@@ -84,7 +84,7 @@ Differences from the reference implementation (semantically equivalent simplific
 5. ``AssignContext::usedCoreNum`` is dead in the reference (written but never read).
 6. The reference's empty-vector branch in ``BaseInfo::Get*SeqSize(batchIdx)``
    is unreachable here: ``init_params`` always fills ``q_seq`` and ``kv_seq``.
-7. ``layout_kv`` and ``layout_out`` are retained for API completeness but do not affect core assignment.
+7. D256 physical tiles depend only on group size times max-Q; layouts do not gate the long-Q tile.
 8. Only ``aic_core_max``, ``aic_core_min`` and ``aiv_core_max`` are read from
    ``DeviceInfo``; ``aiv_core_min`` is not ported.
 9. The elementwise loops in ``clear_result`` and ``copy_result`` use DSL
@@ -101,6 +101,11 @@ from cannbotdsl import get_platform_info
 
 from cannbotdsl.aicpu import GmIn, GmOut, I32, I64, U32, aicpu_kernel, current_raw_stream
 from cannbotdsl.aicpu.toolchain import compile_aicpu_kernel
+
+if __package__:
+    from .flash_attn_validation import select_launch_tile_config
+else:
+    from flash_attn_validation import select_launch_tile_config
 
 # ---------------------------------------------------------------------------
 # Constants: metadata buffer layout (flash_attn_metadata.h)
@@ -282,7 +287,8 @@ def get_max_used_aic_cores(aic_num, batch_size, kv_heads, group_size,
 
 
 def get_launch_core_counts(cube, vector, batch, q_heads, kv_heads, head_dim,
-                           max_seq_q, max_seq_kv, mask_mode, win_left, win_right):
+                           max_seq_q, max_seq_kv, mask_mode, win_left, win_right,
+                           *, tile_m_override=0, tile_n_override=0):
     """Choose launch counts from scalar attrs using the metadata tile policy."""
     ratio = vector // cube
     adjust = SimpleNamespace()
@@ -290,9 +296,11 @@ def get_launch_core_counts(cube, vector, batch, q_heads, kv_heads, head_dim,
     left = UINT32_MAX if win_left == -1 else win_left
     right = UINT32_MAX if win_right == -1 else win_right
     adjust_sinner_souter(head_dim, max_seq_q, max_seq_kv, mask_mode, left, right, adjust)
+    m_base = tile_m_override if tile_m_override else adjust.s_outer * ratio
+    s2_base = tile_n_override if tile_n_override else adjust.s_inner
     launch_cube = get_max_used_aic_cores(
         cube, batch, kv_heads, q_heads // kv_heads, max_seq_q, max_seq_kv,
-        adjust.s_outer * ratio, adjust.s_inner,
+        m_base, s2_base,
     )
     return launch_cube, launch_cube * ratio
 
@@ -341,6 +349,8 @@ class _FlashAttnMetadataArgs:
     layout_q: U32
     layout_kv: U32
     layout_out: U32
+    tile_m_override: U32
+    tile_n_override: U32
 
 
 # ---------------------------------------------------------------------------
@@ -1243,6 +1253,10 @@ def init_params(args, state):
     # Scale m_base by AIV/AIC core ratio: all vector cores share one M row.
     state.m_base = adjust.s_outer * state.aiv_per_aic
     state.s2_base = adjust.s_inner
+    if args.tile_m_override != 0:
+        state.m_base = args.tile_m_override
+    if args.tile_n_override != 0:
+        state.s2_base = args.tile_n_override
     # Match the Host launch bound without changing physical metadata strides.
     state.aic_core_max = get_max_used_aic_cores(
         args.aic_core_num, state.batch_size, state.kv_head_num,
@@ -1595,8 +1609,8 @@ def flash_attn_metadata(
         raise ValueError("cu_seqlens_kv must be None for PA layout")
     if not isinstance(head_dim, int) or isinstance(head_dim, bool):
         raise TypeError("head_dim must be an integer")
-    if head_dim not in (64, 128):
-        raise ValueError("head_dim must be one of 64, 128")
+    if head_dim not in (64, 128, 256):
+        raise ValueError("head_dim must be one of 64, 128, 256")
 
     sequences = dict(
         cu_seqlens_q=cu_seqlens_q,
@@ -1639,6 +1653,13 @@ def flash_attn_metadata(
         if invalid_sequence:
             raise ValueError(f"{name} must be a contiguous 1D int32 tensor on {device}")
 
+    tile = select_launch_tile_config(
+        head_dim, q_heads=num_heads_q, kv_heads=num_heads_kv,
+        max_seqlen_q=max_seqlen_q, layout_q=layout_q,
+        layout_kv=layout_kv, layout_out=layout_out, mask_mode=mask_mode,
+        has_sequence_vectors=any(tensor is not None for tensor in sequences.values()),
+    )
+    large_d256 = head_dim == 256 and tile.tile_cube_m == 128
     _, compiled = _compiled_metadata()
     aic, aiv = get_effective_core_counts(stream=stream)
     size = ((AIC_CORE_NUM + AIV_CORE_NUM) * batch * num_heads_kv + 1) * HEAD_METADATA_STRIDE
@@ -1666,6 +1687,8 @@ def flash_attn_metadata(
         layout_q=_layout_code(layout_q),
         layout_kv=_layout_code(layout_kv),
         layout_out=_layout_code(layout_out),
+        tile_m_override=tile.tile_cube_m if large_d256 else 0,
+        tile_n_override=tile.tile_n if large_d256 else 0,
     )
     for tensor in sequences.values():
         if tensor is not None:

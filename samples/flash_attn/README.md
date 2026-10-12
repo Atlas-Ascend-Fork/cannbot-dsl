@@ -17,7 +17,7 @@ $$
 | 数据类型 | float16、bfloat16（Q/K/V/O 一致）；LSE 为 float32 |
 | Layout | BNSD [B,N,S,D]、BSND [B,S,N,D]、TND [T,N,D]（变长） |
 | GQA | 支持，N1 须为 N2 的整数倍 |
-| D | 64、128（Q/K/V 的 D 相同） |
+| D | 64、128、256（Q/K/V 的 D 相同） |
 | Paged KV | PA_BNBD、PA_BBND、PA_NZ |
 | 支持架构 | NPU ARCH 3510（Ascend 950PR / Ascend 950DT） |
 
@@ -28,7 +28,7 @@ $$
 - `flash_attn_validation.py`：输入参数校验。
 
 调用时先生成 metadata，再将其与相同的布局、head 数和序列参数传给
-`flash_attn`。支持 Split-KV，分块由算子内部自动选择。
+`flash_attn`。支持 Split-KV，分块由算子内部自动选择。D=256 默认使用 N=128；根据 G×max query length 选择 M=64 或 M=128，D 维度内部拆成两个 D=128 子块。
 
 ## 快速开始
 
@@ -70,12 +70,12 @@ o, lse = flash_attn(q, k, v, metadata=metadata, softmax_scale=scale,
 ### `flash_attn_metadata()`
 
 生成注意力计算所需的调度信息，返回一维 int32 NPU tensor。
-前三个参数为 Q head 数、KV head 数和 head dimension，其余参数通过关键字传入。
+前三个参数为 Q head 数、KV head 数和 head dimension，其余参数通过关键字传入。D=256 已支持 QK/PV 的 D128 分块、实际尾块 N 和 D256 专用缓冲布局。
 
 | 参数 | 默认值 | 说明 |
 | :--- | :---: | :--- |
 | `num_heads_q / num_heads_kv` | — | Q/KV head 数，Q head 数须为 KV head 数的整数倍 |
-| `head_dim` | — | head dimension，当前允许 64、128 |
+| `head_dim` | — | head dimension，允许 64、128、256 |
 | `batch_size` | -1 | 无 Q 序列输入时必须提供 |
 | `cu_seqlens_q / cu_seqlens_kv` | None | TND 变长序列的物理累积长度，带前导 0，长度为 `B+1` |
 | `seqused_q / seqused_kv` | None | 逐 batch 有效长度，长度为 `B`；PA 场景必须提供 `seqused_kv` |

@@ -557,7 +557,6 @@ def test_flash_attn_functional_precision(
             "mode must be eager or aclgraph; use -o mode=aclgraph"
         )
     if execution_mode == "aclgraph":
-        pytest.importorskip("opkit")
         if not hasattr(torch.npu, "NPUGraph"):
             pytest.skip("torch_npu does not provide NPUGraph")
 

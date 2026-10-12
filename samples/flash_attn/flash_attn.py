@@ -351,6 +351,9 @@ def _cast_nd_rows(dst, src, rows: int, width):
 @jit
 def _store_o(gm, source, layout, batch: int, kv_head: int,
                         start: int, rows: int, group: int, length: int, cu, s1g):
+    # G1 has identical S1G/GS1 row order; copy all token rows together.
+    if const_expr(group == 1):
+        s1g = False
     span = group if s1g else length
     first_offset = start % span
     segments = (ceil_div(first_offset + rows, span) if rows > 0 else 0)
@@ -376,9 +379,17 @@ class Matmul:
         self.fixpipe = make_copy_engine(split_axis=0)
 
         tmp_n = max(tile_n, self.cube_d)
-        self.q_l1 = Channel(
-            MemLoc.L1, shape=(tile_cube_m, tile_d), dtype=dtype_16, depth=2
-        )
+        if tile_d > CUBE_D_TILE:
+            # D256 uses padded NZ Q slots directly. Allocating a Channel here
+            # and replacing it in __call__ retains both allocations in L1.
+            self.q_l1 = (
+                Buffer(MemLoc.L1, (tile_cube_m, tile_d), dtype_16, n1_pad=256),
+                Buffer(MemLoc.L1, (tile_cube_m, tile_d), dtype_16, n1_pad=256),
+            )
+        else:
+            self.q_l1 = Channel(
+                MemLoc.L1, shape=(tile_cube_m, tile_d), dtype=dtype_16, depth=2
+            )
         kv_kind = ChannelKind.CrossCore if paged_strided else ChannelKind.SameCore
         kv_format = "nz" if paged_nz or paged_strided else None
         self.k_l1 = Channel(MemLoc.L1, shape=(tile_n, tile_d), dtype=dtype_16,
@@ -445,27 +456,51 @@ class Matmul:
             (0, 0),
         )
 
-    def compute_qk(self, active_m, q_source):
-        """QK: retain the producer's L1 layout and pack only active rows."""
+    def compute_qk(self, active_m, q_source, valid_n):
+        """QK: retain L1 pitch and bound cube work to valid KV rows."""
         k_l1 = self.k_l1.consume()
-        q_l0a = self._active_l0a(active_m, self.cube_d)
-        s_l0c = self._active_l0c(active_m, self.tile_n)
+        if const_expr(self.tile_d <= self.cube_d):
+            q_l0a = self._active_l0a(active_m, self.cube_d)
+        s_l0c = reinterpret(
+            self._active_l0c(active_m, self.tile_n),
+            shape=make_tiler((active_m, valid_n), alignment=(1, 1)),
+        )
         if const_expr(self.tile_d > self.cube_d):
             for d_idx in tuple(range(self.d_loops)):
+                # Advance the existing two-slot L0A channel for each D chunk.
+                # Loading Q[d+1] can then overlap MMA on Q[d].
+                q_l0a = self._active_l0a(active_m, self.cube_d)
                 q_part = tile_slice(
                     q_source, (self.tile_cube_m, self.cube_d), (0, d_idx),
                 )
+                # Select the D128 chunk before narrowing N so the original
+                # NZ row-group pitch in L1 remains attached to the source.
                 k_part = tile_slice(
                     k_l1, (self.tile_n, self.cube_d), (0, d_idx),
                 )
+                k_valid = reinterpret(
+                    k_part,
+                    shape=make_tiler((valid_n, self.cube_d), alignment=(1, 1)),
+                )
                 mem_copy(q_l0a, q_part)
-                k_l0b = self.qk_l0b.produce()
-                mem_copy(k_l0b, k_part)
+                k_l0b = reinterpret(
+                    self.qk_l0b.produce(),
+                    shape=make_tiler((valid_n, self.cube_d), alignment=(1, 1)),
+                )
+                mem_copy(k_l0b, k_valid)
                 matmul(s_l0c, self._compute_l0a_view(q_l0a), k_l0b, init=(d_idx == 0))
         else:
             mem_copy(q_l0a, q_source)
-            k_l0b = self.qk_l0b.produce()
-            mem_copy(k_l0b, k_l1)
+            # Retain the L1 source pitch while packing only valid KV rows.
+            k_valid = reinterpret(
+                k_l1,
+                shape=make_tiler((valid_n, self.cube_d), alignment=(1, 1)),
+            )
+            k_l0b = reinterpret(
+                self.qk_l0b.produce(),
+                shape=make_tiler((valid_n, self.cube_d), alignment=(1, 1)),
+            )
+            mem_copy(k_l0b, k_valid)
             matmul(s_l0c, self._compute_l0a_view(q_l0a), k_l0b, init=True)
 
         return s_l0c
@@ -483,17 +518,31 @@ class Matmul:
 
     # Split V along D when head dimension exceeds one cube tile; each chunk
     # computes P x V and writes to its corresponding UB channel.
-    def compute_pv_chunked(self, p_l1_ch, ub_channels, active_m, v_slot):
+    def compute_pv_chunked(self, p_l1_ch, ub_channels, active_m, v_slot,
+                           valid_n=None):
         """Keep D segmentation while computing each chunk with active M."""
         p_l0a = self._active_l0a(active_m, p_l1_ch.shape[1])
+        # Both output-D chunks multiply the same P. Keep it resident until
+        # both MMAs have read it rather than overwriting the L0A slot.
+        mem_copy(p_l0a, p_l1_ch)
         for d_idx in tuple(range(self.d_loops)):
             o_l0c = self._active_l0c(active_m, self.cube_d)
             v_l0b = self.pv_l0b.produce()
             v_part = tile_slice(
                 v_slot, (self.tile_n, self.cube_d), (0, d_idx),
             )
-            mem_copy(v_l0b, v_part, transpose=True)
-            mem_copy(p_l0a, p_l1_ch)
+            if valid_n is not None:
+                v_valid = reinterpret(
+                    v_part,
+                    shape=make_tiler((valid_n, self.cube_d), alignment=(1, 1)),
+                )
+                v_l0b = reinterpret(
+                    v_l0b,
+                    shape=make_tiler((valid_n, self.cube_d), alignment=(1, 1)),
+                )
+                mem_copy(v_l0b, v_valid, transpose=True)
+            else:
+                mem_copy(v_l0b, v_part, transpose=True)
             matmul(o_l0c, self._compute_l0a_view(p_l0a), v_l0b, init=True)
             mem_copy(ub_channels[d_idx].produce(), o_l0c,
                      engine=self.fixpipe,
@@ -568,9 +617,17 @@ class Vector:
             data_format="nz",
             n1_pad=p_n1_pad,
         )
-        self.o_ub = Channel(
-            MemLoc.UB, shape=(tile_vec_m, tile_d), dtype=self.dtype_16, depth=1
-        ).produce()
+        if const_expr(tile_d > CUBE_D_TILE):
+            # Final cast runs after the last update. Its packed fp16 view
+            # reuses the accumulator storage without a second UB allocation.
+            self.o_ub = reinterpret(
+                self.res_o, dtype=self.dtype_16,
+                shape=(tile_vec_m, tile_d), stride=(tile_d, 1),
+            )
+        else:
+            self.o_ub = Channel(
+                MemLoc.UB, shape=(tile_vec_m, tile_d), dtype=self.dtype_16, depth=1
+            ).produce()
         if const_expr(mask_mode != 0):
             if const_expr(mask_in_vector):
                 # Generated and consumed by V: a local buffer needs no
@@ -1210,7 +1267,8 @@ class FlashAttnKernel:
             # Two scratch buffers shared by K and V: only one 16-row ND
             # fragment and one half-head NZ tile per AIV.
             self.pa_nd_ub = Buffer(MemLoc.UB, (16, tile_d // 2), dtype_16)
-            self.pa_nz_ub = Buffer(MemLoc.UB, (tile_d // 32, tile_n * 16), dtype_16)
+            nz_rows = 16 if tile_d > CUBE_D_TILE and tile_cube_m > 64 else tile_n
+            self.pa_nz_ub = Buffer(MemLoc.UB, (tile_d // 32, nz_rows * 16), dtype_16)
             self.pa_ub_to_l1 = make_copy_engine(split_axis=1)
         # One source row at a time is the public-API fallback that covers every
         # S1G/GS1 boundary. NZ rows are 32-byte C0 units for fp16/bf16.
@@ -1220,14 +1278,21 @@ class FlashAttnKernel:
             MemLoc.UB,
             shape=(tile_vec_m, tile_n),
             dtype=dtypes.float32,
-            depth=2,
+            depth=(4 if tile_d > CUBE_D_TILE and tile_n == CUBE_D_TILE else 2),
             kind=ChannelKind.CrossCore,
         )
         if tile_d > CUBE_D_TILE:
-            self.pv_ubs = tuple(Channel(
-                MemLoc.UB, shape=(tile_vec_m, CUBE_D_TILE), dtype=dtypes.float32,
-                depth=2, kind=ChannelKind.CrossCore,
-            ) for _ in range(tile_d // CUBE_D_TILE))
+            if tile_n == CUBE_D_TILE:
+                # QK and both PV chunks carry the same CrossCore FIFO message
+                # shape. Shared identity keeps producer/consumer cursors ordered.
+                self.pv_ubs = tuple(
+                    self.qk_ub for _ in range(tile_d // CUBE_D_TILE)
+                )
+            else:
+                self.pv_ubs = tuple(Channel(
+                    MemLoc.UB, shape=(tile_vec_m, CUBE_D_TILE),
+                    dtype=dtypes.float32, depth=2, kind=ChannelKind.CrossCore,
+                ) for _ in range(tile_d // CUBE_D_TILE))
         else:
             self.pv_ub = Channel(
                 MemLoc.UB, shape=(tile_vec_m, tile_d), dtype=dtypes.float32,
@@ -1656,7 +1721,7 @@ class FlashAttnKernel:
             k_tile_gm = self._kv_tile(self._key, batch_idx, kv_head, n_idx)
             self.matmul.load_k(k_tile_gm)
             valid_n = k_tile_gm.shape[0]
-        result = self.matmul.compute_qk(q_tile_gm.shape[0], q_source)
+        result = self.matmul.compute_qk(q_tile_gm.shape[0], q_source, valid_n)
         self.matmul.store_s(
             self.qk_ub, q_tile_gm.shape[0], valid_n, result
         )
@@ -1746,9 +1811,14 @@ class FlashAttnKernel:
             shape=(self.tile_cube_m, valid_n),
         )
         if const_expr(self.tile_d > CUBE_D_TILE):
-            self.matmul.compute_pv_chunked(
-                p_l1_view, self.pv_ubs, _rows, v_slot,
-            )
+            if const_expr(self._pa_strided and self.tile_cube_m > 64):
+                self.matmul.compute_pv_chunked(
+                    p_l1_view, self.pv_ubs, _rows, v_slot, valid_n,
+                )
+            else:
+                self.matmul.compute_pv_chunked(
+                    p_l1_view, self.pv_ubs, _rows, v_slot,
+                )
         else:
             result = self.matmul.compute_pv(p_l1_view, _rows, v_slot)
             self.matmul.store_o(self.pv_ub, _rows, result)
@@ -1942,6 +2012,76 @@ class FlashAttnKernel:
         return reinterpret(source, shape=(rows, self.tile_d))
 
     @jit
+    def _load_pa_strided_d256_tile(
+        self, gm, slot, batch_idx: int, kv_head: int, start, valid_n,
+    ):
+        """Build and copy each 16-row NZ strip before reusing UB scratch."""
+        half_d = self.tile_d // 2
+        d_start = self.subblock_idx * half_d
+        for segment in range(self.tile_n // 16):
+            copied = dtypes.int64(segment * 16)
+            # Pad the final strip before copying it to the L1 destination.
+            with vf(mode="simd"):
+                zero_mask, _ = rr.update_mask(16, elem_bits=16)
+                zero_reg = rr.vdups(0, self.dtype_16, mask=zero_mask)
+                for di in tuple(range(self.tile_d // 32)):
+                    for row in range(16):
+                        rr.vstore(
+                            self.pa_nz_ub, (di * 16 + row) * 16,
+                            zero_reg, zero_mask,
+                        )
+            if copied < valid_n:
+                token = start + copied
+                page_row = token % self._pa_block_size
+                take = min(16, valid_n - copied)
+                page = dtypes.int64(
+                    self._block_table[batch_idx, token // self._pa_block_size]
+                )
+                if const_expr(self.kv_layout == "PA_NZ"):
+                    for di in tuple(range(self.tile_d // 32)):
+                        global_di = self.subblock_idx * (self.tile_d // 32) + di
+                        source = gm[
+                            page, kv_head, global_di,
+                            page_row:page_row + take, None,
+                        ]
+                        source = tile_slice(source, (16, 16), (0, 0))
+                        dest = tile_slice(self.pa_nd_ub, (16, 16), (0, di))
+                        mem_copy(dest, source)
+                else:
+                    if const_expr(self.kv_layout == "PA_BBND"):
+                        page_cache = permute(gm, (0, 2, 1, 3))
+                    else:
+                        page_cache = gm
+                    source = page_cache[
+                        page, kv_head, page_row:page_row + take,
+                        d_start:d_start + half_d,
+                    ]
+                    source = tile_slice(source, (16, half_d), (0, 0))
+                    mem_copy(self.pa_nd_ub, source)
+                with vf(mode="simd"):
+                    load_mask, _ = rr.update_mask(16, elem_bits=16)
+                    for di in tuple(range(self.tile_d // 32)):
+                        for row in range(take):
+                            value = rr.vload(
+                                self.pa_nd_ub, row * half_d + di * 16,
+                            )
+                            rr.vstore(
+                                self.pa_nz_ub, (di * 16 + row) * 16,
+                                value, load_mask,
+                            )
+            nz_half = reinterpret(
+                self.pa_nz_ub, shape=(16, half_d), data_format="nz",
+            )
+            l1_strip = tile_slice(
+                slot, (16, self.tile_d), (segment, 0),
+            )
+            mem_copy(
+                l1_strip, nz_half, engine=self.pa_ub_to_l1,
+                part_id=self.subblock_idx,
+            )
+        return slot
+
+    @jit
     def _load_pa_strided_tile(self, gm, batch_idx: int, kv_head: int, n_idx: int,
                               is_value=False):
         """Tile-only AIV staging for GM views with a non-unit inner stride."""
@@ -1949,6 +2089,10 @@ class FlashAttnKernel:
         slot = channel.produce()
         start = dtypes.int64(n_idx * self.tile_n)
         valid_n = min(self.tile_n, self._kv_length(batch_idx) - start)
+        if const_expr(self.tile_d > CUBE_D_TILE and self.tile_cube_m > 64):
+            return self._load_pa_strided_d256_tile(
+                gm, slot, batch_idx, kv_head, start, valid_n,
+            )
         half_d = self.tile_d // 2
         d_start = self.subblock_idx * half_d
         # Both AIVs build disjoint D halves, including zero padding.
@@ -2373,10 +2517,11 @@ class FlashAttnKernel:
             return
         # Pad each NZ column group by one 16x16 block so segmented DMA
         # keeps an explicit full-buffer pitch, including dynamic row windows.
-        self.matmul.q_l1 = (
-            Buffer(MemLoc.L1, (self.tile_cube_m, self.tile_d), self.dtype_16, n1_pad=256),
-            Buffer(MemLoc.L1, (self.tile_cube_m, self.tile_d), self.dtype_16, n1_pad=256),
-        )
+        if const_expr(self.tile_d <= CUBE_D_TILE):
+            self.matmul.q_l1 = (
+                Buffer(MemLoc.L1, (self.tile_cube_m, self.tile_d), self.dtype_16, n1_pad=256),
+                Buffer(MemLoc.L1, (self.tile_cube_m, self.tile_d), self.dtype_16, n1_pad=256),
+            )
         self._run_native(metadata)
 
     @jit
@@ -2919,6 +3064,7 @@ def flash_attn(
         win_left=win_left, win_right=win_right, layout_q=layout_q,
         layout_kv=layout_kv, layout_out=layout_out,
         return_softmax_lse=return_softmax_lse,
+        max_seqlen_q=max_seqlen_q,
     )
     batch_size, query_length, kv_length, q_heads, kv_heads, head_dim = (
         validated.batch, validated.query_length, validated.kv_length,
@@ -2942,6 +3088,10 @@ def flash_attn(
     block_dim, vector_dim = get_launch_core_counts(
         block_dim, vector_dim, batch_size, q_heads, kv_heads, head_dim,
         max_seqlen_q, max_seqlen_kv, mask_mode, win_left, win_right,
+        tile_m_override=tile_config.tile_cube_m
+        if head_dim == 256 and tile_config.tile_cube_m == 128 else 0,
+        tile_n_override=tile_config.tile_n
+        if head_dim == 256 and tile_config.tile_cube_m == 128 else 0,
     )
     out_shape, lse_shape = output_shapes(
         layout_q, layout_out, query, batch_size, query_length, q_heads, head_dim,

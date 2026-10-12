@@ -30,10 +30,10 @@ def host_only(monkeypatch):
     )
 
 
-@pytest.mark.parametrize("head_dim", [0, 32, 80, 192, 256, 257])
+@pytest.mark.parametrize("head_dim", [0, 32, 80, 192, 257])
 def test_metadata_rejects_unsupported_head_dim_before_device(head_dim, host_only):
     with pytest.raises(
-        ValueError, match="head_dim must be one of 64, 128"
+        ValueError, match="head_dim must be one of 64, 128, 256"
     ):
         flash_attn_metadata(
             8, 2, head_dim, batch_size=1,

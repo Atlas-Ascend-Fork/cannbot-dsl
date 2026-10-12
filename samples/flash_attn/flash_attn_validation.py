@@ -38,11 +38,26 @@ def select_tile_config(head_dim):
     """Return the physical tile configuration implemented for head_dim."""
     if not isinstance(head_dim, int) or isinstance(head_dim, bool):
         raise TypeError("Invalid head_dim: must be an integer")
-    if head_dim not in (64, 128):
+    if head_dim not in (64, 128, 256):
         raise ValueError(
-            f"Unsupported head dim D={head_dim}; supported values are 64, 128"
+            f"Unsupported head dim D={head_dim}; supported values are 64, 128, 256"
         )
     return _TILE_CONFIGS[head_dim]
+
+
+_D256_LONG_Q_TILE = TileConfig("D256_M128_N128", 256, 128, 64, 128, 128, 2)
+
+
+def select_launch_tile_config(
+    head_dim, *, q_heads, kv_heads, max_seqlen_q, layout_q, layout_kv,
+    layout_out, mask_mode, has_sequence_vectors=False,
+):
+    """Use G*max-Q for D256; layouts and masks do not change the tile."""
+    default = select_tile_config(head_dim)
+    if head_dim != 256:
+        return default
+    max_q = (2**31 - 1) if max_seqlen_q == -1 else max_seqlen_q
+    return default if (q_heads // kv_heads) * max_q < 64 else _D256_LONG_Q_TILE
 
 
 @dataclass(frozen=True)
@@ -72,17 +87,30 @@ def estimate_resource_plan(config, *, grouped, window_mask, return_softmax_lse, 
     l0a = 2 * m * l0_width * elem16
     l0c = L0C_DEPTH * m * l0_width * elem32
     l0b = 2 * c * n * elem16 * (1 if c == n else 2)
-    l1 = 2 * (m * d + 2 * n * d) * elem16 + 3 * m * n * elem16
-    qk_ub_bytes = 2 * vm * n * elem32
-    pv_ub_bytes = 2 * config.d_chunks * vm * c * elem32
+    q_l1_bytes = 2 * m * d * elem16
+    if d > 128:
+        # The allocator reserves the full NZ pitch for every D/16 group.
+        # This includes the final 256-element pad after the occupied span.
+        q_slot_bytes = (m * 16 + 256) * (d // 16) * elem16
+        q_slot_bytes = ((q_slot_bytes + 511) // 512) * 512
+        q_l1_bytes = 2 * q_slot_bytes
+    l1 = q_l1_bytes + 4 * n * d * elem16 + 3 * m * n * elem16
+    qk_depth = 4 if d > 128 and n == c else 2
+    qk_ub_bytes = qk_depth * vm * n * elem32
+    # D256/N128 PV chunks reuse the QK CrossCore FIFO allocation.
+    pv_ub_bytes = (
+        0 if d > 128 and n == c
+        else 2 * config.d_chunks * vm * c * elem32
+    )
     p_nz = 2 * vm * n * elem16
-    output = vm * d * (elem32 + elem16)
+    # D256 casts into a packed fp16 view of the fp32 accumulator.
+    output = vm * d * (elem32 if d > 128 else elem32 + elem16)
     softmax = 11 * vm * elem32
     masks = vm * n * (2 if window_mask else 1)
     lse = vm * elem32 + vm * LSE_ROW_LANES * elem32 if return_softmax_lse or split_mode else 0
     ub = qk_ub_bytes + pv_ub_bytes + p_nz + output + softmax + masks + lse
     if pa_strided:
-        ub += 144 * d
+        ub += 32 * d if d > 128 and m > 64 else 144 * d
     workspace_row = d * elem16 + LSE_ROW_LANES * elem32 if split_mode else 0
     return ResourcePlan(
         config.name, l0a, l0b, l0c, l1, ub, workspace_row, c, config.d_chunks,
@@ -134,8 +162,8 @@ def _parse_pa_kv_shape(key, value, layout):
         dim = d1 * d0
     if block_size % 16 or not 16 <= block_size <= 1024:
         raise ValueError("Invalid PA block_size: must be a 16-aligned value in [16, 1024]")
-    if dim not in (64, 128):
-        raise ValueError("Invalid PA head dimension must be 64 or 128")
+    if dim not in (64, 128, 256):
+        raise ValueError("Invalid PA head dimension must be 64, 128 or 256")
     return int(heads), int(block_size), int(dim)
 
 
@@ -253,11 +281,11 @@ def _validate_sequence_vectors(query, batch, vectors):
 
 def _validate_dense_dimensions(key, value, head_dim, kv_heads, q_heads):
     invalid_heads = (
-        head_dim not in (64, 128) or kv_heads <= 0
+        head_dim not in (64, 128, 256) or kv_heads <= 0
         or q_heads < kv_heads or q_heads % kv_heads
     )
     if invalid_heads:
-        raise ValueError("Invalid flash_attn: requires D=64/128 and integral GQA")
+        raise ValueError("Invalid flash_attn: requires D=64/128/256 and integral GQA")
     if key.shape[-1] != head_dim or value.shape[-1] != head_dim:
         raise ValueError("Invalid Q/K/V head dimensions must match")
 
@@ -266,6 +294,7 @@ def validate_flash_attn_inputs(
     *, query, key, value, block_table, cu_seqlens_q, cu_seqlens_kv,
     seqused_q, seqused_kv, attn_mask, metadata, mask_mode, win_left,
     win_right, layout_q, layout_kv, layout_out, return_softmax_lse,
+    max_seqlen_q=-1,
 ):
     """Validate existing host launch requirements and return derived dimensions."""
     _validate_launch_metadata(query, metadata, mask_mode, win_left, win_right)
@@ -305,7 +334,12 @@ def validate_flash_attn_inputs(
     _validate_sequence_vectors(query, batch, vectors)
     if not is_pa:
         _validate_dense_dimensions(key, value, head_dim, kv_heads, q_heads)
-    tile_config = select_tile_config(head_dim)
+    tile_config = select_launch_tile_config(
+        head_dim, q_heads=q_heads, kv_heads=kv_heads,
+        max_seqlen_q=max_seqlen_q, layout_q=layout_q,
+        layout_kv=layout_kv, layout_out=layout_out, mask_mode=mask_mode,
+        has_sequence_vectors=any(tensor is not None for tensor in vectors.values()),
+    )
     validate_resource_plan(estimate_resource_plan(
         tile_config, grouped=True, window_mask=mask_mode == 4,
         return_softmax_lse=return_softmax_lse, split_mode=True,
