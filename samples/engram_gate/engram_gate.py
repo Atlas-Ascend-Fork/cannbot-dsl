@@ -20,6 +20,7 @@ from cannbotdsl import (
     const_expr,
     dtypes,
 )
+from cannbotdsl.aot import export
 from cannbotdsl.buffer import Buffer
 from cannbotdsl.tensor import tile_slice
 from cannbotdsl.lang.host import host
@@ -1049,3 +1050,53 @@ def engram_gate(
     else:
         fn(x3, key3, value2, weight, out3)
     return out
+
+
+@export("engram_gate")
+def export_engram_gate():
+    """Compile the default model profiles without NPU execution.
+
+    ``total_tokens`` enters the compiled program (tensor shapes and the
+    launch grid), and ``eps``/``clamp_value``/``max_blocks`` are captured by
+    the compiled host launcher, so the catalogue enumerates the default
+    token count for both supported vector-core quotas and both mask ABI
+    variants; other values fall back to JIT.
+    ``CANNBOTDSL_DS41_PROFILES`` may replace the list with an ``engram_gate``
+    array of ``{"max_blocks": int, "tokens": [int, ...], "has_mask":
+    [bool, ...]}`` entries; unlisted fields keep the defaults below.
+    """
+    import json
+    import os
+
+    dim, hc_mult = 5120, 4
+    eps, clamp_value = 1.0e-6, 1.0e-6
+    default_tokens = (72,)
+    default_masks = (False, True)
+    entries = [
+        {"max_blocks": 56, "tokens": default_tokens, "has_mask": default_masks},
+        {"max_blocks": 64, "tokens": default_tokens, "has_mask": default_masks},
+    ]
+    profile_path = os.environ.get("CANNBOTDSL_DS41_PROFILES")
+    if profile_path:
+        with open(profile_path, encoding="utf-8") as stream:
+            loaded = json.load(stream).get("engram_gate")
+        if loaded is not None:
+            entries = loaded
+    profiles = []
+    for entry in entries:
+        quota = int(entry.get("max_blocks", 56))
+        for tokens in entry.get("tokens", default_tokens):
+            for has_mask in entry.get("has_mask", default_masks):
+                profiles.append((quota, int(tokens), bool(has_mask)))
+    for handle in _RUN_CALLABLE_CACHE.values():
+        handle.close()
+    _RUN_CALLABLE_CACHE.clear()
+    try:
+        for max_blocks, tokens, has_mask in dict.fromkeys(profiles):
+            _get_run_callable(
+                eps, clamp_value, dim, hc_mult, max_blocks, tokens, has_mask
+            )
+    finally:
+        for handle in _RUN_CALLABLE_CACHE.values():
+            handle.close()
+        _RUN_CALLABLE_CACHE.clear()

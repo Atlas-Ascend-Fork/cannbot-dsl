@@ -38,11 +38,16 @@ def test_catalog_exports_and_staged_resources(tmp_path, monkeypatch):
             for node in ast.walk(ast.parse(source.read_text())):
                 if isinstance(node, ast.FunctionDef):
                     for decorator in node.decorator_list:
-                        if (
-                            isinstance(decorator, ast.Call)
-                            and isinstance(decorator.func, ast.Name)
-                            and decorator.func.id == "export"
-                        ):
+                        if not isinstance(decorator, ast.Call):
+                            continue
+                        function = decorator.func
+                        if isinstance(function, ast.Name):
+                            name = function.id
+                        elif isinstance(function, ast.Attribute):
+                            name = function.attr
+                        else:
+                            continue
+                        if name == "export":
                             exports.add(ast.literal_eval(decorator.args[0]))
     assert exports == set(operators)
     package = tmp_path / "package"
@@ -211,14 +216,28 @@ def test_build_wheel_contains_sources_and_native_resources(tmp_path, monkeypatch
 
 def test_ds41_selection():
     operators, groups = builder.load_catalog()
-    assert set(operators) == {"mqsmla", "qli", "qsli"}
-    assert groups == {"ds41": ["mqsmla", "qli", "qsli"]}
+    assert {
+        "mqsmla",
+        "qli",
+        "qsli",
+        "indexer_prologue_qw",
+        "indexer_prologue_k",
+        "engram_gate",
+    } <= set(operators)
+    assert groups["ds41"] == [
+        "mqsmla",
+        "qli",
+        "qsli",
+        "indexer_prologue_qw",
+        "indexer_prologue_k",
+        "engram_gate",
+    ]
     assert builder.choose_operators(
         builder.parse_args(["--group", "ds41"]), operators, groups
     ) == (groups["ds41"], Path("groups/ds41"))
     with pytest.raises(ValueError, match="unknown group"):
         builder.choose_operators(
-            builder.parse_args(["--group", "k3"]), operators, groups
+            builder.parse_args(["--group", "unknown"]), operators, groups
         )
 
 
@@ -257,6 +276,82 @@ def test_indexer_export_profiles(operator, monkeypatch):
             assert config[9] in ((64, 128) if layout == "PA_BBND" else (256,))
         else:
             assert config[10] in ((64, 128) if layout == "PA_BBND" else (0,))
+
+
+def _extract_export_collector(operator):
+    """Return (source, collector) for one operator, decorator removed."""
+    operators, _ = builder.load_catalog()
+    source = builder.source_index()[operators[operator][0]]
+    tree = ast.parse(source.read_text())
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name == f"export_{operator}":
+            node.decorator_list = []
+            return source, node
+    raise AssertionError(f"export_{operator} collector not found in {source}")
+
+
+def _exec_collector(source, collector, namespace):
+    """Define the collector in the namespace, then invoke it once."""
+    exec(
+        compile(ast.Module(body=[collector], type_ignores=[]), str(source), "exec"),
+        namespace,
+    )
+    run_export = namespace.get(collector.name)
+    assert callable(run_export)
+    run_export()
+
+
+def _recording_run_callable(calls, cache):
+    """Record positional configs and park closable handles in the cache."""
+    from types import SimpleNamespace
+
+    def fake_get_run_callable(*args):
+        calls.append(args)
+        handle = SimpleNamespace(close=lambda: None)
+        cache[args] = handle
+        return handle
+
+    return fake_get_run_callable
+
+
+def test_engram_gate_default_profiles(monkeypatch):
+    """Check the default token/quota/mask catalogue without device kernels."""
+    calls = []
+    cache = {}
+    source, collector = _extract_export_collector("engram_gate")
+    namespace = {
+        "os": os,
+        "_get_run_callable": _recording_run_callable(calls, cache),
+        "_RUN_CALLABLE_CACHE": cache,
+    }
+    monkeypatch.delenv("CANNBOTDSL_DS41_PROFILES", raising=False)
+    _exec_collector(source, collector, namespace)
+    assert len(calls) == 4
+    assert sorted({call[4] for call in calls}) == [56, 64]
+    assert {call[5] for call in calls} == {72}
+    assert {call[6] for call in calls} == {False, True}
+    assert all(call[:4] == (1.0e-6, 1.0e-6, 5120, 4) for call in calls)
+    assert cache == {}
+
+
+def test_engram_gate_profile_override(monkeypatch, tmp_path):
+    """CANNBOTDSL_DS41_PROFILES replaces the default engram_gate catalogue."""
+    calls = []
+    cache = {}
+    source, collector = _extract_export_collector("engram_gate")
+    namespace = {
+        "os": os,
+        "_get_run_callable": _recording_run_callable(calls, cache),
+        "_RUN_CALLABLE_CACHE": cache,
+    }
+    profiles = tmp_path / "profiles.json"
+    profiles.write_text(
+        '{"engram_gate": [{"max_blocks": 56, "tokens": [72, 100],'
+        ' "has_mask": [false]}]}'
+    )
+    monkeypatch.setenv("CANNBOTDSL_DS41_PROFILES", str(profiles))
+    _exec_collector(source, collector, namespace)
+    assert [call[4:] for call in calls] == [(56, 72, False), (56, 100, False)]
 
 
 def test_aicpu_metadata_resources_do_not_collide(tmp_path, monkeypatch):

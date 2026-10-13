@@ -43,3 +43,32 @@ y    = bf16(x + gate * value)
 ```bash
 pytest -q test/engram_gate/test_engram_gate.py
 ```
+
+## 安装包调用
+
+源码示例与测试直接加载本仓库 sample。需要部署安装包时，使用共享
+[Native 构建工程](../../net/native_package/README.md)，注册名为 `engram_gate`，所属组为
+`ds41`：
+
+```bash
+export PYTHON=/path/to/python3.12
+export CANN_ENV=/path/to/Ascend/cann/set_env.sh
+source "$CANN_ENV"
+export CANNBOTDSL_WHEEL=/path/to/cannbotdsl-0.7.0-cp312-cp312-manylinux_2_28_x86_64.whl
+bash net/native_package/run-build.sh --operator engram_gate
+"$PYTHON" -m pip install --no-deps --force-reinstall \
+  net/native_package/output/operators/engram_gate/wheels/*.whl
+```
+
+`T`、mask ABI 与核配额参与编译（张量形状、launch grid 和 host launcher 均随之变化），
+默认按 56/64 核配额 × `T=72` × 有/无 `image_mask` 共 4 个配置；`eps`/`clamp_value`
+默认导出 `1e-6`。未被枚举的取值会回退 JIT。可通过
+`CANNBOTDSL_DS41_PROFILES` 的 `engram_gate` 键覆盖默认集合：
+
+```json
+{"engram_gate": [{"max_blocks": 56, "tokens": [72, 256, 1024], "has_mask": [true, false]}]}
+```
+
+安装后可设置 `CANNBOTDSL_NATIVE_BINARY_MODE=require` 验证二进制覆盖是否完整，
+未命中时立即报错；`CANNBOTDSL_NATIVE_BINARY_REPORT=/path/to/native-report.json`
+可保存命中记录。

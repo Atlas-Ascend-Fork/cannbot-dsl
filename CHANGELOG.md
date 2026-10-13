@@ -5,6 +5,7 @@
 ### 【2026-10-13】
 #### 特性增强 Feature Enhancement
 - 【indexer_prologue_qw / indexer_prologue_k】接入 `net/native_package` Native 打包：改用 `cannbotdsl.aot.export` 声明导出入口并登记到 `operator_groups.toml` 的 `ds41` 组，可通过 `./run-build.sh --operator indexer_prologue_qw indexer_prologue_k` 编译为 Native 算子包。`indexer_prologue_k` 新增默认导出 profile（H=5120/512 × mode0 带/不带 scale、mode1 G=8，共 6 个二进制），支持通过 `CANNBOTDSL_DS41_PROFILES` 的 `indexer_prologue_k` 键覆盖。同时移除 `indexer_prologue_qw` 的 `_CompatChannel` 及 `matmul`/`mem_copy` 包装层，直接使用 0.7 的 `Channel.produce()/consume()`，编译产物二进制逐字节不变。
+- 【engram_gate】接入 `net/native_package` Native 打包：新增 `@export("engram_gate")`，`T`、mask ABI 与核配额参与编译，默认导出 56/64 核配额 × `T=72` × 有/无 `image_mask` 共 4 个配置（`eps`/`clamp_value` 固定 `1e-6`，其余取值回退 JIT），登记到 `operator_groups.toml` 的 `ds41` 组，支持 `CANNBOTDSL_DS41_PROFILES` 的 `engram_gate` 键覆盖；同时修正 `net/native_package/test_build.py` 两处既有失败（`@aot.export(...)` 属性写法探测、`test_ds41_selection` 断言未随算子集更新）。
 
 ### 【2026-10-08】
 #### 新特性 New Features
