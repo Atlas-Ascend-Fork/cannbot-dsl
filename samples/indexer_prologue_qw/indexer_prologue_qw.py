@@ -50,7 +50,7 @@ except ImportError:  # CPU-only tests import this module without an NPU stack.
 
 from cannbotdsl import (
     Buffer,
-    Channel as _DslChannel,
+    Channel,
     ChannelKind,
     Dim,
     MemLoc,
@@ -68,22 +68,13 @@ from cannbotdsl import (
     kernel,
     cv_valid_extent,
     make_copy_engine as _dsl_make_copy_engine,
-    matmul as _dsl_matmul,
-    mem_copy as _dsl_mem_copy,
+    matmul,
+    mem_copy,
     range_constexpr,
     vf,
 )
 
-try:
-    from cannbotdsl.package.native import register
-except ImportError:  # 0.3.dev441 has the kernel APIs but not the native packager
-    def register(name):
-        """No-op stand-in when the native packager is not installed."""
-
-        def decorate(function):
-            return function
-
-        return decorate
+from cannbotdsl.aot import export
 from cannbotdsl.ops.reg import (
     PackMode,
     create_mask,
@@ -133,77 +124,8 @@ from cannbotdsl.tensor import (
     tile_slice,
 )
 
-# 0.6.0 moved these off the package root into dtypes.
 Float8E4M3FN = dtypes.float8_e4m3fn
 Float8E8M0 = dtypes.float8_e8m0
-
-
-# ---------------------------------------------------------------------------
-# cannbotdsl 0.6.0 compatibility
-# ---------------------------------------------------------------------------
-# 0.6.0 dropped the arena flag allocator, renamed the view helpers, replaced
-# Channel acquire/wait with produce/consume, and moved copy-engine fields
-# onto mem_copy / split_axis. The remaining local staging uses these shims;
-# the Cube/Vector handoff and GM partitioning use the native 0.6 split API.
-
-
-# Compatibility layer: map the old acquire/wait names onto 0.6 produce/consume.
-# commit/release are no-ops here; they do not emit hardware synchronisation.
-class _CompatChannel:
-    """0.5 acquire/commit/wait/release on top of 0.6 produce/consume."""
-
-    def __init__(self, *args, **kwargs):
-        self._ch = _DslChannel(*args, **kwargs)
-        self._alias_dtype = None
-
-    def __getattr__(self, name):
-        return getattr(self._ch, name)
-
-    def reinterpret(self, dtype):
-        alias = _CompatChannel.__new__(_CompatChannel)
-        return alias.adopt(self._ch, dtype)
-
-    def adopt(self, channel, dtype):
-        """Bind an alias onto an existing channel without touching its slots."""
-        self._ch = channel
-        self._alias_dtype = dtype
-        return self
-
-    def acquire(self):
-        return self._view(self._ch.produce())
-
-    def wait(self):
-        return self._view(self._ch.consume())
-
-    def produce(self):
-        return self.acquire()
-
-    def consume(self):
-        return self.wait()
-
-    @staticmethod
-    def commit(slot=None):
-        del slot
-        return None
-
-    @staticmethod
-    def release(slot=None):
-        del slot
-        return None
-
-    def _view(self, slot):
-        if self._alias_dtype is not None:
-            return reinterpret(slot, dtype=self._alias_dtype)
-        return slot
-
-
-Channel = _CompatChannel
-
-
-def _select_slot(value, *, write):
-    if isinstance(value, _CompatChannel):
-        return value.produce() if write else value.consume()
-    return value
 
 
 def tile_view(tensor, tiler, coord):
@@ -225,25 +147,6 @@ def make_copy_engine(*args, **kwargs):
     return _dsl_make_copy_engine(*args, **kwargs)
 
 
-def mem_copy(dst, src, *args, deq_scale_val=None, **kwargs):
-    if deq_scale_val is not None:
-        kwargs.setdefault("deq_scale", deq_scale_val)
-    return _dsl_mem_copy(
-        _select_slot(dst, write=True),
-        _select_slot(src, write=False),
-        *args,
-        **kwargs,
-    )
-
-
-def matmul(dst, lhs, rhs, *args, **kwargs):
-    return _dsl_matmul(
-        _select_slot(dst, write=True),
-        _select_slot(lhs, write=False),
-        _select_slot(rhs, write=False),
-        *args,
-        **kwargs,
-    )
 try:
     from device_properties import get_device_properties
 except ImportError:  # packaged net/ops wheel has no samples/ on sys.path
@@ -1055,8 +958,8 @@ def store_to_vec_barrier():
     docstring calls redundant on a mix kernel.  What is left is the grid
     barrier over the AICs, then the handoff to each block's own AIVs.
 
-    Flag ids match ``global_sync_all`` phases 2 and 4.  0.6.0 dropped the
-    arena allocator; ids are now the same explicit pair that API documents.
+    Flag ids match ``global_sync_all`` phases 2 and 4: the same explicit pair
+    the API documents.
 
     Worth 0.75 us of the 1.77 us the full barrier costs at T=72.  The arrive
     goes out on FIXPIPE and is preceded by ``cube_sync_all`` because an FFTS
@@ -1079,8 +982,8 @@ def _prefetch_qr(cube_q, qr_gm, descale_qr_gm, work, n_work):
 
     It sits after the head loop rather than inside its last iteration, where it
     used to: the staging channels are depth 1 and the read transaction now spans
-    the whole head loop, so a fill issued before the release would block on its
-    own reader.  On the cube's own timeline that moves it past one
+    the whole head loop, so a fill issued inside it would block on its own
+    reader.  On the cube's own timeline that moves it past one
     ``drain_to_vec``, which is a fixpipe op the MTE2 fill does not wait for.
     """
     p = cube_q.p
@@ -1139,9 +1042,6 @@ class CubeQ:
             )
             for _ in range(p.n_buf_wqb)  # == k_l1_tiles_q
         ]
-        self.wqb_l1_fp8 = [
-            ch.reinterpret(Float8E4M3FN) for ch in self.wqb_l1
-        ]
         # No alias on the scales, so one rotating channel is fine here.
         self.scale_wqb_l1 = Channel(
             MemLoc.L1,
@@ -1188,17 +1088,14 @@ class CubeQ:
         height -- see ``rows_view``.
         """
         p = self.p
-        qr_slot = self.qr_l1.acquire()
         mem_copy(
-            qr_slot,
+            self.qr_l1.produce(),
             tile_view(qr_gm, (p.base_m, p.qr_k_l1), (tile, 0)),
             engine=self.eng_nd2nz,
             l2_cache_ctl=p.l2_q,
         )
-        self.qr_l1.commit(qr_slot)
-        scale_slot = self.scale_qr_l1.acquire()
         mem_copy(
-            scale_slot,
+            self.scale_qr_l1.produce(),
             tile_view(
                 descale_qr_gm,
                 (p.base_m, p.scale_k_len_q // MX_PAIR, MX_PAIR),
@@ -1207,17 +1104,11 @@ class CubeQ:
             engine=self.eng_scale_a,
             l2_cache_ctl=p.l2_q,
         )
-        self.scale_qr_l1.commit(scale_slot)
 
     @jit
     def wait_qr(self):
         """The staged ``qr`` tile and its scales, as one transaction pair."""
-        return self.qr_l1.wait(), self.scale_qr_l1.wait()
-
-    @jit
-    def release_qr(self, qr_slot, scale_slot):
-        self.qr_l1.release(qr_slot)
-        self.scale_qr_l1.release(scale_slot)
+        return self.qr_l1.consume(), self.scale_qr_l1.consume()
 
     # Physical layout of a short tail. rows_l1 rounds the live row count up
     # to 16. Later L1 reads must use that same row pitch. Treating the tail
@@ -1273,25 +1164,21 @@ class CubeQ:
         """Stage K window ``kw`` of this head's ``wqb`` and its scales into L1."""
         p = self.p
         groups = p.scale_k_l1_len_q // MX_PAIR
-        # Filled through the uint8 face, read back through the fp8 alias in
-        # gemm_head.  Both halves are written out by hand so the fill and the
-        # read name the same depth-1 buffer.
-        wqb_slot = self.wqb_l1[buf].acquire()
+        # Filled through the uint8 face, read back through an fp8 reinterpret
+        # in gemm_head.  Both halves are written out by hand so the fill and
+        # the read name the same depth-1 buffer.
         mem_copy(
-            wqb_slot,
+            self.wqb_l1[buf].produce(),
             tile_view(wqb_gm, (p.base_n_q, p.k_l1_q), (head, kw)),
             engine=self.eng_nz,
             l2_cache_ctl=p.l2_q,
         )
-        self.wqb_l1[buf].commit(wqb_slot)
-        scale_slot = self.scale_wqb_l1.acquire()
         mem_copy(
-            scale_slot,
+            self.scale_wqb_l1.produce(),
             tile_view(descale_wqb_gm, (p.base_n_q, groups, MX_PAIR), (head, kw, 0)),
             engine=self.eng_scale_b,
             l2_cache_ctl=p.l2_q,
         )
-        self.scale_wqb_l1.commit(scale_slot)
 
     # Reduce the whole q_lora K of one head into one L0C slot.
     # init is true only on the first K block. The next weight window can be
@@ -1316,25 +1203,27 @@ class CubeQ:
                     wqb_gm, descale_wqb_gm, head, kw + 1, (kw + 1) % p.n_buf_wqb
                 )
             buf = kw % p.n_buf_wqb
-            wqb_ready = self.wqb_l1_fp8[buf].wait()
-            scale_ready = self.scale_wqb_l1.wait()
+            wqb_ready = reinterpret(
+                self.wqb_l1[buf].consume(), dtype=Float8E4M3FN
+            )
+            scale_ready = self.scale_wqb_l1.consume()
             for kk in range_constexpr(p.step_k_q):
                 k_l0 = kw * p.step_k_q + kk
                 mem_copy(
-                    self.l0a,
+                    self.l0a.produce(),
                     tile_view(qr_rows, (p.base_m, p.base_k_q), (0, k_l0)),
                     mx_scale=tile_view(
                         scale_rows, (p.base_m, p.scale_k_l0_len), (0, k_l0)
                     ),
                 )
                 mem_copy(
-                    self.l0b,
+                    self.l0b.produce(),
                     tile_view(wqb_ready, (p.base_n_q, p.base_k_q), (0, kk)),
                     mx_scale=tile_view(
                         scale_ready, (p.scale_k_l0_len, p.base_n_q), (kk, 0)
                     ),
                 )
-                # 0.6 matmul takes M from this operand view, not its last fill.
+                # matmul takes M from this operand view, not its last fill.
                 a_rows = local_slice(
                     self.l0a.consume(), (qr_rows.shape[0], p.base_k_q)
                 )
@@ -1343,14 +1232,12 @@ class CubeQ:
                     matmul(
                         l0c,
                         a_rows,
-                        self.l0b,
+                        self.l0b.consume(),
                         init=(k_l0 == 0),
                         unit_flag=3 if last_k else 2,
                     )
                 else:
-                    matmul(l0c, a_rows, self.l0b, init=(k_l0 == 0))
-            self.wqb_l1_fp8[buf].release(wqb_ready)
-            self.scale_wqb_l1.release(scale_ready)
+                    matmul(l0c, a_rows, self.l0b.consume(), init=(k_l0 == 0))
 
     # Hand the Q accumulator from L0C straight to the vector UB. No GM hop.
     # rows is the live output height. rows_l1 is the accumulator layout.
@@ -1407,7 +1294,7 @@ class CubeW:
         to whole tiles in GM.
 
         The height cannot be the channel's declared shape, because only the last
-        tile is short, and it cannot be inferred either: a manual acquire/wait
+        tile is short, and it cannot be inferred either: a manual produce/consume
         slot is a fresh root, so the fill's row count never reaches the read.
         (The ``qr`` staging is an implicit channel, where the layout pass does
         propagate it; see ``CubeQ.load_qr``.)  So it is passed in, and this is
@@ -1463,27 +1350,25 @@ class CubeW:
                 self._fill_window(
                     self.x_gm, self.ww_gm, tile, h_block, local_head * p.w_per_head + j + 1
                 )
-            x_ready = self.x_l1.wait()
-            ww_ready = self.ww_l1.wait()
+            x_ready = self.x_l1.consume()
+            ww_ready = self.ww_l1.consume()
             x_rows = self.x_rows(x_ready, rows_l1)
             for kk in range_constexpr(p.step_k_w):
-                mem_copy(self.l0a, tile_view(x_rows, (p.base_m, p.base_k_w), (0, kk)))
-                mem_copy(self.l0b, tile_view(ww_ready, (p.base_n_w, p.base_k_w), (0, kk)))
+                mem_copy(self.l0a.produce(), tile_view(x_rows, (p.base_m, p.base_k_w), (0, kk)))
+                mem_copy(self.l0b.produce(), tile_view(ww_ready, (p.base_n_w, p.base_k_w), (0, kk)))
                 a_rows = local_slice(self.l0a.consume(), (rows_l1, p.base_k_w))
                 first = kk == 0 and j == 0
                 if const_expr(PROBE == "no_runtime_init"):
-                    matmul(l0c_slot, a_rows, self.l0b, init=False)
+                    matmul(l0c_slot, a_rows, self.l0b.consume(), init=False)
                 elif const_expr(PROBE == "no_w_mmad"):
                     pass
                 else:
                     matmul(
                         l0c_slot,
                         a_rows,
-                        self.l0b,
+                        self.l0b.consume(),
                         init=(local_head == 0) if const_expr(first) else False,
                     )
-            self.x_l1.release(x_ready)
-            self.ww_l1.release(ww_ready)
 
     @jit
     def _fill_window(self, x_gm, ww_gm, tile, k_base, kw):
@@ -1494,22 +1379,18 @@ class CubeW:
         under ``w_k_split``.
         """
         p = self.p
-        x_slot = self.x_l1.acquire()
         mem_copy(
-            x_slot,
+            self.x_l1.produce(),
             tile_view(x_gm, (p.base_m, p.k_l1_w), (tile, k_base + kw)),
             engine=self.eng_nd2nz,
             l2_cache_ctl=L2_W,
         )
-        self.x_l1.commit(x_slot)
-        ww_slot = self.ww_l1.acquire()
         mem_copy(
-            ww_slot,
+            self.ww_l1.produce(),
             tile_view(ww_gm, (p.base_n_w, p.k_l1_w), (0, k_base + kw)),
             engine=self.eng_nz,
             l2_cache_ctl=L2_W,
         )
-        self.ww_l1.commit(ww_slot)
 
     @jit
     def fill(self, tile, local_head, h_block):
@@ -1525,22 +1406,20 @@ class CubeW:
         """Retire the oldest staged window pair into ``l0c_slot``."""
         p = self.p
         for j in range_constexpr(p.w_per_head):
-            x_ready = self.x_l1.wait()
-            ww_ready = self.ww_l1.wait()
+            x_ready = self.x_l1.consume()
+            ww_ready = self.ww_l1.consume()
             x_rows = self.x_rows(x_ready, rows_l1)
             for kk in range_constexpr(p.step_k_w):
-                mem_copy(self.l0a, tile_view(x_rows, (p.base_m, p.base_k_w), (0, kk)))
-                mem_copy(self.l0b, tile_view(ww_ready, (p.base_n_w, p.base_k_w), (0, kk)))
+                mem_copy(self.l0a.produce(), tile_view(x_rows, (p.base_m, p.base_k_w), (0, kk)))
+                mem_copy(self.l0b.produce(), tile_view(ww_ready, (p.base_n_w, p.base_k_w), (0, kk)))
                 a_rows = local_slice(self.l0a.consume(), (rows_l1, p.base_k_w))
                 first = kk == 0 and j == 0
                 matmul(
                     l0c_slot,
                     a_rows,
-                    self.l0b,
+                    self.l0b.consume(),
                     init=(local_head == 0) if const_expr(first) else False,
                 )
-            self.x_l1.release(x_ready)
-            self.ww_l1.release(ww_ready)
 
     # Finish this task's whole W reduction. Under split-K that is only
     # this core's K slice.
@@ -1552,40 +1431,35 @@ class CubeW:
         for kw in range_constexpr(p.k_l1_tiles_w):
             if const_expr(kw + 1 < p.k_l1_tiles_w):
                 self._fill_window(self.x_gm, self.ww_gm, tile, k_base, kw + 1)
-            x_ready = self.x_l1.wait()
-            ww_ready = self.ww_l1.wait()
+            x_ready = self.x_l1.consume()
+            ww_ready = self.ww_l1.consume()
             x_rows = self.x_rows(x_ready, rows_l1)
             for kk in range_constexpr(p.step_k_w):
-                mem_copy(self.l0a, tile_view(x_rows, (p.base_m, p.base_k_w), (0, kk)))
-                mem_copy(self.l0b, tile_view(ww_ready, (p.base_n_w, p.base_k_w), (0, kk)))
+                mem_copy(self.l0a.produce(), tile_view(x_rows, (p.base_m, p.base_k_w), (0, kk)))
+                mem_copy(self.l0b.produce(), tile_view(ww_ready, (p.base_n_w, p.base_k_w), (0, kk)))
                 a_rows = local_slice(self.l0a.consume(), (rows_l1, p.base_k_w))
                 first = kw == 0 and kk == 0
-                matmul(l0c_slot, a_rows, self.l0b, init=const_expr(first))
-            self.x_l1.release(x_ready)
-            self.ww_l1.release(ww_ready)
+                matmul(l0c_slot, a_rows, self.l0b.consume(), init=const_expr(first))
 
     @jit
-    def store(self, tile, l0c_slot, rows_l1):
+    def store(self, tile, rows_l1):
         """Whole-reduction store, straight into ``w``. Not used under w_workspace."""
         # softmax_scale folded into the fixpipe DEQSCALE register: the W path
         # never touches the vector unit.
         p = self.p
-        self.l0c.commit(l0c_slot)
-        ready = self.l0c.wait()
         mem_copy(
             tile_view(self.w_gm, (p.base_m, p.base_n_w), (tile, 0)),
-            self.c_rows(ready, rows_l1),
+            self.c_rows(self.l0c.consume(), rows_l1),
             engine=self.eng_fp,
-            deq_scale_val=self.softmax_scale,
+            deq_scale=self.softmax_scale,
             l2_cache_ctl=L2_W,
         )
-        self.l0c.release(ready)
 
     # Each K slice writes its W partial into a workspace region only it owns.
     # The store overwrites; it is not an atomic add, so the buffer does not
     # need to be zeroed. The vector unit sums the slices later.
     @jit
-    def store_partial(self, tile, h_block, n_tiles, l0c_slot, rows_l1):
+    def store_partial(self, tile, h_block, n_tiles, rows_l1):
         """Write this core's K-slice partial to the rows it alone owns.
 
         A plain store, not an atomic add: nothing else writes these rows, so
@@ -1600,18 +1474,15 @@ class CubeW:
         view is cut to the live rows of ``w``.
         """
         p = self.p
-        self.l0c.commit(l0c_slot)
-        ready = self.l0c.wait()
         mem_copy(
             tile_view(
                 self.workspace_gm, (p.base_m, p.base_n_w), (h_block * n_tiles + tile, 0)
             ),
-            self.c_rows(ready, rows_l1),
+            self.c_rows(self.l0c.consume(), rows_l1),
             engine=self.eng_fp,
-            deq_scale_val=self.softmax_scale,
+            deq_scale=self.softmax_scale,
             l2_cache_ctl=L2_W,
         )
-        self.l0c.release(ready)
 
 
 # ---------------------------------------------------------------------------
@@ -1636,7 +1507,7 @@ class VectorQ:
         # re-view it as (rows, groups) with an explicit packed stride.
         self.q_ub = Buffer(MemLoc.UB, (rows, p.d // 2), U8)
         self.dsc_ub = Buffer(MemLoc.UB, (p.enc_regs, VL), U8)
-        # 0.6.0 auto-buffer-sync orders MTE2 DMA against VF reads on Buffers.
+        # Auto-buffer-sync orders MTE2 DMA against VF reads on Buffers.
         self.amax_ub = Buffer(MemLoc.UB, (p.amax_len,), F32)
         self.off_ub = Buffer(MemLoc.UB, (p.amax_len,), I32)
         self.lut_ub = Buffer(MemLoc.UB, (LUT_LEN,), I32)
@@ -1916,7 +1787,7 @@ def _w_prefix(gm, work):
     rows_full = tile_view(gm.w, (p.base_m, p.n_heads), (tile, 0)).shape[0]
     rows_l1 = ceil_div(rows_full, NZ_M_FRAC) * NZ_M_FRAC
     if const_expr(not (PROBE == "no_w" and p.w_separate)):
-        w_slot = cube_w.l0c.acquire()
+        w_slot = cube_w.l0c.produce()
     else:
         w_slot = None
     if const_expr(p.w_separate) and const_expr(PROBE != "no_w"):
@@ -1926,9 +1797,9 @@ def _w_prefix(gm, work):
             w_k_base = 0
         cube_w.gemm_full(tile, w_k_base, w_slot, rows_l1)
         if const_expr(p.w_workspace):
-            cube_w.store_partial(tile, h_block, gm.n_tiles, w_slot, rows_l1)
+            cube_w.store_partial(tile, h_block, gm.n_tiles, rows_l1)
         else:
-            cube_w.store(tile, w_slot, rows_l1)
+            cube_w.store(tile, rows_l1)
         w_slot = None
         if const_expr(p.w_workspace and p.reduce_at == "early" and PROBE != "no_reduce"):
             if const_expr(PROBE != "no_sync"):
@@ -1976,13 +1847,11 @@ def _q_heads(gm, work, lut_ub, cos_ub, w_slot):
             tile_view(gm.descale_q, (p.base_m, p.groups), (tile, head)),
             rows,
         )
-    cube_q.release_qr(qr_ready, dqr_ready)
     _prefetch_qr(cube_q, gm.qr, gm.descale_qr, work, gm.n_work)
     if const_expr(PROBE != "no_w" and not p.w_separate):
-        cube_w.store(tile, w_slot, rows_l1)
+        cube_w.store(tile, rows_l1)
     elif const_expr(PROBE == "no_w" and not p.w_separate):
-        cube_w.l0c.commit(w_slot)
-        cube_w.l0c.release(cube_w.l0c.wait())
+        cube_w.l0c.consume()
 
 
 @jit
@@ -2004,7 +1873,7 @@ def _arm(p, direct, views, t_live):
     gm.cube_q = CubeQ(p)
     gm.cube_w = cube_w
     gm.vec = VectorQ(p)
-    gm.cv_ub = _DslChannel(
+    gm.cv_ub = Channel(
         MemLoc.UB, (p.rows_vec, p.d), F32, depth=D_CV, kind=ChannelKind.CrossCore,
     )
     gm.subblock = get_subblock_id()
@@ -2658,7 +2527,7 @@ def indexer_prologue_qw(*tensors, **options):
 
 
 
-@register("indexer_prologue_qw")
+@export("indexer_prologue_qw")
 def export_indexer_prologue_qw():
     """Package one artifact per template, not one artifact per T.
 

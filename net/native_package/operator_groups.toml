@@ -13,6 +13,8 @@
 mqsmla = ["mixed_quant_sparse_flash_mla.py", "mixed_quant_sparse_flash_mla_metadata.py"]
 qli = ["quant_lightning_indexer_dsl.py", "quant_lightning_indexer_metadata_dsl.py"]
 qsli = ["quant_sparse_lightning_indexer_dsl.py", "quant_sparse_lightning_indexer_metadata_dsl.py"]
+indexer_prologue_qw = ["indexer_prologue_qw.py", "indexer_prologue_qw_format.py"]
+indexer_prologue_k = ["indexer_prologue_k.py"]
 block_attn_res_update_rms_norm = ["block_attn_res_update_rms_norm.py"]
 flash_kda = ["flash_kda.py", "flash_kda_metadata.py", "_environment.py"]
 fused_recurrent_kda = ["fused_recurrent_kda_snapshot.py"]
@@ -22,7 +24,7 @@ commit_recurrent_kda_replayssm = ["commit_recurrent_kda_replayssm.py"]
 quant_mla_prolog = ["quant_mla_prolog.py"]
 
 [groups]
-ds41 = ["mqsmla", "qli", "qsli"]
+ds41 = ["mqsmla", "qli", "qsli", "indexer_prologue_qw", "indexer_prologue_k"]
 # The K3 network's operator set. FlashKDA's AICPU metadata ships as source and
 # is JIT-compiled at runtime, mirroring the arena packaging behavior.
 k3 = [

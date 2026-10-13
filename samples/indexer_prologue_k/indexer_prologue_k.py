@@ -24,6 +24,9 @@ from the tensors at runtime.  One compiled binary therefore serves every
 the per-launch core counts are runtime scalar arguments.
 """
 
+import json
+import os
+
 import torch
 
 from cannbotdsl import (
@@ -36,6 +39,7 @@ from cannbotdsl import (
     dtypes,
     get_platform_info,
 )
+from cannbotdsl.aot import export
 from cannbotdsl.buffer import Buffer
 from cannbotdsl.channel import Channel
 from cannbotdsl.lang.host import host
@@ -1206,3 +1210,58 @@ def indexer_prologue_k(
         vec_block_num,
     )
     return k_cache
+
+
+def clear_caches():
+    """Close cached executables."""
+    for cache in (_FUSED_AOT_CALLABLE_CACHE, _AOT_CALLABLE_CACHE):
+        for compiled in cache.values():
+            compiled.close()
+        cache.clear()
+
+
+_EXPORT_DEFAULTS = {
+    "head_dim": 5120,
+    "index_head_dim": 128,
+    "rope_head_dim": 64,
+    "storage_mode": 0,
+    "combined_block_size": -1,
+    "write_scale_cache": True,
+}
+
+
+@export("indexer_prologue_k")
+def export_indexer_prologue_k():
+    """Collect one binary per model shape and storage configuration.
+
+    T and the cache geometry are dynamic axes, so each profile is a single
+    binary.  The defaults cover H=5120 (deployment) and H=512 (tests), each
+    with mode 0 with/without a scale cache and mode 1 G=8.
+    ``CANNBOTDSL_DS41_PROFILES`` may replace them through its
+    ``indexer_prologue_k`` key; fields are those of ``_EXPORT_DEFAULTS``.
+    """
+    profiles = [
+        {"head_dim": head_dim, **storage}
+        for head_dim in (5120, 512)
+        for storage in (
+            {"storage_mode": 0, "write_scale_cache": True},
+            {"storage_mode": 0, "write_scale_cache": False},
+            {"storage_mode": 1, "combined_block_size": 8,
+             "write_scale_cache": False},
+        )
+    ]
+    profile_path = os.environ.get("CANNBOTDSL_DS41_PROFILES")
+    if profile_path:
+        with open(profile_path, encoding="utf-8") as stream:
+            profiles = json.load(stream).get("indexer_prologue_k", profiles)
+    clear_caches()
+    try:
+        for profile in profiles:
+            unknown = set(profile) - set(_EXPORT_DEFAULTS)
+            if unknown:
+                raise ValueError(
+                    f"Unknown export profile fields: {sorted(unknown)}"
+                )
+            _get_fused_pipeline_callable(**dict(_EXPORT_DEFAULTS, **profile))
+    finally:
+        clear_caches()

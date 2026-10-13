@@ -2,6 +2,10 @@
 
 ## 🔥 更新日志
 
+### 【2026-10-13】
+#### 特性增强 Feature Enhancement
+- 【indexer_prologue_qw / indexer_prologue_k】接入 `net/native_package` Native 打包：改用 `cannbotdsl.aot.export` 声明导出入口并登记到 `operator_groups.toml` 的 `ds41` 组，可通过 `./run-build.sh --operator indexer_prologue_qw indexer_prologue_k` 编译为 Native 算子包。`indexer_prologue_k` 新增默认导出 profile（H=5120/512 × mode0 带/不带 scale、mode1 G=8，共 6 个二进制），支持通过 `CANNBOTDSL_DS41_PROFILES` 的 `indexer_prologue_k` 键覆盖。同时移除 `indexer_prologue_qw` 的 `_CompatChannel` 及 `matmul`/`mem_copy` 包装层，直接使用 0.7 的 `Channel.produce()/consume()`，编译产物二进制逐字节不变。
+
 ### 【2026-10-08】
 #### 新特性 New Features
 - 【block_attn_res_update_rms_norm】迁入 Block Attention Residual Update 与 RMSNorm 融合算子：将本层增量 `delta` 加到当前残差块，结合 `pseudo_query` 分数与 online-softmax 累积结果合并，再沿隐藏维做 RMSNorm 并乘缩放权重 `gamma`；同步注册 profiling identity（`op_type=BlockAttnResUpdateRMSNorm`）。
