@@ -223,6 +223,7 @@ def test_ds41_selection():
         "indexer_prologue_qw",
         "indexer_prologue_k",
         "engram_gate",
+        "attn_epilogue",
     } <= set(operators)
     assert groups["ds41"] == [
         "mqsmla",
@@ -231,6 +232,7 @@ def test_ds41_selection():
         "indexer_prologue_qw",
         "indexer_prologue_k",
         "engram_gate",
+        "attn_epilogue",
     ]
     assert builder.choose_operators(
         builder.parse_args(["--group", "ds41"]), operators, groups
@@ -276,6 +278,53 @@ def test_indexer_export_profiles(operator, monkeypatch):
             assert config[9] in ((64, 128) if layout == "PA_BBND" else (256,))
         else:
             assert config[10] in ((64, 128) if layout == "PA_BBND" else (0,))
+
+
+def test_attn_epilogue_export_profiles(monkeypatch, tmp_path):
+    """Check the token/quota catalogue without compiling device kernels."""
+    from types import SimpleNamespace
+
+    operators, _ = builder.load_catalog()
+    source = builder.source_index()[operators["attn_epilogue"][0]]
+    tree = ast.parse(source.read_text())
+    collector = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "export_attn_epilogue"
+    )
+    collector.decorator_list = []
+    calls = []
+    namespace = {
+        "os": os,
+        "common": SimpleNamespace(
+            NG=8, F=4096, O_LORA=1024, DIM=5120, ProjectionShape=lambda *args: args
+        ),
+        "_compiled": lambda shape, m_pad, *, device, block_num: (
+            calls.append((block_num, shape[0], m_pad))
+            or SimpleNamespace(close=lambda: None)
+        ),
+        "_COMPILED": {},
+    }
+    monkeypatch.delenv("CANNBOTDSL_DS41_PROFILES", raising=False)
+    exec(
+        compile(ast.Module(body=[collector], type_ignores=[]), str(source), "exec"),
+        namespace,
+    )
+    export_fn = namespace.get("export_attn_epilogue")
+    assert export_fn is not None
+    export_fn()
+    assert len(calls) == 18
+    assert sorted({quota for quota, _, _ in calls}) == [28, 32]
+    assert {t for _, t, _ in calls} == {1, 72, 128, 256, 512, 1024, 2048, 4096, 8192}
+    for _, t, m_pad in calls:
+        assert m_pad == (t + 15) // 16 * 16
+
+    calls.clear()
+    profiles = tmp_path / "profiles.json"
+    profiles.write_text('{"attn_epilogue": [{"block_num": 32, "tokens": [72, 1000]}]}')
+    monkeypatch.setenv("CANNBOTDSL_DS41_PROFILES", str(profiles))
+    export_fn()
+    assert calls == [(32, 72, 80), (32, 1000, 1008)]
 
 
 def _extract_export_collector(operator):

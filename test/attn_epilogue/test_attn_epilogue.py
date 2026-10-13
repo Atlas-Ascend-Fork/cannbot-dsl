@@ -326,6 +326,8 @@ def check_intermediate_quantization(rotated, quantized, activation, intermediate
         (129, 0, 1.0),
         (193, 0, 1.0),
         (255, 0, 1.0),
+        (257, 16, 1.0),
+        (1000, 0, 1.0),
         (72, 0, 0.0),
         (256, 0, 1e-37),
     ],
@@ -394,7 +396,7 @@ def test_public_signature():
 
 
 @pytest.mark.npu
-@pytest.mark.parametrize("t", [1, 72, 256])
+@pytest.mark.parametrize("t", [1, 72, 256, 512, 1024])
 def test_public_tp1(weights, t):
     wa, wb, quantized = weights
     waq, sa, wbq, sb = quantized
@@ -542,8 +544,8 @@ def benchmark():
     parser.add_argument("--tokens", type=int, default=72)
     args = parser.parse_args()
     t = args.tokens
-    if not 1 <= t <= 256:
-        parser.error("--tokens must be in [1, 256]")
+    if t < 1:
+        parser.error("--tokens must be positive")
     call, expected, o = benchmark_inputs(t, args.mode)
     check_benchmark_replays(call, expected)
     device, cube, vector = tp1.core_budget(o)

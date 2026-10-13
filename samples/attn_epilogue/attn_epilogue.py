@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 
-"""TP1 inverse RoPE and two-stage MXFP8 projection. ND weights/scales; T=1..256."""
+"""TP1 inverse RoPE and two-stage MXFP8 projection. ND weights/scales; arbitrary T >= 1."""
 
 from functools import lru_cache
 
@@ -14,6 +14,7 @@ import cannbotdsl
 from cannbotdsl import dtypes
 import torch
 
+from cannbotdsl.aot import export
 from cannbotdsl.lang.host import host
 from cannbotdsl.lang.jit import jit
 from cannbotdsl.lang.control_flow import range as dsl_range
@@ -455,8 +456,8 @@ def _attn_epilogue_out(
     if len(out.shape) != 2:
         raise ValueError("out must be a matrix")
     m_pad = int(out.shape[0]) if m_pad is None else int(m_pad)
-    if not 1 <= t <= 256:
-        raise ValueError("TP=1 supports T in [1, 256]")
+    if t < 1:
+        raise ValueError("T must be positive")
     if m_pad < t or m_pad % 16:
         raise ValueError("m_pad must cover T and be a multiple of 16")
     common.validate_inputs(
@@ -497,8 +498,8 @@ def attn_epilogue(o, woa, wob, descale_woa, descale_wob, rope_sin, rope_cos):
         common.RopeInputs(o, rope_cos, rope_sin),
         common.ProjectionWeights(woa, descale_woa, wob, descale_wob),
     )
-    if not 1 <= t <= 256:
-        raise ValueError("TP1 supports T in [1, 256]")
+    if t < 1:
+        raise ValueError("T must be positive")
     with torch.npu.device(o.device):
         scratch = common.get_scratch(
             o.device, t, torch.npu.is_current_stream_capturing()
@@ -519,3 +520,51 @@ def attn_epilogue(o, woa, wob, descale_woa, descale_wob, rope_sin, rope_cos):
             out,
         )
         return out[:t]
+
+
+@export("attn_epilogue")
+def export_attn_epilogue():
+    """Compile the default single-card profiles without NPU execution.
+
+    ``T`` enters the compiled program (tiling candidates, operand shapes), so
+    the catalogue enumerates representative token counts for both supported
+    MIX launch quotas. ``CANNBOTDSL_DS41_PROFILES`` may override the list with
+    an ``attn_epilogue`` array of ``{"block_num": int, "tokens": [int, ...]}``
+    entries.
+    """
+    import json
+    import os
+
+    default_tokens = (1, 72, 128, 256, 512, 1024, 2048, 4096, 8192)
+    profiles = [(quota, t) for quota in (28, 32) for t in default_tokens]
+    profile_path = os.environ.get("CANNBOTDSL_DS41_PROFILES")
+    if profile_path:
+        with open(profile_path, encoding="utf-8") as stream:
+            entries = json.load(stream).get("attn_epilogue")
+        if entries is None:
+            raise ValueError(
+                "CANNBOTDSL_DS41_PROFILES must define an 'attn_epilogue' list"
+            )
+        profiles = [
+            (int(entry.get("block_num", 32)), int(t))
+            for entry in entries
+            for t in entry.get("tokens", default_tokens)
+        ]
+    handles = []
+    try:
+        for block_num, t in dict.fromkeys(profiles):
+            shape = common.ProjectionShape(
+                t, common.NG, common.F, common.O_LORA, common.DIM
+            )
+            handles.append(
+                _compiled(
+                    shape,
+                    (t + 15) // 16 * 16,
+                    device=0,
+                    block_num=block_num,
+                )
+            )
+    finally:
+        for handle in handles:
+            handle.close()
+        _COMPILED.clear()

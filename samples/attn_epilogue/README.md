@@ -42,7 +42,7 @@ o_proj = attn_epilogue(
 )
 ```
 
-此接口在输入所在设备上执行完整投影，支持 `T=1..256`，返回 BF16 `[T,5120]`。
+此接口在输入所在设备上执行完整投影，支持任意 `T >= 1`（受设备内存限制），返回 BF16 `[T,5120]`。
 
 ### 参数说明
 
@@ -65,7 +65,7 @@ E8M0 scale 的最后两维将每 32 个元素对应的 scale 打包为 `[K/64, 2
 
 ### 使用约束
 
-- 支持 `T=1..256`，权重及 scale 须为连续 ND 布局，不支持 NZ 输入。
+- 支持任意 `T >= 1`（受设备内存限制），权重及 scale 须为连续 ND 布局，不支持 NZ 输入。
 - 返回结果拥有独立的输出存储。普通执行时，内部工作区按设备、当前 stream 和 T 缓存复用；
   跨 stream 的输入输出依赖由网络建立。
 - 图捕获前先预热相同规格。图内工作区使用图内存池，与普通执行和其他图隔离。
@@ -163,11 +163,13 @@ ASCEND_RT_VISIBLE_DEVICES=0 OMP_NUM_THREADS=4 python3 -m pytest -q test/attn_epi
 | 验证项 | 覆盖范围 | 结果 |
 | :--- | :--- | :--- |
 | 最终输出与小算子参考对比 | `T=1,72,128,256` | BF16 逐位一致，最大绝对误差 0，差异位模式数 0 |
+| 扩展 T 范围（超过 256） | `T=257,512,1000,1024,2048,4096,8192` | 每例 10 次预热 + 16 次图捕获调用 + 6 次重放，输出均与参考逐位一致 |
 | 同输入普通执行 | 每个 T 检查 2 次，共 8 次 | 输出逐位一致 |
 | 同输入图重放 | 每个 T 检查 4 次，共 16 次 | 输出逐位一致 |
 | 交替输入图重放 | 每个 T 检查 4 次，共 16 次 | 均与各自参考逐位一致，无前次输入残留 |
 
-以上是已测用例的结果，不表示穷举了 `T=1..256` 或所有输入值。
+以上是已测用例的结果，不表示穷举了所有 `T` 或所有输入值；扩展 T 的验证使用
+`python test/attn_epilogue/test_attn_epilogue.py --tokens <T>`，口径与上表一致。
 
 ## 性能验证
 
@@ -208,3 +210,31 @@ ASCEND_RT_VISIBLE_DEVICES=0 OMP_NUM_THREADS=4 msprof --ai-core=off --l2=off --ta
 
 上面的仓内命令采集 96 次融合 kernel，而上述对比每例采集 32 次；
 仓内命令不包含小算子基线，不能仅凭该命令复现对比表的基线列。
+
+## 安装包调用
+
+源码示例与测试直接加载本仓库 sample。需要部署安装包时，使用共享
+[Native 构建工程](../../net/native_package/README.md)，注册名为 `attn_epilogue`，所属组为
+`ds41`：
+
+```bash
+export PYTHON=/path/to/python3.12
+export CANN_ENV=/path/to/Ascend/cann/set_env.sh
+source "$CANN_ENV"
+export CANNBOTDSL_WHEEL=/path/to/cannbotdsl-0.7.0-cp312-cp312-manylinux_2_28_x86_64.whl
+bash net/native_package/run-build.sh --operator attn_epilogue
+"$PYTHON" -m pip install --no-deps --force-reinstall \
+  net/native_package/output/operators/attn_epilogue/wheels/*.whl
+```
+
+`T` 参与编译（tiling 与算子形状随 `T` 变化），默认按 28/32 核配额导出
+`T=1,72,128,256,512,1024,2048,4096,8192` 共 18 个配置；未被枚举的 `T` 会回退 JIT。
+可通过 `CANNBOTDSL_DS41_PROFILES` 的 `attn_epilogue` 键覆盖默认集合：
+
+```json
+{"attn_epilogue": [{"block_num": 32, "tokens": [72, 256, 1024]}]}
+```
+
+安装后可设置 `CANNBOTDSL_NATIVE_BINARY_MODE=require` 验证二进制覆盖是否完整，
+未命中时立即报错；`CANNBOTDSL_NATIVE_BINARY_REPORT=/path/to/native-report.json`
+可保存命中记录。

@@ -66,11 +66,11 @@ native_package/
 
 构建脚本将 DSL wheel 安装到隔离目录，wheel 内容变化时使用新缓存。生成的算子 wheel 依赖 `cannbotdsl>=0.7.0,<0.8`，导入 `ops` 时通过 `cannbotdsl.aot.register_directory` 注册 Native 资源。
 
-本工程打包 DS41 的 `mqsmla`、`qli` 和 `qsli`，同时携带三个 metadata 模块。AICore 通过 `cannbotdsl.aot` 导出；AICPU metadata 在各自独立的编译目录生成，随 wheel 安装到 `ops/_aicpu/`，运行时优先加载这些预编译文件。源码直接运行时仍保留原有的 metadata 编译路径。
+本工程打包 DS41 的 `mqsmla`、`qli`、`qsli` 和 `attn_epilogue`，其中前三个同时携带 metadata 模块。AICore 通过 `cannbotdsl.aot` 导出；AICPU metadata 在各自独立的编译目录生成，随 wheel 安装到 `ops/_aicpu/`，运行时优先加载这些预编译文件。源码直接运行时仍保留原有的 metadata 编译路径。
 
-默认导出 MQSMLA 的 36 个配置、QLI 和 QSLI 各 18 个配置。QLI 使用 N=32、每块 6 行 query、TopK=512，可启用 2048 个候选块；QSLI 使用 2048 个候选块、TopK=512。两者覆盖 PA_BBND/TND、mask_mode=0/3、因果压缩比 1/2；PA 页大小为 64/128。QLI 覆盖候选开启/关闭，QSLI 覆盖输出偏移有/无。B、T1 和 K 序列长度为动态轴；默认 profile 的序列长度输入均存在。
+默认导出 MQSMLA 的 36 个配置、QLI 和 QSLI 各 18 个配置。QLI 使用 N=32、每块 6 行 query、TopK=512，可启用 2048 个候选块；QSLI 使用 2048 个候选块、TopK=512。两者覆盖 PA_BBND/TND、mask_mode=0/3、因果压缩比 1/2；PA 页大小为 64/128。QLI 覆盖候选开启/关闭，QSLI 覆盖输出偏移有/无。B、T1 和 K 序列长度为动态轴；默认 profile 的序列长度输入均存在。`attn_epilogue` 的 `T` 参与编译，默认导出 28/32 核 × `T=1,72,128,256,512,1024,2048,4096,8192` 共 18 个配置。
 
-其他静态配置可通过 `CANNBOTDSL_DS41_PROFILES=/path/to/profiles.json` 指定，JSON 的 `qli`、`qsli` 键各对应配置字典列表，字段见相应 `export_qli`、`export_qsli`。只列出的配置会被替换，未列出的算子保留默认配置。全量包指全部登记算子及其默认导出配置，不表示任意静态参数组合均有二进制。
+其他静态配置可通过 `CANNBOTDSL_DS41_PROFILES=/path/to/profiles.json` 指定，JSON 的 `qli`、`qsli` 键各对应配置字典列表，字段见相应 `export_qli`、`export_qsli`；`attn_epilogue` 键为 `{"block_num": int, "tokens": [int, ...]}` 列表，字段见 `export_attn_epilogue`。只列出的配置会被替换，未列出的算子保留默认配置。全量包指全部登记算子及其默认导出配置，不表示任意静态参数组合均有二进制。
 
 安装后可设置 `CANNBOTDSL_NATIVE_BINARY_MODE=require` 验证二进制覆盖，未命中时立即报错，不回退 JIT。设置 `CANNBOTDSL_NATIVE_BINARY_REPORT=/path/to/native-report.json` 可保存命中记录。
 
