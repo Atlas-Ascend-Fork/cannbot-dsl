@@ -252,11 +252,9 @@ def _check_supported_features(
     """Check limits imposed by the currently implemented feature set."""
     layout_q = _normalize_layout(layout_q, SUPPORTED_Q_LAYOUTS, "layout_q")
     layout_kv = _normalize_layout(layout_kv, SUPPORTED_KV_LAYOUTS, "layout_kv")
-    layout_out = "BSND" if layout_out is None else _normalize_layout(
+    layout_out = "NTD" if layout_out is None else _normalize_layout(
         layout_out, ("NTD",), "layout_out"
     )
-    if layout_out != "NTD":
-        raise ValueError("Layout_out must be NTD")
     if mask_mode not in SUPPORTED_MASK_MODES:
         raise ValueError(
             f"Mask_mode must be {NO_MASK_MODE} or {CAUSAL_MASK_MODE}; "
@@ -342,6 +340,7 @@ def check_flash_mla_inputs(
     return_softmax_lse,
 ):
     """Validate inputs by category and derive host launch metadata."""
+    layout_q = "TND" if layout_q is None else layout_q
     _check_required_inputs(
         metadata=metadata,
         block_table=block_table,

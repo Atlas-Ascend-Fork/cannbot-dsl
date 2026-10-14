@@ -1659,16 +1659,21 @@ class SplitKvReducer:
         partial_output_tile = self.partial_output_handoff.consume()
         with vf(mode="simd"):
             full_lane_mask, _ = rr.update_mask(VL_T, elem_bits=32)
-            for row in range(active_rows):
-                weight_offset = split_idx * FD_WINDOW_ROWS + row
-                split_weight = rr.vload_brc(self.split_weight_buffer, weight_offset)
-                for col in tuple(range(0, TILE_D, VL_T)):
-                    value = rr.vload(partial_output_tile, (row + window_row_offset) * TILE_D + col)
-                    result = rr.vmul(value, split_weight, mask=full_lane_mask)
-                    if split_idx > 0:
+            if split_idx > 0:
+                for row in range(active_rows):
+                    split_weight = rr.vload_brc(self.split_weight_buffer, split_idx * FD_WINDOW_ROWS + row)
+                    for col in tuple(range(0, TILE_D, VL_T)):
+                        value = rr.vload(partial_output_tile, (row + window_row_offset) * TILE_D + col)
                         old = rr.vload(self.output_accumulator, row * TILE_D + col)
                         result = rr.vmadd(value, split_weight, old, mask=full_lane_mask)
-                    rr.vstore(self.output_accumulator, row * TILE_D + col, result, full_lane_mask)
+                        rr.vstore(self.output_accumulator, row * TILE_D + col, result, full_lane_mask)
+            else:
+                for row in range(active_rows):
+                    split_weight = rr.vload_brc(self.split_weight_buffer, split_idx * FD_WINDOW_ROWS + row)
+                    for col in tuple(range(0, TILE_D, VL_T)):
+                        value = rr.vload(partial_output_tile, (row + window_row_offset) * TILE_D + col)
+                        result = rr.vmul(value, split_weight, mask=full_lane_mask)
+                        rr.vstore(self.output_accumulator, row * TILE_D + col, result, full_lane_mask)
             rr.vmem_bar("vst_vld")
 
     def cast_combined_output_aligned(self):
@@ -3160,9 +3165,9 @@ def flash_mla_with_kvcache(
     mask_mode=0,
     max_seqlen_q=-1,
     max_seqlen_kv=-1,
-    layout_q="BSND",
+    layout_q="TND",
     layout_kv="PA_BBND",
-    layout_out="BSND",
+    layout_out="NTD",
     return_softmax_lse=False,
 ):
     """Launch Flash MLA with direct Q/O/LSE storage and no fold GM buffers."""
@@ -3213,6 +3218,7 @@ def flash_mla_with_kvcache(
             )
             softmax_lse = lse_storage.transpose(0, 1)
         elif layout_q == "BSND":
+            seqlen_q = q.shape[1]  # BSND 的 q 为 [B, S, N, D]
             lse_storage = torch.empty(
                 (batch_size, seqlen_q, num_heads_q),
                 dtype=torch.float32,

@@ -137,9 +137,9 @@ flash_mla_with_kvcache(
     mask_mode=0,
     max_seqlen_q=-1,
     max_seqlen_kv=-1,
-    layout_q="BSND",
+    layout_q="TND",
     layout_kv="PA_BBND",
-    layout_out="BSND",
+    layout_out="NTD",
     return_softmax_lse=False,
 )
 ```
@@ -169,7 +169,7 @@ flash_mla_with_kvcache(
 - `attention_out`：shape 为 `[N, T, 512]`，dtype 与 Q 一致。
 - `softmax_lse`：启用时 shape 为 `[N, T]`、dtype 为 `float32`；关闭时返回空的 `float32` Tensor。
 
-注意：虽然函数签名保留了 `BSND` 默认值，当前 checker 开放的主算子组合为 `layout_q="TND"` 和 `layout_out="NTD"`，调用时应显式传入。
+注意：默认值即 checker 当前开放的主算子组合（`layout_q="TND"`、`layout_out="NTD"`）；传入 `BSND` 等其他布局仍会被 checker 拦截。
 
 ## 性能对比
 
