@@ -1,0 +1,108 @@
+---
+title: atomic_sub
+api_name: atomic_sub
+category: atomic
+api_group: kernel
+layer: scalar
+call_context: device
+execution_unit: scalar
+status: experimental
+since: 待追溯
+---
+
+# `atomic_sub`
+
+## 产品支持情况
+
+- Ascend 950PR/Ascend 950DT：支持
+- Atlas A3 训练系列产品/Atlas A3 推理系列产品：不支持
+- Atlas A2 训练系列产品/Atlas A2 推理系列产品：不支持
+- Atlas 200I/500 A2 推理产品：不支持
+- Atlas 推理系列产品 AI Core：不支持
+- Atlas 推理系列产品 Vector Core：不支持
+- Atlas 训练系列产品：不支持
+
+## 功能说明
+
+对Global Memory中`ptr`指向的单个元素执行原子减操作：读取该地址中的旧值`old_value`，计算`old_value`与输入标量值`value`的差，将结果`new_value`写回该地址，并返回`old_value`。整个读取、计算和写回过程为原子操作。
+
+计算公式如下：
+
+$$
+new\_value = old\_value - value
+$$
+
+## 函数原型
+
+```python
+def atomic_sub(ptr, value) -> ScalarValue: ...
+```
+
+**支持的数据类型：**
+
+`dtypes.int32`、`dtypes.uint32`、`dtypes.float32`、`dtypes.int64`、`dtypes.uint64`。
+
+## 参数说明
+
+**表** 参数说明
+
+| 参数名 | 输入/输出 | 描述 |
+| --- | --- | --- |
+| `ptr` | 输入/输出 | Global Memory的地址。 |
+| `value` | 输入 | 标量值，数据类型与`ptr`指向元素类型一致。 |
+
+## 返回值说明
+
+返回`ptr`地址中计算前的原始数据`old_value`。
+
+## 约束说明
+
+- `ptr`必须落在Global Memory地址空间。
+- `ptr`需按`sizeof(dtype)`字节对齐。
+- 对同一`ptr`的并发调用以原子方式完成“读取、计算、写回”，不会丢失更新。`dtype`为`dtypes.float32`时，最终结果可能因执行顺序不同而存在差异；如需确定性计算结果，需要通过同步指令控制执行顺序。
+- 本接口运行在标量流水（`PIPE_S`）上，同一标量流水内的数据依赖由指令执行顺序保证。若本接口与`PIPE_MTE2`或`PIPE_MTE3`上的数据搬运指令访问同一GM地址，且执行顺序影响结果，编译器无法自动完成跨流水同步，调用方需按实际依赖插入`vec_sync_pipe`，或配合使用`vec_sync_notify`与`vec_sync_wait`保证执行顺序。
+- 本接口访问GM时绕过DCache，不维护缓存一致性。若其他核或其他通路通过缓存访问同一GM地址，调用方需使用[`dcci_single`](/zh/api/kernel/synchronization-cache/dcci-single)清理或失效对应Cache Line，并保证相关访存操作的执行顺序和数据可见性。
+
+## 调用示例
+
+将代码保存为`atomic_sub.py`后，可通过`python`命令运行。
+
+以下调用示例代码仅Ascend 950PR&950DT系列产品支持。
+
+```python
+# Copyright (c) 2026 Huawei Technologies Co., Ltd.
+# Licensed under the CANN Open Software License Agreement Version 2.0.
+
+import torch
+import torch_npu  # noqa: F401  # Register the Ascend NPU backend with PyTorch.
+
+from cannbotdsl import dtypes, host
+from cannbotdsl.lang.kernel import kernel
+from cannbotdsl.ops.scalar import atomic_sub
+
+@kernel
+def _atomic_sub_kernel(acc):
+    # 4 个 block 各自把 acc[0] 原子减 1：10 - 4 = 6
+    atomic_sub(acc.ptr(0), dtypes.int32(1))
+
+@host
+def run(acc):
+    _atomic_sub_kernel[4](acc)
+
+def main():
+    acc = torch.full((1,), 10, dtype=torch.int32, device="npu:0")
+    run(acc)
+    torch.npu.synchronize()
+
+    assert acc.cpu().tolist() == [6], acc.cpu().tolist()
+    print(f"atomic_sub example passed, acc={acc.cpu().tolist()}")
+
+if __name__ == "__main__":
+    main()
+```
+
+### 预期结果
+
+```text
+atomic_sub example passed, acc=[6]
+```

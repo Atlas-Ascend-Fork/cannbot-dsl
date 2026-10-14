@@ -13,7 +13,7 @@ export default {
 
     return h(DefaultTheme.Layout, null, {
       'doc-before': () => {
-        if (!page.value.relativePath.startsWith('api/')) return null
+        if (!page.value.relativePath.startsWith('zh/api/')) return null
         return h('p', { class: 'preview-notice' }, PREVIEW_NOTICE)
       },
     })

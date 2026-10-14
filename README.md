@@ -247,7 +247,7 @@ python3 -m pytest test/sparse_flash_attention/test_sparse_flash_attention.py -v
 
 ## 📂 目录结构
 
-关键目录如下，详细目录参见[仓库结构](docs/guide/repository.md)。
+关键目录如下，详细目录参见[仓库结构](docs/zh/guide/project/repository.md)。
 
 ```bash
 cannbot-dsl/
@@ -266,7 +266,7 @@ cannbot-dsl/
 ## 📝 相关信息
 
 - [更新日志](CHANGELOG.md)
-- [参与贡献](docs/community/contributing.md)
+- [参与贡献](docs/zh/project/community/contributing.md)
 - [许可证](LICENSE)：CANN Open Software License Agreement Version 2.0
 
 ---

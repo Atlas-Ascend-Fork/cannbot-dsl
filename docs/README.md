@@ -1,6 +1,20 @@
 # CANNBot-DSL 文档站
 
-这是 `cannbot-dsl.gitcode.com` 的文档站源码。当前阶段包含站点框架、项目级内容、编程模型和首批 API 文档，其余 API 将在核对实现后逐步补充。
+这是 `cannbot-dsl` 的 VitePress 文档站源码。文档内容按语言和用途组织：
+
+```text
+docs/
+├── zh/                 # 中文文档
+│   ├── api/            # API 参考，索引文件只保留一级标题
+│   ├── guide/          # 开发指南与编程模型
+│   ├── install/        # 安装、构建与预览
+│   ├── project/        # 项目资料、样例和贡献指南
+│   ├── CONTRIBUTION_DOC.md
+│   └── README.md
+├── en/                 # 英文文档（API 与 Guide 待人工翻译）
+├── .vitepress/         # 站点配置与主题
+└── public/             # 静态资源
+```
 
 ## 本地开发
 
@@ -10,8 +24,6 @@ npm install
 npm run dev
 ```
 
-开发服务器监听 `127.0.0.1:5173`。
-
 ## 构建与预览
 
 ```bash
@@ -19,19 +31,4 @@ npm run build
 npm run preview
 ```
 
-生产预览监听 `127.0.0.1:4174`，构建产物位于 `.vitepress/dist/`。
-
-## 目录
-
-```text
-docs/
-├── .vitepress/       # 站点配置与主题
-├── public/           # 静态资源
-├── getting-started/  # 开始使用
-├── guide/            # 项目指南
-├── programming-model/ # 编程模型（总览、22 节正文和附录）
-├── examples/         # 样例导航
-├── api/              # 公共 API 文档
-├── community/        # 参与贡献
-└── about/            # 版本与发布信息
-```
+构建产物位于 `.vitepress/dist/`。开发预览默认使用 `DOCS_VERSION=next`；构建商用版本时同时设置 `DOCS_BASE=/vX.Y.Z/ DOCS_VERSION=vX.Y.Z`。
