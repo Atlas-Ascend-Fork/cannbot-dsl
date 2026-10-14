@@ -77,6 +77,22 @@ flash_kda:
   options:
     - flash_kda
 
+flash_kda_cp_preprocess:
+  module: True
+  src:
+    - samples/flash_kda_cp_preprocess
+    - test/flash_kda_cp_preprocess
+  options:
+    - flash_kda_cp_preprocess
+
+flash_kda_cp_main:
+  module: True
+  src:
+    - samples/flash_kda_cp_main
+    - test/flash_kda_cp_main
+  options:
+    - flash_kda_cp_main
+
 block_attn_res_update_rms_norm:
   module: True
   src:

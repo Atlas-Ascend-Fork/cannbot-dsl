@@ -15,6 +15,8 @@ operators:
   - flash_mla_with_kvcache
   - attn_prologue
   - flash_kda
+  - flash_kda_cp_preprocess
+  - flash_kda_cp_main
   - matmul
   - matmul/batch_matmul
   - pointnet_sa
