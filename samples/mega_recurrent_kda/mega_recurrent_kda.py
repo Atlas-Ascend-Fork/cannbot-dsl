@@ -4686,7 +4686,7 @@ _GRAPH_LIBRARY.define(
     "Tensor dt_bias, "
     "float scale, "
     "float lower_bound, "
-    "float rms_norm_eps"
+    "float rms_norm_eps=1e-5"
     ") -> Tensor"
 )
 
@@ -4712,7 +4712,7 @@ def _mega_recurrent_kda_meta(
     dt_bias,
     scale,
     lower_bound,
-    rms_norm_eps,
+    rms_norm_eps=1e-5,
 ):
     del qkv_projection_weight, decay_projection_a_weight
     del decay_projection_b_weight, beta_projection_weight
@@ -4745,7 +4745,7 @@ def _mega_recurrent_kda_privateuse1(
     dt_bias,
     scale,
     lower_bound,
-    rms_norm_eps,
+    rms_norm_eps=1e-5,
 ):
     return mega_recurrent_kda(
         hidden_states,
