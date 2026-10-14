@@ -1,162 +1,30 @@
-# flash_kda
+# FlashKDA
 
-## 产品支持情况
-
-- Ascend 950：支持。
+基于 CANNBot-DSL 的 Kimi Delta Attention prefill 融合算子，面向 Ascend 950。实现位于 [`flash_kda.py`](flash_kda.py)，配套的 AICPU 调度实现在同目录的 [`flash_kda_metadata.py`](flash_kda_metadata.py)。先生成可复用的 metadata，再由 FlashKDA 消费它并计算序列输出和最终状态。
 
 ## 功能说明
 
-`flash_kda` 基于 CANNBot-DSL 实现 Kimi Delta Attention 的 prefill 前向计算，返回序列输出和最终递归状态。实现位于 [`flash_kda.py`](flash_kda.py)。
-
-调用时先生成调度 metadata，再执行计算：
-
-1. [`flash_kda_metadata`](flash_kda_metadata.py)：根据输入形状、布局和有效序列长度生成调度信息。
-2. `flash_kda`：消费 metadata，启动 AICore 算子。KDA 计算逻辑以 group chunk 为粒度分阶段循环计算。
-
-### 计算过程
-
-先对输入进行归一化与门控激活：
+算子融合原始 gate 和 beta 的激活、Q/K 行级 L2 normalize，以及完整的 Chunk KDA 计算。令 $\gamma_t=\exp(\sum_{i\le t}g_i)$，每个 64-token chunk 内计算
 
 $$
-Q=\operatorname{L2Norm}(Q_{\mathrm{raw}}),\qquad
-K=\operatorname{L2Norm}(K_{\mathrm{raw}}),
+\tilde K=\gamma\odot K,\quad \bar K=\gamma^{-1}\odot K,\quad
+\tilde Q=\operatorname{scale}\cdot(\gamma\odot Q),
 $$
 
 $$
-g=\mathrm{lower\_bound}\cdot
-\operatorname{sigmoid}\left(\exp(\mathrm{A\_log})\cdot(g_{\mathrm{raw}}+\mathrm{dt\_bias})\right),
-\qquad
-\beta=\operatorname{sigmoid}(\beta_{\mathrm{raw}}).
+T=\operatorname{stril}\!\left(\operatorname{diag}(\beta)\tilde K\bar K^\top\right),\quad
+A^{-1}=(I+T)^{-1},\quad
+U=A^{-1}\operatorname{diag}(\beta)V,\quad
+W=A^{-1}\operatorname{diag}(\beta)\tilde K.
 $$
 
-下标 raw 表示接口传入的原始张量。`L2Norm` 沿最后一维归一化，epsilon 为 `1e-6`；后续公式中的 $Q$、$K$、$g$、$\beta$ 均为上述处理后的结果。
+以 $S_0=$ `initial_state`，chunk 间递推状态并生成输出。输入序列不必按 64 对齐，尾块由内核处理。
 
-令 $\gamma_t=\exp(\sum_{i\le t}g_i)$，并定义：
+`flash_kda_metadata(q, v, initial_state, layout_qkv, cu_seqlens=None)` 根据形状、布局、有效长度和当前 stream 的设备核数生成一维 int32 调度张量。它不读取 Q/V/state 的数值，也不计算 attention 输出。调度配置相同时，可在层间复用 metadata；`flash_kda` 只消费该张量，不启动 AICPU。
 
-$$
-\tilde K=\gamma\odot K,\qquad
-\bar K=\gamma^{-1}\odot K,\qquad
-\tilde Q=\operatorname{scale}\cdot(\gamma\odot Q).
-$$
+## 快速开始
 
-序列按 $C=64$ 切分。每个 chunk 内先计算严格下三角矩阵及其逆：
-
-$$
-T=\operatorname{stril}\!\left(\operatorname{diag}(\beta)\tilde K\bar K^{\top}\right),
-\qquad A^{-1}=(I+T)^{-1},
-$$
-
-$$
-U=A^{-1}\operatorname{diag}(\beta)V,
-\qquad W=A^{-1}\operatorname{diag}(\beta)\tilde K,
-\qquad M_{qk}=\operatorname{tril}\!\left(\tilde Q\bar K^{\top}\right).
-$$
-
-以 $S_0=$ `initial_state`，第 $c$ 个 chunk 的状态和输出为：
-
-$$
-S_c=\operatorname{diag}(\gamma_C)S_{c-1}+(K_c^r)^{\top}(U-WS_{c-1}),
-$$
-
-$$
-O_c=\tilde Q_cS_{c-1}+M_{qk,c}(U-WS_{c-1}).
-$$
-
-## 函数原型
-
-先调用 `flash_kda_metadata(q, v, initial_state, layout_qkv, cu_seqlens=None)`，再将返回值作为 `metadata` 传入下列接口。metadata 的参数说明见下文。
-
-```python
-flash_kda.flash_kda.flash_kda(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    g: torch.Tensor,
-    beta: torch.Tensor,
-    scale: float,
-    initial_state: torch.Tensor,
-    A_log: torch.Tensor,
-    dt_bias: torch.Tensor,
-    lower_bound: float,
-    layout_qkv: str,
-    metadata: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]
-```
-
-模块路径为 `flash_kda.flash_kda`，以下参数均为必选，没有默认值。
-
-## 参数说明
-
-`B` 为逻辑 batch 数，`Nqk` 为 Query/Key 头数，`Nv` 为 Value 头数，`S` 为每个 batch 的存储序列长度，`T` 为 packed 序列的总 token 数，`Dk = Dv = D = 128`。
-
-| 参数名 | 参数类型 | 可选/必选 | 描述 | 数据类型 | 维度(shape) |
-|:---|:---|:---|:---|:---|:---|
-| `q` | Tensor | 必选 | Query；内核按行归一化。 | bfloat16 | BNSD：`[B, Nqk, S, D]`；其他布局见下表 |
-| `k` | Tensor | 必选 | Key；shape 和布局与 `q` 相同，内核按行归一化。 | bfloat16 | 与 `q` 相同 |
-| `v` | Tensor | 必选 | Value。 | bfloat16 | BNSD：`[B, Nv, S, D]`；其他布局见下表 |
-| `g` | Tensor | 必选 | 原始门控输入，激活公式见功能说明。 | bfloat16 | 与 `v` 相同 |
-| `beta` | Tensor | 必选 | 原始写入 logits，内核执行 sigmoid。 | bfloat16 | BNSD：`[B, Nv, S]`；其他布局见下表 |
-| `scale` | float | 必选 | Query-key 缩放系数，常用值为 `D ** -0.5`。 | float32 | - |
-| `initial_state` | Tensor | 必选 | 初始递归状态，最后两维依次为 `Dv`、`Dk`；无历史状态时传全零张量。 | float32 | `[B, Nv, Dv, Dk]` |
-| `A_log` | Tensor | 必选 | 每个 Value 头的 log 时间尺度。 | float32 | `[Nv]` |
-| `dt_bias` | Tensor | 必选 | 每个 Value 头、每个 Key 通道的门控偏置。 | float32 | `[Nv, Dk]` |
-| `lower_bound` | float | 必选 | 门控下界，取值范围为 `[-5, 0]`。 | float32 | - |
-| `layout_qkv` | str | 必选 | 输入布局，取值为 `"BNSD"`、`"BSND"` 或 `"TND"`。 | - | - |
-| `metadata` | Tensor | 必选 | 配套 `flash_kda_metadata` 返回的调度张量。 | int32 | `[M]`，容量 `M` 由 metadata 算子确定 |
-
-### metadata 入参
-
-同目录的 `flash_kda_metadata.py` 提供 `flash_kda_metadata(q, v, initial_state, layout_qkv, cu_seqlens=None)`。它只读取输入张量的属性；`cu_seqlens` 的数值决定有效长度与 packed token 起点。
-
-| 参数名 | 参数类型 | 可选/必选 | 描述 | 数据类型 | 维度(shape) |
-|:---|:---|:---|:---|:---|:---|
-| `q` | Tensor | 必选 | 与主算子相同的 Query；读取 shape、dtype、设备和连续性。 | bfloat16 | 见下表 |
-| `v` | Tensor | 必选 | 与主算子相同的 Value；`Nv` 决定每块任务数。 | bfloat16 | 见下表 |
-| `initial_state` | Tensor | 必选 | 与主算子相同的初始状态。 | float32 | `[B, Nv, Dv, Dk]` |
-| `layout_qkv` | str | 必选 | 与主算子一致的布局。 | - | - |
-| `cu_seqlens` | Tensor | 可选 | 有效 token 前缀和；TND 必传，BNSD/BSND 可选。 | int32 | `[B + 1]` |
-
-各布局对应的输入 shape：
-
-| `layout_qkv` | `q`、`k` | `v`、`g` | `beta` |
-|:---|:---|:---|:---|
-| `BNSD` | `[B, Nqk, S, D]` | `[B, Nv, S, D]` | `[B, Nv, S]` |
-| `BSND` | `[B, S, Nqk, D]` | `[B, S, Nv, D]` | `[B, S, Nv]` |
-| `TND` | `[T, Nqk, D]` | `[T, Nv, D]` | `[T, Nv]` |
-
-## 返回值说明
-
-返回 `(out, final_state)`，两个张量均位于输入所在设备。
-
-| 参数名 | 参数类型 | 可选/必选 | 描述 | 数据类型 | 维度(shape) |
-|:---|:---|:---|:---|:---|:---|
-| `out` | Tensor | 必选 | 序列输出，布局与 `v` 相同；metadata 标记的有效序列范围之外，输出值未定义。 | bfloat16 | 与 `v` 相同 |
-| `final_state` | Tensor | 必选 | 每条序列的最终递归状态；不原地修改 `initial_state`。 | float32 | `[B, Nv, Dv, Dk]` |
-
-内部输出存储按 64 个 token 对齐，返回时裁剪为逻辑 shape；非对齐场景下 `out` 可能是不连续的视图。
-
-## 约束说明
-
-- 当前接口用于 prefill 前向计算，要求 `Dk = Dv = 128`，`B >= 1`，`S > 0` 或 `T > 0`。
-- 支持 GQA，要求 `1 <= Nqk <= Nv`、`Nv % Nqk == 0`；metadata 调度要求 `Nv` 不超过 `WORKSPACE_SLOTS`（当前为 861）。
-- 所有输入张量（包括 `metadata`）必须连续，位于同一 NPU，且满足参数表中的 dtype。
-- BNSD/BSND 的物理 batch 数必须等于 `initial_state` 的 `B`。不传 `cu_seqlens` 时，metadata 按每条序列有效长度均为 `S` 调度。
-- BNSD/BSND 可在生成 metadata 时传 `cu_seqlens` 表示各 batch 的有效长度。它是从 0 开始、形状为 `[B + 1]` 的 int32 前缀和，相邻差值必须在 `[1, S]` 内。
-- TND 必须在生成 metadata 时传 `cu_seqlens`：形状为 `[B + 1]`、dtype 为 int32、从 0 开始、严格递增，最后一项为 `T`。它必须连续且位于输入所在设备。
-- 输入序列长度无需按 64 对齐，尾块由内核处理。只读取和比较 metadata 指定有效区的输出。
-- 图捕获兼容性由调用网络验证；当前接口不查询或拒绝 capture 状态。
-
-### metadata 复用
-
-`flash_kda` 不生成 metadata，也不启动 AICPU。整网可在 forward 开始时生成一次 metadata，并在调度配置相同的层间复用。
-
-当 `B`、物理 batch 数、`S/T`、`Nv`、布局、`cu_seqlens` 内容、当前 stream 的有效 AIC 配额、workspace slots 或内置调度 cost 公式版本变化时，必须重新生成 metadata。`Nqk` 和 Q/K/V/g/beta/state 的数值不影响 metadata；每次调用仍须满足当前输入的 shape 和 GQA 约束。
-
-## 确定性计算
-
-当前样例未提供逐位确定性保证，现有精度测试按数值容差校验。
-
-## 调用示例
+在仓库根目录运行以下示例。`metadata` 是必选参数；若使用 TND 布局，还须给 metadata 函数传入 `cu_seqlens`。
 
 ```python
 import math
@@ -166,54 +34,78 @@ import torch_npu
 from flash_kda.flash_kda import flash_kda
 from flash_kda.flash_kda_metadata import flash_kda_metadata
 
-B, Nk, Nv, S, D = 1, 3, 3, 8192, 128
-q = torch.randn(B, Nk, S, D).bfloat16().npu()
-k = torch.randn(B, Nk, S, D).bfloat16().npu()
-v = torch.randn(B, Nv, S, D).bfloat16().npu()
-g = torch.randn(B, Nv, S, D).bfloat16().npu()
-beta = torch.randn(B, Nv, S).bfloat16().npu()
-initial_state = torch.zeros(B, Nv, D, D, dtype=torch.float32).npu()
-A_log = torch.zeros(Nv, dtype=torch.float32).npu()
-dt_bias = torch.zeros(Nv, D, dtype=torch.float32).npu()
+B, Nqk, Nv, S, D = 1, 3, 3, 8192, 128
+q = torch.randn(B, Nqk, S, D, device="npu", dtype=torch.bfloat16)
+k = torch.randn_like(q)
+v = torch.randn(B, Nv, S, D, device="npu", dtype=torch.bfloat16)
+g = torch.randn_like(v)
+beta = torch.randn(B, Nv, S, device="npu", dtype=torch.bfloat16)
+initial_state = torch.zeros(B, Nv, D, D, device="npu", dtype=torch.float32)
+A_log = torch.randn(Nv, device="npu", dtype=torch.float32)
+dt_bias = torch.randn(Nv, D, device="npu", dtype=torch.float32)
 
-metadata = flash_kda_metadata(q, v, initial_state, "BNSD", None)
+metadata = flash_kda_metadata(q, v, initial_state, "BNSD")
 out, final_state = flash_kda(
     q, k, v, g, beta, 1 / math.sqrt(D), initial_state,
-    A_log, dt_bias, -5.0, "BNSD", metadata
+    A_log, dt_bias, -5.0, "BNSD", metadata,
 )
 ```
 
+## 参数说明
+
+`B` 是 batch 数，`Nqk` 和 `Nv` 分别是 Query/Key 与 Value 头数，`S` 是每条序列的存储长度，`T` 是 packed token 总数，`D=128`。
+
+| 参数 | BNSD shape | 类型 | 说明 |
+|:---|:---|:---|:---|
+| `q`, `k` | `[B, Nqk, S, D]` | BF16 | 原始 Query/Key；算子内完成 L2 normalize。 |
+| `v`, `g` | `[B, Nv, S, D]` | BF16 | Value 与原始 gate；gate 由 `A_log`、`dt_bias`、`lower_bound` 激活。 |
+| `beta` | `[B, Nv, S]` | BF16 | 原始写入 logits；算子内执行 sigmoid。 |
+| `scale` | 标量 | float | Query/Key 缩放值，常用 `D ** -0.5`。 |
+| `initial_state` | `[B, Nv, D, D]` | FP32 | 初始递归状态，最后两维依次为 Dv、Dk。 |
+| `A_log` | `[Nv]` | FP32 | 每个 Value 头的 log 时间尺度。 |
+| `dt_bias` | `[Nv, D]` | FP32 | gate 偏置。 |
+| `lower_bound` | 标量 | float | gate 下界，范围 `[-5, 0]`。 |
+| `layout_qkv` | 标量 | string | `"BNSD"`、`"BSND"` 或 `"TND"`。 |
+| `metadata` | `[M]` | int32 | 同目录 `flash_kda_metadata` 返回的调度张量，必选。 |
+
+BSND 的 `q/k` 为 `[B,S,Nqk,D]`、`v/g` 为 `[B,S,Nv,D]`、`beta` 为 `[B,S,Nv]`。TND 分别为 `[T,Nqk,D]`、`[T,Nv,D]`、`[T,Nv]`。
+
+metadata 函数接收与主算子相同的 `q`、`v`、`initial_state` 和 `layout_qkv`，另有可选的 `cu_seqlens`。TND 必须传 `cu_seqlens`；BNSD/BSND 可传它指定每条序列的有效长度，不传时每条长度均为 `S`。
+
+## 返回值说明
+
+`flash_kda` 返回 `(out, final_state)`；metadata 函数返回一维 int32 调度张量。
+
+| 返回值 | Shape | 类型 | 说明 |
+|:---|:---|:---|:---|
+| `out` | 与 `v` 相同 | BF16 | 序列输出，布局与 `v` 相同；仅 metadata 指定的有效行有定义。 |
+| `final_state` | `[B,Nv,D,D]` | FP32 | 最终递归状态；新建张量，不原地修改 `initial_state`。 |
+
+输出内部按 64 个 token 对齐存储，再裁剪为逻辑 shape；非对齐长度下，`out` 可能是不连续的视图。
+
+## 约束说明
+
+- 支持 Ascend 950，`Dk = Dv = 128`，`B >= 1`，序列存储长度大于 0；支持 BNSD、BSND 和 packed TND。
+- 支持 GQA，要求 `1 <= Nqk <= Nv`、`Nv % Nqk == 0`。metadata 调度要求 `Nv <= 861`。
+- Q/K/V/g/beta 为 BF16，`initial_state`、`A_log`、`dt_bias` 为 FP32；`lower_bound` 必须在 `[-5, 0]`。
+- 所有公开输入张量必须连续且位于同一设备；`metadata` 必须是一维 int32 张量。BNSD/BSND 的物理 batch 数必须与 `initial_state` 一致。
+- TND 的 `cu_seqlens` 必须是同设备、连续的 int32 `[B+1]` 前缀和：首项为 0、末项为 `T`，并严格递增。BNSD/BSND 传入 `cu_seqlens` 时，每条有效长度须在 `[1,S]` 内。
+
 ## 精度测试
 
-在仓库根目录执行单文件测试。两个 PyTorch golden 内联于
-`test/flash_kda/test_flash_kda.py`：`cpu_chunk` 用 FP32 分块递推，`npu_chunk`
-在 CPU 上模拟当前算子的 BF16/FP16 交接（state 累加保持 FP32）。
-两者与 DSL 做输出及最终 state 的三方对照，不依赖其他 golden 文件：
+
+在仓库根目录运行（CPU golden 建议限制线程数）：
 
 ```bash
-python -m pytest -q test/flash_kda/test_flash_kda.py
-python -m pytest -q test/flash_kda/test_flash_kda_metadata.py
-python -m pytest -q test/flash_kda/test_flash_kda.py --whitebox
+OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 python -m pytest -q test/flash_kda/test_flash_kda.py
 ```
 
-默认回归运行 3 个布局代表精度场景。`--whitebox` 追加 4 个非对齐尾块和 1 个跨轮调度，共 8 个 NPU 用例。
-容差为 `atol=rtol=5e-3`。
-尾块覆盖 16、32、48、64、128 边界，含 packed 非对齐起点和奇数头数；
-跨轮场景有 864 个 chunk/head 任务，超过 861 个 workspace slots。
-逐轮检查逻辑 chunk 无遗漏、无重叠，padded 无效输入填 NaN。
+测试保留 BNSD、BSND、packed TND 三个精度场景，覆盖 GQA、非对齐尾块和多条变长序列。
+输出和最终状态与内联 PyTorch FP32 golden 及 BF16/FP16 交接模拟对照，
+默认容差为 `atol=rtol=5e-3`。测试需要 Ascend NPU。
 
-## 性能
+## 性能对比
 
-以下结果于 2026-09-14 使用 CANN 9.2、CANNBot-DSL 和 msprof 采集，测试动态
-`flash_kda.py`。
-形状为 `B=1, NV=NK=32, S=8192, D=128`。
-AICPU metadata 在采样循环前生成一次，`Task Duration` 只统计 AICore 算子。
+![FlashKDA (DSL) 与 H800 性能对比](../../figures/flash_kda.png)
 
-每种布局预热 10 次后连续采样 200 次。调用间不清理 L2 cache、编译缓存或
-workspace。管线指标取 200 个任务的中位数，并非最短任务所在行的指标。
-
-| Layout | Task Duration 中位数 (us) | Task Duration 最小值 (us) | aiv_mte2_ratio | aiv_vec_ratio | aic_mac_ratio | aiv_vec_time (us) | aic_mac_time (us) |
-|:---|--:|--:|--:|--:|--:|--:|--:|
-| BNSD | 805.166 | 790.862 | 0.3795 | 0.6225 | 0.4030 | 499.614 | 324.222 |
-| BSND | 836.810 | 822.446 | 0.4385 | 0.6040 | 0.3875 | 504.055 | 324.245 |
-| TND | 838.662 | 822.235 | 0.4460 | 0.6035 | 0.3875 | 504.318 | 324.437 |
+CANNBot-DSL 生成的 FlashKDA 代码与 H800 上的 FlashKDA 代码在 12 个典型配置上的平均延迟对比：`B=1`、`D=128`、`N=24/32/48`、`S=8K/16K/32K/64K`。
