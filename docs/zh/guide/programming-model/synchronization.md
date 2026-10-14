@@ -145,7 +145,13 @@ p_l1 = Channel(MemLoc.L1, (128, 128), dtypes.float16,
 
 ## 场景 5：Cache 一致性
 
-Scalar 单元访问 GM 会经过 DCache，而 **DCache 是多核独立缓存**。一个核通过 Scalar 写 GM、另一个核读同一地址时，可能读到过期数据。
+::: warning 不自动插入 dcci
+框架不会因为检测到 Scalar 直接读写 GM，就自动插入 `dcci_*`、`dci`
+或其他 Cache 一致性指令。直接 GM 访问的 Cache 清理、失效和可见性由
+Kernel 作者显式负责；依赖隐式插入 `dcci` 的写法暂不支持。
+:::
+
+Scalar 单元访问 GM 会经过 DCache，而 **DCache 是多核独立缓存**。一个核通过 Scalar 写 GM、另一个核读同一地址时，可能读到过期数据。框架不会自动推断这种跨核数据依赖，也不会自动插入 `dcci`。需要保证可见性时，必须显式调用 Cache 操作，并自行保证执行顺序和核间同步。
 
 两类处理方式：
 

@@ -4,6 +4,8 @@ AI Core 的标量计算单元直接读写全局内存（Global Memory，GM）时
 
 这些接口用于保证 DCache 与 GM 中的数据一致。通过直接内存访问（Direct Memory Access，DMA）在 GM 与片上存储之间搬运数据时不经过 DCache，通常不需要调用这些接口。
 
+> 这些接口不会由框架根据 GM 访问自动插入。使用 Scalar 直接读写 GM 时，调用方必须根据数据共享关系显式选择 `dcci_*`、`dci` 或 bypass 接口。
+
 - **[概述](/zh/api/kernel/synchronization-cache/)**
 
 ## 接口

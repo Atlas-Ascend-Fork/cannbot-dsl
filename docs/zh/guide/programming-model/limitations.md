@@ -73,6 +73,7 @@ SIMD + SIMT 混合编程和纯 SIMT 编程都需要 CANN 9.2.0 及以上版本�
 | `get_mem_size` | 可查 `"ub"` / `"l1"` / `"l0a"` / `"l0b"` / `"l0c"` / `"bt"` / `"fb0"`。**L2 和 SSBUF 查不到**，传进去抛 `ValueError`。`"ub"` 返回 253952（248 KB），预留已扣除 |
 | `UB.view()` | 一旦调用，当前 Kernel 的 UB `Buffer` 必须走 `make_buffer()`，普通 UB `Channel` 也不能再创建。两种风格不能混用 |
 | 尾块 `mem_copy` | `tile_slice` 与 Channel 槽位 shape 必须一致。不要把尾块缩成 `(actual,)` 再拷进 `(tile,)` 的槽；GM 先对齐，多余 lane 用掩码 |
+| Scalar 直接读写 GM 的 Cache 一致性 | 框架不会自动插入 `dcci` / `dci`；调用方必须显式处理 Cache 可见性，或使用 `*_bypass` |
 
 ## 矩阵乘
 
