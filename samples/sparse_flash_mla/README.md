@@ -4,6 +4,8 @@
 （NPU ARCH 3510）。公共接口 `sparse_flash_mla()` 根据输入自动选择高性能分支
 或通用分支，完成 QK、在线 Softmax、PV 累加及输出写回。
 
+如需复现，请联系马亚飞（gitcode账号：mayafei）获取最新cannbot-dsl whl包。
+
 ## 算子介绍
 
 SMLA 对 Query 与原始 KV、可选压缩 KV 执行融合 Attention。
