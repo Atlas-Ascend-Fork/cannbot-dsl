@@ -191,6 +191,7 @@ python3 -m pytest test/sparse_flash_attention/test_sparse_flash_attention.py -v
 | [mixed_quant_sparse_flash_mla](samples/mixed_quant_sparse_flash_mla) | `mixed_quant_sparse_flash_mla()` | 混合量化稀疏 MLA：BF16 Q + FP8 原始 KV + 可选 FP4 压缩 KV |
 | [mixed_quant_sparse_flash_mla_metadata](samples/mixed_quant_sparse_flash_mla_metadata) | `mixed_quant_sparse_flash_mla_metadata()` | MQSMLA 的 AICPU 分核调度，输出整行 / FlashDecode 分片计划 |
 | [flash_kda](samples/flash_kda) | `flash_kda()`、`flash_kda_metadata()` | Kimi Delta Attention prefill 融合算子，含 AICPU 调度 metadata |
+| [fused_recurrent_kda_replayssm](samples/fused_recurrent_kda_replayssm) | `fused_recurrent_kda_replayssm()` | 独立 ReplaySSM verify，读取 FP32 checkpoint，写出 FP16 U/K 和 FP32 decay；支持 BSND/BNSD/TND 和 8/24/28/32 控核 |
 | [attn_prologue](samples/attn_prologue) | `attn_prologue()` | MXFP8 的 QA/KV 投影、RMSNorm、QR 量化、QB 投影、RoPE 与 KV cache 写回 |
 | [attn_epilogue](samples/attn_epilogue) | `attn_epilogue()` | Attention 输出投影：inverse RoPE、两次 MXFP8 激活量化与 WoA/WoB 两级矩阵乘；BF16 输入/输出，E4M3FN 权重与 E8M0 scale |
 | [indexer_prologue_qw](samples/indexer_prologue_qw) | `indexer_prologue_qw()` | MXFP8 Q GEMM、尾部 RoPE、MXFP4 量化，以及 BF16 W GEMM |

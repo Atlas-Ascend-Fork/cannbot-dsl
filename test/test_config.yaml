@@ -109,6 +109,14 @@ fused_recurrent_kda_snapshot:
   options:
     - fused_recurrent_kda_snapshot
 
+fused_recurrent_kda_replayssm:
+  module: True
+  src:
+    - samples/fused_recurrent_kda_replayssm
+    - test/fused_recurrent_kda_replayssm
+  options:
+    - fused_recurrent_kda_replayssm
+
 mega_recurrent_kda:
   module: True
   src:

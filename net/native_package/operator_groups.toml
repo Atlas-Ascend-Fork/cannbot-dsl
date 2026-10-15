@@ -22,6 +22,7 @@ flash_kda = ["flash_kda.py", "flash_kda_metadata.py"]
 flash_kda_cp_preprocess = ["flash_kda_cp_preprocess.py", "flash_kda_cp_preprocess_metadata.py"]
 flash_kda_cp_main = ["flash_kda_cp_main.py", "flash_kda_cp_main_metadata.py"]
 fused_recurrent_kda = ["fused_recurrent_kda_snapshot.py"]
+fused_recurrent_kda_replayssm = ["fused_recurrent_kda_replayssm.py"]
 mega_recurrent_kda = ["mega_recurrent_kda.py"]
 mega_recurrent_kda_replayssm = ["mega_recurrent_kda_replayssm.py"]
 commit_recurrent_kda_replayssm = ["commit_recurrent_kda_replayssm.py"]
@@ -37,6 +38,7 @@ k3 = [
   "flash_kda_cp_preprocess",
   "flash_kda_cp_main",
   "fused_recurrent_kda",
+  "fused_recurrent_kda_replayssm",
   "mega_recurrent_kda",
   "mega_recurrent_kda_replayssm",
   "commit_recurrent_kda_replayssm",

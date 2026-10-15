@@ -41,6 +41,7 @@ operators:
   - mixed_quant_sparse_flash_mla_metadata
   - block_attn_res_update_rms_norm
   - fused_recurrent_kda_snapshot
+  - fused_recurrent_kda_replayssm
   - mega_recurrent_kda
   - mega_recurrent_kda_replayssm
   - commit_recurrent_kda_replayssm
