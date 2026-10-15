@@ -24,7 +24,7 @@ $$
 
 ## 快速开始
 
-在仓库根目录运行以下示例。`metadata` 是必选参数；若使用 TND 布局，还须给 metadata 函数传入 `cu_seqlens`。
+在仓库根目录运行以下示例。`metadata` 是必传参数；`out` 和 `final_state` 是返回值，由算子内部自动分配，不需要显式传入。若使用 TND 布局，还须给 metadata 函数传入 `cu_seqlens`。
 
 ```python
 import math
@@ -70,23 +70,23 @@ out, final_state = flash_kda(
 
 BSND 的 `q/k` 为 `[B,S,Nqk,D]`、`v/g` 为 `[B,S,Nv,D]`、`beta` 为 `[B,S,Nv]`。TND 分别为 `[T,Nqk,D]`、`[T,Nv,D]`、`[T,Nv]`。
 
-metadata 函数接收与主算子相同的 `q`、`v`、`initial_state` 和 `layout_qkv`，另有可选的 `cu_seqlens`。TND 必须传 `cu_seqlens`；BNSD/BSND 可传它指定每条序列的有效长度，不传时每条长度均为 `S`。
+metadata 函数接收与主算子相同的 `q`、`v`、`initial_state` 和 `layout_qkv`，另有可选的 `cu_seqlens`。TND 必须传 `cu_seqlens`；BNSD/BSND 可传它指定每条序列的有效长度，不传时每条长度均为 `S`。主算子从 `metadata` 获取序列边界，无需再传 `cu_seqlens`。
 
 ## 返回值说明
 
-`flash_kda` 返回 `(out, final_state)`；metadata 函数返回一维 int32 调度张量。
+`flash_kda` 在内部新建输出张量并返回 `(out, final_state)`；metadata 函数返回一维 int32 调度张量。
 
 | 返回值 | Shape | 类型 | 说明 |
 |:---|:---|:---|:---|
 | `out` | 与 `v` 相同 | BF16 | 序列输出，布局与 `v` 相同；仅 metadata 指定的有效行有定义。 |
 | `final_state` | `[B,Nv,D,D]` | FP32 | 最终递归状态；新建张量，不原地修改 `initial_state`。 |
 
-输出内部按 64 个 token 对齐存储，再裁剪为逻辑 shape；非对齐长度下，`out` 可能是不连续的视图。
+输出内部按 64 个 token 对齐存储，再裁剪为逻辑 shape；非对齐长度下，`out` 可能是非连续视图。
 
 ## 约束说明
 
 - 支持 Ascend 950，`Dk = Dv = 128`，`B >= 1`，序列存储长度大于 0；支持 BNSD、BSND 和 packed TND。
-- 支持 GQA，要求 `1 <= Nqk <= Nv`、`Nv % Nqk == 0`。metadata 调度要求 `Nv <= 861`。
+- 支持 GQA，要求 `1 <= Nqk <= Nv <= 96`、`Nv % Nqk == 0`。
 - Q/K/V/g/beta 为 BF16，`initial_state`、`A_log`、`dt_bias` 为 FP32；`lower_bound` 必须在 `[-5, 0]`。
 - 所有公开输入张量必须连续且位于同一设备；`metadata` 必须是一维 int32 张量。BNSD/BSND 的物理 batch 数必须与 `initial_state` 一致。
 - TND 的 `cu_seqlens` 必须是同设备、连续的 int32 `[B+1]` 前缀和：首项为 0、末项为 `T`，并严格递增。BNSD/BSND 传入 `cu_seqlens` 时，每条有效长度须在 `[1,S]` 内。

@@ -9,7 +9,7 @@
 """FlashKDA AICore consumer for BNSD, BSND, and packed TND storage."""
 
 import dataclasses
-from functools import lru_cache
+from functools import lru_cache, wraps
 import os
 from typing import NamedTuple, Optional, Tuple
 
@@ -2601,6 +2601,14 @@ def _compile_flash_kda():
     )
 
 
+def _validate_metadata(metadata, ref):
+    assert metadata is not None, "metadata is required"
+    assert metadata.dtype == torch.int32, "metadata must be int32"
+    assert metadata.dim() == 1, "metadata must be rank-1"
+    assert metadata.is_contiguous(), "metadata must be contiguous"
+    assert metadata.device == ref.device, "metadata must be on the same device as q"
+
+
 def flash_kda(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -2644,6 +2652,7 @@ def flash_kda(
         * Internal output storage is padded to a multiple of 64 rows for kernel computation.
     """
     assert layout_qkv in ("TND", "BNSD", "BSND"), f"layout_qkv must be TND, BNSD, or BSND, got {layout_qkv!r}"
+    _validate_metadata(metadata, q)
     assert initial_state.dim() == 4, "initial_state must be rank-4"
     batch, n_v, state_dv, state_dk = initial_state.shape
     assert state_dv == state_dk == SUPPORTED_HEAD_DIM, f"FlashKDA only supports D={SUPPORTED_HEAD_DIM}"
@@ -2720,10 +2729,6 @@ def flash_kda(
     tensors = (q, k, v, g, beta, initial_state, A_log, dt_bias)
     assert all(tensor.device == q.device for tensor in tensors), "all inputs must be on the same device"
     assert all(tensor.is_contiguous() for tensor in tensors), "all public inputs must be contiguous"
-    assert metadata.dtype == torch.int32, "metadata must be int32"
-    assert metadata.dim() == 1, "metadata must be rank-1"
-    assert metadata.is_contiguous(), "metadata must be contiguous"
-    assert metadata.device == q.device, "all inputs must be on the same device"
 
     core_num = _device_block_num(q)
     workspace = allocate_stage1_workspace(1, 1, WORKSPACE_SLOTS, SUPPORTED_HEAD_DIM, ref=q)
@@ -2782,9 +2787,19 @@ _GRAPH_LIBRARY.define(
 @torch.library.impl(_GRAPH_LIBRARY, "flash_kda", "Meta")
 def _flash_kda_meta(q, k, v, g, beta, scale, initial_state, a_log, dt_bias,
                     lower_bound, layout_qkv, metadata):
-    del q, k, g, beta, scale, a_log, dt_bias, lower_bound, layout_qkv, metadata
-    return (torch.empty_like(v, device="meta"),
-            torch.empty_like(initial_state, device="meta"))
+    assert layout_qkv in ("TND", "BNSD", "BSND"), f"layout_qkv must be TND, BNSD, or BSND, got {layout_qkv!r}"
+    _validate_metadata(metadata, q)
+    assert initial_state.dtype == HIGH_DTYPE, "initial_state must be float32"
+    assert v.dtype == LOW_DTYPE, "v must be bfloat16"
+    del k, g, beta, scale, a_log, dt_bias, lower_bound
+    # Match the host's padded output views so graph consumers see the real strides.
+    sequence_axis = {"TND": 0, "BNSD": 2, "BSND": 1}[layout_qkv]
+    output_shape = list(v.shape)
+    sequence_length = output_shape[sequence_axis]
+    output_shape[sequence_axis] = ((sequence_length + CHUNK_SIZE - 1) // CHUNK_SIZE) * CHUNK_SIZE
+    output_storage = torch.empty(output_shape, dtype=v.dtype, device="meta")
+    out = output_storage.narrow(sequence_axis, 0, sequence_length)
+    return out, torch.empty_like(initial_state, device="meta")
 
 
 @torch.library.impl(_GRAPH_LIBRARY, "flash_kda", "PrivateUse1")
@@ -2797,10 +2812,15 @@ def _flash_kda_privateuse1(q, k, v, g, beta, scale, initial_state, a_log,
 flash_kda_op = torch.ops.cannbotdsl_flash_kda.flash_kda
 
 
-# Old network code calls the public host function directly. Under Dynamo
-# (torch.compile, fullgraph) that host body is untraceable, so during
-# tracing the call is substituted with the registered dispatcher op;
-# eager calls keep taking the host path unchanged.
+@wraps(flash_kda)
+def _flash_kda_graph(*args, **kwargs):
+    # Keep the public keyword spelling compatible with the dispatcher schema.
+    if "A_log" in kwargs:
+        kwargs["a_log"] = kwargs.pop("A_log")
+    return flash_kda_op(*args, **kwargs)
+
+
+# Dynamo captures the functional dispatcher call; the operator allocates both outputs.
 torch._dynamo.substitute_in_graph(
     flash_kda, can_constant_fold_through=False
-)(lambda *args, **kwargs: flash_kda_op(*args, **kwargs))
+)(_flash_kda_graph)
