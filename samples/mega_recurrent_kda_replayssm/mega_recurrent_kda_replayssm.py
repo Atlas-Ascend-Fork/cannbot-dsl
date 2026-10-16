@@ -6,11 +6,11 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 
-"""One mixed Mega KDA kernel with a stream-controlled 8/24/28/32 grid.
+"""One mixed Mega KDA kernel with a stream-controlled 8/16/24/28/32 grid.
 
 get_block_num() selects the schedule inside the kernel. The host compiles
 once, then derives the launch grid from get_platform_info() on the current
-stream. The public B=16,32,...,256 contract uses runtime batch groups; S is fixed at 8.
+stream. The public B=16,32,...,512 contract uses runtime batch groups; S is fixed at 8.
 Each grid retains its established output-projection tile/buffer configuration.
 """
 
@@ -96,7 +96,7 @@ VL = 64
 D_SEGMENTS = TILE // VL
 CONV_KERNEL = 4
 BATCH_TILE = 16
-MAX_BATCH_GROUPS = 16
+MAX_BATCH_GROUPS = 32
 BETA_TILE = 16
 HIDDEN_SIZE = 7168
 SEQ_LEN = 8
@@ -108,11 +108,10 @@ CONV_RAW_V_TO_MTE3_EVENT = 2
 KDA_STATE_KEY_UNROLL = 4
 KDA_STATE_UPDATE_UNROLL = 2
 _COMPILED_LAUNCH = None
-SUPPORTED_BLOCK_NUMS = (8, 24, 28, 32)
 
 
 def _device_block_num(ref: torch.Tensor) -> int:
-    """Return the current stream's effective AIC count, capped at 32."""
+    """Select the largest supported grid within the current stream quota."""
     if ref.device.type not in {"npu", "privateuseone"}:
         raise ValueError("mega_recurrent_kda_replayssm requires NPU inputs")
     device_index = ref.device.index
@@ -126,40 +125,11 @@ def _device_block_num(ref: torch.Tensor) -> int:
         raise RuntimeError(
             f"NPU {device_index} does not expose a valid AIC count"
         ) from error
-    if cube_core_num <= 0:
-        raise RuntimeError(
-            f"NPU {device_index} reports invalid cube_core_num={cube_core_num}"
-        )
-    return min(cube_core_num, 32)
-
-
-def _resolve_block_num(ref: torch.Tensor | None, block_num: int | None) -> int:
-    """Resolve an explicit grid or select the largest supported device grid."""
-    if block_num is None:
-        if ref is None:
-            raise ValueError("block_num=None requires a reference NPU tensor")
-        available = _device_block_num(ref)
-        choices = tuple(value for value in SUPPORTED_BLOCK_NUMS if value <= available)
-        if not choices:
-            raise ValueError(
-                f"device exposes {available} AIC cores; at least 8 are required"
-            )
-        return choices[-1]
-    if isinstance(block_num, bool) or not isinstance(block_num, int):
+    if cube_core_num < 8:
         raise ValueError(
-            f"block_num must be one of {SUPPORTED_BLOCK_NUMS}; got {block_num!r}"
+            f"current stream exposes {cube_core_num} AIC cores; at least 8 are required"
         )
-    if block_num not in SUPPORTED_BLOCK_NUMS:
-        raise ValueError(
-            f"block_num must be one of {SUPPORTED_BLOCK_NUMS}; got {block_num}"
-        )
-    if ref is not None and ref.device.type in {"npu", "privateuseone"}:
-        available = _device_block_num(ref)
-        if block_num > available:
-            raise ValueError(
-                f"block_num={block_num} exceeds the device limit {available}"
-            )
-    return block_num
+    return max(cores for cores in (8, 16, 24, 28, 32) if cores <= cube_core_num)
 
 
 class _CompiledLaunch:
@@ -1716,7 +1686,7 @@ class _GridSchedule:
     """Compile-time branch configuration with one shared KDA wave schedule."""
 
     def __init__(self, block_num: int, hidden_size: int, num_heads: int):
-        # Four grid schedules are embedded in one kernel. These constants only
+        # Five grid schedules are embedded in one kernel. These constants only
         # describe branch-local tiles; runtime get_block_num() selects a branch.
         self.block_num = block_num
         self.hidden_size = hidden_size
@@ -1727,8 +1697,8 @@ class _GridSchedule:
         self.beta_block = self.qkv_block_count + num_heads
         self.low_rank_block = self.beta_block + 1
         self.recurrent_wave_count = 2
-        self.output_tiles_per_core = {8: 7, 24: 2, 28: 1, 32: 1}[block_num]
-        self.output_tile_width = {8: 128, 24: 256, 28: 256, 32: 256}[block_num]
+        self.output_tiles_per_core = {8: 7, 16: 2, 24: 2, 28: 1, 32: 1}[block_num]
+        self.output_tile_width = {8: 128, 16: 256, 24: 256, 28: 256, 32: 256}[block_num]
         # Keep output weights resident when the shard and activation buffers fit.
         activation_channel_bytes = 2 * 64 * OPROJ_KC * 2
         self.output_weight_resident = (
@@ -3456,7 +3426,7 @@ class _GridSchedule:
                 tile_stride=1,
                 l0c_depth=2,
             )
-        elif const_expr(self.block_num == 24):
+        elif const_expr(self.block_num == 16 or self.block_num == 24):
             output_projection_stage = OutputProjectionStage(
                 self.output_tile_width,
                 chunk_rows,
@@ -3465,7 +3435,7 @@ class _GridSchedule:
                 row_capacity=64,
                 resident_input=False,
                 resident_weight=False,
-                tile_stride=24,
+                tile_stride=self.block_num,
                 l0c_depth=2,
             )
         else:
@@ -3776,7 +3746,9 @@ class _GridSchedule:
         frontend_panel_tasks = batch_groups * (
             self.qkv_block_count + self.output_gate_block_count
         )
-        if const_expr(self.block_num != 8) and frontend_panel_tasks <= self.block_num:
+        # A B16 group needs 24 frontend panels, so 8/16-core grids always
+        # use the task pool. Keep their unreachable compact paths out of IR.
+        if const_expr(self.block_num >= 24) and frontend_panel_tasks <= self.block_num:
             self._execute_compact_s8(*execution_args)
         else:
             self._execute_task_pool_s8(*execution_args)
@@ -3791,6 +3763,7 @@ class MegaRecurrentKDAReplaySSMKernel:
         self.workspace_region_widths = (num_heads * TILE,) * 5 + (BETA_TILE, TILE)
         self.workspace_width = sum(self.workspace_region_widths)
         self.grid_8 = _GridSchedule(8, hidden_size, num_heads)
+        self.grid_16 = _GridSchedule(16, hidden_size, num_heads)
         self.grid_24 = _GridSchedule(24, hidden_size, num_heads)
         self.grid_28 = _GridSchedule(28, hidden_size, num_heads)
         self.grid_32 = _GridSchedule(32, hidden_size, num_heads)
@@ -3887,6 +3860,8 @@ class MegaRecurrentKDAReplaySSMKernel:
         )
         if block_num == 8:
             self.grid_8.execute(*execution_args)
+        elif block_num == 16:
+            self.grid_16.execute(*execution_args)
         elif block_num == 24:
             self.grid_24.execute(*execution_args)
         elif block_num == 28:
@@ -4017,7 +3992,7 @@ def _validate_replay_hidden(hidden_states, beta_weight):
     if invalid_batch or hidden_size != HIDDEN_SIZE or seq_len != SEQ_LEN:
         raise ValueError(
             "mega_recurrent_kda_replayssm requires B to be a multiple of 16 in "
-            f"[16, 256], S={SEQ_LEN}, and H={HIDDEN_SIZE}; got B={batch_size}, "
+            f"[16, 512], S={SEQ_LEN}, and H={HIDDEN_SIZE}; got B={batch_size}, "
             f"S={seq_len}, H={hidden_size}"
         )
     if hidden_states.dtype != torch.bfloat16 or not hidden_states.is_contiguous():
@@ -4336,8 +4311,8 @@ def _create_replay_launch(flat_output, flat_hidden, compile_inputs, shape):
         (BATCH_TILE * seq_len, TILE), dtype=torch.float32, device=device
     )
     dims = (
-        cannbotdsl.Dim("rows", min=16, max=2048, multiple_of=16),
-        cannbotdsl.Dim("batch", min=16, max=256, multiple_of=16),
+        cannbotdsl.Dim("rows", min=16, max=4096, multiple_of=16),
+        cannbotdsl.Dim("batch", min=16, max=512, multiple_of=16),
         cannbotdsl.Dim("conv_pool"),
         cannbotdsl.Dim("conv_tokens", min=3),
     )
@@ -4456,7 +4431,6 @@ class _ReplayCall(NamedTuple):
     scale: float
     lower_bound: float
     rms_norm_eps: float
-    block_num: int | None
 
 
 def _validate_replay_call(call):
@@ -4494,7 +4468,7 @@ def _validate_replay_call(call):
         ("conv_num_accepted_tokens", call.conv_accepted),
     )
     _validate_replay_indices(call.hidden_states.device, batch_size, index_tensors)
-    launch_cores = _resolve_block_num(call.hidden_states, call.block_num)
+    launch_cores = _device_block_num(call.hidden_states)
     return shape, (*scalar_values, launch_cores)
 
 
@@ -4555,13 +4529,12 @@ def mega_recurrent_kda_replayssm(
     scale: float,
     lower_bound: float,
     rms_norm_eps: float = 1e-5,
-    block_num: int | None = None,
 ) -> torch.Tensor:
     """Run fused Mega KDA verification and save records for a later commit.
 
     Args:
         hidden_states (torch.Tensor): BF16, contiguous, shape ``[B,8,H]``;
-            ``B`` is a multiple of 16 in ``[16,256]`` and ``H = 7168``.
+            ``B`` is a multiple of 16 in ``[16,512]`` and ``H = 7168``.
         qkv_projection_weight (torch.Tensor): BF16 FRACTAL_NZ allocation-root
             tensor, shape ``[3*P,H] = [2304,7168]``, with output channels in
             ``[Q(P) | K(P) | V(P)]`` order.
@@ -4612,9 +4585,6 @@ def mega_recurrent_kda_replayssm(
         rms_norm_eps (float): Finite positive output RMSNorm epsilon, defaulting
             to ``1e-5`` and passed as a runtime FP32 scalar; Q/K normalization
             keeps epsilon 1e-6.
-        block_num (int | None): AIC launch count, one of ``8``, ``24``, ``28``,
-            or ``32``. ``None`` selects the largest supported count not
-            exceeding the current stream quota.
     Returns:
         torch.Tensor: Contiguous BF16 output with shape ``[B,8,H]`` on the input
             device; ``conv_state``, ``replay_u``, ``replay_k``, and
@@ -4666,7 +4636,6 @@ def mega_recurrent_kda_replayssm(
         scale,
         lower_bound,
         rms_norm_eps,
-        block_num,
     )
     return _execute_replay_call(call)
 
@@ -4676,13 +4645,13 @@ def mega_recurrent_kda_replayssm(
 # ---------------------------------------------------------------------------
 @export("mega_recurrent_kda_replayssm")
 def export_mega_recurrent_kda_replayssm():
-    """Export the S=8 megakernel served by the 8/24/28/32-core schedules."""
+    """Export the S=8 megakernel served by the 8/16/24/28/32-core schedules."""
     op = MegaRecurrentKDAReplaySSMKernel(hidden_size=HIDDEN_SIZE, num_heads=6)
     bf16 = dtypes.bfloat16
     fp16 = dtypes.float16
     fp32 = dtypes.float32
-    rows_dim = cannbotdsl.Dim("rows", min=16, max=2048, multiple_of=16)
-    batch_dim = cannbotdsl.Dim("batch", min=16, max=256, multiple_of=16)
+    rows_dim = cannbotdsl.Dim("rows", min=16, max=4096, multiple_of=16)
+    batch_dim = cannbotdsl.Dim("batch", min=16, max=512, multiple_of=16)
     conv_pool_dim = cannbotdsl.Dim("conv_pool")
     conv_tokens_dim = cannbotdsl.Dim("conv_tokens", min=3)
     group_rows_dim = cannbotdsl.Dim("group_rows", min=16, max=128, multiple_of=16)
@@ -4749,52 +4718,21 @@ _GRAPH_LIBRARY.define(
     "Tensor dt_bias, "
     "float scale, "
     "float lower_bound, "
-    "float rms_norm_eps=1e-5, "
-    "int? block_num=None"
+    "float rms_norm_eps=1e-5"
     ") -> Tensor"
 )
 
 
 @torch.library.impl(_GRAPH_LIBRARY, "mega_recurrent_kda_replayssm", "Meta")
-def _mega_recurrent_kda_replayssm_meta(
-    hidden_states,
-    qkv_projection_weight,
-    decay_projection_a_weight,
-    decay_projection_b_weight,
-    beta_projection_weight,
-    output_gate_projection_weight,
-    output_norm_weight,
-    output_projection_weight,
-    conv1d_weight,
-    conv_state,
-    recurrent_state,
-    replay_u,
-    replay_k,
-    replay_decay,
-    conv_state_indices,
-    conv_num_accepted_tokens,
-    a_log,
-    dt_bias,
-    scale,
-    lower_bound,
-    rms_norm_eps=1e-5,
-    block_num=None,
-):
+def _mega_recurrent_kda_replayssm_meta(hidden_states, *_args, **_kwargs):
     batch_size = int(hidden_states.shape[0])
     if (
         not BATCH_TILE <= batch_size <= BATCH_TILE * MAX_BATCH_GROUPS
         or batch_size % BATCH_TILE
     ):
         raise ValueError(
-            "mega_recurrent_kda_replayssm requires B to be a multiple of 16 in [16, 256]"
+            "mega_recurrent_kda_replayssm requires B to be a multiple of 16 in [16, 512]"
         )
-    del qkv_projection_weight, decay_projection_a_weight
-    del decay_projection_b_weight, beta_projection_weight
-    del output_gate_projection_weight, output_norm_weight
-    del output_projection_weight, conv1d_weight, conv_state
-    del recurrent_state, replay_u, replay_k, replay_decay
-    del conv_state_indices, conv_num_accepted_tokens, a_log, dt_bias
-    del scale, lower_bound, rms_norm_eps, block_num
     return torch.empty_like(hidden_states, device="meta")
 
 
@@ -4821,7 +4759,6 @@ def _mega_recurrent_kda_replayssm_privateuse1(
     scale,
     lower_bound,
     rms_norm_eps=1e-5,
-    block_num=None,
 ):
     return mega_recurrent_kda_replayssm(
         hidden_states,
@@ -4845,7 +4782,6 @@ def _mega_recurrent_kda_replayssm_privateuse1(
         scale,
         lower_bound,
         rms_norm_eps,
-        block_num,
     )
 
 

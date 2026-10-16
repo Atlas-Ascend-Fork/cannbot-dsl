@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 
-"""Independent precision test for the public 28/32-core Mega KDA.
+"""Independent precision test for the stream-controlled Mega KDA.
 
 The independent CPU golden checks outputs, workspaces, and all state snapshots.
 Run the parametrized NPU cases serially. Absolute and relative tolerances are 5e-3.
@@ -109,7 +109,7 @@ class _CpuArguments(NamedTuple):
     dt_bias: torch.Tensor
 
 
-def _linear(
+def linear_reference(
     value: torch.Tensor, weight: torch.Tensor, output_dtype: torch.dtype
 ) -> torch.Tensor:
     result = torch.matmul(value.float(), weight.float().transpose(-1, -2))
@@ -251,7 +251,7 @@ def run_mega_recurrent_kda_golden(case: _GoldenCase) -> MegaRecurrentKDAGolden:
     batch_size, seq_len, hidden_size = map(int, hidden_states.shape)
     num_heads = int(weights.beta_projection_weight.shape[0])
     projection_size = num_heads * HEAD_DIM
-    raw_qkv = _linear(hidden_states, weights.qkv_projection_weight, torch.float32)
+    raw_qkv = linear_reference(hidden_states, weights.qkv_projection_weight, torch.float32)
     convolved_flat = run_model_native_causal_conv1d_silu(
         raw_qkv,
         weights.conv1d_weight,
@@ -260,14 +260,14 @@ def run_mega_recurrent_kda_golden(case: _GoldenCase) -> MegaRecurrentKDAGolden:
         conv_num_accepted_tokens,
     )
     convolved_qkv = convolved_flat.view(batch_size, seq_len, 3, num_heads, HEAD_DIM)
-    decay_a = _linear(hidden_states, weights.decay_projection_a_weight, torch.bfloat16)
-    raw_decay = _linear(
+    decay_a = linear_reference(hidden_states, weights.decay_projection_a_weight, torch.bfloat16)
+    raw_decay = linear_reference(
         decay_a, weights.decay_projection_b_weight, torch.bfloat16
     ).view(batch_size, seq_len, num_heads, HEAD_DIM)
-    raw_beta = _linear(
+    raw_beta = linear_reference(
         hidden_states, weights.beta_projection_weight, torch.bfloat16
     ).view(batch_size, seq_len, num_heads)
-    raw_output_gate = _linear(
+    raw_output_gate = linear_reference(
         hidden_states, weights.output_gate_projection_weight, torch.bfloat16
     ).view(batch_size, seq_len, num_heads, HEAD_DIM)
     recurrent_output = _run_pooled_recurrent(
@@ -291,7 +291,7 @@ def run_mega_recurrent_kda_golden(case: _GoldenCase) -> MegaRecurrentKDAGolden:
     gated_output = (normalized * torch.sigmoid(raw_output_gate.float())).to(
         torch.bfloat16
     )
-    output = _linear(
+    output = linear_reference(
         gated_output.view(batch_size, seq_len, projection_size),
         weights.output_projection_weight,
         torch.bfloat16,
@@ -367,8 +367,6 @@ def _check_precision(
     pytest.importorskip("torch_npu")
     if not hasattr(torch, "npu") or not torch.npu.is_available():
         pytest.skip("requires Ascend NPU")
-    if int(torch.npu.get_device_properties().cube_core_num) < block_num:
-        pytest.skip(f"requires at least {block_num} AIC cores")
     module = load_sample(SAMPLE)
     arguments = _make_cpu_arguments(batch_size, seq_len, 731 + batch_size + seq_len)
     if strong_state:
@@ -411,15 +409,6 @@ def _check_precision(
         written = expected.recurrent_state[arguments[12].long()]
         assert written.abs().flatten(1).amax(1).min().item() > 0.01
     original_empty = torch.empty
-    kernel_class = module.MegaRecurrentKDAKernel
-    original_init = kernel_class.__init__
-
-    def checked_init(self, *args, **kwargs):
-        assert "block_num" not in kwargs, (
-            "runtime grid must not specialize the kernel constructor"
-        )
-        assert "l2_cache_policy" not in kwargs
-        original_init(self, *args, **kwargs)
 
     def poisoned_output(*args, **kwargs):
         value = original_empty(*args, **kwargs)
@@ -436,8 +425,8 @@ def _check_precision(
 
     with monkeypatch.context() as patch:
         patch.setattr(torch, "empty", poisoned_output)
-        patch.setattr(kernel_class, "__init__", checked_init)
-        patch.setattr(module, "_device_block_num", lambda _ref: block_num)
+        if block_num is not None:
+            patch.setattr(module, "_device_block_num", lambda _ref: block_num)
         actual = module.mega_recurrent_kda(*actual_arguments, scale, lower_bound, 1e-5)
     torch.npu.synchronize()
     assert actual.dtype == torch.bfloat16
@@ -446,7 +435,6 @@ def _check_precision(
     launch = getattr(module, "_COMPILED_LAUNCH")
     workspace_views = launch.workspace_views
     assert len(workspace_views) == 7
-    assert tuple(launch.norm_exchange.shape) == (16 * seq_len, 128)
     rows, projection_size = (batch_size * seq_len, 6 * HEAD_DIM)
     expected_workspaces = (
         ("gated_output", expected.gated_output.reshape(rows, projection_size)),
@@ -527,10 +515,35 @@ def _check_precision(
             )
 
 
-_PRECISION_CASES = [(16, 8, 28), (16, 8, 32), (32, 8, 32)]
+# Retain the existing explicit 28/32-core cases and cover automatic quotas.
+_PRECISION_CASES = [
+    pytest.param(16, 8, 28),
+    pytest.param(16, 8, 32),
+    pytest.param(32, 8, 32),
+    pytest.param(16, 8, "auto"),
+    pytest.param(32, 8, "auto"),
+    *[pytest.param(batch, 8, 16) for batch in (16, 32, 512)],
+    *[
+        pytest.param(batch, 8, "available", marks=pytest.mark.slow)
+        for batch in (16, 32, 48, 64, 256, 512)
+    ],
+]
 
 
 @pytest.mark.npu
 @pytest.mark.parametrize("batch_size,seq_len,cores", _PRECISION_CASES)
 def test_precision(batch_size, seq_len, cores, monkeypatch):
-    _check_precision(batch_size, seq_len, cores, monkeypatch)
+    pytest.importorskip("torch_npu")
+    if not hasattr(torch, "npu") or not torch.npu.is_available():
+        pytest.skip("requires Ascend NPU")
+    module = load_sample(SAMPLE)
+    stream = torch.npu.current_stream(torch.npu.current_device())
+    available = int(module.cannbotdsl.get_platform_info(stream=stream).cube_core_num)
+    grids = tuple(count for count in (8, 16, 24, 28, 32) if count <= available)
+    if not grids:
+        pytest.skip("Mega KDA requires at least 8 AIC cores in the current stream")
+    controls = (None,) if cores == "auto" else grids if cores == "available" else (cores,)
+    if isinstance(cores, int) and available < cores:
+        pytest.skip(f"requires a stream quota of at least {cores} AIC cores")
+    for block_num in controls:
+        _check_precision(batch_size, seq_len, block_num, monkeypatch)

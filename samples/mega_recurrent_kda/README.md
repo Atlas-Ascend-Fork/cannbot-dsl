@@ -3,13 +3,13 @@
 ## 产品支持情况
 
 - Ascend 950：支持。
-- AIC 核数：从输入设备的当前 stream 配额读取，并按 32 核封顶。
+- AIC 核数：支持 8、16、24、28、32；自动选择不超过当前 stream 有效配额的最大支持值。
 
 ## 功能说明
 
 `mega_recurrent_kda` 面向多 batch decode，将 QKV、decay、beta、output-gate 投影，causal Conv1D + SiLU，Q/K 归一化，recurrent KDA，RMSNorm，output gating 和输出投影融合为一次 mixed AIC/AIV kernel 调用。实现位于 [`mega_recurrent_kda.py`](mega_recurrent_kda.py)。
 
-本版本服务 `S=8` decode 主力场景。一个 compiled callable 支持运行时 B，以及 8/24/28/32 AIC；host 通过 `get_platform_info(stream=当前 stream)` 读取有效 AIC 核数并按 32 核封顶，kernel 再通过 `get_block_num()` 选择核数调度。
+本版本支持 `S=8` decode 场景。一个 compiled callable 支持运行时 B，以及 8/16/24/28/32 AIC；host 通过 `get_platform_info(stream=当前 stream)` 读取有效 AIC 配额，选择不超过该配额的最大支持核数，kernel 再通过 `get_block_num()` 选择核数调度。
 
 ### 计算过程
 
@@ -88,14 +88,14 @@ mega_recurrent_kda.mega_recurrent_kda.mega_recurrent_kda(
 
 ## 约束说明
 
-- 仅支持 BSH：`B=16,32,…,256`，`S=8`，`H=7168`，`N=6`，`D=128`。
-- 所有 Tensor 必须连续并位于同一 NPU；启动核数从输入设备当前 stream 的有效 AIC 配额读取，并按 32 核封顶。
+- 仅支持 BSH：`B=16,32,…,512`，`S=8`，`H=7168`，`N=6`，`D=128`。
+- 所有 Tensor 必须连续并位于同一 NPU；启动核数从输入设备当前 stream 的有效 AIC 配额读取，选择不超过该配额的最大支持核数。
 - 六个投影权重必须使用 `FRACTAL_NZ`，逻辑 shape 保持输出通道在前。必须传 allocation-root Tensor，不能传 view；`torch.nn.Parameter` 先调用 `.detach()`。
 - beta 权重必须对完整逻辑 `[6,H]` allocation root 做 NZ 转换，保留物理 padding。
 - `conv1d_weight` 和 `output_norm_weight` 保持 ND。兼容 Conv 布局会在每次调用时转换，推荐预先准备 `[3,N,4,D]`。
 - `scale`、`lower_bound`、`rms_norm_eps` 均作为运行时 FP32 scalar 传入；修改这些值不会重新编译。
 - 算子计算全部 S 个 proposal token；accepted 计数只选择初始历史和 state，不截断输出。
-- 一个 compiled callable 复用动态 B、8/24/28/32 AIC 和 state 池大小。workspace 尺寸或设备变化时重新分配；并发调用须由调用方串行化。
+- 一个 compiled callable 复用动态 B、8/16/24/28/32 AIC 和 state 池大小。workspace 尺寸或设备变化时重新分配；并发调用须由调用方串行化。
 
 ### 状态池语义
 
@@ -107,14 +107,15 @@ Recurrent 索引范围为 `[0,R)`，槽 0 有效，且 `R>=B*S`。初始状态�
 
 运行时只有两个 workload 分支：
 
-- 单 group：`B=16` 且 AIC 为 24/28/32。三种核数共用两轮 recurrent 与逐轮 OProj 主路径；24 AIC 仅在该分支内部采用 18 个 QKV core 加 6 个 auxiliary core 的 frontend 映射。8 AIC 的 `B=16` 继续走全局任务池，避免单 group 栅栏开销。
-- 全局自适应任务池：全部 8 AIC case，以及 24/28/32 AIC 的 `B>=32`。frontend 根据任务量在 panel 粒度和 M128/N384 粒度之间动态选择；backend 每 slot 完成最多 `2*AIC` 个 batch/head recurrent 任务，累计每完成 48 个任务便发布一个 128 行 gated chunk 并启动 OProj。
+- 单 group：`B=16` 且 AIC 为 24/28/32。三种核数共用两轮 recurrent 与逐轮 OProj 主路径；24 AIC 仅在该分支内部采用 18 个 QKV core 加 6 个 auxiliary core 的 frontend 映射。8/16 AIC 的 `B=16` 继续走全局任务池，避免单 group 栅栏开销。
+- 全局自适应任务池：全部 8/16 AIC case，以及 24/28/32 AIC 的 `B>=32`。frontend 根据任务量在 panel 粒度和 M128/N384 粒度之间动态选择；backend 每 slot 完成最多 `2*AIC` 个 batch/head recurrent 任务，累计每完成 48 个任务便发布一个 128 行 gated chunk 并启动 OProj。
 
-因此 B16/B32/B48/B64 不是 host 特化或多份二进制；运行时 B 和 `get_block_num()` 在同一 compiled callable 内选中对应调度。
+不同 batch 大小复用同一 compiled callable；运行时 B 和 `get_block_num()` 选择对应调度。
 
 | AIC 核数 | OProj N tile | OProj KS | 每核 tile 数上限 | tile stride | L0C depth | resident input | resident weight |
 |---:|---:|---:|---:|---:|---:|:---:|:---:|
 | 8 | 128 | 64 | 7 | 1 | 2 | 是 | 否 |
+| 16 | 256 | 64 | 2 | 16 | 2 | 否 | 否 |
 | 24 | 256 | 64 | 2 | 24 | 2 | 否 | 否 |
 | 28 | 256 | 64 | 1 | 1 | 1 | 否 | 是 |
 | 32 | 256 | 64 | 1 | 1 | 1 | 否 | 是 |
@@ -169,7 +170,7 @@ python -m pytest -q test/mega_recurrent_kda/test_mega_recurrent_kda.py
 python -m pytest -q test/mega_recurrent_kda/test_mega_recurrent_kda.py --whitebox
 ```
 
-输出和 state snapshot 使用 `atol=rtol=0.005`；应保持不变的槽位使用零容差。8/24 AIC 迁移验证另外以相同输入逐项对比 microbatch 的输出、Conv state 和 recurrent state，覆盖 B16/B64；最大绝对误差不超过 `1.907e-6`（输出）和 `3.987e-8`（recurrent state），Conv state 逐位一致。
+输出和 state snapshot 使用 `atol=rtol=0.005`；应保持不变的槽位使用零容差。8/24 AIC 精度验证另外以相同输入逐项对比 microbatch 的输出、Conv state 和 recurrent state，覆盖 B16/B64；最大绝对误差不超过 `1.907e-6`（输出）和 `3.987e-8`（recurrent state），Conv state 逐位一致。
 
 ## 性能
 

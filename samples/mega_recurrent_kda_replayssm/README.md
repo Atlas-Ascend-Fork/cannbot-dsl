@@ -3,7 +3,7 @@
 ## 产品支持情况
 
 - Ascend 950：支持。
-- AIC 核数：支持 8、24、28、32；默认从输入设备当前 stream 的有效配额读取，并按 32 核封顶。
+- AIC 核数：支持 8、16、24、28、32；默认从输入设备当前 stream 的有效配额读取，选择不超过该配额的最大支持核数。
 
 ## 功能说明
 
@@ -22,9 +22,9 @@ gating 和输出投影融合为一次 mixed AIC/AIV kernel 调用。实现位于
 算子不修改 `recurrent_state`。Conv1D 使用独立的 `conv_state_indices` 和
 `conv_num_accepted_tokens`，并原地更新 `conv_state`。
 
-一个 compiled callable 覆盖 8/24/28/32 AIC。`B` 按 16 的倍数取值；
-当前 Python 接口使用 B16 调度，native binary 支持 `B=16,32,…,256`。
-模块同时提供 native binary 注册和 `torch.compile` 图模式注册。
+一个 compiled callable 覆盖 8/16/24/28/32 AIC。`B` 按 16 的倍数取值；
+Python 接口与 native binary 均支持动态 `B=16,32,…,512`，固定 `S=8`。
+模块提供 native binary 注册和 `torch.compile` 图模式注册。
 
 ### 计算过程
 
@@ -60,12 +60,11 @@ mega_recurrent_kda_replayssm.mega_recurrent_kda_replayssm.mega_recurrent_kda_rep
     scale: float,
     lower_bound: float,
     rms_norm_eps: float = 1e-5,
-    block_num: Optional[int] = None,
 ) -> torch.Tensor
 ```
 
 模块路径为 `mega_recurrent_kda_replayssm.mega_recurrent_kda_replayssm`。
-除 `rms_norm_eps` 和 `block_num` 外，其余参数均为必选。
+除 `rms_norm_eps` 外，其余参数均为必选。
 动态图直接调用上面的 Python 函数；图模式仍调用同一函数，Dynamo 会将其替换为
 `torch.ops.cannbotdsl_mega_recurrent_kda_replayssm.mega_recurrent_kda_replayssm`。
 native binary 注册名为 `mega_recurrent_kda_replayssm`。
@@ -98,7 +97,6 @@ native binary 注册名为 `mega_recurrent_kda_replayssm`。
 | `scale` | float | 必选 | 有限的 query scale。 | float32 | - |
 | `lower_bound` | float | 必选 | decay gate 下界，范围为 `[-5, 0]`。 | float32 | - |
 | `rms_norm_eps` | float | 可选 | 有限且大于零的 RMSNorm epsilon，默认值为 `1e-5`。 | float32 | - |
-| `block_num` | int | 可选 | AIC 核数；可取 `8`、`24`、`28`、`32`，默认自动选择。 | - | - |
 
 ## 返回值说明
 
@@ -111,8 +109,7 @@ native binary 注册名为 `mega_recurrent_kda_replayssm`。
 
 ## 约束说明
 
-- `B` 必须是 16 的倍数：当前 Python 接口支持 `B=16`，native binary 导出规格
-  支持 `B=16,32,…,256`。固定 `S = 8`、`H = 7168`、`N = 6`、`D = 128`。
+- `B` 必须是 16 的倍数：Python 接口和 native binary 均支持 `B=16,32,…,512`。固定 `S = 8`、`H = 7168`、`N = 6`、`D = 128`。
 - 所有 Tensor 必须连续并位于同一 NPU。
 - 六个投影权重必须使用 `FRACTAL_NZ`，逻辑 shape 保持输出通道在前。
   必须传 allocation-root Tensor，不能传 view；`torch.nn.Parameter` 先调用
@@ -126,10 +123,10 @@ native binary 注册名为 `mega_recurrent_kda_replayssm`。
   修改这些值不会重新编译。`scale` 必须有限，`lower_bound` 必须位于
   `[-5,0]`，`rms_norm_eps` 必须有限且大于零。
 - 算子计算全部 8 个 proposal token，并覆盖全部 replay record；accepted 结果由后续 Commit 接口消费，不截断 verify 输出。
-- `block_num=None` 时，算子读取当前 stream 的有效 AIC 配额，并选择不超过
-  该配额的最大支持值。显式值不得超过有效 AIC 配额。
+- 算子读取当前 stream 的有效 AIC 配额，自动选择不超过该配额的最大支持值；
+  Python 和图模式接口不再接受 `block_num` 参数。
 - 索引和 accepted 数值不拷回 host 校验，调用方必须满足上述范围。
-- 一个 compiled callable 复用四种核数；scratch 的设备或 shape 变化时重新分配。模块只保留一份无 cache key 的 compiled callable 和 scratch，并发调用须由调用方串行化。
+- 一个 compiled callable 复用五种核数；scratch 的设备或 shape 变化时重新分配。模块只保留一份无 cache key 的 compiled callable 和 scratch，并发调用须由调用方串行化。
 
 ### 状态语义
 
@@ -147,18 +144,19 @@ FP16 U、FP16 归一化 K 和 FP32 激活后 decay 分别写入 `replay_u`、
 
 ### 调度与 workspace
 
-内核固定按一个 B16 group 调度；运行时 `get_block_num()` 在同一 mixed kernel
-中选择 8/24/28/32 AIC 分支。每个分支均执行两轮 recurrent KDA，并使用对应的
+内核以 B16 group 为基本调度单位；运行时 `get_block_num()` 在同一 mixed kernel
+中选择 8/16/24/28/32 AIC 分支。每个分支均执行两轮 recurrent KDA，并使用对应的
 输出投影配置。
 
 | AIC 核数 | OProj N tile | OProj KS | 每核 tile 数上限 | L0C depth | resident weight |
 |---:|---:|---:|---:|---:|:---:|
 | 8 | 128 | 64 | 7 | 2 | 否 |
+| 16 | 256 | 64 | 2 | 2 | 否 |
 | 24 | 256 | 64 | 2 | 2 | 否 |
 | 28 | 256 | 64 | 1 | 1 | 是 |
 | 32 | 256 | 64 | 1 | 1 | 是 |
 
-GM workspace 固定按 B16、S8 分配 7 个 BF16 区域，宽度为
+GM workspace 按 `B*S` 分配 7 个 BF16 区域，宽度为
 `(768,768,768,768,768,16,128)`，另有 FP32 `[128,128]` norm scratch。
 Replay U/K/decay 是调用方提供的独立输出，不属于 workspace。
 
@@ -199,7 +197,7 @@ out = mega_recurrent_kda_replayssm(
     replay_u, replay_k, replay_decay,
     conv_state_indices, conv_num_accepted_tokens,
     a_log, dt_bias,
-    128 ** -0.5, -5.0, 1e-5, 32,
+    128 ** -0.5, -5.0, 1e-5,
 )
 ```
 
@@ -212,9 +210,9 @@ python -m pytest -q \
   test/mega_recurrent_kda_replayssm/test_mega_recurrent_kda_replayssm.py
 ```
 
-测试与当前 `mega_recurrent_kda` 的输出、Conv state 和逐 token state snapshot
-对照。覆盖 `B=16`、`block_num=8/24/28/32`、checkpoint 只读、replay
-record 完整性、动态图接口和 `torch.compile(fullgraph=True)` 注册。输出与
+测试使用独立 CPU golden 对比输出、Conv state、replay record 和 Commit 结果。
+覆盖 `B=16/32/512`、8/16/24/28/32 AIC、checkpoint 只读、record 完整性、
+Conv state 更新及 Commit 状态精度。输出与
 reference 使用 `atol=rtol=0.005`；只读 checkpoint 使用零容差。
 
 ## 性能
