@@ -305,6 +305,22 @@ flash_mla_with_kvcache:
   options:
     - flash_mla_with_kvcache
 
+gather_v2:
+  module: True
+  src:
+    - samples/gather_v2
+    - test/gather_v2
+  options:
+    - gather_v2
+
+scatter_elements:
+  module: True
+  src:
+    - samples/scatter_elements
+    - test/scatter_elements
+  options:
+    - scatter_elements
+
 shared:
   module: True
   src:

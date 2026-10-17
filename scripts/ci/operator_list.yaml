@@ -46,3 +46,5 @@ operators:
   - mega_recurrent_kda_replayssm
   - commit_recurrent_kda_replayssm
   - quant_mla_prolog
+  - gather_v2
+  - scatter_elements
