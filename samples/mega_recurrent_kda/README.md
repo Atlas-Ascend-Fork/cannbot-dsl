@@ -2,30 +2,32 @@
 
 ## 产品支持情况
 
-- Ascend 950：支持。
-- AIC 核数：支持 8、16、24、28、32；自动选择不超过当前 stream 有效配额的最大支持值。
+- Ascend 950。
+- TP4、TP8、TP16；模型 batch 为 1～32，`S=8`、`H=7168`、head dimension 为 128。
+- 支持的 AIC 配额为 8、16、24、28、32，对应 AIV 配额至少为 AIC 的两倍。
 
 ## 功能说明
 
-`mega_recurrent_kda` 面向多 batch decode，将 QKV、decay、beta、output-gate 投影，causal Conv1D + SiLU，Q/K 归一化，recurrent KDA，RMSNorm，output gating 和输出投影融合为一次 mixed AIC/AIV kernel 调用。实现位于 [`mega_recurrent_kda.py`](mega_recurrent_kda.py)。
+`mega_recurrent_kda` 将 QKV、decay、beta、output-gate 投影、causal Conv1D + SiLU、Q/K 归一化、recurrent KDA、RMSNorm、output gating 和输出投影融合为一次 mixed AIC/AIV kernel 调用。
 
-本版本支持 `S=8` decode 场景。一个 compiled callable 支持运行时 B，以及 8/16/24/28/32 AIC；host 通过 `get_platform_info(stream=当前 stream)` 读取有效 AIC 配额，选择不超过该配额的最大支持核数，kernel 再通过 `get_block_num()` 选择核数调度。
+全部实现位于 [`mega_recurrent_kda.py`](mega_recurrent_kda.py)。保留原有 20 个公开参数，不增加 `core_num` 参数。算子读取输入设备当前 stream 的有效 AIC 配额，超过 32 时按 32 启动；截断后的配额须属于上述支持集合，AIV 配额也必须满足要求。
 
-### 计算过程
+### TP 与 batch 的对应关系
 
-算子按以下顺序执行：
+`N=96/TP`，`D=128`，`P=N*D`。本样例的实际输入为 `[B,8,7168]`，其中 `B=model_batch*TP`。模型 batch 和算子输入的第一维 B 含义不同：
 
-1. 将 hidden states 投影为 Q/K/V、decay、beta 和 output gate。
-2. 对 Q/K/V 执行 causal Conv1D 和 SiLU，并归一化 Q/K。
-3. 按 head 递推 KDA state，对输出执行 RMSNorm 和 sigmoid gating。
-4. 将六个 head 的结果拼接并投影回隐藏维度。
+| TP | N | P | 模型 batch | 算子 B |
+|---:|---:|---:|:---|:---|
+| 4 | 24 | 3072 | 1～32 | 4、8、…、128 |
+| 8 | 12 | 1536 | 1～32 | 8、16、…、256 |
+| 16 | 6 | 768 | 1～32 | 16、32、…、512 |
 
-`rms_norm_eps` 控制第 3 步的输出 RMSNorm，作为运行时 FP32 scalar 传入。Q/K 归一化固定使用 `1e-6`。
+`rms_norm_eps` 控制输出 RMSNorm，作为运行时 FP32 scalar 传入；Q/K 归一化固定使用 `1e-6`。
 
 ## 函数原型
 
 ```python
-mega_recurrent_kda.mega_recurrent_kda.mega_recurrent_kda(
+mega_recurrent_kda(
     hidden_states: torch.Tensor,
     qkv_projection_weight: torch.Tensor,
     decay_projection_a_weight: torch.Tensor,
@@ -41,19 +43,18 @@ mega_recurrent_kda.mega_recurrent_kda.mega_recurrent_kda(
     ssm_state_indices: torch.Tensor,
     conv_num_accepted_tokens: torch.Tensor,
     num_accepted_tokens: torch.Tensor,
-    a_log: torch.Tensor,
+    A_log: torch.Tensor,
     dt_bias: torch.Tensor,
     scale: float,
     lower_bound: float,
-    rms_norm_eps: float = 1e-5,
-) -> torch.Tensor
+    rms_norm_eps: float = 1e-5) -> torch.Tensor
 ```
 
-模块路径为 `mega_recurrent_kda.mega_recurrent_kda`。除 `rms_norm_eps` 外均为必选。
+模块路径为 `mega_recurrent_kda.mega_recurrent_kda`。除 `rms_norm_eps` 外均为必选参数。
 
 ## 参数说明
 
-`B` 为 batch 数，`S` 为 proposal token 数，`H=7168`，`N=6`，`D=128`，`P=N*D=768`。输入布局固定为 BSH。
+输入布局固定为 BSH。下表的 B、N、P 由上方 TP 对应关系决定，`S=8`、`H=7168`、`D=128`。
 
 | 参数名 | 参数类型 | 可选/必选 | 描述 | 数据类型/存储 | 维度(shape) |
 |:---|:---|:---|:---|:---|:---|
@@ -72,7 +73,7 @@ mega_recurrent_kda.mega_recurrent_kda.mega_recurrent_kda(
 | `ssm_state_indices` | Tensor | 必选 | batch-major token 对应的 recurrent state 槽位。 | int32 / ND | `[B*S]` |
 | `conv_num_accepted_tokens` | Tensor | 必选 | 选择 Conv 历史起点的 accepted 计数。 | int32 / ND | `[B]` |
 | `num_accepted_tokens` | Tensor | 必选 | 选择初始 recurrent state 的 accepted 计数。 | int32 / ND | `[B]` |
-| `a_log` | Tensor | 必选 | 每个 head 的 log decay 参数。 | float32 / ND | `[N]` |
+| `A_log` | Tensor | 必选 | 每个 head 的 log decay 参数。 | float32 / ND | `[N]` |
 | `dt_bias` | Tensor | 必选 | 每个 head、每个通道的 decay bias。 | float32 / ND | `[N,D]` |
 | `scale` | float | 必选 | 有限的 query scale，常用值为 `128 ** -0.5`。 | float32 | - |
 | `lower_bound` | float | 必选 | decay gate 下界，范围为 `[-5,0]`。 | float32 | - |
@@ -80,55 +81,37 @@ mega_recurrent_kda.mega_recurrent_kda.mega_recurrent_kda(
 
 ## 返回值说明
 
-| 参数名 | 参数类型 | 可选/必选 | 描述 | 数据类型 | 维度(shape) |
-|:---|:---|:---|:---|:---|:---|
-| `out` | Tensor | 必选 | 输出 hidden states，连续且位于输入设备。 | bfloat16 | `[B,S,H]` |
-
-算子还会原地更新 `conv_state` 和 `recurrent_state`。
+返回连续的 BF16 Tensor，shape 为 `[B,S,H]`，位于输入设备。`conv_state` 和 `recurrent_state` 同时原地更新。
 
 ## 约束说明
 
-- 仅支持 BSH：`B=16,32,…,512`，`S=8`，`H=7168`，`N=6`，`D=128`。
-- 所有 Tensor 必须连续并位于同一 NPU；启动核数从输入设备当前 stream 的有效 AIC 配额读取，选择不超过该配额的最大支持核数。
-- 六个投影权重必须使用 `FRACTAL_NZ`，逻辑 shape 保持输出通道在前。必须传 allocation-root Tensor，不能传 view；`torch.nn.Parameter` 先调用 `.detach()`。
-- beta 权重必须对完整逻辑 `[6,H]` allocation root 做 NZ 转换，保留物理 padding。
-- `conv1d_weight` 和 `output_norm_weight` 保持 ND。兼容 Conv 布局会在每次调用时转换，推荐预先准备 `[3,N,4,D]`。
-- `scale`、`lower_bound`、`rms_norm_eps` 均作为运行时 FP32 scalar 传入；修改这些值不会重新编译。
-- 算子计算全部 S 个 proposal token；accepted 计数只选择初始历史和 state，不截断输出。
-- 一个 compiled callable 复用动态 B、8/16/24/28/32 AIC 和 state 池大小。workspace 尺寸或设备变化时重新分配；并发调用须由调用方串行化。
+- 所有 Tensor 必须连续并位于同一 NPU，B 满足对应 TP 的范围和整除约束。
+- 六个投影权重使用 `FRACTAL_NZ`，逻辑 shape 保持输出通道在前。传入 allocation-root Tensor，不能传 view；`torch.nn.Parameter` 先调用 `.detach()`。
+- beta 权重对完整 `[N,H]` allocation root 做 NZ 转换，保留物理 padding。
+- `conv1d_weight` 和 `output_norm_weight` 保持 ND。兼容 Conv 布局每次调用都会转换，推荐预先准备 `[3,N,4,D]`。
+- `scale` 有限；`lower_bound` 属于 `[-5,0]`；`rms_norm_eps` 有限且大于零。这三个 scalar 均以运行时 FP32 值传入。
+- 计算全部 S 个 proposal token；accepted 计数选择初始历史和 state，不截断输出。
+- 一个设备上复用已编译的 callable。workspace 按设备和 shape 缓存；共享 workspace 的调用必须由调用方串行化。
 
 ### 状态池语义
 
-Conv 索引范围为 `[0,C)`。槽 0 是不可写的空槽，对应 Conv 输出为零；同一次调用中的非零索引不能重复。历史起点为 `max(conv_num_accepted_tokens[b]-1,0)`，要求 `L>=S+2` 且起点加 3 不超过 L。
+Conv 索引范围为 `[0,C)`。槽 0 是不可写的空槽，对应 Conv 输出为零；同一次调用中的非零索引不能重复。历史起点为 `max(conv_num_accepted_tokens[b]-1,0)`，要求 `L>=S+2` 且起点加 3 不超过 L。每个非空槽的 `[0:2]` 写入选中历史的最后两行，`[2:S+2]` 写入当前 raw QKV；其他行和未选槽保持不变。
 
 Recurrent 索引范围为 `[0,R)`，槽 0 有效，且 `R>=B*S`。初始状态来自 `ssm_state_indices[b*S+max(num_accepted_tokens[b]-1,0)]`；每个 token 的新状态写入 `ssm_state_indices[b*S+t]`。不同 batch 使用的 recurrent 槽不能重叠。
 
 ### 调度与 workspace
 
-运行时只有两个 workload 分支：
+TP4/8/16 共用一个算子文件和动态编译入口。32 AIC 使用已有的内部 TP 调度；其他支持配额根据行数、head 数和核数，在固定的 M/N tile 模板中按最忙核工作量统一选型。N384 仅用于完整行块，N256 支持尾块；没有按逐 shape 实测结果索引的调度表。
 
-- 单 group：`B=16` 且 AIC 为 24/28/32。三种核数共用两轮 recurrent 与逐轮 OProj 主路径；24 AIC 仅在该分支内部采用 18 个 QKV core 加 6 个 auxiliary core 的 frontend 映射。8/16 AIC 的 `B=16` 继续走全局任务池，避免单 group 栅栏开销。
-- 全局自适应任务池：全部 8/16 AIC case，以及 24/28/32 AIC 的 `B>=32`。frontend 根据任务量在 panel 粒度和 M128/N384 粒度之间动态选择；backend 每 slot 完成最多 `2*AIC` 个 batch/head recurrent 任务，累计每完成 48 个任务便发布一个 128 行 gated chunk 并启动 OProj。
+输出投影按 TP、核数和发布块大小选择权重驻留、输入复用或流式分块路径。TP16 的对应路径可以驻留输出权重分块，TP4/TP8 的当前路径采用其他复用策略；是否能进一步优化需要结合 L1 预算和流水验证。
 
-不同 batch 大小复用同一 compiled callable；运行时 B 和 `get_block_num()` 选择对应调度。
+GM workspace 包含 7 个 BF16 区域，行数均为 `B*S`，宽度为 `(P,P,P,P,P,16*ceil(N/16),128)`，另有 FP32 `[128,128]` norm scratch。
 
-| AIC 核数 | OProj N tile | OProj KS | 每核 tile 数上限 | tile stride | L0C depth | resident input | resident weight |
-|---:|---:|---:|---:|---:|---:|:---:|:---:|
-| 8 | 128 | 64 | 7 | 1 | 2 | 是 | 否 |
-| 16 | 256 | 64 | 2 | 16 | 2 | 否 | 否 |
-| 24 | 256 | 64 | 2 | 24 | 2 | 否 | 否 |
-| 28 | 256 | 64 | 1 | 1 | 1 | 否 | 是 |
-| 32 | 256 | 64 | 1 | 1 | 1 | 否 | 是 |
-
-GM workspace 按 `B*S` 分配 7 个 BF16 区域，宽度为 `(768,768,768,768,768,16,128)`，另有 FP32 `[16*S,128]` norm scratch。
-
-## 确定性计算
-
-当前样例未提供逐位确定性保证，精度测试按数值容差校验。
+为在同一编译契约内处理三种 NZ 权重布局，内部保留未使用权重槽的存储描述；完整 TP sweep 约保留 370 MiB 的未使用槽存储。当前 TP 的实际权重直接传入，不复制到这些槽中。调用方应在设备内存预算中计入这部分缓存。
 
 ## 调用示例
 
-六个投影权重在模型初始化时转换一次，后续调用直接复用：
+在仓库根目录执行时设置 `PYTHONPATH=samples`，或将 samples 加入 Python 模块搜索路径。以下变量按参数表预先准备，六个投影权重在初始化时转为 NZ，后续直接复用：
 
 ```python
 import torch
@@ -136,11 +119,11 @@ import torch_npu
 
 from mega_recurrent_kda.mega_recurrent_kda import mega_recurrent_kda
 
+
 def to_nz(weight):
-    return torch_npu.npu_format_cast(
-        weight.detach().to(device="npu", dtype=torch.bfloat16).contiguous(),
-        torch_npu.Format.FRACTAL_NZ,
-    )
+    value = weight.detach().to(device="npu", dtype=torch.bfloat16).contiguous()
+    return torch_npu.npu_format_cast(value, torch_npu.Format.FRACTAL_NZ)
+
 
 qkv_weight = to_nz(qkv_weight)
 decay_a_weight = to_nz(decay_a_weight)
@@ -149,38 +132,67 @@ beta_weight = to_nz(beta_weight)
 output_gate_weight = to_nz(output_gate_weight)
 output_projection_weight = to_nz(output_projection_weight)
 
-out = mega_recurrent_kda(
-    hidden_states,
-    qkv_weight, decay_a_weight, decay_b_weight, beta_weight,
-    output_gate_weight, output_norm_weight, output_projection_weight,
-    conv1d_weight, conv_state, recurrent_state,
-    conv_state_indices, ssm_state_indices,
-    conv_num_accepted_tokens, num_accepted_tokens,
-    a_log, dt_bias,
-    128 ** -0.5, -5.0, 1e-5,
-)
+out = mega_recurrent_kda(hidden_states, qkv_weight, decay_a_weight, decay_b_weight, beta_weight,
+    output_gate_weight, output_norm_weight, output_projection_weight, conv1d_weight, conv_state, recurrent_state,
+    conv_state_indices, ssm_state_indices, conv_num_accepted_tokens, num_accepted_tokens,
+    A_log, dt_bias, 128**-0.5, -5.0, 1e-5)
 ```
 
-## 精度测试
+需要指定有效核配额时，由调用方设置当前 stream，再调用同一入口；算子接口保持不变：
 
-在仓库根目录执行单文件测试。测试内联独立 PyTorch FP32 golden，直接校验输出、Conv state 和每个 recurrent state snapshot，不依赖其他 golden 文件：
+```python
+stream = torch.npu.Stream()
+torch.npu.synchronize()
+torch.npu.set_stream_limit(stream, cube_num=16, vector_num=32)
+try:
+    with torch.npu.stream(stream):
+        out = mega_recurrent_kda(*arguments, 128**-0.5, -5.0, 1e-5)
+        torch.npu.synchronize()
+finally:
+    torch.npu.synchronize()
+    torch.npu.reset_stream_limit(stream)
+```
+
+示例中的 `arguments` 为前 17 个 Tensor 参数。切换 stream 前必须保证输入已就绪；读取结果前等待计算完成。
+
+## 编译与精度测试
+
+需要可用的 CANN、CANNBot-DSL、PyTorch 和 torch_npu 环境。仓库根目录可运行：
 
 ```bash
-python -m pytest -q test/mega_recurrent_kda/test_mega_recurrent_kda.py
-python -m pytest -q test/mega_recurrent_kda/test_mega_recurrent_kda.py --whitebox
+# 提前编译动态入口；常规算子首次调用也会触发编译
+PYTHONPATH=samples python -c 'from mega_recurrent_kda.mega_recurrent_kda import export_mega_recurrent_kda; export_mega_recurrent_kda()'
+
+# 无设备接口检查
+python -m pytest -q test/mega_recurrent_kda/test_mega_recurrent_kda.py -m 'not npu'
+
+# 设备精度与白盒检查
+python -m pytest -q test/mega_recurrent_kda/test_mega_recurrent_kda.py -m npu
 ```
 
-输出和 state snapshot 使用 `atol=rtol=0.005`；应保持不变的槽位使用零容差。8/24 AIC 精度验证另外以相同输入逐项对比 microbatch 的输出、Conv state 和 recurrent state，覆盖 B16/B64；最大绝对误差不超过 `1.907e-6`（输出）和 `3.987e-8`（recurrent state），Conv state 逐位一致。
+测试文件内联独立 CPU golden，校验最终输出、内部 workspace、完整 Conv/recurrent 状态池、不可变空槽和重复调用，并覆盖 TP4/TP8 的短 batch 与尾块。数值比较使用 `atol=rtol=0.005`，不可变槽位使用零容差。当前不提供逐位确定性保证。
 
 ## 性能
 
-以下结果于 2026-09-17 使用 Ascend950PR_9599、CANN 9.2.0 和 CANNBot-DSL 采集。固定 `S=8`、`rms_norm_eps=1e-5`、NZ 权重和 seed 123；每个配置先执行 10 次 warmup，再保留 20 次逐次清 L2 的连续 sample，表中为 Task Duration 中位数。
+以下为 2026-10-17 最终泛化实现的代表性结果，目标架构为 dav-3510。完整测试范围为 TP4/8/16 × 模型 batch 1～32 × 8/16/24/32 AIC，共 384 组。
 
-| B | 8 AIC (us) | 24 AIC (us) | 28 AIC (us) | 32 AIC (us) |
-|---:|---:|---:|---:|---:|
-| 16 | 158.944 | 79.017 | 76.136 | 76.687 |
-| 32 | - | 149.534 | 123.800 | 120.870 |
-| 48 | - | 167.280 | - | 154.899 |
-| 64 | 518.759 | 247.880 | 228.880 | 199.003 |
-| 128 | 1003.562 | 512.858 | - | - |
-| 256 | 1996.899 | 1039.709 | 953.063 | 916.243 |
+每组预热 10 次，采集 20 次样本；每次性能采样恢复状态池初态并清理 224 MiB L2，仅统计目标融合内核。表中为算术平均耗时，单位 us，未计状态恢复、清 L2 和 Profiler 导出开销。28 AIC 未纳入本轮性能表。未测小算子基线，不报告相对小算子加速比。
+
+| TP | 模型 batch | 算子 B | 8 AIC avg us | 16 AIC avg us | 24 AIC avg us | 32 AIC avg us |
+|---:|---:|---:|---:|---:|---:|---:|
+| 4 | 1 | 4 | 297.406 | 183.969 | 183.724 | 137.848 |
+| 4 | 8 | 32 | 1041.499 | 566.466 | 470.679 | 399.642 |
+| 4 | 16 | 64 | 2014.204 | 1049.237 | 828.500 | 666.410 |
+| 4 | 32 | 128 | 3963.621 | 2033.745 | 1528.974 | 1294.218 |
+| 8 | 1 | 8 | 213.786 | 139.306 | 132.772 | 108.397 |
+| 8 | 8 | 64 | 1036.876 | 564.738 | 436.069 | 410.589 |
+| 8 | 16 | 128 | 2008.373 | 1062.068 | 800.319 | 646.212 |
+| 8 | 32 | 256 | 3985.566 | 2056.201 | 1492.666 | 1261.817 |
+| 16 | 1 | 16 | 210.033 | 161.007 | 148.721 | 73.787 |
+| 16 | 8 | 128 | 1042.872 | 571.432 | 442.226 | 318.546 |
+| 16 | 16 | 256 | 2055.269 | 1069.722 | 811.641 | 594.935 |
+| 16 | 32 | 512 | 4096.800 | 2109.517 | 1555.538 | 1164.725 |
+
+上述数据的测量基线源码 SHA256 为 `e842d24ff76498763de1b69966ae45952e9a96b2e4523469e7b594a825e25e33`。共享投影方法与各阶段 buffer 构造分别维护，静态检查相关重构保持计算和 buffer 配置等价。性能值反映该次测试环境，不代表所有设备和 SDK 版本的保证值。
+
+同模型 batch 下主要投影的计算量基本相当，但权重规模、分块、权重复用和流水重叠不同。当前数据不能单独证明 TP4/TP8 已达到 HBM 带宽上限；32 AIC 下，TP4/TP8 在模型 batch >= 8 且总行数 `B*S` 能被 128 整除时，主投影使用 M128/N384 分块以形成完整调度波次；其余场景保留原调度。此调度由新框架版本回迁，上表仍为回迁前的历史数据，不能用作本次改动的实测收益。
