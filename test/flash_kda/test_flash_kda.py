@@ -6,6 +6,9 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 
+# fmt: off
+# Keep compact call argument groups consistent with the original FlashKDA samples.
+
 """Three-way FlashKDA precision: CPU FP32, NPU-rounding simulation, and DSL."""
 
 import dataclasses
@@ -70,24 +73,13 @@ def make_inputs_generalized(
     q = F.normalize(torch.randn(batch, nk, seq_len, dim, generator=gen), p=2, dim=-1)
     v = torch.randn(batch, heads, seq_len, dim, generator=gen) * float(v_scale)
     g = torch.randn(batch, heads, seq_len, dim, generator=gen).to(LOW_DTYPE)
-    beta = (torch.randn(batch, heads, seq_len, 1, generator=gen) * float(b_spread)).to(
-        LOW_DTYPE
-    )
-    initial_state = torch.rand(batch, heads, dim, dim, generator=gen) * float(
-        init_scale
-    )
+    beta = (torch.randn(batch, heads, seq_len, 1, generator=gen) * float(b_spread)).to(LOW_DTYPE)
+    initial_state = torch.rand(batch, heads, dim, dim, generator=gen) * float(init_scale)
 
     return KdaInputs(
-        k=k.to(LOW_DTYPE),
-        v=v.to(LOW_DTYPE),
-        q=q.to(LOW_DTYPE),
-        beta_brc=beta,
-        g=g,
-        initial_state=initial_state,
-        scale_value=dim**-0.5,
-        a_log=torch.linspace(-1.0, 0.5, heads, dtype=torch.float32),
-        dt_bias=torch.randn(heads, dim, generator=gen, dtype=torch.float32),
-        lower_bound=float(lower_bound),
+        k=k.to(LOW_DTYPE), v=v.to(LOW_DTYPE), q=q.to(LOW_DTYPE), beta_brc=beta, g=g, initial_state=initial_state,
+        scale_value=dim**-0.5, a_log=torch.linspace(-1.0, 0.5, heads, dtype=torch.float32),
+        dt_bias=torch.randn(heads, dim, generator=gen, dtype=torch.float32), lower_bound=float(lower_bound),
     )
 
 
@@ -143,33 +135,25 @@ def _reference_lower_matmul(
     cast_operand=None,
 ) -> torch.Tensor:
     """Compute causal QK/KKT tiles with 16-token relative-decay references."""
-    result = torch.zeros(
-        *left.shape[:-1],
-        right.shape[-2],
-        dtype=torch.float32,
-        device=left.device,
-    )
+    result = torch.zeros(*left.shape[:-1], right.shape[-2], dtype=torch.float32, device=left.device)
     cast = (lambda x: x) if cast_operand is None else cast_operand
     for row_start in range(0, CHUNK_SIZE, REFERENCE_BLOCK_SIZE):
         row_end = row_start + REFERENCE_BLOCK_SIZE
         reference = cumulative_decay[..., slice(row_start, row_start + 1), :]
         left_rows = cast(
-            left[..., row_start:row_end, :]
-            * (cumulative_decay[..., row_start:row_end, :] - reference).exp()
+            left[..., row_start:row_end, :] * (cumulative_decay[..., row_start:row_end, :] - reference).exp(),
         )
         for col_start in range(0, row_end, REFERENCE_BLOCK_SIZE):
             col_end = col_start + REFERENCE_BLOCK_SIZE
             right_cols = cast(
-                right[..., col_start:col_end, :]
-                * (reference - cumulative_decay[..., col_start:col_end, :]).exp()
+                right[..., col_start:col_end, :] * (reference - cumulative_decay[..., col_start:col_end, :]).exp(),
             )
             result[..., row_start:row_end, col_start:col_end] = (
                 left_rows @ right_cols.transpose(-1, -2)
             )
 
     return result * torch.tril(
-        torch.ones(CHUNK_SIZE, CHUNK_SIZE, dtype=torch.float32, device=left.device),
-        diagonal=diagonal,
+        torch.ones(CHUNK_SIZE, CHUNK_SIZE, dtype=torch.float32, device=left.device), diagonal=diagonal,
     )
 
 
@@ -193,17 +177,13 @@ def _npu_neumann_inverse_from_negative_t(negative_t: torch.Tensor) -> torch.Tens
         odd = slice(block_idx + 16, block_idx + 32)
         odd_lower_even = _to_fp16_to_fp32(negative_t[odd, even])
         lower_tmp = odd_lower_even @ _to_fp16_to_fp32(inverse[even, even])
-        inverse[odd, even] = _to_fp16_to_fp32(inverse[odd, odd]) @ _to_fp16_to_fp32(
-            lower_tmp
-        )
+        inverse[odd, even] = _to_fp16_to_fp32(inverse[odd, odd]) @ _to_fp16_to_fp32(lower_tmp)
 
     even32 = slice(0, 32)
     odd32 = slice(32, 64)
     odd32_lower_even32 = _to_fp16_to_fp32(negative_t[odd32, even32])
     lower32_tmp = odd32_lower_even32 @ _to_fp16_to_fp32(inverse[even32, even32])
-    inverse[odd32, even32] = _to_fp16_to_fp32(inverse[odd32, odd32]) @ _to_fp16_to_fp32(
-        lower32_tmp
-    )
+    inverse[odd32, even32] = _to_fp16_to_fp32(inverse[odd32, odd32]) @ _to_fp16_to_fp32(lower32_tmp)
     return _to_bf16_to_fp32(inverse)
 
 
@@ -225,33 +205,18 @@ def _stage1_cpu(k, v, q, beta_brc, g, *, scale_value) -> _StageOneGolden:
     k_decayed_beta = beta * k_decayed
     q_decayed = gamma * q_chunks * scale_value
 
-    t_matrix = _reference_lower_matmul(
-        beta * k_chunks, k_chunks, cumulative_decay, diagonal=-1
-    )
+    t_matrix = _reference_lower_matmul(beta * k_chunks, k_chunks, cumulative_decay, diagonal=-1)
 
     identity = torch.eye(CHUNK_SIZE, dtype=torch.float32, device=k.device)
     diag_beta = torch.diag_embed(beta.squeeze(-1))
-    inverse = torch.linalg.solve_triangular(
-        identity + t_matrix, diag_beta, upper=False, unitriangular=True
-    )
+    inverse = torch.linalg.solve_triangular(identity + t_matrix, diag_beta, upper=False, unitriangular=True)
     u_pre = inverse @ v_chunks
     w_matrix = inverse @ k_decayed
-    mqk = _reference_lower_matmul(
-        q_chunks * scale_value, k_chunks, cumulative_decay, diagonal=0
-    )
+    mqk = _reference_lower_matmul(q_chunks * scale_value, k_chunks, cumulative_decay, diagonal=0)
     gamma_c = gamma[..., -1, :, None].contiguous()
     k_restored = k_chunks * (cumulative_decay[..., -1:, :] - cumulative_decay).exp()
     return _StageOneGolden(
-        gamma,
-        k_decayed_beta,
-        k_decayed,
-        q_decayed,
-        t_matrix,
-        u_pre,
-        w_matrix,
-        mqk,
-        k_restored,
-        gamma_c,
+        gamma, k_decayed_beta, k_decayed, q_decayed, t_matrix, u_pre, w_matrix, mqk, k_restored, gamma_c,
     )
 
 
@@ -272,22 +237,12 @@ def _stage1_npu(k, v, q, beta_brc, g, *, scale_value) -> _StageOneGolden:
     k_decayed_beta = torch.empty_like(k_chunks)
     k_decayed = torch.empty_like(k_chunks)
     q_decayed = torch.empty_like(k_chunks)
-    t_output = torch.empty(
-        batch,
-        heads,
-        chunks,
-        CHUNK_SIZE,
-        CHUNK_SIZE,
-        dtype=torch.float32,
-        device=k.device,
-    )
+    t_output = torch.empty(batch, heads, chunks, CHUNK_SIZE, CHUNK_SIZE, dtype=torch.float32, device=k.device)
     u_pre = torch.empty_like(k_chunks)
     w_matrix = torch.empty_like(k_chunks)
     mqk = torch.empty_like(t_output)
     k_restored = torch.empty_like(k_chunks)
-    gamma_c_output = torch.empty(
-        batch, heads, chunks, dim, 1, dtype=torch.float32, device=k.device
-    )
+    gamma_c_output = torch.empty(batch, heads, chunks, dim, 1, dtype=torch.float32, device=k.device)
     for b in range(batch):
         for h in range(heads):
             for c in range(chunks):
@@ -304,23 +259,13 @@ def _stage1_npu(k, v, q, beta_brc, g, *, scale_value) -> _StageOneGolden:
                 q_decayed_chunk = _to_bf16_to_fp32(gamma_c * q_chunk * scale_value)
 
                 t_matrix = (
-                    _reference_lower_matmul(
-                        k_chunk,
-                        k_chunk,
-                        g_cumsum,
-                        diagonal=-1,
-                        cast_operand=_to_bf16_to_fp32,
-                    )
+                    _reference_lower_matmul(k_chunk, k_chunk, g_cumsum, diagonal=-1, cast_operand=_to_bf16_to_fp32)
                     * beta_c
                 )
                 mqk_chunk = _to_bf16_to_fp32(
                     _reference_lower_matmul(
-                        q_chunk * scale_value,
-                        k_chunk,
-                        g_cumsum,
-                        diagonal=0,
-                        cast_operand=_to_bf16_to_fp32,
-                    )
+                        q_chunk * scale_value, k_chunk, g_cumsum, diagonal=0, cast_operand=_to_bf16_to_fp32,
+                    ),
                 )
 
                 negative_t = _to_fp16_to_fp32(-t_matrix)
@@ -328,17 +273,10 @@ def _stage1_npu(k, v, q, beta_brc, g, *, scale_value) -> _StageOneGolden:
 
                 k_decayed_beta_chunk = _to_bf16_to_fp32(beta_c * k_decayed_prepare)
                 v_beta = _to_bf16_to_fp32(beta_c * v_chunk)
-                u_pre_chunk = _to_bf16_to_fp32(
-                    _to_bf16_to_fp32(resident_inv) @ _to_bf16_to_fp32(v_beta)
-                )
-                workspace_w = _to_bf16_to_fp32(
-                    _to_bf16_to_fp32(resident_inv)
-                    @ _to_bf16_to_fp32(-k_decayed_beta_chunk)
-                )
+                u_pre_chunk = _to_bf16_to_fp32(_to_bf16_to_fp32(resident_inv) @ _to_bf16_to_fp32(v_beta))
+                workspace_w = _to_bf16_to_fp32(_to_bf16_to_fp32(resident_inv) @ _to_bf16_to_fp32(-k_decayed_beta_chunk))
                 gamma_c_last = gamma_c[-1].reshape(k_chunk.shape[-1], 1)
-                k_restored_chunk = _to_bf16_to_fp32(
-                    k_chunk * (g_cumsum[-1:] - g_cumsum).exp()
-                )
+                k_restored_chunk = _to_bf16_to_fp32(k_chunk * (g_cumsum[-1:] - g_cumsum).exp())
 
                 gamma[b, h, c] = gamma_c
                 k_decayed[b, h, c] = k_decayed_chunk
@@ -351,16 +289,7 @@ def _stage1_npu(k, v, q, beta_brc, g, *, scale_value) -> _StageOneGolden:
                 gamma_c_output[b, h, c] = gamma_c_last
                 k_restored[b, h, c] = k_restored_chunk
     return _StageOneGolden(
-        gamma,
-        k_decayed_beta,
-        k_decayed,
-        q_decayed,
-        t_output,
-        u_pre,
-        w_matrix,
-        mqk,
-        k_restored,
-        gamma_c_output,
+        gamma, k_decayed_beta, k_decayed, q_decayed, t_output, u_pre, w_matrix, mqk, k_restored, gamma_c_output,
     )
 
 
@@ -403,12 +332,8 @@ def _stage2_npu(stage1: _StageOneGolden, initial_state) -> _StageTwoGolden:
             for c in range(chunks):
                 w_s = _to_bf16_to_fp32(w_negative[b, h, c]) @ _to_bf16_to_fp32(state_bh)
                 u_chunk = _to_bf16_to_fp32(u_pre[b, h, c] + w_s)
-                o_chunk = _to_bf16_to_fp32(q_decayed[b, h, c]) @ _to_bf16_to_fp32(
-                    state_bh
-                )
-                kr_u = _to_bf16_to_fp32(
-                    k_restored[b, h, c].transpose(-1, -2)
-                ) @ _to_bf16_to_fp32(u_chunk)
+                o_chunk = _to_bf16_to_fp32(q_decayed[b, h, c]) @ _to_bf16_to_fp32(state_bh)
+                kr_u = _to_bf16_to_fp32(k_restored[b, h, c].transpose(-1, -2)) @ _to_bf16_to_fp32(u_chunk)
                 # Current DSL retains the recurrent accumulator in FP32.
                 scaled_state = gamma_c[b, h, c] * state_bh
                 state_bh = scaled_state + kr_u
@@ -420,13 +345,9 @@ def _stage2_npu(stage1: _StageOneGolden, initial_state) -> _StageTwoGolden:
 
 def _stage3_cpu(stage1: _StageOneGolden, stage2: _StageTwoGolden) -> _StageThreeGolden:
     """Stage3 CPU 公式：O = O_state + Mqk @ U。"""
-    output = stage2.o_state.to(torch.float32) + stage1.mqk.to(
-        torch.float32
-    ) @ stage2.u.to(torch.float32)
+    output = stage2.o_state.to(torch.float32) + stage1.mqk.to(torch.float32) @ stage2.u.to(torch.float32)
     batch, heads, chunks, chunk, dim = output.shape
-    return _StageThreeGolden(
-        out=output.reshape(batch, heads, chunks * chunk, dim).contiguous()
-    )
+    return _StageThreeGolden(out=output.reshape(batch, heads, chunks * chunk, dim).contiguous())
 
 
 def _stage3_npu(stage1: _StageOneGolden, stage2: _StageTwoGolden) -> _StageThreeGolden:
@@ -440,38 +361,20 @@ def _stage3_npu(stage1: _StageOneGolden, stage2: _StageTwoGolden) -> _StageThree
     for b in range(batch):
         for h in range(heads):
             for c in range(chunks):
-                mqk_u = _to_bf16_to_fp32(mqk[b, h, c]) @ _to_bf16_to_fp32(
-                    u_output[b, h, c]
-                )
+                mqk_u = _to_bf16_to_fp32(mqk[b, h, c]) @ _to_bf16_to_fp32(u_output[b, h, c])
                 output[b, h, c] = _to_bf16_to_fp32(o_state[b, h, c] + mqk_u)
-    return _StageThreeGolden(
-        out=output.reshape(batch, heads, chunks * chunk, dim).contiguous()
-    )
+    return _StageThreeGolden(out=output.reshape(batch, heads, chunks * chunk, dim).contiguous())
 
 
 def _chain_cpu(inputs: KdaInputs) -> _ChainGolden:
-    s1 = _stage1_cpu(
-        inputs.k,
-        inputs.v,
-        inputs.q,
-        inputs.beta_brc,
-        inputs.g,
-        scale_value=inputs.scale_value,
-    )
+    s1 = _stage1_cpu(inputs.k, inputs.v, inputs.q, inputs.beta_brc, inputs.g, scale_value=inputs.scale_value)
     s2 = _stage2_cpu(s1, inputs.initial_state)
     s3 = _stage3_cpu(s1, s2)
     return _ChainGolden(stage1=s1, stage2=s2, stage3=s3)
 
 
 def _chain_npu(inputs: KdaInputs) -> _ChainGolden:
-    s1 = _stage1_npu(
-        inputs.k,
-        inputs.v,
-        inputs.q,
-        inputs.beta_brc,
-        inputs.g,
-        scale_value=inputs.scale_value,
-    )
+    s1 = _stage1_npu(inputs.k, inputs.v, inputs.q, inputs.beta_brc, inputs.g, scale_value=inputs.scale_value)
     s2 = _stage2_npu(s1, inputs.initial_state)
     s3 = _stage3_npu(s1, s2)
     return _ChainGolden(stage1=s1, stage2=s2, stage3=s3)
@@ -483,11 +386,8 @@ def compute_golden(name: str, inputs: KdaInputs):
     alpha = torch.exp(inputs.a_log).view(1, -1, 1, 1)
     bias = inputs.dt_bias.view(1, -1, 1, inputs.dt_bias.shape[-1])
     activated = dataclasses.replace(
-        inputs,
-        q=inputs.q.float()
-        / torch.sqrt(inputs.q.float().square().sum(-1, keepdim=True) + 1e-6),
-        k=inputs.k.float()
-        / torch.sqrt(inputs.k.float().square().sum(-1, keepdim=True) + 1e-6),
+        inputs, q=inputs.q.float() / torch.sqrt(inputs.q.float().square().sum(-1, keepdim=True) + 1e-6),
+        k=inputs.k.float() / torch.sqrt(inputs.k.float().square().sum(-1, keepdim=True) + 1e-6),
         g=inputs.lower_bound * torch.sigmoid(alpha * (inputs.g.float() + bias)),
         beta_brc=torch.sigmoid(inputs.beta_brc.float()),
     )
@@ -502,9 +402,7 @@ def compute_golden(name: str, inputs: KdaInputs):
             },
         )
     chain = _chain_cpu(activated) if name == "cpu_chunk" else _chain_npu(activated)
-    return chain.stage3.out[:, :, :tokens].contiguous(), chain.stage2.s.transpose(
-        -1, -2
-    ).contiguous()
+    return chain.stage3.out[:, :, :tokens].contiguous(), chain.stage2.s.transpose(-1, -2).contiguous()
 
 
 pytestmark = pytest.mark.npu
@@ -537,34 +435,27 @@ class _DynamicPrecisionCase:
 
 
 _DYNAMIC_FAST_CASES = (
-    _DynamicPrecisionCase("BNSD", False, (513,), 1, 1, 101),
-    _DynamicPrecisionCase("BSND", False, (512,), 2, 1, 102),
-    _DynamicPrecisionCase("TND", True, (1, 512, 513), 3, 1, 105),
+    _DynamicPrecisionCase("BNSD", False, (65,), 1, 1, 101),
+    _DynamicPrecisionCase("BSND", False, (65,), 1, 1, 102),
+    _DynamicPrecisionCase("TND", True, (65,), 1, 1, 105),
+    _DynamicPrecisionCase("BNSD", False, (65,), 16, 1, 201),
+    _DynamicPrecisionCase("BSND", False, (65,), 16, 1, 202),
+    _DynamicPrecisionCase("TND", True, (65,), 16, 1, 205),
 )
 
 
 def _make_dynamic_case(case):
     inputs = make_inputs_generalized(
-        len(case.lengths),
-        case.nv,
-        max(case.lengths),
-        128,
-        nk=case.nk,
-        seed=case.seed,
-        lower_bound=_LOWER_BOUND,
+        len(case.lengths), case.nv, max(case.lengths), 128, nk=case.nk, seed=case.seed, lower_bound=_LOWER_BOUND,
     )
     outputs = {name: [] for name in ("cpu_chunk", "npu_chunk")}
     states = {name: [] for name in outputs}
     for batch_idx, length in enumerate(case.lengths):
         batch_slice = slice(batch_idx, batch_idx + 1)
         one = dataclasses.replace(
-            inputs,
-            k=inputs.k[batch_slice, :, :length],
-            v=inputs.v[batch_slice, :, :length],
-            q=inputs.q[batch_slice, :, :length],
-            beta_brc=inputs.beta_brc[batch_slice, :, :length],
-            g=inputs.g[batch_slice, :, :length],
-            initial_state=inputs.initial_state[batch_slice],
+            inputs, k=inputs.k[batch_slice, :, :length], v=inputs.v[batch_slice, :, :length],
+            q=inputs.q[batch_slice, :, :length], beta_brc=inputs.beta_brc[batch_slice, :, :length],
+            g=inputs.g[batch_slice, :, :length], initial_state=inputs.initial_state[batch_slice],
         )
         for name in outputs:
             output, state = compute_golden(name, one)
@@ -582,23 +473,14 @@ def _dynamic_layout_inputs(inputs, case):
     if case.layout == "BNSD":
         return inputs.q, inputs.k, inputs.v, inputs.g, beta
     if case.layout == "BSND":
-        return tuple(
-            tensor.transpose(1, 2).contiguous()
-            for tensor in (inputs.q, inputs.k, inputs.v, inputs.g, beta)
-        )
+        return tuple(tensor.transpose(1, 2).contiguous() for tensor in (inputs.q, inputs.k, inputs.v, inputs.g, beta))
 
     def packed(tensor):
         return torch.cat(
-            [
-                tensor[b, :, :length].transpose(0, 1)
-                for b, length in enumerate(case.lengths)
-            ],
-            dim=0,
+            [tensor[b, :, :length].transpose(0, 1) for b, length in enumerate(case.lengths)], dim=0,
         ).contiguous()
 
-    return tuple(
-        packed(tensor) for tensor in (inputs.q, inputs.k, inputs.v, inputs.g, beta)
-    )
+    return tuple(packed(tensor) for tensor in (inputs.q, inputs.k, inputs.v, inputs.g, beta))
 
 
 def _dynamic_valid_outputs(output, case):
@@ -624,27 +506,13 @@ def _assert_dynamic_precision_case(case):
     q, k, v, g, beta = (tensor.npu() for tensor in _dynamic_layout_inputs(inputs, case))
     cu_seqlens = None
     if case.has_cu:
-        cu_seqlens = torch.tensor(
-            (0, *torch.tensor(case.lengths).cumsum(0).tolist()), dtype=torch.int32
-        ).npu()
+        cu_seqlens = torch.tensor((0, *torch.tensor(case.lengths).cumsum(0).tolist()), dtype=torch.int32).npu()
     initial_state = inputs.initial_state.transpose(-1, -2).contiguous().npu()
     initial_state_before = initial_state.clone()
-    metadata = _DYNAMIC_METADATA.flash_kda_metadata(
-        q, v, initial_state, case.layout, cu_seqlens
-    )
+    metadata = _DYNAMIC_METADATA.flash_kda_metadata(q, v, initial_state, case.layout, cu_seqlens)
     output, state = _DYNAMIC_KDA.flash_kda(
-        q,
-        k,
-        v,
-        g,
-        beta,
-        inputs.scale_value,
-        initial_state,
-        inputs.a_log.npu(),
-        inputs.dt_bias.npu(),
-        inputs.lower_bound,
-        case.layout,
-        metadata,
+        q, k, v, g, beta, inputs.scale_value, initial_state, inputs.a_log.npu(), inputs.dt_bias.npu(),
+        inputs.lower_bound, case.layout, metadata,
     )
     torch.npu.synchronize()
 
@@ -652,12 +520,7 @@ def _assert_dynamic_precision_case(case):
     assert torch.isfinite(actual_state).all(), (
         f"{case.case_id}: final_state contains inf/nan"
     )
-    torch.testing.assert_close(
-        initial_state.cpu().float(),
-        initial_state_before.cpu().float(),
-        atol=0.0,
-        rtol=0.0,
-    )
+    torch.testing.assert_close(initial_state.cpu().float(), initial_state_before.cpu().float(), atol=0.0, rtol=0.0)
     actual_outputs = [
         actual.cpu().float() for actual in _dynamic_valid_outputs(output, case)
     ]
@@ -667,11 +530,7 @@ def _assert_dynamic_precision_case(case):
             f"{case.case_id}: {name} state is not finite"
         )
         torch.testing.assert_close(
-            actual_state,
-            expected_state,
-            atol=_TOL,
-            rtol=_TOL,
-            msg=lambda msg: f"DSL vs {name} state: {msg}",
+            actual_state, expected_state, atol=_TOL, rtol=_TOL, msg=lambda msg: f"DSL vs {name} state: {msg}",
         )
         output_max = 0.0
         for actual, expected in zip(actual_outputs, golden_outputs[name]):
@@ -682,33 +541,18 @@ def _assert_dynamic_precision_case(case):
                 f"{case.case_id}: {name} output is not finite"
             )
             torch.testing.assert_close(
-                actual,
-                expected.float(),
-                atol=_TOL,
-                rtol=_TOL,
-                msg=lambda msg: f"DSL vs {name} output: {msg}",
+                actual, expected.float(), atol=_TOL, rtol=_TOL, msg=lambda msg: f"DSL vs {name} output: {msg}",
             )
             output_max = max(output_max, (actual - expected).abs().amax().item())
         state_max = (actual_state - expected_state).abs().amax().item()
-        print(
-            f"{case.case_id} vs {name}: O max_abs={output_max:.3e} state max_abs={state_max:.3e}"
-        )
+        print(f"{case.case_id} vs {name}: O max_abs={output_max:.3e} state max_abs={state_max:.3e}")
     torch.testing.assert_close(
-        golden_state["npu_chunk"],
-        golden_state["cpu_chunk"],
-        atol=_TOL,
-        rtol=_TOL,
+        golden_state["npu_chunk"], golden_state["cpu_chunk"], atol=_TOL, rtol=_TOL,
         msg=lambda msg: f"npu_chunk vs cpu_chunk state: {msg}",
     )
-    for simulated, fp32 in zip(
-        golden_outputs["npu_chunk"], golden_outputs["cpu_chunk"]
-    ):
+    for simulated, fp32 in zip(golden_outputs["npu_chunk"], golden_outputs["cpu_chunk"]):
         torch.testing.assert_close(
-            simulated,
-            fp32,
-            atol=_TOL,
-            rtol=_TOL,
-            msg=lambda msg: f"npu_chunk vs cpu_chunk output: {msg}",
+            simulated, fp32, atol=_TOL, rtol=_TOL, msg=lambda msg: f"npu_chunk vs cpu_chunk output: {msg}",
         )
 
 

@@ -22,9 +22,16 @@ $$
 
 `flash_kda_metadata(q, v, initial_state, layout_qkv, cu_seqlens=None)` 根据形状、布局、有效长度和当前 stream 的设备核数生成一维 int32 调度张量。它不读取 Q/V/state 的数值，也不计算 attention 输出。调度配置相同时，可在层间复用 metadata；`flash_kda` 只消费该张量，不启动 AICPU。
 
+实现按调度方式分为两个模板，公开入口和 metadata 接口保持一致：
+
+- [`flash_kda_staged.py`](flash_kda_staged.py)：以 chunk group 为单位分阶段计算，阶段间通过 workspace 交换数据。
+- [`flash_kda_persistent.py`](flash_kda_persistent.py)：一个核连续处理同一序列头的 chunk，使递推状态驻留。
+
+metadata 的 `template="auto"` 自动选择模板；`template="staged"` 和 `template="persistent"` 可分别固定使用对应模板。metadata 必须由同版本的配套模块生成；输入布局、形状、有效长度或设备有效核数改变时应重新生成。
+
 ## 快速开始
 
-在仓库根目录运行以下示例。`metadata` 是必传参数；`out` 和 `final_state` 是返回值，由算子内部自动分配，不需要显式传入。若使用 TND 布局，还须给 metadata 函数传入 `cu_seqlens`。
+在仓库根目录设置 `export PYTHONPATH="$PWD/samples:$PYTHONPATH"` 后运行以下示例。`metadata` 是必传参数；`out` 和 `final_state` 是返回值，由算子内部自动分配，不需要显式传入。若使用 TND 布局，还须给 metadata 函数传入 `cu_seqlens`。
 
 ```python
 import math
@@ -100,12 +107,18 @@ metadata 函数接收与主算子相同的 `q`、`v`、`initial_state` 和 `layo
 OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 python -m pytest -q test/flash_kda/test_flash_kda.py
 ```
 
-测试保留 BNSD、BSND、packed TND 三个精度场景，覆盖 GQA、非对齐尾块和多条变长序列。
+测试共 6 个精度用例：BNSD、BSND、packed TND 三种布局分别覆盖 staged 和 persistent，包含 GQA、非对齐尾块和多条变长序列。
 输出和最终状态与内联 PyTorch FP32 golden 及 BF16/FP16 交接模拟对照，
 默认容差为 `atol=rtol=5e-3`。测试需要 Ascend NPU。
 
-## 性能对比
+## 性能测试
 
-![FlashKDA (DSL) 与 H800 性能对比](../../figures/flash_kda.png)
+2026-10-18 在 PR 服务器上实测：Ascend 950，`arena_old`，cannbotdsl 0.7.1、PyTorch 2.10.0、CANN 9.2.0，32 个 AIC。
 
-CANNBot-DSL 生成的 FlashKDA 代码与 H800 上的 FlashKDA 代码在 12 个典型配置上的平均延迟对比：`B=1`、`D=128`、`N=24/32/48`、`S=8K/16K/32K/64K`。
+`B=1`、`Nqk=Nv=96`、`S=16384`、`Dk=Dv=128`；Q/K/V/g/beta 为 BF16，初始状态及门控参数为 FP32，metadata 使用 `template="auto"`。`lower_bound=-5.0`，初态、`A_log` 和 `dt_bias` 均为 0。校验后预热 3 次，采样 20 次，不额外清理缓存。下表为设备 kernel Task Duration 的中位数，不包含 metadata 生成、编译和 host 分配时间。
+
+| 布局 | Q/K/V shape | 实际模板 | 内核耗时（μs） |
+|:---|:---|:---|---:|
+| BNSD | `[1, 96, 16384, 128]` | persistent | 2535.828 |
+| BSND | `[1, 16384, 96, 128]` | persistent | 2542.530 |
+| TND | `[16384, 96, 128]` | persistent | 2539.177 |
