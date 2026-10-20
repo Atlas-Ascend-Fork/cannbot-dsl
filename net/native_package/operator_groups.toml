@@ -18,7 +18,8 @@ indexer_prologue_qw = ["indexer_prologue_qw.py", "indexer_prologue_qw_format.py"
 indexer_prologue_k = ["indexer_prologue_k.py"]
 engram_gate = ["engram_gate.py"]
 block_attn_res_update_rms_norm = ["block_attn_res_update_rms_norm.py"]
-flash_kda = ["flash_kda.py", "flash_kda_metadata.py"]
+flash_kda = ["flash_kda.py", "flash_kda_metadata.py", "flash_kda_staged.py", "flash_kda_persistent.py"]
+flash_kda_fwd = ["flash_kda_fwd.py", "flash_kda_fwd_metadata.py", "flash_kda_fwd_staged.py", "flash_kda_fwd_persistent.py"]
 flash_kda_cp_preprocess = ["flash_kda_cp_preprocess.py", "flash_kda_cp_preprocess_metadata.py"]
 flash_kda_cp_main = ["flash_kda_cp_main.py", "flash_kda_cp_main_metadata.py"]
 fused_recurrent_kda = ["fused_recurrent_kda_snapshot.py"]
@@ -35,6 +36,7 @@ ds41 = ["mqsmla", "qli", "qsli", "indexer_prologue_qw", "indexer_prologue_k", "e
 k3 = [
   "block_attn_res_update_rms_norm",
   "flash_kda",
+  "flash_kda_fwd",
   "flash_kda_cp_preprocess",
   "flash_kda_cp_main",
   "fused_recurrent_kda",

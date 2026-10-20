@@ -77,6 +77,14 @@ flash_kda:
   options:
     - flash_kda
 
+flash_kda_fwd:
+  module: True
+  src:
+    - samples/flash_kda_fwd
+    - test/flash_kda_fwd
+  options:
+    - flash_kda_fwd
+
 flash_kda_cp_preprocess:
   module: True
   src:
