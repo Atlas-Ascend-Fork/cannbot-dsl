@@ -270,7 +270,9 @@ def flash_kda_metadata_kernel(a: FlashKDAMetadataArgs):
     selected_stage2_core_ranges = zeros(I64, MAX_AIC_CORES * 2)
 
     if a.metadata_word_capacity < HEADER_WORDS:
-        return STATUS_BAD_METADATA_CAPACITY
+        # AICPU treats a non-zero kernel return as a task exception (ACL 507005).
+        # Diagnostic codes belong in the metadata header, not in the return value.
+        return STATUS_OK
 
     a.metadata[HEADER_MAGIC] = MAGIC
     a.metadata[HEADER_ABI_VERSION] = ABI_VERSION
@@ -305,12 +307,12 @@ def flash_kda_metadata_kernel(a: FlashKDAMetadataArgs):
         status = STATUS_BAD_SHAPE
     if status != STATUS_OK:
         a.metadata[HEADER_STATUS] = status
-        return status
+        return STATUS_OK
 
     if a.has_cu == 1:
         if a.cu_seqlens[0] != 0:
             a.metadata[HEADER_STATUS] = STATUS_BAD_CU_START
-            return STATUS_BAD_CU_START
+            return STATUS_OK
 
     batch_num_per_set = a.workspace_slots // a.value_heads
     stage12_round_num = 0
@@ -374,7 +376,7 @@ def flash_kda_metadata_kernel(a: FlashKDAMetadataArgs):
             status = STATUS_BAD_PACKED_END
     if status != STATUS_OK:
         a.metadata[HEADER_STATUS] = status
-        return status
+        return STATUS_OK
 
     record_begin = HEADER_WORDS + stage12_round_num + 1
     used_words = (
@@ -384,7 +386,7 @@ def flash_kda_metadata_kernel(a: FlashKDAMetadataArgs):
     )
     if used_words > a.metadata_word_capacity:
         a.metadata[HEADER_STATUS] = STATUS_BAD_METADATA_CAPACITY
-        return STATUS_BAD_METADATA_CAPACITY
+        return STATUS_OK
 
     a.metadata[HEADER_STAGE12_ROUND_NUM] = stage12_round_num
     record_cursor = record_begin
@@ -832,6 +834,57 @@ def _get_aicpu_kernel():
         return _AICPU_COMPILED
 
 
+_STATUS_NAMES = (
+    "STATUS_OK",
+    "STATUS_BAD_CORE_NUM",
+    "STATUS_BAD_WORKSPACE_SLOTS",
+    "STATUS_BAD_FLAGS",
+    "STATUS_BAD_SHAPE",
+    "STATUS_BAD_CU_START",
+    "STATUS_BAD_LENGTH",
+    "STATUS_BAD_PADDED_LENGTH",
+    "STATUS_BAD_PACKED_END",
+    "STATUS_BAD_METADATA_CAPACITY",
+)
+
+
+def _host_validate_cu_seqlens(cu_seqlens, batch, storage_length, is_packed) -> None:
+    """Reject empty sequences on the host before AICPU can fault the stream."""
+
+    prefix = [int(value) for value in cu_seqlens.detach().to("cpu").tolist()]
+    if len(prefix) != batch + 1:
+        raise ValueError(f"cu_seqlens length must be {batch + 1}, got {len(prefix)}")
+    if prefix[0] != 0:
+        raise ValueError("cu_seqlens must start at 0")
+    empty = []
+    for index, (start, end) in enumerate(zip(prefix, prefix[1:])):
+        length = end - start
+        if length <= 0:
+            empty.append(index)
+        elif not is_packed and length > storage_length:
+            raise ValueError(
+                f"cu_seqlens batch {index} length {length} exceeds storage length {storage_length}"
+            )
+    if empty:
+        raise ValueError(
+            "cu_seqlens has non-positive lengths at batch indices "
+            f"{empty}; drop empty sequences before calling flash_kda_metadata"
+        )
+    if is_packed and prefix[-1] != int(storage_length):
+        raise ValueError(
+            f"packed cu_seqlens end {prefix[-1]} must equal storage length {int(storage_length)}"
+        )
+
+
+def _raise_if_metadata_failed(metadata: torch.Tensor) -> None:
+    if metadata.device.type in {"npu", "privateuseone"}:
+        torch.npu.synchronize()
+    status = int(metadata[HEADER_STATUS].item())
+    if status != STATUS_OK:
+        name = _STATUS_NAMES[status] if 0 <= status < len(_STATUS_NAMES) else str(status)
+        raise ValueError(f"flash_kda_metadata failed with {name} ({status})")
+
+
 def flash_kda_metadata(
     q: torch.Tensor,
     v: torch.Tensor,
@@ -880,6 +933,7 @@ def flash_kda_metadata(
     assert q.is_contiguous() and v.is_contiguous() and initial_state.is_contiguous(), "all public inputs must be contiguous"
     if cu_seqlens is not None:
         assert cu_seqlens.device == q.device, "all inputs must be on the same device"
+        _host_validate_cu_seqlens(cu_seqlens, int(batch), int(storage_length), is_packed)
 
     core_num = _device_block_num(q)
     metadata_capacity = metadata_capacity_upper_bound(batch, storage_length, is_packed=is_packed)
@@ -888,6 +942,7 @@ def flash_kda_metadata(
     device_id = q.get_device() if hasattr(q, "get_device") and q.device.type != "cpu" else 0
     stream = current_raw_stream(device_id)
     aicpu.launch(stream, cu_seqlens=0 if cu_seqlens is None else cu_seqlens.data_ptr(), metadata=metadata.data_ptr(), metadata_word_capacity=metadata.numel(), batch=batch, physical_batches=physical_batches, storage_length=storage_length, value_heads=n_v, has_cu=int(cu_seqlens is not None), is_packed=int(is_packed), core_num=core_num, workspace_slots=WORKSPACE_SLOTS)
+    _raise_if_metadata_failed(metadata)
     return metadata
 
 
