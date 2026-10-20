@@ -10,11 +10,7 @@
 
 from __future__ import annotations
 
-import importlib.util
-import sys
-from functools import lru_cache
 from types import SimpleNamespace
-from pathlib import Path
 
 import pytest
 import torch
@@ -25,6 +21,7 @@ from _samples_path import load_sample
 SAMPLE = "mega_recurrent_kda_replayssm/mega_recurrent_kda_replayssm.py"
 COMMIT_SAMPLE = "commit_recurrent_kda_replayssm/commit_recurrent_kda_replayssm.py"
 NZ_WEIGHT_ARGUMENTS = (1, 2, 3, 4, 5, 7)
+CONV_KERNEL_SIZE = 4
 
 _INPUT_NAMES = (
     "hidden_states",
@@ -52,15 +49,57 @@ def _module():
     return load_sample(SAMPLE)
 
 
-@lru_cache(maxsize=1)
-def _cpu_golden_module():
-    """Reuse CPU projection/Conv arithmetic without importing a second NPU op."""
-    path = Path(__file__).parents[1] / "mega_recurrent_kda" / "test_mega_recurrent_kda.py"
-    spec = importlib.util.spec_from_file_location("_mega_kda_cpu_golden", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
+def _linear_reference(value: torch.Tensor, weight: torch.Tensor, output_dtype: torch.dtype) -> torch.Tensor:
+    result = torch.matmul(value.float(), weight.float().transpose(-1, -2))
+    return result.to(output_dtype)
+
+
+def _run_model_native_causal_conv1d_silu(raw_qkv: torch.Tensor, conv1d_weight: torch.Tensor, conv_state: torch.Tensor,
+    conv_state_indices: torch.Tensor, conv_num_accepted_tokens: torch.Tensor) -> torch.Tensor:
+    """Run pooled K=4 Conv with the raw-FP32/BF16-history boundary.
+
+    ``conv_state_indices == 0`` denotes the immutable null slot. All proposal
+    tokens are evaluated; the accepted count chooses the three history rows
+    from the model-native speculative cache.
+    """
+    if raw_qkv.ndim != 3:
+        raise ValueError("raw_qkv must be [B,S,3*P]")
+    batch_size, seq_len, channels = map(int, raw_qkv.shape)
+    if tuple(conv1d_weight.shape) != (CONV_KERNEL_SIZE, channels):
+        raise ValueError("conv1d_weight must be [4,3*P]")
+    if conv_state.ndim != 3 or int(conv_state.shape[2]) != channels:
+        raise ValueError("conv_state must be [pool,state_length,3*P]")
+    if int(conv_state.shape[1]) < seq_len + CONV_KERNEL_SIZE - 2:
+        raise ValueError("conv_state state_length must be at least S+2")
+    if tuple(conv_state_indices.shape) != (batch_size,):
+        raise ValueError("conv_state_indices must be [B]")
+    if tuple(conv_num_accepted_tokens.shape) != (batch_size,):
+        raise ValueError("conv_num_accepted_tokens must be [B]")
+    result = torch.zeros_like(raw_qkv, dtype=torch.bfloat16)
+    original_state = conv_state.clone()
+    filter_fp32 = conv1d_weight.float()
+    for batch_index in range(batch_size):
+        cache_index = int(conv_state_indices[batch_index])
+        if cache_index == 0:
+            continue
+        accepted = int(conv_num_accepted_tokens[batch_index])
+        offset = max(accepted - 1, 0)
+        history_stop = offset + CONV_KERNEL_SIZE - 1
+        history = original_state[cache_index, offset:history_stop].float().clone()
+        if int(history.shape[0]) != CONV_KERNEL_SIZE - 1:
+            raise ValueError("accepted Conv history exceeds state_length")
+        for token in range(seq_len):
+            current = raw_qkv[batch_index, token].float()
+            window = torch.cat((history, current.unsqueeze(0)), dim=0)
+            products = window * filter_fp32
+            convolved = products[0] + products[1] + (products[2] + products[3])
+            result[batch_index, token] = torch.nn.functional.silu(convolved).to(torch.bfloat16)
+            history = torch.cat((history[1:], current.to(torch.bfloat16).float().unsqueeze(0)), dim=0)
+        selected = original_state[cache_index, offset:history_stop]
+        conv_state[cache_index, :2].copy_(selected[1:])
+        proposal_stop = 2 + seq_len
+        conv_state[cache_index, 2:proposal_stop].copy_(raw_qkv[batch_index])
+    return result
 
 
 def _make_cpu_arguments(batch=16, seed=20260921):
@@ -98,7 +137,6 @@ def _make_cpu_arguments(batch=16, seed=20260921):
 
 def _project_replay_inputs(arguments):
     """Prepare projections, convolution and activated recurrence inputs."""
-    cpu = _cpu_golden_module()
     hidden = arguments.hidden_states
     qkv_w = arguments.qkv_projection_weight
     fa_w = arguments.decay_projection_a_weight
@@ -108,14 +146,14 @@ def _project_replay_inputs(arguments):
     conv_w = arguments.conv1d_weight
     batch, sequence, _ = hidden.shape
     conv_state = arguments.conv_state.clone()
-    raw_qkv = cpu.linear_reference(hidden, qkv_w, torch.float32)
-    convolved = cpu.run_model_native_causal_conv1d_silu(
+    raw_qkv = _linear_reference(hidden, qkv_w, torch.float32)
+    convolved = _run_model_native_causal_conv1d_silu(
         raw_qkv, conv_w, conv_state, arguments.conv_state_indices, arguments.conv_num_accepted_tokens
     ).view(batch, sequence, 3, 6, 128)
     query, key, value = (convolved[:, :, index].float() for index in range(3))
     query *= torch.rsqrt(query.square().sum(-1, keepdim=True) + 1e-6)
     key *= torch.rsqrt(key.square().sum(-1, keepdim=True) + 1e-6)
-    raw_decay = cpu.linear_reference(cpu.linear_reference(hidden, fa_w, torch.bfloat16), fb_w, torch.bfloat16).view(
+    raw_decay = _linear_reference(_linear_reference(hidden, fa_w, torch.bfloat16), fb_w, torch.bfloat16).view(
         batch, sequence, 6, 128
     )
     decay = torch.exp(
@@ -124,8 +162,8 @@ def _project_replay_inputs(arguments):
             torch.exp(arguments.a_log).view(1, 1, 6, 1) * (raw_decay.float() + arguments.dt_bias.view(1, 1, 6, 128))
         )
     )
-    beta = torch.sigmoid(cpu.linear_reference(hidden, beta_w, torch.bfloat16).float())
-    gate = cpu.linear_reference(hidden, gate_w, torch.bfloat16).view(batch, sequence, 6, 128)
+    beta = torch.sigmoid(_linear_reference(hidden, beta_w, torch.bfloat16).float())
+    gate = _linear_reference(hidden, gate_w, torch.bfloat16).view(batch, sequence, 6, 128)
     return SimpleNamespace(
         query=query,
         key=key,
@@ -159,7 +197,7 @@ def _run_replay_cpu_golden(arguments, *, snapshots=False):
         recurrent * torch.rsqrt(recurrent.square().mean(-1, keepdim=True) + 1e-5) * arguments.output_norm_weight.float()
     )
     gated = (normalized * torch.sigmoid(gate.float())).to(torch.bfloat16)
-    output = _cpu_golden_module().linear_reference(gated.flatten(2), arguments.output_projection_weight, torch.bfloat16)
+    output = _linear_reference(gated.flatten(2), arguments.output_projection_weight, torch.bfloat16)
     return SimpleNamespace(
         output=output,
         conv_state=projected.conv_state,
