@@ -2,8 +2,9 @@
 
 ## 产品支持情况
 
-- Ascend 950：支持。
-- AIC 核数：支持 8、16、24、28、32；默认从输入设备当前 stream 的有效配额读取，选择不超过该配额的最大支持核数。
+- Ascend 950。
+- TP4、TP8、TP16；模型 batch 为 1～32，`S=8`、`H=7168`、head dimension 为 128。
+- AIC 核数：支持 8、16、24、28、32；同时检查物理 AIC/AIV 核数和当前 stream 的有效配额，选择安全范围内的最大支持核数；至少需要 8 AIC 和 16 AIV。
 
 ## 功能说明
 
@@ -15,16 +16,26 @@ gating 和输出投影融合为一次 mixed AIC/AIV kernel 调用。实现位于
 算子读取 FP32 checkpoint `recurrent_state`，计算全部 8 个候选 token，
 并写出 Commit 所需的 replay record：
 
-- `replay_u`：FP16 `[B, 8, 6, 128]`；
-- `replay_k`：FP16 `[B, 8, 6, 128]`；
-- `replay_decay`：FP32 `[B, 8, 6, 128]`。
+- `replay_u`：FP16 `[B, 8, N, 128]`；
+- `replay_k`：FP16 `[B, 8, N, 128]`；
+- `replay_decay`：FP32 `[B, 8, N, 128]`。
 
 算子不修改 `recurrent_state`。Conv1D 使用独立的 `conv_state_indices` 和
 `conv_num_accepted_tokens`，并原地更新 `conv_state`。
 
-一个 compiled callable 覆盖 8/16/24/28/32 AIC。`B` 按 16 的倍数取值；
-Python 接口与 native binary 均支持动态 `B=16,32,…,512`，固定 `S=8`。
-模块提供 native binary 注册和 `torch.compile` 图模式注册。
+全部实现位于同一个算子文件，公开接口包含 21 个参数，核数由设备配额决定。一个 compiled callable 覆盖 TP4/8/16 和 8/16/24/28/32 AIC；模块同时提供 native binary 注册和 `torch.compile` 图模式注册。
+
+### TP 与 batch 的对应关系
+
+`N=96/TP`，`D=128`，`P=N*D`。实际输入为 `[B,8,7168]`，其中 `B=model_batch*TP`。模型 batch 和算子输入的第一维 B 含义不同：
+
+| TP | N | P | 模型 batch | 算子 B |
+|---:|---:|---:|:---|:---|
+| 4 | 24 | 3072 | 1～32 | 4、8、…、128 |
+| 8 | 12 | 1536 | 1～32 | 8、16、…、256 |
+| 16 | 6 | 768 | 1～32 | 16、32、…、512 |
+
+`rms_norm_eps` 控制输出 RMSNorm，作为运行时 FP32 scalar 传入；Q/K 归一化固定使用 `1e-6`。
 
 ### 计算过程
 
@@ -38,7 +49,7 @@ Python 接口与 native binary 均支持动态 `B=16,32,…,512`，固定 `S=8`�
 ## 函数原型
 
 ```python
-mega_recurrent_kda_replayssm.mega_recurrent_kda_replayssm.mega_recurrent_kda_replayssm(
+mega_recurrent_kda_replayssm(
     hidden_states: torch.Tensor,
     qkv_projection_weight: torch.Tensor,
     decay_projection_a_weight: torch.Tensor,
@@ -55,12 +66,11 @@ mega_recurrent_kda_replayssm.mega_recurrent_kda_replayssm.mega_recurrent_kda_rep
     replay_decay: torch.Tensor,
     conv_state_indices: torch.Tensor,
     conv_num_accepted_tokens: torch.Tensor,
-    a_log: torch.Tensor,
+    A_log: torch.Tensor,
     dt_bias: torch.Tensor,
     scale: float,
     lower_bound: float,
-    rms_norm_eps: float = 1e-5,
-) -> torch.Tensor
+    rms_norm_eps: float = 1e-5) -> torch.Tensor
 ```
 
 模块路径为 `mega_recurrent_kda_replayssm.mega_recurrent_kda_replayssm`。
@@ -71,8 +81,7 @@ native binary 注册名为 `mega_recurrent_kda_replayssm`。
 
 ## 参数说明
 
-`B` 为 batch 数，`S = 8`，`H = 7168`，`N = 6`，`D = 128`，
-`P = N * D = 768`。输入布局固定为 BSH。
+输入布局固定为 BSH。下表的 B、N、P 由上方 TP 对应关系决定，`S=8`、`H=7168`、`D=128`。
 
 | 参数名 | 参数类型 | 可选/必选 | 描述 | 数据类型/存储 | 维度(shape) |
 |:---|:---|:---|:---|:---|:---|
@@ -92,7 +101,7 @@ native binary 注册名为 `mega_recurrent_kda_replayssm`。
 | `replay_decay` | Tensor | 必选 | decay replay record 输出。 | float32 / ND | `[B, S, N, D]` |
 | `conv_state_indices` | Tensor | 必选 | 每个 batch 的 Conv state 槽位。 | int32 / ND | `[B]` |
 | `conv_num_accepted_tokens` | Tensor | 必选 | 选择 Conv 历史起点的 accepted 计数。 | int32 / ND | `[B]` |
-| `a_log` | Tensor | 必选 | 每个 head 的 log decay 参数。 | float32 / ND | `[N]` |
+| `A_log` | Tensor | 必选 | 每个 head 的 log decay 参数。 | float32 / ND | `[N]` |
 | `dt_bias` | Tensor | 必选 | 每个 head、每个通道的 decay bias。 | float32 / ND | `[N, D]` |
 | `scale` | float | 必选 | 有限的 query scale。 | float32 | - |
 | `lower_bound` | float | 必选 | decay gate 下界，范围为 `[-5, 0]`。 | float32 | - |
@@ -100,21 +109,16 @@ native binary 注册名为 `mega_recurrent_kda_replayssm`。
 
 ## 返回值说明
 
-| 参数名 | 参数类型 | 可选/必选 | 描述 | 数据类型 | 维度(shape) |
-|:---|:---|:---|:---|:---|:---|
-| `out` | Tensor | 必选 | 输出 hidden states。 | bfloat16 | `[B, S, H]` |
-
-算子还会原地更新 `conv_state`、`replay_u`、`replay_k` 和
-`replay_decay`。`recurrent_state` 保持不变。
+返回连续的 BF16 Tensor，shape 为 `[B,S,H]`，位于输入设备。`conv_state`、`replay_u`、`replay_k` 和 `replay_decay` 同时原地更新，`recurrent_state` 保持不变。
 
 ## 约束说明
 
-- `B` 必须是 16 的倍数：Python 接口和 native binary 均支持 `B=16,32,…,512`。固定 `S = 8`、`H = 7168`、`N = 6`、`D = 128`。
+- `TP` 为 4、8 或 16，`B / TP` 为 1～32 的整数，`N = 96 / TP`。固定 `S = 8`、`H = 7168`、`D = 128`。
 - 所有 Tensor 必须连续并位于同一 NPU。
 - 六个投影权重必须使用 `FRACTAL_NZ`，逻辑 shape 保持输出通道在前。
   必须传 allocation-root Tensor，不能传 view；`torch.nn.Parameter` 先调用
   `.detach()`。
-- beta 权重必须对完整逻辑 `[6,H]` allocation root 做 NZ 转换，保留物理 padding。
+- beta 权重必须对完整逻辑 `[N,H]` allocation root 做 NZ 转换，保留物理 padding。
 - `conv1d_weight` 和 `output_norm_weight` 使用 ND。兼容 Conv 布局会在每次调用时转换，推荐预先准备 `[3,N,4,D]`。
 - `conv_state` 要求 `L >= S + 2`。`conv_state_indices` 的每个元素必须位于
   `[0, C)`，同一次调用中的非零槽位不能重复。
@@ -123,10 +127,9 @@ native binary 注册名为 `mega_recurrent_kda_replayssm`。
   修改这些值不会重新编译。`scale` 必须有限，`lower_bound` 必须位于
   `[-5,0]`，`rms_norm_eps` 必须有限且大于零。
 - 算子计算全部 8 个 proposal token，并覆盖全部 replay record；accepted 结果由后续 Commit 接口消费，不截断 verify 输出。
-- 算子读取当前 stream 的有效 AIC 配额，自动选择不超过该配额的最大支持值；
-  Python 和图模式接口不再接受 `block_num` 参数。
+- 算子自动读取当前 stream 的有效 AIC 配额，选择不超过该配额的最大支持值（8/16/24/28/32）；配额低于 8 时拒绝运行。
 - 索引和 accepted 数值不拷回 host 校验，调用方必须满足上述范围。
-- 一个 compiled callable 复用五种核数；scratch 的设备或 shape 变化时重新分配。模块只保留一份无 cache key 的 compiled callable 和 scratch，并发调用须由调用方串行化。
+- 每个设备保留一个 compiled callable，TP、batch 和配额切换不触发重新编译。workspace 按设备、batch 和 head 数缓存，重叠调用须由调用方串行化。
 
 ### 状态语义
 
@@ -144,20 +147,15 @@ FP16 U、FP16 归一化 K 和 FP32 激活后 decay 分别写入 `replay_u`、
 
 ### 调度与 workspace
 
-内核以 B16 group 为基本调度单位；运行时 `get_block_num()` 在同一 mixed kernel
-中选择 8/16/24/28/32 AIC 分支。每个分支均执行两轮 recurrent KDA，并使用对应的
-输出投影配置。
+当前 stream 和物理设备共同限制可用的 AIC/AIV 数，28 AIC 机器不会请求 32 AIC。
+TP 由权重和 `A_log` 的 head 维度确定，不增加核数或 TP 接口参数。
+TP16 在各核数下保留专用投影与递推重叠调度，32 AIC 的单组路径使用 K128 常驻输出权重。
+TP4/8 主投影按行数、head 数和核数选择 N256 或 N384 tile。32 AIC 下，TP4/8 的
+model batch 至少为 8 且行数整除 128 时，使用 M128/N384 主投影波次。
+回放记录在归一化 K、激活 decay 和计算 U 后立即写出，FP32 递推保持不变。
 
-| AIC 核数 | OProj N tile | OProj KS | 每核 tile 数上限 | L0C depth | resident weight |
-|---:|---:|---:|---:|---:|:---:|
-| 8 | 128 | 64 | 7 | 2 | 否 |
-| 16 | 256 | 64 | 2 | 2 | 否 |
-| 24 | 256 | 64 | 2 | 2 | 否 |
-| 28 | 256 | 64 | 1 | 1 | 是 |
-| 32 | 256 | 64 | 1 | 1 | 是 |
-
-GM workspace 按 `B*S` 分配 7 个 BF16 区域，宽度为
-`(768,768,768,768,768,16,128)`，另有 FP32 `[128,128]` norm scratch。
+GM workspace 的 7 个 BF16 区域宽度为
+`(P,P,P,P,P,ceil_div(N,16)*16,128)`，另有 FP32 `[128,128]` norm scratch。
 Replay U/K/decay 是调用方提供的独立输出，不属于 workspace。
 
 ## 确定性计算
@@ -166,21 +164,19 @@ Replay U/K/decay 是调用方提供的独立输出，不属于 workspace。
 
 ## 调用示例
 
-投影权重在模型初始化时转换为 `FRACTAL_NZ`，后续调用直接复用：
+在仓库根目录执行时设置 `PYTHONPATH=samples`，或将 samples 加入 Python 模块搜索路径。以下变量按参数表预先准备，六个投影权重在初始化时转为 NZ，后续直接复用：
 
 ```python
 import torch
 import torch_npu
 
-from mega_recurrent_kda_replayssm.mega_recurrent_kda_replayssm import (
-    mega_recurrent_kda_replayssm,
-)
+from mega_recurrent_kda_replayssm.mega_recurrent_kda_replayssm import mega_recurrent_kda_replayssm
+
 
 def to_nz(weight):
-    return torch_npu.npu_format_cast(
-        weight.detach().to(device="npu", dtype=torch.bfloat16).contiguous(),
-        torch_npu.Format.FRACTAL_NZ,
-    )
+    value = weight.detach().to(device="npu", dtype=torch.bfloat16).contiguous()
+    return torch_npu.npu_format_cast(value, torch_npu.Format.FRACTAL_NZ)
+
 
 qkv_weight = to_nz(qkv_weight)
 decay_a_weight = to_nz(decay_a_weight)
@@ -189,40 +185,53 @@ beta_weight = to_nz(beta_weight)
 output_gate_weight = to_nz(output_gate_weight)
 output_projection_weight = to_nz(output_projection_weight)
 
-out = mega_recurrent_kda_replayssm(
-    hidden_states,
-    qkv_weight, decay_a_weight, decay_b_weight, beta_weight,
-    output_gate_weight, output_norm_weight, output_projection_weight,
-    conv1d_weight, conv_state, recurrent_state,
-    replay_u, replay_k, replay_decay,
-    conv_state_indices, conv_num_accepted_tokens,
-    a_log, dt_bias,
-    128 ** -0.5, -5.0, 1e-5,
-)
+out = mega_recurrent_kda_replayssm(hidden_states, qkv_weight, decay_a_weight, decay_b_weight, beta_weight,
+    output_gate_weight, output_norm_weight, output_projection_weight, conv1d_weight, conv_state, recurrent_state,
+    replay_u, replay_k, replay_decay, conv_state_indices, conv_num_accepted_tokens,
+    A_log, dt_bias, 128**-0.5, -5.0, 1e-5)
 ```
 
-## 精度测试
+## 编译与精度测试
 
-在仓库根目录运行独立测试：
+需要可用的 CANN、CANNBot-DSL、PyTorch 和 torch_npu 环境。仓库根目录可运行：
 
 ```bash
-python -m pytest -q \
-  test/mega_recurrent_kda_replayssm/test_mega_recurrent_kda_replayssm.py
+# 提前编译动态入口；常规算子首次调用也会触发编译
+PYTHONPATH=samples python -c 'from mega_recurrent_kda_replayssm.mega_recurrent_kda_replayssm import export_mega_recurrent_kda_replayssm; export_mega_recurrent_kda_replayssm()'
+
+# 设备精度与白盒检查
+python -m pytest -q -m npu test/mega_recurrent_kda_replayssm/test_mega_recurrent_kda_replayssm.py
 ```
 
-测试使用独立 CPU golden 对比输出、Conv state、replay record 和 Commit 结果。
-覆盖 `B=16/32/512`、8/16/24/28/32 AIC、checkpoint 只读、record 完整性、
-Conv state 更新及 Commit 状态精度。输出与
-reference 使用 `atol=rtol=0.005`；只读 checkpoint 使用零容差。
+CPU FP32 golden 算法直接定义在此测试脚本中，不依赖其他算子的测试文件。
+测试覆盖 TP4/8/16、典型短长 batch、当前设备支持的 8/16/24/28/32 配额，
+并检查输出、Conv state、U/K/decay 记录、checkpoint 只读和 accepted 0～8 的 commit 状态。
+数值容差为 `atol=rtol=0.005`；只读 checkpoint、空 Conv 槽和未选中槽使用零容差。
 
 ## 性能
 
-以下结果于 2026-09-21 在 Ascend950PR_9599 上使用 CANN 9.2、
-CANNBot-DSL 和 msprof 采集。形状为
-`B=16, S=8, H=7168, N=6, D=128`，使用 32 AIC 和 NZ 权重。
+以下为 Ascend 950、Channel API 的 DSL 0.7.1、CANN 9.2.0-beta.2 实测均值，单位 μs。
+统计 Verify mixed kernel 的设备执行时间，Commit 单独验证；每点预热 3 次、采样 20 次，并清理 224 MiB L2。
+共 48 个典型精度/性能点通过；NPU 白盒 21 项通过，真实 28 AIC / 56 AIV 配额下另有 6 项及 3 个最小 batch 用例通过。
 
-| 测试范围 | 统计口径 | 时间 (us) |
-|:---|:---|---:|
-| ReplaySSM verify kernel | MIX_AIC Task Duration 中位数 | 74.137 |
+| TP | model batch | 8 AIC | 16 AIC | 24 AIC | 32 AIC |
+|---:|---:|---:|---:|---:|---:|
+| 4 | 1 | 299.725 | 185.283 | 185.874 | 137.835 |
+| 4 | 2 | 377.234 | 229.044 | 217.237 | 158.785 |
+| 4 | 8 | 1060.117 | 569.852 | 457.342 | 326.546 |
+| 8 | 1 | 216.237 | 139.829 | 133.311 | 106.101 |
+| 8 | 2 | 325.206 | 205.328 | 184.187 | 137.797 |
+| 8 | 8 | 1053.266 | 566.658 | 425.238 | 293.842 |
+| 16 | 1 | 163.434 | 119.479 | 84.141 | 74.458 |
+| 16 | 8 | 986.518 | 492.964 | 365.058 | 278.766 |
+| 16 | 16 | 1942.248 | 945.279 | 673.912 | 502.966 |
+| 16 | 32 | 3870.474 | 1859.382 | 1279.752 | 961.440 |
 
-表中数据不包含独立 Commit kernel。
+32 AIC 下另测的较大 batch：
+
+| TP | model batch 16 | model batch 32 |
+|---:|---:|---:|
+| 4 | 543.017 | 1049.055 |
+| 8 | 504.679 | 985.747 |
+
+本环境同一内容键的正常冷编译用时 10790.004 秒；上表仅统计设备执行时间。

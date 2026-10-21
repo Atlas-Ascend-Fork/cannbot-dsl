@@ -10,7 +10,7 @@
 
 `mega_recurrent_kda` 将 QKV、decay、beta、output-gate 投影、causal Conv1D + SiLU、Q/K 归一化、recurrent KDA、RMSNorm、output gating 和输出投影融合为一次 mixed AIC/AIV kernel 调用。
 
-全部实现位于 [`mega_recurrent_kda.py`](mega_recurrent_kda.py)。保留原有 20 个公开参数，不增加 `core_num` 参数。算子读取输入设备当前 stream 的有效 AIC 配额，超过 32 时按 32 启动；截断后的配额须属于上述支持集合，AIV 配额也必须满足要求。
+全部实现位于 [`mega_recurrent_kda.py`](mega_recurrent_kda.py)。公开接口包含 20 个参数，核数由设备配额决定。算子读取输入设备当前 stream 的有效 AIC 配额，超过 32 时按 32 启动；截断后的配额须属于上述支持集合，AIV 配额也必须满足要求。
 
 ### TP 与 batch 的对应关系
 
@@ -174,7 +174,7 @@ python -m pytest -q test/mega_recurrent_kda/test_mega_recurrent_kda.py -m npu
 
 ## 性能
 
-以下为 2026-10-17 最终泛化实现的代表性结果，目标架构为 dav-3510。完整测试范围为 TP4/8/16 × 模型 batch 1～32 × 8/16/24/32 AIC，共 384 组。
+以下为 2026-10-17 在 dav-3510 上的代表性测量记录，对应算子文件 SHA256 为 `e842d24ff76498763de1b69966ae45952e9a96b2e4523469e7b594a825e25e33`。完整测试范围为 TP4/8/16 × 模型 batch 1～32 × 8/16/24/32 AIC，共 384 组。
 
 每组预热 10 次，采集 20 次样本；每次性能采样恢复状态池初态并清理 224 MiB L2，仅统计目标融合内核。表中为算术平均耗时，单位 us，未计状态恢复、清 L2 和 Profiler 导出开销。28 AIC 未纳入本轮性能表。未测小算子基线，不报告相对小算子加速比。
 
@@ -193,6 +193,4 @@ python -m pytest -q test/mega_recurrent_kda/test_mega_recurrent_kda.py -m npu
 | 16 | 16 | 256 | 2055.269 | 1069.722 | 811.641 | 594.935 |
 | 16 | 32 | 512 | 4096.800 | 2109.517 | 1555.538 | 1164.725 |
 
-上述数据的测量基线源码 SHA256 为 `e842d24ff76498763de1b69966ae45952e9a96b2e4523469e7b594a825e25e33`。共享投影方法与各阶段 buffer 构造分别维护，静态检查相关重构保持计算和 buffer 配置等价。性能值反映该次测试环境，不代表所有设备和 SDK 版本的保证值。
-
-同模型 batch 下主要投影的计算量基本相当，但权重规模、分块、权重复用和流水重叠不同。当前数据不能单独证明 TP4/TP8 已达到 HBM 带宽上限；32 AIC 下，TP4/TP8 在模型 batch >= 8 且总行数 `B*S` 能被 128 整除时，主投影使用 M128/N384 分块以形成完整调度波次；其余场景保留原调度。此调度由新框架版本回迁，上表仍为回迁前的历史数据，不能用作本次改动的实测收益。
+性能值对应上述源码和测量条件。当前源码的 TP4/TP8 主投影在 32 AIC、模型 batch >= 8 且总行数 `B*S` 能被 128 整除时使用 M128/N384 分块；该分块配置尚无本环境下对应的性能数据，上表不覆盖此配置。

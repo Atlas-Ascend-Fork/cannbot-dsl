@@ -6,10 +6,10 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 
-"""Independent CPU-golden precision tests for ReplaySSM."""
-
+"""Independent CPU golden arithmetic used only by ReplaySSM NPU whitebox tests."""
 from __future__ import annotations
 
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -17,32 +17,10 @@ import torch
 
 from _samples_path import load_sample
 
-
 SAMPLE = "mega_recurrent_kda_replayssm/mega_recurrent_kda_replayssm.py"
 COMMIT_SAMPLE = "commit_recurrent_kda_replayssm/commit_recurrent_kda_replayssm.py"
 NZ_WEIGHT_ARGUMENTS = (1, 2, 3, 4, 5, 7)
 CONV_KERNEL_SIZE = 4
-
-_INPUT_NAMES = (
-    "hidden_states",
-    "qkv_projection_weight",
-    "decay_projection_a_weight",
-    "decay_projection_b_weight",
-    "beta_projection_weight",
-    "output_gate_projection_weight",
-    "output_norm_weight",
-    "output_projection_weight",
-    "conv1d_weight",
-    "conv_state",
-    "recurrent_state",
-    "replay_u",
-    "replay_k",
-    "replay_decay",
-    "conv_state_indices",
-    "conv_num_accepted_tokens",
-    "a_log",
-    "dt_bias",
-)
 
 
 def _module():
@@ -102,9 +80,9 @@ def _run_model_native_causal_conv1d_silu(raw_qkv: torch.Tensor, conv1d_weight: t
     return result
 
 
-def _make_cpu_arguments(batch=16, seed=20260921):
+def _make_cpu_arguments(batch=16, seed=20260921, heads=6):
     generator = torch.Generator().manual_seed(seed)
-    sequence, hidden, heads, dim = 8, 7168, 6, 128
+    sequence, hidden, dim = 8, 7168, 128
     projection = heads * dim
 
     def randn(shape, dtype=torch.bfloat16, scale=0.02):
@@ -113,99 +91,63 @@ def _make_cpu_arguments(batch=16, seed=20260921):
     conv_indices = torch.randperm(batch, generator=generator).int() + 1
     conv_indices[::7] = 0
     conv_accepted = torch.arange(batch, dtype=torch.int32) % (sequence + 1)
-    return SimpleNamespace(
-        hidden_states=randn((batch, sequence, hidden)),
-        qkv_projection_weight=randn((3 * projection, hidden)),
-        decay_projection_a_weight=randn((dim, hidden)),
-        decay_projection_b_weight=randn((projection, dim)),
-        beta_projection_weight=randn((heads, hidden)),
-        output_gate_projection_weight=randn((projection, hidden)),
-        output_norm_weight=randn((dim,), torch.float32, scale=0.2),
-        output_projection_weight=randn((hidden, projection)),
-        conv1d_weight=randn((4, 3 * projection)),
-        conv_state=randn((batch + 1, sequence + 2, 3 * projection)),
-        recurrent_state=randn((batch, heads, dim, dim), torch.float32, scale=0.002),
-        replay_u=torch.empty(batch, sequence, heads, dim, dtype=torch.float16),
-        replay_k=torch.empty(batch, sequence, heads, dim, dtype=torch.float16),
-        replay_decay=torch.empty(batch, sequence, heads, dim, dtype=torch.float32),
-        conv_state_indices=conv_indices,
-        conv_num_accepted_tokens=conv_accepted,
-        a_log=randn((heads,), torch.float32, scale=0.1),
-        dt_bias=randn((heads, dim), torch.float32, scale=0.1),
-    )
+    return (
+        randn((batch, sequence, hidden)),
+        randn((3 * projection, hidden)),
+        randn((dim, hidden)),
+        randn((projection, dim)),
+        randn((heads, hidden)),
+        randn((projection, hidden)),
+        randn((dim,), torch.float32, scale=0.2),
+        randn((hidden, projection)),
+        randn((4, 3 * projection)),
+        randn((batch + 1, sequence + 2, 3 * projection)),
+        randn((batch, heads, dim, dim), torch.float32, scale=0.002),
+        torch.empty(batch, sequence, heads, dim, dtype=torch.float16),
+        torch.empty(batch, sequence, heads, dim, dtype=torch.float16),
+        torch.empty(batch, sequence, heads, dim, dtype=torch.float32),
+        conv_indices,
+        conv_accepted,
+        randn((heads,), torch.float32, scale=0.1),
+        randn((heads, dim), torch.float32, scale=0.1),)
 
 
-def _project_replay_inputs(arguments):
-    """Prepare projections, convolution and activated recurrence inputs."""
-    hidden = arguments.hidden_states
-    qkv_w = arguments.qkv_projection_weight
-    fa_w = arguments.decay_projection_a_weight
-    fb_w = arguments.decay_projection_b_weight
-    beta_w = arguments.beta_projection_weight
-    gate_w = arguments.output_gate_projection_weight
-    conv_w = arguments.conv1d_weight
+def _run_replay_cpu_golden(arguments, *, snapshots=False, scale=128**-0.5, lower_bound=-5.0, rms_norm_eps=1e-5):
+    """Evaluate FP32 recurrence and format records at the public dtype boundaries."""
+    hidden, qkv_w, fa_w, fb_w, beta_w, gate_w, norm_w, output_w, conv_w = arguments[:9]
     batch, sequence, _ = hidden.shape
-    conv_state = arguments.conv_state.clone()
+    heads = int(beta_w.shape[0])
+    conv_state = arguments[9].clone()
     raw_qkv = _linear_reference(hidden, qkv_w, torch.float32)
     convolved = _run_model_native_causal_conv1d_silu(
-        raw_qkv, conv_w, conv_state, arguments.conv_state_indices, arguments.conv_num_accepted_tokens
-    ).view(batch, sequence, 3, 6, 128)
+        raw_qkv, conv_w, conv_state, arguments[14], arguments[15]
+    ).view(batch, sequence, 3, heads, 128)
     query, key, value = (convolved[:, :, index].float() for index in range(3))
     query *= torch.rsqrt(query.square().sum(-1, keepdim=True) + 1e-6)
     key *= torch.rsqrt(key.square().sum(-1, keepdim=True) + 1e-6)
-    raw_decay = _linear_reference(_linear_reference(hidden, fa_w, torch.bfloat16), fb_w, torch.bfloat16).view(
-        batch, sequence, 6, 128
-    )
-    decay = torch.exp(
-        -5.0
-        * torch.sigmoid(
-            torch.exp(arguments.a_log).view(1, 1, 6, 1) * (raw_decay.float() + arguments.dt_bias.view(1, 1, 6, 128))
-        )
-    )
+    raw_decay = _linear_reference(_linear_reference(hidden, fa_w, torch.bfloat16), fb_w, torch.bfloat16).view(batch,
+        sequence, heads, 128)
+    decay = torch.exp(lower_bound * torch.sigmoid(
+        torch.exp(arguments[16]).view(1, 1, heads, 1) * (raw_decay.float() + arguments[17].view(1, 1, heads, 128))))
     beta = torch.sigmoid(_linear_reference(hidden, beta_w, torch.bfloat16).float())
-    gate = _linear_reference(hidden, gate_w, torch.bfloat16).view(batch, sequence, 6, 128)
-    return SimpleNamespace(
-        query=query,
-        key=key,
-        value=value,
-        decay=decay,
-        beta=beta,
-        gate=gate,
-        conv_state=conv_state,
-    )
-
-
-def _run_replay_cpu_golden(arguments, *, snapshots=False):
-    """Evaluate FP32 recurrence and format records at the public dtype boundaries."""
-    projected = _project_replay_inputs(arguments)
-    batch, sequence, _ = arguments.hidden_states.shape
-    query, key, value = projected.query, projected.key, projected.value
-    decay, beta, gate = projected.decay, projected.beta, projected.gate
-    current = arguments.recurrent_state.clone()
-    replay_u = torch.empty(batch, sequence, 6, 128, dtype=torch.float16)
-    recurrent = torch.empty(batch, sequence, 6, 128)
+    gate = _linear_reference(hidden, gate_w, torch.bfloat16).view(batch, sequence, heads, 128)
+    current = arguments[10].clone()
+    replay_u = torch.empty(batch, sequence, heads, 128, dtype=torch.float16)
+    recurrent = torch.empty(batch, sequence, heads, 128)
     states = []
     for token in range(sequence):
         current *= decay[:, token].unsqueeze(-2)
         delta = (value[:, token] - (current * key[:, token].unsqueeze(-2)).sum(-1)) * beta[:, token].unsqueeze(-1)
         replay_u[:, token] = delta.to(torch.float16)
         current += delta.unsqueeze(-1) * key[:, token].unsqueeze(-2)
-        recurrent[:, token] = (current * query[:, token].unsqueeze(-2)).sum(-1) * 128**-0.5
+        recurrent[:, token] = (current * query[:, token].unsqueeze(-2)).sum(-1) * scale
         if snapshots:
             states.append(current.clone())
-    normalized = (
-        recurrent * torch.rsqrt(recurrent.square().mean(-1, keepdim=True) + 1e-5) * arguments.output_norm_weight.float()
-    )
+    normalized = recurrent * torch.rsqrt(recurrent.square().mean(-1, keepdim=True) + rms_norm_eps) * norm_w.float()
     gated = (normalized * torch.sigmoid(gate.float())).to(torch.bfloat16)
-    output = _linear_reference(gated.flatten(2), arguments.output_projection_weight, torch.bfloat16)
-    return SimpleNamespace(
-        output=output,
-        conv_state=projected.conv_state,
-        replay_u=replay_u,
-        replay_k=key.to(torch.float16),
-        replay_decay=decay,
-        snapshots=states,
-    )
+    output = _linear_reference(gated.flatten(2), output_w, torch.bfloat16)
+    return SimpleNamespace(output=output, conv_state=conv_state, replay_u=replay_u,
+                           replay_k=key.to(torch.float16), replay_decay=decay, snapshots=states)
 
 
 def _reconstruct_commit_cpu(checkpoint, replay_u, replay_k, replay_decay, accepted):
@@ -213,134 +155,172 @@ def _reconstruct_commit_cpu(checkpoint, replay_u, replay_k, replay_decay, accept
     for batch, count in enumerate(accepted):
         for token in range(int(count)):
             current[batch] *= replay_decay[batch, token].float().unsqueeze(-2)
-            current[batch] += replay_u[batch, token].float().unsqueeze(-1) * replay_k[batch, token].float().unsqueeze(
-                -2
-            )
+            current[batch] += replay_u[batch, token].float().unsqueeze(-1) * replay_k[batch,
+                token].float().unsqueeze(-2)
     return current
 
 
 def _to_npu_arguments(arguments):
     torch_npu = pytest.importorskip("torch_npu")
-    actual = [getattr(arguments, name).to("npu") for name in _INPUT_NAMES]
+    actual = [value.to("npu") for value in arguments]
     for index in NZ_WEIGHT_ARGUMENTS:
-        actual[index] = torch_npu.npu_format_cast(actual[index], torch_npu.Format.FRACTAL_NZ)
+        actual[index] = torch_npu.npu_format_cast(
+            actual[index], torch_npu.Format.FRACTAL_NZ)
+        torch.npu.synchronize()
+        assert torch_npu.get_npu_format(actual[index]) == torch_npu.Format.FRACTAL_NZ
+        assert actual[index]._base is None and actual[index].storage_offset() == 0
     return tuple(actual)
 
 
-def _allocate_replay(batch_size, *, fill_nan=False):
+def _allocate_replay(batch_size, heads=6, *, fill_nan=False):
     factory = torch.full if fill_nan else torch.empty
     extra = (float("nan"),) if fill_nan else ()
-    replay_u = factory((batch_size, 8, 6, 128), *extra, dtype=torch.float16, device="npu")
-    replay_k = factory((batch_size, 8, 6, 128), *extra, dtype=torch.float16, device="npu")
-    replay_decay = factory((batch_size, 8, 6, 128), *extra, dtype=torch.float32, device="npu")
+    replay_u = factory(
+        (batch_size, 8, heads, 128), *extra, dtype=torch.float16, device="npu")
+    replay_k = factory(
+        (batch_size, 8, heads, 128), *extra, dtype=torch.float16, device="npu")
+    replay_decay = factory(
+        (batch_size, 8, heads, 128), *extra, dtype=torch.float32, device="npu")
     return replay_u, replay_k, replay_decay
 
 
+
+def _available_core_counts(module):
+    hardware = torch.npu.get_device_properties(torch.npu.current_device())
+    info = module.cannbotdsl.get_platform_info(stream=torch.npu.current_stream())
+    cube = min(int(hardware.cube_core_num), int(info.cube_core_num))
+    vector = min(int(hardware.vector_core_num), int(info.vector_core_num))
+    return tuple(core for core in module.VALID_CORES if core <= cube and 2 * core <= vector)
+
+
+@contextmanager
+def _core_stream(module, cores):
+    available = _available_core_counts(module)
+    if not available:
+        pytest.skip("requires at least 8 AIC and 16 AIV cores")
+    requested = max(available) if cores in (None, "max") else cores
+    if requested not in available:
+        pytest.skip(f"quota {requested} exceeds available AIC/AIV resources {available}")
+    stream = torch.npu.Stream()
+    torch.npu.set_stream_limit(stream, cube_num=requested, vector_num=2 * requested)
+    try:
+        with torch.npu.stream(stream):
+            yield requested
+            torch.npu.synchronize()
+    finally:
+        torch.npu.synchronize()
+        torch.npu.reset_stream_limit(stream)
+
+
 def _run_verify(module, arguments, cores, monkeypatch):
-    replay_u, replay_k, replay_decay = _allocate_replay(len(arguments[0]), fill_nan=True)
-    actual = (*arguments[:11], replay_u, replay_k, replay_decay, *arguments[14:])
     original_empty = torch.empty
-    batch = len(arguments[0])
+    shape = (len(arguments[0]) * 8, 7168)
 
     def poisoned_output(*args, **kwargs):
         value = original_empty(*args, **kwargs)
-        if (
-            value.device.type == "npu"
-            and value.dtype == torch.bfloat16
-            and tuple(value.shape) in ((batch * 8, 7168), (batch, 8, 7168))
-        ):
+        if value.device.type == "npu" and value.dtype == torch.bfloat16 and tuple(value.shape) == shape:
             value.fill_(float("nan"))
         return value
 
-    with monkeypatch.context() as patch:
+    with _core_stream(module, cores), monkeypatch.context() as patch:
         patch.setattr(torch, "empty", poisoned_output)
-        if cores is not None:
-            patch.setattr(module, "_device_block_num", lambda _ref: cores)
+        replay = _allocate_replay(len(arguments[0]), int(arguments[4].shape[0]), fill_nan=True)
+        actual = (*arguments[:11], *replay, *arguments[14:])
         output = module.mega_recurrent_kda_replayssm(*actual, 128**-0.5, -5.0, 1e-5)
-    return output, replay_u, replay_k, replay_decay
-
-
-_REPLAY_PRECISION_CASES = [
-    pytest.param(16, "auto"),
-    *[pytest.param(batch, 16) for batch in (16, 32, 512)],
-    *[pytest.param(batch, "available", marks=pytest.mark.slow) for batch in (16, 512)],
-]
+        return output, *replay
 
 
 @pytest.mark.npu
-@pytest.mark.parametrize("batch,cores", _REPLAY_PRECISION_CASES)
-def test_npu_precision_batch_generalization_and_core_control(batch, cores, monkeypatch):
+@pytest.mark.parametrize("tp", (4, 8, 16))
+@pytest.mark.parametrize("model_batch", (1, 3, 8, 16, 32))
+def test_npu_precision_batch_generalization_and_core_control(tp, model_batch, monkeypatch):
     pytest.importorskip("torch_npu")
-    if not hasattr(torch, "npu") or not torch.npu.is_available():
+    if not torch.npu.is_available():
         pytest.skip("requires Ascend NPU")
     module = _module()
-    stream = torch.npu.current_stream(torch.npu.current_device())
-    available = int(module.cannbotdsl.get_platform_info(stream=stream).cube_core_num)
-    grids = tuple(count for count in (8, 16, 24, 28, 32) if count <= available)
-    if not grids:
-        pytest.skip("Mega KDA requires at least 8 AIC cores in the current stream")
-    controls = (None,) if cores == "auto" else grids if cores == "available" else (cores,)
-    if cores == 16 and available < 16:
-        pytest.skip("requires a stream quota of at least 16 AIC cores")
-    cpu_arguments = _make_cpu_arguments(batch, seed=20260921 + batch)
-    initial_conv = cpu_arguments.conv_state.clone()
-    expected = _run_replay_cpu_golden(cpu_arguments)
-    used_slots = set(cpu_arguments.conv_state_indices.tolist()) - {0}
-    unchanged = [slot for slot in range(batch + 1) if slot not in used_slots]
-    arguments = _to_npu_arguments(cpu_arguments)
-    for control in controls:
-        actual_arguments = list(arguments)
-        actual_arguments[9] = arguments[9].clone()
-        actual_arguments[10] = arguments[10].clone()
-        output, replay_u, replay_k, replay_decay = _run_verify(module, actual_arguments, control, monkeypatch)
-        torch.npu.synchronize()
-        for name, actual in (
-            ("output", output),
-            ("replay_u", replay_u),
-            ("replay_k", replay_k),
-            ("replay_decay", replay_decay),
-            ("conv_state", actual_arguments[9]),
-        ):
-            torch.testing.assert_close(
-                actual.cpu().float(),
-                getattr(expected, name).float(),
-                atol=0.005,
-                rtol=0.005,
-                msg=lambda message, name=name: f"{name}: {message}",
-            )
-        torch.testing.assert_close(actual_arguments[9].cpu()[unchanged], initial_conv[unchanged], atol=0, rtol=0)
-        torch.testing.assert_close(actual_arguments[10].cpu(), cpu_arguments.recurrent_state, atol=0, rtol=0)
+    cpu = _make_cpu_arguments(tp * model_batch, seed=20260921 + model_batch, heads=96 // tp)
+    expected = _run_replay_cpu_golden(cpu)
+    arguments = _to_npu_arguments(cpu)
+    controls = _available_core_counts(module) if model_batch == 3 else ("max",)
+    if not controls:
+        pytest.skip("requires at least 8 AIC and 16 AIV cores")
+    used = set(cpu[14].tolist()) - {0}
+    unchanged = [slot for slot in range(len(cpu[0]) + 1) if slot not in used]
+    for core in controls:
+        actual = list(arguments)
+        actual[9] = arguments[9].clone()
+        actual[10] = arguments[10].clone()
+        output, replay_u, replay_k, replay_decay = _run_verify(module, actual, core, monkeypatch)
+        for name, value in (("output", output), ("replay_u", replay_u), ("replay_k", replay_k),
+            ("replay_decay", replay_decay), ("conv_state", actual[9])):
+            torch.testing.assert_close(value.cpu().float(), getattr(expected, name).float(),
+                atol=0.005, rtol=0.005, msg=lambda text, name=name: f"{name}: {text}")
+        torch.testing.assert_close(actual[9].cpu()[unchanged], cpu[9][unchanged], atol=0, rtol=0)
+        torch.testing.assert_close(actual[10].cpu(), cpu[10], atol=0, rtol=0)
+    assert len(module._COMPILED_FNS) == 1
 
 
 @pytest.mark.npu
-def test_npu_verify_records_commit_to_cpu_snapshots(monkeypatch):
+@pytest.mark.parametrize("tp", (4, 8, 16))
+def test_npu_verify_records_commit_to_cpu_snapshots(tp, monkeypatch):
     pytest.importorskip("torch_npu")
-    if not hasattr(torch, "npu") or not torch.npu.is_available():
+    if not torch.npu.is_available():
         pytest.skip("requires Ascend NPU")
     verify = _module()
     commit = load_sample(COMMIT_SAMPLE)
-    cpu_arguments = _make_cpu_arguments(seed=20260922)
-    expected = _run_replay_cpu_golden(cpu_arguments, snapshots=True)
-    arguments = _to_npu_arguments(cpu_arguments)
-    output, replay_u, replay_k, replay_decay = _run_verify(verify, arguments, None, monkeypatch)
-    torch.npu.synchronize()
-    accepted_cpu = torch.arange(16, dtype=torch.int32) % 9
-    expected_state = _reconstruct_commit_cpu(
-        cpu_arguments.recurrent_state, expected.replay_u, expected.replay_k, expected.replay_decay, accepted_cpu
-    )
-    # Quantized records reconstruct every accepted FP32 proposal snapshot.
-    for batch, accepted in enumerate(accepted_cpu.tolist()):
-        reference = cpu_arguments.recurrent_state[batch] if accepted == 0 else expected.snapshots[accepted - 1][batch]
-        torch.testing.assert_close(expected_state[batch], reference, atol=0.005, rtol=0.005)
+    batch_size = tp * 3
+    cpu = _make_cpu_arguments(batch_size, seed=20260922, heads=96 // tp)
+    expected = _run_replay_cpu_golden(cpu, snapshots=True)
+    arguments = _to_npu_arguments(cpu)
+    output, replay_u, replay_k, replay_decay = _run_verify(verify, arguments, "max", monkeypatch)
+    accepted = torch.arange(batch_size, dtype=torch.int32) % 9
+    expected_state = _reconstruct_commit_cpu(cpu[10], expected.replay_u, expected.replay_k,
+        expected.replay_decay, accepted)
+    for batch, count in enumerate(accepted.tolist()):
+        snapshot = cpu[10][batch] if count == 0 else expected.snapshots[count - 1][batch]
+        torch.testing.assert_close(expected_state[batch], snapshot, atol=0.005, rtol=0.005)
     state = arguments[10].clone()
-    actual_cpu_state = _reconstruct_commit_cpu(
-        cpu_arguments.recurrent_state, replay_u.cpu(), replay_k.cpu(), replay_decay.cpu(), accepted_cpu
-    )
-    commit.commit_recurrent_kda_replayssm(state, replay_u, replay_k, replay_decay, accepted_cpu.npu())
-    torch.npu.synchronize()
+    replay_state = _reconstruct_commit_cpu(cpu[10], replay_u.cpu(), replay_k.cpu(), replay_decay.cpu(), accepted)
+    with _core_stream(verify, "max"):
+        commit.commit_recurrent_kda_replayssm(state, replay_u, replay_k, replay_decay, accepted.npu())
     torch.testing.assert_close(output.cpu().float(), expected.output.float(), atol=0.005, rtol=0.005)
     torch.testing.assert_close(state.cpu(), expected_state, atol=0.005, rtol=0.005)
-    torch.testing.assert_close(state.cpu(), actual_cpu_state, atol=0.005, rtol=0.005)
-    torch.testing.assert_close(
-        state.cpu()[accepted_cpu == 0], cpu_arguments.recurrent_state[accepted_cpu == 0], atol=0, rtol=0
-    )
+    torch.testing.assert_close(state.cpu(), replay_state, atol=0.005, rtol=0.005)
+    torch.testing.assert_close(state.cpu()[accepted == 0], cpu[10][accepted == 0], atol=0, rtol=0)
+
+
+@pytest.mark.npu
+@pytest.mark.parametrize("tp", (4, 8, 16))
+def test_npu_runtime_scalars_and_strong_checkpoint(tp):
+    pytest.importorskip("torch_npu")
+    if not torch.npu.is_available():
+        pytest.skip("requires Ascend NPU")
+    module = _module()
+    cpu = list(_make_cpu_arguments(tp * 2, seed=20261020, heads=96 // tp))
+    cpu[10].mul_(10.0)
+    scalars = (0.125, 0.0, 0.002)
+    expected = _run_replay_cpu_golden(cpu, snapshots=True, scale=scalars[0], lower_bound=scalars[1],
+        rms_norm_eps=scalars[2])
+    actual = _to_npu_arguments(cpu)
+
+    def graph_call(*values):
+        return module.mega_recurrent_kda_replayssm(*values[:16], A_log=values[16], dt_bias=values[17],
+            scale=scalars[0], lower_bound=scalars[1], rms_norm_eps=scalars[2])
+
+    compiled = torch.compile(graph_call, backend="eager", fullgraph=True)
+    with _core_stream(module, "max"):
+        output = compiled(*actual)
+    for name, value in (("output", output), ("conv_state", actual[9]), ("replay_u", actual[11]),
+        ("replay_k", actual[12]), ("replay_decay", actual[13])):
+        torch.testing.assert_close(value.cpu().float(), getattr(expected, name).float(), atol=0.005, rtol=0.005)
+    torch.testing.assert_close(actual[10].cpu(), cpu[10], atol=0, rtol=0)
+    commit = load_sample(COMMIT_SAMPLE)
+    accepted = torch.full((len(cpu[0]),), 8, dtype=torch.int32)
+    expected_state = _reconstruct_commit_cpu(cpu[10], expected.replay_u, expected.replay_k,
+        expected.replay_decay, accepted)
+    state = actual[10].clone()
+    with _core_stream(module, "max"):
+        commit.commit_recurrent_kda_replayssm(state, actual[11], actual[12], actual[13], accepted.npu())
+    torch.testing.assert_close(state.cpu(), expected_state, atol=0.005, rtol=0.005)
+    torch.testing.assert_close(state.cpu(), expected.snapshots[-1], atol=0.005, rtol=0.005)
+    assert len(module._COMPILED_FNS) == 1

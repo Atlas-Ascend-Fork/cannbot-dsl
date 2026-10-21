@@ -81,7 +81,7 @@ metadata 算子读取 `cu_seqlens` 边界值；对于 `qg` 和 `local_initial_st
 
 metadata 记录每条逻辑序列实际消费的 chunk 数；`decay` 和 `mqk` 的 chunk 轴按同一模块导出的 `chunk_capacity_upper_bound(B, S)`（稠密）或 `chunk_capacity_upper_bound(B, T)`（TND）申请，容量为上文定义的 `C`。
 
-主算子的 metadata wrapper 与 CP preprocess 使用同一个共享 CP ABI 和 AICPU 编译对象。该 ABI 的历史名称为 stage12w；主算子跳过其中为预处理调度保留的字段。
+主算子的 metadata wrapper 与 CP preprocess 使用同一个共享 CP ABI 和 AICPU 编译对象。主算子跳过共享 ABI 中为预处理调度保留的字段。
 
 ## 返回值说明
 

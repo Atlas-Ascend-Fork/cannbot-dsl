@@ -113,7 +113,7 @@ OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 python -m pytest -q test/flash_kda/test_flas
 
 ## 性能测试
 
-2026-10-18 在 PR 服务器上实测：Ascend 950，`arena_old`，cannbotdsl 0.7.1、PyTorch 2.10.0、CANN 9.2.0，32 个 AIC。
+2026-10-18 实测环境：Ascend 950，cannbotdsl 0.7.1、PyTorch 2.10.0、CANN 9.2.0，32 个 AIC。
 
 `B=1`、`Nqk=Nv=96`、`S=16384`、`Dk=Dv=128`；Q/K/V/g/beta 为 BF16，初始状态及门控参数为 FP32，metadata 使用 `template="auto"`。`lower_bound=-5.0`，初态、`A_log` 和 `dt_bias` 均为 0。校验后预热 3 次，采样 20 次，不额外清理缓存。下表为设备 kernel Task Duration 的中位数，不包含 metadata 生成、编译和 host 分配时间。
 

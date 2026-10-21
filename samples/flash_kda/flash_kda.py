@@ -566,5 +566,5 @@ def _flash_kda_graph(
 
 
 def __getattr__(name):
-    """Preserve the original module helpers after extracting the group template."""
+    """Expose helper attributes from the GROUP template module."""
     return getattr(_group_template, name)
