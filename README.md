@@ -203,6 +203,7 @@ python3 -m pytest test/sparse_flash_attention/test_sparse_flash_attention.py -v
 | [quant_sparse_lightning_indexer_dsl](samples/quant_sparse_lightning_indexer_dsl) | `quant_sparse_lightning_indexer()` | MXFP4 Sparse Lightning Indexer（QSLI），仅访问候选 Key 块 |
 | [quant_sparse_lightning_indexer_metadata_dsl](samples/quant_sparse_lightning_indexer_metadata_dsl) | `quant_sparse_lightning_indexer_metadata()` | QSLI 配套的 AICPU 调度算子 |
 | [kv_compress_epilog](samples/kv_compress_epilog) | `kv_compress_epilog()` | KV Cache 量化压缩与按槽位原地更新 |
+| [reduce_scatter](samples/reduce_scatter) | `AivReduceScatterSoleMesh` | HIF8 多卡 ReduceScatter，支持 sum/max/min 与 UBMem/URMA |
 | [rms_norm](samples/rms_norm) | `rms_norm()` | RMSNorm，`y = x · rstd · γ` |
 | [engram_gate](samples/engram_gate) | `engram_gate()` | Engram 残差门：双路 RMS、加权点积与 signed-sqrt sigmoid 门控 |
 | [pointnet_sa](samples/pointnet_sa) | `pointnet_sa()` | PointNet++ SA 层的 shared MLP + max-pool |

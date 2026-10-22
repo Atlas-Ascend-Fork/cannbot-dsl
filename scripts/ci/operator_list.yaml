@@ -49,3 +49,4 @@ operators:
   - quant_mla_prolog
   - gather_v2
   - scatter_elements
+  - reduce_scatter
