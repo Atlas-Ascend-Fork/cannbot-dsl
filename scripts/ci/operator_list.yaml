@@ -50,3 +50,4 @@ operators:
   - gather_v2
   - scatter_elements
   - reduce_scatter
+  - all_to_all_quant_matmul

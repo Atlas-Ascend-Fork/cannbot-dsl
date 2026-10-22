@@ -339,6 +339,14 @@ scatter_elements:
   options:
     - scatter_elements
 
+all_to_all_quant_matmul:
+  module: True
+  src:
+    - samples/all_to_all_quant_matmul
+    - test/all_to_all_quant_matmul
+  options:
+    - all_to_all_quant_matmul
+
 shared:
   module: True
   src:
