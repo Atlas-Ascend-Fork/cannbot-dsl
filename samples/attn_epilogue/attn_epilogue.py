@@ -568,3 +568,85 @@ def export_attn_epilogue():
         for handle in handles:
             handle.close()
         _COMPILED.clear()
+
+
+_GRAPH_LIBRARY = torch.library.Library("cannbotdsl_attn_epilogue", "DEF")
+_GRAPH_LIBRARY.define(
+    "attn_epilogue("
+    "Tensor o, Tensor woa, Tensor wob, Tensor descale_woa, Tensor descale_wob, "
+    "Tensor rope_sin, Tensor rope_cos"
+    ") -> Tensor"
+)
+
+
+def _attn_epilogue_meta(inputs, weights):
+    """Infer the [T, DIM] BF16 output from tensor metadata only.
+
+    FakeTensor tracing runs this implementation, so it must not call NPU-only
+    APIs such as ``torch_npu.get_npu_format`` (they have no fake kernel).
+    """
+    o, rope_cos, rope_sin = inputs.source, inputs.cos, inputs.sin
+    woa, descale_woa = weights.first, weights.first_scale
+    wob, descale_wob = weights.second, weights.second_scale
+    if not isinstance(o, torch.Tensor) or o.ndim != 3:
+        raise ValueError("o must have shape (T, 64, 512)")
+    if tuple(o.shape[1:]) != (common.NG * common.F // common.HEAD_DIM, common.HEAD_DIM):
+        raise ValueError("o must have shape (T, 64, 512)")
+    if o.dtype != torch.bfloat16:
+        raise TypeError("o must be bfloat16")
+    t = o.shape[0]
+    if tuple(woa.shape) != (common.NG, common.O_LORA, common.F):
+        raise ValueError("woa must have shape (8, 1024, 4096)")
+    if woa.dtype != torch.float8_e4m3fn:
+        raise TypeError("woa must be float8_e4m3fn")
+    if tuple(wob.shape) != (common.DIM, common.NG * common.O_LORA):
+        raise ValueError("wob must have shape (5120, 8192)")
+    if wob.dtype != torch.float8_e4m3fn:
+        raise TypeError("wob must be float8_e4m3fn")
+    if tuple(descale_woa.shape) != (
+        common.NG,
+        common.O_LORA,
+        common.F // common.MX_DIVISOR,
+        2,
+    ):
+        raise ValueError("descale_woa must have shape (8, 1024, 64, 2)")
+    if descale_woa.dtype != torch.float8_e8m0fnu:
+        raise TypeError("descale_woa must be float8_e8m0fnu")
+    if tuple(descale_wob.shape) != (
+        common.DIM,
+        common.NG * common.O_LORA // common.MX_DIVISOR,
+        2,
+    ):
+        raise ValueError("descale_wob must have shape (5120, 128, 2)")
+    if descale_wob.dtype != torch.float8_e8m0fnu:
+        raise TypeError("descale_wob must be float8_e8m0fnu")
+    if tuple(rope_sin.shape) != (t, common.ROPE_DIM):
+        raise ValueError("rope_sin must have shape (T, 64)")
+    if rope_sin.dtype != torch.float32:
+        raise TypeError("rope_sin must be float32")
+    if tuple(rope_cos.shape) != (t, common.ROPE_DIM):
+        raise ValueError("rope_cos must have shape (T, 64)")
+    if rope_cos.dtype != torch.float32:
+        raise TypeError("rope_cos must be float32")
+    return torch.empty((t, common.DIM), dtype=torch.bfloat16, device="meta")
+
+
+@torch.library.impl(_GRAPH_LIBRARY, "attn_epilogue", "Meta")
+def _attn_epilogue_meta_dispatch(*args):
+    """Adapt the dispatcher schema to the grouped metadata inputs."""
+    o, woa, wob, descale_woa, descale_wob, rope_sin, rope_cos = args
+    return _attn_epilogue_meta(
+        common.RopeInputs(o, rope_cos, rope_sin),
+        common.ProjectionWeights(woa, descale_woa, wob, descale_wob),
+    )
+
+
+torch.library.impl(_GRAPH_LIBRARY, "attn_epilogue", "PrivateUse1")(attn_epilogue)
+
+attn_epilogue_op = torch.ops.cannbotdsl_attn_epilogue.attn_epilogue
+
+# While tracing, dynamo records the registered dispatcher call instead of inlining
+# the host wrapper, so FakeTensor never reaches torch_npu.get_npu_format.
+torch.compiler.substitute_in_graph(attn_epilogue, can_constant_fold_through=False)(
+    lambda *args, **kwargs: attn_epilogue_op(*args, **kwargs)
+)

@@ -470,6 +470,48 @@ def test_public_validation(weights):
         tp1.attn_epilogue(*bad)
 
 
+def test_graph_op_meta_and_dynamo_substitution():
+    """npugraph_ex regression: dynamo must capture the registered graph op.
+
+    Inlining the host wrapper instead reaches ``torch_npu.get_npu_format`` on
+    FakeTensors, which has no fake kernel (UnsupportedOperatorException).
+    """
+    t = 72
+    args = (
+        torch.empty(t, 64, 512, dtype=torch.bfloat16, device="meta"),
+        torch.empty(8, 1024, 4096, dtype=torch.float8_e4m3fn, device="meta"),
+        torch.empty(5120, 8192, dtype=torch.float8_e4m3fn, device="meta"),
+        torch.empty(8, 1024, 64, 2, dtype=torch.float8_e8m0fnu, device="meta"),
+        torch.empty(5120, 128, 2, dtype=torch.float8_e8m0fnu, device="meta"),
+        torch.empty(t, 64, dtype=torch.float32, device="meta"),
+        torch.empty(t, 64, dtype=torch.float32, device="meta"),
+    )
+
+    out = tp1.attn_epilogue_op(*args)
+    assert tuple(out.shape) == (t, DIM)
+    assert out.dtype == torch.bfloat16
+
+    def decode(o, woa, wob, dwa, dwb, rope_cos, rope_sin):
+        return tp1.attn_epilogue(o, woa, wob, dwa, dwb, rope_sin, rope_cos)
+
+    captured = {}
+
+    def backend(graph, example_inputs):
+        captured["graph"] = graph
+        raise RuntimeError("graph captured")
+
+    compiled = torch.compile(decode, backend=backend, fullgraph=True)
+    with pytest.raises(RuntimeError, match="graph captured"):
+        compiled(*args)
+
+    targets = [
+        node.target
+        for node in captured["graph"].graph.nodes
+        if node.op == "call_function"
+    ]
+    assert any("cannbotdsl_attn_epilogue.attn_epilogue" in str(x) for x in targets)
+
+
 def benchmark_inputs(t, mode):
     torch.npu.set_device(0)
     wa, wb = weight_fixture()

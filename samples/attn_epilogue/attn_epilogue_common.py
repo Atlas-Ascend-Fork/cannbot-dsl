@@ -1016,18 +1016,21 @@ def validate_network_inputs(inputs, weights):
             ("rope_cos", rope_cos, (t, 64), torch.float32),
         ),
     )
-    for name, tensor in (
-        ("o", o),
-        ("woa", woa),
-        ("descale_woa", descale_woa),
-        ("descale_wob", descale_wob),
-        ("rope_sin", rope_sin),
-        ("rope_cos", rope_cos),
-    ):
-        if torch_npu.get_npu_format(tensor) not in (0, 2):
-            raise ValueError(f"{name} must use ND storage")
-    if torch_npu.get_npu_format(wob) not in (0, 2):
-        raise ValueError(
-            "wob must use ND storage; direct FRACTAL_NZ support is pending"
-        )
+    # Storage-format queries need real NPU storage; while dynamo traces, inputs are
+    # FakeTensors and npu.get_npu_format has no fake kernel, so skip the check here.
+    if not torch.compiler.is_compiling():
+        for name, tensor in (
+            ("o", o),
+            ("woa", woa),
+            ("descale_woa", descale_woa),
+            ("descale_wob", descale_wob),
+            ("rope_sin", rope_sin),
+            ("rope_cos", rope_cos),
+        ):
+            if torch_npu.get_npu_format(tensor) not in (0, 2):
+                raise ValueError(f"{name} must use ND storage")
+        if torch_npu.get_npu_format(wob) not in (0, 2):
+            raise ValueError(
+                "wob must use ND storage; direct FRACTAL_NZ support is pending"
+            )
     return t
