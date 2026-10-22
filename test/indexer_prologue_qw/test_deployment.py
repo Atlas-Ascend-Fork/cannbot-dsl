@@ -36,6 +36,10 @@ def _require_npu():
     pytest.importorskip("torch_npu")
     if not torch.npu.is_available():
         pytest.skip("no NPU visible")
+    # CI can report an available NPU without binding an ACL context to the
+    # pytest thread.  Bind it before the first tensor ``.npu()`` conversion
+    # rather than relying on LazySetDevice during a test body.
+    torch.npu.set_device(0)
 
 
 def _check_shape(t: int) -> None:

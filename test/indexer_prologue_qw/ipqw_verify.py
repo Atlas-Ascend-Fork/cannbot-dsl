@@ -75,10 +75,12 @@ def _fp32_scale_to_e8m0(scale: torch.Tensor) -> torch.Tensor:
     return torch.where(zero, torch.zeros_like(exp_bits), exp_bits).to(torch.uint8)
 
 
-def rotate_half(x: torch.Tensor) -> torch.Tensor:
-    half = x.shape[-1] // 2
-    x1, x2 = x[..., :half], x[..., half:]
-    return torch.cat((-x2, x1), dim=-1)
+def rotate_interleave(x: torch.Tensor) -> torch.Tensor:
+    """Rotate adjacent RoPE pairs: ``(x0, x1) -> (-x1, x0)``."""
+    if x.shape[-1] % 2:
+        raise ValueError(f"interleaved RoPE needs an even width, got {x.shape[-1]}")
+    pair = x.reshape(*x.shape[:-1], -1, 2)
+    return torch.stack((-pair[..., 1], pair[..., 0]), dim=-1).reshape_as(x)
 
 
 def apply_rope_inplace(q: torch.Tensor, rope_sin: torch.Tensor, rope_cos: torch.Tensor) -> torch.Tensor:
@@ -93,7 +95,7 @@ def apply_rope_inplace(q: torch.Tensor, rope_sin: torch.Tensor, rope_cos: torch.
     pe = q[..., -dr:]
     cos = rope_cos.to(torch.float32).unsqueeze(1)
     sin = rope_sin.to(torch.float32).unsqueeze(1)
-    q[..., -dr:] = pe * cos + rotate_half(pe) * sin
+    q[..., -dr:] = pe * cos + rotate_interleave(pe) * sin
     return q
 
 
@@ -112,7 +114,7 @@ def mx_matmul_fp32(
 
 
 def fp32_to_e2m1_nibble(values: torch.Tensor) -> torch.Tensor:
-    """Round FP32 to nearest OCP E2M1 code (4-bit nibble). Ties go away from zero."""
+    """Round FP32 to nearest OCP E2M1 code (4-bit nibble), ties-to-even."""
     codebook = torch.tensor(E2M1_POS, dtype=torch.float32, device=values.device)
     sign = values < 0
     mag = values.abs()
@@ -120,7 +122,11 @@ def fp32_to_e2m1_nibble(values: torch.Tensor) -> torch.Tensor:
     min_dist = dist.min(dim=-1).values.unsqueeze(-1)
     tied = dist == min_dist
     arange = torch.arange(8, device=values.device, dtype=torch.int64)
-    idx = torch.where(tied, arange, torch.full_like(arange, -1)).max(dim=-1).values
+    nearest = torch.where(tied, arange, torch.full_like(arange, 8)).min(dim=-1).values
+    even = torch.where(
+        tied & ((arange & 1) == 0), arange, torch.full_like(arange, 8)
+    ).min(dim=-1).values
+    idx = torch.where(tied.sum(dim=-1) > 1, even, nearest)
     nibble = idx.to(torch.uint8)
     nibble = torch.where(sign, nibble | 0x08, nibble)
     return nibble
@@ -473,7 +479,10 @@ def make_inputs(
         rope_cos = torch.ones((t, dr), dtype=torch.float32)
         rope_sin = torch.zeros((t, dr), dtype=torch.float32)
     else:
-        theta = torch.rand((t, dr), generator=gen, dtype=torch.float32) * (2 * math.pi)
+        # RoPE uses adjacent (even, odd) pairs, so both lanes in a pair share
+        # one angle/frequency.
+        theta = torch.rand((t, dr // 2), generator=gen, dtype=torch.float32) * (2 * math.pi)
+        theta = theta.repeat_interleave(2, dim=-1)
         rope_cos = torch.cos(theta)
         rope_sin = torch.sin(theta)
     return IndexerPrologueQwInputs(

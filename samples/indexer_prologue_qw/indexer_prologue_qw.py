@@ -85,7 +85,9 @@ from cannbotdsl.ops.reg import (
     vadds,
     vbitwise_and,
     vbitwise_or,
+    vbitwise_xor,
     vdups,
+    veq,
     vgather,
     vgather_reg,
     vges,
@@ -379,8 +381,9 @@ def build_e2m1_lut() -> torch.Tensor:
     ``y`` is the already-descaled value, so ``|y| <= 6``.  Index bits are the
     biased fp32 exponent times eight plus the top three mantissa bits; every
     E2M1 midpoint (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0) is exactly on such a
-    bucket boundary, so a truncating index reproduces round-to-nearest with
-    ties away from zero -- the rule the CPU golden uses.
+    bucket boundary.  The normal bucket lookup therefore selects the upper
+    neighbour at a midpoint.  ``_pack_e2m1`` fixes the four exact midpoints
+    whose upper neighbour is odd, completing round-to-nearest-even (RNE).
     """
     codes = torch.zeros(LUT_LEN, dtype=torch.int32)
     midpoints = (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)
@@ -828,13 +831,13 @@ class Plan:
                 f"fused kernel needs D and Dr as multiples of {VL}, got D={self.d}, Dr={self.dr}"
             )
         if self.rope_regs != 1:
-            # Dr == 64 keeps rotate-half inside one register, so pass 1 can read
+            # Dr == 64 keeps interleaved RoPE pairs inside one register, so pass 1 can read
             # the pre-RoPE partner lanes from the register it is about to
             # overwrite.  Dr > 64 would need every rope register live at once
             # before any write-back; not implemented, and Dr=64 is the frozen
             # case (and what MLA uses).
             raise NotImplementedError(
-                f"rotate-half is implemented for Dr == {VL} only, got Dr={self.dr}"
+                f"interleaved RoPE is implemented for Dr == {VL} only, got Dr={self.dr}"
             )
         if self.dr > self.d:
             raise ValueError(f"Dr={self.dr} exceeds D={self.d}")
@@ -1631,14 +1634,21 @@ class VectorQ:
             m32 = full_mask()
             m_lo = create_mask("h", 32)
             lane = varange(0, I32)
-            k_lane_wrap = vdups(VL - 1, I32, mask=m32)
-            rot_idx = vreinterpret(
-                vbitwise_and(vadds(lane, VL // 2, mask=m32), k_lane_wrap, mask=m32), U32
+            one_i = vdups(1, I32, mask=m32)
+            pair_idx = vreinterpret(
+                vbitwise_xor(lane, one_i, mask=m32), U32
+            )
+            group_idx = vreinterpret(
+                vbitwise_and(
+                    vadds(lane, VL // 2, mask=m32),
+                    vdups(VL - 1, I32, mask=m32),
+                    mask=m32,
+                ), U32
             )
             rope_sgn = vselect(
                 vdups(1.0, F32, mask=m32),
                 vdups(-1.0, F32, mask=m32),
-                cond_mask=vges(lane, p.dr // 2, mask=m32),
+                cond_mask=vne(vbitwise_and(lane, one_i, mask=m32), vdups(0, I32, mask=m32), mask=m32),
             )
             for r in range(rows):
                 base = r * p.d
@@ -1650,7 +1660,7 @@ class VectorQ:
                         sinv = vload(sin_ub, r * p.dr + pe * VL)
                         rot = vmul(
                             vreinterpret(
-                                vgather_reg(vreinterpret(x, I32), rot_idx), F32
+                                vgather_reg(vreinterpret(x, I32), pair_idx), F32
                             ),
                             rope_sgn,
                             mask=m32,
@@ -1660,7 +1670,7 @@ class VectorQ:
                         vstore(cv_ub, base + i * VL, x, m32)
                     abs_d = vabs(x, mask=m32)
                     abs_d_hi = vreinterpret(
-                        vgather_reg(vreinterpret(abs_d, I32), rot_idx), F32
+                        vgather_reg(vreinterpret(abs_d, I32), group_idx), F32
                     )
                     slot = r * p.groups + 2 * i
                     vstore_first(self.amax_ub, slot, vreduce_max(abs_d, mask=m_lo))
@@ -1714,6 +1724,7 @@ class VectorQ:
             zero_i = vdups(0, I32, mask=m32)
             k8 = vdups(8, I32, mask=m32)
             mag_mask = vdups(FP32_MAG_MASK, I32, mask=m32)
+            lut_remainder_mask = vdups((1 << LUT_SHIFT) - 1, I32, mask=m32)
             one_i = vdups(1, I32, mask=m32)
             odd = vne(vbitwise_and(lane, one_i, mask=m32), zero_i, mask=m32)
             pack_w = vselect(
@@ -1734,6 +1745,32 @@ class VectorQ:
                     idx = vsub(vshr(mag, LUT_SHIFT, mask=m32), off, mask=m32)
                     idx = vmaxs(idx, 0, mask=m32)
                     code = vgather(lut_ub, vreinterpret(idx, U32), mask=m32)
+                    # The LUT takes the upper value at every midpoint.  For
+                    # RNE, the exact midpoints 0.25, 1.25, 2.5 and 5.0 must
+                    # instead take the lower (even) E2M1 code.  ``idx`` is
+                    # the descaled fp32 bucket, while the discarded LUT bits
+                    # distinguish the exact midpoint from values just above it.
+                    tie_lower = vselect(
+                        one_i, zero_i,
+                        cond_mask=veq(idx, vdups(1000, I32, mask=m32), mask=m32),
+                    )
+                    for midpoint_idx in (1018, 1026, 1034):
+                        tie_lower = vselect(
+                            one_i, tie_lower,
+                            cond_mask=veq(
+                                idx, vdups(midpoint_idx, I32, mask=m32), mask=m32
+                            ),
+                        )
+                    tie_code = vselect(
+                        vsub(code, one_i, mask=m32), code,
+                        cond_mask=veq(
+                            vbitwise_and(mag, lut_remainder_mask, mask=m32), zero_i,
+                            mask=m32,
+                        ),
+                    )
+                    code = vselect(
+                        tie_code, code, cond_mask=vne(tie_lower, zero_i, mask=m32)
+                    )
                     # Sign follows q < 0, so negative zero encodes as nibble 0.
                     neg = vlts(xv, 0.0, mask=m32)
                     sign = vselect(k8, zero_i, cond_mask=neg)

@@ -59,7 +59,7 @@ q, descale_q, w = indexer_prologue_qw(
 | wqb | `(4096, 1280)` FP8 E4M3 / uint8，NPU FRACTAL_NZ |
 | ww | `(32, 5120)` BF16，NPU FRACTAL_NZ |
 | descale_qr / descale_wqb | `(T, 20, 2)` / `(4096, 20, 2)` paired E8M0 |
-| rope_sin / rope_cos | `(T, 64)` FP32，rotate-half |
+| rope_sin / rope_cos | `(T, 64)` FP32，interleave RoPE；相邻 `(2i, 2i+1)` 通道构成一对，表值也按对重复 |
 | q | `(T, 32, 64)` uint8，低 nibble 为偶数列，高 nibble 为奇数列 |
 | descale_q | `(T, 32, 2, 2)` E8M0 字节 |
 | w | `(T, 32)` FP32 |
