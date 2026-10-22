@@ -14,6 +14,7 @@
         <policylist>
             <policy name="projectPolicy" desc="">
                 <policyitem type="license" name="CANN-2.0" path=".*" desc="Dynamically linked by module X"/>
+                <policyitem type="copyright" name="Huawei Technologies Co., Ltd." path=".*" rule="may" group="defaultGroup" filefilter="copyrightPolicyFilter" desc=""/>
             </policy>
         </policylist>
         <filefilterlist>
@@ -23,6 +24,7 @@
             </filefilter>
             <filefilter name="defaultPolicyFilter" desc="Filters for compatibility，license header policies">
                 <filteritem type="filename" name=".gitkeep" desc="Git directory placeholder, no license header required"/>
+                <filteritem type="filename" name="requirements*.txt" desc="Dependency manifest files, license header not applicable"/>
             </filefilter>
             <filefilter name="copyrightPolicyFilter" desc="Filters for copyright header policies">
                 <filteritem type="filename" name=".gitkeep" desc="Git directory placeholder, no copyright header required"/>
@@ -34,6 +36,7 @@
             <filefilter name="readmeOpenSourcefileNamePolicyFilter" desc="Filters for README.OpenSource file policies">
             </filefilter>
             <filefilter name="binaryFileTypePolicyFilter" desc="Filters for binary file policies">
+                <filteritem type="filename" name="*.png" desc="Documentation images, legitimate binary assets"/>
             </filefilter>
         </filefilterlist>
         <licensematcherlist>

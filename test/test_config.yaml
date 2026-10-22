@@ -38,9 +38,13 @@
 skip_all_tests: false
 
 ignore:
+  - .pre-commit-config.yaml
   - install_deps.sh
   - scripts/ci/operator_list.yaml
   - scripts/ci/parse_changed_ops.py
+  - scripts/format_cpp.sh
+  - scripts/oat_check.sh
+  - scripts/run_codespell.sh
   - test/test_config.yaml
 
 attn_epilogue:
