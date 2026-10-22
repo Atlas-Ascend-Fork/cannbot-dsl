@@ -94,6 +94,7 @@ required = {
     "numpy": "pip",
     "ml_dtypes": "pip",
     "pytest": "pip",
+    "xdist": "pip install pytest-xdist==3.8.0",
     "yaml": "pip",
 }
 missing = [f"{m} ({src})" for m, src in required.items() if importlib.util.find_spec(m) is None]

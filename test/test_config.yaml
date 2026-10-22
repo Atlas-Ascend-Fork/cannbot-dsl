@@ -10,17 +10,23 @@
 # test_config.yaml
 #
 # 用来配置 CI 如何根据文件变更列表触发相应的验证。
-# 规则以结点为最小单位，结点通过 module: True 标识，解析器（scripts/ci/parse_changed_ops.py）
+# 规则以结点为最小单位，结点通过 module 字段标识，解析器（scripts/ci/parse_changed_ops.py）
 # 递归遍历配置树，命中 module 结点后读取其 src 与 options。
 #
 # 字段说明：
-#   skip_all_tests: ---------- [可选] 置 true 时不做变更分析，本次变更不跑任何算子测试
+#   skip_all_tests: ---------- [可选] 置 true 时仍校验配置，本次变更不跑任何算子测试
 #   ignore: ------------------ [可选] 不影响算子测试范围的精确文件路径列表
-#   module: True ------------- 固定写法，标识此处为一个结点
+#   module: true/false ------- 标识规则结点；true 启用，false 跳过命中该结点的变更
 #   src: --------------------- [可选] 看护的源码/测试路径列表，其中任一文件被修改时触发
 #   options: ----------------- [可选] 命中结点后需要验证的算子列表；all 表示运行全部算子
 #
 # 匹配规则：变更文件路径以某个 src 为前缀（或等于 src）即命中该结点。
+# test/ 根目录直属文件变更自动触发 all（ignore 中的文件除外）。
+# module: false 时保留 src 匹配，命中的变更不触发测试，也不做缺配置拦截。
+# 仅跳过该结点的变更触发；公共文件全量和其他结点的 options 仍可选择相同测试。
+# samples/ 子目录内的非文档变更只校验 operator_list.yaml 的目录覆盖，不要求测试路由。
+# test/ 子目录内的非文档变更只校验本文件的有效定向规则或显式禁用规则，不要求算子清单。
+# 源码已登记但没有测试路由时不选择测试；缺配置时输出 YAML 路径、示例并阻断 CI。
 # 公共文件（conftest.py、scripts、依赖清单等）改动会触发 all，即全量验证。
 
 # 临时开关（默认 false）：置 true 时本次变更不跑任何算子测试。
@@ -336,7 +342,6 @@ shared:
     - install_deps.sh
     - test/conftest.py
     - scripts
-    - test
     - requirements.txt
     - .pre-commit-config.yaml
   options:

@@ -1,18 +1,19 @@
 name: PR-pipeline_cannbot-dsl
 
 concurrency:
-  max: 5
+  max: 15
   exceed-action: QUEUE
   enable: true
   preemption:
     enable: true
+    # Platform cancellation is scoped to the same PR across runners.
     events: [mr_id]
 
 on:
   workflow_dispatch:
   pull_request_comment:
     types: [created]
-    branches: [ '*' ]
+    branches: [ '**' ]
     comments: [ '^(?:\/)?compile*' ]
   pr_comment:
     types: [ created ]
@@ -27,12 +28,15 @@ env:
   obs_path: "${{ env.org_name }}/${{ env.repo_name }}/ci/package/${{ env.MERGE_ID }}"
   online: ${{ vars.APPLY_LABEL }}
 
+# Evaluate before dispatching jobs to runners. Comment events may omit merged,
+# so a PR must still be open. Dispatches without a PR keep their existing behavior.
 stages:
   stage1:
     name: PreBuild
     jobs:
       JOB_image:
         name: Test_image
+        if: ${{ !atomgit.event.pull_request.number || (atomgit.event.pull_request.state == 'open' && atomgit.event.pull_request.merged != true && !atomgit.event.pull_request.merged_at) }}
         steps:
           - name: revise_image
             identifier: revise_image
@@ -47,6 +51,7 @@ stages:
           image: swr.cn-north-4.myhuaweicloud.com/ci_cann/ubuntu20.04.05_x86:k8s_v1.1006
       JOB_pre:
         name: Test_PreBuild
+        if: ${{ !atomgit.event.pull_request.number || (atomgit.event.pull_request.state == 'open' && atomgit.event.pull_request.merged != true && !atomgit.event.pull_request.merged_at) }}
         uses: cann/.gitcode/.gitcode/workflows/pre_action.yml@master
     pre:
     - type: auto
@@ -56,6 +61,7 @@ stages:
     jobs:
       JOB_codecheck:
         name: CodeCheck
+        if: ${{ !atomgit.event.pull_request.number || (atomgit.event.pull_request.state == 'open' && atomgit.event.pull_request.merged != true && !atomgit.event.pull_request.merged_at) }}
         uses: cann/.gitcode/.gitcode/workflows/codecheck_action.yml@master
         with:
           precommit_image_version: ${{ jobs.JOB_image.outputs.precommit }}
@@ -64,18 +70,11 @@ stages:
     - type: auto
     fail-fast: false
   stage3:
-    name: test
+    name: Test
     jobs:
-      JOB_test_cpu:
-        name: Test_cpu
+      JOB_test:
+        name: Test CPU/NPU and Perf Profiling
         uses: .gitcode/workflows/test_action.yml
-        with:
-          mode: cpu
-      JOB_test_npu:
-        name: Test_npu
-        uses: .gitcode/workflows/test_action.yml
-        with:
-          mode: npu
     pre:
     - type: auto
     fail-fast: false
@@ -85,4 +84,5 @@ post:
   jobs:
     job_post:
       name: Test_post
+      if: ${{ !atomgit.event.pull_request.number || (atomgit.event.pull_request.state == 'open' && atomgit.event.pull_request.merged != true && !atomgit.event.pull_request.merged_at) }}
       uses: cann/.gitcode/.gitcode/workflows/post_action.yml@master

@@ -9,4 +9,5 @@ torch_npu
 numpy
 ml_dtypes
 pytest
+pytest-xdist==3.8.0
 PyYAML

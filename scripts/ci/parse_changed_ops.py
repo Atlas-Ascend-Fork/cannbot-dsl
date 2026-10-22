@@ -28,11 +28,16 @@ Output (stdout):
     ""            — no operator affected (or the skip_all_tests switch is on)
 
 ``skip_all_tests`` in the rule file is an escape hatch for landing windows: when
-it is ``true`` the changed files are not analysed and no operator test runs,
+it is ``true`` configuration is still validated, but no operator test runs,
 while the remaining pipeline stages keep working.
+
+``module: false`` keeps a routing node as an explicit opt-out: changes matching
+its sources do not select tests or require inventory entries. Other routing
+nodes and shared-file full-suite triggers remain independent.
 """
 
 import argparse
+from dataclasses import dataclass
 import logging
 import sys
 from pathlib import Path
@@ -59,6 +64,7 @@ class Module:
 
     def __init__(self, name, desc):
         self.name = name
+        self.enabled = desc.get("module", True)
         src = desc.get("src", [])
         self.src_files = [Path(p) for p in (src if isinstance(src, list) else [src])]
         options = desc.get("options", [])
@@ -137,28 +143,128 @@ def normalize_line(line):
     return line
 
 
-def matching_ops(modules, line):
-    """Return options of modules matching the given line, or None."""
+def matching_module(modules, line):
+    """Return the first matching rule, including explicit disabled rules."""
     for mod in modules:
         if mod.matches(line):
-            return mod.options
+            return mod
     return None
 
 
-def collect_related_ops(modules, changed_list_path, ignored_paths=()):
-    """Collect related operator options for the changed-file list."""
+class MissingOperatorConfig(ValueError):
+    """An operator change has no valid routing or inventory entry."""
+
+
+def target_is_registered(target, operators):
+    """Allow inventory directories to cover nested sample paths."""
+    target = Path(target)
+    return any(target == Path(op) or Path(op) in target.parents for op in operators)
+
+
+def warn_missing_config(missing_samples, missing_tests, config_path, op_list_path):
+    """Show actionable YAML examples for only the configuration that is missing."""
+    required = []
+    if missing_samples:
+        names = list(
+            dict.fromkeys(
+                Path(path).parent.relative_to("samples").as_posix()
+                for path in missing_samples
+            )
+        )
+        logger.warning(
+            "New operators must be registered in %s.\n"
+            "Changed files missing configuration:\n  %s\n"
+            "Example configuration (merge into the existing operators list "
+            "and adjust the operator paths as needed):\n%s",
+            op_list_path,
+            "\n  ".join(dict.fromkeys(missing_samples)),
+            yaml.safe_dump({"operators": names}, sort_keys=False),
+        )
+        required.append(str(op_list_path))
+    if missing_tests:
+        examples = {}
+        for path in missing_tests:
+            name = Path(path).parent.relative_to("test").as_posix()
+            examples[name.replace("/", "_")] = {
+                "module": True,
+                "src": [f"samples/{name}", f"test/{name}"],
+                "options": [name],
+            }
+        logger.warning(
+            "New operator test files require a valid targeted rule in %s.\n"
+            "Changed files missing configuration:\n  %s\n"
+            "Example configuration (adjust the operator paths as needed):\n%s",
+            config_path,
+            "\n  ".join(dict.fromkeys(missing_tests)),
+            yaml.safe_dump(examples, sort_keys=False),
+        )
+        required.append(str(config_path))
+    raise MissingOperatorConfig(
+        "Please update " + " and ".join(required) + " and trigger CI again."
+    )
+
+
+@dataclass
+class RoutingConfig:
+    """Related rules, inventory and paths used to route a changed file."""
+
+    modules: list[Module]
+    ignored_paths: set[Path]
+    operators: list[str]
+    config_path: Path
+    op_list_path: Path
+
+
+def route_changed_file(line, routing):
+    """Return selected tests and the missing configuration category, if any."""
+    module = matching_module(routing.modules, line)
+    if module is not None and not module.enabled:
+        logger.info("module disabled, skip tests: %s (%s)", module.name, line)
+        return [], None
+    options = module.options if module is not None else []
+    path = Path(line)
+    if len(path.parts) < 3:
+        return options, None
+    if path.parts[0] == "samples":
+        if not target_is_registered(path.relative_to("samples"), routing.operators):
+            return [], "samples"
+        if not options:
+            logger.info("sample registered without test routing: %s", line)
+    elif path.parts[0] == "test" and (not options or "all" in options):
+        return [], "test"
+    return options, None
+
+
+def collect_related_ops(routing, changed_list_path):
+    """Collect test targets, rejecting operator changes without configuration."""
     related = []
+    missing_files = {"samples": [], "test": []}
     with open(changed_list_path, encoding="utf-8") as f:
         for line in f:
             line = normalize_line(line)
-            if not line or line.startswith("#") or is_skippable(line):
+            if not line or line.startswith("#"):
                 continue
-            if Path(line) in ignored_paths:
+            if Path(line) in routing.ignored_paths:
                 logger.info("ignored metadata file: %s", line)
                 continue
-            options = matching_ops(modules, line)
-            if options:
-                related.extend(options)
+            path = Path(line)
+            if path.parent == Path("test"):
+                related.append("all")
+                continue
+            if is_skippable(line):
+                continue
+            options, missing = route_changed_file(line, routing)
+            if missing is not None:
+                missing_files.setdefault(missing, []).append(line)
+                continue
+            related.extend(options)
+    if any(missing_files.values()):
+        warn_missing_config(
+            missing_files["samples"],
+            missing_files["test"],
+            routing.config_path,
+            routing.op_list_path,
+        )
     return list(dict.fromkeys(related))
 
 
@@ -201,6 +307,23 @@ def main():
         logger.error("config file not found: %s", args.config)
         return 1, ""
 
+    if not args.op_list.exists():
+        logger.warning("operator-list file not found: %s", args.op_list)
+        return 2, ""
+
+    routing = RoutingConfig(
+        modules=load_modules(args.config),
+        ignored_paths=load_ignored_paths(args.config),
+        operators=load_operator_list(args.op_list),
+        config_path=args.config,
+        op_list_path=args.op_list,
+    )
+    try:
+        related = collect_related_ops(routing, args.changed_list)
+    except MissingOperatorConfig as exc:
+        logger.warning("%s", exc)
+        return 2, ""
+
     if is_test_skipped(args.config):
         logger.warning(
             "skip_all_tests is enabled in %s: no operator test will run",
@@ -208,9 +331,6 @@ def main():
         )
         return 0, ""
 
-    modules = load_modules(args.config)
-    ignored_paths = load_ignored_paths(args.config)
-    related = collect_related_ops(modules, args.changed_list, ignored_paths)
     return 0, resolve_ops_output(related, args.op_list)
 
 

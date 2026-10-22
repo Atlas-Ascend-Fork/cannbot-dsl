@@ -2,10 +2,6 @@ name: test_action
 
 on:
   workflow_call:
-    inputs:
-      mode:
-        required: true
-        type: string
 
 jobs:
   JOB_test:
@@ -31,8 +27,30 @@ jobs:
       -
         name: run_tests
         identifier: run_tests
+        env:
+          CI_TEST_WORKERS: '16'
         run: |
           cd ${{ steps.process_checkout.outputs.path }}
-          bash build.sh --mode=${{ inputs.mode }} --changed-list=pr_filelist.txt
-    if: "${{ default() }}"
+          # Defer the test failure until after result upload, without a status function.
+          set +e
+          bash build.sh --mode=ci --changed-list=pr_filelist.txt
+          test_rc=$?
+          set -e
+          echo "exit_code=$test_rc" >> "$ATOMGIT_OUTPUT"
+      -
+        name: upload_results
+        if: ${{ steps.run_tests.outputs.perf_archive != '' }}
+        uses: obs-upload
+        with:
+          endpoint: "https://obs.cn-north-4.myhuaweicloud.com"
+          bucket: "ascend-ci"
+          access-key: ${{ secrets.AK }}
+          secret-key: ${{ secrets.SK }}
+          artifact-path: ${{ steps.run_tests.outputs.perf_archive }}
+          object-prefix: ${{ env.obs_path }}/perf_results/${{ steps.run_tests.outputs.perf_run_id }}
+      -
+        name: check_test_result
+        run: |
+          exit "${{ steps.run_tests.outputs.exit_code }}"
+    if: "${{ !atomgit.event.pull_request.number || (atomgit.event.pull_request.state == 'open' && atomgit.event.pull_request.merged != true && !atomgit.event.pull_request.merged_at) }}"
     runs-on: ['self-hosted', 'os=ubuntu', 'evb=a5', 'repo=dsl']

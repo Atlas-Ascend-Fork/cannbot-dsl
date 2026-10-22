@@ -10,11 +10,13 @@
 # -----------------------------------------------------------------------------------------------------------
 
 # CI 流水线统一入口：平台侧只需调用本脚本。
+# Precision tests compile on demand with pytest -n 16; profile eligible cases afterward.
 # 流程：环境校验 → 变更分析 → 跑相关算子的测试。
 #
 # 用法（平台侧 job 内）:
 #   bash build.sh --mode=npu     # 设备环境，跑 npu 用例
 #   bash build.sh --mode=cpu     # 无设备环境，跑非 npu 用例
+#   bash build.sh --mode=perf    # 用 msprof 采集相关 npu 用例的性能
 #   bash build.sh --mode=all
 # 可选: --base=origin/master  变更对比基线（默认 origin/master）
 #       --changed-list=FILE   直接使用外部变更清单（跳过 git diff）
@@ -59,7 +61,7 @@ fi
 
 usage() {
     cat <<EOF
-Usage: bash build.sh --mode=cpu|npu|all [--base=<branch>] [--changed-list=FILE]
+Usage: bash build.sh --mode=ci|cpu|npu|perf|all [--base=<branch>] [--changed-list=FILE]
 EOF
 }
 
@@ -74,8 +76,8 @@ parse_args() {
         esac
     done
     case "$MODE" in
-        cpu|npu|all) ;;
-        *) echo "[ERROR] --mode is required and must be cpu|npu|all" >&2; usage; exit 1 ;;
+        ci|cpu|npu|perf|all) ;;
+        *) echo "[ERROR] --mode is required and must be ci|cpu|npu|perf|all" >&2; usage; exit 1 ;;
     esac
 }
 
@@ -95,7 +97,7 @@ if [[ -z "$CHANGED_LIST" ]]; then
 fi
 [[ -s "$CHANGED_LIST" ]] || { echo "[INFO] no changed files, skip tests"; exit 0; }
 
-ops=$("$PYTHON" "$REPO_ROOT/scripts/ci/parse_changed_ops.py" "$CHANGED_LIST")
+ops=$("$PYTHON" "$REPO_ROOT/scripts/ci/parse_changed_ops.py" "$CHANGED_LIST") || exit 1
 echo "affected ops: [$ops]"
 if [[ -z "$ops" ]]; then
     echo "[INFO] no operator affected, skip tests"
