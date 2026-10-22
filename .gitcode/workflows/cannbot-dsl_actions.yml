@@ -66,6 +66,13 @@ stages:
         with:
           precommit_image_version: ${{ jobs.JOB_image.outputs.precommit }}
           codecheck_image_version: ${{ jobs.JOB_image.outputs.codecheck }}
+      JOB_staticcheck_md_check:
+        name: CodeCheck_staticcheck_md_check
+        if: ${{ !atomgit.event.pull_request.number || (atomgit.event.pull_request.state == 'open' && atomgit.event.pull_request.merged != true && !atomgit.event.pull_request.merged_at) }}
+        uses: .gitcode/workflows/staticcheck_action.yml
+        with:
+          check_type: 'md_check'
+          image_version: ${{ jobs.JOB_image.outputs.staticcheck }}
     pre:
     - type: auto
     fail-fast: false
