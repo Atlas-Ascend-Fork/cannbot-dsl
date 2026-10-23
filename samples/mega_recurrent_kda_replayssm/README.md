@@ -145,14 +145,7 @@ FP16 U、FP16 归一化 K 和 FP32 激活后 decay 分别写入 `replay_u`、
 [`commit_recurrent_kda_replayssm`](../commit_recurrent_kda_replayssm/README.md)
 按接受前缀提交。
 
-### 调度与 workspace
-
-当前 stream 和物理设备共同限制可用的 AIC/AIV 数，28 AIC 机器不会请求 32 AIC。
-TP 由权重和 `A_log` 的 head 维度确定，不增加核数或 TP 接口参数。
-TP16 在各核数下保留专用投影与递推重叠调度，32 AIC 的单组路径使用 K128 常驻输出权重。
-TP4/8 主投影按行数、head 数和核数选择 N256 或 N384 tile。32 AIC 下，TP4/8 的
-model batch 至少为 8 且行数整除 128 时，使用 M128/N384 主投影波次。
-回放记录在归一化 K、激活 decay 和计算 U 后立即写出，FP32 递推保持不变。
+### Workspace
 
 GM workspace 的 7 个 BF16 区域宽度为
 `(P,P,P,P,P,ceil_div(N,16)*16,128)`，另有 FP32 `[128,128]` norm scratch。
@@ -196,42 +189,28 @@ out = mega_recurrent_kda_replayssm(hidden_states, qkv_weight, decay_a_weight, de
 需要可用的 CANN、CANNBot-DSL、PyTorch 和 torch_npu 环境。仓库根目录可运行：
 
 ```bash
-# 提前编译动态入口；常规算子首次调用也会触发编译
 PYTHONPATH=samples python -c 'from mega_recurrent_kda_replayssm.mega_recurrent_kda_replayssm import export_mega_recurrent_kda_replayssm; export_mega_recurrent_kda_replayssm()'
-
-# 设备精度与白盒检查
-python -m pytest -q -m npu test/mega_recurrent_kda_replayssm/test_mega_recurrent_kda_replayssm.py
+python -m pytest -q test/mega_recurrent_kda_replayssm/test_mega_recurrent_kda_replayssm.py -m npu
 ```
 
-CPU FP32 golden 算法直接定义在此测试脚本中，不依赖其他算子的测试文件。
-测试覆盖 TP4/8/16、典型短长 batch、当前设备支持的 8/16/24/28/32 配额，
-并检查输出、Conv state、U/K/decay 记录、checkpoint 只读和 accepted 0～8 的 commit 状态。
-数值容差为 `atol=rtol=0.005`；只读 checkpoint、空 Conv 槽和未选中槽使用零容差。
+测试脚本内联独立 CPU golden，作为 NPU 输出和状态的参考，不依赖其他算子的测试文件。覆盖 TP4/8/16、当前硬件与 stream 支持的 8/16/24/28/32 配额、短 batch、尾块及重复调用。切换 stream 前显式等待输入与参考状态初始化完成。数值容差为 `atol=rtol=0.005`，不可变槽位使用零容差。
+
+ReplaySSM 检查 Conv、U/K/decay、checkpoint 不变性，以及 accepted 0～8 的 Commit 状态。
 
 ## 性能
 
-以下为 Ascend 950、Channel API 的 DSL 0.7.1、CANN 9.2.0-beta.2 实测均值，单位 μs。
-统计 Verify mixed kernel 的设备执行时间，Commit 单独验证；每点预热 3 次、采样 20 次，并清理 224 MiB L2。
-共 48 个典型精度/性能点通过；NPU 白盒 21 项通过，真实 28 AIC / 56 AIV 配额下另有 6 项及 3 个最小 batch 用例通过。
+验证环境为 Ascend 950、CANN 9.2.0-beta.2、DSL 0.7.1。
 
-| TP | model batch | 8 AIC | 16 AIC | 24 AIC | 32 AIC |
-|---:|---:|---:|---:|---:|---:|
-| 4 | 1 | 299.725 | 185.283 | 185.874 | 137.835 |
-| 4 | 2 | 377.234 | 229.044 | 217.237 | 158.785 |
-| 4 | 8 | 1060.117 | 569.852 | 457.342 | 326.546 |
-| 8 | 1 | 216.237 | 139.829 | 133.311 | 106.101 |
-| 8 | 2 | 325.206 | 205.328 | 184.187 | 137.797 |
-| 8 | 8 | 1053.266 | 566.658 | 425.238 | 293.842 |
-| 16 | 1 | 163.434 | 119.479 | 84.141 | 74.458 |
-| 16 | 8 | 986.518 | 492.964 | 365.058 | 278.766 |
-| 16 | 16 | 1942.248 | 945.279 | 673.912 | 502.966 |
-| 16 | 32 | 3870.474 | 1859.382 | 1279.752 | 961.440 |
+下表为本环境代表点的设备耗时均值，单位 μs。表中核数为 AIC 数，对应 AIV 配额为其两倍；32 AIC 列使用 32 AIC / 64 AIV。
 
-32 AIC 下另测的较大 batch：
+每点采集 20 次样本，每次恢复初始状态并驱逐 224 MiB L2；状态恢复、清 L2 和采集导出不计入设备耗时。
 
-| TP | model batch 16 | model batch 32 |
-|---:|---:|---:|
-| 4 | 543.017 | 1049.055 |
-| 8 | 504.679 | 985.747 |
+| TP | 模型 batch | 算子 batch | 8 AIC avg μs | 16 AIC avg μs | 24 AIC avg μs | 32 AIC avg μs |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 4 | 1 | 4 | 259.946 | 166.961 | 173.065 | 127.555 |
+| 4 | 16 | 64 | 2047.252 | 1052.872 | 806.345 | 539.828 |
+| 8 | 1 | 8 | 194.862 | 130.058 | 123.978 | 95.129 |
+| 8 | 16 | 128 | 2033.055 | 1060.404 | 771.504 | 499.650 |
+| 16 | 16 | 256 | 1941.354 | 940.288 | 670.315 | 501.256 |
 
-本环境同一内容键的正常冷编译用时 10790.004 秒；上表仅统计设备执行时间。
+表中仅统计 Verify mixed kernel；后续 Replay Commit 的执行成本另计。

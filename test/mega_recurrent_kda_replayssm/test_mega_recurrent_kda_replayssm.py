@@ -202,6 +202,8 @@ def _core_stream(module, cores):
     if requested not in available:
         pytest.skip(f"quota {requested} exceeds available AIC/AIV resources {available}")
     stream = torch.npu.Stream()
+    # Make default-stream input copies and cloned state seeds visible.
+    torch.npu.synchronize()
     torch.npu.set_stream_limit(stream, cube_num=requested, vector_num=2 * requested)
     try:
         with torch.npu.stream(stream):
@@ -232,7 +234,7 @@ def _run_verify(module, arguments, cores, monkeypatch):
 
 @pytest.mark.npu
 @pytest.mark.parametrize("tp", (4, 8, 16))
-@pytest.mark.parametrize("model_batch", (1, 3, 8, 16, 32))
+@pytest.mark.parametrize("model_batch", (1, 3, 8, 9, 16, 32))
 def test_npu_precision_batch_generalization_and_core_control(tp, model_batch, monkeypatch):
     pytest.importorskip("torch_npu")
     if not torch.npu.is_available():
@@ -241,22 +243,24 @@ def test_npu_precision_batch_generalization_and_core_control(tp, model_batch, mo
     cpu = _make_cpu_arguments(tp * model_batch, seed=20260921 + model_batch, heads=96 // tp)
     expected = _run_replay_cpu_golden(cpu)
     arguments = _to_npu_arguments(cpu)
-    controls = _available_core_counts(module) if model_batch == 3 else ("max",)
+    controls = _available_core_counts(module) if model_batch in (1, 3) else ("max",)
     if not controls:
         pytest.skip("requires at least 8 AIC and 16 AIV cores")
     used = set(cpu[14].tolist()) - {0}
     unchanged = [slot for slot in range(len(cpu[0]) + 1) if slot not in used]
     for core in controls:
-        actual = list(arguments)
-        actual[9] = arguments[9].clone()
-        actual[10] = arguments[10].clone()
-        output, replay_u, replay_k, replay_decay = _run_verify(module, actual, core, monkeypatch)
-        for name, value in (("output", output), ("replay_u", replay_u), ("replay_k", replay_k),
-            ("replay_decay", replay_decay), ("conv_state", actual[9])):
-            torch.testing.assert_close(value.cpu().float(), getattr(expected, name).float(),
-                atol=0.005, rtol=0.005, msg=lambda text, name=name: f"{name}: {text}")
-        torch.testing.assert_close(actual[9].cpu()[unchanged], cpu[9][unchanged], atol=0, rtol=0)
-        torch.testing.assert_close(actual[10].cpu(), cpu[10], atol=0, rtol=0)
+        for _ in range(2):
+            actual = list(arguments)
+            actual[9] = arguments[9].clone()
+            actual[10] = arguments[10].clone()
+            output, replay_u, replay_k, replay_decay = _run_verify(module, actual, core, monkeypatch)
+            for name, value in (("output", output), ("replay_u", replay_u), ("replay_k", replay_k),
+                ("replay_decay", replay_decay), ("conv_state", actual[9])):
+                atol = 5e-5 if model_batch == 1 and name == "output" else 0.005
+                torch.testing.assert_close(value.cpu().float(), getattr(expected, name).float(),
+                    atol=atol, rtol=0.005, msg=lambda text, name=name: f"{name}: {text}")
+            torch.testing.assert_close(actual[9].cpu()[unchanged], cpu[9][unchanged], atol=0, rtol=0)
+            torch.testing.assert_close(actual[10].cpu(), cpu[10], atol=0, rtol=0)
     assert len(module._COMPILED_FNS) == 1
 
 
