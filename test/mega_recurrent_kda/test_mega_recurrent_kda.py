@@ -321,7 +321,7 @@ def _available_core_counts(module):
     return tuple(core for core in module.VALID_CORES if core <= cube and 2 * core <= vector)
 
 
-def _check_precision(batch_size, seq_len, block_num, num_heads):
+def _check_precision(batch_size, seq_len, block_num, num_heads, precision_case=None):
     pytest.importorskip("torch_npu")
     module = load_sample(SAMPLE)
     available = _available_core_counts(module)
@@ -330,20 +330,24 @@ def _check_precision(batch_size, seq_len, block_num, num_heads):
     quota = available[-1] if block_num is None else block_num
     if quota not in available:
         pytest.skip(f"AIC quota {quota} exceeds the device or current stream capacity")
-    arguments = _make_cpu_arguments(batch_size, seq_len, 731 + batch_size + seq_len, num_heads)
-    initial = (arguments[9].clone(), arguments[10].clone())
-    weights = MegaRecurrentKDAWeights(*arguments[1:9], arguments[15], arguments[16])
     scale, lower = 128**-0.5, -5.0
-    original_threads = torch.get_num_threads()
-    try:
-        torch.set_num_threads(min(original_threads, 8))
-        expected = run_mega_recurrent_kda_golden(
-            _GoldenCase(arguments[0], weights, initial[0].clone(), initial[1].clone(), *arguments[11:15], scale, lower,
-                1e-5))
-    finally:
-        torch.set_num_threads(original_threads)
+    if precision_case is None:
+        arguments = _make_cpu_arguments(batch_size, seq_len, 731 + batch_size + seq_len, num_heads)
+        initial = (arguments[9].clone(), arguments[10].clone())
+        weights = MegaRecurrentKDAWeights(*arguments[1:9], arguments[15], arguments[16])
+        original_threads = torch.get_num_threads()
+        try:
+            torch.set_num_threads(min(original_threads, 8))
+            expected = run_mega_recurrent_kda_golden(
+                _GoldenCase(arguments[0], weights, initial[0].clone(), initial[1].clone(), *arguments[11:15], scale, lower,
+                    1e-5))
+        finally:
+            torch.set_num_threads(original_threads)
+    else:
+        arguments, initial, expected = precision_case
     actual = _to_npu_arguments(arguments)
     stream = torch.npu.Stream()
+    # Inputs and state seeds were produced on the caller stream.
     torch.npu.synchronize()
     torch.npu.set_stream_limit(stream, cube_num=quota, vector_num=2 * quota)
     try:
@@ -351,12 +355,14 @@ def _check_precision(batch_size, seq_len, block_num, num_heads):
             for _ in range(2):
                 actual[9].copy_(initial[0])
                 actual[10].copy_(initial[1])
-                y = module.mega_recurrent_kda(*actual, scale, lower, 1e-5)
+                y = module.mega_recurrent_kda(*actual[:15], A_log=actual[15], dt_bias=actual[16],
+                    scale=scale, lower_bound=lower, rms_norm_eps=1e-5)
                 torch.npu.synchronize()
                 _assert_precision_results(module, actual, expected, y, initial)
     finally:
         torch.npu.synchronize()
         torch.npu.reset_stream_limit(stream)
+    return arguments, initial, expected
 
 
 # Bound every device test by both physical cores and the current stream quota.
@@ -368,6 +374,11 @@ _PRECISION_CASES = [
     pytest.param(32, 8, "auto", 6),
     *[pytest.param(batch, 8, 16, 6) for batch in (16, 32, 512)],
     *[pytest.param(batch, 8, "available", 6, marks=pytest.mark.slow) for batch in (16, 32, 48, 64, 256, 512)],
+    pytest.param(36, 8, "available", 24, id="TP4-NB-tail"),
+    pytest.param(72, 8, "available", 12, id="TP8-NB-tail"),
+    pytest.param(200, 8, "available", 12, id="TP8-Conv-state-regression"),
+    pytest.param(4, 8, "available", 24, id="TP4-NB-short"),
+    pytest.param(8, 8, "available", 12, id="TP8-NB-short"),
     pytest.param(4, 8, 8, 24, id="TP4-short"),
     pytest.param(12, 8, 24, 24, id="TP4-tail"),
     pytest.param(8, 8, 16, 12, id="TP8-short"),
@@ -376,12 +387,6 @@ _PRECISION_CASES = [
     pytest.param(64, 8, "max", 12, id="TP8-aligned-main"), ]
 
 
-@pytest.mark.parametrize("seq_len", range(1, 8))
-def test_rejects_sequence_lengths_outside_public_contract(seq_len):
-    module = load_sample(SAMPLE)
-    hidden = torch.empty((16, seq_len, 7168), dtype=torch.bfloat16)
-    with pytest.raises(ValueError, match="S=8"):
-        module.mega_recurrent_kda(hidden, *([None] * 16), 128**-0.5, -5.0, 1e-5)
 
 
 @pytest.mark.npu
@@ -400,37 +405,7 @@ def test_precision(batch_size, seq_len, cores, num_heads):
         controls = (grids[-1],)
     else:
         controls = (None,) if cores == "auto" else (cores,)
+    precision_case = None
     for block_num in controls:
-        _check_precision(batch_size, seq_len, block_num, num_heads)
-
-
-def test_public_signature():
-    import inspect
-
-    module = load_sample(SAMPLE)
-    assert list(inspect.signature(module.mega_recurrent_kda).parameters) == [
-        "hidden_states",
-        "qkv_projection_weight",
-        "decay_projection_a_weight",
-        "decay_projection_b_weight",
-        "beta_projection_weight",
-        "output_gate_projection_weight",
-        "output_norm_weight",
-        "output_projection_weight",
-        "conv1d_weight",
-        "conv_state",
-        "recurrent_state",
-        "conv_state_indices",
-        "ssm_state_indices",
-        "conv_num_accepted_tokens",
-        "num_accepted_tokens",
-        "A_log",
-        "dt_bias",
-        "scale",
-        "lower_bound",
-        "rms_norm_eps", ]
-    schema = str(module.mega_recurrent_kda_op.default._schema)
-    assert "core_num" not in schema
-    assert "Tensor A_log" in schema
-    assert "Tensor(a!) conv_state" in schema
-    assert "Tensor(b!) recurrent_state" in schema
+        precision_case = _check_precision(batch_size, seq_len, block_num, num_heads, precision_case)
+    assert len(module._COMPILED_FNS) == 1

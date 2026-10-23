@@ -235,6 +235,17 @@ class _ProjectionOperations:
         self.matmul_hidden(hidden_gm, weight_gm, n_idx, k_tiles)
         self.cast_result()
 
+    @jit
+    def project_to_gm(self, hidden_gm, weight_gm, workspace_tile, n_idx, k_tiles):
+        """Round a complete projection to BF16 in Fixpipe without an AIV cast."""
+        self.matmul_hidden(hidden_gm, weight_gm, n_idx, k_tiles)
+        self.publish_result(workspace_tile)
+
+    @jit
+    def publish_result(self, workspace_tile):
+        result = reinterpret(self.l0c.consume(), shape=(self.row_count, self.tile_width))
+        mem_copy(workspace_tile[0:self.row_count, 0:self.tile_width], result, engine=make_copy_engine())
+
     def publish(self, workspace_tile, subblock_idx):
         out_half = tile_slice(
             workspace_tile, make_tiler((self.row_block, self.tile_width), alignment=(1, 1)), (subblock_idx, 0))
@@ -467,10 +478,8 @@ class LowRankDecayStage:
             mem_copy(self.fb_l1, tile_slice(fb_weight_gm, (TILE, TILE), (output_head, 0)),
                 l2_cache_ctl=self.projection_stage.weight_l2_cache_ctl)
             self.projection_stage.matmul_resident(self.fa_l1, self.fb_l1, self.fa_copy_engine)
-            self.projection_stage.cast_result()
-            self.projection_stage.publish(
-                tile_slice(decay_workspace_gm, (self.projection_stage.row_capacity, TILE), (0, output_head)),
-                subblock_idx)
+            self.projection_stage.publish_result(
+                tile_slice(decay_workspace_gm, (self.projection_stage.row_capacity, TILE), (0, output_head)))
             vec_sync_all()
 
 
@@ -834,11 +843,30 @@ class OutputGateStage:
 
 
 @jit
+def _recurrent_item_index(item, batch_size: int, num_heads: int, nb_group_batch: int):
+    """Order heads before batches within each complete OProj publication block.
+
+    The last block uses its actual batch count, so no padded task can read or
+    overwrite another request's state. Publication counters remain task ordinals.
+    """
+    group_tasks = nb_group_batch * num_heads
+    group_start = item // group_tasks * nb_group_batch
+    group_batch = batch_size - group_start
+    if group_batch > nb_group_batch:
+        group_batch = nb_group_batch
+    offset = item % group_tasks
+    batch = group_start + offset % group_batch
+    head = offset // group_batch
+    return batch * num_heads + head
+
+
+@jit
 def prefetch_recurrent_item(recurrent_stage, output_gate_stage, q_workspace_gm, k_workspace_gm, v_workspace_gm,
     decay_workspace_gm, output_gate_workspace_gm, beta_workspace_gm, item, batch_size: int, seq_len: int,
-    num_heads: int, row_block: int):
+    num_heads: int, row_block: int, nb_group_batch: int = 1):
     """Issue token-0 inputs for one complete batch/head item."""
-    batch_index, value_head = idx2crd(item, [batch_size, num_heads])
+    batch_index, value_head = idx2crd(
+        _recurrent_item_index(item, batch_size, num_heads, nb_group_batch), [batch_size, num_heads])
     base = batch_index * seq_len
     recurrent_stage.prefetch_inputs(tile_slice(k_workspace_gm, (1, TILE), (base, value_head)),
         tile_slice(q_workspace_gm, (1, TILE), (base, value_head)),
@@ -850,9 +878,10 @@ def prefetch_recurrent_item(recurrent_stage, output_gate_stage, q_workspace_gm, 
 
 @jit
 def prefetch_recurrent_state(recurrent_stage, initial_state_gm, state_indices_gm, accepted_gm, item, batch_size: int,
-    seq_len: int, num_heads: int, row_block: int):
+    seq_len: int, num_heads: int, row_block: int, nb_group_batch: int = 1):
     """Issue the initial-state load for one complete batch/head item."""
-    batch_index, value_head = idx2crd(item, [batch_size, num_heads])
+    batch_index, value_head = idx2crd(
+        _recurrent_item_index(item, batch_size, num_heads, nb_group_batch), [batch_size, num_heads])
     base = batch_index * seq_len
     accepted = dtypes.int64(accepted_gm[batch_index])
     initial_token = base + accepted - 1 if accepted > 0 else base
@@ -866,10 +895,12 @@ def run_recurrent_wave(recurrent_stage, output_gate_stage, q_workspace_gm, k_wor
     decay_workspace_gm, output_gate_workspace_gm, beta_workspace_gm, initial_state_gm, final_state_gm,
     state_indices_gm, accepted_gm, item_start, item_end, batch_size: int, seq_len: int, num_heads: int, row_block: int,
     scale_value: float, lower_bound: float, rms_norm_eps: float, defer_final_snapshot: bool = False,
-    first_inputs_prefetched: bool = False, first_state_prefetched: bool = False, next_item_stride: int = 0):
-    """Run a wave, optionally carrying token-0 inputs across item boundaries."""
+    first_inputs_prefetched: bool = False, first_state_prefetched: bool = False, next_item_stride: int = 0,
+    nb_group_batch: int = 1):
+    """Run NB tasks and carry the same order into token/state prefetch."""
     for item in range(item_start, item_end):
-        batch_index, value_head = idx2crd(item, [batch_size, num_heads])
+        batch_index, value_head = idx2crd(
+        _recurrent_item_index(item, batch_size, num_heads, nb_group_batch), [batch_size, num_heads])
         base = batch_index * seq_len
         accepted = dtypes.int64(accepted_gm[batch_index])
         initial_token = base + accepted - 1 if accepted > 0 else base
@@ -877,7 +908,7 @@ def run_recurrent_wave(recurrent_stage, output_gate_stage, q_workspace_gm, k_wor
         if not const_expr(first_inputs_prefetched):
             prefetch_recurrent_item(recurrent_stage, output_gate_stage, q_workspace_gm, k_workspace_gm, v_workspace_gm,
                 decay_workspace_gm, output_gate_workspace_gm, beta_workspace_gm, item, batch_size, seq_len, num_heads,
-                row_block)
+                row_block, nb_group_batch=nb_group_batch)
         if not const_expr(first_state_prefetched):
             recurrent_stage.load_state(
                 tile_slice(initial_state_gm[initial_state_index, value_head, None, None], (row_block, TILE), (0, 0)))
@@ -897,15 +928,15 @@ def run_recurrent_wave(recurrent_stage, output_gate_stage, q_workspace_gm, k_wor
             output_gate_stage.prepare_local_sum(recurrent_stage.out)
             output_gate_stage.apply_and_store(
                 tile_slice(q_workspace_gm, (1, row_block), (base + token, value_head)), rms_norm_eps)
-            if const_expr(next_item_stride > 0):
+            if next_item_stride > 0:
                 if token + 1 == seq_len:
                     next_item = item + next_item_stride
                     if next_item < batch_size * num_heads:
                         prefetch_recurrent_item(recurrent_stage, output_gate_stage, q_workspace_gm, k_workspace_gm,
                             v_workspace_gm, decay_workspace_gm, output_gate_workspace_gm, beta_workspace_gm, next_item,
-                            batch_size, seq_len, num_heads, row_block)
+                            batch_size, seq_len, num_heads, row_block, nb_group_batch=nb_group_batch)
                         prefetch_recurrent_state(recurrent_stage, initial_state_gm, state_indices_gm, accepted_gm,
-                            next_item, batch_size, seq_len, num_heads, row_block)
+                            next_item, batch_size, seq_len, num_heads, row_block, nb_group_batch=nb_group_batch)
             if not defer_final_snapshot or token + 1 < seq_len:
                 snapshot_index = dtypes.int64(state_indices_gm[base + token])
                 recurrent_stage.store_state(
@@ -1031,14 +1062,8 @@ class BetaZSharedStage:
         self.lb = Channel(MemLoc.L0B, (16, 128), dtypes.bfloat16, depth=2)
         self.cz = Channel(MemLoc.L0C, (rows, 128), dtypes.float32, depth=1, capacity=(128, 128)).produce()
         self.cb = Channel(MemLoc.L0C, (rows, 16), dtypes.float32, depth=1, capacity=(128, 16)).produce()
-        self.uz = Channel(MemLoc.UB, (self.half, 128), dtypes.float32, depth=1, kind=ChannelKind.CrossCore,
-            capacity=(64, 128)).produce()
-        self.ub = Channel(MemLoc.UB, (self.half, 16), dtypes.float32, depth=1, kind=ChannelKind.CrossCore,
-            capacity=(64, 16)).produce()
-        self.zbf = Buffer(MemLoc.UB, (self.half, 128), dtypes.bfloat16, capacity=(64, 128))
-        self.bbf = Buffer(MemLoc.UB, (self.half, 16), dtypes.bfloat16, capacity=(64, 16))
         self.nd = make_copy_engine(format_transform="nd2nz")
-        self.fix = make_copy_engine(split_axis=0)
+        self.fix = make_copy_engine()
 
     @jit
     def project(self, hidden_gm, z_weight_gm, beta_weight_gm, z_gm, beta_gm, subblock):
@@ -1060,24 +1085,8 @@ class BetaZSharedStage:
                 lb_slot = self.lb.produce()
                 mem_copy(lb_slot, tile_slice(beta_l1, (16, 128), (0, kc * 2 + ks)))
                 matmul(self.cb, la_slot, lb_slot, init=kc == 0 and ks == 0)
-        mem_copy(self.uz, reinterpret(self.cz, shape=(self.rows, 128)), engine=self.fix)
-        mem_copy(self.ub, reinterpret(self.cb, shape=(self.rows, 16)), engine=self.fix)
-        with vf(mode="simd"):
-            full, _ = update_mask(VL, elem_bits=32)
-            for segment in range(self.half * 128 // VL):
-                offset = segment * VL
-                value = vcast(vload(self.uz, offset), dtypes.bfloat16, mask=full)
-                vstore_pack(self.zbf, offset, value, full, pack_mode=PackMode.B32_TO_B16)
-            for segment in range(self.half * 16 // VL):
-                offset = segment * VL
-                value = vcast(vload(self.ub, offset), dtypes.bfloat16, mask=full)
-                vstore_pack(self.bbf, offset, value, full, pack_mode=PackMode.B32_TO_B16)
-        vec_sync_all()
-        mem_copy(
-            tile_slice(z_gm, (128, 128), (0, 0)), self.zbf, engine=self.fix, part_id=subblock, actual=(self.rows, 128))
-        mem_copy(
-            tile_slice(beta_gm, (128, 16), (0, 0)), self.bbf, engine=self.fix, part_id=subblock, actual=(self.rows, 16))
-        vec_sync_all()
+        mem_copy(z_gm[0:self.rows, None], reinterpret(self.cz, shape=(self.rows, 128)), engine=self.fix)
+        mem_copy(beta_gm[0:self.rows, None], reinterpret(self.cb, shape=(self.rows, 16)), engine=self.fix)
         cube_sync_all()
 
 
@@ -1380,9 +1389,8 @@ class _GridSchedule:
                 beta_stage = ProjectionStage(row_count=TILE, row_capacity=TILE, tile_width=BETA_TILE,
                     input_l2_cache_ctl=self.projection_input_l2_cache_ctl,
                     weight_l2_cache_ctl=self.projection_weight_l2_cache_ctl)
-                beta_stage.project(
-                    tile_slice(hidden_gm, (TILE, self.hidden_size), (m_group, 0)), beta_weight_gm, 0, k_tiles)
-                beta_stage.publish(tile_slice(beta_workspace_gm, (TILE, BETA_TILE), (m_group, 0)), subblock_idx)
+                beta_stage.project_to_gm(tile_slice(hidden_gm, (TILE, self.hidden_size), (m_group, 0)), beta_weight_gm,
+                    tile_slice(beta_workspace_gm, (TILE, BETA_TILE), (m_group, 0)), 0, k_tiles)
                 vec_sync_all()
             else:
                 m_group = auxiliary_idx - self.batch_groups
@@ -1493,9 +1501,8 @@ class _GridSchedule:
             beta_stage = ProjectionStage(row_count=128, row_capacity=128, tile_width=BETA_TILE,
                 input_l2_cache_ctl=self.projection_input_l2_cache_ctl,
                 weight_l2_cache_ctl=frontend_weight_l2_cache_ctl)
-            beta_stage.project(
-                tile_slice(hidden_gm, (128, self.hidden_size), (beta_group, 0)), beta_weight_gm, 0, k_tiles)
-            beta_stage.publish(tile_slice(beta_workspace_gm, (128, BETA_TILE), (beta_group, 0)), subblock_idx)
+            beta_stage.project_to_gm(tile_slice(hidden_gm, (128, self.hidden_size), (beta_group, 0)), beta_weight_gm,
+                tile_slice(beta_workspace_gm, (128, BETA_TILE), (beta_group, 0)), 0, k_tiles)
 
     @jit
     def _frontend_flat_m128(self, q_workspace_gm: Tensor, k_workspace_gm: Tensor, v_workspace_gm: Tensor,
@@ -1558,8 +1565,8 @@ class _GridSchedule:
             beta_stage = ProjectionStage(row_count=128, row_capacity=128, tile_width=BETA_TILE,
                 input_l2_cache_ctl=self.projection_input_l2_cache_ctl,
                 weight_l2_cache_ctl=self.projection_weight_l2_cache_ctl)
-            beta_stage.project(tile_slice(hidden_gm, hidden_tile, (aux_group, 0)), beta_weight_gm, 0, k_tiles)
-            beta_stage.publish(tile_slice(beta_workspace_gm, beta_tile, (aux_group, 0)), subblock_idx)
+            beta_stage.project_to_gm(tile_slice(hidden_gm, hidden_tile, (aux_group, 0)), beta_weight_gm,
+                tile_slice(beta_workspace_gm, beta_tile, (aux_group, 0)), 0, k_tiles)
 
     @jit
     def _frontend_24_single_group(self, q_workspace_gm, k_workspace_gm, v_workspace_gm, decay_workspace_gm,
@@ -1628,8 +1635,7 @@ class _GridSchedule:
                 mem_copy(f_l1, fa_workspace_gm, engine=projection_stage.nd2nz)
                 mem_copy(fb_l1, tile_slice(fb_weight_gm, (128, 128), (block_idx - 18, 0)))
                 projection_stage.matmul_resident(f_l1, fb_l1)
-                projection_stage.cast_result()
-                projection_stage.publish(tile_slice(decay_workspace_gm, (128, 128), (0, block_idx - 18)), subblock_idx)
+                projection_stage.publish_result(tile_slice(decay_workspace_gm, (128, 128), (0, block_idx - 18)))
                 vec_sync_all()
                 vec_sync_block_wait(PIPE.S, 3, mode=0)
             else:
@@ -1682,8 +1688,7 @@ class _GridSchedule:
                 mem_copy(f_l1, fa_workspace_gm, engine=projection_stage.nd2nz)
                 mem_copy(fb_l1, tile_slice(fb_weight_gm, (128, 128), (5, 0)))
                 projection_stage.matmul_resident(f_l1, fb_l1)
-                projection_stage.cast_result()
-                projection_stage.publish(tile_slice(decay_workspace_gm, (128, 128), (0, 5)), subblock_idx)
+                projection_stage.publish_result(tile_slice(decay_workspace_gm, (128, 128), (0, 5)))
                 vec_sync_all()
                 vec_sync_block_wait(PIPE.S, 0, mode=0)
 
@@ -1720,8 +1725,7 @@ class _GridSchedule:
         if block_idx == self.beta_block:
             beta_stage = ProjectionStage(self.row_count, self.projection_input_l2_cache_ctl,
                 self.projection_weight_l2_cache_ctl, tile_width=BETA_TILE)
-            beta_stage.project(hidden_gm, beta_weight_gm, 0, k_tiles)
-            beta_stage.publish(beta_workspace_gm, subblock_idx)
+            beta_stage.project_to_gm(hidden_gm, beta_weight_gm, beta_workspace_gm, 0, k_tiles)
         else:
             channel_rewind(reset_sync_id=True)
             projection_stage = ProjectionStage(
@@ -1859,7 +1863,8 @@ class _GridSchedule:
                 run_recurrent_wave(recurrent_stage, output_gate_stage, q_workspace_gm, k_workspace_gm, v_workspace_gm,
                     decay_workspace_gm, output_gate_workspace_gm, beta_workspace_gm, initial_state_gm, final_state_gm,
                     state_indices_gm, accepted_gm, item_start, item_start + item_count, accepted_gm.shape[0],
-                    self.seq_len, self.num_heads, state_row_block, scale_value, lower_bound, rms_norm_eps)
+                    self.seq_len, self.num_heads, state_row_block, scale_value, lower_bound, rms_norm_eps,
+                        nb_group_batch=self.recurrent_wave_rows // self.seq_len)
             publish_batch_group_vector_grid_to_cube(3 + wave * 2, 4 + wave * 2)
             output_projection_stage.project(out_gm, q_workspace_gm, o_proj_weight_gm, self.num_heads, wave)
 
@@ -1901,9 +1906,9 @@ class _GridSchedule:
         if first_item < total:
             prefetch_recurrent_item(recurrent_stage, output_gate_stage, q_workspace_gm, k_workspace_gm, v_workspace_gm,
                 decay_workspace_gm, output_gate_workspace_gm, beta_workspace_gm, first_item, batch_size, self.seq_len,
-                6, TILE)
+                6, TILE, nb_group_batch=chunk_rows // self.seq_len)
             prefetch_recurrent_state(recurrent_stage, initial_state_gm, state_indices_gm, accepted_gm, first_item,
-                batch_size, self.seq_len, 6, TILE)
+                batch_size, self.seq_len, 6, TILE, nb_group_batch=chunk_rows // self.seq_len)
         for slot in range(slot_count):
             item = slot * slot_capacity + block_idx * 2 + subblock_idx
             if item < total:
@@ -1911,14 +1916,16 @@ class _GridSchedule:
                     decay_workspace_gm, output_gate_workspace_gm, beta_workspace_gm, initial_state_gm, final_state_gm,
                     state_indices_gm, accepted_gm, item, item + 1, batch_size, self.seq_len, 6, TILE, scale_value,
                     lower_bound, rms_norm_eps, defer_final_snapshot=True, first_inputs_prefetched=True,
-                    first_state_prefetched=True, next_item_stride=2 * self.block_num)
+                    first_state_prefetched=True, next_item_stride=2 * self.block_num,
+                        nb_group_batch=chunk_rows // self.seq_len)
             completed_before = slot * slot_capacity if slot * slot_capacity < total else total
             completed_after = (slot + 1) * slot_capacity if (slot + 1) * slot_capacity < total else total
             ready_before = completed_before // 48
             ready_after = completed_after // 48
             publish_vector_grid_to_cube(3, 4, ack_flag=5)
             if item < total:
-                batch_index, value_head = idx2crd(item, [batch_size, 6])
+                batch_index, value_head = idx2crd(
+                    _recurrent_item_index(item, batch_size, 6, chunk_rows // self.seq_len), [batch_size, 6])
                 final_row = batch_index * self.seq_len + self.seq_len - 1
                 snapshot_index = dtypes.int64(state_indices_gm[final_row])
                 recurrent_stage.store_state(
@@ -2454,8 +2461,6 @@ class Schedule:
     main_weight_l2_cache_ctl: int = 4
     state_store_l2_cache_ctl: int = 4
     state_load_l2_cache_ctl: int = 2
-    row_fusion: bool = False
-    row_unroll: int = 8
     fa_width: int = 128
 
     def __post_init__(self):
@@ -2469,8 +2474,6 @@ class Schedule:
             raise ValueError("state_store_l2_cache_ctl must be 0 or 4")
         if self.state_load_l2_cache_ctl not in (0, 2, 4):
             raise ValueError("state_load_l2_cache_ctl must be 0, 2 or 4")
-        if self.row_unroll not in (2, 4, 8, 16):
-            raise ValueError("row_unroll must be 2, 4, 8 or 16")
         if self.ragged_main and self.main_width != 256:
             raise ValueError("ragged_main requires N256")
         if self.main_width not in (128, 256, 384):
@@ -2515,10 +2518,6 @@ class BetaProjectionStage(_ProjectionOperations):
         self.l0a = Channel(MemLoc.L0A, (rows, 64), dtypes.bfloat16, depth=2)
         self.l0b = Channel(MemLoc.L0B, (tile_width, 64), dtypes.bfloat16, depth=2)
         self.l0c = Channel(MemLoc.L0C, (rows, tile_width), dtypes.float32, depth=2)
-        self.projection_half = Channel(
-            MemLoc.UB, (rows // 2, tile_width), dtypes.float32, depth=1, kind=ChannelKind.CrossCore
-        ).produce()
-        self.projection_bf16 = Buffer(MemLoc.UB, (rows // 2, tile_width), dtypes.bfloat16)
         self.nd2nz = make_copy_engine(format_transform="nd2nz")
         self.fixpipe = make_copy_engine(split_axis=0)
 
@@ -2568,55 +2567,9 @@ class RecurrentStage(RecurrentKDAStage):
         super().__init__(row_block, num_heads, state_key_unroll=4, state_update_unroll=config.state_update_unroll)
         self.store_policy = config.state_store_l2_cache_ctl
         self.load_policy = config.state_load_l2_cache_ctl
-        self.row_unroll = config.row_unroll
 
     def load_state(self, state_gm):
         mem_copy(self.state, state_gm, l2_cache_ctl=self.load_policy)
-
-
-class RowFusedRecurrentStage(RecurrentStage):
-    """Read each state row once; retain the original FP32 operation order."""
-
-    @jit
-    def recur_step(self):
-        snapshot = self.state_snapshot.produce()
-        with vf(mode="simd"):
-            mask, _ = update_mask(64, elem_bits=32)
-            decay_pre = vload(self.decay_exp, 0)
-            decay_post = vload(self.decay_exp, 64)
-            key_pre = vload(self.key, 0)
-            key_post = vload(self.key, 64)
-            query_pre = vload(self.query, 0)
-            query_post = vload(self.query, 64)
-            decay_key_pre = vmul(decay_pre, key_pre, mask=mask)
-            decay_key_post = vmul(decay_post, key_post, mask=mask)
-            beta = vload_broadcast(self.ub_beta, 0)
-            for dv in dsl_range(0, self.row_block, 1, unroll=self.row_unroll):
-                offset = dv * 128
-                state_pre = vload(self.state, offset)
-                state_post = vload(self.state, offset + 64)
-                state_key = vmul(state_pre, decay_key_pre, mask=mask)
-                state_key = vmadd(state_post, decay_key_post, state_key, mask=mask)
-                state_sum = vreduce_sum(state_key, mask=mask)
-                state_sum = vdup(state_sum, mask=mask)
-                value = vload_broadcast(self.ub_value, dv)
-                residual = vsub(value, state_sum, mask=mask)
-                delta = vmul(residual, beta, mask=mask)
-                update_pre = vmul(delta, key_pre, mask=mask)
-                state_pre = vmul(state_pre, decay_pre, mask=mask)
-                state_pre = vadd(state_pre, update_pre, mask=mask)
-                update_post = vmul(delta, key_post, mask=mask)
-                state_post = vmul(state_post, decay_post, mask=mask)
-                state_post = vadd(state_post, update_post, mask=mask)
-                vstore(self.state, offset, state_pre, mask)
-                vstore(self.state, offset + 64, state_post, mask)
-                vstore(snapshot, offset, state_pre, mask)
-                vstore(snapshot, offset + 64, state_post, mask)
-                output_pre = vmul(state_pre, query_pre, mask=mask)
-                output_post = vmul(state_post, query_post, mask=mask)
-                output = vadd(output_pre, output_post, mask=mask)
-                output = vreduce_sum(output, mask=mask)
-                vstore_first(self.out, dv, output)
 
 
 class TPSchedule(_GridSchedule):
@@ -2777,7 +2730,6 @@ class TPSchedule(_GridSchedule):
     @jit
     def frontend_auxiliary_partitioned(self, decay, beta, fa, x, wa, wb, wbeta):
         groups = x.shape[0] // self.auxiliary_rows
-        subblock = get_subblock_id()
         for task in range(get_block_idx(), groups * (1 + 128 // self.config.fa_width), 32):
             channel_rewind(reset_sync_id=True)
             group = task % groups
@@ -2786,9 +2738,8 @@ class TPSchedule(_GridSchedule):
             if part == 0:
                 stage = BetaProjectionStage(self.auxiliary_rows, 0, 0, tile_width=(self.num_heads + 15) // 16 * 16,
                     row_capacity=self.auxiliary_rows)
-                stage.project(hidden, wbeta, 0, 56)
-                stage.publish(
-                    tile_slice(beta, (self.auxiliary_rows, (self.num_heads + 15) // 16 * 16), (group, 0)), subblock)
+                stage.project_to_gm(hidden, wbeta,
+                    tile_slice(beta, (self.auxiliary_rows, (self.num_heads + 15) // 16 * 16), (group, 0)), 0, 56)
             else:
                 if const_expr(self.config.fa_width <= 32):
                     stage = FaResident(
@@ -2796,8 +2747,8 @@ class TPSchedule(_GridSchedule):
                 else:
                     stage = ProjectionStage(
                         self.auxiliary_rows, 0, 0, tile_width=self.config.fa_width, row_capacity=self.auxiliary_rows)
-                stage.project(hidden, tile_slice(wa, (self.config.fa_width, HIDDEN_SIZE), (part - 1, 0)), 0, 56)
-                stage.publish(tile_slice(fa, (self.auxiliary_rows, self.config.fa_width), (group, part - 1)), subblock)
+                stage.project_to_gm(hidden, tile_slice(wa, (self.config.fa_width, HIDDEN_SIZE), (part - 1, 0)),
+                    tile_slice(fa, (self.auxiliary_rows, self.config.fa_width), (group, part - 1)), 0, 56)
             vec_sync_all()
 
     @jit
@@ -2824,15 +2775,13 @@ class TPSchedule(_GridSchedule):
                 if task < groups:
                     stage = BetaProjectionStage(self.auxiliary_rows, 0, 4, tile_width=(self.num_heads + 15) // 16 * 16,
                         row_capacity=self.auxiliary_rows)
-                    stage.project(hidden, wbeta, 0, 56)
-                    stage.publish(
-                        tile_slice(beta, (self.auxiliary_rows, (self.num_heads + 15) // 16 * 16), (group, 0)), subblock)
+                    stage.project_to_gm(hidden, wbeta,
+                        tile_slice(beta, (self.auxiliary_rows, (self.num_heads + 15) // 16 * 16), (group, 0)), 0, 56)
                     vec_sync_all()
                 else:
                     stage = ProjectionStage(self.auxiliary_rows, 0, 4, row_capacity=self.auxiliary_rows)
                     if const_expr(self.config.split_fb):
-                        stage.project(hidden, wa, 0, 56)
-                        stage.publish(tile_slice(fa, (self.auxiliary_rows, TILE), (group, 0)), subblock)
+                        stage.project_to_gm(hidden, wa, tile_slice(fa, (self.auxiliary_rows, TILE), (group, 0)), 0, 56)
                         vec_sync_all()
                     else:
                         low_rank = LowRankDecayStage(stage, self.num_heads)
@@ -2851,9 +2800,8 @@ class TPSchedule(_GridSchedule):
                 stage = BetaProjectionStage(self.auxiliary_rows, 0, 4, tile_width=(self.num_heads + 15) // 16 * 16,
                     row_capacity=self.auxiliary_rows)
                 hidden = tile_slice(x, (self.auxiliary_rows, HIDDEN_SIZE), (group, 0))
-                stage.project(hidden, wbeta, 0, 56)
-                stage.publish(
-                    tile_slice(beta, (self.auxiliary_rows, (self.num_heads + 15) // 16 * 16), (group, 0)), subblock)
+                stage.project_to_gm(hidden, wbeta,
+                    tile_slice(beta, (self.auxiliary_rows, (self.num_heads + 15) // 16 * 16), (group, 0)), 0, 56)
                 vec_sync_all()
             global_sync_all()
             channel_rewind(reset_sync_id=True)
@@ -2862,8 +2810,7 @@ class TPSchedule(_GridSchedule):
                 stage = ProjectionStage(self.auxiliary_rows, 0, 4, row_capacity=self.auxiliary_rows)
                 hidden = tile_slice(x, (self.auxiliary_rows, HIDDEN_SIZE), (group, 0))
                 if const_expr(self.config.split_fb):
-                    stage.project(hidden, wa, 0, 56)
-                    stage.publish(tile_slice(fa, (self.auxiliary_rows, TILE), (group, 0)), subblock)
+                    stage.project_to_gm(hidden, wa, tile_slice(fa, (self.auxiliary_rows, TILE), (group, 0)), 0, 56)
                     vec_sync_all()
                 else:
                     low_rank = LowRankDecayStage(stage, self.num_heads)
@@ -2883,8 +2830,7 @@ class TPSchedule(_GridSchedule):
             mem_copy(a, tile_slice(fa, (self.auxiliary_rows, TILE), (group, 0)), engine=stage.nd2nz)
             mem_copy(b, tile_slice(wb, (TILE, TILE), (head, 0)))
             stage.matmul_resident(a, b)
-            stage.cast_result()
-            stage.publish(tile_slice(decay, (self.auxiliary_rows, TILE), (group, head)), get_subblock_id())
+            stage.publish_result(tile_slice(decay, (self.auxiliary_rows, TILE), (group, head)))
             vec_sync_all()
 
     @jit
@@ -2897,10 +2843,7 @@ class TPSchedule(_GridSchedule):
         lower, eps):
         total = accepted.shape[0] * self.num_heads
         slots = ceil_div(total, 64)
-        if const_expr(self.config.row_fusion):
-            recurrent = RowFusedRecurrentStage(128, self.num_heads, self.config)
-        else:
-            recurrent = RecurrentStage(128, self.num_heads, self.config)
+        recurrent = RecurrentStage(128, self.num_heads, self.config)
         self._configure_recurrent(recurrent)
         output_gate = OutputGateStage()
         resident = self.config.resident_output_weight and self.num_heads == 6
@@ -2922,16 +2865,17 @@ class TPSchedule(_GridSchedule):
             if first < total:
                 prefetch_recurrent_item(
                     recurrent, output_gate, q, k, v, decay, gate, beta, first, accepted.shape[0], 8,
-                        self.num_heads, 128)
+                        self.num_heads, 128, nb_group_batch=self.publish_rows // 8)
                 prefetch_recurrent_state(
-                    recurrent, initial, indices, accepted, first, accepted.shape[0], 8, self.num_heads, 128)
+                    recurrent, initial, indices, accepted, first, accepted.shape[0], 8, self.num_heads, 128,
+                        nb_group_batch=self.publish_rows // 8)
             for slot in range(slots):
                 item = slot * 64 + first
                 if item < total:
                     run_recurrent_wave(recurrent, output_gate, q, k, v, decay, gate, beta, initial, final, indices,
                         accepted, item, item + 1, accepted.shape[0], 8, self.num_heads, 128, scale, lower, eps,
                         defer_final_snapshot=True, first_inputs_prefetched=True, first_state_prefetched=True,
-                        next_item_stride=64)
+                        next_item_stride=64, nb_group_batch=self.publish_rows // 8)
                 before = slot * 64
                 after = (slot + 1) * 64 if (slot + 1) * 64 < total else total
                 jobs = self.publish_rows // 8 * self.num_heads
@@ -2943,7 +2887,9 @@ class TPSchedule(_GridSchedule):
                 if const_expr(self.config.phase != "recurrent"):
                     publish_vector_grid_to_cube(3, 4, ack_flag=5)
                 if item < total:
-                    batch, head = idx2crd(item, [accepted.shape[0], self.num_heads])
+                    batch, head = idx2crd(
+                        _recurrent_item_index(item, accepted.shape[0], self.num_heads, self.publish_rows // 8),
+                        [accepted.shape[0], self.num_heads])
                     index = dtypes.int64(indices[batch * 8 + 7])
                     recurrent.store_state(tile_slice(final[index, head, None, None], (128, 128), (0, 0)))
                 if const_expr(self.config.phase not in ("recurrent", "backend_no_output")):
@@ -2986,8 +2932,6 @@ _SHORT_SCHEDULES = {
         "main_weight_l2_cache_ctl": 4,
         "state_store_l2_cache_ctl": 0,
         "state_load_l2_cache_ctl": 2,
-        "row_fusion": False,
-        "row_unroll": 2,
         "fa_width": 64, },
     12: {
         "main_rows": 128,
@@ -2996,8 +2940,6 @@ _SHORT_SCHEDULES = {
         "main_weight_l2_cache_ctl": 4,
         "state_store_l2_cache_ctl": 0,
         "state_load_l2_cache_ctl": 2,
-        "row_fusion": False,
-        "row_unroll": 2,
         "fa_width": 32, },
     6: {"task_pool32": True}, }
 
@@ -3005,7 +2947,7 @@ _LARGE_SCHEDULES = {
     heads: dict(ragged_output=True, ragged_main=True, main_rows=256, auxiliary_rows=0, main_width=256,
         split_fb=True, publish_rows=128 if heads == 24 else 64, resident_output_weight=True, phase="full",
         state_update_unroll=2, main_weight_l2_cache_ctl=0, state_store_l2_cache_ctl=4,
-        state_load_l2_cache_ctl=4 if heads == 12 else 2, row_fusion=heads == 12, row_unroll=2)
+        state_load_l2_cache_ctl=4 if heads == 12 else 2)
     for heads in (24, 12, 6)}
 
 
@@ -3017,7 +2959,7 @@ def _tp16_schedule(model_batch):
     if model_batch == 2:
         # 32 M64xN384 jobs fill the grid; resident N32 Fa has 20 jobs.
         return Schedule(main_rows=64, main_width=384, auxiliary_rows=64, publish_rows=64,
-            main_weight_l2_cache_ctl=0, state_store_l2_cache_ctl=0, row_unroll=2, fa_width=32)
+            main_weight_l2_cache_ctl=0, state_store_l2_cache_ctl=0, fa_width=32)
     # Retain the original N384 task pool and its fused short-batch Fa/Fb.
     return _Core32TaskSchedule(main_weight_l2_cache_ctl=0, state_store_l2_cache_ctl=4 if model_batch >= 7 else 0)
 
@@ -3034,8 +2976,6 @@ def _intermediate_schedule(num_heads, model_batch):
     physical_rows = _tile_rows(rows, options["main_rows"], options.get("ragged_main"))
     options["main_weight_l2_cache_ctl"] = 0 if rows > physical_rows else 4
     options["state_store_l2_cache_ctl"] = 4 if model_batch >= 4 else 0
-    options["row_fusion"] = num_heads == 12 and model_batch >= 8
-    options["row_unroll"] = 2
     return Schedule(**options)
 
 
@@ -3467,6 +3407,99 @@ class _Core32ProjectionSchedule(_ProjectionScheduleOperations):
                     56)
 
 
+class _HeadOutputStage:
+    """Retain output partial sums for up to four column tiles per AIC."""
+
+    def __init__(
+        self,
+        rows,
+        heads):
+        self.rows = rows
+        self.heads = heads
+        self.a_l1 = Channel(MemLoc.L1, (rows, TILE), dtypes.bfloat16, depth=2)
+        self.b_l1 = Channel(MemLoc.L1, (256, TILE), dtypes.bfloat16, depth=2, data_format="nz")
+        self.l0a = Channel(MemLoc.L0A, (rows, OPROJ_KS), dtypes.bfloat16, depth=2)
+        self.l0b = Channel(MemLoc.L0B, (256, OPROJ_KS), dtypes.bfloat16, depth=2)
+        self.nd2nz = make_copy_engine(format_transform="nd2nz")
+        self.fixpipe = make_copy_engine()
+        self.c0 = Channel(MemLoc.L0C, (rows, 256), dtypes.float32, depth=1).produce()
+        self.c1 = Channel(MemLoc.L0C, (rows, 256), dtypes.float32, depth=1).produce()
+        self.c2 = Channel(MemLoc.L0C, (rows, 256), dtypes.float32, depth=1).produce()
+        self.c3 = Channel(MemLoc.L0C, (rows, 256), dtypes.float32, depth=1).produce()
+
+    @jit
+    def _accumulate_tile(self, tensors, accumulator, column, head_range):
+        out, gated, weight = tensors
+        first_head, last_head = head_range
+        if column < HIDDEN_SIZE // 256:
+            for head in range(first_head, last_head):
+                a = self.a_l1.produce()
+                b = self.b_l1.produce()
+                mem_copy(a, tile_slice(gated, (self.rows, TILE), (0, head)), engine=self.nd2nz)
+                mem_copy(b, tile_slice(weight, (256, TILE), (column, head)))
+                for ks in range(TILE // OPROJ_KS):
+                    la = self.l0a.produce()
+                    lb = self.l0b.produce()
+                    mem_copy(la, tile_slice(a, (self.rows, OPROJ_KS), (0, ks)))
+                    mem_copy(lb, tile_slice(b, (256, OPROJ_KS), (0, ks)))
+                    matmul(accumulator, la, lb, init=head == 0 and ks == 0)
+            if last_head == self.heads:
+                mem_copy(tile_slice(out, (self.rows, 256), (0, column)), accumulator, engine=self.fixpipe)
+
+    @jit
+    def accumulate(self, out, gated, weight, first_head, last_head):
+        tensors = (out, gated, weight)
+        head_range = (first_head, last_head)
+        column = get_block_idx()
+        stride = get_block_num()
+        self._accumulate_tile(tensors, self.c0, column, head_range)
+        self._accumulate_tile(tensors, self.c1, column + stride, head_range)
+        self._accumulate_tile(tensors, self.c2, column + 2 * stride, head_range)
+        self._accumulate_tile(tensors, self.c3, column + 3 * stride, head_range)
+
+
+class _HeadPanelBackend:
+    """Overlap small-batch NB recurrence with output K-panel accumulation."""
+
+    def __init__(
+        self,
+        heads,
+        store_policy=4):
+        self.heads = heads
+        self.rows = 64 if heads == 12 else 32
+        self.config = Schedule(state_store_l2_cache_ctl=store_policy)
+
+    @jit
+    def backend(self, out, q, k, v, decay, gate, beta, gamma, wo, alog, bias, initial, final, indices, accepted, scale, lower, eps):
+        batch = accepted.shape[0]
+        stride = 2 * get_block_num()
+        total = batch * self.heads
+        recurrent = RecurrentStage(128, self.heads, self.config)
+        output_gate = OutputGateStage()
+        output = _HeadOutputStage(self.rows, self.heads)
+        recurrent.load_gate_params(alog, bias)
+        output_gate.load_gamma(gamma)
+        first = 2 * get_block_idx() + get_subblock_id()
+        for slot in range(ceil_div(total, stride)):
+            nb_item = slot * stride + first
+            batch_index = nb_item % batch
+            head = nb_item // batch
+            if nb_item < total:
+                run_recurrent_wave(recurrent, output_gate, q, k, v, decay, gate, beta, initial, final,
+                    indices, accepted, nb_item, nb_item + 1, batch, 8, self.heads, 128, scale, lower, eps,
+                    defer_final_snapshot=True, nb_group_batch=batch)
+            ready = (slot + 1) * stride
+            if ready > total:
+                ready = total
+            publish_vector_grid_to_cube(3, 4, ack_flag=5)
+            if nb_item < total:
+                index = dtypes.int64(indices[batch_index * 8 + 7])
+                recurrent.store_state(tile_slice(final[index, head, None, None], (128, 128), (0, 0)))
+            output.accumulate(out, q, wo, slot * stride // batch, ready // batch)
+            # Keep the Cube accumulator alive across head-group publications.
+        channel_rewind(reset_sync_id=True)
+
+
 class _PhaseSchedule(TPSchedule):
     """Keep measured output geometry while sharing runtime cache controls."""
 
@@ -3513,7 +3546,7 @@ class _Runtime32Logic:
         self.task = _TP16N384Schedule(32, HIDDEN_SIZE, 6)
         self.task.projection_weight_l2_cache_ctl = 0
         config = Schedule(main_rows=64, main_width=384, auxiliary_rows=64, publish_rows=64, main_weight_l2_cache_ctl=0,
-            state_store_l2_cache_ctl=0, row_unroll=2, fa_width=32)
+            state_store_l2_cache_ctl=0, fa_width=32)
         self.short = TPSchedule(6, 64, 64, 64, config)
 
     @jit
@@ -3581,18 +3614,19 @@ class _Runtime32Logic:
 
 class _TP12Logic:
     def __init__(self):
+        self.head_backend = _HeadPanelBackend(12, store_policy=0)
         self.main384 = _Core32ProjectionSchedule(12, 128, 384)
         self.main256 = _Core32ProjectionSchedule(12, 256, 256)
         self.aux0 = TPSchedule(12, 128, 32, 64, Schedule(fa_width=32))
         self.aux1 = TPSchedule(12, 128, 64, 64, Schedule(fa_width=128))
         self.back0 = _PhaseSchedule(
-            12, 128, 64, 64, Schedule(publish_rows=64, ragged_output=False, row_fusion=False, row_unroll=2))
+            12, 128, 64, 64, Schedule(publish_rows=64, ragged_output=False))
         self.back1 = _PhaseSchedule(
-            12, 128, 64, 256, Schedule(publish_rows=256, ragged_output=True, row_fusion=False, row_unroll=2))
+            12, 128, 64, 256, Schedule(publish_rows=256, ragged_output=True))
         self.back2 = _PhaseSchedule(
-            12, 128, 64, 256, Schedule(publish_rows=256, ragged_output=True, row_fusion=True, row_unroll=2))
+            12, 128, 64, 256, Schedule(publish_rows=256, ragged_output=True))
         self.back3 = _PhaseSchedule(
-            12, 128, 64, 64, Schedule(publish_rows=64, ragged_output=False, row_fusion=True, row_unroll=2))
+            12, 128, 64, 64, Schedule(publish_rows=64, ragged_output=False))
 
     @jit
     def execute(self, out, q, k, v, decay, gate, beta, fa, norm, x, wqkv, wa, wb, wbeta, wz, gamma, wo, alog, bias,
@@ -3635,7 +3669,10 @@ class _TP12Logic:
             self.aux1.frontend_fb(decay, fa, wb)
         global_sync_all()
         channel_rewind(reset_sync_id=True)
-        if mb == 1 or mb == 2 or mb == 5:
+        if mb == 1:
+            self.head_backend.backend(out, q, k, v, decay, gate, beta, gamma, wo, alog, bias, initial,
+                final, indices, accepted, scale, lower, eps)
+        elif mb == 2 or mb == 5:
             self.back0.store_policy = store_policy
             self.back0.load_policy = load_policy
             self.back0.backend(out, q, k, v, decay, gate, beta, gamma, wo, alog, bias, initial, final, indices,
@@ -3660,18 +3697,19 @@ class _TP12Logic:
 
 class _TP24Logic:
     def __init__(self):
+        self.head_backend = _HeadPanelBackend(24, store_policy=0)
         self.main384 = _Core32ProjectionSchedule(24, 128, 384)
         self.main256 = _Core32ProjectionSchedule(24, 256, 256)
         self.aux0 = TPSchedule(24, 128, 32, 64, Schedule(fa_width=64))
         self.aux1 = TPSchedule(24, 128, 32, 64, Schedule(fa_width=128))
         self.back0 = _PhaseSchedule(
-            24, 128, 64, 32, Schedule(publish_rows=32, ragged_output=False, row_fusion=False, row_unroll=2))
+            24, 128, 64, 32, Schedule(publish_rows=32, ragged_output=False))
         self.back1 = _PhaseSchedule(
-            24, 128, 64, 64, Schedule(publish_rows=64, ragged_output=False, row_fusion=False, row_unroll=2))
+            24, 128, 64, 64, Schedule(publish_rows=64, ragged_output=False))
         self.back2 = _PhaseSchedule(
-            24, 128, 64, 128, Schedule(publish_rows=128, ragged_output=True, row_fusion=False, row_unroll=2))
+            24, 128, 64, 128, Schedule(publish_rows=128, ragged_output=True))
         self.back3 = _PhaseSchedule(
-            24, 128, 64, 256, Schedule(publish_rows=256, ragged_output=True, row_fusion=False, row_unroll=2))
+            24, 128, 64, 256, Schedule(publish_rows=256, ragged_output=True))
 
     @jit
     def execute(self, out, q, k, v, decay, gate, beta, fa, norm, x, wqkv, wa, wb, wbeta, wz, gamma, wo, alog, bias,
@@ -3712,10 +3750,8 @@ class _TP24Logic:
         global_sync_all()
         channel_rewind(reset_sync_id=True)
         if mb == 1:
-            self.back0.store_policy = store_policy
-            self.back0.load_policy = load_policy
-            self.back0.backend(out, q, k, v, decay, gate, beta, gamma, wo, alog, bias, initial, final, indices,
-                accepted, scale, lower, eps)
+            self.head_backend.backend(out, q, k, v, decay, gate, beta, gamma, wo, alog, bias, initial,
+                final, indices, accepted, scale, lower, eps)
         elif mb == 2 or mb == 4:
             self.back1.store_policy = store_policy
             self.back1.load_policy = load_policy
@@ -3800,11 +3836,14 @@ def _core32_plan(model_batch, tp):
     return dict(model_batch=model_batch, tp=tp, cores=32, rows=rows, heads=heads, main_id=-1, **geometry,
         main_geometry=main_geometry(rows, heads, 32, geometry["main_m"], geometry["main_n"]),
         kda_waves=(96 * model_batch + lanes - 1) // lanes, vector_lanes=lanes, output_width=256,
-        output="weight256_r64" if heads == 6 else "measured32_stream",
+        output="nb_head_panels" if model_batch == 1 and heads != 6 else (
+            "weight256_r64" if heads == 6 else "measured32_stream"),
         mode="specialized32_compact" if heads == 6 and model_batch == 1 else "specialized32")
 
 
 def _output_policy(rows, heads, cores):
+    if heads != 6 and rows * heads == 768:
+        return "nb_head_panels"
     if rows in (32, 64):
         return "short32" if rows == 32 else "short64"
     if heads == 6:
@@ -3856,57 +3895,6 @@ class DynamicBetaStage(BetaProjectionStage):
                 mem_copy(l0a, tile_slice(a, (self.row_capacity, 64), (0, ks_idx)))
                 mem_copy(l0b, tile_slice(beta_l1, (self.tile_width, 64), (0, kc_idx * 2 + ks_idx)))
                 matmul(accumulator, l0a, l0b, init=kc_idx == 0 and ks_idx == 0)
-
-
-@jit
-def _run_recurrent_wave(recurrent_stage, output_gate_stage, q_workspace_gm, k_workspace_gm, v_workspace_gm,
-    decay_workspace_gm, output_gate_workspace_gm, beta_workspace_gm, initial_state_gm, final_state_gm,
-    state_indices_gm, accepted_gm, item_start, item_end, batch_size: int, seq_len: int, num_heads: int, row_block: int,
-    scale_value: float, lower_bound: float, rms_norm_eps: float, defer_final_snapshot: bool = False,
-    first_inputs_prefetched: bool = False, first_state_prefetched: bool = False, next_item_stride: int = 0):
-    """Run a wave, optionally carrying token-0 inputs across item boundaries."""
-    for item in range(item_start, item_end):
-        batch_index, value_head = idx2crd(item, [batch_size, num_heads])
-        base = batch_index * seq_len
-        accepted = dtypes.int64(accepted_gm[batch_index])
-        initial_token = base + accepted - 1 if accepted > 0 else base
-        initial_state_index = dtypes.int64(state_indices_gm[initial_token])
-        if not const_expr(first_inputs_prefetched):
-            prefetch_recurrent_item(recurrent_stage, output_gate_stage, q_workspace_gm, k_workspace_gm, v_workspace_gm,
-                decay_workspace_gm, output_gate_workspace_gm, beta_workspace_gm, item, batch_size, seq_len, num_heads,
-                row_block)
-        if not const_expr(first_state_prefetched):
-            recurrent_stage.load_state(
-                tile_slice(initial_state_gm[initial_state_index, value_head, None, None], (row_block, TILE), (0, 0)))
-        for token in range(seq_len):
-            recurrent_stage.normalize_qk(scale_value)
-            recurrent_stage.activate_g_beta(lower_bound, value_head)
-            if token + 1 < seq_len:
-                next_row = base + token + 1
-                recurrent_stage.prefetch_inputs(tile_slice(k_workspace_gm, (1, TILE), (next_row, value_head)),
-                    tile_slice(q_workspace_gm, (1, TILE), (next_row, value_head)),
-                    tile_slice(decay_workspace_gm, (1, TILE), (next_row, value_head)),
-                    tile_slice(v_workspace_gm, (1, row_block), (next_row, value_head)),
-                    tile_slice(beta_workspace_gm, (1, 1), (next_row, value_head)))
-                output_gate_stage.issue_gate(
-                    tile_slice(output_gate_workspace_gm, (1, row_block), (next_row, value_head)))
-            recurrent_stage.recur_step()
-            output_gate_stage.prepare_local_sum(recurrent_stage.out)
-            output_gate_stage.apply_and_store(
-                tile_slice(q_workspace_gm, (1, row_block), (base + token, value_head)), rms_norm_eps)
-            if next_item_stride > 0:
-                if token + 1 == seq_len:
-                    next_item = item + next_item_stride
-                    if next_item < batch_size * num_heads:
-                        prefetch_recurrent_item(recurrent_stage, output_gate_stage, q_workspace_gm, k_workspace_gm,
-                            v_workspace_gm, decay_workspace_gm, output_gate_workspace_gm, beta_workspace_gm, next_item,
-                            batch_size, seq_len, num_heads, row_block)
-                        prefetch_recurrent_state(recurrent_stage, initial_state_gm, state_indices_gm, accepted_gm,
-                            next_item, batch_size, seq_len, num_heads, row_block)
-            if not defer_final_snapshot or token + 1 < seq_len:
-                snapshot_index = dtypes.int64(state_indices_gm[base + token])
-                recurrent_stage.store_state(
-                    tile_slice(final_state_gm[snapshot_index, value_head, None, None], (row_block, TILE), (0, 0)))
 
 
 @jit
@@ -4099,14 +4087,9 @@ class AuxiliarySchedule(TPSchedule):
         for group in range(get_block_idx(), groups, get_block_num()):
             channel_rewind(reset_sync_id=True)
             stage = DynamicBetaStage(self.auxiliary_rows, 0, 4, tile_width=width, row_capacity=self.auxiliary_rows)
-            stage.project(
-                tile_slice(x, make_tiler((self.auxiliary_rows, HIDDEN_SIZE), alignment=(16, 16)), (group, 0)),
-                wbeta,
-                0,
-                56)
-            stage.publish(
-                tile_slice(beta, make_tiler((self.auxiliary_rows, width), alignment=(16, 16)), (group, 0)),
-                get_subblock_id())
+            stage.project_to_gm(
+                tile_slice(x, make_tiler((self.auxiliary_rows, HIDDEN_SIZE), alignment=(16, 16)), (group, 0)), wbeta,
+                tile_slice(beta, make_tiler((self.auxiliary_rows, width), alignment=(16, 16)), (group, 0)), 0, 56)
             vec_sync_all()
 
     @jit
@@ -4122,12 +4105,9 @@ class AuxiliarySchedule(TPSchedule):
         for group in range(get_block_idx(), groups, get_block_num()):
             channel_rewind(reset_sync_id=True)
             stage = ProjectionStage(self.auxiliary_rows, 0, 4, row_capacity=self.auxiliary_rows)
-            stage.project(
+            stage.project_to_gm(
                 tile_slice(x, make_tiler((self.auxiliary_rows, HIDDEN_SIZE), alignment=(16, 16)), (group, 0)), wa,
-                    0, 56)
-            stage.publish(
-                tile_slice(fa, make_tiler((self.auxiliary_rows, TILE), alignment=(16, 16)), (group, 0)),
-                get_subblock_id())
+                tile_slice(fa, make_tiler((self.auxiliary_rows, TILE), alignment=(16, 16)), (group, 0)), 0, 56)
             vec_sync_all()
         global_sync_all()
         channel_rewind(reset_sync_id=True)
@@ -4147,10 +4127,8 @@ class AuxiliarySchedule(TPSchedule):
                 engine=stage.nd2nz)
             mem_copy(b, tile_slice(wb, (TILE, TILE), (head, 0)))
             stage.matmul_resident(a, b)
-            stage.cast_result()
-            stage.publish(
-                tile_slice(decay, make_tiler((self.auxiliary_rows, TILE), alignment=(16, 16)), (group, head)),
-                get_subblock_id())
+            stage.publish_result(
+                tile_slice(decay, make_tiler((self.auxiliary_rows, TILE), alignment=(16, 16)), (group, head)))
             vec_sync_all()
 
 
@@ -4242,8 +4220,6 @@ class BackendSchedule:
         slots = ceil_div(total, stride)
         recurrent = DynamicRecurrentStage()
         output_gate = OutputGateStage()
-        recurrent.load_gate_params(alog, bias)
-        output_gate.load_gamma(gamma)
         publish_rows = 128
         if q.shape[0] == 32:
             publish_rows = 32
@@ -4261,15 +4237,17 @@ class BackendSchedule:
             first = get_block_idx() * 2 + get_subblock_id()
             if first < total:
                 prefetch_recurrent_item(
-                    recurrent, output_gate, q, k, v, decay, gate, beta, first, accepted.shape[0], 8, n, 128)
-                prefetch_recurrent_state(recurrent, initial, indices, accepted, first, accepted.shape[0], 8, n, 128)
+                    recurrent, output_gate, q, k, v, decay, gate, beta, first, accepted.shape[0], 8, n, 128,
+                        nb_group_batch=publish_rows // 8)
+                prefetch_recurrent_state(recurrent, initial, indices, accepted, first, accepted.shape[0], 8, n, 128,
+                    nb_group_batch=publish_rows // 8)
             for slot in range(slots):
                 item = slot * stride + first
                 if item < total:
-                    _run_recurrent_wave(recurrent, output_gate, q, k, v, decay, gate, beta, initial, final, indices,
+                    run_recurrent_wave(recurrent, output_gate, q, k, v, decay, gate, beta, initial, final, indices,
                         accepted, item, item + 1, accepted.shape[0], 8, n, 128, scale, lower, eps,
                         defer_final_snapshot=True, first_inputs_prefetched=True, first_state_prefetched=True,
-                        next_item_stride=stride)
+                        next_item_stride=stride, nb_group_batch=publish_rows // 8)
                 before = slot * stride
                 after = (slot + 1) * stride if (slot + 1) * stride < total else total
                 jobs = publish_rows // 8 * n
@@ -4281,7 +4259,8 @@ class BackendSchedule:
                 if const_expr(self.config.phase != "recurrent"):
                     publish_vector_grid_to_cube(3, 4, ack_flag=5)
                 if item < total:
-                    batch, head = idx2crd(item, [accepted.shape[0], n])
+                    batch, head = idx2crd(
+                        _recurrent_item_index(item, accepted.shape[0], n, publish_rows // 8), [accepted.shape[0], n])
                     index = dtypes.int64(indices[batch * 8 + 7])
                     recurrent.store_state(tile_slice(final[index, head, None, None], (128, 128), (0, 0)))
                 if const_expr(self.config.phase not in ("recurrent", "backend_no_output")):
@@ -4301,6 +4280,7 @@ class TPStages:
         self.aux64 = AuxiliarySchedule(heads, 64)
         self.aux128 = AuxiliarySchedule(heads, 128)
         self.backend = BackendSchedule(heads)
+        self.head_backend = _HeadPanelBackend(heads)
         if heads == 6:
             self.fast32 = _Runtime32Logic()
         elif heads == 12:
@@ -4335,8 +4315,12 @@ class TPStages:
                 self.aux32.execute(decay, beta, fa, x, wa, wb, wbeta)
             global_sync_all()
             channel_rewind(reset_sync_id=True)
-            self.backend.backend(out, q, k, v, decay, gate, beta, gamma, wo, alog, bias, initial, final, indices,
-                accepted, scale, lower, eps, wbeta)
+            if n != 6 and accepted.shape[0] * n == 96:
+                self.head_backend.backend(out, q, k, v, decay, gate, beta, gamma, wo, alog[0:n,], bias[0:n, None],
+                    initial, final, indices, accepted, scale, lower, eps)
+            else:
+                self.backend.backend(out, q, k, v, decay, gate, beta, gamma, wo, alog, bias, initial, final, indices,
+                    accepted, scale, lower, eps, wbeta)
         global_sync_all()
 
 
