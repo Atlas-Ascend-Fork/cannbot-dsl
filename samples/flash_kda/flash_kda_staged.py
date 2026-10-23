@@ -12,7 +12,7 @@
 
 """Staged chunk-group scheduling, staged matrix/vector resources and sequence views for FlashKDA inference."""
 
-__all__ = ["GroupFlashKDA", "clear_caches", "group_flash_kda", "group_flash_kda_kernel"]
+__all__ = ["StagedFlashKDA", "clear_caches", "staged_flash_kda", "staged_flash_kda_kernel"]
 
 
 import dataclasses
@@ -2230,7 +2230,7 @@ def _run_stage2_dynamic(
 
 
 @jit
-def run_group_flash_kda(
+def run_staged_flash_kda(
     gm_K: Tensor,
     gm_V: Tensor,
     gm_Q: Tensor,
@@ -2340,12 +2340,12 @@ def run_group_flash_kda(
 
 @kernel(
     profile=cannbotdsl.ProfileSpec(
-        name="group_flash_kda", op_type="FlashKDA",
+        name="staged_flash_kda", op_type="FlashKDA",
         inputs=("gm_K", "gm_V", "gm_Q", "gm_beta", "gm_g", "gm_A_log", "gm_dt_bias", "gm_state_in", "gm_metadata",),
         outputs=("gm_O",), inouts=("gm_state_out",),
     ),
 )
-class group_flash_kda_kernel:
+class staged_flash_kda_kernel:
     def __call__(
         self,
         gm_K: Tensor,
@@ -2370,15 +2370,15 @@ class group_flash_kda_kernel:
         scale_value: float,
         lower_bound: float,
     ):
-        run_group_flash_kda(
+        run_staged_flash_kda(
             gm_K, gm_V, gm_Q, gm_beta, gm_g, gm_qk_exchange, gm_A_log, gm_dt_bias, gm_k_restored, gm_gamma,
             gm_q_decayed, gm_w, gm_Mqk, gm_U, gm_O, gm_state_in, gm_state_out, gm_identity16, gm_metadata, scale_value,
             lower_bound,
         )
 
 
-class GroupFlashKDA:
-    """Compiled AICore entry used by :func:`group_flash_kda`."""
+class StagedFlashKDA:
+    """Compiled AICore entry used by :func:`staged_flash_kda`."""
 
     @host
     def run(
@@ -2406,7 +2406,7 @@ class GroupFlashKDA:
         lower_bound: float,
         core_num: int,
     ):
-        op = group_flash_kda_kernel()
+        op = staged_flash_kda_kernel()
         op[core_num](
             K, V, Q, beta, g, qk_exchange, A_log, dt_bias, kr, gamma, qd, w, mqk, u, out, state_in, state_out, identity,
             metadata, scale, lower_bound,
@@ -2415,11 +2415,11 @@ class GroupFlashKDA:
 
 @compile_cache
 def _compile_flash_kda():
-    from .flash_kda import _compile_group_entry
-    return _compile_group_entry(GroupFlashKDA)
+    from .flash_kda import _compile_staged_entry
+    return _compile_staged_entry(StagedFlashKDA)
 
 
-def group_flash_kda(
+def staged_flash_kda(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -2433,7 +2433,7 @@ def group_flash_kda(
     layout_qkv: str,
     metadata: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Run the direct group AICore template; see :func:`flash_kda` for arguments."""
+    """Run the direct staged AICore template; see :func:`flash_kda` for arguments."""
     from .flash_kda import _flash_kda_impl
     return _flash_kda_impl(
         q, k, v, g, beta, scale, initial_state, A_log, dt_bias, lower_bound, layout_qkv, metadata,
@@ -2445,12 +2445,12 @@ def clear_caches():
     _compile_flash_kda.cache_clear()
 
 
-@aot.export("group_flash_kda")
+@aot.export("staged_flash_kda")
 def export_flash_kda():
     _compile_flash_kda()
 
 
-_GRAPH_LIBRARY = torch.library.Library("cannbotdsl_group_flash_kda", "DEF")
+_GRAPH_LIBRARY = torch.library.Library("cannbotdsl_staged_flash_kda", "DEF")
 _GRAPH_LIBRARY.define(
     "flash_kda(Tensor q, Tensor k, Tensor v, Tensor g, Tensor beta, float scale, Tensor "
     "initial_state, Tensor a_log, Tensor dt_bias, float lower_bound, str layout_qkv, "
@@ -2494,10 +2494,10 @@ def _flash_kda_privateuse1(
     layout_qkv,
     metadata,
 ):
-    return group_flash_kda(q, k, v, g, beta, scale, initial_state, a_log, dt_bias, lower_bound, layout_qkv, metadata)
+    return staged_flash_kda(q, k, v, g, beta, scale, initial_state, a_log, dt_bias, lower_bound, layout_qkv, metadata)
 
 
-flash_kda_op = torch.ops.cannbotdsl_group_flash_kda.flash_kda
-torch._dynamo.substitute_in_graph(group_flash_kda, can_constant_fold_through=False)(
+flash_kda_op = torch.ops.cannbotdsl_staged_flash_kda.flash_kda
+torch._dynamo.substitute_in_graph(staged_flash_kda, can_constant_fold_through=False)(
     lambda *args, **kwargs: flash_kda_op(*args, **kwargs),
 )

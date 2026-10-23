@@ -40,19 +40,19 @@ from .flash_kda_metadata import (
     TEMPLATE_STAGED,
     WORKSPACE_SLOTS,
 )
-from . import flash_kda_staged as _group_template
+from . import flash_kda_staged as _staged_template
 from .flash_kda_staged import (
     allocate_qk_exchange_workspace,
     allocate_stage1_workspace,
-    run_group_flash_kda,
-    _compile_flash_kda as compile_group_kernel,
-    _device_block_num as group_device_block_num,
+    run_staged_flash_kda,
+    _compile_flash_kda as compile_staged_kernel,
+    _device_block_num as staged_device_block_num,
 )
 from .flash_kda_persistent import (
-    run_chunk_flash_kda,
-    _compile_flash_kda as compile_chunk_kernel,
-    _device_block_num as chunk_device_block_num,
-    _identity_matrix16 as chunk_identity_matrix16,
+    run_persistent_flash_kda,
+    _compile_flash_kda as compile_persistent_kernel,
+    _device_block_num as persistent_device_block_num,
+    _identity_matrix16 as persistent_identity_matrix16,
 )
 
 
@@ -131,14 +131,14 @@ class flash_kda_kernel:
             selected_template = gm_metadata[HEADER_TEMPLATE]
             if selected_template == TEMPLATE_STAGED:
                 channel_rewind(reset_sync_id=True)
-                run_group_flash_kda(
+                run_staged_flash_kda(
                     gm_K, gm_V, gm_Q, gm_beta, gm_g, gm_qk_exchange, gm_A_log, gm_dt_bias, gm_k_restored, gm_gamma,
                     gm_q_decayed, gm_w, gm_Mqk, gm_U, gm_O, gm_state_in, gm_state_out, gm_identity16, gm_metadata,
                     scale_value, lower_bound,
                 )
             else:
                 channel_rewind(reset_sync_id=True)
-                run_chunk_flash_kda(
+                run_persistent_flash_kda(
                     gm_Q, gm_K, gm_V, gm_g, gm_beta, gm_state_in, gm_A_log, gm_dt_bias, gm_identity16, gm_qk_exchange,
                     gm_O, gm_state_out, gm_metadata, scale_value, lower_bound,
                 )
@@ -189,7 +189,7 @@ def _sequence_spec(dtype, physical_batches, length, heads, width, stride_prefix)
     )
 
 
-def _compile_group_entry(entry):
+def _compile_staged_entry(entry):
     """Share the tensor contract while compiling each named AICore entry separately."""
     physical_batches = cannbotdsl.Dim("P")
     storage_length = cannbotdsl.Dim("L")
@@ -222,7 +222,7 @@ def _compile_group_entry(entry):
 
 @compile_cache
 def _compile_flash_kda():
-    return _compile_group_entry(FlashKDA)
+    return _compile_staged_entry(FlashKDA)
 
 
 def _validate_metadata(metadata, ref):
@@ -373,20 +373,20 @@ def _flash_kda_impl(
         "invalid internal template"
     )
     if internal_template == TEMPLATE_STAGED:
-        core_num = group_device_block_num(q)
-        compile_entry = compile_group_kernel
+        core_num = staged_device_block_num(q)
+        compile_entry = compile_staged_kernel
     elif internal_template == TEMPLATE_PERSISTENT:
-        core_num = chunk_device_block_num(q)
-        compile_entry = compile_chunk_kernel
+        core_num = persistent_device_block_num(q)
+        compile_entry = compile_persistent_kernel
     else:
         core_num = _device_block_num(q)
         compile_entry = _compile_flash_kda
     qk_exchange = allocate_qk_exchange_workspace(active_block_num=core_num, ref=q)
     final_state = torch.empty(initial_state.shape, dtype=initial_state.dtype, device=initial_state.device)
     if internal_template == TEMPLATE_PERSISTENT:
-        # Standalone chunk takes q/k/v and no group scratch. Its C08 contract
-        # differs from the B991 unified/group entry even when both execute chunk.
-        identity = chunk_identity_matrix16(str(q.device))
+        # Standalone persistent takes q/k/v and no staged scratch. Its C08 contract
+        # differs from the B991 unified/staged entry even when both execute persistent.
+        identity = persistent_identity_matrix16(str(q.device))
         fn = compile_entry()
         fn(
             q_logical, k_logical, v_logical, g_logical, beta_logical, initial_state, A_log, dt_bias, identity,
@@ -566,5 +566,5 @@ def _flash_kda_graph(
 
 
 def __getattr__(name):
-    """Expose helper attributes from the GROUP template module."""
-    return getattr(_group_template, name)
+    """Expose helper attributes from the staged template module."""
+    return getattr(_staged_template, name)

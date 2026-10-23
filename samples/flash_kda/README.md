@@ -100,25 +100,24 @@ metadata 函数接收与主算子相同的 `q`、`v`、`initial_state` 和 `layo
 
 ## 精度测试
 
-
-在仓库根目录运行（CPU golden 建议限制线程数）：
+在仓库根目录运行：
 
 ```bash
 OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 python -m pytest -q test/flash_kda/test_flash_kda.py
 ```
 
-测试共 6 个精度用例：BNSD、BSND、packed TND 三种布局分别覆盖 staged 和 persistent，包含 GQA、非对齐尾块和多条变长序列。
-输出和最终状态与内联 PyTorch FP32 golden 及 BF16/FP16 交接模拟对照，
-默认容差为 `atol=rtol=5e-3`。测试需要 Ascend NPU。
+默认容差为 `atol=rtol=5e-3`。
 
 ## 性能测试
 
-2026-10-18 实测环境：Ascend 950，cannbotdsl 0.7.1、PyTorch 2.10.0、CANN 9.2.0，32 个 AIC。
+测量环境：Ascend 950 PR，cannbotdsl 0.7.1、PyTorch 2.10.0、CANN 9.2.0，32 个 AIC。
 
-`B=1`、`Nqk=Nv=96`、`S=16384`、`Dk=Dv=128`；Q/K/V/g/beta 为 BF16，初始状态及门控参数为 FP32，metadata 使用 `template="auto"`。`lower_bound=-5.0`，初态、`A_log` 和 `dt_bias` 均为 0。校验后预热 3 次，采样 20 次，不额外清理缓存。下表为设备 kernel Task Duration 的中位数，不包含 metadata 生成、编译和 host 分配时间。
+`B=1`、`Nqk=Nv=96`、`S=16384`、`Dk=Dv=128`，BF16 输入、FP32 状态，`template="auto"`。
 
-| 布局 | Q/K/V shape | 实际模板 | 内核耗时（μs） |
-|:---|:---|:---|---:|
-| BNSD | `[1, 96, 16384, 128]` | persistent | 2535.828 |
-| BSND | `[1, 16384, 96, 128]` | persistent | 2542.530 |
-| TND | `[16384, 96, 128]` | persistent | 2539.177 |
+每轮预热 50 次、采样 40 次，共 3 轮。下表为 120 次设备 kernel Task Duration 的中位数；未额外清理缓存，不包含 metadata 生成、编译和 host 分配时间。
+
+| 布局 | Q/K/V shape | 延迟（μs） |
+|:---|:---|---:|
+| BNSD | `[1, 96, 16384, 128]` | 2491.377 |
+| BSND | `[1, 16384, 96, 128]` | 2501.178 |
+| TND | `[16384, 96, 128]` | 2497.461 |

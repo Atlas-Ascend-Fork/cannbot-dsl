@@ -47,8 +47,6 @@ $$
 
 metadata 默认 `template="auto"`；`template="staged"` 和 `template="persistent"` 可分别固定使用对应模板。两个模板共用公开接口和缓存布局。
 
-persistent 使用连续 ND 状态合并、recurrent L0A/L0B 双缓冲和已加载状态半块复用；状态仍以 FP32 递推，完整保存训练缓存。
-
 ## 快速开始
 
 在仓库根目录设置 `export PYTHONPATH="$PWD/samples:$PYTHONPATH"` 后运行：
@@ -144,24 +142,26 @@ metadata 接口为 `flash_kda_fwd_metadata(q, v, initial_state, layout_qkv, cu_s
 
 ## 精度测试
 
-在仓库根目录运行，需要 Ascend NPU：
+在仓库根目录运行：
 
 ```bash
 OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 python -m pytest -q test/flash_kda_fwd/test_flash_kda_fwd.py
 ```
 
-共 6 个精度用例，覆盖 BNSD、BSND、TND 下的 staged 和 persistent，以及 GQA、非对齐尾块和变长序列。输出、状态和反向缓存与内联 PyTorch FP32 golden、BF16/FP16 交接模拟比较，默认容差为 `atol=rtol=5e-3`。仅在推理与训练 metadata ABI 相同时，测试才额外执行推理结果交叉验证。
+默认容差为 `atol=rtol=5e-3`。
 
 ## 性能测试
 
-2026-10-19 实测环境：Ascend 950，cannbotdsl 0.7.1、PyTorch 2.10.0、CANN 9.2.0，32 个 AIC。
+测量环境：Ascend 950 PR，cannbotdsl 0.7.1、PyTorch 2.10.0、CANN 9.2.0，32 个 AIC。
 
-`B=1`、`Nqk=Nv=96`、`S=16384`、`Dk=Dv=128`；Q/K/V/g/beta 为 BF16，初始状态及门控参数为 FP32，metadata 使用 `template="auto"`。`lower_bound=-5.0`，初态、`A_log` 和 `dt_bias` 均为 0。校验后预热 3 次，采样 20 次，不额外清理缓存。下表为设备 kernel Task Duration 的中位数，不包含 metadata 生成、编译和 host 分配时间。
+`B=1`、`Nqk=Nv=96`、`S=16384`、`Dk=Dv=128`，BF16 输入、FP32 状态，`template="auto"`。
 
-训练前向开启 `disable_recompute=True`、`return_intermediate_state=True`、`output_final_state=True`，保存完整反向缓存；Q/K 归一化、gate 激活、beta sigmoid 均在内核完成，`allow_neg_eigval=False`。
+训练前向开启 `disable_recompute=True`、`return_intermediate_state=True`、`output_final_state=True`；Q/K 归一化、gate 激活和 beta sigmoid 均在内核完成，`allow_neg_eigval=False`。
 
-| 布局 | Q/K/V shape | 实际模板 | 内核耗时（μs） |
-|:---|:---|:---|---:|
-| BNSD | `[1, 96, 16384, 128]` | persistent | 6059.995 |
-| BSND | `[1, 16384, 96, 128]` | persistent | 6443.095 |
-| TND | `[16384, 96, 128]` | persistent | 6437.970 |
+每轮预热 50 次、采样 40 次，共 3 轮。下表为 120 次设备 kernel Task Duration 的中位数；未额外清理缓存，不包含 metadata 生成、编译和 host 分配时间。
+
+| 布局 | Q/K/V shape | 延迟（μs） |
+|:---|:---|---:|
+| BNSD | `[1, 96, 16384, 128]` | 6114.947 |
+| BSND | `[1, 16384, 96, 128]` | 6451.615 |
+| TND | `[16384, 96, 128]` | 6435.956 |

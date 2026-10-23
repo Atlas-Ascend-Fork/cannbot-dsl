@@ -426,12 +426,14 @@ class _DynamicPrecisionCase:
     nv: int
     nk: int
     seed: int
+    qk_scale: float = 1.0
 
     @property
     def case_id(self):
         lengths = "-".join(str(length) for length in self.lengths)
         suffix = "-cu" if self.has_cu else ""
-        return f"{self.layout.lower()}{suffix}_n{self.nv}k{self.nk}_s{lengths}_seed{self.seed}"
+        scale_label = f"_qks{self.qk_scale:g}" if self.qk_scale != 1.0 else ""
+        return f"{self.layout.lower()}{suffix}_n{self.nv}k{self.nk}_s{lengths}_seed{self.seed}{scale_label}"
 
 
 _DYNAMIC_FAST_CASES = (
@@ -441,6 +443,18 @@ _DYNAMIC_FAST_CASES = (
     _DynamicPrecisionCase("BNSD", False, (65,), 16, 1, 201),
     _DynamicPrecisionCase("BSND", False, (65,), 16, 1, 202),
     _DynamicPrecisionCase("TND", True, (65,), 16, 1, 205),
+    _DynamicPrecisionCase("BNSD", False, (1, 1), 3, 1, 301, qk_scale=1e-4),
+    _DynamicPrecisionCase("BSND", False, (16, 16), 6, 2, 302, qk_scale=64.0),
+    _DynamicPrecisionCase("TND", True, (1, 63, 65), 3, 1, 303),
+    _DynamicPrecisionCase("BNSD", False, (63,), 96, 96, 304),
+    _DynamicPrecisionCase("BSND", False, (64,), 96, 96, 305),
+    _DynamicPrecisionCase("TND", True, (65,), 96, 96, 306),
+    _DynamicPrecisionCase("BNSD", False, (127,), 6, 3, 307),
+    _DynamicPrecisionCase("BSND", False, (128,), 6, 3, 308),
+    _DynamicPrecisionCase("TND", True, (129, 64, 1), 6, 2, 309),
+    _DynamicPrecisionCase("TND", True, (511, 513), 3, 1, 310),
+    _DynamicPrecisionCase("BNSD", False, (513,), 3, 1, 311),
+    _DynamicPrecisionCase("BSND", False, (513,), 3, 1, 312),
 )
 
 
@@ -448,6 +462,8 @@ def _make_dynamic_case(case):
     inputs = make_inputs_generalized(
         len(case.lengths), case.nv, max(case.lengths), 128, nk=case.nk, seed=case.seed, lower_bound=_LOWER_BOUND,
     )
+    inputs.q.mul_(case.qk_scale)
+    inputs.k.mul_(case.qk_scale)
     outputs = {name: [] for name in ("cpu_chunk", "npu_chunk")}
     states = {name: [] for name in outputs}
     for batch_idx, length in enumerate(case.lengths):
@@ -500,7 +516,7 @@ def _dynamic_valid_outputs(output, case):
     ]
 
 
-def _assert_dynamic_precision_case(case):
+def _assert_dynamic_precision_case(case, *, template="auto"):
     require_npu()
     inputs, golden_outputs, golden_state = _make_dynamic_case(case)
     q, k, v, g, beta = (tensor.npu() for tensor in _dynamic_layout_inputs(inputs, case))
@@ -509,7 +525,9 @@ def _assert_dynamic_precision_case(case):
         cu_seqlens = torch.tensor((0, *torch.tensor(case.lengths).cumsum(0).tolist()), dtype=torch.int32).npu()
     initial_state = inputs.initial_state.transpose(-1, -2).contiguous().npu()
     initial_state_before = initial_state.clone()
-    metadata = _DYNAMIC_METADATA.flash_kda_metadata(q, v, initial_state, case.layout, cu_seqlens)
+    metadata = _DYNAMIC_METADATA.flash_kda_metadata(
+        q, v, initial_state, case.layout, cu_seqlens, template=template,
+    )
     output, state = _DYNAMIC_KDA.flash_kda(
         q, k, v, g, beta, inputs.scale_value, initial_state, inputs.a_log.npu(), inputs.dt_bias.npu(),
         inputs.lower_bound, case.layout, metadata,
@@ -517,29 +535,19 @@ def _assert_dynamic_precision_case(case):
     torch.npu.synchronize()
 
     actual_state = state.cpu().float()
-    assert torch.isfinite(actual_state).all(), (
-        f"{case.case_id}: final_state contains inf/nan"
-    )
+    assert torch.isfinite(actual_state).all(), f"{case.case_id}: final_state contains inf/nan"
     torch.testing.assert_close(initial_state.cpu().float(), initial_state_before.cpu().float(), atol=0.0, rtol=0.0)
-    actual_outputs = [
-        actual.cpu().float() for actual in _dynamic_valid_outputs(output, case)
-    ]
+    actual_outputs = [actual.cpu().float() for actual in _dynamic_valid_outputs(output, case)]
     for name in ("cpu_chunk", "npu_chunk"):
         expected_state = golden_state[name].float()
-        assert torch.isfinite(expected_state).all(), (
-            f"{case.case_id}: {name} state is not finite"
-        )
+        assert torch.isfinite(expected_state).all(), f"{case.case_id}: {name} state is not finite"
         torch.testing.assert_close(
             actual_state, expected_state, atol=_TOL, rtol=_TOL, msg=lambda msg: f"DSL vs {name} state: {msg}",
         )
         output_max = 0.0
         for actual, expected in zip(actual_outputs, golden_outputs[name]):
-            assert torch.isfinite(actual).all(), (
-                f"{case.case_id}: DSL output is not finite"
-            )
-            assert torch.isfinite(expected).all(), (
-                f"{case.case_id}: {name} output is not finite"
-            )
+            assert torch.isfinite(actual).all(), f"{case.case_id}: DSL output is not finite"
+            assert torch.isfinite(expected).all(), f"{case.case_id}: {name} output is not finite"
             torch.testing.assert_close(
                 actual, expected.float(), atol=_TOL, rtol=_TOL, msg=lambda msg: f"DSL vs {name} output: {msg}",
             )
@@ -556,9 +564,10 @@ def _assert_dynamic_precision_case(case):
         )
 
 
+@pytest.mark.parametrize("template", ("auto", "staged", "persistent"))
 @pytest.mark.parametrize("case", _DYNAMIC_FAST_CASES, ids=lambda case: case.case_id)
-def test_flash_kda_dynamic_precision(case):
-    _assert_dynamic_precision_case(case)
+def test_flash_kda_dynamic_precision(case, template):
+    _assert_dynamic_precision_case(case, template=template)
 
 
 def teardown_module():

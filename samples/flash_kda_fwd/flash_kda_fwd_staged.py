@@ -2369,7 +2369,7 @@ def _run_stage2_body(
                 gm_kg[0, seq_idx, None, None], (CHUNK_SIZE, SUPPORTED_HEAD_DIM), (group_start, 0),
             )
             first_mqk_tile = tile_slice(
-                gm_Mqk[0, seq_idx, None, None, None], (CHUNK_SIZE, CHUNK_SIZE), (group_start, 0),
+                gm_Mqk[0, seq_idx, group_start, None, None], (CHUNK_SIZE, CHUNK_SIZE), (0, 0),
             )
             first_gamma_col_full = tile_slice(gm_gamma, (SUPPORTED_HEAD_DIM, 1), (first_linear, 0))
             first_gamma_col = tile_slice(first_gamma_col_full, (half_dk, 1), (subblock_idx, 0))
@@ -2410,7 +2410,6 @@ def _run_stage2_body(
                     gm_v_new[0, seq_idx, None, None], (CHUNK_SIZE, SUPPORTED_HEAD_DIM), (k, 0),
                 )
                 v_new_chunk = tile_slice(v_new_chunk_full, (CHUNK_SIZE, dv_base), (0, dv_idx))
-                _mqk_tile = tile_slice(gm_Mqk[0, seq_idx, None, None, None], (CHUNK_SIZE, CHUNK_SIZE), (k, 0))
                 h_state = gm_h[
                     state_batch_idx, seq_idx, state_chunk_base + k, None, None
                 ]
@@ -2450,7 +2449,7 @@ def _run_stage2_body(
                         gm_kg[0, seq_idx, None, None], (CHUNK_SIZE, SUPPORTED_HEAD_DIM), (k + 1, 0),
                     )
                     next_mqk_tile = tile_slice(
-                        gm_Mqk[0, seq_idx, None, None, None], (CHUNK_SIZE, CHUNK_SIZE), (k + 1, 0),
+                        gm_Mqk[0, seq_idx, k + 1, None, None], (CHUNK_SIZE, CHUNK_SIZE), (0, 0),
                     )
                     s2_matmul.load_k_restored(k_restored_l1, next_k_restored_chunk, next_valid_rows)
                     s2_matmul.load_mqk(mqk_l1, next_mqk_tile, next_valid_rows)
@@ -2705,7 +2704,7 @@ def _run_stage2_dynamic(
 
 
 @jit
-def run_group_flash_kda_fwd(
+def run_staged_flash_kda_fwd(
     gm_K: Tensor,
     gm_V: Tensor,
     gm_Q: Tensor,
@@ -2845,7 +2844,7 @@ def run_group_flash_kda_fwd(
             vec_sync_all()
 
 
-def group_flash_kda_fwd(
+def staged_flash_kda_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -2874,8 +2873,8 @@ def group_flash_kda_fwd(
     )
 
 
-@export("group_flash_kda_fwd")
-def export_group_flash_kda_fwd():
+@export("staged_flash_kda_fwd")
+def export_staged_flash_kda_fwd():
     """Collect the direct template compile request without launching a Provider."""
     from .flash_kda_fwd import _get_compiled_kernel
     from .flash_kda_fwd import clear_caches
@@ -2887,7 +2886,7 @@ def export_group_flash_kda_fwd():
 
 _GRAPH_LIBRARY = torch.library.Library("cannbotdsl_flash_kda_fwd", "FRAGMENT")
 _GRAPH_LIBRARY.define(
-    "group_flash_kda_fwd(Tensor q, Tensor k, Tensor v, Tensor g, Tensor beta, float? "
+    "staged_flash_kda_fwd(Tensor q, Tensor k, Tensor v, Tensor g, Tensor beta, float? "
     "scale, Tensor initial_state, Tensor? a_log, Tensor? dt_bias, float? lower_bound, str"
     " layout_qkv, Tensor metadata, bool use_qk_l2norm_in_kernel=True, bool "
     "use_gate_in_kernel=True, bool use_beta_sigmoid_in_kernel=True, bool "
@@ -2898,8 +2897,8 @@ _GRAPH_LIBRARY.define(
 )
 
 
-@torch.library.impl(_GRAPH_LIBRARY, "group_flash_kda_fwd", "Meta")
-def _group_flash_kda_fwd_meta(
+@torch.library.impl(_GRAPH_LIBRARY, "staged_flash_kda_fwd", "Meta")
+def _staged_flash_kda_fwd_meta(
     q,
     k,
     v,
@@ -3031,8 +3030,8 @@ def _group_flash_kda_fwd_meta(
     )
 
 
-@torch.library.impl(_GRAPH_LIBRARY, "group_flash_kda_fwd", "PrivateUse1")
-def _group_flash_kda_fwd_privateuse1(
+@torch.library.impl(_GRAPH_LIBRARY, "staged_flash_kda_fwd", "PrivateUse1")
+def _staged_flash_kda_fwd_privateuse1(
     q,
     k,
     v,
@@ -3053,18 +3052,18 @@ def _group_flash_kda_fwd_privateuse1(
     allow_neg_eigval=False,
     output_final_state=False,
 ):
-    return group_flash_kda_fwd(
+    return staged_flash_kda_fwd(
         q, k, v, g, beta, scale, initial_state, a_log, dt_bias, lower_bound, layout_qkv, metadata,
         use_qk_l2norm_in_kernel, use_gate_in_kernel, use_beta_sigmoid_in_kernel, disable_recompute,
         return_intermediate_state, allow_neg_eigval, output_final_state,
     )
 
 
-group_flash_kda_fwd_op = torch.ops.cannbotdsl_flash_kda_fwd.group_flash_kda_fwd
+staged_flash_kda_fwd_op = torch.ops.cannbotdsl_flash_kda_fwd.staged_flash_kda_fwd
 
 
-@torch._dynamo.substitute_in_graph(group_flash_kda_fwd, can_constant_fold_through=False)
-def _group_flash_kda_fwd_graph(
+@torch._dynamo.substitute_in_graph(staged_flash_kda_fwd, can_constant_fold_through=False)
+def _staged_flash_kda_fwd_graph(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -3085,7 +3084,7 @@ def _group_flash_kda_fwd_graph(
     allow_neg_eigval: bool = False,
     output_final_state: bool = False,
 ) -> Tuple[torch.Tensor, ...]:
-    return group_flash_kda_fwd_op(
+    return staged_flash_kda_fwd_op(
         q, k, v, g, beta, scale, initial_state, A_log, dt_bias, lower_bound, layout_qkv, metadata,
         use_qk_l2norm_in_kernel, use_gate_in_kernel, use_beta_sigmoid_in_kernel, disable_recompute,
         return_intermediate_state, allow_neg_eigval, output_final_state,

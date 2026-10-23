@@ -466,7 +466,8 @@ class _DynamicPrecisionCase:
     def case_id(self):
         lengths_label = "-".join(str(length) for length in self.lengths)
         suffix = "-cu" if self.has_cu else ""
-        return f"{self.layout.lower()}{suffix}_n{self.nv}k{self.nk}_s{lengths_label}_seed{self.seed}"
+        scale_label = f"_qks{self.qk_scale:g}" if self.qk_scale != 1.0 else ""
+        return f"{self.layout.lower()}{suffix}_n{self.nv}k{self.nk}_s{lengths_label}_seed{self.seed}{scale_label}"
 
 
 _DYNAMIC_FAST_CASES = (
@@ -476,6 +477,18 @@ _DYNAMIC_FAST_CASES = (
     _DynamicPrecisionCase("BNSD", False, (65,), 16, 1, 201),
     _DynamicPrecisionCase("BSND", False, (65,), 16, 1, 202),
     _DynamicPrecisionCase("TND", True, (65,), 16, 1, 205),
+    _DynamicPrecisionCase("BNSD", False, (1, 1), 3, 1, 301, qk_scale=1e-4),
+    _DynamicPrecisionCase("BSND", False, (16, 16), 6, 2, 302, qk_scale=64.0),
+    _DynamicPrecisionCase("TND", True, (1, 63, 65), 3, 1, 303),
+    _DynamicPrecisionCase("BNSD", False, (63,), 96, 96, 304),
+    _DynamicPrecisionCase("BSND", False, (64,), 96, 96, 305),
+    _DynamicPrecisionCase("TND", True, (65,), 96, 96, 306),
+    _DynamicPrecisionCase("BNSD", False, (127,), 6, 3, 307),
+    _DynamicPrecisionCase("BSND", False, (128,), 6, 3, 308),
+    _DynamicPrecisionCase("TND", True, (129, 64, 1), 6, 2, 309),
+    _DynamicPrecisionCase("TND", True, (511, 513), 3, 1, 310),
+    _DynamicPrecisionCase("BNSD", False, (513,), 3, 1, 311),
+    _DynamicPrecisionCase("BSND", False, (513,), 3, 1, 312),
 )
 
 
@@ -591,7 +604,59 @@ def _assert_schedule_covers_logical_chunks(metadata, case):
     return schedule
 
 
-def _saved_golden(inputs, batch_idx, length):
+def _l0c_cache_reference(stage1, u_pre_fp32, initial_state):
+    """Keep U_pre in FP32 through W*S, then round only the published U."""
+    state = initial_state.float().clone()
+    chunks = u_pre_fp32.shape[2]
+    updated_values = torch.empty_like(u_pre_fp32)
+    state_history = torch.empty(
+        *u_pre_fp32.shape[:3], *state.shape[-2:], dtype=torch.float32,
+    )
+    for chunk in range(chunks):
+        state_history[:, :, chunk] = state
+        current = u_pre_fp32[:, :, chunk] - stage1.w[:, :, chunk] @ _to_bf16_to_fp32(state)
+        updated_values[:, :, chunk] = current
+        state = (
+            stage1.chunk_decay[:, :, chunk] * state
+            + stage1.k_restored[:, :, chunk].transpose(-1, -2) @ _to_bf16_to_fp32(current)
+        )
+    return updated_values, state_history
+
+
+def _saved_matrix_golden(inputs, q_norm, k_norm, beta, g):
+    length = q_norm.shape[-2]
+    repeat = inputs.v.shape[1] // q_norm.shape[1]
+    scale_value = inputs.scale_value
+
+    def pad_to_chunk(tensor):
+        return F.pad(tensor, (0, 0, 0, (-length) % CHUNK_SIZE))
+
+    matrices = {}
+    for name, cast in (("cpu_chunk", lambda x: x), ("npu_chunk", _to_bf16_to_fp32)):
+        qc = _chunk_major(pad_to_chunk(cast(q_norm).repeat_interleave(repeat, 1)))
+        kc = _chunk_major(pad_to_chunk(cast(k_norm).repeat_interleave(repeat, 1)))
+        bc = _chunk_major(pad_to_chunk(beta))
+        gc = _chunk_major(pad_to_chunk(g)).cumsum(-2)
+        operand_cast = None if name == "cpu_chunk" else _to_bf16_to_fp32
+        mqk = _reference_lower_matmul(qc * scale_value, kc, gc, diagonal=0, cast_operand=operand_cast)
+        t = (
+            _reference_lower_matmul(kc, kc, gc, diagonal=-1, cast_operand=operand_cast)
+            * bc
+        )
+        identity = torch.eye(CHUNK_SIZE).expand_as(t)
+        if name == "cpu_chunk":
+            inverse = torch.linalg.solve_triangular(identity + t, identity, upper=False, unitriangular=True)
+        else:
+            inverse_tiles = []
+            for tile in t.reshape(-1, CHUNK_SIZE, CHUNK_SIZE):
+                inverse_tiles.append(_npu_neumann_inverse_from_negative_t(_to_fp16_to_fp32(-tile)))
+            inverse = torch.stack(inverse_tiles).reshape_as(t)
+            mqk = _to_bf16_to_fp32(mqk)
+        matrices[name] = [x.flatten(2, 3)[:, :, :length] for x in (mqk, inverse)]
+    return matrices, inverse
+
+
+def _saved_golden(inputs, batch_idx, length, *, direct_u=False):
     batch_slice = slice(batch_idx, batch_idx + 1)
     q = inputs.q[batch_slice, :, :length].float()
     k = inputs.k[batch_slice, :, :length].float()
@@ -608,32 +673,7 @@ def _saved_golden(inputs, batch_idx, length):
         return F.pad(tensor, (0, 0, 0, (-length) % CHUNK_SIZE))
 
     repeat = inputs.v.shape[1] // q.shape[1]
-    matrices = {}
-    for name, cast in (("cpu_chunk", lambda x: x), ("npu_chunk", _to_bf16_to_fp32)):
-        qc = _chunk_major(pad_to_chunk(cast(q_norm).repeat_interleave(repeat, 1)))
-        kc = _chunk_major(pad_to_chunk(cast(k_norm).repeat_interleave(repeat, 1)))
-        bc = _chunk_major(pad_to_chunk(beta))
-        gc = _chunk_major(pad_to_chunk(g)).cumsum(-2)
-        operand_cast = None if name == "cpu_chunk" else _to_bf16_to_fp32
-        mqk = _reference_lower_matmul(qc * inputs.scale_value, kc, gc, diagonal=0, cast_operand=operand_cast)
-        t = (
-            _reference_lower_matmul(kc, kc, gc, diagonal=-1, cast_operand=operand_cast)
-            * bc
-        )
-        identity = torch.eye(CHUNK_SIZE).expand_as(t)
-        if name == "cpu_chunk":
-            inverse = torch.linalg.solve_triangular(identity + t, identity, upper=False, unitriangular=True)
-        else:
-            inverse = torch.stack(
-                [
-                    _npu_neumann_inverse_from_negative_t(_to_fp16_to_fp32(-tile))
-                    for tile in t.reshape(-1, CHUNK_SIZE, CHUNK_SIZE)
-                ],
-            ).reshape_as(
-                t,
-            )
-            mqk = _to_bf16_to_fp32(mqk)
-        matrices[name] = [x.flatten(2, 3)[:, :, :length] for x in (mqk, inverse)]
+    matrices, inverse = _saved_matrix_golden(inputs, q_norm, k_norm, beta, g)
     padded_q = pad_to_chunk(q_norm.bfloat16())
     padded_k = pad_to_chunk(k_norm.bfloat16())
     padded_v = pad_to_chunk(inputs.v[batch_slice, :, :length])
@@ -641,6 +681,16 @@ def _saved_golden(inputs, batch_idx, length):
     padded_g = pad_to_chunk(g)
     npu_stage1 = _stage1_npu(padded_k, padded_v, padded_q, padded_beta, padded_g, scale_value=inputs.scale_value)
     npu_stage2 = _stage2_npu(npu_stage1, inputs.initial_state[batch_slice])
+    u_reference = npu_stage2.u
+    h_reference = npu_stage2.state_history
+    if direct_u:
+        # The final loop iteration above holds the NPU-rounded resident inverse.
+        # This product stays FP32 in L0C; the public U_pre cache is still BF16.
+        v_beta = _to_bf16_to_fp32(_chunk_major(padded_beta) * _chunk_major(padded_v).float())
+        u_pre_fp32 = _to_bf16_to_fp32(inverse) @ v_beta
+        u_reference, h_reference = _l0c_cache_reference(
+            npu_stage1, u_pre_fp32, inputs.initial_state[batch_slice],
+        )
     g_cumsum = _chunk_major(padded_g).cumsum(-2)
     q_value_heads = _chunk_major(padded_q).repeat_interleave(repeat, dim=1).float()
     qg = _to_bf16_to_fp32(q_value_heads * g_cumsum.exp())
@@ -653,18 +703,14 @@ def _saved_golden(inputs, batch_idx, length):
         flatten_tokens(npu_stage1.u_pre).bfloat16(),
         flatten_tokens(qg).bfloat16(),
         flatten_tokens(npu_stage1.k_restored).bfloat16(),
-        flatten_tokens(npu_stage2.u).bfloat16(),
+        flatten_tokens(u_reference) if direct_u else flatten_tokens(u_reference).bfloat16(),
         flatten_tokens(g_cumsum),
-        npu_stage2.state_history.transpose(-1, -2),
+        h_reference.transpose(-1, -2),
     )
-    return (
-        (q_norm.bfloat16(), k_norm.bfloat16(), q_rstd, k_rstd, beta),
-        matrices,
-        extras,
-    )
+    return (q_norm.bfloat16(), k_norm.bfloat16(), q_rstd, k_rstd, beta), matrices, extras
 
 
-def _assert_saved_precision(saved, inputs, case):
+def _assert_saved_shapes(saved, inputs, case):
     assert len(saved) == 14
     q_norm, k_norm, q_rstd, k_rstd, beta, aqk, akk, w, u, qg, kg, v_new, g_cumsum, h = (
         saved
@@ -710,6 +756,9 @@ def _assert_saved_precision(saved, inputs, case):
     else:
         state_shape = (len(case.lengths), case.nv, chunk_count, 128, 128)
     assert h.shape == state_shape
+
+
+def _saved_actual_tokens(saved, case):
     actual = []
     for index, value in enumerate(saved[:-1]):
         assert value.dtype == (
@@ -722,9 +771,16 @@ def _assert_saved_precision(saved, inputs, case):
         elif case.layout == "BSND":
             value = value.transpose(1, 2)
         actual.append(_dynamic_valid_outputs(value.cpu(), case))
-    assert h.dtype == torch.float32
+    assert saved[-1].dtype == torch.float32
+    return actual
+
+
+def _assert_saved_precision(saved, inputs, case, *, direct_u=False):
+    _assert_saved_shapes(saved, inputs, case)
+    actual = _saved_actual_tokens(saved, case)
+    h = saved[-1]
     for batch_idx, length in enumerate(case.lengths):
-        token_golden, matrices, extras = _saved_golden(inputs, batch_idx, length)
+        token_golden, matrices, extras = _saved_golden(inputs, batch_idx, length, direct_u=direct_u)
         for index, expected in enumerate(token_golden):
             tol = 1e-3 if index < 2 else 1e-6
             torch.testing.assert_close(actual[index][batch_idx].float(), expected.float(), atol=tol, rtol=tol)
@@ -759,22 +815,26 @@ def _assert_saved_precision(saved, inputs, case):
         torch.testing.assert_close(actual_h.float(), extras[-1].float(), atol=_TOL, rtol=_TOL)
 
 
-def _assert_dynamic_precision_case(case, *, whitebox=False, compare_output_golden=True):
-    require_npu()
-    inputs, golden_outputs, golden_state = _make_dynamic_case(case)
-    if whitebox and case.has_cu and case.layout != "TND":
-        # Invalid rows must never affect valid outputs or the final state.
-        # Padding output is undefined, so only poison inputs, not expected output.
-        for batch, length in enumerate(case.lengths):
-            for tensor in (inputs.q, inputs.k, inputs.v, inputs.g, inputs.beta_brc):
-                tensor[batch, :, length:] = float("nan")
+@dataclasses.dataclass
+class _DynamicForwardResult:
+    output: torch.Tensor
+    state: torch.Tensor
+    saved: list[torch.Tensor]
+    metadata: torch.Tensor
+    initial_state: torch.Tensor
+    initial_state_before: torch.Tensor
+
+
+def _run_dynamic_forward(inputs, case, template, *, whitebox):
     q, k, v, g, beta = (tensor.npu() for tensor in _dynamic_layout_inputs(inputs, case))
     cu_seqlens = None
     if case.has_cu:
         cu_seqlens = torch.tensor((0, *torch.tensor(case.lengths).cumsum(0).tolist()), dtype=torch.int32).npu()
     initial_state = inputs.initial_state.transpose(-1, -2).contiguous().npu()
     initial_state_before = initial_state.clone()
-    metadata = _DYNAMIC_METADATA.flash_kda_fwd_metadata(q, v, initial_state, case.layout, cu_seqlens)
+    metadata = _DYNAMIC_METADATA.flash_kda_fwd_metadata(
+        q, v, initial_state, case.layout, cu_seqlens, template=template,
+    )
     if whitebox:
         schedule = _assert_schedule_covers_logical_chunks(metadata, case)
         if (
@@ -783,76 +843,53 @@ def _assert_dynamic_precision_case(case, *, whitebox=False, compare_output_golde
         ):
             assert schedule["stage12_round_num"] > 1
     args = (
-        q,
-        k,
-        v,
-        g,
-        beta,
-        inputs.scale_value,
-        initial_state,
-        inputs.a_log.npu(),
-        inputs.dt_bias.npu(),
-        inputs.lower_bound,
-        case.layout,
-        metadata,
+        q, k, v, g, beta, inputs.scale_value, initial_state, inputs.a_log.npu(), inputs.dt_bias.npu(),
+        inputs.lower_bound, case.layout, metadata,
     )
-    # Independently submitted training PRs may still contain the older inference
-    # ABI. Its device entry cannot interpret the newer scheduling metadata.
-    # Cross-check bitwise only when both consumers accept the same metadata ABI;
-    # CPU FP32, NPU-rounding and saved-tensor checks below always remain active.
-    compatible_baseline = (
-        _BASELINE_METADATA.ABI_VERSION == _DYNAMIC_METADATA.ABI_VERSION
-    )
+    # Each operator generates its own scheduling metadata.
+    # CPU FP32 and saved-cache references remain independent of this cross-check.
+    compatible_baseline = _BASELINE_METADATA.ABI_VERSION == _DYNAMIC_METADATA.ABI_VERSION
     if compatible_baseline:
-        baseline_output, baseline_state = _BASELINE_KDA.flash_kda(*args)
+        inference_metadata = _BASELINE_METADATA.flash_kda_metadata(
+            q, v, initial_state, case.layout, cu_seqlens, template=template,
+        )
+        baseline_args = (*args[:-1], inference_metadata)
+        baseline_output, baseline_state = _BASELINE_KDA.flash_kda(*baseline_args)
     before = [value.cpu().clone() for value in args if isinstance(value, torch.Tensor)]
     output, state, *saved = _DYNAMIC_KDA.flash_kda_fwd(*args, return_intermediate_state=True, output_final_state=True)
     torch.npu.synchronize()
 
     if compatible_baseline:
-        torch.testing.assert_close(state.cpu(), baseline_state.cpu(), atol=0, rtol=0)
+        torch.testing.assert_close(state.cpu(), baseline_state.cpu(), atol=_TOL, rtol=_TOL)
         for actual, expected in zip(
             _dynamic_valid_outputs(output, case), _dynamic_valid_outputs(baseline_output, case),
         ):
-            torch.testing.assert_close(actual.cpu(), expected.cpu(), atol=0, rtol=0)
+            torch.testing.assert_close(actual.cpu(), expected.cpu(), atol=_TOL, rtol=_TOL)
     for value, expected in zip((v for v in args if isinstance(v, torch.Tensor)), before):
         torch.testing.assert_close(value.cpu(), expected, atol=0, rtol=0, equal_nan=True)
-    _assert_saved_precision(saved, inputs, case)
-    if case.layout == "TND":
-        state_h = saved[-1].cpu()
-        for batch_idx, _ in enumerate(case.lengths):
-            token_start = sum(case.lengths[:batch_idx])
-            chunk_base = _DYNAMIC_STAGED._tnd_state_chunk_base(token_start, batch_idx)
-            assert torch.equal(state_h[chunk_base], initial_state_before[batch_idx].cpu())
-    else:
-        assert torch.equal(saved[-1][:, :, 0].cpu(), initial_state_before.cpu())
-    if not compare_output_golden:
-        return
-
-    actual_state = state.cpu().float()
-    assert torch.isfinite(actual_state).all(), (
-        f"{case.case_id}: final_state contains inf/nan"
+    return _DynamicForwardResult(
+        output=output, state=state, saved=saved, metadata=metadata,
+        initial_state=initial_state, initial_state_before=initial_state_before,
     )
+
+
+def _assert_dynamic_output_golden(result, case, golden_outputs, golden_state):
+    output, state = result.output, result.state
+    initial_state, initial_state_before = result.initial_state, result.initial_state_before
+    actual_state = state.cpu().float()
+    assert torch.isfinite(actual_state).all(), f"{case.case_id}: final_state contains inf/nan"
     torch.testing.assert_close(initial_state.cpu().float(), initial_state_before.cpu().float(), atol=0.0, rtol=0.0)
-    actual_outputs = [
-        actual.cpu().float() for actual in _dynamic_valid_outputs(output, case)
-    ]
+    actual_outputs = [actual.cpu().float() for actual in _dynamic_valid_outputs(output, case)]
     for name in ("cpu_chunk", "npu_chunk"):
         expected_state = golden_state[name].float()
-        assert torch.isfinite(expected_state).all(), (
-            f"{case.case_id}: {name} state is not finite"
-        )
+        assert torch.isfinite(expected_state).all(), f"{case.case_id}: {name} state is not finite"
         torch.testing.assert_close(
             actual_state, expected_state, atol=_TOL, rtol=_TOL, msg=lambda msg: f"DSL vs {name} state: {msg}",
         )
         output_max = 0.0
         for actual, expected in zip(actual_outputs, golden_outputs[name]):
-            assert torch.isfinite(actual).all(), (
-                f"{case.case_id}: DSL output is not finite"
-            )
-            assert torch.isfinite(expected).all(), (
-                f"{case.case_id}: {name} output is not finite"
-            )
+            assert torch.isfinite(actual).all(), f"{case.case_id}: DSL output is not finite"
+            assert torch.isfinite(expected).all(), f"{case.case_id}: {name} output is not finite"
             torch.testing.assert_close(
                 actual, expected.float(), atol=_TOL, rtol=_TOL, msg=lambda msg: f"DSL vs {name} output: {msg}",
             )
@@ -869,9 +906,40 @@ def _assert_dynamic_precision_case(case, *, whitebox=False, compare_output_golde
         )
 
 
+def _assert_dynamic_precision_case(case, *, whitebox=False, compare_output_golden=True, template="auto"):
+    require_npu()
+    inputs, golden_outputs, golden_state = _make_dynamic_case(case)
+    if whitebox and case.has_cu and case.layout != "TND":
+        # Invalid rows must never affect valid outputs or the final state.
+        # Padding output is undefined, so only poison inputs, not expected output.
+        for batch, length in enumerate(case.lengths):
+            for tensor in (inputs.q, inputs.k, inputs.v, inputs.g, inputs.beta_brc):
+                tensor[batch, :, length:] = float("nan")
+    result = _run_dynamic_forward(inputs, case, template, whitebox=whitebox)
+    saved, metadata = result.saved, result.metadata
+    initial_state_before = result.initial_state_before
+    selected_template = int(metadata[_DYNAMIC_METADATA.HEADER_TEMPLATE].item())
+    _assert_saved_precision(
+        saved, inputs, case, direct_u=selected_template == _DYNAMIC_METADATA.TEMPLATE_PERSISTENT,
+    )
+    if case.layout == "TND":
+        state_h = saved[-1].cpu()
+        for batch_idx, _ in enumerate(case.lengths):
+            token_start = sum(case.lengths[:batch_idx])
+            chunk_base = _DYNAMIC_STAGED._tnd_state_chunk_base(token_start, batch_idx)
+            assert torch.equal(state_h[chunk_base], initial_state_before[batch_idx].cpu())
+    else:
+        assert torch.equal(saved[-1][:, :, 0].cpu(), initial_state_before.cpu())
+    if not compare_output_golden:
+        return
+
+    _assert_dynamic_output_golden(result, case, golden_outputs, golden_state)
+
+
+@pytest.mark.parametrize("template", ("auto", "staged", "persistent"))
 @pytest.mark.parametrize("case", _DYNAMIC_FAST_CASES, ids=lambda case: case.case_id)
-def test_flash_kda_fwd_dynamic_precision(case):
-    _assert_dynamic_precision_case(case)
+def test_flash_kda_fwd_dynamic_precision(case, template):
+    _assert_dynamic_precision_case(case, template=template)
 
 
 def teardown_module():

@@ -50,14 +50,14 @@ from .flash_kda_fwd_staged import (
     SUPPORTED_HEAD_DIM,
     allocate_qk_exchange_workspace,
     allocate_stage1_workspace,
-    run_group_flash_kda_fwd,
+    run_staged_flash_kda_fwd,
     _tnd_state_chunk_capacity,
     _public_bnsd_tensor,
     _public_bnsd_scalar,
     _public_chunk_tensor,
     _public_chunk_state,
 )
-from .flash_kda_fwd_persistent import run_chunk_flash_kda_fwd
+from .flash_kda_fwd_persistent import run_persistent_flash_kda_fwd
 
 
 def compile_environment():
@@ -149,7 +149,7 @@ class flash_kda_fwd_kernel:
             template = gm_metadata[HEADER_TEMPLATE]
             if template == TEMPLATE_STAGED:
                 channel_rewind(reset_sync_id=True)
-                run_group_flash_kda_fwd(
+                run_staged_flash_kda_fwd(
                     gm_K, gm_V, gm_Q, gm_beta, gm_g, gm_qk_exchange, gm_A_log, gm_dt_bias, gm_kg, gm_gamma,
                     gm_q_decayed, gm_u, gm_saved_w, gm_qg, gm_g_cumsum, gm_v_new, gm_h, gm_O, gm_state_in, gm_state_out,
                     gm_identity16, gm_q_norm, gm_k_norm, gm_q_rstd, gm_k_rstd, gm_beta_activated, gm_Aqk, gm_Akk,
@@ -159,7 +159,7 @@ class flash_kda_fwd_kernel:
                 )
             elif template == TEMPLATE_PERSISTENT:
                 channel_rewind(reset_sync_id=True)
-                run_chunk_flash_kda_fwd(
+                run_persistent_flash_kda_fwd(
                     gm_K, gm_V, gm_Q, gm_beta, gm_g, gm_qk_exchange, gm_A_log, gm_dt_bias, gm_kg, gm_gamma,
                     gm_q_decayed, gm_u, gm_saved_w, gm_qg, gm_g_cumsum, gm_v_new, gm_h, gm_O, gm_state_in, gm_state_out,
                     gm_identity16, gm_q_norm, gm_k_norm, gm_q_rstd, gm_k_rstd, gm_beta_activated, gm_Aqk, gm_Akk,
@@ -171,7 +171,7 @@ class flash_kda_fwd_kernel:
 
 @kernel(
     profile=cannbotdsl.ProfileSpec(
-        name="group_flash_kda_fwd", op_type="FlashKDAFwd",
+        name="staged_flash_kda_fwd", op_type="FlashKDAFwd",
         inputs=("gm_K", "gm_V", "gm_Q", "gm_beta", "gm_g", "gm_A_log", "gm_dt_bias", "gm_metadata",),
         outputs=(
             "gm_O",
@@ -188,7 +188,7 @@ class flash_kda_fwd_kernel:
         ),
     ),
 )
-class group_flash_kda_fwd_kernel:
+class staged_flash_kda_fwd_kernel:
     def __call__(
         self,
         gm_K: Tensor,
@@ -240,7 +240,7 @@ class group_flash_kda_fwd_kernel:
             and (gm_metadata[HEADER_TEMPLATE] == TEMPLATE_STAGED)
         ):
             channel_rewind(reset_sync_id=True)
-            run_group_flash_kda_fwd(
+            run_staged_flash_kda_fwd(
                 gm_K, gm_V, gm_Q, gm_beta, gm_g, gm_qk_exchange, gm_A_log, gm_dt_bias, gm_kg, gm_gamma, gm_q_decayed,
                 gm_u, gm_saved_w, gm_qg, gm_g_cumsum, gm_v_new, gm_h, gm_O, gm_state_in, gm_state_out, gm_identity16,
                 gm_q_norm, gm_k_norm, gm_q_rstd, gm_k_rstd, gm_beta_activated, gm_Aqk, gm_Akk, gm_metadata, scale_value,
@@ -251,7 +251,7 @@ class group_flash_kda_fwd_kernel:
 
 @kernel(
     profile=cannbotdsl.ProfileSpec(
-        name="chunk_flash_kda_fwd", op_type="FlashKDAFwd",
+        name="persistent_flash_kda_fwd", op_type="FlashKDAFwd",
         inputs=("gm_K", "gm_V", "gm_Q", "gm_beta", "gm_g", "gm_A_log", "gm_dt_bias", "gm_metadata",),
         outputs=(
             "gm_O",
@@ -268,7 +268,7 @@ class group_flash_kda_fwd_kernel:
         ),
     ),
 )
-class chunk_flash_kda_fwd_kernel:
+class persistent_flash_kda_fwd_kernel:
     def __call__(
         self,
         gm_K: Tensor,
@@ -320,7 +320,7 @@ class chunk_flash_kda_fwd_kernel:
             and (gm_metadata[HEADER_TEMPLATE] == TEMPLATE_PERSISTENT)
         ):
             channel_rewind(reset_sync_id=True)
-            run_chunk_flash_kda_fwd(
+            run_persistent_flash_kda_fwd(
                 gm_K, gm_V, gm_Q, gm_beta, gm_g, gm_qk_exchange, gm_A_log, gm_dt_bias, gm_kg, gm_gamma, gm_q_decayed,
                 gm_u, gm_saved_w, gm_qg, gm_g_cumsum, gm_v_new, gm_h, gm_O, gm_state_in, gm_state_out, gm_identity16,
                 gm_q_norm, gm_k_norm, gm_q_rstd, gm_k_rstd, gm_beta_activated, gm_Aqk, gm_Akk, gm_metadata, scale_value,
@@ -386,7 +386,7 @@ class FlashKDAFwd:
         )
 
 
-class GroupFlashKDAFwd:
+class StagedFlashKDAFwd:
     """Compiled AICore entry used by :func:`flash_kda_fwd`."""
 
     @host
@@ -434,7 +434,7 @@ class GroupFlashKDAFwd:
         save_intermediate_state: int,
         core_num: int,
     ):
-        op = group_flash_kda_fwd_kernel()
+        op = staged_flash_kda_fwd_kernel()
         op[core_num](
             K, V, Q, beta, g, qk_exchange, A_log, dt_bias, kg, gamma, qd, u, saved_w, qg, g_cumsum, v_new, h, out,
             state_in, state_out, identity, q_norm, k_norm, q_rstd, k_rstd, beta_activated, Aqk, Akk, metadata, scale,
@@ -443,7 +443,7 @@ class GroupFlashKDAFwd:
         )
 
 
-class ChunkFlashKDAFwd:
+class PersistentFlashKDAFwd:
     """Compiled AICore entry used by :func:`flash_kda_fwd`."""
 
     @host
@@ -491,7 +491,7 @@ class ChunkFlashKDAFwd:
         save_intermediate_state: int,
         core_num: int,
     ):
-        op = chunk_flash_kda_fwd_kernel()
+        op = persistent_flash_kda_fwd_kernel()
         op[core_num](
             K, V, Q, beta, g, qk_exchange, A_log, dt_bias, kg, gamma, qd, u, saved_w, qg, g_cumsum, v_new, h, out,
             state_in, state_out, identity, q_norm, k_norm, q_rstd, k_rstd, beta_activated, Aqk, Akk, metadata, scale,
@@ -566,7 +566,7 @@ def _get_compiled_kernel(template=0):
             dtypes.float32, physical_batches, storage_length, n_v, SUPPORTED_HEAD_DIM, "G_CUMSUM",
         )
         h_spec = fake((state_batches, n_v, state_chunks, SUPPORTED_HEAD_DIM, SUPPORTED_HEAD_DIM), dtypes.float32)
-        runner = (FlashKDAFwd, GroupFlashKDAFwd, ChunkFlashKDAFwd)[template]()
+        runner = (FlashKDAFwd, StagedFlashKDAFwd, PersistentFlashKDAFwd)[template]()
         compiled_kernel = cannbotdsl.compile(
             runner.run, qk_spec, v_spec, qk_spec, beta_spec, v_spec, fake((core_num, 2, 2, CHUNK_SIZE), dtypes.float32),
             fake((n_v,), dtypes.float32), fake((n_v, SUPPORTED_HEAD_DIM), dtypes.float32), v_spec,
