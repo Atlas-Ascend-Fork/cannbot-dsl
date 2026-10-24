@@ -408,3 +408,11 @@ mixed_quant_sparse_flash_mla_metadata:
   options:
     - mixed_quant_sparse_flash_mla
     - mixed_quant_sparse_flash_mla_metadata
+
+moonep:
+  module: True
+  src:
+    - samples/moonep
+    - test/moonep
+  options:
+    - moonep
