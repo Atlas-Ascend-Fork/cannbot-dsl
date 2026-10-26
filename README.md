@@ -17,7 +17,7 @@
 >
 > - **✅ 支持 DeepSeek V4.1**：本仓算子集已覆盖相关算子，包括 [`indexer_prologue_qw`](samples/indexer_prologue_qw)、[`indexer_prologue_k`](samples/indexer_prologue_k)、[`attn_prologue`](samples/attn_prologue)、[`attn_epilogue`](samples/attn_epilogue)、[`quant_lightning_indexer_dsl`](samples/quant_lightning_indexer_dsl)、[`quant_sparse_lightning_indexer_dsl`](samples/quant_sparse_lightning_indexer_dsl)、[`mixed_quant_sparse_flash_mla`](samples/mixed_quant_sparse_flash_mla)。
 >
-> - **🚀 新增 17 个算子样例，并更新既有算子适配最新 CANNBot-DSL**。例如，[Sparse Flash Attention](samples/sparse_flash_attention) 相比 AscendC 版本，**加速比最高达到 1.63 倍**；[Qwen Sparse Attention](samples/qwen_sparse_attn) 相比 AscendC 版本，长 KV decode 场景**平均加速比达到 1.23 倍**。其余算子的详细信息见[算子列表](#算子列表)。
+> - **🚀 新增 17 个算子样例，并更新既有算子适配最新 CANNBot-DSL**。其中，[Sparse Flash Attention](samples/sparse_flash_attention) 在典型场景下**最高加速比达到 1.63 倍**；[Qwen Sparse Attention](samples/qwen_sparse_attn) 在长 KV decode 场景下**平均加速比达到 1.23 倍**。更多性能数据与测试口径请参见对应样例 README，其余算子的详细信息请参见下方的算子列表。
 >
 > - **🛠 支持样例运行与自定义算子的调试开发**：CANNBot-DSL 0.7.0 版本发布，可直接通过 `python -m pip install cannbot-dsl` 安装；本仓样例可直接运行，自定义算子可通过 `net/native_package` 编译打包为 Native 算子包。使用说明见[快速上手](#快速上手)，打包方式见 [Native 打包说明](net/native_package/README.md)，接口与调试能力见 [API 文档](https://cannbot-dsl.gitcode.com/api/)。
 
