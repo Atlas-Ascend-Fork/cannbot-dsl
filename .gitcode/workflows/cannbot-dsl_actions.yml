@@ -80,7 +80,7 @@ stages:
     name: Test
     jobs:
       JOB_test:
-        name: Test CPU/NPU and Perf Profiling
+        name: PreSmoke_CPU_NPU_PERF
         uses: .gitcode/workflows/test_action.yml
     pre:
     - type: auto
