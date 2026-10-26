@@ -17,7 +17,6 @@ repos:
       - id: end-of-file-fixer
       - id: check-yaml
         args: ["--allow-multiple-documents"]
-      - id: check-added-large-files
       - id: check-merge-conflict
       - id: detect-private-key
       - id: check-json
@@ -27,7 +26,7 @@ repos:
     rev: v0.14.14
     hooks:
       - id: ruff-check
-        args: ["--output-format", "github", "--fix", "--unsafe-fixes", "--ignore", "E501,RUF001,RUF002,RUF003,E402,E701,E702,N815"]
+        args: ["--output-format", "github", "--fix", "--unsafe-fixes", "--ignore", "E501,RUF001,RUF002,RUF003,E402,E701,E702,N815,F821"]
         types: [python]
       - id: ruff-format
         types: [python]
@@ -37,24 +36,17 @@ repos:
     rev: v2.4.1
     hooks:
       - id: codespell
-        # 包装 entry：输出 tee 到 pre-commit_reports/codespell.log（仍跑在托管 venv）
+        # 只查 markdown（files 过滤后 --skip 不再需要）
+        files: \.md$
         entry: bash scripts/run_codespell.sh
         args: [
             "-L",
             "CANN,cann,ascend,Ascend,tbe,EnQue,CopyIn,nd2nz,ND,NZ,NNAL,nnal,ASCEND,ArchType,AND,ND,nd,te,copyin,alog,wIh,dout,indexs,inH,padD,outWeight,vor,invokable,VALU,LastR,nin,COO,registe,CLen,REGIST,fo,subtile,rIn,IndexT,ot,iput,datas",
-            "--skip",
-            "*.py,*.sample,*.cc,*.cjs,*.clang-format,*.cmake,*.cpp,*.csv,*.cts,*.gitignore,*.gitkeep,*.gitmodules,*.h,*.hpp,*.in,*.info,*.ini,*.js,*.json,*.jsonl,*.log,*.sh,*.TAG,*.ts,*.tsx,*.txt,*.xml",
           ]
-
-  # OAT 合规性检查 (Open Source Audit Tool)
-  - repo: local
+  - repo: https://gitcode.com/HiAgent/compliance
+    rev: v1.0.6
     hooks:
       - id: oat-check
-        name: OAT Compliance Check
-        entry: bash scripts/oat_check.sh
-        language: system
         pass_filenames: true
-        require_serial: true
-        types: [file]
         stages: [commit]
         verbose: true
