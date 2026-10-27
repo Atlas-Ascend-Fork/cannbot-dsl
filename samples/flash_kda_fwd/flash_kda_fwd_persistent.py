@@ -504,7 +504,6 @@ class RecurrentStateUpdate:
         self.gamma_ub = RingBuffer(MemLoc.UB, (D_HALF,), dtypes.float32, depth=2)
         self.u_l1 = RingBuffer(MemLoc.L1, (CHUNK_SIZE, SUPPORTED_HEAD_DIM), dtypes.bfloat16, depth=1)
 
-
     def load(self, gm_state_rows):
         mem_copy(self.ub_state_fp32, tile_slice(gm_state_rows, (SUPPORTED_HEAD_DIM, D_HALF), (0, self.subblock_idx)))
         vec_sync_notify(PIPE.MTE2, PIPE.V, 7)
@@ -551,7 +550,6 @@ class RecurrentStateUpdate:
         vec_sync_notify(PIPE.V, PIPE.MTE3, 7)
         vec_sync_wait(PIPE.V, PIPE.MTE3, 7)
         mem_copy(tile_slice(gm_state_rows, (SUPPORTED_HEAD_DIM, D_HALF), (0, self.subblock_idx)), self.ub_state_fp32)
-
 
 
 class ChunkMatmul:
@@ -935,7 +933,7 @@ class ChunkMatmul:
         )
 
     def compose_odd_even_lower32_to64_accum_full64(self, scratch, packed_inv):
-        """组合 64x64 左下 32x32 lower 逆矩并生成 BF16 resident inverse。"""
+        """组合 64x64 左下 32x32 lower 逆矩，保留 FP32 累加器供写出。"""
         self.issue_odd32_lower_even32_inv_full64(scratch, packed_inv)
         second_l0b = self.prepare_odd32_inv_odd32_tmp_full64(packed_inv)
         c_tmp = self.raw_l0c_aux
@@ -946,8 +944,6 @@ class ChunkMatmul:
         self.complete_odd32_inv_odd32_tmp_full64(tmp64, second_l0b)
         c_inv = self.raw_l0c_main
         self.begin_mmad_raw_l0ab_db_packed64(c_inv, init_c=False, unit_flag=3)
-        c_inv_read = self.raw_l0c_main
-        self.publish_resident_inverse_bf16_l1(self.resident_inv_l1, c_inv_read)
 
     def _load_beta_to_l0b(self, beta_read):
         l0b_write = reinterpret(self.l0b_recurrent.produce(), shape=(D_HALF, SUPPORTED_HEAD_DIM))
@@ -1036,20 +1032,8 @@ class ChunkMatmul:
         )
 
     def _load_resident_inv_to_l0a(self):
-        resident_inv = self.resident_inv_l1
         l0a_write = self.l0a_recurrent.produce()
-        mem_copy(reinterpret(l0a_write, shape=(CHUNK_SIZE, CHUNK_SIZE), offset=0), resident_inv)
-        for block in range_constexpr(DIAGONAL_BLOCK_COUNT):
-            source_column = block % 2 + 1
-            source = reinterpret(
-                self.tile_inv_l1, shape=(DIAGONAL_BLOCK_SIZE, DIAGONAL_BLOCK_SIZE),
-                offset=self._packed64_block_offset_elems(block, source_column) * 2, dtype=dtypes.bfloat16,
-            )
-            target = reinterpret(
-                l0a_write, shape=(DIAGONAL_BLOCK_SIZE, DIAGONAL_BLOCK_SIZE),
-                offset=self.l0_matrix_block_offset_elems(block, block) * 2,
-            )
-            mem_copy(target, source)
+        mem_copy(reinterpret(l0a_write, shape=(CHUNK_SIZE, CHUNK_SIZE), offset=0), self.resident_inv_l1)
         return l0a_write
 
 
@@ -1087,6 +1071,10 @@ class GateWeightedScoresAndDiagonalInverse:
             MemLoc.UB, (HALF_CHUNK_SIZE, CHUNK_SIZE), dtypes.float16, depth=1, data_format="nz", n1_pad=16,
         ).produce()
         self.ub_inverse_prefix = preprocessing.ub_inverse_prefix
+        self.ub_inverse_indices = reinterpret(
+            self.ub_diag_inv_nz, shape=(2, 32), offset=self.ub_diag_inv_nz.physical_stride[0] * 2,
+            dtype=dtypes.uint32, data_format="nd",
+        )
         self.ub_k_norm = preprocessing.ub_k_norm
         self.ub_q_norm = preprocessing.ub_q_norm
         self.ub_g_cumsum = preprocessing.ub_g_cumsum
@@ -1238,11 +1226,17 @@ class GateWeightedScoresAndDiagonalInverse:
         mask_b16, _ = update_mask(32, elem_bits=16)
         zero = vdups(0.0, dtypes.float32, mask=lane_mask)
         one = vdups(1.0, dtypes.float32, mask=lane_mask)
-        lane_idx = varange(0, dtypes.uint32)
-        block_idx = vbitwise_and(lane_idx, vdups(16, dtypes.uint32), mask=lane_mask)
-        lane_in_block = vbitwise_and(lane_idx, vdups(15, dtypes.uint32), mask=lane_mask)
-        block_base = vadd(vshl(block_idx, 6, mask=lane_mask), block_idx, mask=lane_mask)
-        block_base = vadds(block_base, self.subblock_idx * 32, mask=lane_mask)
+        if const_expr(start == 0):
+            lane_idx = varange(0, dtypes.uint32)
+            block_idx = vbitwise_and(lane_idx, vdups(16, dtypes.uint32), mask=lane_mask)
+            lane_in_block = vbitwise_and(lane_idx, vdups(15, dtypes.uint32), mask=lane_mask)
+            block_base = vadd(vshl(block_idx, 6, mask=lane_mask), block_idx, mask=lane_mask)
+            block_base = vadds(block_base, self.subblock_idx * 32, mask=lane_mask)
+            vstore(self.ub_inverse_indices, 0, lane_in_block, lane_mask)
+            vstore(self.ub_inverse_indices, 32, block_base, lane_mask)
+        else:
+            lane_in_block = vload(self.ub_inverse_indices, 0)
+            block_base = vload(self.ub_inverse_indices, 32)
         inverse_rows = []
         for row in range_constexpr(start, start + count):
             diagonal = veq(lane_in_block, vdups(row, dtypes.uint32), mask=lane_mask)
@@ -1287,12 +1281,6 @@ class GateWeightedScoresAndDiagonalInverse:
             vstore_strided(
                 self.ub_diag_inv_nz, self.subblock_idx * 2 * self.ub_diag_inv_nz.physical_stride[0] + row * 16,
                 packed_inverse, mask_b16, block_stride=16 + self.ub_diag_inv_nz.physical_stride[0] // 16,
-            )
-            diagonal_final_bf16 = cast_and_pack_bf16(acc, lane_mask)
-            diagonal_final_bits = vreinterpret(diagonal_final_bf16, dtypes.float16)
-            vstore_strided(
-                self.ub_diag_inv_nz, self.ub_diag_inv_nz.physical_stride[0] + row * 16, diagonal_final_bits, mask_b16,
-                block_stride=16 + self.ub_diag_inv_nz.physical_stride[0] // 16,
             )
 
     @jit
@@ -1584,7 +1572,7 @@ def run_persistent_training_sequence(
         scores_and_inverse.mask_and_publish_causal_qkt()
         caches.store_causal_qkt(scores_and_inverse, chunk_idx)
         matmul_stage.compose_chunk_inverse64(identity)
-        caches.store_inverse(matmul_stage, scores_and_inverse, chunk_idx)
+        caches.store_inverse(matmul_stage, chunk_idx)
         matmul_stage.chunk_idx = chunk_idx
         matmul_stage.valid_rows = caches.valid_rows(chunk_idx)
         matmul_stage.compute_u_pre_and_w(preprocessing, recurrent_state)
@@ -1687,43 +1675,12 @@ class TrainingCacheWriter:
             )
 
     @jit
-    def store_inverse(self, matmul_stage, scores, chunk_idx):
-        """Assemble final BF16 cache in existing UB, then publish each valid half once."""
-        inverse = self.Akk[0, 0, chunk_idx, None, None]
+    def store_inverse(self, matmul_stage, chunk_idx):
+        """Publish the complete inverse to the public cache and resident L1."""
+        inverse = tile_slice(self.Akk[0, 0, chunk_idx, None, None], (CHUNK_SIZE, CHUNK_SIZE), (0, 0))
         valid_rows = self.valid_rows(chunk_idx)
-        mem_copy(scores.ub_kkt, matmul_stage.raw_l0c_main, engine=make_copy_engine(split_axis=0))
-        conversion = reinterpret(self.ub_cast_bf16, shape=(HALF_CHUNK_SIZE, CHUNK_SIZE))
-        with vf(mode="simd"):
-            lane_mask, _ = update_mask(CHUNK_SIZE, elem_bits=32)
-            for row in dsl_range(0, HALF_CHUNK_SIZE, 1, unroll=4):
-                value = vcast(vload(scores.ub_kkt, row * CHUNK_SIZE), dtypes.bfloat16, mask=lane_mask)
-                vstore_pack(conversion, row * CHUNK_SIZE, value, lane_mask, pack_mode=PackMode.B32_TO_B16)
-        diagonal = reinterpret(scores.ub_diag_inv_nz, dtype=dtypes.bfloat16)
-        for local_block in range_constexpr(2):
-            with vf(mode="simd"):
-                lane_mask, _ = update_mask(DIAGONAL_BLOCK_SIZE, elem_bits=32)
-                for row in dsl_range(0, DIAGONAL_BLOCK_SIZE, 1):
-                    source_offset = (
-                        (local_block + 1) * scores.ub_diag_inv_nz.physical_stride[0]
-                        + local_block * FRACTAL_ELEMENTS
-                        + row * DIAGONAL_BLOCK_SIZE
-                    )
-                    value = vload_unpack(diagonal, source_offset, unpack_mode=UnpackMode.B16_TO_B32)
-                    target_offset = (
-                        local_block * DIAGONAL_BLOCK_SIZE + row
-                    ) * CHUNK_SIZE + (
-                        self.subblock_idx * 2 + local_block
-                    ) * DIAGONAL_BLOCK_SIZE
-                    vstore_pack(conversion, target_offset, value, lane_mask, pack_mode=PackMode.B32_TO_B16)
-        rows = valid_rows - self.subblock_idx * HALF_CHUNK_SIZE
-        if rows > HALF_CHUNK_SIZE:
-            rows = HALF_CHUNK_SIZE
-        if rows > 0:
-            mem_copy(
-                tile_slice(inverse, (HALF_CHUNK_SIZE, CHUNK_SIZE), (self.subblock_idx, 0))[:rows, None],
-                conversion[:rows, None], l2_cache_ctl=4,
-            )
-
+        mem_copy(inverse[:valid_rows, None], matmul_stage.raw_l0c_main, unit_flag=2, l2_cache_ctl=4)
+        matmul_stage.publish_resident_inverse_bf16_l1(matmul_stage.resident_inv_l1, matmul_stage.raw_l0c_main)
 
 
 @jit
