@@ -18,6 +18,7 @@ completion fence, and the scalar-read fences for runtime manifests.
 from __future__ import annotations
 
 import threading
+import warnings
 
 import torch
 
@@ -44,7 +45,9 @@ from cannbotdsl.ops.distributed.context import hccl
 # 对称堆内布局（字节偏移，均以 heap_base=4096 为基址，32B 对齐）：
 #   [0, PLAN_END)                规划交换区（demand/topk 表等 + barrier flag）
 #   [PUB_OFF, ...)               prefetch 权重发布区（(epn, W) bf16）
-#   [STG_OFF, ...)               reduce_grad 梯度 staging 区（(R, epn, W) fp32）
+#   [FLAGS_OFF, ...)             reduce_grad staging 就绪 flag（(R, epn) int32）
+#   [STG_OFF, ...)               reduce_grad 梯度 staging 区（(R, epn, W) dtype）
+# flags 固定在 staging 之前：staging 宽度随 grad dtype 收缩，flags 位置不能跟着动。
 # 各区域基址由下列函数按运行时形状计算，所有 rank 公式一致 → 结果一致。
 HEAP_BASE = 4096  # 对称堆基址（与 cannbotdsl SymBuffer 的默认 heap_base 一致）
 MAX_E = 1024  # v1 支持的专家总数上限
@@ -75,18 +78,119 @@ def reduce_stg_off(epn: int, w_elems: int, num_groups: int = 1, slots: int = 1) 
 
 
 def reduce_region_end(
-    world_size: int, epn: int, w_elems: int, num_groups: int = 1, slots: int = 1
+    world_size: int,
+    epn: int,
+    w_elems: int,
+    num_groups: int = 1,
+    slots: int = 1,
+    staging_bytes_per_elem: int = 4,
 ) -> int:
     """Symmetric heap upper bound (for capacity self-check).
 
     staging 组间复用：与 num_groups 无关（组间串行共享同一块）。
+
+    布局顺序（A1 修订）：窗口池 | flags 区（固定宽 R×epn int32，32B 对齐）|
+    staging 段（按 dtype 收缩）| 尾。flags 必须放在 staging **之前**：若紧随
+    fp32 口径的 staging 之后，同进程先 fp32 后 bf16 调用会让 bf16 的 flags
+    落在上次 fp32 staging 的残留数据上——浮点位型当 int32 读出远大于 epoch，
+    busy_wait 提前放行、归并读到半新半旧数据。
+
+    staging_bytes_per_elem：staging 段元素宽度。缺省 4（fp32）；grad 视图为
+    bf16 时传 2——reduce_grad 的 SymBuffer 已随 dtype 收缩，容量公式同步后
+    堆申请省 R×epn×W×2 字节。所有 rank 须传同一值。
     """
+    flags_off = reduce_stg_off(epn, w_elems, num_groups, slots)
+    stg_off = (flags_off + world_size * epn * 4 + 31) & ~31  # 32B 对齐
     return (
-        reduce_stg_off(epn, w_elems, num_groups, slots)
-        + world_size * epn * w_elems * 4
-        + world_size * epn * 4
+        stg_off
+        + world_size * epn * w_elems * staging_bytes_per_elem
         + LAYOUT_TAIL_BYTES
     )
+
+
+_RESIDENT_BLOCKS = None  # 本机有效 AIV 核数（首次查询后缓存）
+_FALLBACK_BLOCKS = 16  # 平台信息不可用时的保守值（小核数机型也不会挂栅栏）
+
+
+def resident_blocks(cap: int = 64) -> int:
+    """本机可同时常驻的 AIV block 数（grid 栅栏类 kernel 的硬上限）。
+
+    `global_sync_all()` 要求**全部 block 同时常驻**：block_dim 超过本机有效
+    AIV 核数（例如 56 核机型上排 64 块）时，调度器只能分时复用，栅栏永远
+    收不齐 → 死循环挂死。核数取 `get_platform_info().vector_core_num`
+    （已含流的控核配额），查询失败时退保守值而不是猜硬件规格。
+
+    cap 是"核数再多也不加块"的经验上限（块数收益递减）；返回值 ≤ cap。
+    进程内只查询一次并缓存（含失败时的保守值），保证同一进程内编译期与
+    运行期的 block 数一致——二者不一致会让 kernel 的角色分派与实启块数错位。
+    """
+    global _RESIDENT_BLOCKS
+    if _RESIDENT_BLOCKS is None:
+        cores = 0
+        try:
+            cores = int(cannbotdsl.get_platform_info().vector_core_num)
+        except Exception:  # 无 CANN / 设备未就绪：用保守值
+            cores = 0
+        if cores <= 0:
+            warnings.warn(
+                f"无法获取 AIV 核数，block 数退保守值 {_FALLBACK_BLOCKS}"
+                "（plan/reduce 会变慢但不会挂栅栏）",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            _RESIDENT_BLOCKS = _FALLBACK_BLOCKS
+        else:
+            _RESIDENT_BLOCKS = cores
+    return min(cap, _RESIDENT_BLOCKS)
+
+
+def finish_op(context, barrier):
+    """算子尾部公共段（prefetch_weight / reduce_grad 共用）。
+
+    barrier=True（缺省语义）：独立 sym_barrier（多 block kernel 内联尾段须先
+    global_sync_all 保序、与运行时取模分派组合撞编译器已知问题——独立 launch
+    是已验证形态）+ 发起流级等待（返回即全组本轮完成，连续调用无槽位竞态）
+    + plan 延迟溢出检查（.item() 微秒级）；返回 None。
+    barrier=False（async_finish，侧流并发路径）：跳过 host 阻塞，返回发起流
+    完成事件——调用方 wait_event 汇合，跨 rank 槽位/staging 复用安全由调用方
+    在合适位置（如下一轮迭代的 barrier）负责；plan 溢出检查顺延到下一个我方
+    算子尾部（context.pending_overflow 机制）。
+    """
+    if barrier:
+        sym_barrier(context)
+        record_transport_event(context)  # 跨流护栏 fork 点（只等我方算子）
+        check_pending_overflow(context)
+        return None
+    ev = torch.npu.Event()
+    ev.record(torch.npu.current_stream())
+    record_transport_event(context)
+    return ev
+
+
+def normalize_group_list(context, tensors, op_name):
+    """单 Tensor / list / tuple 归一化为 list + 组数守卫 + 行宽一致 + plan 前置检查。
+
+    返回 (list, w_elems)。layout_groups 首个调用定型：prefetch/reduce 的组数
+    必须一致，否则发布区/staging 区会重叠（prefetch_weight 与 reduce_grad
+    共用本守卫）。
+    """
+    if isinstance(tensors, torch.Tensor):
+        tensors = [tensors]
+    if not tensors:
+        raise ValueError(f"{op_name} 至少一组（可为单 Tensor 或多组 list/tuple）")
+    if context.layout_groups is None:
+        context.layout_groups = len(tensors)
+    elif context.layout_groups != len(tensors):
+        raise RuntimeError(
+            f"prefetch/reduce 组数不一致（已有 {context.layout_groups}，本次 {len(tensors)}），"
+            "会导致发布/staging 区重叠"
+        )
+    w_elems = tensors[0].shape[1]
+    if any(t.shape[1] != w_elems for t in tensors):
+        raise ValueError("多组的行宽 W 必须一致（gate/up/down 同为 H*H'）")
+    if context.last_plan_shape is None:
+        raise RuntimeError(f"{op_name} 需先调用 moonep_plan（依赖其形状与窗口布局）")
+    return tensors, w_elems
 
 
 def pick_weight_chunk(w_elems: int, ub_limit_elems: int) -> int:
@@ -141,8 +245,10 @@ class MoonepContext:
         # A/B kernel 对四表全量覆写，同 shape 重复调用免分配。（内部状态，勿改）
         self.plan_workspace = None
         # 跨流安全护栏状态：首个算子调用的发起流；跨流调用时
-        # 由 sync_transport_stream 做事件 fork/join 串行化
+        # 由 sync_transport_stream 做事件 fork/join 串行化（跨流时等
+        # transport_event=上一个我方算子的完成点，而非旧流尾部）
         self.transport_stream = None
+        self.transport_event = None
         # 由 moonep_plan 在规划后填充为 (S, K)，prefetch/reduce 推导窗口布局依赖它
         self.last_plan_shape = None
         # barrier 作用域：EP 子组时由 create_moonep_context(group=...) 设置，缺省 WORLD
@@ -160,20 +266,37 @@ class MoonepContext:
         # 不变量检查延迟到 prefetch/reduce 尾部（sym_barrier 后流已排空，
         # .item() 微秒级）执行（内部状态，勿改）
         self.pending_overflow = None
+        # HCCL 对称缓冲区（base, size）：每次 hccl.get_comm_handle +
+        # get_hccl_buffer 都是 C API 调用，而值在 comm 生命周期内不变——
+        # 缓存后 create_weight_view / prefetch / reduce 的每步 host 路径省掉它们
+        # （内部状态，勿改）
+        self.hccl_buf = None
+        # 权重视图缓存：{(epn, W, group, groups, slot, slots): tensor}。视图只是
+        # 同一块对称堆上的非拥有句柄，重复 create_weight_view 直接复用（免 HCCL
+        # API、免容量校验、免 npu_from_blob 扩展调用）（内部状态，勿改）
+        self.weight_views = {}
+        # barrier epoch 张量（复用，避免每步 torch.full 分配）（内部状态，勿改）
+        self.bar_epoch_t = None
+
+
+def _hccl_buf(context):
+    """(base, size) 单次查询后缓存在 context 上（comm 生命周期内不变）。"""
+    cached = context.hccl_buf
+    if cached is None:
+        comm = hccl.get_comm_handle(context.group_name)
+        cached = hccl.get_hccl_buffer(comm)
+        context.hccl_buf = cached
+    return cached
 
 
 def hccl_buffer_base(context):
     """本 rank HCCL 对称缓冲区基址（SymBuffer 的 commBufferAddrs[me]）。"""
-    comm = hccl.get_comm_handle(context.group_name)
-    buf, _ = hccl.get_hccl_buffer(comm)
-    return buf
+    return _hccl_buf(context)[0]
 
 
 def hccl_buffer_size(context):
     """本 rank HCCL 对称缓冲区字节数。"""
-    comm = hccl.get_comm_handle(context.group_name)
-    _, size = hccl.get_hccl_buffer(comm)
-    return size
+    return _hccl_buf(context)[1]
 
 
 def check_heap_capacity(context, need_bytes, what):
@@ -262,12 +385,23 @@ def scalar_read_fence_post(event_id):
     vec_sync_wait(PIPE.MTE2, PIPE.S, event_id)
 
 
-def busy_wait_flag(view, gm_epoch, event_id, ub_flag=None, ub_epoch=None):
-    """轮询 view 处 flag >= gm_epoch（epoch 单调化阈值，进程内复入不被陈旧 flag 误唤醒）。
+def busy_wait_flag(view, gm_epoch, event_id, ub_flag=None, ub_epoch=None, exact=False):
+    """轮询 view 处 flag 就位（缺省 >= gm_epoch；exact=True 时 == gm_epoch）。
 
     plan 的 ready flag 与 reduce_grad 的 staging flag 共用本握手原语。
     ub_flag/ub_epoch 缺省现配；recv 侧按组轮询时由调用方共享传入，
     避免每实例一对 UB 缓冲耗尽 VEC buf_id。
+
+    两种匹配语义的分工：
+    - **>=（缺省，barrier / plan ready 必须用）**：容忍"peer 已进入下一轮、
+      用 n+1 覆盖了自己槽位"——这两类收齐协议没有"对方已读走本轮 flag"的
+      回执，等待方可能读到超前值，改 == 会死锁。
+    - **==（exact=True，仅 reduce staging flag）**：WORLD 组对称堆在同进程
+      多用例间复用，flag 槽位的**残留数据**（前置 prefetch/多槽用例写入的
+      权重编码，bf16 位型当 int32 读数 ~1e9 大正数）在 >= 下被当作"已就位"，
+      recv 首轮即放行、读到在途的旧 staging。reduce 有组间 barrier 充当"读
+      完成回执"，== 无被下一轮覆盖的死锁风险；残留恰等于当轮 epoch 需 32 位
+      巧合，概率可忽略。
     """
     if ub_flag is None:
         ub_flag = Buffer(MemLoc.UB, (1,), dtypes.int32)
@@ -280,6 +414,8 @@ def busy_wait_flag(view, gm_epoch, event_id, ub_flag=None, ub_epoch=None):
         mem_copy(ub_epoch, gm_epoch)
         vec_sync_notify(PIPE.MTE2, PIPE.S, event_id)
         vec_sync_wait(PIPE.MTE2, PIPE.S, event_id)
+        if exact:
+            return ub_flag[dtypes.int64(0)] == ub_epoch[dtypes.int64(0)]
         return ub_flag[dtypes.int64(0)] >= ub_epoch[dtypes.int64(0)]
 
     vec_busy_wait(_check)
@@ -368,11 +504,18 @@ def barrier_tail(xfer, ctx, gm_epoch, me, world_size, ub_flag, ub_epoch):
             )
 
 
-def next_barrier_epoch():
-    """取下一个 barrier epoch（跨算子单调；融合发射的 kernel 尾段共用本计数器）。"""
-    global _BAR_EPOCH
-    _BAR_EPOCH += 1
-    return _BAR_EPOCH
+def record_transport_event(context):
+    """各算子 wrapper 发射后记录完成事件（跨流护栏的 fork 点）。
+
+    后续跨流调用只等待本事件（上一个我方算子的完成点），而非发起流尾部
+    （主流尾部可能排着 dispatch 等非我方工作，等尾部会把双流重叠串行掉）。
+    事件对象复用（每步新建 torch.npu.Event() 有 host 分配开销；单线程
+    按序"先等后录"，重录语义安全）。
+    """
+    ev = context.transport_event
+    if ev is None:
+        ev = context.transport_event = torch.npu.Event()
+    ev.record(torch.npu.current_stream())
 
 
 def _get_barrier_program(world_size, me):
@@ -392,17 +535,28 @@ def _get_barrier_program(world_size, me):
     return prog
 
 
-def sym_barrier(context):
+def sym_barrier(context, *, sync=True):
     """对称堆自旋 barrier：替代 dist.barrier（绕开 HCCL SoleMesh 集合通信死锁）。
 
     语义与同流 dist.barrier 等价且更强：返回时全组 rank 本轮此前流上工作全部
     完成（kernel 内自旋收齐各 peer 的 epoch flag，flag 与数据同通道保序）。
     epoch 跨算子单调递增，陈旧 flag 不会提前放行。
+
+    sync=False 为"只发射"形态：仅入队 barrier kernel、不做 host 同步——
+    跨 rank 保序由 kernel 自身的自旋协议保证（后继同流 kernel 在设备序上
+    排在它之后），host 立即返回。供 async_finish 路径的组间 staging 复用
+    栅栏使用：staging 覆写的跨 rank 安全是设备序问题，不需要 host 等待。
     """
     global _BAR_EPOCH
     _BAR_EPOCH += 1
-    gm_epoch = torch.full((1,), _BAR_EPOCH, dtype=torch.int32, device="npu")
+    gm_epoch = context.bar_epoch_t
+    if gm_epoch is None:
+        gm_epoch = torch.empty(1, dtype=torch.int32, device="npu")
+        context.bar_epoch_t = gm_epoch
+    gm_epoch.fill_(_BAR_EPOCH)  # 复用张量：省掉每步一次分配
     _get_barrier_program(context.rank_size, context.rank)(gm_epoch, context.ctx_tensor)
+    if not sync:
+        return
     # 等待范围为发起流而非整卡：barrier kernel 在发起流上，等本流完成即意味着
     # 全组本轮握手收齐。全设备 synchronize 会把无关流上的在飞工作也等进来，
     # 封死跨层/跨流流水（多层训练里每层 reduce/组间串行都走本 barrier）。
@@ -423,14 +577,13 @@ def sync_transport_stream(context):
     """
     cur = torch.npu.current_stream()
     ts = context.transport_stream
-    if ts is None:
+    if ts is None or ts == cur:
         context.transport_stream = cur
         return
-    if ts == cur:
-        return
-    ev = torch.npu.Event()
-    ev.record(ts)
-    cur.wait_event(ev)
+    # 跨流：等上一个我方算子的完成事件（而非旧流尾部——主流尾部可能排着
+    # dispatch 等非我方工作，等尾部会把双流重叠串行掉）
+    if context.transport_event is not None:
+        cur.wait_event(context.transport_event)
     context.transport_stream = cur
 
 

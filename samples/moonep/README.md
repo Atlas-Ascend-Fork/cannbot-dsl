@@ -137,16 +137,24 @@ reduce_grad(context, experts_to_copy, grad_view, epn)
 | `grad_view` | `[2*epn, H*H']` | `torch.float32` | 梯度视图：前 `epn` 行真实专家，后 `epn` 行副本槽 |
 | `epn` | 标量 | int | 每 rank 本地专家数（行宽由张量 shape 自取） |
 
-两接口均原地生效、无返回值；gate / up / down 三个 projection 各调一次
-（或传 list 共享清单）。每次调用末尾含一次**kernel 内联的**对称堆自旋完成屏障
-（barrier_tail：epoch 直推 + flag 收齐，融合在 push/recv kernel 尾段，不走
-HCCL 集合通信、无独立 launch）；调用末尾为发起流级等待（不等无关流）。
+两接口均原地生效、无返回值（`barrier=True` 缺省形态）；gate / up / down 三个
+projection 各调一次（或传 list 共享清单）。每次调用末尾含一次对称堆自旋完成
+屏障（独立 launch，不走 HCCL 集合通信）；调用末尾为发起流级等待（不等无关流）。
+prefetch 直推按 block 取模分派（`PUSH_BLOCKS=16` 并行 put，清单在 kernel
+内逐 block 扫 etc 生成）；多 block 下 kernel 内联 barrier 尾段须先
+global_sync_all 保序、与运行时取模分派组合撞编译器已知问题，故 barrier
+保持独立 launch 形态。
+**侧流并发（async_finish）**：两接口均可传 `barrier=False`——跳过末尾屏障
+及其 host 同步（reduce 的组间 barrier 同时改为只发射 kernel），**返回发起流
+上的 NPU 事件**；调用方 `wait_event` 汇合，跨 rank 的槽位/staging 复用安全由
+调用方在合适位置（如下一轮迭代的 barrier）负责，plan 延迟溢出检查顺延到下一
+个我方算子尾部。适配侧流重叠调度（prefetch∥共享专家计算、reduce∥下层反向）。
 `reduce_grad` 语义：`grad_view[e_local] += Σ 副本梯度`，随后副本槽清零。
 对称堆容量在 `create_moonep_context` 与 `create_weight_view` 处前置校验，
 不足即报所需/现有容量。对称窗权重视图进 grouped_matmul 前先
 `materialize_weights(view)` 落地普通显存（GMM host 路径限制）。
-两接口的发送/接收清单按 `experts_to_copy` 身份单槽缓存——同一 plan 重复调用
-无 GM→CPU 回读与清单重建，新 plan 自动重建。
+两接口的清单均由设备侧 kernel 从 `etc` 生成（host 零回读/零 H2D），
+清单缓冲按形状缓存——路由变化不触发重编译，新 plan 自动重建。
 
 ### 使用约束
 
@@ -189,13 +197,18 @@ HCCL 集合通信、无独立 launch）；调用末尾为发起流级等待（�
 - 原子累加的目标 tile 有 **32B 粒度要求**（不足须 padding 到 32B 倍数，
   见 plan 的 per-block 局部 loads 行方案——本仓直接避免了原子路径）。
 - UB 标量点读只在 vf(simt) 或完整 S↔MTE2 双向握手（notify+wait 成对）后进行。
+- **kernel 内张量切片须用元组索引形式**：`t[a:b,]`（尾逗号）合法，普通
+  `t[a:b]` 触发 "non-trivial Tensor slice may only index a shape leaf" 编译错
+  （reduce 清单打包切片的实证）。
 - **流序写入纪律**：跨调用复用的设备缓冲只允许 kernel 全量覆写或设备侧
   `copy_`，禁止 host 侧 H2D 直写复用缓冲（会与上一轮仍在读的 kernel 竞争，
   表现为轮询/握手永久等待）；epoch 类小标量每次新分配。
-- 已验证形态：单机 4 卡与 8 卡全机（Ascend 950PR）——默认门禁 13 用例
-  （前向/反向/预取各 3 代表 shape + 多组 + 多槽 + 归并 + bf16）4P/8P 全 PASS，
-  `--full` 全量矩阵 27 用例按需执行（倾斜/中间档 shape）；推荐配置
-  （S=4096/K=8/E=256/H=7168）三档 maxvio（0.1/1/8）性能基准全通过。
+- 已验证形态：单机 4 卡与 8 卡全机（Ascend 950PR）——默认门禁 21 用例
+  （前向/反向/预取各代表 shape + 多组 + 多槽 + 双槽零拷贝 + 归并 + bf16 +
+  K6/EPN32 典型形状 + 数值漏斗 + 布局公式自检 + 块数回归 + async overlap）
+  4P/8P 全 PASS，`--full` 全量矩阵按需执行（倾斜/中间档 shape + 双槽 +
+  经典规格泛化）；推荐配置（S=4096/K=8/E=256/H=7168）三档 maxvio
+  （0.1/1/8）性能基准全通过。
 
 ## 通信上下文
 
@@ -209,10 +222,10 @@ HCCL 集合通信、无独立 launch）；调用末尾为发起流级等待（�
 ```text
 samples/moonep/
 ├── README.md               # 本文档（接口参考）
-├── moonep_context.py       # 通信上下文/容量校验/流级 barrier 助手/跨流护栏（共享）
-├── moonep_plan.py          # 规划（7 kernel：MoonepPlanExchange 交换/GreedyInit 初态/Greedy 贪心+cu/Tables 逐 rank 表/Count 计数/Pfx 查表/Assign 段倒计时）
-├── prefetch_weight.py      # 权重预取（清单 kernel + 融合多组直推 + 内联 barrier 尾段）
-├── reduce_grad.py          # 副本梯度归并（清单 kernel + 两段式 UB 累加 + 内联 barrier 尾段）
+├── moonep_context.py       # 通信上下文/容量校验/对称堆 barrier/跨流护栏/resident_blocks 核数探测（共享）
+├── moonep_plan.py          # 规划（单 launch 融合 kernel：Exchange 交换 → Greedy 贪心+cu → Tables/Pfx → Count → Assign，阶段间 global_sync_all；workspace 打包 9 参）
+├── prefetch_weight.py      # 权重预取（16-block 并行直推：清单 kernel 内按 block 分段生成 + 融合多组发射 + 独立 barrier）
+├── reduce_grad.py          # 副本梯度归并（独立清单 kernel + send/recv 融合单 kernel + 独立 barrier）
 └── npu_blob.py             # from_blob 扩展（对称区权重视图用；C++ 源内嵌）
 ```
 
@@ -248,8 +261,8 @@ golden 参考实现见 [moonep_golden.py](../../test/moonep/moonep_golden.py)：
 | `test_moonep.py` | golden 自测 4 组（均衡不变量 / cu_seqlens 一致性 / 往返一致 ×2） | CPU 常跑 |
 | `test_moonep_ep.py` | ep 复用链 E2E 3 组（前向 / 反向 / 含权重全链），三档路由参数化 | `torchrun --nproc_per_node≥2`，无 NPU 或未装 `cann_ops_transformer` 自动 skip |
 
-已验证记录（8×Ascend950PR，DSL 0.7.1）：全量矩阵 27 用例全 PASS；vtopk 全量对拍
-N=32768 mismatch=0；推荐配置三档 maxvio 全通过。
+已验证记录（8×Ascend950PR，DSL 0.7.1）：默认门禁 21 用例 4P/8P 全 PASS；
+vtopk 全量对拍 N=32768 mismatch=0；推荐配置三档 maxvio 全通过。
 
 ## 性能验证
 
@@ -259,3 +272,11 @@ N=32768 mismatch=0；推荐配置三档 maxvio 全通过。
 ~3× URMA 跨迭代干扰（背靠背口径固有现象，孤立口径为准）；**清单由设备侧 kernel 从
 etc 生成（host 零回读/零扫描/零 H2D，plan 返回路径零同步）**；plan/prefetch/reduce
 编译键均只含形状与布局——路由变化不触发重编译（清单为定长数组 + 运行时计数）。
+
+融合形态经典规格台账（4P，S=8192/K=16/E=112/H=7168，feat/fuse 口径）：
+plan 1.843→**1.069ms**（-42%）、prefetch 2.009→**0.759ms**（-62%，16-block
+并行直推）、reduce_grad 12.790→**5.19ms**（-59%），三算子合计 16.6→7.0ms
+（**-58%**）、训练步 **-16.2%**；MoonEP vs 标准 EP 前向 **1.52×**（37.07 vs
+56.31ms，收益全部来自负载均衡）。前向构成：FFN 42.1% + combine 45.2%——87%
+在外部算子，三 DSL 算子仅 12.7%（plan/prefetch 设备段已到 host 边界，进一步
+收敛依赖框架发射器优化，见 cann/cannbot-dsl #65）。
