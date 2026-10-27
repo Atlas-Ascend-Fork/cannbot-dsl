@@ -2850,8 +2850,9 @@ class TPSchedule(_GridSchedule):
         kc = 384 if self.publish_rows <= 64 else 256
         if self.publish_rows == 256 and resident:
             kc = 128
-        output = OutputProjectionStage(256, self.publish_rows, kc=kc, tiles_per_core=1, resident_weight=resident,
-            row_capacity=self.publish_rows, num_heads=self.num_heads, allow_tail=self.config.ragged_output)
+        output = OutputProjectionStage(self.output_tile_width, self.publish_rows, kc=kc, tiles_per_core=1,
+            resident_weight=resident, row_capacity=self.publish_rows, num_heads=self.num_heads,
+            allow_tail=self.config.ragged_output)
         if const_expr(self.config.phase != "recurrent"):
             output.prefetch_weight(wo)
         if const_expr(self.config.phase != "oproj"):
@@ -3708,6 +3709,7 @@ class _TP24Logic:
             24, 128, 64, 64, Schedule(publish_rows=64, ragged_output=False))
         self.back2 = _PhaseSchedule(
             24, 128, 64, 128, Schedule(publish_rows=128, ragged_output=True))
+        self.back2.output_tile_width = 224
         self.back3 = _PhaseSchedule(
             24, 128, 64, 256, Schedule(publish_rows=256, ragged_output=True))
 
