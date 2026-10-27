@@ -52,7 +52,6 @@ _LAYOUT_CODES = {
     "NBSD": LAYOUT_NBSD,
     "TND": LAYOUT_TND,
     "NTD": LAYOUT_NTD,
-    "PA": LAYOUT_PA_BBND,
     "PA_BBND": LAYOUT_PA_BBND,
 }
 
@@ -546,6 +545,9 @@ def sparse_flash_mla_metadata(
     """Generate transformer-compatible SMLA metadata on AICPU."""
     import torch
     from cannbotdsl.aicpu import current_raw_stream
+
+    if layout_kv == "PA":
+        raise ValueError("layout_kv='PA' is unsupported; use 'PA_BBND'")
 
     tensors = {
         "cu_seqlens_q": cu_seqlens_q,

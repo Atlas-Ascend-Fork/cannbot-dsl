@@ -354,6 +354,15 @@ all_to_all_quant_matmul:
   options:
     - all_to_all_quant_matmul
 
+sparse_flash_mla:
+  module: True
+  src:
+    - samples/sparse_flash_mla
+    - samples/sparse_flash_mla_metadata
+    - test/sparse_flash_mla
+  options:
+    - sparse_flash_mla
+
 shared:
   module: True
   src:

@@ -53,3 +53,5 @@ operators:
   - reduce_scatter
   - all_to_all_quant_matmul
   - moonep
+  - sparse_flash_mla
+  - sparse_flash_mla_metadata

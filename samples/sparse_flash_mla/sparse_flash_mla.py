@@ -8,7 +8,7 @@
 
 """Sparse flash MLA entry and generic kernels.
 
-The public entry routes admitted inputs to the separate high-performance
+The public entry routes sparse inputs with 1..64 query heads to the N64 sparse
 module and all other inputs to the generic implementation in this file.
 """
 
@@ -51,7 +51,7 @@ from cannbotdsl.ops.sync import (
     vec_sync_intra_arrive,
     vec_sync_intra_wait,
 )
-from sparse_flash_mla_high_perf import high_perf_admission, high_perf_sparse_flash_mla
+from sparse_flash_mla_sparse_n64_kernel import sparse_n64_kernel
 
 _BITS_PER_BYTE = 8
 _F32_BITS = 32
@@ -171,18 +171,18 @@ class SmlaMatmulBase:
         # Two independent half-slots, each reused only after its final QK read.
         for half in range_constexpr(2):
             mem_copy(
-                self.q_ring.head_next(),
+                self.q_ring.next_write(),
                 tile_slice(q_tile_gm, (self.tile_cube_m, _D // 2), (0, half)),
             )
 
     def bmm1_fanout_q(self, kv_slot, q_half0, q_half1, actual_n=None):
         # The physical NZ frame stays full width. Softmax masks columns
         # beyond actual_n, so narrowing this load must not repack the frame.
-        qk_acc = self.l0c_qk.head_next()
+        qk_acc = self.l0c_qk.next_write()
         for chunk in range_constexpr(_D_TILES):
             q_half = q_half0 if chunk < 2 else q_half1
-            l0_a = self.l0a.head_next()
-            l0_b = self.l0b.head_next()
+            l0_a = self.l0a.next_write()
+            l0_b = self.l0b.next_write()
             mem_copy(
                 l0_a, tile_slice(q_half, (self.tile_cube_m, _TILE), (0, chunk % 2))
             )
@@ -190,13 +190,13 @@ class SmlaMatmulBase:
             matmul(qk_acc, l0_a, l0_b, init=(chunk == 0))
 
     def store_s(self, qk_ub_ch):
-        mem_copy(qk_ub_ch.head_next(), self.l0c_qk.tail_next().partition(dim=0))
+        mem_copy(qk_ub_ch.next_write(), self.l0c_qk.next_read().partition(dim=0))
 
     def compute_pv_fanout(self, p_l1_ch, pv_ub_ch, kv_slot, actual_n=None):
         valid_kv_rows = actual_n if actual_n is not None else self.tile_n
-        p = p_l1_ch.tail_next()
-        out = pv_ub_ch.head_next()
-        l0_a = self.l0a_p.head_next()
+        p = p_l1_ch.next_read()
+        out = pv_ub_ch.next_write()
+        l0_a = self.l0a_p.next_write()
         mem_copy(l0_a, p)
         # View P at the parent NZ pitch and round the reduction extent up to
         # the 16-row fractal; P is masked to zero beyond actual_n.
@@ -205,12 +205,12 @@ class SmlaMatmulBase:
             l0_a, shape=(self.tile_cube_m, pv_k), stride=(self.tile_n, 1)
         )
         for chunk in range_constexpr(_D_TILES):
-            l0_b = self.l0b.head_next()
+            l0_b = self.l0b.next_write()
             # A ZN destination view makes this L1 -> L0B copy transpose the
             # KV chunk; the matmul reads the same view at the pv_k extent.
             l0_b_view = reinterpret(l0_b, shape=(self.tile_n, _TILE), data_format="zn")
             mem_copy(l0_b_view, self._kv_chunk(kv_slot, chunk))
-            pv_accumulator = self.l0c.head_next()
+            pv_accumulator = self.l0c.next_write()
             matmul(
                 pv_accumulator,
                 l0_a_view,
@@ -304,7 +304,7 @@ class GeneralSmlaVector:
     def softmax_rest(
         self, qk_ch, scale, query_state_slot: Int64, tile_state_slot: Int64, actual_n
     ):
-        p_slot = self.p_ub.head_next()
+        p_slot = self.p_ub.next_write()
         sm_max = self.sm_max_tb[query_state_slot]
         sm_sum = self.sm_sum_tb[query_state_slot]
         sm_exp = self.sm_exp_tb[tile_state_slot]
@@ -400,8 +400,8 @@ class GeneralSmlaVector:
 
     def store_p(self, p_l1_ch):
         mem_copy(
-            p_l1_ch.head_next().partition(dim=0, part_id=self.subblock_idx),
-            self.p_ub.tail_next(),
+            p_l1_ch.next_write().partition(dim=0, part_id=self.subblock_idx),
+            self.p_ub.next_read(),
         )
 
     @jit
@@ -686,7 +686,7 @@ class SmlaMatmul(SmlaMatmulBase):
         is_cmp: Int64,
         page_size: Int64,
     ):
-        kv_slot = self.kv_ring.head_next()
+        kv_slot = self.kv_ring.next_write()
         if is_cmp != 0:
             mem_copy(
                 kv_slot,
@@ -827,7 +827,7 @@ class SmlaVec0:
             linear_prefix = batch * (-page_size)
         for chunk in range_constexpr(rows_per_vec // _GATHER_TILE_ROWS):
             ring = self.gather_ping if chunk % 2 == 0 else self.gather_pong
-            dst = ring.head_next()
+            dst = ring.next_write()
             chunk_kv_row_start = vector_kv_row_start + chunk * _GATHER_TILE_ROWS
             self._load_full16(
                 dst,
@@ -842,7 +842,7 @@ class SmlaVec0:
                 page_size,
                 linear_prefix,
             )
-            ready = ring.tail_next()
+            ready = ring.next_read()
             mem_copy(
                 tile_slice(
                     workspace,
@@ -935,7 +935,7 @@ class SmlaVec0:
         for chunk in range_constexpr(rows_per_vec // _GATHER_TILE_ROWS):
             if chunk < full_chunks:
                 ring = self.gather_ping if chunk % 2 == 0 else self.gather_pong
-                dst = ring.head_next()
+                dst = ring.next_write()
                 chunk_kv_row_start = vector_kv_row_start + chunk * _GATHER_TILE_ROWS
                 self._load_full16(
                     dst,
@@ -950,7 +950,7 @@ class SmlaVec0:
                     page_size,
                     linear_prefix,
                 )
-                ready = ring.tail_next()
+                ready = ring.next_read()
                 mem_copy(
                     tile_slice(
                         workspace,
@@ -962,7 +962,7 @@ class SmlaVec0:
         if tail_rows > 0:
             tail_kv_row_start = vector_kv_row_start + full_chunks * _GATHER_TILE_ROWS
             if full_chunks % 2 == 0:
-                dst = self.gather_ping.head_next()
+                dst = self.gather_ping.next_write()
                 self._load_tail(
                     dst,
                     kv,
@@ -977,13 +977,13 @@ class SmlaVec0:
                     page_size,
                     linear_prefix,
                 )
-                ready = self.gather_ping.tail_next()
+                ready = self.gather_ping.next_read()
                 mem_copy(
                     workspace[tail_kv_row_start : tail_kv_row_start + tail_rows, None],
                     reinterpret(ready, shape=(tail_rows, _D), stride=(_D, 1)),
                 )
             else:
-                dst = self.gather_pong.head_next()
+                dst = self.gather_pong.next_write()
                 self._load_tail(
                     dst,
                     kv,
@@ -998,7 +998,7 @@ class SmlaVec0:
                     page_size,
                     linear_prefix,
                 )
-                ready = self.gather_pong.tail_next()
+                ready = self.gather_pong.next_read()
                 mem_copy(
                     workspace[tail_kv_row_start : tail_kv_row_start + tail_rows, None],
                     reinterpret(ready, shape=(tail_rows, _D), stride=(_D, 1)),
@@ -1517,10 +1517,10 @@ class SparseFlashMlaCsaKernel:
         load_ori = ori_kv_gm
         load_ori_page = ori_page
 
-        kv_qk = self.matmul.kv_ring.tail_next()
+        kv_qk = self.matmul.kv_ring.next_read()
         kv_pv = kv_qk
-        q_half0 = self.matmul.q_ring.tail_next()
-        q_half1 = self.matmul.q_ring.tail_next()
+        q_half0 = self.matmul.q_ring.next_read()
+        q_half1 = self.matmul.q_ring.next_read()
         block = get_block_idx()
         metadata_base = block * _METADATA_FIELDS_PER_BLOCK
         # Head halves read the same KV values, but own independent workspace
@@ -1752,12 +1752,12 @@ class SparseFlashMlaCsaKernel:
         # Reuse MQSMLA's query-axis max/sum and task-axis exp banking.
         m_bank = query_job_idx % 2
         exp_bank = tick % 2
-        score_ub_slot = self.qk_ub.tail_next()
+        score_ub_slot = self.qk_ub.next_read()
         score_ub = reinterpret(
             score_ub_slot, shape=(_VEC_TILE_M, _TILE), stride=(_TILE, 1)
         )
         if kv_tile_idx == 0:
-            sink_ub_write = self.vector.sinks_ub.head_next()
+            sink_ub_write = self.vector.sinks_ub.next_write()
             mem_copy(
                 sink_ub_write,
                 tile_slice(
@@ -1766,7 +1766,7 @@ class SparseFlashMlaCsaKernel:
                     (query_head_half_idx * 2 + get_subblock_id(),),
                 ),
             )
-            sink_ub_read = self.vector.sinks_ub.tail_next()
+            sink_ub_read = self.vector.sinks_ub.next_read()
             self.vector.seed_from_sinks(sink_ub_read, m_bank)
         self.vector.softmax_rest(score_ub, scale, m_bank, exp_bank, valid_kv_rows)
         self.vector.store_p(self.p_l1)
@@ -1782,7 +1782,7 @@ class SparseFlashMlaCsaKernel:
         out: Tensor,
         query_head_half_idx: Int64,
     ):
-        pv = self.pv_ub.tail_next()
+        pv = self.pv_ub.next_read()
         sum_idx = query_job_idx % 2
         exp_idx = tick % 2
         if kv_tile_idx == 0:
@@ -1867,10 +1867,10 @@ class SparseFlashMlaCsaKernel:
                 kv_qk, q_half0, q_half1, actual_n=info.valid_kv_rows
             )
             next_pv = kv_qk
-            kv_qk = self.matmul.kv_ring.tail_next()
+            kv_qk = self.matmul.kv_ring.next_read()
             if info.last_loop != 0:
-                q_half0 = self.matmul.q_ring.tail_next()
-                q_half1 = self.matmul.q_ring.tail_next()
+                q_half0 = self.matmul.q_ring.next_read()
+                q_half1 = self.matmul.q_ring.next_read()
             if info.last_loop != 0 and tick < kv_tile_count + _STAGE_LOAD:
                 next_info = self.run_info.tap(1)
                 self.matmul.load_q_wide(
@@ -1990,10 +1990,10 @@ class SparseFlashMlaSwaHcaKernel:
         load_cmp_page = cmp_page
         load_ori = ori_kv_gm
         load_ori_page = ori_page
-        kv_qk = self.matmul.kv_ring.tail_next()
+        kv_qk = self.matmul.kv_ring.next_read()
         kv_pv = kv_qk
-        q_half0 = self.matmul.q_ring.tail_next()
-        q_half1 = self.matmul.q_ring.tail_next()
+        q_half0 = self.matmul.q_ring.next_read()
+        q_half1 = self.matmul.q_ring.next_read()
         block = get_block_idx()
         metadata_base = block * _METADATA_FIELDS_PER_BLOCK
         query_head_half_idx = (
@@ -2205,12 +2205,12 @@ class SparseFlashMlaSwaHcaKernel:
         # Reuse MQSMLA's query-axis max/sum and task-axis exp banking.
         m_bank = query_job_idx % 2
         exp_bank = tick % 2
-        score_ub_slot = self.qk_ub.tail_next()
+        score_ub_slot = self.qk_ub.next_read()
         score_ub = reinterpret(
             score_ub_slot, shape=(_VEC_TILE_M, _TILE), stride=(_TILE, 1)
         )
         if kv_tile_idx == 0:
-            sink_ub_write = self.vector.sinks_ub.head_next()
+            sink_ub_write = self.vector.sinks_ub.next_write()
             mem_copy(
                 sink_ub_write,
                 tile_slice(
@@ -2219,7 +2219,7 @@ class SparseFlashMlaSwaHcaKernel:
                     (query_head_half_idx * 2 + get_subblock_id(),),
                 ),
             )
-            sink_ub_read = self.vector.sinks_ub.tail_next()
+            sink_ub_read = self.vector.sinks_ub.next_read()
             self.vector.seed_from_sinks(sink_ub_read, m_bank)
         self.vector.softmax_rest(score_ub, scale, m_bank, exp_bank, valid_kv_rows)
         self.vector.store_p(self.p_l1)
@@ -2235,7 +2235,7 @@ class SparseFlashMlaSwaHcaKernel:
         out: Tensor,
         query_head_half_idx: Int64,
     ):
-        pv = self.pv_ub.tail_next()
+        pv = self.pv_ub.next_read()
         sum_idx = query_job_idx % 2
         exp_idx = tick % 2
         if kv_tile_idx == 0:
@@ -2333,10 +2333,10 @@ class SparseFlashMlaSwaHcaKernel:
                 kv_qk, q_half0, q_half1, actual_n=info.valid_kv_rows
             )
             next_pv = kv_qk
-            kv_qk = self.matmul.kv_ring.tail_next()
+            kv_qk = self.matmul.kv_ring.next_read()
             if info.last_loop != 0:
-                q_half0 = self.matmul.q_ring.tail_next()
-                q_half1 = self.matmul.q_ring.tail_next()
+                q_half0 = self.matmul.q_ring.next_read()
+                q_half1 = self.matmul.q_ring.next_read()
             if info.last_loop != 0 and tick < kv_tile_count:
                 self.matmul.load_q_wide(
                     tile_slice(
@@ -2725,10 +2725,10 @@ class SparseFlashMlaOriSparseKernel:
         ori_length_mode,
         cmp_length_mode,
     ):
-        kv_qk = self.matmul.kv_ring.tail_next()
+        kv_qk = self.matmul.kv_ring.next_read()
         kv_pv = kv_qk
-        q_half0 = self.matmul.q_ring.tail_next()
-        q_half1 = self.matmul.q_ring.tail_next()
+        q_half0 = self.matmul.q_ring.next_read()
+        q_half1 = self.matmul.q_ring.next_read()
         block = get_block_idx()
         metadata_base = block * _METADATA_FIELDS_PER_BLOCK
         group = block // 2 if const_expr(self.n1 == _MAX_QUERY_HEADS) else block
@@ -3013,12 +3013,12 @@ class SparseFlashMlaOriSparseKernel:
     ):
         m_bank = query_job_idx % 2
         exp_bank = tick % 2
-        score_ub_slot = self.qk_ub.tail_next()
+        score_ub_slot = self.qk_ub.next_read()
         score_ub = reinterpret(
             score_ub_slot, shape=(_VEC_TILE_M, _TILE), stride=(_TILE, 1)
         )
         if kv_tile_idx == 0:
-            sink_ub_write = self.vector.sinks_ub.head_next()
+            sink_ub_write = self.vector.sinks_ub.next_write()
             mem_copy(
                 sink_ub_write,
                 tile_slice(
@@ -3027,7 +3027,7 @@ class SparseFlashMlaOriSparseKernel:
                     (query_head_half_idx * 2 + get_subblock_id(),),
                 ),
             )
-            sink_ub_read = self.vector.sinks_ub.tail_next()
+            sink_ub_read = self.vector.sinks_ub.next_read()
             self.vector.seed_from_sinks(sink_ub_read, m_bank)
         self.vector.softmax_rest(score_ub, scale, m_bank, exp_bank, valid_kv_rows)
         self.vector.store_p(self.p_l1)
@@ -3043,7 +3043,7 @@ class SparseFlashMlaOriSparseKernel:
         out: Tensor,
         query_head_half_idx: Int64,
     ):
-        pv = self.pv_ub.tail_next()
+        pv = self.pv_ub.next_read()
         sum_idx = query_job_idx % 2
         exp_idx = tick % 2
         if kv_tile_idx == 0:
@@ -3126,10 +3126,10 @@ class SparseFlashMlaOriSparseKernel:
                 kv_qk, q_half0, q_half1, actual_n=info.valid_kv_rows
             )
             next_pv = kv_qk
-            kv_qk = self.matmul.kv_ring.tail_next()
+            kv_qk = self.matmul.kv_ring.next_read()
             if info.last_loop != 0:
-                q_half0 = self.matmul.q_ring.tail_next()
-                q_half1 = self.matmul.q_ring.tail_next()
+                q_half0 = self.matmul.q_ring.next_read()
+                q_half1 = self.matmul.q_ring.next_read()
             if info.last_loop != 0 and tick < kv_tile_count + _STAGE_LOAD:
                 next_info = self.run_info.tap(1)
                 self.matmul.load_q_wide(
@@ -3358,9 +3358,8 @@ def generic_sparse_flash_mla(
 ):
     """Full-validation generic path.
 
-    Input checking here intentionally overlaps ``high_perf_admission``: the
-    high-performance guard is descriptor-only (see its docstring), so this
-    function remains the single source of truth for complete validation.
+    Route admission checks descriptors only. This function performs complete
+    validation for inputs dispatched to the generic implementation.
     """
     if return_softmax_lse:
         raise NotImplementedError("LSE deferred by user")
@@ -3369,7 +3368,6 @@ def generic_sparse_flash_mla(
     if layout_q not in ("TND", "BSND") or layout_kv not in (
         "TND",
         "BSND",
-        "PA",
         "PA_BBND",
     ):
         raise ValueError("Unsupported layout")
@@ -3441,13 +3439,15 @@ def generic_sparse_flash_mla(
             continue
         if kv.dtype != query_gm.dtype or tuple(kv.shape[-2:]) != (1, _D):
             raise ValueError("KV dtype/N2/D must match specification")
-        if layout_kv in ("PA", "PA_BBND"):
+        if layout_kv == "PA_BBND":
             if (
                 table is None
                 or lengths is None
                 or not 1 <= kv.shape[1] <= _MAX_PAGE_ROWS
             ):
-                raise ValueError("PA requires page1..1024, table and actual lengths")
+                raise ValueError(
+                    "PA_BBND requires page1..1024, table and actual lengths"
+                )
         if layout_kv == "TND" and cu is None:
             raise ValueError("TND KV requires storage prefixes")
     batch_count = query_gm.shape[0] if layout_q == "BSND" else cu_seqlens_q.numel() - 1
@@ -3467,7 +3467,7 @@ def generic_sparse_flash_mla(
     has_ori_topk = int(ori_sparse_indices is not None and ori_topk_length is not None)
 
     def kv_view(kv, table, cu):
-        if layout_kv in ("PA", "PA_BBND"):
+        if layout_kv == "PA_BBND":
             page = kv.shape[1]
             stride = kv.stride(0) // _D
             storage = kv.as_strided(((kv.shape[0] - 1) * stride + page, _D), (_D, 1))
@@ -3663,11 +3663,49 @@ def generic_sparse_flash_mla(
     return out, torch.empty((0,), device=query_gm.device, dtype=torch.float32)
 
 
+def _is_sparse_n64_candidate(query_gm, kwargs):
+    if not isinstance(query_gm, torch.Tensor) or query_gm.ndim < 2:
+        return False
+    if (
+        not 1 <= query_gm.shape[-2] <= _Q_TILE_ROWS
+        or query_gm.shape[-1] != _D
+        or query_gm.dtype not in (torch.float16, torch.bfloat16)
+    ):
+        return False
+    metadata = kwargs.get("metadata")
+    if (
+        not isinstance(metadata, torch.Tensor)
+        or metadata.dtype != torch.int32
+        or metadata.numel() != _METADATA_ELEMENTS
+    ):
+        return False
+    layout_q = kwargs.get("layout_q", "BSND")
+    layout_kv = kwargs.get("layout_kv", "BSND")
+    expected_rank = 3 if layout_q == "TND" else 4
+    if layout_q not in ("TND", "BSND"):
+        return False
+    if query_gm.ndim != expected_rank:
+        return False
+    if not query_gm.is_contiguous():
+        return False
+    if not (layout_kv == "PA_BBND" or layout_kv == layout_q):
+        return False
+    ori_indices = kwargs.get("ori_sparse_indices")
+    cmp_kv = kwargs.get("cmp_kv")
+    cmp_indices = kwargs.get("cmp_sparse_indices")
+    # N64 sparse modes: ORI-only, ORI+CMP, and CSA (dense ORI + sparse CMP).
+    return (ori_indices is not None and cmp_kv is None and cmp_indices is None) or (
+        cmp_kv is not None and cmp_indices is not None
+    )
+
+
 def route_admission(query_gm, **kwargs):
-    result = high_perf_admission(query_gm, **kwargs)
-    if result["route"] != "asc_high_perf":
-        return {**result, "route": "generic"}
-    return result
+    """Select the N64 sparse or generic implementation from input descriptors."""
+    if kwargs.get("layout_kv") == "PA":
+        raise ValueError("layout_kv='PA' is unsupported; use 'PA_BBND'")
+    if _is_sparse_n64_candidate(query_gm, kwargs):
+        return {"route": "asc_sparse_n64_kernel", "reasons": []}
+    return {"route": "generic", "reasons": ["not_sparse_n64_candidate"]}
 
 
 def sparse_flash_mla(
@@ -3704,6 +3742,6 @@ def sparse_flash_mla(
     kwargs = locals().copy()
     kwargs.pop("query_gm")
     admission = route_admission(query_gm, **kwargs)
-    if admission["route"] == "asc_high_perf":
-        return high_perf_sparse_flash_mla(query_gm, _admission=admission, **kwargs)
+    if admission["route"] == "asc_sparse_n64_kernel":
+        return sparse_n64_kernel(query_gm, **kwargs)
     return generic_sparse_flash_mla(query_gm, **kwargs)
