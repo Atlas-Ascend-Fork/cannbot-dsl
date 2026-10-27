@@ -46,6 +46,14 @@ ignore:
   - scripts/run_codespell.sh
   - test/test_config.yaml
 
+add:
+  module: True
+  src:
+    - samples/add
+    - test/add
+  options:
+    - add
+
 attn_epilogue:
   module: True
   src:
