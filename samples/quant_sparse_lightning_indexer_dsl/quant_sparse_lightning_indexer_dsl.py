@@ -78,7 +78,6 @@ STAGING_DEPTH = 4
 VECTOR0_READY_ID = 6
 AIV1_SYNC_ID_OFFSET = 16
 TOPK_TRUNK_LEN = 16384
-MAX_CUBE_WORKERS = 32
 
 # 每个 8-token 候选块：K 为 8×64B，E8M0 scale 为 8×4B。
 SCALE_GROUP_SIZE = 32
@@ -100,6 +99,19 @@ METADATA_ELEMENTS = 1024
 METADATA_FIELDS = 8
 METADATA_ROWS = METADATA_ELEMENTS // METADATA_FIELDS
 LD_RECORD_START = 36
+# TensorSpec/GM capacity; the launch count is queried from the input device.
+MAX_CUBE_WORKERS = LD_RECORD_START
+
+
+def _get_cube_core_num(device):
+    """Use the input NPU; LD_RECORD_START is the fixed LI/LD boundary."""
+    workers = int(torch.npu.get_device_properties(device).cube_core_num)
+    if not 1 <= workers <= LD_RECORD_START:
+        raise RuntimeError(
+            f"Unsupported Cube core count {workers}; "
+            f"LI metadata supports 1..{LD_RECORD_START}"
+        )
+    return workers
 
 
 @jit
@@ -890,6 +902,9 @@ class QsliVector0:
     @jit
     def preload_table(self, table, batch, has_block_table):
         if has_block_table and table.shape[1] <= self.pa_table_capacity:
+            # 完成上一 batch 的 Vector 读取，才能覆盖页表缓存。
+            vec_sync_notify(PIPE.V, PIPE.MTE2, 5)
+            vec_sync_wait(PIPE.V, PIPE.MTE2, 5)
             mem_copy(
                 self.page_table_ub[0:1, 0 : table.shape[1]],
                 table[batch : batch + 1, 0 : table.shape[1]],
@@ -2087,19 +2102,21 @@ class QsliFusedKernel:
                         tile_end = min(tile_end, dtypes.int64(metadata[worker_idx, 6]))
                     valid_s2 = actual
                     if self.mask_mode == 3:
-                        valid_s2 = min(
-                            actual,
-                            max(
-                                dtypes.int32(0),
-                                (
-                                    actual * self.cmp_ratio
-                                    + residual
-                                    - used_q
-                                    + dtypes.int32(m_idx)
-                                    + 1
-                                )
-                                // self.cmp_ratio,
-                            ),
+                        valid_s2 = dtypes.int32(
+                            min(
+                                actual,
+                                max(
+                                    dtypes.int32(0),
+                                    (
+                                        dtypes.int64(actual) * self.cmp_ratio
+                                        + residual
+                                        - used_q
+                                        + dtypes.int32(m_idx)
+                                        + 1
+                                    )
+                                    // self.cmp_ratio,
+                                ),
+                            )
                         )
                     if m_idx >= dtypes.int64(used_q):
                         valid_s2 = dtypes.int32(0)
@@ -2288,19 +2305,22 @@ class QsliFusedKernel:
                                     )
                                 next_visible = actual
                                 if self.mask_mode == 3:
-                                    next_visible = min(
-                                        actual,
-                                        max(
-                                            dtypes.int32(0),
-                                            (
-                                                actual * self.cmp_ratio
-                                                + residual
-                                                - used_q
-                                                + dtypes.int32(next_m)
-                                                + 1
-                                            )
-                                            // self.cmp_ratio,
-                                        ),
+                                    next_visible = dtypes.int32(
+                                        min(
+                                            actual,
+                                            max(
+                                                dtypes.int32(0),
+                                                (
+                                                    dtypes.int64(actual)
+                                                    * self.cmp_ratio
+                                                    + residual
+                                                    - used_q
+                                                    + dtypes.int32(next_m)
+                                                    + 1
+                                                )
+                                                // self.cmp_ratio,
+                                            ),
+                                        )
                                     )
                                 if (
                                     next_length > 0
@@ -2468,16 +2488,16 @@ def _build_compiled_fused_runner(
             dtypes.uint16, dtypes.int64(sparse_value_address), MemLoc.GM
         )
         sparse_indices = make_tensor(
-            index_pointer, make_layout((64, topk), stride=(topk, 1))
+            index_pointer, make_layout((worker_count * 2, topk), stride=(topk, 1))
         )
         sparse_value_bits = make_tensor(
-            value_pointer, make_layout((64, topk), stride=(topk, 1))
+            value_pointer, make_layout((worker_count * 2, topk), stride=(topk, 1))
         )
         merge_indices = make_tensor(
-            index_pointer, make_layout((64, topk), stride=(topk, 1))
+            index_pointer, make_layout((worker_count * 2, topk), stride=(topk, 1))
         )
         merge_bits = make_tensor(
-            value_pointer, make_layout((64, topk), stride=(topk, 1))
+            value_pointer, make_layout((worker_count * 2, topk), stride=(topk, 1))
         )
         QsliFusedKernel(
             tokens,
@@ -2992,15 +3012,15 @@ def quant_sparse_lightning_indexer(
         raise ValueError("Metadata must be on the same device as q")
     metadata = metadata.view(METADATA_ROWS, METADATA_FIELDS)
     tokens = full_tokens
-    worker_count = MAX_CUBE_WORKERS
+    worker_count = _get_cube_core_num(q.device)
 
     sparse_indices = torch.empty(
-        (64, N2, int(topk)),
+        (worker_count * 2, N2, int(topk)),
         dtype=torch.int32,
         device=q.device,
     )
     sparse_values = torch.empty(
-        (64, N2, int(topk)),
+        (worker_count * 2, N2, int(topk)),
         dtype=torch.bfloat16,
         device=w.device,
     )
@@ -3463,19 +3483,21 @@ class QsliTndFusedKernel:
                         tile_end = min(tile_end, dtypes.int64(metadata[worker_idx, 6]))
                     valid_s2 = actual
                     if self.mask_mode == 3:
-                        valid_s2 = min(
-                            actual,
-                            max(
-                                dtypes.int32(0),
-                                (
-                                    actual * self.cmp_ratio
-                                    + residual
-                                    - used_q
-                                    + dtypes.int32(m_idx)
-                                    + 1
-                                )
-                                // self.cmp_ratio,
-                            ),
+                        valid_s2 = dtypes.int32(
+                            min(
+                                actual,
+                                max(
+                                    dtypes.int32(0),
+                                    (
+                                        dtypes.int64(actual) * self.cmp_ratio
+                                        + residual
+                                        - used_q
+                                        + dtypes.int32(m_idx)
+                                        + 1
+                                    )
+                                    // self.cmp_ratio,
+                                ),
+                            )
                         )
                     if m_idx >= dtypes.int64(used_q):
                         valid_s2 = dtypes.int32(0)
@@ -3650,19 +3672,22 @@ class QsliTndFusedKernel:
                                     )
                                 next_visible = actual
                                 if self.mask_mode == 3:
-                                    next_visible = min(
-                                        actual,
-                                        max(
-                                            dtypes.int32(0),
-                                            (
-                                                actual * self.cmp_ratio
-                                                + residual
-                                                - used_q
-                                                + dtypes.int32(next_m)
-                                                + 1
-                                            )
-                                            // self.cmp_ratio,
-                                        ),
+                                    next_visible = dtypes.int32(
+                                        min(
+                                            actual,
+                                            max(
+                                                dtypes.int32(0),
+                                                (
+                                                    dtypes.int64(actual)
+                                                    * self.cmp_ratio
+                                                    + residual
+                                                    - used_q
+                                                    + dtypes.int32(next_m)
+                                                    + 1
+                                                )
+                                                // self.cmp_ratio,
+                                            ),
+                                        )
                                     )
                                 if (
                                     next_length > 0
@@ -3821,16 +3846,16 @@ def _build_tnd_compiled_fused_runner(
             dtypes.uint16, dtypes.int64(sparse_value_address), MemLoc.GM
         )
         sparse_indices = make_tensor(
-            index_pointer, make_layout((64, topk), stride=(topk, 1))
+            index_pointer, make_layout((worker_count * 2, topk), stride=(topk, 1))
         )
         sparse_value_bits = make_tensor(
-            value_pointer, make_layout((64, topk), stride=(topk, 1))
+            value_pointer, make_layout((worker_count * 2, topk), stride=(topk, 1))
         )
         merge_indices = make_tensor(
-            index_pointer, make_layout((64, topk), stride=(topk, 1))
+            index_pointer, make_layout((worker_count * 2, topk), stride=(topk, 1))
         )
         merge_bits = make_tensor(
-            value_pointer, make_layout((64, topk), stride=(topk, 1))
+            value_pointer, make_layout((worker_count * 2, topk), stride=(topk, 1))
         )
         QsliTndFusedKernel(
             tokens,
@@ -4245,15 +4270,15 @@ def _run_tnd(
         )
     metadata = metadata.view(METADATA_ROWS, METADATA_FIELDS)
     tokens = full_tokens
-    worker_count = MAX_CUBE_WORKERS
+    worker_count = _get_cube_core_num(q.device)
 
     sparse_indices = torch.empty(
-        (64, N2, int(topk)),
+        (worker_count * 2, N2, int(topk)),
         dtype=torch.int32,
         device=q.device,
     )
     sparse_values = torch.empty(
-        (64, N2, int(topk)),
+        (worker_count * 2, N2, int(topk)),
         dtype=torch.bfloat16,
         device=w.device,
     )

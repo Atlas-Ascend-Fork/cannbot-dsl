@@ -79,9 +79,10 @@ N2 = 1
 VEC_TILE = 128
 CANDIDATE_BLOCK_SIZE = 8
 TOPK_TRUNK_LEN = 26624
-MAX_CUBE_WORKERS = 32
 # Metadata 的 LI 区占 36 行，LD/FD 归并记录从固定第 36 行开始。
 LD_RECORD_START = 36
+# TensorSpec/GM capacity; the launch count is queried from the input device.
+MAX_CUBE_WORKERS = LD_RECORD_START
 METADATA_ELEMENTS = 1024
 METADATA_FIELDS = 8
 METADATA_ROWS = METADATA_ELEMENTS // METADATA_FIELDS
@@ -107,6 +108,17 @@ CACHED_TOPK_INDEX_OFFSET = CACHE_TOKENS * 2 + 1024
 CACHED_TOPK_VALUE_OFFSET = CACHED_TOPK_INDEX_OFFSET + CACHED_TOPK_COUNT * 4
 KEY_STORAGE_ROW_ELEMENTS = N2 * PACKED_D
 KEY_SCALE_STORAGE_ROW_ELEMENTS = N2 * 2 * 2
+
+
+def _get_cube_core_num(device):
+    """Use the input NPU; LD_RECORD_START is the fixed LI/LD boundary."""
+    workers = int(torch.npu.get_device_properties(device).cube_core_num)
+    if not 1 <= workers <= LD_RECORD_START:
+        raise RuntimeError(
+            f"Unsupported Cube core count {workers}; "
+            f"LI metadata supports 1..{LD_RECORD_START}"
+        )
+    return workers
 
 
 @jit
@@ -3802,21 +3814,23 @@ class QliVector:
             group_count = dtypes.int32(self.n1)
         s2_len_v0 = actual_s2
         if self.mask_mode == 3:
-            s2_len_v0 = max(
-                0,
-                min(
-                    actual_s2,
-                    (
-                        actual_s2 * self.cmp_ratio
-                        + cmp_residual
-                        - task_used_q
-                        + task_q_offset
-                        + dtypes.int32(self.subblock_idx) * self.vec_rows
-                        + 0
-                        + 1
-                    )
-                    // self.cmp_ratio,
-                ),
+            s2_len_v0 = dtypes.int32(
+                max(
+                    0,
+                    min(
+                        actual_s2,
+                        (
+                            dtypes.int64(actual_s2) * self.cmp_ratio
+                            + cmp_residual
+                            - task_used_q
+                            + task_q_offset
+                            + dtypes.int32(self.subblock_idx) * self.vec_rows
+                            + 0
+                            + 1
+                        )
+                        // self.cmp_ratio,
+                    ),
+                )
             )
         if dtypes.int32(self.subblock_idx) * self.vec_rows + 0 >= task_active_count:
             s2_len_v0 = 0
@@ -3825,21 +3839,23 @@ class QliVector:
         )
         s2_len_v1 = actual_s2
         if self.mask_mode == 3:
-            s2_len_v1 = max(
-                0,
-                min(
-                    actual_s2,
-                    (
-                        actual_s2 * self.cmp_ratio
-                        + cmp_residual
-                        - task_used_q
-                        + task_q_offset
-                        + dtypes.int32(self.subblock_idx) * self.vec_rows
-                        + 1
-                        + 1
-                    )
-                    // self.cmp_ratio,
-                ),
+            s2_len_v1 = dtypes.int32(
+                max(
+                    0,
+                    min(
+                        actual_s2,
+                        (
+                            dtypes.int64(actual_s2) * self.cmp_ratio
+                            + cmp_residual
+                            - task_used_q
+                            + task_q_offset
+                            + dtypes.int32(self.subblock_idx) * self.vec_rows
+                            + 1
+                            + 1
+                        )
+                        // self.cmp_ratio,
+                    ),
+                )
             )
         if dtypes.int32(self.subblock_idx) * self.vec_rows + 1 >= task_active_count:
             s2_len_v1 = 0
@@ -3848,21 +3864,23 @@ class QliVector:
         )
         s2_len_v2 = actual_s2
         if self.mask_mode == 3:
-            s2_len_v2 = max(
-                0,
-                min(
-                    actual_s2,
-                    (
-                        actual_s2 * self.cmp_ratio
-                        + cmp_residual
-                        - task_used_q
-                        + task_q_offset
-                        + dtypes.int32(self.subblock_idx) * self.vec_rows
-                        + 2
-                        + 1
-                    )
-                    // self.cmp_ratio,
-                ),
+            s2_len_v2 = dtypes.int32(
+                max(
+                    0,
+                    min(
+                        actual_s2,
+                        (
+                            dtypes.int64(actual_s2) * self.cmp_ratio
+                            + cmp_residual
+                            - task_used_q
+                            + task_q_offset
+                            + dtypes.int32(self.subblock_idx) * self.vec_rows
+                            + 2
+                            + 1
+                        )
+                        // self.cmp_ratio,
+                    ),
+                )
             )
         if dtypes.int32(self.subblock_idx) * self.vec_rows + 2 >= task_active_count:
             s2_len_v2 = 0
@@ -3933,13 +3951,22 @@ class QliVector:
                             + dtypes.int32(self.subblock_idx) * self.vec_rows
                             + dtypes.int32(row_in_subblock)
                         )
-                        valid_s2 = (
-                            actual_s2 * self.cmp_ratio
-                            + cmp_residual
-                            - task_used_q
-                            + query_in_batch
-                            + 1
-                        ) // self.cmp_ratio
+                        valid_s2 = dtypes.int32(
+                            max(
+                                dtypes.int64(0),
+                                min(
+                                    dtypes.int64(actual_s2),
+                                    (
+                                        dtypes.int64(actual_s2) * self.cmp_ratio
+                                        + cmp_residual
+                                        - task_used_q
+                                        + query_in_batch
+                                        + 1
+                                    )
+                                    // self.cmp_ratio,
+                                ),
+                            )
+                        )
                         if valid_s2 < 0:
                             valid_s2 = 0
                         if valid_s2 > actual_s2:
@@ -6243,19 +6270,21 @@ class QliFusedKernel:
             )
         cache_min_valid = actual_s2
         if self.mask_mode == 3:
-            cache_min_valid = max(
-                0,
-                min(
-                    actual_s2,
-                    (
-                        actual_s2 * self.cmp_ratio
-                        + cmp_residual
-                        - used_q
-                        + query_offset
-                        + 1
-                    )
-                    // self.cmp_ratio,
-                ),
+            cache_min_valid = dtypes.int32(
+                max(
+                    0,
+                    min(
+                        actual_s2,
+                        (
+                            dtypes.int64(actual_s2) * self.cmp_ratio
+                            + cmp_residual
+                            - used_q
+                            + query_offset
+                            + 1
+                        )
+                        // self.cmp_ratio,
+                    ),
+                )
             )
         cache_task = dtypes.int32(0)
         if self.cache_enabled:
@@ -6369,6 +6398,9 @@ class QliFusedKernel:
         # Order GM score writes before TopK reloads, as in ASC ProcessTopK.
         vec_sync_notify(PIPE.MTE3, PIPE.MTE2, 0)
         vec_sync_wait(PIPE.MTE3, PIPE.MTE2, 0)
+        # MTE3 读取的源缓冲与后续 TopK Vector 临时区有重叠。
+        vec_sync_notify(PIPE.MTE3, PIPE.V, 0)
+        vec_sync_wait(PIPE.MTE3, PIPE.V, 0)
         # Reuse the verified ASC vf_topk_16 implementation through a genuine
         # JIT boundary.  It emits into this top-level kernel and does not
         # launch a second kernel.
@@ -6389,13 +6421,22 @@ class QliFusedKernel:
                     + dtypes.int32(get_subblock_id()) * (self.query_rows // 2)
                     + dtypes.int32(row_in_subblock)
                 )
-                valid_s2 = (
-                    actual_s2 * self.cmp_ratio
-                    + cmp_residual
-                    - used_q
-                    + query_in_batch
-                    + 1
-                ) // self.cmp_ratio
+                valid_s2 = dtypes.int32(
+                    max(
+                        dtypes.int64(0),
+                        min(
+                            dtypes.int64(actual_s2),
+                            (
+                                dtypes.int64(actual_s2) * self.cmp_ratio
+                                + cmp_residual
+                                - used_q
+                                + query_in_batch
+                                + 1
+                            )
+                            // self.cmp_ratio,
+                        ),
+                    )
+                )
                 if valid_s2 < 0:
                     valid_s2 = 0
                 if valid_s2 > actual_s2:
@@ -6482,6 +6523,119 @@ class QliFusedKernel:
                     )
 
     @jit
+    def _store_empty_rows(
+        self,
+        sparse_indices,
+        sparse_value_bits,
+        candidate_indices,
+        candidate_value_bits,
+        candidate_length,
+        public_row_base,
+        task_span_count,
+    ):
+        for row_in_subblock in range_constexpr(self.query_rows // 2):
+            local_row = dtypes.int32(
+                get_subblock_id() * (self.query_rows // 2) + row_in_subblock
+            )
+            public_row = dtypes.int64(public_row_base) + dtypes.int64(local_row)
+            if local_row < task_span_count:
+                self.topk.store_empty_row(
+                    tile_slice(
+                        sparse_indices,
+                        (1, self.topk_count),
+                        (public_row, 0),
+                    ),
+                    tile_slice(
+                        sparse_value_bits,
+                        (1, self.topk_count),
+                        (public_row, 0),
+                    ),
+                )
+                if self.candidate_enabled:
+                    self.candidate_topk.store_empty_row(
+                        tile_slice(
+                            candidate_indices,
+                            (1, self.candidate_topk_count),
+                            (public_row, 0),
+                        ),
+                        tile_slice(
+                            candidate_value_bits,
+                            (1, self.candidate_topk_count),
+                            (public_row, 0),
+                        ),
+                    )
+        if self.candidate_enabled:
+            self.vector.store_empty_candidate_lengths(
+                candidate_length, public_row_base, task_span_count
+            )
+
+    @jit
+    def _initialize_unscheduled_padding(
+        self,
+        cu_seqlens_q,
+        seqused_q,
+        candidate_length,
+        worker,
+        worker_count,
+        total_q,
+        batch_count,
+        final_idx_address,
+        final_bits_address,
+        final_candidate_address,
+        final_candidate_bits_address,
+    ):
+        # Only whole query tiles beyond effective Q are omitted from ASC-style
+        # compute groups. The last active tile already initializes its own tail.
+        indices = make_tensor(
+            make_pointer(dtypes.int32, dtypes.int64(final_idx_address), MemLoc.GM),
+            make_layout((total_q, self.topk_count), stride=(self.topk_count, 1)),
+        )
+        bits = make_tensor(
+            make_pointer(dtypes.uint16, dtypes.int64(final_bits_address), MemLoc.GM),
+            make_layout((total_q, self.topk_count), stride=(self.topk_count, 1)),
+        )
+        candidates = make_tensor(
+            make_pointer(
+                dtypes.int32, dtypes.int64(final_candidate_address), MemLoc.GM
+            ),
+            make_layout(
+                (total_q, self.candidate_topk_count),
+                stride=(self.candidate_topk_count, 1),
+            ),
+        )
+        candidate_bits = make_tensor(
+            make_pointer(
+                dtypes.uint16, dtypes.int64(final_candidate_bits_address), MemLoc.GM
+            ),
+            make_layout(
+                (total_q, self.candidate_topk_count),
+                stride=(self.candidate_topk_count, 1),
+            ),
+        )
+        for batch_idx in dsl_range(batch_count, unroll=1):
+            begin = dtypes.int64(0)
+            end = dtypes.int64(total_q)
+            if self.has_cu_seqlens_q:
+                begin = dtypes.int64(cu_seqlens_q[batch_idx])
+                end = dtypes.int64(cu_seqlens_q[batch_idx + 1])
+            used = dtypes.int64(seqused_q[batch_idx])
+            first_padding = (
+                (used + self.query_rows - 1) // self.query_rows
+            ) * self.query_rows
+            offset = first_padding + worker * self.query_rows
+            while offset < end - begin:
+                self._store_empty_rows(
+                    indices,
+                    bits,
+                    candidates,
+                    candidate_bits,
+                    candidate_length,
+                    begin + offset,
+                    dtypes.int32(min(self.query_rows, end - begin - offset)),
+                )
+                offset += dtypes.int64(worker_count) * self.query_rows
+
+    @jit
     def _compute_task(
         self,
         query: Tensor,
@@ -6546,46 +6700,15 @@ class QliFusedKernel:
                 row_ld,
             )
         else:
-            for row_in_subblock in range_constexpr(self.query_rows // 2):
-                local_row = dtypes.int32(
-                    get_subblock_id() * (self.query_rows // 2) + row_in_subblock
-                )
-                public_row = dtypes.int64(public_row_base) + dtypes.int64(local_row)
-                _workspace_row = (
-                    workspace_task_idx * self.query_rows
-                    + get_subblock_id() * (self.query_rows // 2)
-                    + row_in_subblock
-                )
-                if local_row < task_span_count:
-                    self.topk.store_empty_row(
-                        tile_slice(
-                            sparse_indices,
-                            (1, self.topk_count),
-                            (public_row, 0),
-                        ),
-                        tile_slice(
-                            sparse_value_bits,
-                            (1, self.topk_count),
-                            (public_row, 0),
-                        ),
-                    )
-                    if self.candidate_enabled:
-                        self.candidate_topk.store_empty_row(
-                            tile_slice(
-                                candidate_indices,
-                                (1, self.candidate_topk_count),
-                                (public_row, 0),
-                            ),
-                            tile_slice(
-                                candidate_value_bits,
-                                (1, self.candidate_topk_count),
-                                (public_row, 0),
-                            ),
-                        )
-            if self.candidate_enabled:
-                self.vector.store_empty_candidate_lengths(
-                    candidate_length, public_row_base, task_span_count
-                )
+            self._store_empty_rows(
+                sparse_indices,
+                sparse_value_bits,
+                candidate_indices,
+                candidate_value_bits,
+                candidate_length,
+                public_row_base,
+                task_span_count,
+            )
 
     @jit
     def __call__(
@@ -6650,6 +6773,10 @@ class QliFusedKernel:
                 last_m = (
                     query_end - query_begin + self.query_rows - 1
                 ) // self.query_rows
+                if self.has_seqused_q:
+                    last_m = (
+                        dtypes.int64(used_q) + self.query_rows - 1
+                    ) // self.query_rows
                 if batch_idx == first_b:
                     first_m = dtypes.int64(metadata[worker, 2])
                 if batch_idx == last_b:
@@ -6665,19 +6792,21 @@ class QliFusedKernel:
                     active = min(span, max(dtypes.int32(0), used_q - query_offset))
                     visible = actual_s2
                     if self.mask_mode == 3:
-                        visible = min(
-                            actual_s2,
-                            max(
-                                dtypes.int32(0),
-                                (
-                                    actual_s2 * self.cmp_ratio
-                                    + remainder
-                                    - used_q
-                                    + query_offset
-                                    + active
-                                )
-                                // self.cmp_ratio,
-                            ),
+                        visible = dtypes.int32(
+                            min(
+                                actual_s2,
+                                max(
+                                    dtypes.int32(0),
+                                    (
+                                        dtypes.int64(actual_s2) * self.cmp_ratio
+                                        + remainder
+                                        - used_q
+                                        + query_offset
+                                        + active
+                                    )
+                                    // self.cmp_ratio,
+                                ),
+                            )
                         )
                     if active == 0:
                         visible = dtypes.int32(0)
@@ -6869,6 +6998,21 @@ class QliFusedKernel:
                     if row_ld:
                         workspace_cursor += 1
 
+        if self.has_seqused_q:
+            self._initialize_unscheduled_padding(
+                cu_seqlens_q,
+                seqused_q,
+                candidate_length,
+                worker,
+                worker_count,
+                total_q,
+                batch_count,
+                final_idx_address,
+                final_bits_address,
+                final_candidate_address,
+                final_candidate_bits_address,
+            )
+
 
 _COMPILED_KERNEL: dict[tuple[object, ...], object] = {}
 _COMPILED_KERNEL_LOCK = threading.Lock()
@@ -6946,13 +7090,13 @@ def _build_compiled_fused_runner(
         )
         sparse_indices = make_tensor(
             make_pointer(dtypes.int32, dtypes.int64(sparse_indices_address), MemLoc.GM),
-            make_layout((64 * query_tile_rows, topk), stride=(topk, 1)),
+            make_layout((worker_count * 2 * query_tile_rows, topk), stride=(topk, 1)),
         )
         sparse_value_bits = make_tensor(
             make_pointer(
                 dtypes.uint16, dtypes.int64(sparse_value_bits_address), MemLoc.GM
             ),
-            make_layout((64 * query_tile_rows, topk), stride=(topk, 1)),
+            make_layout((worker_count * 2 * query_tile_rows, topk), stride=(topk, 1)),
         )
         final_sparse_bits = make_tensor(
             make_pointer(
@@ -6977,7 +7121,8 @@ def _build_compiled_fused_runner(
                 dtypes.int32, dtypes.int64(candidate_indices_address), MemLoc.GM
             ),
             make_layout(
-                (64 * query_tile_rows, candidate_topk), stride=(candidate_topk, 1)
+                (worker_count * 2 * query_tile_rows, candidate_topk),
+                stride=(candidate_topk, 1),
             ),
         )
         candidate_value_bits = make_tensor(
@@ -6985,7 +7130,8 @@ def _build_compiled_fused_runner(
                 dtypes.uint16, dtypes.int64(candidate_value_bits_address), MemLoc.GM
             ),
             make_layout(
-                (64 * query_tile_rows, candidate_topk), stride=(candidate_topk, 1)
+                (worker_count * 2 * query_tile_rows, candidate_topk),
+                stride=(candidate_topk, 1),
             ),
         )
         query = make_tensor(
@@ -7191,7 +7337,11 @@ def _build_compiled_fused_runner(
     candidate_width = cannbotdsl.Dim("CANDIDATE_WIDTH")
     partial_rows = cannbotdsl.Dim("PARTIAL_ROWS")
     _metadata_tasks = cannbotdsl.Dim("METADATA_TASKS")
-    workspace_rows = MAX_CUBE_WORKERS * (query_tile_m // query_head_count)
+    workspace_rows = cannbotdsl.Dim(
+        "WORKSPACE_ROWS",
+        min=1,
+        max=MAX_CUBE_WORKERS * (query_tile_m // query_head_count),
+    )
     fake = TensorSpec
     dummy_i32_spec = fake((1,), dtypes.int32)
     cu_spec = (
@@ -7580,20 +7730,24 @@ def quant_lightning_indexer(
     if metadata.device != q.device:
         raise ValueError("Metadata must be on the same device as q")
     metadata = metadata.view(METADATA_ROWS, METADATA_FIELDS)
-    worker_count = MAX_CUBE_WORKERS
-    workspace_row_count = MAX_CUBE_WORKERS * (tile_m // query_heads)
+    worker_count = _get_cube_core_num(q.device)
+    workspace_row_count = worker_count * (tile_m // query_heads)
     shard_pad = tokens_pad
     # Public outputs and GM scratch are allocation-only Torch calls.  The
     # fused kernel writes every public row, including invalid/padded rows.
     sparse_indices_2d = torch.empty(
-        (64 * query_tile_rows, int(topk)), dtype=torch.int32, device=query.device
+        (worker_count * 2 * query_tile_rows, int(topk)),
+        dtype=torch.int32,
+        device=query.device,
     )
     sparse_values_2d = torch.empty(
-        (64 * query_tile_rows, int(topk)), dtype=torch.bfloat16, device=weights.device
+        (worker_count * 2 * query_tile_rows, int(topk)),
+        dtype=torch.bfloat16,
+        device=weights.device,
     )
     candidate_count = max(0, int(candidate_topk_blocks))
     candidate_indices_2d = torch.empty(
-        (64 * query_tile_rows, candidate_count),
+        (worker_count * 2 * query_tile_rows, candidate_count),
         dtype=torch.int32,
         device=query.device,
     )
@@ -7621,7 +7775,7 @@ def quant_lightning_indexer(
         else torch.empty((1, split_count), dtype=torch.int32, device=query.device)
     )
     candidate_value_workspace = torch.empty(
-        (64 * query_tile_rows, kernel_candidate_count),
+        (worker_count * 2 * query_tile_rows, kernel_candidate_count),
         dtype=torch.uint16,
         device=query.device,
     )
@@ -7692,7 +7846,7 @@ def quant_lightning_indexer(
         final_candidate_indices.data_ptr(),
         final_candidate_bits.data_ptr(),
         int(return_value),
-        min(64, t),
+        min(worker_count * 2, t),
         0 if output_idx_offset is None else output_idx_offset.data_ptr(),
     )
 
@@ -8102,13 +8256,13 @@ def _build_tnd_compiled_fused_runner(
         )
         sparse_indices = make_tensor(
             make_pointer(dtypes.int32, dtypes.int64(sparse_indices_address), MemLoc.GM),
-            make_layout((64 * query_tile_rows, topk), stride=(topk, 1)),
+            make_layout((worker_count * 2 * query_tile_rows, topk), stride=(topk, 1)),
         )
         sparse_value_bits = make_tensor(
             make_pointer(
                 dtypes.uint16, dtypes.int64(sparse_value_bits_address), MemLoc.GM
             ),
-            make_layout((64 * query_tile_rows, topk), stride=(topk, 1)),
+            make_layout((worker_count * 2 * query_tile_rows, topk), stride=(topk, 1)),
         )
         final_sparse_bits = make_tensor(
             make_pointer(
@@ -8133,7 +8287,8 @@ def _build_tnd_compiled_fused_runner(
                 dtypes.int32, dtypes.int64(candidate_indices_address), MemLoc.GM
             ),
             make_layout(
-                (64 * query_tile_rows, candidate_topk), stride=(candidate_topk, 1)
+                (worker_count * 2 * query_tile_rows, candidate_topk),
+                stride=(candidate_topk, 1),
             ),
         )
         candidate_value_bits = make_tensor(
@@ -8141,7 +8296,8 @@ def _build_tnd_compiled_fused_runner(
                 dtypes.uint16, dtypes.int64(candidate_value_bits_address), MemLoc.GM
             ),
             make_layout(
-                (64 * query_tile_rows, candidate_topk), stride=(candidate_topk, 1)
+                (worker_count * 2 * query_tile_rows, candidate_topk),
+                stride=(candidate_topk, 1),
             ),
         )
         query = make_tensor(
@@ -8347,7 +8503,11 @@ def _build_tnd_compiled_fused_runner(
     candidate_width = cannbotdsl.Dim("CANDIDATE_WIDTH")
     partial_rows = cannbotdsl.Dim("PARTIAL_ROWS")
     _metadata_tasks = cannbotdsl.Dim("METADATA_TASKS")
-    workspace_rows = MAX_CUBE_WORKERS * (query_tile_m // query_head_count)
+    workspace_rows = cannbotdsl.Dim(
+        "WORKSPACE_ROWS",
+        min=1,
+        max=MAX_CUBE_WORKERS * (query_tile_m // query_head_count),
+    )
     fake = TensorSpec
     dummy_i32_spec = fake((1,), dtypes.int32)
     cu_spec = (
@@ -8654,20 +8814,24 @@ def _run_tnd(
     if metadata.device != q.device:
         raise ValueError("Metadata must be on the same device as q")
     metadata = metadata.view(METADATA_ROWS, METADATA_FIELDS)
-    worker_count = MAX_CUBE_WORKERS
-    workspace_row_count = MAX_CUBE_WORKERS * (tile_m // query_heads)
+    worker_count = _get_cube_core_num(q.device)
+    workspace_row_count = worker_count * (tile_m // query_heads)
     shard_pad = tokens_pad
     # Public outputs and GM scratch are allocation-only Torch calls.  The
     # fused kernel writes every public row, including invalid/padded rows.
     sparse_indices_2d = torch.empty(
-        (64 * query_tile_rows, int(topk)), dtype=torch.int32, device=query.device
+        (worker_count * 2 * query_tile_rows, int(topk)),
+        dtype=torch.int32,
+        device=query.device,
     )
     sparse_values_2d = torch.empty(
-        (64 * query_tile_rows, int(topk)), dtype=torch.bfloat16, device=weights.device
+        (worker_count * 2 * query_tile_rows, int(topk)),
+        dtype=torch.bfloat16,
+        device=weights.device,
     )
     candidate_count = max(0, int(candidate_topk_blocks))
     candidate_indices_2d = torch.empty(
-        (64 * query_tile_rows, candidate_count),
+        (worker_count * 2 * query_tile_rows, candidate_count),
         dtype=torch.int32,
         device=query.device,
     )
@@ -8695,7 +8859,7 @@ def _run_tnd(
         else torch.empty((1, split_count), dtype=torch.int32, device=query.device)
     )
     candidate_value_workspace = torch.empty(
-        (64 * query_tile_rows, kernel_candidate_count),
+        (worker_count * 2 * query_tile_rows, kernel_candidate_count),
         dtype=torch.uint16,
         device=query.device,
     )
@@ -8766,7 +8930,7 @@ def _run_tnd(
         final_candidate_indices.data_ptr(),
         final_candidate_bits.data_ptr(),
         int(return_value),
-        min(64, t),
+        min(worker_count * 2, t),
         0 if output_idx_offset is None else output_idx_offset.data_ptr(),
     )
 

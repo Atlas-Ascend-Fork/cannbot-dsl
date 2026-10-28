@@ -80,8 +80,6 @@ def metadata_kernel(args: Args):
     if args.sparse != 0:
         groups = total_q
     workers = args.workers
-    if args.sparse != 0:
-        workers = 32
     # 调度开销按有效 M 轴长度计算，尾组只计入实际 query 行。
     for i in range(METADATA_ELEMENTS):
         args.output[i] = 0
@@ -414,7 +412,12 @@ def build_metadata(
     output_idx_offset=None,
 ):
     groups = q.shape[0] if sparse else batch * max_tasks
-    workers = 32
+    workers = int(torch.npu.get_device_properties(q.device).cube_core_num)
+    if not 1 <= workers <= LD_RECORD_START:
+        raise RuntimeError(
+            f"Unsupported Cube core count {workers}; "
+            f"LI metadata supports 1..{LD_RECORD_START}"
+        )
     output = torch.empty((METADATA_ELEMENTS,), dtype=torch.int32, device=q.device)
     scratch = torch.empty(
         (groups * (12 + 3 * splits),), dtype=torch.int64, device=q.device
