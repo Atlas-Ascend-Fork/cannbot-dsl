@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="432" viewBox="0 0 1000 270" role="img" aria-labelledby="write_gm_bypass_dcache-title write_gm_bypass_dcache-desc">
+  <title id="write_gm_bypass_dcache-title">多核数据随机覆盖问题示意图</title>
+  <desc id="write_gm_bypass_dcache-desc">Editable vector diagram reconstructed from the preserved write_gm_bypass_dcache.png; text uses FZLanTingHei-R-GBK.</desc>
+  <defs>
+    <marker id="write_gm_bypass_dcache-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#696d75" />
+    </marker>
+    <marker id="write_gm_bypass_dcache-ink-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#101843" />
+    </marker>
+    <marker id="write_gm_bypass_dcache-blue-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#5277ff" />
+    </marker>
+  </defs>
+  <rect x="0" y="0" width="1000" height="270" fill="#fff" stroke="none" stroke-width="1" rx="0" />
+  <g>
+    <rect x="0" y="50" width="175" height="75" fill="#b6e9fa" stroke="none" stroke-width="1" rx="12" />
+    <rect x="225" y="50" width="287" height="75" fill="#b0f0e2" stroke="none" stroke-width="1" rx="12" />
+    <line x1="175" y1="88" x2="225" y2="88" stroke="#101843" stroke-width="1.5" marker-end="url(#write_gm_bypass_dcache-ink-arrow)" />
+    <rect x="0" y="193" width="175" height="75" fill="#b6e9fa" stroke="none" stroke-width="1" rx="12" />
+    <rect x="225" y="193" width="287" height="75" fill="#b0f0e2" stroke="none" stroke-width="1" rx="12" />
+    <line x1="175" y1="231" x2="225" y2="231" stroke="#101843" stroke-width="1.5" marker-end="url(#write_gm_bypass_dcache-ink-arrow)" />
+    <path d="M512 88H525V232H512" stroke="#101843" stroke-width="1" fill="none" />
+    <line x1="525" y1="160" x2="723" y2="160" stroke="#101843" stroke-width="1.5" marker-end="url(#write_gm_bypass_dcache-ink-arrow)" />
+    <rect x="725" y="122" width="275" height="75" fill="#c2d5fe" stroke="none" stroke-width="1" rx="12" />
+  </g>
+  <g fill="#171717" font-family="FZLanTingHei-R-GBK, 方正兰亭黑_GBK, sans-serif" font-size="12" font-weight="400">
+    <text x="500" y="24" font-size="21.00" text-anchor="middle" fill="#171717">经DCache写入：非Cache Line对齐时存在覆盖风险</text>
+    <text x="87.5" y="81" font-size="20.00" text-anchor="middle" fill="#171717">Core0</text>
+    <text x="87.5" y="108" font-size="20.00" text-anchor="middle" fill="#171717">在addrA写数据A</text>
+    <text x="368.5" y="81" font-size="20.00" text-anchor="middle" fill="#171717">Core0的DCache</text>
+    <text x="368.5" y="108" font-size="20.00" text-anchor="middle" fill="#171717">读入并修改整条Cache Line</text>
+    <text x="87.5" y="224" font-size="20.00" text-anchor="middle" fill="#171717">Core1</text>
+    <text x="87.5" y="251" font-size="20.00" text-anchor="middle" fill="#171717">在addrB写数据B</text>
+    <text x="368.5" y="224" font-size="20.00" text-anchor="middle" fill="#171717">Core1的DCache</text>
+    <text x="368.5" y="251" font-size="20.00" text-anchor="middle" fill="#171717">读入并修改整条Cache Line</text>
+    <text x="620" y="126" font-size="18.00" text-anchor="middle" fill="#171717">如果addrA和addrB落在</text>
+    <text x="620" y="150.3" font-size="18.00" text-anchor="middle" fill="#171717">同一个64B对齐区间内</text>
+    <text x="862.5" y="153" font-size="20.00" text-anchor="middle" fill="#171717">同一条GM Cache Line</text>
+    <text x="862.5" y="180" font-size="20.00" text-anchor="middle" fill="#171717">A与B可能相互覆盖</text>
+  </g>
+</svg>

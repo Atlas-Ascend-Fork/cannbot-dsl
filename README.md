@@ -2,9 +2,7 @@
 
 > 基于 CANNBot-DSL 的 Ascend NPU 复杂算子样例集合，配套完整的文档站与精度测试。
 
-<sub><span style="color:#999999">当前为尝鲜版本，CANNBot-DSL 的 API 接口不保证兼容性，后续版本可能发生变更。</span></sub>
-
-[📖 概述](#概述) · [💻 软硬件配套](#软硬件配套说明) · [⚡️ 快速上手](#快速上手) · [📦 算子列表](#算子列表) · [📚 文档导航](#文档导航) · [📂 目录结构](#目录结构) · [🔥 更新日志](CHANGELOG.md) · [📜 许可证](LICENSE)
+[📖 概述](docs/zh/guide/overview.md) · [💻 软硬件配套](docs/zh/guide/hardware-model.md) · [⚡️ 快速上手](docs/zh/install/source-build.md) · [📦 算子列表](samples/) · [📚 文档导航](docs/zh/api/index.md) · [📂 目录结构](docs/zh/guide/repository.md) · [🔥 更新日志](CHANGELOG.md) · [📜 许可证](LICENSE)
 
 <!-- TODO(发布后)：补顶部徽章行（许可证 / 文档站 / CANN 版本 / 所属 SIG）。 -->
 <!-- TODO(发布后)：补语言切换入口（中文 | English）。本次仅提供中文。 -->
@@ -19,7 +17,7 @@
 >
 > - **🚀 新增 17 个算子样例，并更新既有算子适配最新 CANNBot-DSL**。其中，[Sparse Flash Attention](samples/sparse_flash_attention) 在典型场景下**最高加速比达到 1.63 倍**；[Qwen Sparse Attention](samples/qwen_sparse_attn) 在长 KV decode 场景下**平均加速比达到 1.23 倍**。更多性能数据与测试口径请参见对应样例 README，其余算子的详细信息请参见下方的算子列表。
 >
-> - **🛠 支持样例运行与自定义算子的调试开发**：CANNBot-DSL 0.7.0 版本发布，可直接通过 `python -m pip install cannbot-dsl` 安装；本仓样例可直接运行，自定义算子可通过 `net/native_package` 编译打包为 Native 算子包。使用说明见[快速上手](#快速上手)，打包方式见 [Native 打包说明](net/native_package/README.md)，接口与调试能力见 [API 文档](https://cannbot-dsl.gitcode.com/api/)。
+> - **🛠 支持样例运行与自定义算子的调试开发**：CANNBot-DSL 0.7.0 版本发布，可直接通过 `python -m pip install cannbot-dsl` 安装；本仓样例可直接运行，自定义算子可通过 `net/native_package` 编译打包为 Native 算子包。使用说明见[快速上手](docs/zh/install/source-build.md)，打包方式见 [Native 打包说明](net/native_package/README.md)，接口与调试能力见 [API 文档](docs/zh/api/index.md)。
 
 <!-- TODO(算子全量合入后)：本节只保留当前这批重大更新，跟随后续合入滚动替换，
      顶部那行日期（现为 2026-09-30）需一并更新为最新一批的合入日期。
@@ -38,7 +36,7 @@ CANNBot 是 [CANN](https://hiascend.com/software/cann) 社区的 Infra 智能体
 
 本仓（cannbot-dsl）是其 DSL 仓，提供 Agent 亲和的编程范式；仓群还包括 [cannbot](https://gitcode.com/cann/cannbot)、[cannbot-skills](https://gitcode.com/cann/cannbot-skills)、[cannbot-knowledge](https://gitcode.com/cann/cannbot-knowledge)、[cann-bench](https://gitcode.com/cann/cann-bench)、[cannbot-sentry](https://gitcode.com/cann/cannbot-sentry) 等仓库，结构如下。
 
-![CANNBot 仓群结构](docs/figures/cannbot-repo-map.png)
+![CANNBot 仓群结构](docs/project/public/cannbot-repo-map.png)
 
 ## 💻 软硬件配套说明
 
@@ -209,47 +207,27 @@ python3 -m pytest test/sparse_flash_attention/test_sparse_flash_attention.py -v
 | [pointnet_sa](samples/pointnet_sa) | `pointnet_sa()` | PointNet++ SA 层的 shared MLP + max-pool |
 | [voxel_conv](samples/voxel_conv) | `voxel_conv()` | VoxelNet Convolutional Middle Layers |
 
-<!-- TODO(算子全量合入后)：补全本表（不要漏掉后续合入的算子）。当前已知缺口：
-     1) scripts/ci/operator_list.yaml 与 test/test_config.yaml 登记的算子均已有对应样例目录，无缺口。
-     2) docs/examples/index.md 的样例索引仍滞后（仅 10 行），缺 batch_matmul、matmul_streamk、
-        quant_matmul 的另两个实现、flash_attn_fp8_fullquant、sparse_flash_attention、qwen_sparse_attn、
-        flash_mla_with_kvcache、quant_block_sparse_attn、mixed_quant_sparse_flash_mla 及其 metadata、
-        indexer_prologue_qw、indexer_prologue_k、qsa_indexer、stem_indexer、QLI/QSLI 及其 metadata、
-        engram_gate、attn_epilogue 等，需同步。
-     3) figures/ 下 17 张图均已被引用；但 attn_prologue、attn_epilogue、indexer_prologue_k、mixed_quant_sparse_flash_mla、
-        qsa_indexer、quant_lightning_indexer_dsl、quant_sparse_lightning_indexer_dsl 等样例的 README
-        已给出性能数据，尚无对应性能对比图。
-     4) `flash_kda_metadata`、`fused_recurrent_kda_snapshot` 两个样例已在本轮撤并（前者的实现并入
-        `samples/flash_kda/`，后者删除），CHANGELOG.md 中两者的历史条目保留未动，发布前需确认口径。 -->
-
 ## 📚 文档导航
 
-接口文档发布在文档站 <https://cannbot-dsl.gitcode.com/api/>；算子样例、测试与仓库结构不另设站点页面，直接阅读仓内文件。
+接口文档的入口是 [API 参考](docs/zh/api/index.md)；算子样例、测试与仓库结构不另设站点页面，直接阅读仓内文件。
 
 | 内容 | 说明 | 入口 |
 | :--- | :--- | :--- |
-| API 总览 | Host / Kernel / AI CPU 三类公共接口，以及 AOT 编译与 Native 算子包发布 | [/api/](https://cannbot-dsl.gitcode.com/api/) |
-| Host API | 数据描述（`TensorSpec` / `TensorListSpec` / `Dim`）与平台信息接口 | [/api/host/](https://cannbot-dsl.gitcode.com/api/host/) |
-| Kernel API | 类型与视图、控制流、数据搬运、Cube 与寄存器计算、同步与缓存、系统变量 | [/api/kernel/](https://cannbot-dsl.gitcode.com/api/kernel/) |
-| AI CPU API | AI CPU 侧调度接口 | [/api/aicpu/](https://cannbot-dsl.gitcode.com/api/aicpu/) |
-| 装饰器 | `@host`、`@jit`、`@kernel` 等六个装饰器说明 | [/api/decorators.html](https://cannbot-dsl.gitcode.com/api/decorators.html) |
-| 接口清单 | 全部接口的索引 | [/api/api-list.html](https://cannbot-dsl.gitcode.com/api/api-list.html) |
+| API 总览 | 按语言、数据结构、操作、执行、编译发布和 AI CPU 组织的 API 参考 | [docs/zh/api/index.md](docs/zh/api/index.md) |
+| 语言 API | 装饰器、控制流、VF、编译期表达式和 Kernel 启动 | [docs/zh/api/language/index.md](docs/zh/api/language/index.md) |
+| 数据结构 | 数据类型、Tensor、布局、片上存储、Buffer、RingBuffer 和数组 | [docs/zh/api/data-structures/index.md](docs/zh/api/data-structures/index.md) |
+| 操作 API | 数据搬运、标量、矢量、矩阵、原子和张量操作 | [docs/zh/api/compute/index.md](docs/zh/api/compute/index.md) |
+| 设备执行 | 设备执行上下文、流水类型、调试和已公开的同步接口 | [docs/zh/api/execution/index.md](docs/zh/api/execution/index.md) |
+| 编译与发布 | Host 参数规格、JIT/AOT 编译、Native 发布和 ACLNN 工程接入 | [docs/zh/api/compilation/index.md](docs/zh/api/compilation/index.md) |
+| AI CPU API | AI CPU Kernel 的声明、参数、编译、验证和启动 | [docs/zh/api/aicpu/index.md](docs/zh/api/aicpu/index.md) |
 | 算子样例 | 各样例目录下的 README：接口签名、数据类型约束与运行方式 | [samples/](samples/) |
 | 精度测试 | 与样例一一对应的 pytest 用例 | [test/](test/) |
 | Native 打包 | 把 `samples/` 下的算子编译打包为 Native wheel | [net/native_package/README.md](net/native_package/README.md) |
 | 更新日志 | 版本与算子变更记录 | [CHANGELOG.md](CHANGELOG.md) |
 
-<!-- TODO(文档站新增 API 分区后)：同步扩充本表。
-     TODO：本仓暂不提供「复现与调试开发」的独立文档，`快速上手` 与各样例 README 覆盖复现步骤，
-     调试能力见 API 文档的 Kernel API 部分；待该指南成型后在本表补一行。 -->
-<!-- TODO(托管支持 cleanUrls 后)：`/api/decorators.html`、`/api/api-list.html` 两个叶子页现带 `.html`。
-     站点 VitePress 配置为 `cleanUrls: true`，但托管层未做 rewrite，无后缀的叶子页冷启动会 404
-     （目录页如 `/api/`、`/api/host/` 不受影响），故按可直接访问的形态书写；
-     托管侧补上 rewrite 后可去掉后缀。 -->
-
 ## 📂 目录结构
 
-关键目录如下，详细目录参见[仓库结构](docs/zh/guide/project/repository.md)。
+关键目录如下，详细目录参见[仓库结构](docs/zh/guide/repository.md)。
 
 ```bash
 cannbot-dsl/
@@ -261,14 +239,10 @@ cannbot-dsl/
 └── scripts/       # CI 与合规检查脚本
 ```
 
-<!-- TODO：本节与 docs/guide/repository.md 的分工是「简版索引 / 详版说明」。
-     但两处集合目前不一致（repository.md 多列了 build.sh 与 requirements.txt、缺 net/ 与
-     install_deps.sh），描述措辞也不同，需对齐。该文件不在本次改动范围内。 -->
-
 ## 📝 相关信息
 
 - [更新日志](CHANGELOG.md)
-- [参与贡献](docs/zh/project/community/contributing.md)
+- [文档贡献指南](CONTRIBUTION_DOC.md)
 - [许可证](LICENSE)：CANN Open Software License Agreement Version 2.0
 
 ---

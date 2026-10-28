@@ -1,0 +1,91 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="613" height="245" viewBox="0 0 613 245" role="img" aria-labelledby="reg_scatter-title reg_scatter-desc">
+  <title id="reg_scatter-title">reg scatter示意图</title>
+  <desc id="reg_scatter-desc">Editable vector diagram reconstructed from the preserved reg_scatter.png; text uses FZLanTingHei-R-GBK.</desc>
+  <defs>
+    <marker id="reg_scatter-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#696d75" />
+    </marker>
+    <marker id="reg_scatter-ink-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#101843" />
+    </marker>
+    <marker id="reg_scatter-blue-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#5277ff" />
+    </marker>
+  </defs>
+  <rect x="0" y="0" width="613" height="245" fill="#fff" stroke="none" stroke-width="1" rx="0" />
+  <g>
+    <rect x="94" y="4" width="50" height="42" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="151" y="4" width="50" height="42" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="208" y="4" width="50" height="42" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="265" y="4" width="50" height="42" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="322" y="4" width="50" height="42" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="379" y="4" width="50" height="42" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="436" y="4" width="50" height="42" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="493" y="4" width="50" height="42" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="89" y="0" width="459" height="50" fill="none" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="94" y="79" width="50" height="42" fill="#b0f0e2" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="151" y="79" width="50" height="42" fill="#b0f0e2" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="208" y="79" width="50" height="42" fill="#b0f0e2" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="265" y="79" width="50" height="42" fill="#b0f0e2" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="322" y="79" width="50" height="42" fill="#b0f0e2" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="379" y="79" width="50" height="42" fill="#b0f0e2" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="436" y="79" width="50" height="42" fill="#b0f0e2" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="493" y="79" width="50" height="42" fill="#b0f0e2" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="89" y="75" width="459" height="50" fill="none" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="94" y="198" width="50" height="42" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="151" y="198" width="50" height="42" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="208" y="198" width="50" height="42" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="265" y="198" width="50" height="42" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="322" y="198" width="50" height="42" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="379" y="198" width="50" height="42" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="436" y="198" width="50" height="42" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="493" y="198" width="50" height="42" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="550" y="198" width="50" height="42" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="89" y="194" width="516" height="50" fill="none" stroke="#101843" stroke-width="1" rx="0" />
+    <line x1="119.0" y1="46" x2="119.0" y2="78" stroke="#696d75" stroke-width="1.3" marker-end="url(#reg_scatter-arrow)" />
+    <line x1="176.0" y1="46" x2="176.0" y2="78" stroke="#696d75" stroke-width="1.3" marker-end="url(#reg_scatter-arrow)" />
+    <line x1="233.0" y1="46" x2="233.0" y2="78" stroke="#696d75" stroke-width="1.3" marker-end="url(#reg_scatter-arrow)" />
+    <line x1="290.0" y1="46" x2="290.0" y2="78" stroke="#696d75" stroke-width="1.3" marker-end="url(#reg_scatter-arrow)" />
+    <line x1="347.0" y1="46" x2="347.0" y2="78" stroke="#696d75" stroke-width="1.3" marker-end="url(#reg_scatter-arrow)" />
+    <line x1="404.0" y1="46" x2="404.0" y2="78" stroke="#696d75" stroke-width="1.3" marker-end="url(#reg_scatter-arrow)" />
+    <line x1="461.0" y1="46" x2="461.0" y2="78" stroke="#696d75" stroke-width="1.3" marker-end="url(#reg_scatter-arrow)" />
+    <line x1="518.0" y1="46" x2="518.0" y2="78" stroke="#696d75" stroke-width="1.3" marker-end="url(#reg_scatter-arrow)" />
+    <line x1="119.0" y1="121" x2="290.0" y2="197" stroke="#696d75" stroke-width="1.4" marker-end="url(#reg_scatter-arrow)" />
+    <line x1="176.0" y1="121" x2="233.0" y2="197" stroke="#696d75" stroke-width="1.4" marker-end="url(#reg_scatter-arrow)" />
+    <line x1="233.0" y1="121" x2="347.0" y2="197" stroke="#696d75" stroke-width="1.4" marker-end="url(#reg_scatter-arrow)" />
+    <line x1="290.0" y1="121" x2="176.0" y2="197" stroke="#696d75" stroke-width="1.4" marker-end="url(#reg_scatter-arrow)" />
+    <line x1="347.0" y1="121" x2="518.0" y2="197" stroke="#696d75" stroke-width="1.4" marker-end="url(#reg_scatter-arrow)" />
+    <line x1="404.0" y1="121" x2="119.0" y2="197" stroke="#696d75" stroke-width="1.4" marker-end="url(#reg_scatter-arrow)" />
+    <line x1="518.0" y1="121" x2="404.0" y2="197" stroke="#696d75" stroke-width="1.4" marker-end="url(#reg_scatter-arrow)" />
+  </g>
+  <g fill="#171717" font-family="FZLanTingHei-R-GBK, 方正兰亭黑_GBK, sans-serif" font-size="12" font-weight="400">
+    <text x="119" y="29.2" font-size="12.00" text-anchor="middle" fill="#171717">elm0</text>
+    <text x="176" y="29.2" font-size="12.00" text-anchor="middle" fill="#171717">elm1</text>
+    <text x="233" y="29.2" font-size="12.00" text-anchor="middle" fill="#171717">elm2</text>
+    <text x="290" y="29.2" font-size="12.00" text-anchor="middle" fill="#171717">elm3</text>
+    <text x="347" y="29.2" font-size="12.00" text-anchor="middle" fill="#171717">elm4</text>
+    <text x="404" y="29.2" font-size="12.00" text-anchor="middle" fill="#171717">elm5</text>
+    <text x="461" y="29.2" font-size="12.00" text-anchor="middle" fill="#171717">...</text>
+    <text x="518" y="29.2" font-size="12.00" text-anchor="middle" fill="#171717">elmN</text>
+    <text x="119" y="104.2" font-size="12.00" text-anchor="middle" fill="#171717">3</text>
+    <text x="176" y="104.2" font-size="12.00" text-anchor="middle" fill="#171717">2</text>
+    <text x="233" y="104.2" font-size="12.00" text-anchor="middle" fill="#171717">4</text>
+    <text x="290" y="104.2" font-size="12.00" text-anchor="middle" fill="#171717">1</text>
+    <text x="347" y="104.2" font-size="12.00" text-anchor="middle" fill="#171717">N</text>
+    <text x="404" y="104.2" font-size="12.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="461" y="104.2" font-size="12.00" text-anchor="middle" fill="#171717">...</text>
+    <text x="518" y="104.2" font-size="12.00" text-anchor="middle" fill="#171717">5</text>
+    <text x="119" y="223.2" font-size="12.00" text-anchor="middle" fill="#171717">elm5</text>
+    <text x="176" y="223.2" font-size="12.00" text-anchor="middle" fill="#171717">elm3</text>
+    <text x="233" y="223.2" font-size="12.00" text-anchor="middle" fill="#171717">elm1</text>
+    <text x="290" y="223.2" font-size="12.00" text-anchor="middle" fill="#171717">elm0</text>
+    <text x="347" y="223.2" font-size="12.00" text-anchor="middle" fill="#171717">elm2</text>
+    <text x="404" y="223.2" font-size="12.00" text-anchor="middle" fill="#171717">elmN</text>
+    <text x="461" y="223.2" font-size="12.00" text-anchor="middle" fill="#171717">...</text>
+    <text x="518" y="223.2" font-size="12.00" text-anchor="middle" fill="#171717">elm4</text>
+    <text x="575" y="223.2" font-size="12.00" text-anchor="middle" fill="#171717">...</text>
+    <text x="60" y="29" font-size="14.00" text-anchor="end" fill="#171717">src</text>
+    <text x="71" y="103" font-size="14.00" text-anchor="end" fill="#171717">index</text>
+    <text x="72" y="226" font-size="14.00" text-anchor="end" fill="#171717">tensor</text>
+  </g>
+</svg>

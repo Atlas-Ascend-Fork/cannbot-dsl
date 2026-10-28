@@ -1,0 +1,180 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1031" height="267" viewBox="0 0 1031 267">
+<defs><marker id="arrow" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0 0L10 4L0 8Z" fill="#12194b"/></marker></defs>
+<rect x="16" y="30" width="817" height="207" rx="0" fill="#fff" stroke="none" stroke-width="1"/>
+<rect x="16" y="50" width="186" height="75" rx="0" fill="#ebebeb" stroke="none" stroke-width="1"/>
+<rect x="16" y="139" width="186" height="78" rx="0" fill="#ebebeb" stroke="none" stroke-width="1"/>
+<rect x="219" y="50" width="186" height="75" rx="0" fill="#ebebeb" stroke="none" stroke-width="1"/>
+<rect x="219" y="139" width="186" height="78" rx="0" fill="#ebebeb" stroke="none" stroke-width="1"/>
+<rect x="423" y="50" width="186" height="75" rx="0" fill="#ebebeb" stroke="none" stroke-width="1"/>
+<rect x="423" y="139" width="186" height="78" rx="0" fill="#ebebeb" stroke="none" stroke-width="1"/>
+<rect x="628" y="50" width="186" height="75" rx="0" fill="#ebebeb" stroke="none" stroke-width="1"/>
+<rect x="628" y="139" width="186" height="78" rx="0" fill="#ebebeb" stroke="none" stroke-width="1"/>
+<rect x="69.5" y="68" width="74" height="52" rx="3" fill="#c1d3fc" stroke="none" stroke-width="1"/>
+<g transform="translate(106.5 0) scale(1 1) translate(-106.5 0)">
+<text x="106.5" y="89" text-anchor="middle" fill="#171717" font-family="FZLanTingHeiS-R-GB, 方正兰亭黑简体, sans-serif" font-size="12" font-weight="400">
+<tspan x="106.5" dy="0">block</tspan>
+<tspan x="106.5" dy="20">0</tspan>
+</text></g>
+<rect x="272.5" y="68" width="74" height="52" rx="3" fill="#c1d3fc" stroke="none" stroke-width="1"/>
+<g transform="translate(309.5 0) scale(1 1) translate(-309.5 0)">
+<text x="309.5" y="89" text-anchor="middle" fill="#171717" font-family="FZLanTingHeiS-R-GB, 方正兰亭黑简体, sans-serif" font-size="12" font-weight="400">
+<tspan x="309.5" dy="0">block</tspan>
+<tspan x="309.5" dy="20">1</tspan>
+</text></g>
+<rect x="475.5" y="68" width="74" height="52" rx="3" fill="#c1d3fc" stroke="none" stroke-width="1"/>
+<g transform="translate(512.5 0) scale(1 1) translate(-512.5 0)">
+<text x="512.5" y="89" text-anchor="middle" fill="#171717" font-family="FZLanTingHeiS-R-GB, 方正兰亭黑简体, sans-serif" font-size="12" font-weight="400">
+<tspan x="512.5" dy="0">block</tspan>
+<tspan x="512.5" dy="20">2</tspan>
+</text></g>
+<rect x="678.5" y="68" width="74" height="52" rx="3" fill="#c1d3fc" stroke="none" stroke-width="1"/>
+<g transform="translate(715.5 0) scale(1 1) translate(-715.5 0)">
+<text x="715.5" y="89" text-anchor="middle" fill="#171717" font-family="FZLanTingHeiS-R-GB, 方正兰亭黑简体, sans-serif" font-size="12" font-weight="400">
+<tspan x="715.5" dy="0">block</tspan>
+<tspan x="715.5" dy="20">M-1</tspan>
+</text></g>
+<rect x="25" y="157" width="74" height="52" rx="2" fill="#b0eee4" stroke="none" stroke-width="1"/>
+<g transform="translate(62 0) scale(1 1) translate(-62 0)">
+<text x="62" y="179" text-anchor="middle" fill="#171717" font-family="FZLanTingHeiS-R-GB, 方正兰亭黑简体, sans-serif" font-size="12" font-weight="400">
+<tspan x="62" dy="0">subblock</tspan>
+<tspan x="62" dy="20">0</tspan>
+</text></g>
+<rect x="119" y="157" width="74" height="52" rx="2" fill="#b0eee4" stroke="none" stroke-width="1"/>
+<g transform="translate(156 0) scale(1 1) translate(-156 0)">
+<text x="156" y="179" text-anchor="middle" fill="#171717" font-family="FZLanTingHeiS-R-GB, 方正兰亭黑简体, sans-serif" font-size="12" font-weight="400">
+<tspan x="156" dy="0">subblock</tspan>
+<tspan x="156" dy="20">N-1</tspan>
+</text></g>
+<g transform="translate(108 0) scale(1 1) translate(-108 0)">
+<text x="108" y="188" text-anchor="middle" fill="#171717" font-family="FZLanTingHeiS-R-GB, 方正兰亭黑简体, sans-serif" font-size="11" font-weight="400">
+<tspan x="108" dy="0">....</tspan>
+</text></g>
+<rect x="228" y="157" width="74" height="52" rx="2" fill="#b0eee4" stroke="none" stroke-width="1"/>
+<g transform="translate(265 0) scale(1 1) translate(-265 0)">
+<text x="265" y="179" text-anchor="middle" fill="#171717" font-family="FZLanTingHeiS-R-GB, 方正兰亭黑简体, sans-serif" font-size="12" font-weight="400">
+<tspan x="265" dy="0">subblock</tspan>
+<tspan x="265" dy="20">0</tspan>
+</text></g>
+<rect x="322" y="157" width="74" height="52" rx="2" fill="#b0eee4" stroke="none" stroke-width="1"/>
+<g transform="translate(359 0) scale(1 1) translate(-359 0)">
+<text x="359" y="179" text-anchor="middle" fill="#171717" font-family="FZLanTingHeiS-R-GB, 方正兰亭黑简体, sans-serif" font-size="12" font-weight="400">
+<tspan x="359" dy="0">subblock</tspan>
+<tspan x="359" dy="20">N-1</tspan>
+</text></g>
+<g transform="translate(311 0) scale(1 1) translate(-311 0)">
+<text x="311" y="188" text-anchor="middle" fill="#171717" font-family="FZLanTingHeiS-R-GB, 方正兰亭黑简体, sans-serif" font-size="11" font-weight="400">
+<tspan x="311" dy="0">....</tspan>
+</text></g>
+<rect x="432" y="157" width="74" height="52" rx="2" fill="#b0eee4" stroke="none" stroke-width="1"/>
+<g transform="translate(469 0) scale(1 1) translate(-469 0)">
+<text x="469" y="179" text-anchor="middle" fill="#171717" font-family="FZLanTingHeiS-R-GB, 方正兰亭黑简体, sans-serif" font-size="12" font-weight="400">
+<tspan x="469" dy="0">subblock</tspan>
+<tspan x="469" dy="20">0</tspan>
+</text></g>
+<rect x="526" y="157" width="74" height="52" rx="2" fill="#b0eee4" stroke="none" stroke-width="1"/>
+<g transform="translate(563 0) scale(1 1) translate(-563 0)">
+<text x="563" y="179" text-anchor="middle" fill="#171717" font-family="FZLanTingHeiS-R-GB, 方正兰亭黑简体, sans-serif" font-size="12" font-weight="400">
+<tspan x="563" dy="0">subblock</tspan>
+<tspan x="563" dy="20">N-1</tspan>
+</text></g>
+<g transform="translate(515 0) scale(1 1) translate(-515 0)">
+<text x="515" y="188" text-anchor="middle" fill="#171717" font-family="FZLanTingHeiS-R-GB, 方正兰亭黑简体, sans-serif" font-size="11" font-weight="400">
+<tspan x="515" dy="0">....</tspan>
+</text></g>
+<rect x="637" y="157" width="74" height="52" rx="2" fill="#b0eee4" stroke="none" stroke-width="1"/>
+<g transform="translate(674 0) scale(1 1) translate(-674 0)">
+<text x="674" y="179" text-anchor="middle" fill="#171717" font-family="FZLanTingHeiS-R-GB, 方正兰亭黑简体, sans-serif" font-size="12" font-weight="400">
+<tspan x="674" dy="0">subblock</tspan>
+<tspan x="674" dy="20">0</tspan>
+</text></g>
+<rect x="731" y="157" width="74" height="52" rx="2" fill="#b0eee4" stroke="none" stroke-width="1"/>
+<g transform="translate(768 0) scale(1 1) translate(-768 0)">
+<text x="768" y="179" text-anchor="middle" fill="#171717" font-family="FZLanTingHeiS-R-GB, 方正兰亭黑简体, sans-serif" font-size="12" font-weight="400">
+<tspan x="768" dy="0">subblock</tspan>
+<tspan x="768" dy="20">N-1</tspan>
+</text></g>
+<g transform="translate(720 0) scale(1 1) translate(-720 0)">
+<text x="720" y="188" text-anchor="middle" fill="#171717" font-family="FZLanTingHeiS-R-GB, 方正兰亭黑简体, sans-serif" font-size="11" font-weight="400">
+<tspan x="720" dy="0">....</tspan>
+</text></g>
+<rect x="9" y="48" width="810" height="78" rx="0" fill="none" stroke="#ff0000" stroke-width="2"/>
+<rect x="9" y="135" width="810" height="86" rx="0" fill="none" stroke="#ff0000" stroke-width="2"/>
+<rect x="223" y="155" width="177" height="59" rx="0" fill="none" stroke="#ffc000" stroke-width="2"/>
+<rect x="423" y="53" width="186" height="160" rx="0" fill="none" stroke="#00b050" stroke-width="2"/>
+<path d="M498 50 L556 82 L471 230 L414 198 Z" fill="none" stroke="#4472c4" stroke-width="0.7"/>
+<g transform="translate(17 0) scale(1 1) translate(-17 0)">
+<text x="17" y="63" text-anchor="start" fill="#171717" font-family="FZLanTingHeiS-R-GB, 方正兰亭黑简体, sans-serif" font-size="13" font-weight="400">
+<tspan x="17" dy="0">mode 0</tspan>
+</text></g>
+<g transform="translate(17 0) scale(1 1) translate(-17 0)">
+<text x="17" y="149" text-anchor="start" fill="#171717" font-family="FZLanTingHeiS-R-GB, 方正兰亭黑简体, sans-serif" font-size="13" font-weight="400">
+<tspan x="17" dy="0">mode 0</tspan>
+</text></g>
+<g transform="translate(226 0) scale(1 1) translate(-226 0)">
+<text x="226" y="149" text-anchor="start" fill="#171717" font-family="FZLanTingHeiS-R-GB, 方正兰亭黑简体, sans-serif" font-size="13" font-weight="400">
+<tspan x="226" dy="0">mode 1</tspan>
+</text></g>
+<g transform="translate(425 0) scale(1 1) translate(-425 0)">
+<text x="425" y="69" text-anchor="start" fill="#171717" font-family="FZLanTingHeiS-R-GB, 方正兰亭黑简体, sans-serif" font-size="13" font-weight="400">
+<tspan x="425" dy="0">mode 2</tspan>
+</text></g>
+<g transform="translate(457 0) scale(1 1) translate(-457 0)">
+<text x="457" y="144" text-anchor="start" fill="#171717" font-family="FZLanTingHeiS-R-GB, 方正兰亭黑简体, sans-serif" font-size="13" font-weight="400">
+<tspan x="457" dy="0">mode 4</tspan>
+</text></g>
+<line x1="16" y1="29" x2="811" y2="29" stroke="#303030" stroke-width="1"/>
+<line x1="804" y1="25" x2="811" y2="29" stroke="#303030" stroke-width="1"/>
+<line x1="804" y1="33" x2="811" y2="29" stroke="#303030" stroke-width="1"/>
+<g transform="translate(414 0) scale(1 1) translate(-414 0)">
+<text x="414" y="22" text-anchor="middle" fill="#222" font-family="FZLanTingHeiS-R-GB, 方正兰亭黑简体, sans-serif" font-size="14" font-weight="400">
+<tspan x="414" dy="0">M</tspan>
+</text></g>
+<line x1="35" y1="239" x2="186" y2="239" stroke="#303030" stroke-width="1"/>
+<line x1="179" y1="235" x2="186" y2="239" stroke="#303030" stroke-width="1"/>
+<line x1="179" y1="243" x2="186" y2="239" stroke="#303030" stroke-width="1"/>
+<g transform="translate(110.5 0) scale(1 1) translate(-110.5 0)">
+<text x="110.5" y="259" text-anchor="middle" fill="#222" font-family="FZLanTingHeiS-R-GB, 方正兰亭黑简体, sans-serif" font-size="14" font-weight="400">
+<tspan x="110.5" dy="0">N</tspan>
+</text></g>
+<line x1="233" y1="239" x2="385" y2="239" stroke="#303030" stroke-width="1"/>
+<line x1="378" y1="235" x2="385" y2="239" stroke="#303030" stroke-width="1"/>
+<line x1="378" y1="243" x2="385" y2="239" stroke="#303030" stroke-width="1"/>
+<g transform="translate(309.0 0) scale(1 1) translate(-309.0 0)">
+<text x="309.0" y="259" text-anchor="middle" fill="#222" font-family="FZLanTingHeiS-R-GB, 方正兰亭黑简体, sans-serif" font-size="14" font-weight="400">
+<tspan x="309.0" dy="0">N</tspan>
+</text></g>
+<line x1="440" y1="239" x2="592" y2="239" stroke="#303030" stroke-width="1"/>
+<line x1="585" y1="235" x2="592" y2="239" stroke="#303030" stroke-width="1"/>
+<line x1="585" y1="243" x2="592" y2="239" stroke="#303030" stroke-width="1"/>
+<g transform="translate(516.0 0) scale(1 1) translate(-516.0 0)">
+<text x="516.0" y="259" text-anchor="middle" fill="#222" font-family="FZLanTingHeiS-R-GB, 方正兰亭黑简体, sans-serif" font-size="14" font-weight="400">
+<tspan x="516.0" dy="0">N</tspan>
+</text></g>
+<line x1="646" y1="239" x2="797" y2="239" stroke="#303030" stroke-width="1"/>
+<line x1="790" y1="235" x2="797" y2="239" stroke="#303030" stroke-width="1"/>
+<line x1="790" y1="243" x2="797" y2="239" stroke="#303030" stroke-width="1"/>
+<g transform="translate(721.5 0) scale(1 1) translate(-721.5 0)">
+<text x="721.5" y="259" text-anchor="middle" fill="#222" font-family="FZLanTingHeiS-R-GB, 方正兰亭黑简体, sans-serif" font-size="14" font-weight="400">
+<tspan x="721.5" dy="0">N</tspan>
+</text></g>
+<g transform="translate(840 0) scale(1 1) translate(-840 0)">
+<text x="840" y="40" text-anchor="start" fill="#ff0000" font-family="FZLanTingHeiS-R-GB, 方正兰亭黑简体, sans-serif" font-size="12" font-weight="400">
+<tspan x="840" dy="0">mode 0: 多group中全部block</tspan>
+<tspan x="840" dy="20">同步 / 全部subblock同步</tspan>
+</text></g>
+<g transform="translate(840 0) scale(1 1) translate(-840 0)">
+<text x="840" y="94" text-anchor="start" fill="#d6ad00" font-family="FZLanTingHeiS-R-GB, 方正兰亭黑简体, sans-serif" font-size="12" font-weight="400">
+<tspan x="840" dy="0">mode 1: 单group中全部</tspan>
+<tspan x="840" dy="20">subblock同步</tspan>
+</text></g>
+<g transform="translate(840 0) scale(1 1) translate(-840 0)">
+<text x="840" y="148" text-anchor="start" fill="#00b050" font-family="FZLanTingHeiS-R-GB, 方正兰亭黑简体, sans-serif" font-size="12" font-weight="400">
+<tspan x="840" dy="0">mode 2: 单group中block与全</tspan>
+<tspan x="840" dy="20">部subblock同步</tspan>
+</text></g>
+<g transform="translate(840 0) scale(1 1) translate(-840 0)">
+<text x="840" y="202" text-anchor="start" fill="#4472c4" font-family="FZLanTingHeiS-R-GB, 方正兰亭黑简体, sans-serif" font-size="12" font-weight="400">
+<tspan x="840" dy="0">mode 4: 单group中block与单</tspan>
+<tspan x="840" dy="20">个subblock同步</tspan>
+</text></g>
+</svg>

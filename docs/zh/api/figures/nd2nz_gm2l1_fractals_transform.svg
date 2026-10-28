@@ -1,0 +1,117 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="842" height="469" viewBox="0 0 842 469" role="img" aria-labelledby="nd2nz_gm2l1_fractals_transform-title nd2nz_gm2l1_fractals_transform-desc">
+  <title id="nd2nz_gm2l1_fractals_transform-title">nd2nz gm2l1 fractals transform示意图</title>
+  <desc id="nd2nz_gm2l1_fractals_transform-desc">Editable vector diagram reconstructed from the preserved nd2nz_gm2l1_fractals_transform.png; text uses FZLanTingHei-R-GBK.</desc>
+  <defs>
+    <marker id="nd2nz_gm2l1_fractals_transform-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#696d75" />
+    </marker>
+    <marker id="nd2nz_gm2l1_fractals_transform-ink-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#101843" />
+    </marker>
+    <marker id="nd2nz_gm2l1_fractals_transform-blue-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#5277ff" />
+    </marker>
+  </defs>
+  <rect x="0" y="0" width="842" height="469" fill="#fff" stroke="none" stroke-width="1" rx="0" />
+  <g>
+    <rect x="107" y="2" width="99" height="39" fill="#3ca3df" stroke="#696d75" stroke-width="1" rx="5" />
+    <rect x="501" y="3" width="173" height="39" fill="#3ca3df" stroke="#696d75" stroke-width="1" rx="5" />
+    <rect x="52" y="131" width="244" height="209" fill="#fff" stroke="#101843" stroke-width="1" rx="3" />
+    <line x1="57" y1="135" x2="292" y2="135" stroke="#101843" stroke-width="0.65" marker-end="url(#nd2nz_gm2l1_fractals_transform-ink-arrow)" />
+    <line x1="292" y1="135" x2="57" y2="331" stroke="#101843" stroke-width="0.65" marker-end="url(#nd2nz_gm2l1_fractals_transform-ink-arrow)" />
+    <line x1="57" y1="331" x2="292" y2="331" stroke="#101843" stroke-width="0.65" marker-end="url(#nd2nz_gm2l1_fractals_transform-ink-arrow)" />
+    <path d="M314 229H338V221L360 237L338 253V245H314Z" stroke="none" stroke-width="1" fill="#000" />
+    <rect x="433" y="97" width="281" height="250" fill="#d6d6d6" stroke="#101843" stroke-width="1" rx="3" />
+    <rect x="433" y="97" width="244" height="209" fill="#fff" stroke="#101843" stroke-width="1" rx="3" />
+    <line x1="438" y1="103" x2="487" y2="103" stroke="#101843" stroke-width="0.65" marker-end="url(#nd2nz_gm2l1_fractals_transform-ink-arrow)" />
+    <line x1="487" y1="103" x2="438" y2="164" stroke="#101843" stroke-width="0.65" marker-end="url(#nd2nz_gm2l1_fractals_transform-ink-arrow)" />
+    <line x1="438" y1="164" x2="487" y2="164" stroke="#101843" stroke-width="0.65" marker-end="url(#nd2nz_gm2l1_fractals_transform-ink-arrow)" />
+    <line x1="512" y1="103" x2="561" y2="103" stroke="#101843" stroke-width="0.65" marker-end="url(#nd2nz_gm2l1_fractals_transform-ink-arrow)" />
+    <line x1="561" y1="103" x2="512" y2="164" stroke="#101843" stroke-width="0.65" marker-end="url(#nd2nz_gm2l1_fractals_transform-ink-arrow)" />
+    <line x1="512" y1="164" x2="561" y2="164" stroke="#101843" stroke-width="0.65" marker-end="url(#nd2nz_gm2l1_fractals_transform-ink-arrow)" />
+    <line x1="586" y1="103" x2="635" y2="103" stroke="#101843" stroke-width="0.65" marker-end="url(#nd2nz_gm2l1_fractals_transform-ink-arrow)" />
+    <line x1="635" y1="103" x2="586" y2="164" stroke="#101843" stroke-width="0.65" marker-end="url(#nd2nz_gm2l1_fractals_transform-ink-arrow)" />
+    <line x1="586" y1="164" x2="635" y2="164" stroke="#101843" stroke-width="0.65" marker-end="url(#nd2nz_gm2l1_fractals_transform-ink-arrow)" />
+    <line x1="660" y1="103" x2="709" y2="103" stroke="#101843" stroke-width="0.65" marker-end="url(#nd2nz_gm2l1_fractals_transform-ink-arrow)" />
+    <line x1="709" y1="103" x2="660" y2="164" stroke="#101843" stroke-width="0.65" marker-end="url(#nd2nz_gm2l1_fractals_transform-ink-arrow)" />
+    <line x1="660" y1="164" x2="709" y2="164" stroke="#101843" stroke-width="0.65" marker-end="url(#nd2nz_gm2l1_fractals_transform-ink-arrow)" />
+    <line x1="438" y1="189" x2="487" y2="189" stroke="#101843" stroke-width="0.65" marker-end="url(#nd2nz_gm2l1_fractals_transform-ink-arrow)" />
+    <line x1="487" y1="189" x2="438" y2="250" stroke="#101843" stroke-width="0.65" marker-end="url(#nd2nz_gm2l1_fractals_transform-ink-arrow)" />
+    <line x1="438" y1="250" x2="487" y2="250" stroke="#101843" stroke-width="0.65" marker-end="url(#nd2nz_gm2l1_fractals_transform-ink-arrow)" />
+    <line x1="512" y1="189" x2="561" y2="189" stroke="#101843" stroke-width="0.65" marker-end="url(#nd2nz_gm2l1_fractals_transform-ink-arrow)" />
+    <line x1="561" y1="189" x2="512" y2="250" stroke="#101843" stroke-width="0.65" marker-end="url(#nd2nz_gm2l1_fractals_transform-ink-arrow)" />
+    <line x1="512" y1="250" x2="561" y2="250" stroke="#101843" stroke-width="0.65" marker-end="url(#nd2nz_gm2l1_fractals_transform-ink-arrow)" />
+    <line x1="586" y1="189" x2="635" y2="189" stroke="#101843" stroke-width="0.65" marker-end="url(#nd2nz_gm2l1_fractals_transform-ink-arrow)" />
+    <line x1="635" y1="189" x2="586" y2="250" stroke="#101843" stroke-width="0.65" marker-end="url(#nd2nz_gm2l1_fractals_transform-ink-arrow)" />
+    <line x1="586" y1="250" x2="635" y2="250" stroke="#101843" stroke-width="0.65" marker-end="url(#nd2nz_gm2l1_fractals_transform-ink-arrow)" />
+    <line x1="660" y1="189" x2="709" y2="189" stroke="#101843" stroke-width="0.65" marker-end="url(#nd2nz_gm2l1_fractals_transform-ink-arrow)" />
+    <line x1="709" y1="189" x2="660" y2="250" stroke="#101843" stroke-width="0.65" marker-end="url(#nd2nz_gm2l1_fractals_transform-ink-arrow)" />
+    <line x1="660" y1="250" x2="709" y2="250" stroke="#101843" stroke-width="0.65" marker-end="url(#nd2nz_gm2l1_fractals_transform-ink-arrow)" />
+    <line x1="438" y1="275" x2="487" y2="275" stroke="#101843" stroke-width="0.65" marker-end="url(#nd2nz_gm2l1_fractals_transform-ink-arrow)" />
+    <line x1="487" y1="275" x2="438" y2="336" stroke="#101843" stroke-width="0.65" marker-end="url(#nd2nz_gm2l1_fractals_transform-ink-arrow)" />
+    <line x1="438" y1="336" x2="487" y2="336" stroke="#101843" stroke-width="0.65" marker-end="url(#nd2nz_gm2l1_fractals_transform-ink-arrow)" />
+    <line x1="512" y1="275" x2="561" y2="275" stroke="#101843" stroke-width="0.65" marker-end="url(#nd2nz_gm2l1_fractals_transform-ink-arrow)" />
+    <line x1="561" y1="275" x2="512" y2="336" stroke="#101843" stroke-width="0.65" marker-end="url(#nd2nz_gm2l1_fractals_transform-ink-arrow)" />
+    <line x1="512" y1="336" x2="561" y2="336" stroke="#101843" stroke-width="0.65" marker-end="url(#nd2nz_gm2l1_fractals_transform-ink-arrow)" />
+    <line x1="586" y1="275" x2="635" y2="275" stroke="#101843" stroke-width="0.65" marker-end="url(#nd2nz_gm2l1_fractals_transform-ink-arrow)" />
+    <line x1="635" y1="275" x2="586" y2="336" stroke="#101843" stroke-width="0.65" marker-end="url(#nd2nz_gm2l1_fractals_transform-ink-arrow)" />
+    <line x1="586" y1="336" x2="635" y2="336" stroke="#101843" stroke-width="0.65" marker-end="url(#nd2nz_gm2l1_fractals_transform-ink-arrow)" />
+    <line x1="660" y1="275" x2="709" y2="275" stroke="#101843" stroke-width="0.65" marker-end="url(#nd2nz_gm2l1_fractals_transform-ink-arrow)" />
+    <line x1="709" y1="275" x2="660" y2="336" stroke="#101843" stroke-width="0.65" marker-end="url(#nd2nz_gm2l1_fractals_transform-ink-arrow)" />
+    <line x1="660" y1="336" x2="709" y2="336" stroke="#101843" stroke-width="0.65" marker-end="url(#nd2nz_gm2l1_fractals_transform-ink-arrow)" />
+    <line x1="487" y1="164" x2="438" y2="189" stroke="#696d75" stroke-width="0.65" marker-end="url(#nd2nz_gm2l1_fractals_transform-arrow)" />
+    <line x1="487" y1="250" x2="438" y2="275" stroke="#696d75" stroke-width="0.65" marker-end="url(#nd2nz_gm2l1_fractals_transform-arrow)" />
+    <line x1="487" y1="336" x2="512" y2="103" stroke="#696d75" stroke-width="0.65" marker-end="url(#nd2nz_gm2l1_fractals_transform-arrow)" />
+    <line x1="561" y1="164" x2="512" y2="189" stroke="#696d75" stroke-width="0.65" marker-end="url(#nd2nz_gm2l1_fractals_transform-arrow)" />
+    <line x1="561" y1="250" x2="512" y2="275" stroke="#696d75" stroke-width="0.65" marker-end="url(#nd2nz_gm2l1_fractals_transform-arrow)" />
+    <line x1="561" y1="336" x2="586" y2="103" stroke="#696d75" stroke-width="0.65" marker-end="url(#nd2nz_gm2l1_fractals_transform-arrow)" />
+    <line x1="635" y1="164" x2="586" y2="189" stroke="#696d75" stroke-width="0.65" marker-end="url(#nd2nz_gm2l1_fractals_transform-arrow)" />
+    <line x1="635" y1="250" x2="586" y2="275" stroke="#696d75" stroke-width="0.65" marker-end="url(#nd2nz_gm2l1_fractals_transform-arrow)" />
+    <line x1="635" y1="336" x2="660" y2="103" stroke="#696d75" stroke-width="0.65" marker-end="url(#nd2nz_gm2l1_fractals_transform-arrow)" />
+    <line x1="709" y1="164" x2="660" y2="189" stroke="#696d75" stroke-width="0.65" marker-end="url(#nd2nz_gm2l1_fractals_transform-arrow)" />
+    <line x1="709" y1="250" x2="660" y2="275" stroke="#696d75" stroke-width="0.65" marker-end="url(#nd2nz_gm2l1_fractals_transform-arrow)" />
+    <line x1="52" y1="367" x2="296" y2="367" stroke="#696d75" stroke-width="1.2" />
+    <line x1="52" y1="363" x2="52" y2="371" stroke="#696d75" stroke-width="1.2" />
+    <line x1="296" y1="363" x2="296" y2="371" stroke="#696d75" stroke-width="1.2" />
+    <rect x="144.727" y="357" width="58.546" height="20" fill="#fff" stroke="none" stroke-width="1" rx="0" />
+    <line x1="435" y1="367" x2="676" y2="367" stroke="#696d75" stroke-width="1.2" />
+    <line x1="435" y1="363" x2="435" y2="371" stroke="#696d75" stroke-width="1.2" />
+    <line x1="676" y1="363" x2="676" y2="371" stroke="#696d75" stroke-width="1.2" />
+    <rect x="526.227" y="357" width="58.546" height="20" fill="#fff" stroke="none" stroke-width="1" rx="0" />
+    <line x1="435" y1="395" x2="714" y2="395" stroke="#696d75" stroke-width="1.2" />
+    <line x1="435" y1="391" x2="435" y2="399" stroke="#696d75" stroke-width="1.2" />
+    <line x1="714" y1="391" x2="714" y2="399" stroke="#696d75" stroke-width="1.2" />
+    <rect x="557.953" y="385" width="33.094" height="20" fill="#fff" stroke="none" stroke-width="1" rx="0" />
+    <line x1="28" y1="135" x2="28" y2="340" stroke="#696d75" stroke-width="1" />
+    <line x1="24" y1="135" x2="32" y2="135" stroke="#696d75" stroke-width="1" />
+    <line x1="24" y1="340" x2="32" y2="340" stroke="#696d75" stroke-width="1" />
+    <line x1="380" y1="102" x2="380" y2="347" stroke="#696d75" stroke-width="1" />
+    <line x1="376" y1="102" x2="384" y2="102" stroke="#696d75" stroke-width="1" />
+    <line x1="376" y1="347" x2="384" y2="347" stroke="#696d75" stroke-width="1" />
+    <line x1="404" y1="102" x2="404" y2="306" stroke="#696d75" stroke-width="1" />
+    <line x1="400" y1="102" x2="408" y2="102" stroke="#696d75" stroke-width="1" />
+    <line x1="400" y1="306" x2="408" y2="306" stroke="#696d75" stroke-width="1" />
+    <line x1="438" y1="85" x2="487" y2="85" stroke="#696d75" stroke-width="1.2" />
+    <line x1="438" y1="81" x2="438" y2="89" stroke="#696d75" stroke-width="1.2" />
+    <line x1="487" y1="81" x2="487" y2="89" stroke="#696d75" stroke-width="1.2" />
+    <rect x="407.648" y="75" width="109.704" height="20" fill="#fff" stroke="none" stroke-width="1" rx="0" />
+    <rect x="735" y="199" width="20" height="24" fill="#fff" stroke="#101843" stroke-width="1" rx="3" />
+    <rect x="735" y="245" width="20" height="24" fill="#d6d6d6" stroke="#101843" stroke-width="1" rx="3" />
+  </g>
+  <g fill="#171717" font-family="FZLanTingHei-R-GBK, 方正兰亭黑_GBK, sans-serif" font-size="12" font-weight="400">
+    <text x="156.5" y="29.55" font-size="23.00" text-anchor="middle" fill="#171717">GM</text>
+    <text x="587.5" y="30.55" font-size="23.00" text-anchor="middle" fill="#171717">L1 Buffer</text>
+    <text x="174" y="371" font-size="18.00" text-anchor="middle" fill="#171717">K=56</text>
+    <text x="555.5" y="371" font-size="18.00" text-anchor="middle" fill="#171717">K=56</text>
+    <text x="574.5" y="399" font-size="18.00" text-anchor="middle" fill="#171717">64</text>
+    <text x="0" y="246" font-size="16.00" text-anchor="start" fill="#171717">M=40</text>
+    <text x="397" y="215" font-size="18.00" text-anchor="middle" fill="#171717">M=40</text>
+    <text x="382" y="244" font-size="18.00" text-anchor="middle" fill="#171717">48</text>
+    <text x="462.5" y="89" font-size="11.00" text-anchor="middle" fill="#171717">32 / sizeof(float16)</text>
+    <text x="421" y="142" font-size="14.00" text-anchor="middle" fill="#171717">16</text>
+    <text x="745" y="215.2" font-size="12.00" text-anchor="middle" fill="#171717" />
+    <text x="769" y="220" font-size="18.00" text-anchor="start" fill="#171717">有效数据</text>
+    <text x="745" y="261.2" font-size="12.00" text-anchor="middle" fill="#171717" />
+    <text x="769" y="265" font-size="18.00" text-anchor="start" fill="#171717">无效数据</text>
+  </g>
+</svg>

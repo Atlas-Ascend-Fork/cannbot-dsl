@@ -1,0 +1,82 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="772" height="172" viewBox="0 0 772 172" role="img" aria-labelledby="vload-broadcast-title vload-broadcast-desc">
+  <title id="vload-broadcast-title">广播搬入矢量数据寄存器</title>
+  <desc id="vload-broadcast-desc">源张量tensor中值为0的首个int16元素广播到目的寄存器dst的所有元素。省略号表示未逐个画出的元素，原始PNG保留不变。</desc>
+  <defs>
+    <marker id="vload-broadcast-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#696d75"/>
+    </marker>
+  </defs>
+
+  <rect width="772" height="172" fill="#ffffff"/>
+
+  <g fill="none" stroke="#101843" stroke-width="1">
+    <rect x="77.5" y="0.5" width="693" height="46"/>
+    <rect x="77.5" y="110.5" width="641" height="46"/>
+  </g>
+
+  <g fill="#b0f0e2" stroke="#101843" stroke-width="1">
+    <rect x="83.5" y="4.5" width="48" height="39"/>
+    <rect x="135.5" y="4.5" width="49" height="39"/>
+    <rect x="188.5" y="4.5" width="48" height="39"/>
+    <rect x="346.5" y="4.5" width="48" height="39"/>
+    <rect x="399.5" y="4.5" width="49" height="39"/>
+    <rect x="558.5" y="4.5" width="48" height="39"/>
+    <rect x="611.5" y="4.5" width="49" height="39"/>
+    <rect x="665.5" y="4.5" width="48" height="39"/>
+  </g>
+
+  <g fill="#c2d5fe" stroke="#101843" stroke-width="1">
+    <rect x="83.5" y="114.5" width="48" height="39"/>
+    <rect x="135.5" y="114.5" width="49" height="39"/>
+    <rect x="188.5" y="114.5" width="48" height="39"/>
+    <rect x="346.5" y="114.5" width="48" height="39"/>
+    <rect x="399.5" y="114.5" width="49" height="39"/>
+    <rect x="558.5" y="114.5" width="48" height="39"/>
+    <rect x="611.5" y="114.5" width="49" height="39"/>
+    <rect x="665.5" y="114.5" width="48" height="39"/>
+  </g>
+
+  <g fill="none" stroke="#696d75" stroke-width="1.5" marker-end="url(#vload-broadcast-arrow)">
+    <line x1="107.5" y1="43.5" x2="107.5" y2="114"/>
+    <line x1="107.5" y1="43.5" x2="160" y2="114"/>
+    <line x1="107.5" y1="43.5" x2="212.5" y2="114"/>
+    <line x1="107.5" y1="43.5" x2="370.5" y2="114"/>
+    <line x1="107.5" y1="43.5" x2="424" y2="114"/>
+    <line x1="107.5" y1="43.5" x2="582.5" y2="114"/>
+    <line x1="107.5" y1="43.5" x2="636" y2="114"/>
+    <line x1="107.5" y1="43.5" x2="689.5" y2="114"/>
+  </g>
+
+  <g fill="#171717" font-family="FZLanTingHei-R-GBK, 方正兰亭黑_GBK, sans-serif" font-weight="400">
+    <g text-anchor="end">
+      <text x="64" y="25" font-size="14">tensor</text>
+      <text x="75" y="44" font-size="10.5">(dtypes.int16)</text>
+      <text x="54" y="135" font-size="14">dst</text>
+      <text x="75" y="154" font-size="10.5">(dtypes.int16)</text>
+    </g>
+    <g text-anchor="middle" font-size="12">
+      <text x="107.5" y="28">0</text>
+      <text x="160" y="28">1</text>
+      <text x="212.5" y="28">2</text>
+      <text x="291" y="28">...</text>
+      <text x="370.5" y="28">63</text>
+      <text x="424" y="28">64</text>
+      <text x="504" y="28">...</text>
+      <text x="582.5" y="28">125</text>
+      <text x="636" y="28">126</text>
+      <text x="689.5" y="28">127</text>
+      <text x="743" y="28">...</text>
+
+      <text x="107.5" y="138">0</text>
+      <text x="160" y="138">0</text>
+      <text x="212.5" y="138">0</text>
+      <text x="291" y="138">...</text>
+      <text x="370.5" y="138">0</text>
+      <text x="424" y="138">0</text>
+      <text x="504" y="138">...</text>
+      <text x="582.5" y="138">0</text>
+      <text x="636" y="138">0</text>
+      <text x="689.5" y="138">0</text>
+    </g>
+  </g>
+</svg>

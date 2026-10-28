@@ -1,0 +1,53 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="697" height="264" viewBox="0 0 697 264" role="img" aria-labelledby="scalar_atomic_operation_diagram-title scalar_atomic_operation_diagram-desc">
+  <title id="scalar_atomic_operation_diagram-title">scalar atomic operation diagram示意图</title>
+  <desc id="scalar_atomic_operation_diagram-desc">Editable vector diagram reconstructed from the preserved scalar_atomic_operation_diagram.png; text uses FZLanTingHei-R-GBK.</desc>
+  <defs>
+    <marker id="scalar_atomic_operation_diagram-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#696d75" />
+    </marker>
+    <marker id="scalar_atomic_operation_diagram-ink-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#101843" />
+    </marker>
+    <marker id="scalar_atomic_operation_diagram-blue-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#5277ff" />
+    </marker>
+  </defs>
+  <rect x="0" y="0" width="697" height="264" fill="#fff" stroke="none" stroke-width="1" rx="0" />
+  <g>
+    <rect x="110" y="58" width="70" height="29" fill="#b0f0e2" stroke="none" stroke-width="1" rx="2" />
+    <rect x="195" y="58" width="70" height="29" fill="#b0f0e2" stroke="none" stroke-width="1" rx="2" />
+    <rect x="280" y="58" width="70" height="29" fill="#b0f0e2" stroke="none" stroke-width="1" rx="2" />
+    <rect x="130" y="151" width="86" height="29" fill="#b0f0e2" stroke="none" stroke-width="1" rx="0" />
+    <rect x="130" y="222" width="86" height="29" fill="#b0f0e2" stroke="none" stroke-width="1" rx="0" />
+    <rect x="430" y="58" width="70" height="29" fill="#b0f0e2" stroke="none" stroke-width="1" rx="2" />
+    <rect x="515" y="58" width="70" height="29" fill="#b0f0e2" stroke="none" stroke-width="1" rx="2" />
+    <rect x="600" y="58" width="70" height="29" fill="#b0f0e2" stroke="none" stroke-width="1" rx="2" />
+    <rect x="450" y="151" width="86" height="29" fill="#b0f0e2" stroke="none" stroke-width="1" rx="0" />
+    <rect x="450" y="222" width="86" height="29" fill="#b0f0e2" stroke="none" stroke-width="1" rx="0" />
+    <rect x="0" y="149" width="90" height="34" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="10" />
+    <rect x="0" y="217" width="90" height="45" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="10" />
+  </g>
+  <g fill="#171717" font-family="FZLanTingHei-R-GBK, 方正兰亭黑_GBK, sans-serif" font-size="12" font-weight="400">
+    <text x="230" y="27" font-size="17.00" text-anchor="middle" fill="#171717">不使用原子累加</text>
+    <text x="145" y="77.05" font-size="13.00" text-anchor="middle" fill="#171717">x=x+1</text>
+    <text x="145" y="111" font-size="12.00" text-anchor="middle" fill="#171717">AI Core 0</text>
+    <text x="230" y="77.05" font-size="13.00" text-anchor="middle" fill="#171717">x=x+1</text>
+    <text x="230" y="111" font-size="12.00" text-anchor="middle" fill="#171717">AI Core 1</text>
+    <text x="315" y="77.05" font-size="13.00" text-anchor="middle" fill="#171717">x=x+1</text>
+    <text x="315" y="111" font-size="12.00" text-anchor="middle" fill="#171717">AI Core 2</text>
+    <text x="173" y="170.4" font-size="14.00" text-anchor="middle" fill="#171717">x</text>
+    <text x="173" y="241.4" font-size="14.00" text-anchor="middle" fill="#171717">未知</text>
+    <text x="550" y="27" font-size="17.00" text-anchor="middle" fill="#171717">使用原子累加</text>
+    <text x="465" y="77.05" font-size="13.00" text-anchor="middle" fill="#171717">x=x+1</text>
+    <text x="465" y="111" font-size="12.00" text-anchor="middle" fill="#171717">AI Core 0</text>
+    <text x="550" y="77.05" font-size="13.00" text-anchor="middle" fill="#171717">x=x+1</text>
+    <text x="550" y="111" font-size="12.00" text-anchor="middle" fill="#171717">AI Core 1</text>
+    <text x="635" y="77.05" font-size="13.00" text-anchor="middle" fill="#171717">x=x+1</text>
+    <text x="635" y="111" font-size="12.00" text-anchor="middle" fill="#171717">AI Core 2</text>
+    <text x="493" y="170.4" font-size="14.00" text-anchor="middle" fill="#171717">x</text>
+    <text x="493" y="241.4" font-size="14.00" text-anchor="middle" fill="#171717">x=x+3</text>
+    <text x="45" y="170.2" font-size="12.00" text-anchor="middle" fill="#171717">GM原始数据</text>
+    <text x="45" y="235.6" font-size="12.00" text-anchor="middle" fill="#171717">计算完成后</text>
+    <text x="45" y="251.8" font-size="12.00" text-anchor="middle" fill="#171717">GM数据</text>
+  </g>
+</svg>

@@ -1,0 +1,54 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="624" height="214" viewBox="0 0 624 214" role="img" aria-labelledby="vstore_unalign_first-title vstore_unalign_first-desc">
+  <title id="vstore_unalign_first-title">非对齐搬出示意图（首次搬出）</title>
+  <desc id="vstore_unalign_first-desc">Editable vector diagram reconstructed from the preserved vstore_unalign_first.png; text uses FZLanTingHei-R-GBK.</desc>
+  <defs>
+    <marker id="vstore_unalign_first-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#696d75" />
+    </marker>
+    <marker id="vstore_unalign_first-ink-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#101843" />
+    </marker>
+    <marker id="vstore_unalign_first-blue-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#5277ff" />
+    </marker>
+  </defs>
+  <rect x="0" y="0" width="624" height="214" fill="#fff" stroke="none" stroke-width="1" rx="0" />
+  <g>
+    <rect x="134" y="2" width="425" height="38" fill="#b8e8fa" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="514" y="77" width="92" height="38" fill="#ffd0af" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="89" y="153" width="45" height="38" fill="#fff" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="134" y="153" width="46" height="38" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="180" y="153" width="92" height="38" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="272" y="153" width="91" height="38" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="424" y="153" width="91" height="38" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="515" y="153" width="46" height="38" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="561" y="153" width="46" height="38" fill="#fff" stroke="#101843" stroke-width="1" rx="0" />
+    <line x1="89" y1="40" x2="89" y2="191" stroke="#696d75" stroke-width="0.8" stroke-dasharray="4 3" />
+    <line x1="515" y1="40" x2="515" y2="191" stroke="#696d75" stroke-width="0.8" stroke-dasharray="4 3" />
+    <line x1="561" y1="40" x2="561" y2="191" stroke="#696d75" stroke-width="0.8" stroke-dasharray="4 3" />
+    <line x1="607" y1="40" x2="607" y2="191" stroke="#696d75" stroke-width="0.8" stroke-dasharray="4 3" />
+    <line x1="361" y1="40" x2="361" y2="153" stroke="#101843" stroke-width="1" marker-end="url(#vstore_unalign_first-ink-arrow)" />
+    <line x1="538" y1="40" x2="538" y2="76" stroke="#101843" stroke-width="1" marker-end="url(#vstore_unalign_first-ink-arrow)" />
+    <line x1="538" y1="115" x2="538" y2="153" stroke="#101843" stroke-width="1" marker-end="url(#vstore_unalign_first-ink-arrow)" />
+  </g>
+  <g fill="#171717" font-family="FZLanTingHei-R-GBK, 方正兰亭黑_GBK, sans-serif" font-size="12" font-weight="400">
+    <text x="346.5" y="25.2" font-size="12.00" text-anchor="middle" fill="#171717" />
+    <text x="80" y="25" font-size="13.00" text-anchor="end" fill="#171717">源寄存器</text>
+    <text x="560" y="100.2" font-size="12.00" text-anchor="middle" fill="#171717" />
+    <text x="86" y="100" font-size="13.00" text-anchor="end" fill="#171717">非对齐寄存器</text>
+    <text x="89" y="205" font-size="13.00" text-anchor="middle" fill="#171717">32</text>
+    <text x="134" y="205" font-size="13.00" text-anchor="middle" fill="#171717">dst</text>
+    <text x="180" y="205" font-size="13.00" text-anchor="middle" fill="#171717">64</text>
+    <text x="272" y="205" font-size="13.00" text-anchor="middle" fill="#171717">96</text>
+    <text x="363" y="205" font-size="13.00" text-anchor="middle" fill="#171717">128</text>
+    <text x="424" y="205" font-size="13.00" text-anchor="middle" fill="#171717">256</text>
+    <text x="515" y="205" font-size="13.00" text-anchor="middle" fill="#171717">288</text>
+    <text x="561" y="205" font-size="13.00" text-anchor="middle" fill="#171717">304</text>
+    <text x="607" y="205" font-size="13.00" text-anchor="middle" fill="#171717">320</text>
+    <text x="350" y="98" font-size="14.00" text-anchor="middle" fill="#171717">①</text>
+    <text x="526" y="62" font-size="14.00" text-anchor="middle" fill="#171717">①</text>
+    <text x="527" y="140" font-size="14.00" text-anchor="middle" fill="#171717">②</text>
+    <text x="55" y="177" font-size="14.00" text-anchor="middle" fill="#171717">UB</text>
+    <text x="401" y="173" font-size="16.00" text-anchor="middle" fill="#171717">...</text>
+  </g>
+</svg>

@@ -1,0 +1,114 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="843" height="455" viewBox="0 0 843 455" role="img" aria-labelledby="vreduce_datablock_index-title vreduce_datablock_index-desc">
+  <title id="vreduce_datablock_index-title">vreduce datablock index示意图</title>
+  <desc id="vreduce_datablock_index-desc">Editable vector diagram reconstructed from the preserved vreduce_datablock_index.png; text uses FZLanTingHei-R-GBK.</desc>
+  <defs>
+    <marker id="vreduce_datablock_index-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#696d75" />
+    </marker>
+    <marker id="vreduce_datablock_index-ink-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#101843" />
+    </marker>
+    <marker id="vreduce_datablock_index-blue-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#5277ff" />
+    </marker>
+  </defs>
+  <rect x="0" y="0" width="843" height="455" fill="#fff" stroke="none" stroke-width="1" rx="0" />
+  <g>
+    <rect x="1" y="1" width="841" height="453" fill="none" stroke="#101843" stroke-width="1" rx="4" />
+    <rect x="15" y="18" width="814" height="51" fill="none" stroke="#101843" stroke-width="1" rx="3" />
+    <rect x="22.0" y="24" width="43" height="39" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="3" />
+    <rect x="72.5" y="24" width="43" height="39" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="3" />
+    <rect x="123.0" y="24" width="43" height="39" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="3" />
+    <rect x="173.5" y="24" width="43" height="39" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="3" />
+    <rect x="224.0" y="24" width="43" height="39" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="3" />
+    <rect x="274.5" y="24" width="43" height="39" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="3" />
+    <rect x="325.0" y="24" width="43" height="39" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="3" />
+    <rect x="375.5" y="24" width="43" height="39" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="3" />
+    <rect x="426.0" y="24" width="43" height="39" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="3" />
+    <rect x="476.5" y="24" width="43" height="39" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="3" />
+    <rect x="527.0" y="24" width="43" height="39" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="3" />
+    <rect x="577.5" y="24" width="43" height="39" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="3" />
+    <rect x="628.0" y="24" width="43" height="39" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="3" />
+    <rect x="678.5" y="24" width="43" height="39" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="3" />
+    <rect x="729.0" y="24" width="43" height="39" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="3" />
+    <rect x="779.5" y="24" width="43" height="39" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="3" />
+    <rect x="43.75" y="121" width="50" height="39" fill="#ffe6be" stroke="#101843" stroke-width="1" rx="3" />
+    <line x1="43.5" y1="63" x2="68.75" y2="121" stroke="#101843" stroke-width="0.8" marker-end="url(#vreduce_datablock_index-ink-arrow)" />
+    <line x1="94.0" y1="63" x2="68.75" y2="121" stroke="#101843" stroke-width="0.8" marker-end="url(#vreduce_datablock_index-ink-arrow)" />
+    <rect x="144.75" y="121" width="50" height="39" fill="#ffe6be" stroke="#101843" stroke-width="1" rx="3" />
+    <line x1="144.5" y1="63" x2="169.75" y2="121" stroke="#101843" stroke-width="0.8" marker-end="url(#vreduce_datablock_index-ink-arrow)" />
+    <line x1="195.0" y1="63" x2="169.75" y2="121" stroke="#101843" stroke-width="0.8" marker-end="url(#vreduce_datablock_index-ink-arrow)" />
+    <rect x="245.75" y="121" width="50" height="39" fill="#ffe6be" stroke="#101843" stroke-width="1" rx="3" />
+    <line x1="245.5" y1="63" x2="270.75" y2="121" stroke="#101843" stroke-width="0.8" marker-end="url(#vreduce_datablock_index-ink-arrow)" />
+    <line x1="296.0" y1="63" x2="270.75" y2="121" stroke="#101843" stroke-width="0.8" marker-end="url(#vreduce_datablock_index-ink-arrow)" />
+    <rect x="346.75" y="121" width="50" height="39" fill="#ffe6be" stroke="#101843" stroke-width="1" rx="3" />
+    <line x1="346.5" y1="63" x2="371.75" y2="121" stroke="#101843" stroke-width="0.8" marker-end="url(#vreduce_datablock_index-ink-arrow)" />
+    <line x1="397.0" y1="63" x2="371.75" y2="121" stroke="#101843" stroke-width="0.8" marker-end="url(#vreduce_datablock_index-ink-arrow)" />
+    <rect x="447.75" y="121" width="50" height="39" fill="#ffe6be" stroke="#101843" stroke-width="1" rx="3" />
+    <line x1="447.5" y1="63" x2="472.75" y2="121" stroke="#101843" stroke-width="0.8" marker-end="url(#vreduce_datablock_index-ink-arrow)" />
+    <line x1="498.0" y1="63" x2="472.75" y2="121" stroke="#101843" stroke-width="0.8" marker-end="url(#vreduce_datablock_index-ink-arrow)" />
+    <rect x="548.75" y="121" width="50" height="39" fill="#ffe6be" stroke="#101843" stroke-width="1" rx="3" />
+    <line x1="548.5" y1="63" x2="573.75" y2="121" stroke="#101843" stroke-width="0.8" marker-end="url(#vreduce_datablock_index-ink-arrow)" />
+    <line x1="599.0" y1="63" x2="573.75" y2="121" stroke="#101843" stroke-width="0.8" marker-end="url(#vreduce_datablock_index-ink-arrow)" />
+    <rect x="649.75" y="121" width="50" height="39" fill="#ffe6be" stroke="#101843" stroke-width="1" rx="3" />
+    <line x1="649.5" y1="63" x2="674.75" y2="121" stroke="#101843" stroke-width="0.8" marker-end="url(#vreduce_datablock_index-ink-arrow)" />
+    <line x1="700.0" y1="63" x2="674.75" y2="121" stroke="#101843" stroke-width="0.8" marker-end="url(#vreduce_datablock_index-ink-arrow)" />
+    <rect x="750.75" y="121" width="50" height="39" fill="#ffe6be" stroke="#101843" stroke-width="1" rx="3" />
+    <line x1="750.5" y1="63" x2="775.75" y2="121" stroke="#101843" stroke-width="0.8" marker-end="url(#vreduce_datablock_index-ink-arrow)" />
+    <line x1="801.0" y1="63" x2="775.75" y2="121" stroke="#101843" stroke-width="0.8" marker-end="url(#vreduce_datablock_index-ink-arrow)" />
+    <rect x="94.25" y="214" width="50" height="39" fill="#ffe6be" stroke="#101843" stroke-width="1" rx="3" />
+    <line x1="68.75" y1="160" x2="119.25" y2="214" stroke="#101843" stroke-width="0.8" marker-end="url(#vreduce_datablock_index-ink-arrow)" />
+    <line x1="169.75" y1="160" x2="119.25" y2="214" stroke="#101843" stroke-width="0.8" marker-end="url(#vreduce_datablock_index-ink-arrow)" />
+    <rect x="296.25" y="214" width="50" height="39" fill="#ffe6be" stroke="#101843" stroke-width="1" rx="3" />
+    <line x1="270.75" y1="160" x2="321.25" y2="214" stroke="#101843" stroke-width="0.8" marker-end="url(#vreduce_datablock_index-ink-arrow)" />
+    <line x1="371.75" y1="160" x2="321.25" y2="214" stroke="#101843" stroke-width="0.8" marker-end="url(#vreduce_datablock_index-ink-arrow)" />
+    <rect x="498.25" y="214" width="50" height="39" fill="#ffe6be" stroke="#101843" stroke-width="1" rx="3" />
+    <line x1="472.75" y1="160" x2="523.25" y2="214" stroke="#101843" stroke-width="0.8" marker-end="url(#vreduce_datablock_index-ink-arrow)" />
+    <line x1="573.75" y1="160" x2="523.25" y2="214" stroke="#101843" stroke-width="0.8" marker-end="url(#vreduce_datablock_index-ink-arrow)" />
+    <rect x="700.25" y="214" width="50" height="39" fill="#ffe6be" stroke="#101843" stroke-width="1" rx="3" />
+    <line x1="674.75" y1="160" x2="725.25" y2="214" stroke="#101843" stroke-width="0.8" marker-end="url(#vreduce_datablock_index-ink-arrow)" />
+    <line x1="775.75" y1="160" x2="725.25" y2="214" stroke="#101843" stroke-width="0.8" marker-end="url(#vreduce_datablock_index-ink-arrow)" />
+    <rect x="195.25" y="307" width="50" height="39" fill="#ffe6be" stroke="#101843" stroke-width="1" rx="3" />
+    <line x1="119.25" y1="253" x2="220.25" y2="307" stroke="#101843" stroke-width="0.8" marker-end="url(#vreduce_datablock_index-ink-arrow)" />
+    <line x1="321.25" y1="253" x2="220.25" y2="307" stroke="#101843" stroke-width="0.8" marker-end="url(#vreduce_datablock_index-ink-arrow)" />
+    <rect x="599.25" y="307" width="50" height="39" fill="#ffe6be" stroke="#101843" stroke-width="1" rx="3" />
+    <line x1="523.25" y1="253" x2="624.25" y2="307" stroke="#101843" stroke-width="0.8" marker-end="url(#vreduce_datablock_index-ink-arrow)" />
+    <line x1="725.25" y1="253" x2="624.25" y2="307" stroke="#101843" stroke-width="0.8" marker-end="url(#vreduce_datablock_index-ink-arrow)" />
+    <rect x="397.25" y="402" width="50" height="39" fill="#b0f0e2" stroke="#101843" stroke-width="1" rx="3" />
+    <line x1="220.25" y1="346" x2="422.25" y2="402" stroke="#101843" stroke-width="0.8" marker-end="url(#vreduce_datablock_index-ink-arrow)" />
+    <line x1="624.25" y1="346" x2="422.25" y2="402" stroke="#101843" stroke-width="0.8" marker-end="url(#vreduce_datablock_index-ink-arrow)" />
+  </g>
+  <g fill="#171717" font-family="FZLanTingHei-R-GBK, 方正兰亭黑_GBK, sans-serif" font-size="12" font-weight="400">
+    <text x="43.5" y="48.4" font-size="14.00" text-anchor="middle" fill="#171717">1</text>
+    <text x="94" y="48.4" font-size="14.00" text-anchor="middle" fill="#171717">2</text>
+    <text x="144.5" y="48.4" font-size="14.00" text-anchor="middle" fill="#171717">3</text>
+    <text x="195" y="48.4" font-size="14.00" text-anchor="middle" fill="#171717">4</text>
+    <text x="245.5" y="48.4" font-size="14.00" text-anchor="middle" fill="#171717">5</text>
+    <text x="296" y="48.4" font-size="14.00" text-anchor="middle" fill="#171717">6</text>
+    <text x="346.5" y="48.4" font-size="14.00" text-anchor="middle" fill="#171717">7</text>
+    <text x="397" y="48.4" font-size="14.00" text-anchor="middle" fill="#171717">8</text>
+    <text x="447.5" y="48.4" font-size="14.00" text-anchor="middle" fill="#171717">9</text>
+    <text x="498" y="48.4" font-size="14.00" text-anchor="middle" fill="#171717">10</text>
+    <text x="548.5" y="48.4" font-size="14.00" text-anchor="middle" fill="#171717">11</text>
+    <text x="599" y="48.4" font-size="14.00" text-anchor="middle" fill="#171717">12</text>
+    <text x="649.5" y="48.4" font-size="14.00" text-anchor="middle" fill="#171717">13</text>
+    <text x="700" y="48.4" font-size="14.00" text-anchor="middle" fill="#171717">14</text>
+    <text x="750.5" y="48.4" font-size="14.00" text-anchor="middle" fill="#171717">15</text>
+    <text x="801" y="48.4" font-size="14.00" text-anchor="middle" fill="#171717">16</text>
+    <text x="68.75" y="145.05" font-size="13.00" text-anchor="middle" fill="#171717">01</text>
+    <text x="169.75" y="145.05" font-size="13.00" text-anchor="middle" fill="#171717">02</text>
+    <text x="270.75" y="145.05" font-size="13.00" text-anchor="middle" fill="#171717">03</text>
+    <text x="371.75" y="145.05" font-size="13.00" text-anchor="middle" fill="#171717">04</text>
+    <text x="472.75" y="145.05" font-size="13.00" text-anchor="middle" fill="#171717">05</text>
+    <text x="573.75" y="145.05" font-size="13.00" text-anchor="middle" fill="#171717">06</text>
+    <text x="674.75" y="145.05" font-size="13.00" text-anchor="middle" fill="#171717">07</text>
+    <text x="775.75" y="145.05" font-size="13.00" text-anchor="middle" fill="#171717">08</text>
+    <text x="119.25" y="238.05" font-size="13.00" text-anchor="middle" fill="#171717">001</text>
+    <text x="321.25" y="238.05" font-size="13.00" text-anchor="middle" fill="#171717">002</text>
+    <text x="523.25" y="238.05" font-size="13.00" text-anchor="middle" fill="#171717">003</text>
+    <text x="725.25" y="238.05" font-size="13.00" text-anchor="middle" fill="#171717">004</text>
+    <text x="220.25" y="331.05" font-size="13.00" text-anchor="middle" fill="#171717">0001</text>
+    <text x="624.25" y="331.05" font-size="13.00" text-anchor="middle" fill="#171717">0002</text>
+    <text x="422.25" y="426.05" font-size="13.00" text-anchor="middle" fill="#171717">sum</text>
+  </g>
+</svg>

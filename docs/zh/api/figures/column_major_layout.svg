@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="222" height="123" viewBox="0 0 222 123" role="img" aria-labelledby="column_major_layout-title column_major_layout-desc">
+  <title id="column_major_layout-title">column major layout示意图</title>
+  <desc id="column_major_layout-desc">Editable vector diagram reconstructed from the preserved column_major_layout.png; text uses FZLanTingHei-R-GBK.</desc>
+  <defs>
+    <marker id="column_major_layout-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#696d75" />
+    </marker>
+    <marker id="column_major_layout-ink-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#101843" />
+    </marker>
+    <marker id="column_major_layout-blue-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#5277ff" />
+    </marker>
+  </defs>
+  <rect x="0" y="0" width="222" height="123" fill="#fff" stroke="none" stroke-width="1" rx="0" />
+  <g>
+    <rect x="39" y="48.0" width="44" height="37.5" fill="#fff" stroke="#696d75" stroke-width="1" rx="0" />
+    <rect x="39" y="85.5" width="44" height="37.5" fill="#fff" stroke="#696d75" stroke-width="1" rx="0" />
+    <line x1="61.0" y1="53" x2="61.0" y2="118.0" stroke="#696d75" stroke-width="1.1" marker-end="url(#column_major_layout-arrow)" />
+    <line x1="61.0" y1="118.0" x2="105.0" y2="53" stroke="#696d75" stroke-width="1" marker-end="url(#column_major_layout-arrow)" />
+    <rect x="83" y="48.0" width="44" height="37.5" fill="#fff" stroke="#696d75" stroke-width="1" rx="0" />
+    <rect x="83" y="85.5" width="44" height="37.5" fill="#fff" stroke="#696d75" stroke-width="1" rx="0" />
+    <line x1="105.0" y1="53" x2="105.0" y2="118.0" stroke="#696d75" stroke-width="1.1" marker-end="url(#column_major_layout-arrow)" />
+    <line x1="105.0" y1="118.0" x2="149.0" y2="53" stroke="#696d75" stroke-width="1" marker-end="url(#column_major_layout-arrow)" />
+    <rect x="127" y="48.0" width="44" height="37.5" fill="#fff" stroke="#696d75" stroke-width="1" rx="0" />
+    <rect x="127" y="85.5" width="44" height="37.5" fill="#fff" stroke="#696d75" stroke-width="1" rx="0" />
+    <line x1="149.0" y1="53" x2="149.0" y2="118.0" stroke="#696d75" stroke-width="1.1" marker-end="url(#column_major_layout-arrow)" />
+    <line x1="149.0" y1="118.0" x2="193.0" y2="53" stroke="#696d75" stroke-width="1" marker-end="url(#column_major_layout-arrow)" />
+    <rect x="171" y="48.0" width="44" height="37.5" fill="#fff" stroke="#696d75" stroke-width="1" rx="0" />
+    <rect x="171" y="85.5" width="44" height="37.5" fill="#fff" stroke="#696d75" stroke-width="1" rx="0" />
+    <line x1="193.0" y1="53" x2="193.0" y2="118.0" stroke="#696d75" stroke-width="1.1" marker-end="url(#column_major_layout-arrow)" />
+  </g>
+  <g fill="#171717" font-family="FZLanTingHei-R-GBK, 方正兰亭黑_GBK, sans-serif" font-size="12" font-weight="400">
+    <text x="61" y="34" font-size="20.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="61" y="75" font-size="20.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="61" y="112.5" font-size="20.00" text-anchor="middle" fill="#171717">1</text>
+    <text x="105" y="34" font-size="20.00" text-anchor="middle" fill="#171717">1</text>
+    <text x="105" y="75" font-size="20.00" text-anchor="middle" fill="#171717">2</text>
+    <text x="105" y="112.5" font-size="20.00" text-anchor="middle" fill="#171717">3</text>
+    <text x="149" y="34" font-size="20.00" text-anchor="middle" fill="#171717">2</text>
+    <text x="149" y="75" font-size="20.00" text-anchor="middle" fill="#171717">4</text>
+    <text x="149" y="112.5" font-size="20.00" text-anchor="middle" fill="#171717">5</text>
+    <text x="193" y="34" font-size="20.00" text-anchor="middle" fill="#171717">3</text>
+    <text x="193" y="75" font-size="20.00" text-anchor="middle" fill="#171717">6</text>
+    <text x="193" y="112.5" font-size="20.00" text-anchor="middle" fill="#171717">7</text>
+    <text x="22" y="75" font-size="19.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="22" y="112.5" font-size="19.00" text-anchor="middle" fill="#171717">1</text>
+  </g>
+</svg>

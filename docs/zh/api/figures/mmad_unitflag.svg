@@ -1,0 +1,164 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="846" height="340" viewBox="0 0 846 340" role="img" aria-labelledby="mmad_unitflag-title mmad_unitflag-desc">
+  <title id="mmad_unitflag-title">mmad unitflag示意图</title>
+  <desc id="mmad_unitflag-desc">Editable vector diagram reconstructed from the preserved mmad_unitflag.png; text uses FZLanTingHei-R-GBK.</desc>
+  <defs>
+    <marker id="mmad_unitflag-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#696d75" />
+    </marker>
+    <marker id="mmad_unitflag-ink-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#101843" />
+    </marker>
+    <marker id="mmad_unitflag-blue-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#5277ff" />
+    </marker>
+  </defs>
+  <rect x="0" y="0" width="846" height="340" fill="#fff" stroke="none" stroke-width="1" rx="0" />
+  <g>
+    <line x1="154" y1="29" x2="204" y2="29" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="204" y1="29" x2="154" y2="90" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="154" y1="90" x2="204" y2="90" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="221" y1="29" x2="271" y2="29" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="271" y1="29" x2="221" y2="90" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="221" y1="90" x2="271" y2="90" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="288" y1="29" x2="338" y2="29" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="338" y1="29" x2="288" y2="90" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="288" y1="90" x2="338" y2="90" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="355" y1="29" x2="405" y2="29" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="405" y1="29" x2="355" y2="90" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="355" y1="90" x2="405" y2="90" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="154" y1="107" x2="204" y2="107" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="204" y1="107" x2="154" y2="168" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="154" y1="168" x2="204" y2="168" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="221" y1="107" x2="271" y2="107" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="271" y1="107" x2="221" y2="168" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="221" y1="168" x2="271" y2="168" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="288" y1="107" x2="338" y2="107" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="338" y1="107" x2="288" y2="168" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="288" y1="168" x2="338" y2="168" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="355" y1="107" x2="405" y2="107" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="405" y1="107" x2="355" y2="168" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="355" y1="168" x2="405" y2="168" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="154" y1="185" x2="204" y2="185" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="204" y1="185" x2="154" y2="246" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="154" y1="246" x2="204" y2="246" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="221" y1="185" x2="271" y2="185" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="271" y1="185" x2="221" y2="246" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="221" y1="246" x2="271" y2="246" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="288" y1="185" x2="338" y2="185" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="338" y1="185" x2="288" y2="246" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="288" y1="246" x2="338" y2="246" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="355" y1="185" x2="405" y2="185" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="405" y1="185" x2="355" y2="246" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="355" y1="246" x2="405" y2="246" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="154" y1="263" x2="204" y2="263" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="204" y1="263" x2="154" y2="324" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="154" y1="324" x2="204" y2="324" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="221" y1="263" x2="271" y2="263" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="271" y1="263" x2="221" y2="324" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="221" y1="324" x2="271" y2="324" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="288" y1="263" x2="338" y2="263" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="338" y1="263" x2="288" y2="324" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="288" y1="324" x2="338" y2="324" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="355" y1="263" x2="405" y2="263" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="405" y1="263" x2="355" y2="324" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="355" y1="324" x2="405" y2="324" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="204" y1="90" x2="154" y2="107" stroke="#696d75" stroke-width="0.65" marker-end="url(#mmad_unitflag-arrow)" />
+    <line x1="204" y1="168" x2="154" y2="185" stroke="#696d75" stroke-width="0.65" marker-end="url(#mmad_unitflag-arrow)" />
+    <line x1="204" y1="246" x2="154" y2="263" stroke="#696d75" stroke-width="0.65" marker-end="url(#mmad_unitflag-arrow)" />
+    <line x1="204" y1="324" x2="221" y2="29" stroke="#696d75" stroke-width="0.65" marker-end="url(#mmad_unitflag-arrow)" />
+    <line x1="271" y1="90" x2="221" y2="107" stroke="#696d75" stroke-width="0.65" marker-end="url(#mmad_unitflag-arrow)" />
+    <line x1="271" y1="168" x2="221" y2="185" stroke="#696d75" stroke-width="0.65" marker-end="url(#mmad_unitflag-arrow)" />
+    <line x1="271" y1="246" x2="221" y2="263" stroke="#696d75" stroke-width="0.65" marker-end="url(#mmad_unitflag-arrow)" />
+    <line x1="271" y1="324" x2="288" y2="29" stroke="#696d75" stroke-width="0.65" marker-end="url(#mmad_unitflag-arrow)" />
+    <line x1="338" y1="90" x2="288" y2="107" stroke="#696d75" stroke-width="0.65" marker-end="url(#mmad_unitflag-arrow)" />
+    <line x1="338" y1="168" x2="288" y2="185" stroke="#696d75" stroke-width="0.65" marker-end="url(#mmad_unitflag-arrow)" />
+    <line x1="338" y1="246" x2="288" y2="263" stroke="#696d75" stroke-width="0.65" marker-end="url(#mmad_unitflag-arrow)" />
+    <line x1="338" y1="324" x2="355" y2="29" stroke="#696d75" stroke-width="0.65" marker-end="url(#mmad_unitflag-arrow)" />
+    <line x1="405" y1="90" x2="355" y2="107" stroke="#696d75" stroke-width="0.65" marker-end="url(#mmad_unitflag-arrow)" />
+    <line x1="405" y1="168" x2="355" y2="185" stroke="#696d75" stroke-width="0.65" marker-end="url(#mmad_unitflag-arrow)" />
+    <line x1="405" y1="246" x2="355" y2="263" stroke="#696d75" stroke-width="0.65" marker-end="url(#mmad_unitflag-arrow)" />
+    <line x1="588" y1="23" x2="638" y2="23" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="638" y1="23" x2="588" y2="84" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="588" y1="84" x2="638" y2="84" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="655" y1="23" x2="705" y2="23" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="705" y1="23" x2="655" y2="84" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="655" y1="84" x2="705" y2="84" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="722" y1="23" x2="772" y2="23" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="772" y1="23" x2="722" y2="84" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="722" y1="84" x2="772" y2="84" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="789" y1="23" x2="839" y2="23" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="839" y1="23" x2="789" y2="84" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="789" y1="84" x2="839" y2="84" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="588" y1="101" x2="638" y2="101" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="638" y1="101" x2="588" y2="162" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="588" y1="162" x2="638" y2="162" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="655" y1="101" x2="705" y2="101" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="705" y1="101" x2="655" y2="162" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="655" y1="162" x2="705" y2="162" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="722" y1="101" x2="772" y2="101" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="772" y1="101" x2="722" y2="162" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="722" y1="162" x2="772" y2="162" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="789" y1="101" x2="839" y2="101" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="839" y1="101" x2="789" y2="162" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="789" y1="162" x2="839" y2="162" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="588" y1="179" x2="638" y2="179" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="638" y1="179" x2="588" y2="240" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="588" y1="240" x2="638" y2="240" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="655" y1="179" x2="705" y2="179" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="705" y1="179" x2="655" y2="240" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="655" y1="240" x2="705" y2="240" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="722" y1="179" x2="772" y2="179" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="772" y1="179" x2="722" y2="240" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="722" y1="240" x2="772" y2="240" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="789" y1="179" x2="839" y2="179" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="839" y1="179" x2="789" y2="240" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="789" y1="240" x2="839" y2="240" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="588" y1="257" x2="638" y2="257" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="638" y1="257" x2="588" y2="318" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="588" y1="318" x2="638" y2="318" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="655" y1="257" x2="705" y2="257" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="705" y1="257" x2="655" y2="318" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="655" y1="318" x2="705" y2="318" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="722" y1="257" x2="772" y2="257" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="772" y1="257" x2="722" y2="318" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="722" y1="318" x2="772" y2="318" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="789" y1="257" x2="839" y2="257" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="839" y1="257" x2="789" y2="318" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="789" y1="318" x2="839" y2="318" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_unitflag-ink-arrow)" />
+    <line x1="638" y1="84" x2="588" y2="101" stroke="#696d75" stroke-width="0.65" marker-end="url(#mmad_unitflag-arrow)" />
+    <line x1="638" y1="162" x2="588" y2="179" stroke="#696d75" stroke-width="0.65" marker-end="url(#mmad_unitflag-arrow)" />
+    <line x1="638" y1="240" x2="588" y2="257" stroke="#696d75" stroke-width="0.65" marker-end="url(#mmad_unitflag-arrow)" />
+    <line x1="638" y1="318" x2="655" y2="23" stroke="#696d75" stroke-width="0.65" marker-end="url(#mmad_unitflag-arrow)" />
+    <line x1="705" y1="84" x2="655" y2="101" stroke="#696d75" stroke-width="0.65" marker-end="url(#mmad_unitflag-arrow)" />
+    <line x1="705" y1="162" x2="655" y2="179" stroke="#696d75" stroke-width="0.65" marker-end="url(#mmad_unitflag-arrow)" />
+    <line x1="705" y1="240" x2="655" y2="257" stroke="#696d75" stroke-width="0.65" marker-end="url(#mmad_unitflag-arrow)" />
+    <line x1="705" y1="318" x2="722" y2="23" stroke="#696d75" stroke-width="0.65" marker-end="url(#mmad_unitflag-arrow)" />
+    <line x1="772" y1="84" x2="722" y2="101" stroke="#696d75" stroke-width="0.65" marker-end="url(#mmad_unitflag-arrow)" />
+    <line x1="772" y1="162" x2="722" y2="179" stroke="#696d75" stroke-width="0.65" marker-end="url(#mmad_unitflag-arrow)" />
+    <line x1="772" y1="240" x2="722" y2="257" stroke="#696d75" stroke-width="0.65" marker-end="url(#mmad_unitflag-arrow)" />
+    <line x1="772" y1="318" x2="789" y2="23" stroke="#696d75" stroke-width="0.65" marker-end="url(#mmad_unitflag-arrow)" />
+    <line x1="839" y1="84" x2="789" y2="101" stroke="#696d75" stroke-width="0.65" marker-end="url(#mmad_unitflag-arrow)" />
+    <line x1="839" y1="162" x2="789" y2="179" stroke="#696d75" stroke-width="0.65" marker-end="url(#mmad_unitflag-arrow)" />
+    <line x1="839" y1="240" x2="789" y2="257" stroke="#696d75" stroke-width="0.65" marker-end="url(#mmad_unitflag-arrow)" />
+    <line x1="154" y1="10" x2="405" y2="10" stroke="#696d75" stroke-width="1.2" />
+    <line x1="154" y1="6" x2="154" y2="14" stroke="#696d75" stroke-width="1.2" />
+    <line x1="405" y1="6" x2="405" y2="14" stroke="#696d75" stroke-width="1.2" />
+    <rect x="255.152" y="0" width="48.696" height="20" fill="#fff" stroke="none" stroke-width="1" rx="0" />
+    <line x1="588" y1="10" x2="839" y2="10" stroke="#696d75" stroke-width="1.2" />
+    <line x1="588" y1="6" x2="588" y2="14" stroke="#696d75" stroke-width="1.2" />
+    <line x1="839" y1="6" x2="839" y2="14" stroke="#696d75" stroke-width="1.2" />
+    <rect x="689.152" y="0" width="48.696" height="20" fill="#fff" stroke="none" stroke-width="1" rx="0" />
+    <path d="M70 131h14v37h8l-15 37l-15 -37h8Z" stroke="#696d75" stroke-width="0.8" fill="#a4cf43" />
+    <path d="M512 131h14v37h8l-15 37l-15 -37h8Z" stroke="#696d75" stroke-width="0.8" fill="#ffc927" />
+    <line x1="139" y1="29" x2="139" y2="333" stroke="#696d75" stroke-width="1" />
+    <line x1="574" y1="23" x2="574" y2="334" stroke="#696d75" stroke-width="1" />
+  </g>
+  <g fill="#171717" font-family="FZLanTingHei-R-GBK, 方正兰亭黑_GBK, sans-serif" font-size="12" font-weight="400">
+    <text x="279.5" y="14" font-size="14.00" text-anchor="middle" fill="#171717">N=64</text>
+    <text x="713.5" y="14" font-size="14.00" text-anchor="middle" fill="#171717">N=64</text>
+    <text x="75" y="111" font-size="14.00" text-anchor="middle" fill="#171717">Mmad沿M方向写L0C</text>
+    <text x="499" y="101" font-size="14.00" text-anchor="middle" fill="#171717">Fixpipe沿M方向读L0C</text>
+    <text x="140" y="187" font-size="14.00" text-anchor="middle" fill="#171717">M=64</text>
+    <text x="576" y="181" font-size="14.00" text-anchor="middle" fill="#171717">M=64</text>
+  </g>
+</svg>

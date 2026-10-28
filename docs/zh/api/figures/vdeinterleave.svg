@@ -1,0 +1,97 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="843" height="257" viewBox="0 0 843 257" role="img" aria-labelledby="vdeinterleave-title vdeinterleave-desc">
+  <title id="vdeinterleave-title">解交织实现流程</title>
+  <desc id="vdeinterleave-desc">Editable vector diagram reconstructed from the preserved vdeinterleave.png; text uses FZLanTingHei-R-GBK.</desc>
+  <defs>
+    <marker id="vdeinterleave-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#696d75" />
+    </marker>
+    <marker id="vdeinterleave-ink-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#101843" />
+    </marker>
+    <marker id="vdeinterleave-blue-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#5277ff" />
+    </marker>
+  </defs>
+  <rect x="0" y="0" width="843" height="257" fill="#fff" stroke="none" stroke-width="1" rx="0" />
+  <g>
+    <rect x="81.0" y="18" width="41.5" height="42" fill="#d3d3d3" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="122.5" y="18" width="41.5" height="42" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="164.0" y="18" width="41.5" height="42" fill="#d3d3d3" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="205.5" y="18" width="41.5" height="42" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="247.0" y="18" width="41.5" height="42" fill="#d3d3d3" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="288.5" y="18" width="41.5" height="42" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="330.0" y="18" width="41.5" height="42" fill="#d3d3d3" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="371.5" y="18" width="41.5" height="42" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="508.0" y="18" width="41.5" height="42" fill="#d3d3d3" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="549.5" y="18" width="41.5" height="42" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="591.0" y="18" width="41.5" height="42" fill="#d3d3d3" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="632.5" y="18" width="41.5" height="42" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="674.0" y="18" width="41.5" height="42" fill="#d3d3d3" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="715.5" y="18" width="41.5" height="42" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="757.0" y="18" width="41.5" height="42" fill="#d3d3d3" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="798.5" y="18" width="41.5" height="42" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="81.0" y="154" width="41.5" height="42" fill="#d3d3d3" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="122.5" y="154" width="41.5" height="42" fill="#d3d3d3" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="164.0" y="154" width="41.5" height="42" fill="#d3d3d3" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="205.5" y="154" width="41.5" height="42" fill="#d3d3d3" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="247.0" y="154" width="41.5" height="42" fill="#d3d3d3" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="288.5" y="154" width="41.5" height="42" fill="#d3d3d3" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="330.0" y="154" width="41.5" height="42" fill="#d3d3d3" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="371.5" y="154" width="41.5" height="42" fill="#d3d3d3" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="508.0" y="154" width="41.5" height="42" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="549.5" y="154" width="41.5" height="42" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="591.0" y="154" width="41.5" height="42" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="632.5" y="154" width="41.5" height="42" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="674.0" y="154" width="41.5" height="42" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="715.5" y="154" width="41.5" height="42" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="757.0" y="154" width="41.5" height="42" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="798.5" y="154" width="41.5" height="42" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <path d="M437 77 H443 V111.45 H453.25 L440 130 L426.75 111.45 H437 Z" stroke="none" stroke-width="1" fill="#000" />
+    <path d="M101 196 v19 h292.0 v-19" stroke="#101843" stroke-width="1" fill="none" />
+    <path d="M528 196 v19 h292.0 v-19" stroke="#101843" stroke-width="1" fill="none" />
+  </g>
+  <g fill="#171717" font-family="FZLanTingHei-R-GBK, 方正兰亭黑_GBK, sans-serif" font-size="12" font-weight="400">
+    <text x="101.75" y="43.2" font-size="12.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="143.25" y="43.2" font-size="12.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="184.75" y="43.2" font-size="12.00" text-anchor="middle" fill="#171717">1</text>
+    <text x="226.25" y="43.2" font-size="12.00" text-anchor="middle" fill="#171717">...</text>
+    <text x="267.75" y="43.2" font-size="12.00" text-anchor="middle" fill="#171717">...</text>
+    <text x="309.25" y="43.2" font-size="12.00" text-anchor="middle" fill="#171717">126</text>
+    <text x="350.75" y="43.2" font-size="12.00" text-anchor="middle" fill="#171717">127</text>
+    <text x="392.25" y="43.2" font-size="12.00" text-anchor="middle" fill="#171717">127</text>
+    <text x="61" y="33" font-size="13.00" text-anchor="end" fill="#171717">src0</text>
+    <text x="75" y="53" font-size="10.50" text-anchor="end" fill="#171717">&lt;dtypes.int8&gt;</text>
+    <text x="528.75" y="43.2" font-size="12.00" text-anchor="middle" fill="#171717">128</text>
+    <text x="570.25" y="43.2" font-size="12.00" text-anchor="middle" fill="#171717">128</text>
+    <text x="611.75" y="43.2" font-size="12.00" text-anchor="middle" fill="#171717">129</text>
+    <text x="653.25" y="43.2" font-size="12.00" text-anchor="middle" fill="#171717">...</text>
+    <text x="694.75" y="43.2" font-size="12.00" text-anchor="middle" fill="#171717">...</text>
+    <text x="736.25" y="43.2" font-size="12.00" text-anchor="middle" fill="#171717">254</text>
+    <text x="777.75" y="43.2" font-size="12.00" text-anchor="middle" fill="#171717">255</text>
+    <text x="819.25" y="43.2" font-size="12.00" text-anchor="middle" fill="#171717">255</text>
+    <text x="488" y="33" font-size="13.00" text-anchor="end" fill="#171717">src1</text>
+    <text x="502" y="53" font-size="10.50" text-anchor="end" fill="#171717">&lt;dtypes.int8&gt;</text>
+    <text x="101.75" y="179.2" font-size="12.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="143.25" y="179.2" font-size="12.00" text-anchor="middle" fill="#171717">1</text>
+    <text x="184.75" y="179.2" font-size="12.00" text-anchor="middle" fill="#171717">2</text>
+    <text x="226.25" y="179.2" font-size="12.00" text-anchor="middle" fill="#171717">...</text>
+    <text x="267.75" y="179.2" font-size="12.00" text-anchor="middle" fill="#171717">...</text>
+    <text x="309.25" y="179.2" font-size="12.00" text-anchor="middle" fill="#171717">253</text>
+    <text x="350.75" y="179.2" font-size="12.00" text-anchor="middle" fill="#171717">254</text>
+    <text x="392.25" y="179.2" font-size="12.00" text-anchor="middle" fill="#171717">255</text>
+    <text x="61" y="169" font-size="13.00" text-anchor="end" fill="#171717">dst0</text>
+    <text x="75" y="189" font-size="10.50" text-anchor="end" fill="#171717">&lt;dtypes.int8&gt;</text>
+    <text x="528.75" y="179.2" font-size="12.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="570.25" y="179.2" font-size="12.00" text-anchor="middle" fill="#171717">1</text>
+    <text x="611.75" y="179.2" font-size="12.00" text-anchor="middle" fill="#171717">2</text>
+    <text x="653.25" y="179.2" font-size="12.00" text-anchor="middle" fill="#171717">...</text>
+    <text x="694.75" y="179.2" font-size="12.00" text-anchor="middle" fill="#171717">...</text>
+    <text x="736.25" y="179.2" font-size="12.00" text-anchor="middle" fill="#171717">253</text>
+    <text x="777.75" y="179.2" font-size="12.00" text-anchor="middle" fill="#171717">254</text>
+    <text x="819.25" y="179.2" font-size="12.00" text-anchor="middle" fill="#171717">255</text>
+    <text x="488" y="169" font-size="13.00" text-anchor="end" fill="#171717">dst1</text>
+    <text x="502" y="189" font-size="10.50" text-anchor="end" fill="#171717">&lt;dtypes.int8&gt;</text>
+    <text x="247" y="247" font-size="14.00" text-anchor="middle" fill="#171717">lower part</text>
+    <text x="674" y="247" font-size="14.00" text-anchor="middle" fill="#171717">higher part</text>
+  </g>
+</svg>

@@ -1,0 +1,66 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="843" height="134" viewBox="0 0 843 134" role="img" aria-labelledby="reg_vector_overview-title reg_vector_overview-desc">
+  <title id="reg_vector_overview-title">Reg矢量计算</title>
+  <desc id="reg_vector_overview-desc">Editable vector diagram reconstructed from the preserved reg_vector_overview.png; text uses FZLanTingHei-R-GBK.</desc>
+  <defs>
+    <marker id="reg_vector_overview-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#696d75" />
+    </marker>
+    <marker id="reg_vector_overview-ink-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#101843" />
+    </marker>
+    <marker id="reg_vector_overview-blue-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#5277ff" />
+    </marker>
+    <marker id="reg_vector_overview-arrow-32aa73" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#32aa73" />
+    </marker>
+    <marker id="reg_vector_overview-arrow-dca800" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#dca800" />
+    </marker>
+  </defs>
+  <rect x="0" y="0" width="843" height="134" fill="#fff" stroke="none" stroke-width="1" rx="0" />
+  <g>
+    <rect x="298" y="20" width="247" height="113" fill="none" stroke="#101843" stroke-width="0.8" rx="9" />
+    <rect x="0" y="87" width="53" height="37" fill="#5e89ff" stroke="#101843" stroke-width="1" rx="7" />
+    <rect x="76" y="90" width="91" height="32" fill="#bbb" stroke="#101843" stroke-width="1" rx="7" />
+    <rect x="189" y="88" width="85" height="36" fill="#8db6f8" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="311" y="96" width="66" height="32" fill="#bbb" stroke="#101843" stroke-width="1" rx="7" />
+    <rect x="388" y="96" width="66" height="32" fill="#bbb" stroke="#101843" stroke-width="1" rx="7" />
+    <rect x="464" y="96" width="67" height="32" fill="#bbb" stroke="#101843" stroke-width="1" rx="7" />
+    <rect x="569" y="88" width="84" height="36" fill="#8db6f8" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="677" y="90" width="91" height="32" fill="#bbb" stroke="#101843" stroke-width="1" rx="7" />
+    <rect x="791" y="88" width="51" height="36" fill="#5e89ff" stroke="#101843" stroke-width="1" rx="7" />
+    <line x1="53" y1="106" x2="74" y2="106" stroke="#32aa73" stroke-width="1" marker-end="url(#reg_vector_overview-arrow-32aa73)" />
+    <line x1="167" y1="106" x2="187" y2="106" stroke="#32aa73" stroke-width="1" marker-end="url(#reg_vector_overview-arrow-32aa73)" />
+    <line x1="274" y1="106" x2="296" y2="106" stroke="#32aa73" stroke-width="1" marker-end="url(#reg_vector_overview-arrow-32aa73)" />
+    <line x1="545" y1="106" x2="567" y2="106" stroke="#32aa73" stroke-width="1" marker-end="url(#reg_vector_overview-arrow-32aa73)" />
+    <line x1="653" y1="106" x2="675" y2="106" stroke="#32aa73" stroke-width="1" marker-end="url(#reg_vector_overview-arrow-32aa73)" />
+    <line x1="768" y1="106" x2="789" y2="106" stroke="#32aa73" stroke-width="1" marker-end="url(#reg_vector_overview-arrow-32aa73)" />
+    <rect x="394" y="41" width="56" height="27" fill="#ffd800" stroke="#101843" stroke-width="1" rx="0" />
+    <line x1="344" y1="96" x2="394" y2="54" stroke="#dca800" stroke-width="1" marker-end="url(#reg_vector_overview-arrow-dca800)" />
+    <line x1="422" y1="68" x2="422" y2="95" stroke="#dca800" stroke-width="1" marker-end="url(#reg_vector_overview-arrow-dca800)" />
+    <line x1="450" y1="55" x2="498" y2="96" stroke="#dca800" stroke-width="1" marker-end="url(#reg_vector_overview-arrow-dca800)" />
+  </g>
+  <g fill="#171717" font-family="FZLanTingHei-R-GBK, 方正兰亭黑_GBK, sans-serif" font-size="12" font-weight="400">
+    <text x="421" y="18" font-size="14.00" text-anchor="middle" fill="#171717">Vector Function</text>
+    <text x="303" y="37" font-size="12.00" text-anchor="start" fill="#171717">VF执行单元</text>
+    <text x="26.5" y="109.35" font-size="11.00" text-anchor="middle" fill="#171717">GM</text>
+    <text x="121.5" y="109.85" font-size="11.00" text-anchor="middle" fill="#171717">GM搬入单元</text>
+    <text x="231.5" y="109.85" font-size="11.00" text-anchor="middle" fill="#171717">UB</text>
+    <text x="344" y="108.425" font-size="11.00" text-anchor="middle" fill="#171717">寄存器搬入</text>
+    <text x="344" y="123.275" font-size="11.00" text-anchor="middle" fill="#171717">单元</text>
+    <text x="421" y="108.425" font-size="11.00" text-anchor="middle" fill="#171717">寄存器执行</text>
+    <text x="421" y="123.275" font-size="11.00" text-anchor="middle" fill="#171717">单元</text>
+    <text x="497.5" y="108.425" font-size="11.00" text-anchor="middle" fill="#171717">寄存器搬出</text>
+    <text x="497.5" y="123.275" font-size="11.00" text-anchor="middle" fill="#171717">单元</text>
+    <text x="611" y="109.85" font-size="11.00" text-anchor="middle" fill="#171717">UB</text>
+    <text x="722.5" y="109.85" font-size="11.00" text-anchor="middle" fill="#171717">GM搬出单元</text>
+    <text x="816.5" y="109.85" font-size="11.00" text-anchor="middle" fill="#171717">GM</text>
+    <text x="422" y="59.05" font-size="13.00" text-anchor="middle" fill="#171717">寄存器</text>
+    <text x="346" y="67" font-size="11.00" text-anchor="middle" fill="#171717">LD</text>
+    <text x="346" y="81.85" font-size="11.00" text-anchor="middle" fill="#171717">搬入</text>
+    <text x="423" y="89" font-size="11.00" text-anchor="middle" fill="#171717">EXE</text>
+    <text x="497" y="67" font-size="11.00" text-anchor="middle" fill="#171717">ST</text>
+    <text x="497" y="81.85" font-size="11.00" text-anchor="middle" fill="#171717">搬出</text>
+  </g>
+</svg>

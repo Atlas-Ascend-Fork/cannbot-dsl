@@ -1,0 +1,81 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="523" height="359" viewBox="0 0 523 359" role="img" aria-labelledby="vaddc-title vaddc-desc">
+  <title id="vaddc-title">vaddc示意图</title>
+  <desc id="vaddc-desc">Editable vector diagram reconstructed from the preserved vaddc.png; text uses FZLanTingHei-R-GBK.</desc>
+  <defs>
+    <marker id="vaddc-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#696d75" />
+    </marker>
+    <marker id="vaddc-ink-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#101843" />
+    </marker>
+    <marker id="vaddc-blue-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#5277ff" />
+    </marker>
+  </defs>
+  <rect x="0" y="0" width="523" height="359" fill="#fff" stroke="none" stroke-width="1" rx="0" />
+  <g>
+    <rect x="0" y="0" width="112" height="44" fill="#fff0ed" stroke="none" stroke-width="1" rx="0" />
+    <rect x="158" y="1" width="154" height="37" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="367" y="1" width="154" height="37" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="0" y="43" width="112" height="44" fill="#fff0ed" stroke="none" stroke-width="1" rx="0" />
+    <rect x="158" y="48" width="154" height="37" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="367" y="48" width="154" height="37" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="0" y="94" width="112" height="44" fill="#e9edfb" stroke="none" stroke-width="1" rx="0" />
+    <rect x="158.0" y="99" width="38.5" height="39" fill="#ccc" stroke="#b09241" stroke-width="1" rx="0" />
+    <rect x="196.5" y="99" width="38.5" height="39" fill="#ccc" stroke="#b09241" stroke-width="1" rx="0" />
+    <rect x="235.0" y="99" width="38.5" height="39" fill="#ccc" stroke="#b09241" stroke-width="1" rx="0" />
+    <rect x="273.5" y="99" width="38.5" height="39" fill="#ccc" stroke="#b09241" stroke-width="1" rx="0" />
+    <rect x="367.0" y="99" width="38.5" height="39" fill="#c2d5fe" stroke="#b09241" stroke-width="1" rx="0" />
+    <rect x="405.5" y="99" width="38.5" height="39" fill="#ccc" stroke="#b09241" stroke-width="1" rx="0" />
+    <rect x="444.0" y="99" width="38.5" height="39" fill="#ccc" stroke="#b09241" stroke-width="1" rx="0" />
+    <rect x="482.5" y="99" width="38.5" height="39" fill="#ccc" stroke="#b09241" stroke-width="1" rx="0" />
+    <rect x="0" y="186" width="112" height="44" fill="#e9edfb" stroke="none" stroke-width="1" rx="0" />
+    <rect x="158" y="191" width="154" height="37" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="367" y="191" width="154" height="37" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="0" y="234" width="112" height="44" fill="#e9edfb" stroke="none" stroke-width="1" rx="0" />
+    <rect x="158.0" y="239" width="38.5" height="39" fill="#c2d5fe" stroke="#b09241" stroke-width="1" rx="0" />
+    <rect x="196.5" y="239" width="38.5" height="39" fill="#ccc" stroke="#b09241" stroke-width="1" rx="0" />
+    <rect x="235.0" y="239" width="38.5" height="39" fill="#ccc" stroke="#b09241" stroke-width="1" rx="0" />
+    <rect x="273.5" y="239" width="38.5" height="39" fill="#ccc" stroke="#b09241" stroke-width="1" rx="0" />
+    <rect x="367.0" y="239" width="38.5" height="39" fill="#ccc" stroke="#b09241" stroke-width="1" rx="0" />
+    <rect x="405.5" y="239" width="38.5" height="39" fill="#ccc" stroke="#b09241" stroke-width="1" rx="0" />
+    <rect x="444.0" y="239" width="38.5" height="39" fill="#ccc" stroke="#b09241" stroke-width="1" rx="0" />
+    <rect x="482.5" y="239" width="38.5" height="39" fill="#ccc" stroke="#b09241" stroke-width="1" rx="0" />
+    <line x1="238" y1="147" x2="238" y2="184" stroke="#696d75" stroke-width="1.2" marker-end="url(#vaddc-arrow)" />
+    <line x1="447" y1="147" x2="447" y2="184" stroke="#696d75" stroke-width="1.2" marker-end="url(#vaddc-arrow)" />
+    <rect x="146" y="285" width="58" height="28" fill="#e2f8ff" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="268" y="285" width="58" height="28" fill="#eef0f9" stroke="#101843" stroke-width="1" rx="0" />
+  </g>
+  <g fill="#171717" font-family="FZLanTingHei-R-GBK, 方正兰亭黑_GBK, sans-serif" font-size="12" font-weight="400">
+    <text x="100" y="21" font-size="12.00" text-anchor="end" fill="#171717">src0</text>
+    <text x="235" y="23.7" font-size="12.00" text-anchor="middle" fill="#171717">0xFFFF FFFF</text>
+    <text x="444" y="23.7" font-size="12.00" text-anchor="middle" fill="#171717">0x8000 0001</text>
+    <text x="100" y="68" font-size="12.00" text-anchor="end" fill="#171717">src1</text>
+    <text x="235" y="70.7" font-size="12.00" text-anchor="middle" fill="#171717">0x0000 0002</text>
+    <text x="444" y="70.7" font-size="12.00" text-anchor="middle" fill="#171717">0x0000 0002</text>
+    <text x="100" y="119" font-size="12.00" text-anchor="end" fill="#171717">carry_src</text>
+    <text x="177.25" y="122.7" font-size="12.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="215.75" y="122.7" font-size="12.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="254.25" y="122.7" font-size="12.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="292.75" y="122.7" font-size="12.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="386.25" y="122.7" font-size="12.00" text-anchor="middle" fill="#171717">1</text>
+    <text x="424.75" y="122.7" font-size="12.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="463.25" y="122.7" font-size="12.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="501.75" y="122.7" font-size="12.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="100" y="211" font-size="12.00" text-anchor="end" fill="#171717">dst</text>
+    <text x="235" y="213.7" font-size="12.00" text-anchor="middle" fill="#171717">0x0000 0001</text>
+    <text x="444" y="213.7" font-size="12.00" text-anchor="middle" fill="#171717">0x8000 0004</text>
+    <text x="100" y="259" font-size="12.00" text-anchor="end" fill="#171717">carry</text>
+    <text x="177.25" y="262.7" font-size="12.00" text-anchor="middle" fill="#171717">1</text>
+    <text x="215.75" y="262.7" font-size="12.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="254.25" y="262.7" font-size="12.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="292.75" y="262.7" font-size="12.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="386.25" y="262.7" font-size="12.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="424.75" y="262.7" font-size="12.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="463.25" y="262.7" font-size="12.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="501.75" y="262.7" font-size="12.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="175" y="303.55" font-size="13.00" text-anchor="middle" fill="#171717">LOW</text>
+    <text x="297" y="303.55" font-size="13.00" text-anchor="middle" fill="#171717">HIGH</text>
+    <text x="261.5" y="354" font-size="11.00" text-anchor="middle" fill="#171717">掩码寄存器中四个bit对应一个元素，只有最低比特位有效</text>
+  </g>
+</svg>

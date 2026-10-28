@@ -1,0 +1,70 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1869" height="1253" viewBox="0 0 1000 672" role="img" aria-labelledby="non_deterministic_computation_1_gm_data_change_process-title non_deterministic_computation_1_gm_data_change_process-desc">
+  <title id="non_deterministic_computation_1_gm_data_change_process-title">non deterministic computation 1 gm data change process示意图</title>
+  <desc id="non_deterministic_computation_1_gm_data_change_process-desc">Editable vector diagram reconstructed from the preserved non_deterministic_computation_1_gm_data_change_process.png; text uses FZLanTingHei-R-GBK.</desc>
+  <defs>
+    <marker id="non_deterministic_computation_1_gm_data_change_process-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#696d75" />
+    </marker>
+    <marker id="non_deterministic_computation_1_gm_data_change_process-ink-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#101843" />
+    </marker>
+    <marker id="non_deterministic_computation_1_gm_data_change_process-blue-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#5277ff" />
+    </marker>
+  </defs>
+  <rect x="0" y="0" width="1000" height="672" fill="#fff" stroke="none" stroke-width="1" rx="0" />
+  <g>
+    <rect x="675" y="113" width="250" height="44" fill="#c2d5fe" stroke="none" stroke-width="1" rx="4" />
+    <line x1="800" y1="157" x2="800" y2="180" stroke="#101843" stroke-width="4" marker-end="url(#non_deterministic_computation_1_gm_data_change_process-ink-arrow)" />
+    <rect x="65" y="181" width="250" height="48" fill="#c2d5fe" stroke="none" stroke-width="1" rx="4" />
+    <line x1="190.0" y1="229" x2="190.0" y2="267" stroke="#101843" stroke-width="4" marker-end="url(#non_deterministic_computation_1_gm_data_change_process-ink-arrow)" />
+    <rect x="65" y="269" width="250" height="48" fill="#c2d5fe" stroke="none" stroke-width="1" rx="4" />
+    <line x1="190.0" y1="317" x2="190.0" y2="355" stroke="#101843" stroke-width="4" marker-end="url(#non_deterministic_computation_1_gm_data_change_process-ink-arrow)" />
+    <rect x="65" y="357" width="250" height="48" fill="#c2d5fe" stroke="none" stroke-width="1" rx="4" />
+    <line x1="190.0" y1="405" x2="190.0" y2="443" stroke="#101843" stroke-width="4" marker-end="url(#non_deterministic_computation_1_gm_data_change_process-ink-arrow)" />
+    <rect x="65" y="445" width="250" height="48" fill="#c2d5fe" stroke="none" stroke-width="1" rx="4" />
+    <line x1="190.0" y1="493" x2="190.0" y2="531" stroke="#101843" stroke-width="4" marker-end="url(#non_deterministic_computation_1_gm_data_change_process-ink-arrow)" />
+    <rect x="65" y="533" width="250" height="48" fill="#c2d5fe" stroke="none" stroke-width="1" rx="4" />
+    <rect x="365" y="181" width="250" height="48" fill="#c2d5fe" stroke="none" stroke-width="1" rx="4" />
+    <line x1="490.0" y1="229" x2="490.0" y2="267" stroke="#101843" stroke-width="4" marker-end="url(#non_deterministic_computation_1_gm_data_change_process-ink-arrow)" />
+    <rect x="365" y="269" width="250" height="48" fill="#c2d5fe" stroke="none" stroke-width="1" rx="4" />
+    <line x1="490.0" y1="317" x2="490.0" y2="355" stroke="#101843" stroke-width="4" marker-end="url(#non_deterministic_computation_1_gm_data_change_process-ink-arrow)" />
+    <rect x="365" y="357" width="250" height="48" fill="#c2d5fe" stroke="none" stroke-width="1" rx="4" />
+    <line x1="490.0" y1="405" x2="490.0" y2="443" stroke="#101843" stroke-width="4" marker-end="url(#non_deterministic_computation_1_gm_data_change_process-ink-arrow)" />
+    <rect x="365" y="445" width="250" height="48" fill="#c2d5fe" stroke="none" stroke-width="1" rx="4" />
+    <line x1="490.0" y1="493" x2="490.0" y2="531" stroke="#101843" stroke-width="4" marker-end="url(#non_deterministic_computation_1_gm_data_change_process-ink-arrow)" />
+    <rect x="365" y="533" width="250" height="48" fill="#c2d5fe" stroke="none" stroke-width="1" rx="4" />
+    <rect x="675" y="181" width="250" height="48" fill="#c2d5fe" stroke="none" stroke-width="1" rx="4" />
+    <line x1="800.0" y1="229" x2="800.0" y2="267" stroke="#101843" stroke-width="4" marker-end="url(#non_deterministic_computation_1_gm_data_change_process-ink-arrow)" />
+    <rect x="675" y="269" width="250" height="48" fill="#c2d5fe" stroke="none" stroke-width="1" rx="4" />
+    <line x1="800.0" y1="317" x2="800.0" y2="355" stroke="#101843" stroke-width="4" marker-end="url(#non_deterministic_computation_1_gm_data_change_process-ink-arrow)" />
+    <rect x="675" y="357" width="250" height="48" fill="#c2d5fe" stroke="none" stroke-width="1" rx="4" />
+    <line x1="800.0" y1="405" x2="800.0" y2="443" stroke="#101843" stroke-width="4" marker-end="url(#non_deterministic_computation_1_gm_data_change_process-ink-arrow)" />
+    <rect x="675" y="445" width="250" height="60" fill="#c2d5fe" stroke="none" stroke-width="1" rx="4" />
+    <line x1="800.0" y1="505" x2="800.0" y2="531" stroke="#101843" stroke-width="4" marker-end="url(#non_deterministic_computation_1_gm_data_change_process-ink-arrow)" />
+    <rect x="675" y="533" width="250" height="60" fill="#c2d5fe" stroke="none" stroke-width="1" rx="4" />
+  </g>
+  <g fill="#171717" font-family="FZLanTingHei-R-GBK, 方正兰亭黑_GBK, sans-serif" font-size="12" font-weight="400">
+    <text x="190" y="148" font-size="25.00" text-anchor="middle" fill="#171717" font-weight="700">指令发射顺序</text>
+    <text x="490" y="158" font-size="25.00" text-anchor="middle" fill="#171717" font-weight="700">指令执行顺序</text>
+    <text x="800" y="89" font-size="25.00" text-anchor="middle" fill="#171717" font-weight="700">GM上的数据</text>
+    <text x="800" y="143.05" font-size="23.00" text-anchor="middle" fill="#171717">随机数</text>
+    <text x="190" y="212.35" font-size="21.00" text-anchor="middle" fill="#171717">1.向GM搬运data0</text>
+    <text x="190" y="300.35" font-size="21.00" text-anchor="middle" fill="#171717">2.开启原子累加</text>
+    <text x="190" y="388.35" font-size="21.00" text-anchor="middle" fill="#171717">3.向GM搬运data1</text>
+    <text x="190" y="476.35" font-size="21.00" text-anchor="middle" fill="#171717">4.向GM搬运data2</text>
+    <text x="190" y="564.35" font-size="21.00" text-anchor="middle" fill="#171717">5.向GM搬运data3</text>
+    <text x="490" y="212.35" font-size="21.00" text-anchor="middle" fill="#171717">1.向GM搬运data0</text>
+    <text x="490" y="300.35" font-size="21.00" text-anchor="middle" fill="#171717">2.开启原子累加</text>
+    <text x="490" y="388.35" font-size="21.00" text-anchor="middle" fill="#171717">3.向GM搬运data2</text>
+    <text x="490" y="476.35" font-size="21.00" text-anchor="middle" fill="#171717">4.向GM搬运data3</text>
+    <text x="490" y="564.35" font-size="21.00" text-anchor="middle" fill="#171717">5.向GM搬运data1</text>
+    <text x="800" y="212.35" font-size="21.00" text-anchor="middle" fill="#171717">data0</text>
+    <text x="800" y="300.35" font-size="21.00" text-anchor="middle" fill="#171717">data0</text>
+    <text x="800" y="388.35" font-size="21.00" text-anchor="middle" fill="#171717">data0+data2</text>
+    <text x="800" y="468.175" font-size="21.00" text-anchor="middle" fill="#171717">data0+data2</text>
+    <text x="800" y="496.525" font-size="21.00" text-anchor="middle" fill="#171717">+data3</text>
+    <text x="800" y="556.175" font-size="21.00" text-anchor="middle" fill="#171717">data0+data2</text>
+    <text x="800" y="584.525" font-size="21.00" text-anchor="middle" fill="#171717">+data3+data1</text>
+  </g>
+</svg>

@@ -1,0 +1,86 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="3368" height="1736" viewBox="0 0 1000 515" role="img" aria-labelledby="float_to_int16_conversion-title float_to_int16_conversion-desc">
+  <title id="float_to_int16_conversion-title">float to int16 conversion示意图</title>
+  <desc id="float_to_int16_conversion-desc">Editable vector diagram reconstructed from the preserved float_to_int16_conversion.png; text uses FZLanTingHei-R-GBK.</desc>
+  <defs>
+    <marker id="float_to_int16_conversion-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#696d75" />
+    </marker>
+    <marker id="float_to_int16_conversion-ink-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#101843" />
+    </marker>
+    <marker id="float_to_int16_conversion-blue-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#5277ff" />
+    </marker>
+  </defs>
+  <rect x="0" y="0" width="1000" height="515" fill="#fff" stroke="none" stroke-width="1" rx="0" />
+  <g>
+    <rect x="244" y="8" width="145" height="57" fill="#b0f0e2" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="399" y="8" width="145" height="57" fill="#b0f0e2" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="619" y="8" width="145" height="57" fill="#b0f0e2" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="235" y="2" width="606" height="69" fill="none" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="236" y="171" width="145" height="57" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="390" y="171" width="145" height="57" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="619" y="171" width="145" height="57" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="235" y="165" width="540" height="69" fill="none" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="236" y="320" width="70" height="57" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="313" y="320" width="70" height="57" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="390" y="320" width="70" height="57" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="467" y="320" width="70" height="57" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="619" y="320" width="70" height="57" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="696" y="320" width="70" height="57" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="235" y="314" width="540" height="69" fill="none" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="236" y="432" width="70" height="57" fill="#b0f0e2" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="313" y="432" width="70" height="57" fill="#b0f0e2" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="468" y="432" width="70" height="57" fill="#b0f0e2" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="235" y="426" width="358" height="69" fill="none" stroke="#101843" stroke-width="1" rx="0" />
+    <line x1="316.5" y1="65" x2="308.5" y2="171" stroke="#696d75" stroke-width="2" marker-end="url(#float_to_int16_conversion-arrow)" />
+    <line x1="471.5" y1="65" x2="462.5" y2="171" stroke="#696d75" stroke-width="2" marker-end="url(#float_to_int16_conversion-arrow)" />
+    <line x1="691.5" y1="65" x2="691.5" y2="171" stroke="#696d75" stroke-width="2" marker-end="url(#float_to_int16_conversion-arrow)" />
+    <line x1="308.5" y1="228" x2="271.0" y2="320" stroke="#696d75" stroke-width="2" marker-end="url(#float_to_int16_conversion-arrow)" />
+    <line x1="462.5" y1="228" x2="425.0" y2="320" stroke="#696d75" stroke-width="2" marker-end="url(#float_to_int16_conversion-arrow)" />
+    <line x1="691.5" y1="228" x2="654.0" y2="320" stroke="#696d75" stroke-width="2" marker-end="url(#float_to_int16_conversion-arrow)" />
+    <line x1="271.0" y1="377" x2="271.0" y2="432" stroke="#696d75" stroke-width="2" marker-end="url(#float_to_int16_conversion-arrow)" />
+    <line x1="425.0" y1="377" x2="348.0" y2="432" stroke="#696d75" stroke-width="2" marker-end="url(#float_to_int16_conversion-arrow)" />
+    <line x1="654.0" y1="377" x2="503.0" y2="432" stroke="#696d75" stroke-width="2" marker-end="url(#float_to_int16_conversion-arrow)" />
+  </g>
+  <g fill="#171717" font-family="FZLanTingHei-R-GBK, 方正兰亭黑_GBK, sans-serif" font-size="12" font-weight="400">
+    <text x="316.5" y="43.15" font-size="19.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="471.5" y="43.15" font-size="19.00" text-anchor="middle" fill="#171717">1</text>
+    <text x="581.5" y="44" font-size="18.00" text-anchor="middle" fill="#171717">...</text>
+    <text x="691.5" y="43.15" font-size="19.00" text-anchor="middle" fill="#171717">63</text>
+    <text x="808.5" y="44" font-size="18.00" text-anchor="middle" fill="#171717">...</text>
+    <text x="308.5" y="206.15" font-size="19.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="462.5" y="206.15" font-size="19.00" text-anchor="middle" fill="#171717">1</text>
+    <text x="581.5" y="207" font-size="18.00" text-anchor="middle" fill="#171717">...</text>
+    <text x="691.5" y="206.15" font-size="19.00" text-anchor="middle" fill="#171717">63</text>
+    <text x="271" y="355.15" font-size="19.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="348" y="355.15" font-size="19.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="425" y="355.15" font-size="19.00" text-anchor="middle" fill="#171717">1</text>
+    <text x="502" y="355.15" font-size="19.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="582" y="356" font-size="18.00" text-anchor="middle" fill="#171717">...</text>
+    <text x="654" y="355.15" font-size="19.00" text-anchor="middle" fill="#171717">63</text>
+    <text x="731" y="355.15" font-size="19.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="271" y="467.15" font-size="19.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="348" y="467.15" font-size="19.00" text-anchor="middle" fill="#171717">1</text>
+    <text x="425" y="468" font-size="18.00" text-anchor="middle" fill="#171717">...</text>
+    <text x="503" y="467.15" font-size="19.00" text-anchor="middle" fill="#171717">63</text>
+    <text x="173" y="27" font-size="19.00" text-anchor="middle" fill="#171717">x_addr</text>
+    <text x="173" y="52.65" font-size="19.00" text-anchor="middle" fill="#171717">(float32)</text>
+    <text x="173" y="184" font-size="19.00" text-anchor="middle" fill="#171717">x_reg</text>
+    <text x="173" y="209.65" font-size="19.00" text-anchor="middle" fill="#171717">(float32)</text>
+    <text x="173" y="335" font-size="19.00" text-anchor="middle" fill="#171717">y_reg</text>
+    <text x="173" y="360.65" font-size="19.00" text-anchor="middle" fill="#171717">(int16)</text>
+    <text x="173" y="449" font-size="19.00" text-anchor="middle" fill="#171717">y_addr</text>
+    <text x="173" y="474.65" font-size="19.00" text-anchor="middle" fill="#171717">(int16)</text>
+    <text x="990" y="45" font-size="17.00" text-anchor="end" fill="#171717">64个float32元素</text>
+    <text x="990" y="204" font-size="17.00" text-anchor="end" fill="#171717">64个float32元素</text>
+    <text x="990" y="352" font-size="17.00" text-anchor="end" fill="#171717">128个int16元素</text>
+    <text x="990" y="463" font-size="17.00" text-anchor="end" fill="#171717">64个int16元素</text>
+    <text x="104" y="113" font-size="18.00" text-anchor="middle" fill="#171717">vload</text>
+    <text x="104" y="137.3" font-size="18.00" text-anchor="middle" fill="#171717">(x_reg, x_addr)</text>
+    <text x="104" y="266" font-size="18.00" text-anchor="middle" fill="#171717">vcast</text>
+    <text x="104" y="290.3" font-size="18.00" text-anchor="middle" fill="#171717">(y_reg, x_reg, mask)</text>
+    <text x="104" y="399" font-size="18.00" text-anchor="middle" fill="#171717">vstore_pack</text>
+    <text x="104" y="423.3" font-size="18.00" text-anchor="middle" fill="#171717">(y_addr, y_reg, mask)</text>
+  </g>
+</svg>

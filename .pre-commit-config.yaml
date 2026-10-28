@@ -48,5 +48,5 @@ repos:
     hooks:
       - id: oat-check
         pass_filenames: true
-        stages: [commit]
+        stages: [pre-commit]
         verbose: true

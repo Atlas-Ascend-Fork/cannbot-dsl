@@ -1,0 +1,48 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="785" height="184" viewBox="0 0 785 184" role="img" aria-labelledby="reg_store_onept-title reg_store_onept-desc">
+  <title id="reg_store_onept-title">reg store onept示意图</title>
+  <desc id="reg_store_onept-desc">Editable vector diagram reconstructed from the preserved reg_store_onept.png; text uses FZLanTingHei-R-GBK.</desc>
+  <defs>
+    <marker id="reg_store_onept-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#696d75" />
+    </marker>
+    <marker id="reg_store_onept-ink-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#101843" />
+    </marker>
+    <marker id="reg_store_onept-blue-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#5277ff" />
+    </marker>
+  </defs>
+  <rect x="0" y="0" width="785" height="184" fill="#fff" stroke="none" stroke-width="1" rx="0" />
+  <g>
+    <rect x="89" y="6" width="53" height="41" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="146" y="6" width="53" height="41" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="204" y="6" width="53" height="41" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="376" y="6" width="53" height="41" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="434" y="6" width="53" height="41" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="607" y="6" width="53" height="41" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="665" y="6" width="53" height="41" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="723" y="6" width="53" height="41" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="83" y="1" width="700" height="51" fill="none" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="89" y="127" width="53" height="41" fill="#b0f0e2" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="83" y="122" width="120" height="51" fill="none" stroke="#101843" stroke-width="1" rx="0" />
+    <line x1="115.5" y1="47" x2="115.5" y2="126" stroke="#696d75" stroke-width="1.3" marker-end="url(#reg_store_onept-arrow)" />
+  </g>
+  <g fill="#171717" font-family="FZLanTingHei-R-GBK, 方正兰亭黑_GBK, sans-serif" font-size="12" font-weight="400">
+    <text x="115.5" y="30.7" font-size="12.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="172.5" y="30.7" font-size="12.00" text-anchor="middle" fill="#171717">1</text>
+    <text x="230.5" y="30.7" font-size="12.00" text-anchor="middle" fill="#171717">2</text>
+    <text x="308" y="31" font-size="12.00" text-anchor="middle" fill="#171717">...</text>
+    <text x="402.5" y="30.7" font-size="12.00" text-anchor="middle" fill="#171717">63</text>
+    <text x="460.5" y="30.7" font-size="12.00" text-anchor="middle" fill="#171717">64</text>
+    <text x="546" y="31" font-size="12.00" text-anchor="middle" fill="#171717">...</text>
+    <text x="633.5" y="30.7" font-size="12.00" text-anchor="middle" fill="#171717">125</text>
+    <text x="691.5" y="30.7" font-size="12.00" text-anchor="middle" fill="#171717">126</text>
+    <text x="749.5" y="30.7" font-size="12.00" text-anchor="middle" fill="#171717">127</text>
+    <text x="115.5" y="151.7" font-size="12.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="174" y="153" font-size="12.00" text-anchor="middle" fill="#171717">...</text>
+    <text x="65" y="29" font-size="14.00" text-anchor="end" fill="#171717">value</text>
+    <text x="81" y="48" font-size="10.50" text-anchor="end" fill="#171717">(dtypes.int16)</text>
+    <text x="66" y="150" font-size="14.00" text-anchor="end" fill="#171717">tensor</text>
+    <text x="81" y="169" font-size="10.50" text-anchor="end" fill="#171717">(dtypes.int16)</text>
+  </g>
+</svg>

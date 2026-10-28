@@ -1,0 +1,88 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="584" height="217" viewBox="0 0 584 217" role="img" aria-labelledby="vload_downsample-title vload_downsample-desc">
+  <title id="vload_downsample-title">vload downsample示意图</title>
+  <desc id="vload_downsample-desc">Editable vector diagram reconstructed from the preserved vload_downsample.png; text uses FZLanTingHei-R-GBK.</desc>
+  <defs>
+    <marker id="vload_downsample-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#696d75" />
+    </marker>
+    <marker id="vload_downsample-ink-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#101843" />
+    </marker>
+    <marker id="vload_downsample-blue-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#5277ff" />
+    </marker>
+  </defs>
+  <rect x="0" y="0" width="584" height="217" fill="#fff" stroke="none" stroke-width="1" rx="0" />
+  <g>
+    <rect x="100" y="42" width="18" height="30" fill="#fff" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="133" y="42" width="18" height="30" fill="#fff" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="166" y="42" width="18" height="30" fill="#fff" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="199" y="42" width="18" height="30" fill="#fff" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="232" y="42" width="18" height="30" fill="#fff" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="265" y="42" width="18" height="30" fill="#fff" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="298" y="42" width="18" height="30" fill="#fff" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="331" y="42" width="18" height="30" fill="#fff" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="364" y="42" width="18" height="30" fill="#fff" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="397" y="42" width="18" height="30" fill="#fff" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="430" y="42" width="18" height="30" fill="#fff" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="463" y="42" width="18" height="30" fill="#fff" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="496" y="42" width="18" height="30" fill="#fff" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="529" y="42" width="18" height="30" fill="#fff" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="562" y="42" width="18" height="30" fill="#fff" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="100" y="148" width="18" height="30" fill="#fff" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="133" y="148" width="18" height="30" fill="#fff" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="166" y="148" width="18" height="30" fill="#fff" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="199" y="148" width="18" height="30" fill="#fff" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="232" y="148" width="18" height="30" fill="#fff" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="265" y="148" width="18" height="30" fill="#fff" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="298" y="148" width="18" height="30" fill="#fff" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="331" y="148" width="18" height="30" fill="#fff" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="364" y="148" width="18" height="30" fill="#fff" stroke="#101843" stroke-width="1" rx="0" />
+    <line x1="97" y1="15" x2="580.0" y2="15" stroke="#696d75" stroke-width="1.2" />
+    <line x1="97" y1="11" x2="97" y2="19" stroke="#696d75" stroke-width="1.2" />
+    <line x1="580.0" y1="11" x2="580.0" y2="19" stroke="#696d75" stroke-width="1.2" />
+    <rect x="305.626" y="5" width="65.74799999999999" height="20" fill="#fff" stroke="none" stroke-width="1" rx="0" />
+    <line x1="97" y1="205" x2="382.0" y2="205" stroke="#696d75" stroke-width="1.2" />
+    <line x1="97" y1="201" x2="97" y2="209" stroke="#696d75" stroke-width="1.2" />
+    <line x1="382.0" y1="201" x2="382.0" y2="209" stroke="#696d75" stroke-width="1.2" />
+    <rect x="205.688" y="195" width="67.624" height="20" fill="#fff" stroke="none" stroke-width="1" rx="0" />
+    <line x1="109.0" y1="72" x2="109.0" y2="148" stroke="#101843" stroke-width="0.9" marker-end="url(#vload_downsample-ink-arrow)" />
+    <line x1="175.0" y1="72" x2="142.0" y2="148" stroke="#101843" stroke-width="0.9" marker-end="url(#vload_downsample-ink-arrow)" />
+    <line x1="241.0" y1="72" x2="175.0" y2="148" stroke="#101843" stroke-width="0.9" marker-end="url(#vload_downsample-ink-arrow)" />
+    <line x1="307.0" y1="72" x2="208.0" y2="148" stroke="#101843" stroke-width="0.9" marker-end="url(#vload_downsample-ink-arrow)" />
+    <line x1="373.0" y1="72" x2="274.0" y2="148" stroke="#101843" stroke-width="0.9" marker-end="url(#vload_downsample-ink-arrow)" />
+    <line x1="439.0" y1="72" x2="307.0" y2="148" stroke="#101843" stroke-width="0.9" marker-end="url(#vload_downsample-ink-arrow)" />
+    <line x1="505.0" y1="72" x2="340.0" y2="148" stroke="#101843" stroke-width="0.9" marker-end="url(#vload_downsample-ink-arrow)" />
+    <line x1="571.0" y1="72" x2="373.0" y2="148" stroke="#101843" stroke-width="0.9" marker-end="url(#vload_downsample-ink-arrow)" />
+  </g>
+  <g fill="#171717" font-family="FZLanTingHei-R-GBK, 方正兰亭黑_GBK, sans-serif" font-size="12" font-weight="400">
+    <text x="109" y="61.55" font-size="13.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="142" y="61.55" font-size="13.00" text-anchor="middle" fill="#171717">1</text>
+    <text x="175" y="61.55" font-size="13.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="208" y="61.55" font-size="13.00" text-anchor="middle" fill="#171717">1</text>
+    <text x="241" y="61.55" font-size="13.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="274" y="61.55" font-size="13.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="307" y="61.55" font-size="13.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="340" y="61.55" font-size="12.70" text-anchor="middle" fill="#171717">...</text>
+    <text x="373" y="61.55" font-size="13.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="406" y="61.55" font-size="13.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="439" y="61.55" font-size="13.00" text-anchor="middle" fill="#171717">1</text>
+    <text x="472" y="61.55" font-size="13.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="505" y="61.55" font-size="13.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="538" y="61.55" font-size="13.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="571" y="61.55" font-size="13.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="109" y="167.55" font-size="13.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="142" y="167.55" font-size="13.00" text-anchor="middle" fill="#171717">1</text>
+    <text x="175" y="167.55" font-size="13.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="208" y="167.55" font-size="13.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="241" y="167.55" font-size="12.70" text-anchor="middle" fill="#171717">...</text>
+    <text x="274" y="167.55" font-size="13.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="307" y="167.55" font-size="13.00" text-anchor="middle" fill="#171717">1</text>
+    <text x="340" y="167.55" font-size="13.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="373" y="167.55" font-size="13.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="52" y="63" font-size="15.00" text-anchor="middle" fill="#171717">src</text>
+    <text x="52" y="169" font-size="15.00" text-anchor="middle" fill="#171717">dst</text>
+    <text x="338.5" y="19" font-size="14.00" text-anchor="middle" fill="#171717">共512bit</text>
+    <text x="239.5" y="209" font-size="14.00" text-anchor="middle" fill="#171717">共256bit</text>
+  </g>
+</svg>

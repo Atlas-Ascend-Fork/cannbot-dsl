@@ -1,0 +1,88 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="3368" height="1736" viewBox="0 0 1000 515" role="img" aria-labelledby="half_to_int32_conversion-title half_to_int32_conversion-desc">
+  <title id="half_to_int32_conversion-title">half to int32 conversion示意图</title>
+  <desc id="half_to_int32_conversion-desc">Editable vector diagram reconstructed from the preserved half_to_int32_conversion.png; text uses FZLanTingHei-R-GBK.</desc>
+  <defs>
+    <marker id="half_to_int32_conversion-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#696d75" />
+    </marker>
+    <marker id="half_to_int32_conversion-ink-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#101843" />
+    </marker>
+    <marker id="half_to_int32_conversion-blue-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#5277ff" />
+    </marker>
+  </defs>
+  <rect x="0" y="0" width="1000" height="515" fill="#fff" stroke="none" stroke-width="1" rx="0" />
+  <g>
+    <rect x="272" y="8" width="76" height="57" fill="#b0f0e2" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="352" y="8" width="76" height="57" fill="#b0f0e2" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="492" y="8" width="76" height="57" fill="#b0f0e2" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="264" y="2" width="382" height="69" fill="none" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="272" y="171" width="76" height="57" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="352" y="171" width="76" height="57" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="432" y="171" width="76" height="57" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="512" y="171" width="76" height="57" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="672" y="171" width="76" height="57" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="752" y="171" width="76" height="57" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="264" y="165" width="568" height="69" fill="none" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="272" y="320" width="154" height="57" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="432" y="320" width="154" height="57" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="672" y="320" width="154" height="57" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="264" y="314" width="568" height="69" fill="none" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="272" y="452" width="154" height="57" fill="#b0f0e2" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="432" y="452" width="154" height="57" fill="#b0f0e2" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="672" y="452" width="154" height="57" fill="#b0f0e2" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="264" y="446" width="568" height="69" fill="none" stroke="#101843" stroke-width="1" rx="0" />
+    <line x1="310.0" y1="65" x2="310.0" y2="171" stroke="#696d75" stroke-width="2" marker-end="url(#half_to_int32_conversion-arrow)" />
+    <line x1="310.0" y1="65" x2="390.0" y2="171" stroke="#696d75" stroke-width="2" marker-end="url(#half_to_int32_conversion-arrow)" />
+    <line x1="390.0" y1="65" x2="470.0" y2="171" stroke="#696d75" stroke-width="2" marker-end="url(#half_to_int32_conversion-arrow)" />
+    <line x1="390.0" y1="65" x2="550.0" y2="171" stroke="#696d75" stroke-width="2" marker-end="url(#half_to_int32_conversion-arrow)" />
+    <line x1="530.0" y1="65" x2="710.0" y2="171" stroke="#696d75" stroke-width="2" marker-end="url(#half_to_int32_conversion-arrow)" />
+    <line x1="530.0" y1="65" x2="790.0" y2="171" stroke="#696d75" stroke-width="2" marker-end="url(#half_to_int32_conversion-arrow)" />
+    <line x1="310.0" y1="228" x2="349.0" y2="320" stroke="#696d75" stroke-width="2" marker-end="url(#half_to_int32_conversion-arrow)" />
+    <line x1="470.0" y1="228" x2="509.0" y2="320" stroke="#696d75" stroke-width="2" marker-end="url(#half_to_int32_conversion-arrow)" />
+    <line x1="710.0" y1="228" x2="749.0" y2="320" stroke="#696d75" stroke-width="2" marker-end="url(#half_to_int32_conversion-arrow)" />
+    <line x1="349.0" y1="377" x2="349.0" y2="452" stroke="#696d75" stroke-width="2" marker-end="url(#half_to_int32_conversion-arrow)" />
+    <line x1="509.0" y1="377" x2="509.0" y2="452" stroke="#696d75" stroke-width="2" marker-end="url(#half_to_int32_conversion-arrow)" />
+    <line x1="749.0" y1="377" x2="749.0" y2="452" stroke="#696d75" stroke-width="2" marker-end="url(#half_to_int32_conversion-arrow)" />
+  </g>
+  <g fill="#171717" font-family="FZLanTingHei-R-GBK, 方正兰亭黑_GBK, sans-serif" font-size="12" font-weight="400">
+    <text x="310" y="43.15" font-size="19.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="390" y="43.15" font-size="19.00" text-anchor="middle" fill="#171717">1</text>
+    <text x="448" y="44" font-size="18.00" text-anchor="middle" fill="#171717">...</text>
+    <text x="530" y="43.15" font-size="19.00" text-anchor="middle" fill="#171717">63</text>
+    <text x="310" y="206.15" font-size="19.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="390" y="206.15" font-size="19.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="470" y="206.15" font-size="19.00" text-anchor="middle" fill="#171717">1</text>
+    <text x="550" y="206.15" font-size="19.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="632" y="207" font-size="18.00" text-anchor="middle" fill="#171717">...</text>
+    <text x="710" y="206.15" font-size="19.00" text-anchor="middle" fill="#171717">63</text>
+    <text x="790" y="206.15" font-size="19.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="349" y="355.15" font-size="19.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="509" y="355.15" font-size="19.00" text-anchor="middle" fill="#171717">1</text>
+    <text x="632" y="356" font-size="18.00" text-anchor="middle" fill="#171717">...</text>
+    <text x="749" y="355.15" font-size="19.00" text-anchor="middle" fill="#171717">63</text>
+    <text x="349" y="487.15" font-size="19.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="509" y="487.15" font-size="19.00" text-anchor="middle" fill="#171717">1</text>
+    <text x="632" y="488" font-size="18.00" text-anchor="middle" fill="#171717">...</text>
+    <text x="749" y="487.15" font-size="19.00" text-anchor="middle" fill="#171717">63</text>
+    <text x="173" y="27" font-size="19.00" text-anchor="middle" fill="#171717">x_addr</text>
+    <text x="173" y="52.65" font-size="19.00" text-anchor="middle" fill="#171717">(float16)</text>
+    <text x="173" y="184" font-size="19.00" text-anchor="middle" fill="#171717">x_reg</text>
+    <text x="173" y="209.65" font-size="19.00" text-anchor="middle" fill="#171717">(float16)</text>
+    <text x="173" y="335" font-size="19.00" text-anchor="middle" fill="#171717">y_reg</text>
+    <text x="173" y="360.65" font-size="19.00" text-anchor="middle" fill="#171717">(int32)</text>
+    <text x="173" y="468" font-size="19.00" text-anchor="middle" fill="#171717">y_addr</text>
+    <text x="173" y="493.65" font-size="19.00" text-anchor="middle" fill="#171717">(int32)</text>
+    <text x="990" y="45" font-size="17.00" text-anchor="end" fill="#171717">64个float16元素</text>
+    <text x="990" y="204" font-size="17.00" text-anchor="end" fill="#171717">128个float16元素</text>
+    <text x="990" y="352" font-size="17.00" text-anchor="end" fill="#171717">64个int32元素</text>
+    <text x="990" y="480" font-size="17.00" text-anchor="end" fill="#171717">64个int32元素</text>
+    <text x="104" y="113" font-size="18.00" text-anchor="middle" fill="#171717">vload_unpack</text>
+    <text x="104" y="137.3" font-size="18.00" text-anchor="middle" fill="#171717">(x_reg, x_addr)</text>
+    <text x="104" y="266" font-size="18.00" text-anchor="middle" fill="#171717">vcast</text>
+    <text x="104" y="290.3" font-size="18.00" text-anchor="middle" fill="#171717">(y_reg, x_reg, mask)</text>
+    <text x="104" y="414" font-size="18.00" text-anchor="middle" fill="#171717">vstore</text>
+    <text x="104" y="438.3" font-size="18.00" text-anchor="middle" fill="#171717">(y_addr, y_reg, mask)</text>
+  </g>
+</svg>

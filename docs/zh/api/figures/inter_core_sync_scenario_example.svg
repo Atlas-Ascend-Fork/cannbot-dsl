@@ -1,0 +1,77 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="964" height="414" viewBox="0 0 964 414">
+<defs><marker id="arrow" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0 0L10 4L0 8Z" fill="#12194b"/></marker></defs>
+<rect x="0" y="0" width="964" height="414" rx="0" fill="#fff" stroke="none" stroke-width="1"/>
+<rect x="41" y="50" width="206" height="227" rx="0" fill="#c3c3c3" stroke="none" stroke-width="1"/>
+<rect x="265" y="50" width="206" height="227" rx="0" fill="#c3c3c3" stroke="none" stroke-width="1"/>
+<rect x="491" y="50" width="206" height="227" rx="0" fill="#c3c3c3" stroke="none" stroke-width="1"/>
+<rect x="716" y="50" width="206" height="227" rx="0" fill="#c3c3c3" stroke="none" stroke-width="1"/>
+<rect x="100" y="74" width="81" height="69" rx="4" fill="#c1d3fc" stroke="none" stroke-width="1"/>
+<g transform="translate(140.5 0) scale(0.85 1) translate(-140.5 0)">
+<text x="140.5" y="116" text-anchor="middle" fill="#000" font-family="FZLanTingHeiS-R-GB, 方正兰亭黑简体, sans-serif" font-size="18" font-weight="400">
+<tspan x="140.5" dy="0">AIC 0</tspan>
+</text></g>
+<rect x="325" y="74" width="81" height="69" rx="4" fill="#c1d3fc" stroke="none" stroke-width="1"/>
+<g transform="translate(365.5 0) scale(0.85 1) translate(-365.5 0)">
+<text x="365.5" y="116" text-anchor="middle" fill="#000" font-family="FZLanTingHeiS-R-GB, 方正兰亭黑简体, sans-serif" font-size="18" font-weight="400">
+<tspan x="365.5" dy="0">AIC 1</tspan>
+</text></g>
+<rect x="551" y="74" width="81" height="69" rx="4" fill="#c1d3fc" stroke="none" stroke-width="1"/>
+<g transform="translate(591.5 0) scale(0.85 1) translate(-591.5 0)">
+<text x="591.5" y="116" text-anchor="middle" fill="#000" font-family="FZLanTingHeiS-R-GB, 方正兰亭黑简体, sans-serif" font-size="18" font-weight="400">
+<tspan x="591.5" dy="0">AIC 2</tspan>
+</text></g>
+<rect x="775" y="74" width="81" height="69" rx="4" fill="#c1d3fc" stroke="none" stroke-width="1"/>
+<g transform="translate(815.5 0) scale(0.85 1) translate(-815.5 0)">
+<text x="815.5" y="116" text-anchor="middle" fill="#000" font-family="FZLanTingHeiS-R-GB, 方正兰亭黑简体, sans-serif" font-size="18" font-weight="400">
+<tspan x="815.5" dy="0">AIC M-1</tspan>
+</text></g>
+<rect x="52" y="194" width="81" height="69" rx="4" fill="#b0eee4" stroke="none" stroke-width="1"/>
+<g transform="translate(92.5 0) scale(0.85 1) translate(-92.5 0)">
+<text x="92.5" y="236" text-anchor="middle" fill="#000" font-family="FZLanTingHeiS-R-GB, 方正兰亭黑简体, sans-serif" font-size="18" font-weight="400">
+<tspan x="92.5" dy="0">AIV 0-0</tspan>
+</text></g>
+<rect x="156" y="194" width="81" height="69" rx="4" fill="#b0eee4" stroke="none" stroke-width="1"/>
+<g transform="translate(196.5 0) scale(0.85 1) translate(-196.5 0)">
+<text x="196.5" y="236" text-anchor="middle" fill="#000" font-family="FZLanTingHeiS-R-GB, 方正兰亭黑简体, sans-serif" font-size="18" font-weight="400">
+<tspan x="196.5" dy="0">AIV 0-1</tspan>
+</text></g>
+<rect x="277" y="194" width="81" height="69" rx="4" fill="#b0eee4" stroke="none" stroke-width="1"/>
+<g transform="translate(317.5 0) scale(0.85 1) translate(-317.5 0)">
+<text x="317.5" y="236" text-anchor="middle" fill="#000" font-family="FZLanTingHeiS-R-GB, 方正兰亭黑简体, sans-serif" font-size="18" font-weight="400">
+<tspan x="317.5" dy="0">AIV 1-0</tspan>
+</text></g>
+<rect x="381" y="194" width="81" height="69" rx="4" fill="#b0eee4" stroke="none" stroke-width="1"/>
+<g transform="translate(421.5 0) scale(0.85 1) translate(-421.5 0)">
+<text x="421.5" y="236" text-anchor="middle" fill="#000" font-family="FZLanTingHeiS-R-GB, 方正兰亭黑简体, sans-serif" font-size="18" font-weight="400">
+<tspan x="421.5" dy="0">AIV 1-1</tspan>
+</text></g>
+<rect x="503" y="194" width="81" height="69" rx="4" fill="#b0eee4" stroke="none" stroke-width="1"/>
+<g transform="translate(543.5 0) scale(0.85 1) translate(-543.5 0)">
+<text x="543.5" y="236" text-anchor="middle" fill="#000" font-family="FZLanTingHeiS-R-GB, 方正兰亭黑简体, sans-serif" font-size="18" font-weight="400">
+<tspan x="543.5" dy="0">AIV 2-0</tspan>
+</text></g>
+<rect x="607" y="194" width="81" height="69" rx="4" fill="#b0eee4" stroke="none" stroke-width="1"/>
+<g transform="translate(647.5 0) scale(0.85 1) translate(-647.5 0)">
+<text x="647.5" y="236" text-anchor="middle" fill="#000" font-family="FZLanTingHeiS-R-GB, 方正兰亭黑简体, sans-serif" font-size="18" font-weight="400">
+<tspan x="647.5" dy="0">AIV 2-1</tspan>
+</text></g>
+<rect x="727" y="194" width="81" height="69" rx="4" fill="#b0eee4" stroke="none" stroke-width="1"/>
+<g transform="translate(767.5 0) scale(0.85 1) translate(-767.5 0)">
+<text x="767.5" y="223" text-anchor="middle" fill="#000" font-family="FZLanTingHeiS-R-GB, 方正兰亭黑简体, sans-serif" font-size="18" font-weight="400">
+<tspan x="767.5" dy="0">AIV</tspan>
+<tspan x="767.5" dy="20">M-1-0</tspan>
+</text></g>
+<rect x="831" y="194" width="81" height="69" rx="4" fill="#b0eee4" stroke="none" stroke-width="1"/>
+<g transform="translate(871.5 0) scale(0.85 1) translate(-871.5 0)">
+<text x="871.5" y="223" text-anchor="middle" fill="#000" font-family="FZLanTingHeiS-R-GB, 方正兰亭黑简体, sans-serif" font-size="18" font-weight="400">
+<tspan x="871.5" dy="0">AIV</tspan>
+<tspan x="871.5" dy="20">M-1-1</tspan>
+</text></g>
+<rect x="44" y="182" width="878" height="93" rx="0" fill="none" stroke="#00c956" stroke-width="2" stroke-dasharray="14 8"/>
+<path d="M75 277 V289 Q75 301 83 301 H466 Q478 301 478 314 Q478 301 490 301 H873 Q882 301 882 289 V277" fill="none" stroke="#000" stroke-width="2"/>
+<rect x="370" y="314" width="215" height="50" rx="4" fill="#b6e8fa" stroke="none" stroke-width="1"/>
+<g transform="translate(477.5 0) scale(0.85 1) translate(-477.5 0)">
+<text x="477.5" y="346" text-anchor="middle" fill="#000" font-family="FZLanTingHeiS-R-GB, 方正兰亭黑简体, sans-serif" font-size="17" font-weight="400">
+<tspan x="477.5" dy="0">GM上做ReduceSum的结果</tspan>
+</text></g>
+</svg>

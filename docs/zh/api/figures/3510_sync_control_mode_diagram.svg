@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="833" height="210" viewBox="0 0 833 210" role="img" aria-labelledby="title desc">
+  <title id="title">Four inter-core synchronization modes</title>
+  <desc id="desc">Reconstructed from the original diagram. Mode 0 spans all AICs or all AIVs; mode 1 spans two AIVs within a core; mode 2 spans an AIC and its two AIVs; mode 4 spans an AIC and one AIV.</desc>
+  <rect width="833" height="210" fill="#ffffff"/>
+  <g fill="#f4f5f7">
+    <rect x="16" y="20" width="186" height="78"/>
+    <rect x="16" y="106" width="186" height="85"/>
+    <rect x="219" y="20" width="187" height="78"/>
+    <rect x="219" y="106" width="187" height="85"/>
+    <rect x="423" y="20" width="186" height="78"/>
+    <rect x="423" y="106" width="186" height="85"/>
+    <rect x="628" y="20" width="187" height="78"/>
+    <rect x="628" y="106" width="187" height="85"/>
+  </g>
+  <g fill="#c1d5ff">
+    <rect x="69.5" y="37.5" width="74" height="52" rx="3"/>
+    <rect x="272.5" y="37.5" width="74" height="52" rx="3"/>
+    <rect x="475.5" y="37.5" width="74" height="52" rx="3"/>
+    <rect x="678.5" y="37.5" width="74" height="52" rx="3"/>
+  </g>
+  <g fill="#adf0e3">
+    <rect x="25.5" y="127.5" width="74" height="52" rx="2"/>
+    <rect x="119.5" y="127.5" width="74" height="52" rx="2"/>
+    <rect x="228.5" y="127.5" width="74" height="52" rx="2"/>
+    <rect x="322.5" y="127.5" width="74" height="52" rx="2"/>
+    <rect x="431.5" y="127.5" width="74" height="52" rx="2"/>
+    <rect x="525.5" y="127.5" width="74" height="52" rx="2"/>
+    <rect x="634.5" y="127.5" width="74" height="52" rx="2"/>
+    <rect x="728.5" y="127.5" width="74" height="52" rx="2"/>
+  </g>
+  <g fill="none" stroke="#7a87ff" stroke-width="1">
+    <rect x="9" y="12" width="810" height="86"/>
+    <rect x="9" y="105" width="810" height="97"/>
+    <rect x="225" y="108" width="178" height="80"/>
+    <rect x="423" y="20" width="186" height="168"/>
+  </g>
+  <path d="M 496 22 L 552 51 L 480 194 L 421 165 Z" fill="none" stroke="#406db4" stroke-width="2"/>
+  <g fill="#171717" font-family="FZLanTingHeiS-R-GB, 方正兰亭黑简体, sans-serif" font-size="12" text-anchor="middle">
+    <text x="106.5" y="69">AIC 0</text><text x="309.5" y="69">AIC 1</text>
+    <text x="512.5" y="69">AIC 2</text><text x="715.5" y="69">AIC N-1</text>
+    <text x="62.5" y="158">AIV 0-0</text><text x="156.5" y="158">AIV 0-1</text>
+    <text x="265.5" y="158">AIV 1-0</text><text x="359.5" y="158">AIV 1-1</text>
+    <text x="468.5" y="158">AIV 2-0</text><text x="562.5" y="158">AIV 2-1</text>
+    <text x="671.5" y="158">AIV N-1-0</text><text x="765.5" y="158">AIV N-1-1</text>
+  </g>
+  <g fill="#171717" font-family="FZLanTingHeiS-R-GB, 方正兰亭黑简体, sans-serif" font-size="13">
+    <text x="17" y="33">mode 0</text><text x="17" y="119">mode 0</text>
+    <text x="226" y="119">mode 1</text><text x="424" y="33">mode 2</text>
+    <text x="466" y="121" font-size="14">mode4</text>
+  </g>
+</svg>

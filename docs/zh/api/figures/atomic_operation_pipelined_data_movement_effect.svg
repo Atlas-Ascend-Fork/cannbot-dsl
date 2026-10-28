@@ -1,0 +1,88 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="842" height="244" viewBox="0 0 842 244" role="img" aria-labelledby="atomic_operation_pipelined_data_movement_effect-title atomic_operation_pipelined_data_movement_effect-desc">
+  <title id="atomic_operation_pipelined_data_movement_effect-title">atomic operation pipelined data movement effect示意图</title>
+  <desc id="atomic_operation_pipelined_data_movement_effect-desc">Editable vector diagram reconstructed from the preserved atomic_operation_pipelined_data_movement_effect.png; text uses FZLanTingHei-R-GBK.</desc>
+  <defs>
+    <marker id="atomic_operation_pipelined_data_movement_effect-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#696d75" />
+    </marker>
+    <marker id="atomic_operation_pipelined_data_movement_effect-ink-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#101843" />
+    </marker>
+    <marker id="atomic_operation_pipelined_data_movement_effect-blue-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#5277ff" />
+    </marker>
+  </defs>
+  <rect x="0" y="0" width="842" height="244" fill="#fff" stroke="none" stroke-width="1" rx="0" />
+  <g>
+    <rect x="117" y="46" width="42" height="27" fill="#b0f0e2" stroke="none" stroke-width="1" rx="0" />
+    <rect x="160" y="46" width="42" height="27" fill="#b0f0e2" stroke="none" stroke-width="1" rx="0" />
+    <rect x="203" y="46" width="42" height="27" fill="#b0f0e2" stroke="none" stroke-width="1" rx="0" />
+    <rect x="261" y="46" width="42" height="27" fill="#b0f0e2" stroke="none" stroke-width="1" rx="0" />
+    <rect x="304" y="46" width="42" height="27" fill="#b0f0e2" stroke="none" stroke-width="1" rx="0" />
+    <rect x="347" y="46" width="42" height="27" fill="#b0f0e2" stroke="none" stroke-width="1" rx="0" />
+    <rect x="117" y="129" width="42" height="27" fill="#b0f0e2" stroke="none" stroke-width="1" rx="0" />
+    <rect x="117" y="205" width="42" height="27" fill="#b0f0e2" stroke="none" stroke-width="1" rx="0" />
+    <rect x="160" y="129" width="42" height="27" fill="#b0f0e2" stroke="none" stroke-width="1" rx="0" />
+    <rect x="160" y="205" width="42" height="27" fill="#b0f0e2" stroke="none" stroke-width="1" rx="0" />
+    <rect x="203" y="129" width="42" height="27" fill="#b0f0e2" stroke="none" stroke-width="1" rx="0" />
+    <rect x="203" y="205" width="42" height="27" fill="#b0f0e2" stroke="none" stroke-width="1" rx="0" />
+    <rect x="0" y="45" width="68" height="30" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="12" />
+    <rect x="0" y="128" width="88" height="34" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="10" />
+    <rect x="0" y="200" width="88" height="44" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="10" />
+    <rect x="542" y="46" width="42" height="27" fill="#b0f0e2" stroke="none" stroke-width="1" rx="0" />
+    <rect x="585" y="46" width="42" height="27" fill="#b0f0e2" stroke="none" stroke-width="1" rx="0" />
+    <rect x="628" y="46" width="42" height="27" fill="#b0f0e2" stroke="none" stroke-width="1" rx="0" />
+    <rect x="686" y="46" width="42" height="27" fill="#b0f0e2" stroke="none" stroke-width="1" rx="0" />
+    <rect x="729" y="46" width="42" height="27" fill="#b0f0e2" stroke="none" stroke-width="1" rx="0" />
+    <rect x="772" y="46" width="42" height="27" fill="#b0f0e2" stroke="none" stroke-width="1" rx="0" />
+    <rect x="542" y="129" width="42" height="27" fill="#b0f0e2" stroke="none" stroke-width="1" rx="0" />
+    <rect x="542" y="205" width="78" height="27" fill="#b0f0e2" stroke="none" stroke-width="1" rx="0" />
+    <rect x="585" y="129" width="42" height="27" fill="#b0f0e2" stroke="none" stroke-width="1" rx="0" />
+    <rect x="621" y="205" width="78" height="27" fill="#b0f0e2" stroke="none" stroke-width="1" rx="0" />
+    <rect x="628" y="129" width="42" height="27" fill="#b0f0e2" stroke="none" stroke-width="1" rx="0" />
+    <rect x="700" y="205" width="78" height="27" fill="#b0f0e2" stroke="none" stroke-width="1" rx="0" />
+    <rect x="425" y="45" width="68" height="30" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="12" />
+    <rect x="425" y="128" width="88" height="34" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="10" />
+    <rect x="425" y="200" width="88" height="44" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="10" />
+  </g>
+  <g fill="#171717" font-family="FZLanTingHei-R-GBK, 方正兰亭黑_GBK, sans-serif" font-size="12" font-weight="400">
+    <text x="235" y="28" font-size="17.00" text-anchor="middle" fill="#171717">未开启原子累加</text>
+    <text x="138" y="64.05" font-size="13.00" text-anchor="middle" fill="#171717">x1</text>
+    <text x="181" y="64.05" font-size="13.00" text-anchor="middle" fill="#171717">x2</text>
+    <text x="224" y="64.05" font-size="13.00" text-anchor="middle" fill="#171717">x3</text>
+    <text x="181" y="86" font-size="12.00" text-anchor="middle" fill="#171717">第一次搬运</text>
+    <text x="282" y="64.05" font-size="13.00" text-anchor="middle" fill="#171717">y1</text>
+    <text x="325" y="64.05" font-size="13.00" text-anchor="middle" fill="#171717">y2</text>
+    <text x="368" y="64.05" font-size="13.00" text-anchor="middle" fill="#171717">y3</text>
+    <text x="325" y="86" font-size="12.00" text-anchor="middle" fill="#171717">第二次搬运</text>
+    <text x="138" y="147.05" font-size="13.00" text-anchor="middle" fill="#171717">z1</text>
+    <text x="138" y="222.7" font-size="12.00" text-anchor="middle" fill="#171717">y1</text>
+    <text x="181" y="147.05" font-size="13.00" text-anchor="middle" fill="#171717">z2</text>
+    <text x="181" y="222.7" font-size="12.00" text-anchor="middle" fill="#171717">y2</text>
+    <text x="224" y="147.05" font-size="13.00" text-anchor="middle" fill="#171717">z3</text>
+    <text x="224" y="222.7" font-size="12.00" text-anchor="middle" fill="#171717">y3</text>
+    <text x="34" y="64.55" font-size="13.00" text-anchor="middle" fill="#171717">UB</text>
+    <text x="44" y="148.85" font-size="11.00" text-anchor="middle" fill="#171717">GM原始数据</text>
+    <text x="44" y="218.425" font-size="11.00" text-anchor="middle" fill="#171717">搬运完成后</text>
+    <text x="44" y="233.275" font-size="11.00" text-anchor="middle" fill="#171717">GM数据</text>
+    <text x="660" y="28" font-size="17.00" text-anchor="middle" fill="#171717">开启原子累加</text>
+    <text x="563" y="64.05" font-size="13.00" text-anchor="middle" fill="#171717">x1</text>
+    <text x="606" y="64.05" font-size="13.00" text-anchor="middle" fill="#171717">x2</text>
+    <text x="649" y="64.05" font-size="13.00" text-anchor="middle" fill="#171717">x3</text>
+    <text x="606" y="86" font-size="12.00" text-anchor="middle" fill="#171717">第一次搬运</text>
+    <text x="707" y="64.05" font-size="13.00" text-anchor="middle" fill="#171717">y1</text>
+    <text x="750" y="64.05" font-size="13.00" text-anchor="middle" fill="#171717">y2</text>
+    <text x="793" y="64.05" font-size="13.00" text-anchor="middle" fill="#171717">y3</text>
+    <text x="750" y="86" font-size="12.00" text-anchor="middle" fill="#171717">第二次搬运</text>
+    <text x="563" y="147.05" font-size="13.00" text-anchor="middle" fill="#171717">z1</text>
+    <text x="581" y="222.7" font-size="12.00" text-anchor="middle" fill="#171717">x1+y1+z1</text>
+    <text x="606" y="147.05" font-size="13.00" text-anchor="middle" fill="#171717">z2</text>
+    <text x="660" y="222.7" font-size="12.00" text-anchor="middle" fill="#171717">x2+y2+z2</text>
+    <text x="649" y="147.05" font-size="13.00" text-anchor="middle" fill="#171717">z3</text>
+    <text x="739" y="222.7" font-size="12.00" text-anchor="middle" fill="#171717">x3+y3+z3</text>
+    <text x="459" y="64.55" font-size="13.00" text-anchor="middle" fill="#171717">UB</text>
+    <text x="469" y="148.85" font-size="11.00" text-anchor="middle" fill="#171717">GM原始数据</text>
+    <text x="469" y="218.425" font-size="11.00" text-anchor="middle" fill="#171717">搬运完成后</text>
+    <text x="469" y="233.275" font-size="11.00" text-anchor="middle" fill="#171717">GM数据</text>
+  </g>
+</svg>

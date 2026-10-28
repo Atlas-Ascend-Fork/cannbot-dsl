@@ -1,0 +1,70 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="394" height="413" viewBox="0 0 394 413" role="img" aria-labelledby="nz_fractals_of_half_for_cmatrix-title nz_fractals_of_half_for_cmatrix-desc">
+  <title id="nz_fractals_of_half_for_cmatrix-title">nz fractals of half for cmatrix示意图</title>
+  <desc id="nz_fractals_of_half_for_cmatrix-desc">Editable vector diagram reconstructed from the preserved nz_fractals_of_half_for_cmatrix.png; text uses FZLanTingHei-R-GBK.</desc>
+  <defs>
+    <marker id="nz_fractals_of_half_for_cmatrix-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#696d75" />
+    </marker>
+    <marker id="nz_fractals_of_half_for_cmatrix-ink-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#101843" />
+    </marker>
+    <marker id="nz_fractals_of_half_for_cmatrix-blue-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#5277ff" />
+    </marker>
+  </defs>
+  <rect x="0" y="0" width="394" height="413" fill="#fff" stroke="none" stroke-width="1" rx="0" />
+  <g>
+    <line x1="45" y1="24" x2="393" y2="24" stroke="#101843" stroke-width="0.8" marker-end="url(#nz_fractals_of_half_for_cmatrix-ink-arrow)" />
+    <line x1="45" y1="31" x2="45" y2="327" stroke="#101843" stroke-width="0.8" marker-end="url(#nz_fractals_of_half_for_cmatrix-ink-arrow)" />
+    <line x1="70" y1="36" x2="177" y2="36" stroke="#101843" stroke-width="0.65" marker-end="url(#nz_fractals_of_half_for_cmatrix-ink-arrow)" />
+    <line x1="177" y1="36" x2="70" y2="143" stroke="#101843" stroke-width="0.65" marker-end="url(#nz_fractals_of_half_for_cmatrix-ink-arrow)" />
+    <line x1="70" y1="143" x2="177" y2="143" stroke="#101843" stroke-width="0.65" marker-end="url(#nz_fractals_of_half_for_cmatrix-ink-arrow)" />
+    <line x1="70" y1="195" x2="177" y2="195" stroke="#101843" stroke-width="0.65" marker-end="url(#nz_fractals_of_half_for_cmatrix-ink-arrow)" />
+    <line x1="177" y1="195" x2="70" y2="302" stroke="#101843" stroke-width="0.65" marker-end="url(#nz_fractals_of_half_for_cmatrix-ink-arrow)" />
+    <line x1="70" y1="302" x2="177" y2="302" stroke="#101843" stroke-width="0.65" marker-end="url(#nz_fractals_of_half_for_cmatrix-ink-arrow)" />
+    <line x1="233" y1="36" x2="340" y2="36" stroke="#101843" stroke-width="0.65" marker-end="url(#nz_fractals_of_half_for_cmatrix-ink-arrow)" />
+    <line x1="340" y1="36" x2="233" y2="143" stroke="#101843" stroke-width="0.65" marker-end="url(#nz_fractals_of_half_for_cmatrix-ink-arrow)" />
+    <line x1="233" y1="143" x2="340" y2="143" stroke="#101843" stroke-width="0.65" marker-end="url(#nz_fractals_of_half_for_cmatrix-ink-arrow)" />
+    <line x1="233" y1="195" x2="340" y2="195" stroke="#101843" stroke-width="0.65" marker-end="url(#nz_fractals_of_half_for_cmatrix-ink-arrow)" />
+    <line x1="340" y1="195" x2="233" y2="302" stroke="#101843" stroke-width="0.65" marker-end="url(#nz_fractals_of_half_for_cmatrix-ink-arrow)" />
+    <line x1="233" y1="302" x2="340" y2="302" stroke="#101843" stroke-width="0.65" marker-end="url(#nz_fractals_of_half_for_cmatrix-ink-arrow)" />
+    <line x1="177" y1="143" x2="70" y2="195" stroke="#101843" stroke-width="0.7" marker-end="url(#nz_fractals_of_half_for_cmatrix-ink-arrow)" />
+    <line x1="177" y1="302" x2="233" y2="36" stroke="#101843" stroke-width="0.7" marker-end="url(#nz_fractals_of_half_for_cmatrix-ink-arrow)" />
+    <line x1="340" y1="143" x2="233" y2="195" stroke="#101843" stroke-width="0.7" marker-end="url(#nz_fractals_of_half_for_cmatrix-ink-arrow)" />
+    <line x1="233" y1="335" x2="340" y2="335" stroke="#696d75" stroke-width="1.2" />
+    <line x1="233" y1="331" x2="233" y2="339" stroke="#696d75" stroke-width="1.2" />
+    <line x1="340" y1="331" x2="340" y2="339" stroke="#696d75" stroke-width="1.2" />
+    <rect x="274.624" y="325" width="23.752000000000002" height="20" fill="#fff" stroke="none" stroke-width="1" rx="0" />
+    <line x1="377" y1="195" x2="377" y2="302" stroke="#696d75" stroke-width="1" />
+    <line x1="370" y1="195" x2="384" y2="195" stroke="#696d75" stroke-width="1" />
+    <line x1="370" y1="302" x2="384" y2="302" stroke="#696d75" stroke-width="1" />
+    <rect x="127.0" y="357" width="140" height="51" fill="#eee" stroke="none" stroke-width="1" rx="8" />
+  </g>
+  <g fill="#171717" font-family="FZLanTingHei-R-GBK, 方正兰亭黑_GBK, sans-serif" font-size="12" font-weight="400">
+    <text x="205" y="16" font-size="18.00" text-anchor="middle" fill="#171717" font-weight="700">Col</text>
+    <text x="20" y="153" font-size="17.00" text-anchor="middle" fill="#171717" font-weight="700">Row</text>
+    <text x="40" y="47" font-size="15.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="28" y="285" font-size="15.00" text-anchor="middle" fill="#171717">31</text>
+    <text x="70" y="18" font-size="15.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="340" y="18" font-size="15.00" text-anchor="middle" fill="#171717">31</text>
+    <text x="70" y="46" font-size="14.00" text-anchor="middle" fill="#171717" font-weight="700">(0,0)</text>
+    <text x="177" y="46" font-size="14.00" text-anchor="middle" fill="#171717" font-weight="700">(0,15)</text>
+    <text x="233" y="46" font-size="14.00" text-anchor="middle" fill="#171717" font-weight="700">(0,16)</text>
+    <text x="340" y="46" font-size="14.00" text-anchor="middle" fill="#171717" font-weight="700">(0,31)</text>
+    <text x="70" y="153" font-size="14.00" text-anchor="middle" fill="#171717" font-weight="700">(15,0)</text>
+    <text x="177" y="153" font-size="14.00" text-anchor="middle" fill="#171717" font-weight="700">(15,15)</text>
+    <text x="233" y="153" font-size="14.00" text-anchor="middle" fill="#171717" font-weight="700">(15,16)</text>
+    <text x="340" y="153" font-size="14.00" text-anchor="middle" fill="#171717" font-weight="700">(15,31)</text>
+    <text x="70" y="205" font-size="14.00" text-anchor="middle" fill="#171717" font-weight="700">(16,0)</text>
+    <text x="177" y="205" font-size="14.00" text-anchor="middle" fill="#171717" font-weight="700">(16,15)</text>
+    <text x="233" y="205" font-size="14.00" text-anchor="middle" fill="#171717" font-weight="700">(16,16)</text>
+    <text x="340" y="205" font-size="14.00" text-anchor="middle" fill="#171717" font-weight="700">(16,31)</text>
+    <text x="70" y="312" font-size="14.00" text-anchor="middle" fill="#171717" font-weight="700">(31,0)</text>
+    <text x="177" y="312" font-size="14.00" text-anchor="middle" fill="#171717" font-weight="700">(31,15)</text>
+    <text x="233" y="312" font-size="14.00" text-anchor="middle" fill="#171717" font-weight="700">(31,16)</text>
+    <text x="340" y="312" font-size="14.00" text-anchor="middle" fill="#171717" font-weight="700">(31,31)</text>
+    <text x="286.5" y="339" font-size="12.00" text-anchor="middle" fill="#171717">16</text>
+    <text x="379" y="254" font-size="14.00" text-anchor="middle" fill="#171717">16</text>
+    <text x="197" y="388.1" font-size="16.00" text-anchor="middle" fill="#171717">矩阵C</text>
+  </g>
+</svg>

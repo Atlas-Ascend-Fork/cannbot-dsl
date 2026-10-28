@@ -8,10 +8,18 @@ venv/
 .mypy_cache/
 .ruff_cache/
 build/
+# The AI CPU API uses a directory named `build`; these Markdown pages are source docs.
+!docs/zh/api/aicpu/build/
+!docs/zh/api/aicpu/build/**
 dist/
 docs/node_modules/
+docs/project/node_modules/
 docs/.vitepress/.temp/
 docs/.vitepress/cache/
+docs/project/.vitepress/.temp/
+docs/project/.vitepress/cache/
+docs/project/.vitepress/dist/
+docs/public/
 log/
 oat_reports/
 *.log

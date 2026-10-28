@@ -1,0 +1,208 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="842" height="519" viewBox="0 0 842 519" role="img" aria-labelledby="vsqueeze-title vsqueeze-desc">
+  <title id="vsqueeze-title">unsqueeze流程</title>
+  <desc id="vsqueeze-desc">Editable vector diagram reconstructed from the preserved vsqueeze.png; text uses FZLanTingHei-R-GBK.</desc>
+  <defs>
+    <marker id="vsqueeze-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#696d75" />
+    </marker>
+    <marker id="vsqueeze-ink-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#101843" />
+    </marker>
+    <marker id="vsqueeze-blue-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#5277ff" />
+    </marker>
+  </defs>
+  <rect x="0" y="0" width="842" height="519" fill="#fff" stroke="none" stroke-width="1" rx="0" />
+  <g>
+    <rect x="121.0" y="34" width="44.25" height="38" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="165.25" y="34" width="44.25" height="38" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="209.5" y="34" width="44.25" height="38" fill="#ccc" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="253.75" y="34" width="44.25" height="38" fill="#ccc" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="298.0" y="34" width="44.25" height="38" fill="#ccc" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="342.25" y="34" width="44.25" height="38" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="386.5" y="34" width="44.25" height="38" fill="#ccc" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="430.75" y="34" width="44.25" height="38" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="475.0" y="34" width="44.25" height="38" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="519.25" y="34" width="44.25" height="38" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="563.5" y="34" width="44.25" height="38" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="607.75" y="34" width="44.25" height="38" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="652.0" y="34" width="44.25" height="38" fill="#ccc" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="696.25" y="34" width="44.25" height="38" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="740.5" y="34" width="44.25" height="38" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="784.75" y="34" width="44.25" height="38" fill="#ccc" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="121.0" y="101" width="44.25" height="38" fill="#d7d7d7" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="165.25" y="101" width="44.25" height="38" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="209.5" y="101" width="44.25" height="38" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="253.75" y="101" width="44.25" height="38" fill="#cdcece" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="298.0" y="101" width="44.25" height="38" fill="#cdcece" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="342.25" y="101" width="44.25" height="38" fill="#d7d7d7" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="386.5" y="101" width="44.25" height="38" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="430.75" y="101" width="44.25" height="38" fill="#d7d7d7" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="475.0" y="101" width="44.25" height="38" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="519.25" y="101" width="44.25" height="38" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="563.5" y="101" width="44.25" height="38" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="607.75" y="101" width="44.25" height="38" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="652.0" y="101" width="44.25" height="38" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="696.25" y="101" width="44.25" height="38" fill="#d7d7d7" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="740.5" y="101" width="44.25" height="38" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="784.75" y="101" width="44.25" height="38" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <line x1="143.125" y1="72" x2="187.375" y2="101" stroke="#696d75" stroke-width="0.7" marker-end="url(#vsqueeze-arrow)" />
+    <line x1="187.375" y1="72" x2="231.625" y2="101" stroke="#696d75" stroke-width="0.7" marker-end="url(#vsqueeze-arrow)" />
+    <line x1="231.625" y1="72" x2="275.875" y2="101" stroke="#696d75" stroke-width="0.7" marker-end="url(#vsqueeze-arrow)" />
+    <line x1="275.875" y1="72" x2="320.125" y2="101" stroke="#696d75" stroke-width="0.7" marker-end="url(#vsqueeze-arrow)" />
+    <line x1="320.125" y1="72" x2="364.375" y2="101" stroke="#696d75" stroke-width="0.7" marker-end="url(#vsqueeze-arrow)" />
+    <line x1="364.375" y1="72" x2="408.625" y2="101" stroke="#696d75" stroke-width="0.7" marker-end="url(#vsqueeze-arrow)" />
+    <line x1="408.625" y1="72" x2="452.875" y2="101" stroke="#696d75" stroke-width="0.7" marker-end="url(#vsqueeze-arrow)" />
+    <line x1="452.875" y1="72" x2="497.125" y2="101" stroke="#696d75" stroke-width="0.7" marker-end="url(#vsqueeze-arrow)" />
+    <line x1="497.125" y1="72" x2="541.375" y2="101" stroke="#696d75" stroke-width="0.7" marker-end="url(#vsqueeze-arrow)" />
+    <line x1="541.375" y1="72" x2="585.625" y2="101" stroke="#696d75" stroke-width="0.7" marker-end="url(#vsqueeze-arrow)" />
+    <line x1="585.625" y1="72" x2="629.875" y2="101" stroke="#696d75" stroke-width="0.7" marker-end="url(#vsqueeze-arrow)" />
+    <line x1="629.875" y1="72" x2="674.125" y2="101" stroke="#696d75" stroke-width="0.7" marker-end="url(#vsqueeze-arrow)" />
+    <line x1="674.125" y1="72" x2="718.375" y2="101" stroke="#696d75" stroke-width="0.7" marker-end="url(#vsqueeze-arrow)" />
+    <line x1="718.375" y1="72" x2="762.625" y2="101" stroke="#696d75" stroke-width="0.7" marker-end="url(#vsqueeze-arrow)" />
+    <line x1="762.625" y1="72" x2="806.875" y2="101" stroke="#696d75" stroke-width="0.7" marker-end="url(#vsqueeze-arrow)" />
+    <rect x="121.0" y="196" width="44.25" height="38" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="165.25" y="196" width="44.25" height="38" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="209.5" y="196" width="44.25" height="38" fill="#ccc" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="253.75" y="196" width="44.25" height="38" fill="#ccc" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="298.0" y="196" width="44.25" height="38" fill="#ccc" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="342.25" y="196" width="44.25" height="38" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="386.5" y="196" width="44.25" height="38" fill="#ccc" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="430.75" y="196" width="44.25" height="38" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="475.0" y="196" width="44.25" height="38" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="519.25" y="196" width="44.25" height="38" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="563.5" y="196" width="44.25" height="38" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="607.75" y="196" width="44.25" height="38" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="652.0" y="196" width="44.25" height="38" fill="#ccc" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="696.25" y="196" width="44.25" height="38" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="740.5" y="196" width="44.25" height="38" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="784.75" y="196" width="44.25" height="38" fill="#ccc" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="121.0" y="263" width="88.5" height="38" fill="#d7d7d7" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="209.5" y="263" width="88.5" height="38" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="298.0" y="263" width="88.5" height="38" fill="#d7d7d7" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="386.5" y="263" width="88.5" height="38" fill="#d7d7d7" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="475.0" y="263" width="88.5" height="38" fill="#d7d7d7" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="563.5" y="263" width="88.5" height="38" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="652.0" y="263" width="88.5" height="38" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="740.5" y="263" width="88.5" height="38" fill="#d7d7d7" stroke="#101843" stroke-width="1" rx="0" />
+    <line x1="143.125" y1="234" x2="253.75" y2="263" stroke="#696d75" stroke-width="0.7" marker-end="url(#vsqueeze-arrow)" />
+    <line x1="231.625" y1="234" x2="342.25" y2="263" stroke="#696d75" stroke-width="0.7" marker-end="url(#vsqueeze-arrow)" />
+    <line x1="320.125" y1="234" x2="430.75" y2="263" stroke="#696d75" stroke-width="0.7" marker-end="url(#vsqueeze-arrow)" />
+    <line x1="408.625" y1="234" x2="519.25" y2="263" stroke="#696d75" stroke-width="0.7" marker-end="url(#vsqueeze-arrow)" />
+    <line x1="497.125" y1="234" x2="607.75" y2="263" stroke="#696d75" stroke-width="0.7" marker-end="url(#vsqueeze-arrow)" />
+    <line x1="585.625" y1="234" x2="696.25" y2="263" stroke="#696d75" stroke-width="0.7" marker-end="url(#vsqueeze-arrow)" />
+    <line x1="674.125" y1="234" x2="784.75" y2="263" stroke="#696d75" stroke-width="0.7" marker-end="url(#vsqueeze-arrow)" />
+    <rect x="121.0" y="362" width="44.25" height="38" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="165.25" y="362" width="44.25" height="38" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="209.5" y="362" width="44.25" height="38" fill="#ccc" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="253.75" y="362" width="44.25" height="38" fill="#ccc" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="298.0" y="362" width="44.25" height="38" fill="#ccc" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="342.25" y="362" width="44.25" height="38" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="386.5" y="362" width="44.25" height="38" fill="#ccc" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="430.75" y="362" width="44.25" height="38" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="475.0" y="362" width="44.25" height="38" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="519.25" y="362" width="44.25" height="38" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="563.5" y="362" width="44.25" height="38" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="607.75" y="362" width="44.25" height="38" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="652.0" y="362" width="44.25" height="38" fill="#ccc" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="696.25" y="362" width="44.25" height="38" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="740.5" y="362" width="44.25" height="38" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="784.75" y="362" width="44.25" height="38" fill="#ccc" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="121.0" y="429" width="177.0" height="38" fill="#d7d7d7" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="298.0" y="429" width="177.0" height="38" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="475.0" y="429" width="177.0" height="38" fill="#d7d7d7" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="652.0" y="429" width="177.0" height="38" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <line x1="143.125" y1="400" x2="386.5" y2="429" stroke="#696d75" stroke-width="0.7" marker-end="url(#vsqueeze-arrow)" />
+    <line x1="320.125" y1="400" x2="563.5" y2="429" stroke="#696d75" stroke-width="0.7" marker-end="url(#vsqueeze-arrow)" />
+    <line x1="497.125" y1="400" x2="740.5" y2="429" stroke="#696d75" stroke-width="0.7" marker-end="url(#vsqueeze-arrow)" />
+  </g>
+  <g fill="#171717" font-family="FZLanTingHei-R-GBK, 方正兰亭黑_GBK, sans-serif" font-size="12" font-weight="400">
+    <text x="127" y="22" font-size="14.00" text-anchor="start" fill="#171717">LOW</text>
+    <text x="819" y="22" font-size="14.00" text-anchor="end" fill="#171717">HIGH</text>
+    <text x="143.125" y="57.55" font-size="13.00" text-anchor="middle" fill="#171717">1</text>
+    <text x="187.375" y="57.55" font-size="13.00" text-anchor="middle" fill="#171717">1</text>
+    <text x="231.625" y="57.55" font-size="13.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="275.875" y="57.55" font-size="13.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="320.125" y="57.55" font-size="13.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="364.375" y="57.55" font-size="13.00" text-anchor="middle" fill="#171717">1</text>
+    <text x="408.625" y="57.55" font-size="13.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="452.875" y="57.55" font-size="13.00" text-anchor="middle" fill="#171717">1</text>
+    <text x="497.125" y="57.55" font-size="13.00" text-anchor="middle" fill="#171717">1</text>
+    <text x="541.375" y="57.55" font-size="13.00" text-anchor="middle" fill="#171717">1</text>
+    <text x="585.625" y="57.55" font-size="13.00" text-anchor="middle" fill="#171717">1</text>
+    <text x="629.875" y="57.55" font-size="13.00" text-anchor="middle" fill="#171717">1</text>
+    <text x="674.125" y="57.55" font-size="13.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="718.375" y="57.55" font-size="13.00" text-anchor="middle" fill="#171717">1</text>
+    <text x="762.625" y="57.55" font-size="13.00" text-anchor="middle" fill="#171717">1</text>
+    <text x="806.875" y="57.55" font-size="13.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="143.125" y="124.55" font-size="13.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="187.375" y="124.55" font-size="13.00" text-anchor="middle" fill="#171717">1</text>
+    <text x="231.625" y="124.55" font-size="13.00" text-anchor="middle" fill="#171717">2</text>
+    <text x="275.875" y="124.55" font-size="13.00" text-anchor="middle" fill="#171717">2</text>
+    <text x="320.125" y="124.55" font-size="13.00" text-anchor="middle" fill="#171717">2</text>
+    <text x="364.375" y="124.55" font-size="13.00" text-anchor="middle" fill="#171717">2</text>
+    <text x="408.625" y="124.55" font-size="13.00" text-anchor="middle" fill="#171717">3</text>
+    <text x="452.875" y="124.55" font-size="13.00" text-anchor="middle" fill="#171717">3</text>
+    <text x="497.125" y="124.55" font-size="13.00" text-anchor="middle" fill="#171717">4</text>
+    <text x="541.375" y="124.55" font-size="13.00" text-anchor="middle" fill="#171717">5</text>
+    <text x="585.625" y="124.55" font-size="13.00" text-anchor="middle" fill="#171717">6</text>
+    <text x="629.875" y="124.55" font-size="13.00" text-anchor="middle" fill="#171717">7</text>
+    <text x="674.125" y="124.55" font-size="13.00" text-anchor="middle" fill="#171717">8</text>
+    <text x="718.375" y="124.55" font-size="13.00" text-anchor="middle" fill="#171717">8</text>
+    <text x="762.625" y="124.55" font-size="13.00" text-anchor="middle" fill="#171717">9</text>
+    <text x="806.875" y="124.55" font-size="13.00" text-anchor="middle" fill="#171717">10</text>
+    <text x="82" y="58" font-size="13.00" text-anchor="end" fill="#171717">mask</text>
+    <text x="94" y="125" font-size="13.00" text-anchor="end" fill="#171717">dst&lt;b8&gt;</text>
+    <text x="465" y="170" font-size="14.00" text-anchor="middle" fill="#171717">数据类型为b8时，mask中一个bit对应一个元素</text>
+    <text x="143.125" y="219.55" font-size="13.00" text-anchor="middle" fill="#171717">1</text>
+    <text x="187.375" y="219.55" font-size="13.00" text-anchor="middle" fill="#171717">1</text>
+    <text x="231.625" y="219.55" font-size="13.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="275.875" y="219.55" font-size="13.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="320.125" y="219.55" font-size="13.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="364.375" y="219.55" font-size="13.00" text-anchor="middle" fill="#171717">1</text>
+    <text x="408.625" y="219.55" font-size="13.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="452.875" y="219.55" font-size="13.00" text-anchor="middle" fill="#171717">1</text>
+    <text x="497.125" y="219.55" font-size="13.00" text-anchor="middle" fill="#171717">1</text>
+    <text x="541.375" y="219.55" font-size="13.00" text-anchor="middle" fill="#171717">1</text>
+    <text x="585.625" y="219.55" font-size="13.00" text-anchor="middle" fill="#171717">1</text>
+    <text x="629.875" y="219.55" font-size="13.00" text-anchor="middle" fill="#171717">1</text>
+    <text x="674.125" y="219.55" font-size="13.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="718.375" y="219.55" font-size="13.00" text-anchor="middle" fill="#171717">1</text>
+    <text x="762.625" y="219.55" font-size="13.00" text-anchor="middle" fill="#171717">1</text>
+    <text x="806.875" y="219.55" font-size="13.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="165.25" y="286.55" font-size="13.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="253.75" y="286.55" font-size="13.00" text-anchor="middle" fill="#171717">1</text>
+    <text x="342.25" y="286.55" font-size="13.00" text-anchor="middle" fill="#171717">1</text>
+    <text x="430.75" y="286.55" font-size="13.00" text-anchor="middle" fill="#171717">1</text>
+    <text x="519.25" y="286.55" font-size="13.00" text-anchor="middle" fill="#171717">1</text>
+    <text x="607.75" y="286.55" font-size="13.00" text-anchor="middle" fill="#171717">2</text>
+    <text x="696.25" y="286.55" font-size="13.00" text-anchor="middle" fill="#171717">3</text>
+    <text x="784.75" y="286.55" font-size="13.00" text-anchor="middle" fill="#171717">3</text>
+    <text x="82" y="220" font-size="13.00" text-anchor="end" fill="#171717">mask</text>
+    <text x="94" y="287" font-size="13.00" text-anchor="end" fill="#171717">dst&lt;b16&gt;</text>
+    <text x="465" y="332" font-size="14.00" text-anchor="middle" fill="#171717">数据类型为b16时，mask中两个bit对应一个元素，只有低bit位有效</text>
+    <text x="143.125" y="385.55" font-size="13.00" text-anchor="middle" fill="#171717">1</text>
+    <text x="187.375" y="385.55" font-size="13.00" text-anchor="middle" fill="#171717">1</text>
+    <text x="231.625" y="385.55" font-size="13.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="275.875" y="385.55" font-size="13.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="320.125" y="385.55" font-size="13.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="364.375" y="385.55" font-size="13.00" text-anchor="middle" fill="#171717">1</text>
+    <text x="408.625" y="385.55" font-size="13.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="452.875" y="385.55" font-size="13.00" text-anchor="middle" fill="#171717">1</text>
+    <text x="497.125" y="385.55" font-size="13.00" text-anchor="middle" fill="#171717">1</text>
+    <text x="541.375" y="385.55" font-size="13.00" text-anchor="middle" fill="#171717">1</text>
+    <text x="585.625" y="385.55" font-size="13.00" text-anchor="middle" fill="#171717">1</text>
+    <text x="629.875" y="385.55" font-size="13.00" text-anchor="middle" fill="#171717">1</text>
+    <text x="674.125" y="385.55" font-size="13.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="718.375" y="385.55" font-size="13.00" text-anchor="middle" fill="#171717">1</text>
+    <text x="762.625" y="385.55" font-size="13.00" text-anchor="middle" fill="#171717">1</text>
+    <text x="806.875" y="385.55" font-size="13.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="209.5" y="452.55" font-size="13.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="386.5" y="452.55" font-size="13.00" text-anchor="middle" fill="#171717">1</text>
+    <text x="563.5" y="452.55" font-size="13.00" text-anchor="middle" fill="#171717">1</text>
+    <text x="740.5" y="452.55" font-size="13.00" text-anchor="middle" fill="#171717">2</text>
+    <text x="82" y="386" font-size="13.00" text-anchor="end" fill="#171717">mask</text>
+    <text x="94" y="453" font-size="13.00" text-anchor="end" fill="#171717">dst&lt;b32&gt;</text>
+    <text x="465" y="498" font-size="14.00" text-anchor="middle" fill="#171717">数据类型为b32时，mask中四个bit对应一个元素，只有最低bit位有效</text>
+  </g>
+</svg>

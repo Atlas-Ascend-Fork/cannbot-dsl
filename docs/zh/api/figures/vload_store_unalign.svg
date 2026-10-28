@@ -1,0 +1,146 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1058" height="443" viewBox="0 0 1058 443" role="img" aria-labelledby="vload_store_unalign-title vload_store_unalign-desc">
+  <title id="vload_store_unalign-title">连续非对齐搬入搬出示例</title>
+  <desc id="vload_store_unalign-desc">Editable vector diagram reconstructed from the preserved vload_store_unalign.png; text uses FZLanTingHei-R-GBK.</desc>
+  <defs>
+    <marker id="vload_store_unalign-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#696d75" />
+    </marker>
+    <marker id="vload_store_unalign-ink-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#101843" />
+    </marker>
+    <marker id="vload_store_unalign-blue-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#5277ff" />
+    </marker>
+  </defs>
+  <rect x="0" y="0" width="1058" height="443" fill="#fff" stroke="none" stroke-width="1" rx="0" />
+  <g>
+    <rect x="121" y="2" width="56" height="38" fill="#fff" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="177" y="2" width="55" height="38" fill="#d9dcfc" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="232" y="2" width="110" height="38" fill="#d9dcfc" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="342" y="2" width="110" height="38" fill="#d9dcfc" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="532" y="2" width="56" height="38" fill="#d9dcfc" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="588" y="2" width="55" height="38" fill="#d9dcfc" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="643" y="2" width="55" height="38" fill="#d9dcfc" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="779" y="2" width="109" height="38" fill="#d9dcfc" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="888" y="2" width="57" height="38" fill="#d9dcfc" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="945" y="2" width="55" height="38" fill="#d9dcfc" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="121" y="381" width="56" height="38" fill="#fff" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="177" y="381" width="55" height="38" fill="#d9dcfc" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="232" y="381" width="110" height="38" fill="#d9dcfc" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="342" y="381" width="110" height="38" fill="#d9dcfc" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="532" y="381" width="56" height="38" fill="#d9dcfc" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="588" y="381" width="55" height="38" fill="#d9dcfc" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="643" y="381" width="55" height="38" fill="#d9dcfc" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="779" y="381" width="109" height="38" fill="#d9dcfc" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="888" y="381" width="57" height="38" fill="#d9dcfc" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="945" y="381" width="55" height="38" fill="#d9dcfc" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="232" y="78" width="825" height="38" fill="#b8e8fa" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="177" y="229" width="825" height="38" fill="#b8e8fa" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="121" y="154" width="112" height="38" fill="#ffd0af" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="532" y="154" width="112" height="38" fill="#ffd0af" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="532" y="305" width="112" height="38" fill="#ffd0af" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="945" y="305" width="112" height="38" fill="#ffd0af" stroke="#101843" stroke-width="1" rx="0" />
+    <line x1="121" y1="40" x2="121" y2="381" stroke="#696d75" stroke-width="0.7" stroke-dasharray="4 3" />
+    <line x1="177" y1="40" x2="177" y2="381" stroke="#696d75" stroke-width="0.7" stroke-dasharray="4 3" />
+    <line x1="232" y1="40" x2="232" y2="381" stroke="#696d75" stroke-width="0.7" stroke-dasharray="4 3" />
+    <line x1="532" y1="40" x2="532" y2="381" stroke="#696d75" stroke-width="0.7" stroke-dasharray="4 3" />
+    <line x1="588" y1="40" x2="588" y2="381" stroke="#696d75" stroke-width="0.7" stroke-dasharray="4 3" />
+    <line x1="643" y1="40" x2="643" y2="381" stroke="#696d75" stroke-width="0.7" stroke-dasharray="4 3" />
+    <line x1="945" y1="40" x2="945" y2="381" stroke="#696d75" stroke-width="0.7" stroke-dasharray="4 3" />
+    <line x1="1000" y1="40" x2="1000" y2="381" stroke="#696d75" stroke-width="0.7" stroke-dasharray="4 3" />
+    <line x1="177" y1="40" x2="177" y2="154" stroke="#101843" stroke-width="0.9" marker-end="url(#vload_store_unalign-ink-arrow)" />
+    <line x1="422" y1="40" x2="422" y2="78" stroke="#101843" stroke-width="0.9" marker-end="url(#vload_store_unalign-ink-arrow)" />
+    <line x1="588" y1="40" x2="588" y2="154" stroke="#101843" stroke-width="0.9" marker-end="url(#vload_store_unalign-ink-arrow)" />
+    <line x1="832" y1="40" x2="832" y2="78" stroke="#101843" stroke-width="0.9" marker-end="url(#vload_store_unalign-ink-arrow)" />
+    <line x1="205" y1="192" x2="205" y2="229" stroke="#101843" stroke-width="0.9" marker-end="url(#vload_store_unalign-ink-arrow)" />
+    <line x1="422" y1="116" x2="422" y2="229" stroke="#101843" stroke-width="0.9" marker-end="url(#vload_store_unalign-ink-arrow)" />
+    <line x1="588" y1="192" x2="588" y2="229" stroke="#101843" stroke-width="0.9" marker-end="url(#vload_store_unalign-ink-arrow)" />
+    <line x1="785" y1="116" x2="785" y2="229" stroke="#101843" stroke-width="0.9" marker-end="url(#vload_store_unalign-ink-arrow)" />
+    <line x1="377" y1="267" x2="377" y2="381" stroke="#101843" stroke-width="0.9" marker-end="url(#vload_store_unalign-ink-arrow)" />
+    <line x1="561" y1="267" x2="561" y2="305" stroke="#101843" stroke-width="0.9" marker-end="url(#vload_store_unalign-ink-arrow)" />
+    <line x1="588" y1="343" x2="588" y2="381" stroke="#101843" stroke-width="0.9" marker-end="url(#vload_store_unalign-ink-arrow)" />
+    <line x1="1000" y1="267" x2="1000" y2="305" stroke="#101843" stroke-width="0.9" marker-end="url(#vload_store_unalign-ink-arrow)" />
+    <line x1="795" y1="267" x2="795" y2="381" stroke="#101843" stroke-width="0.9" marker-end="url(#vload_store_unalign-ink-arrow)" />
+    <line x1="973" y1="343" x2="973" y2="381" stroke="#101843" stroke-width="0.9" marker-end="url(#vload_store_unalign-ink-arrow)" />
+  </g>
+  <g fill="#171717" font-family="FZLanTingHei-R-GBK, 方正兰亭黑_GBK, sans-serif" font-size="12" font-weight="400">
+    <text x="121" y="56" font-size="12.00" text-anchor="middle" fill="#171717">32</text>
+    <text x="177" y="56" font-size="12.00" text-anchor="middle" fill="#171717">48</text>
+    <text x="232" y="56" font-size="12.00" text-anchor="middle" fill="#171717">64</text>
+    <text x="342" y="56" font-size="12.00" text-anchor="middle" fill="#171717">96</text>
+    <text x="452" y="56" font-size="12.00" text-anchor="middle" fill="#171717">128</text>
+    <text x="532" y="56" font-size="12.00" text-anchor="middle" fill="#171717">288</text>
+    <text x="588" y="56" font-size="12.00" text-anchor="middle" fill="#171717">304</text>
+    <text x="643" y="56" font-size="12.00" text-anchor="middle" fill="#171717">320</text>
+    <text x="698" y="56" font-size="12.00" text-anchor="middle" fill="#171717">336</text>
+    <text x="779" y="56" font-size="12.00" text-anchor="middle" fill="#171717">496</text>
+    <text x="888" y="56" font-size="12.00" text-anchor="middle" fill="#171717">528</text>
+    <text x="945" y="56" font-size="12.00" text-anchor="middle" fill="#171717">544</text>
+    <text x="1000" y="56" font-size="12.00" text-anchor="middle" fill="#171717">560</text>
+    <text x="198" y="27" font-size="8.00" text-anchor="middle" fill="#171717">1 2 3 4</text>
+    <text x="288" y="27" font-size="8.00" text-anchor="middle" fill="#171717">5 6 7 8 9 10 11 12</text>
+    <text x="395" y="27" font-size="8.00" text-anchor="middle" fill="#171717">13 14 15 16 17 18 19 20</text>
+    <text x="559" y="27" font-size="8.00" text-anchor="middle" fill="#171717">61 62 63 64</text>
+    <text x="615" y="27" font-size="8.00" text-anchor="middle" fill="#171717">65 66 67 68</text>
+    <text x="670" y="27" font-size="8.00" text-anchor="middle" fill="#171717">69 70 71 72</text>
+    <text x="834" y="19" font-size="8.00" text-anchor="middle" fill="#171717">113 114 115 116</text>
+    <text x="834" y="29.8" font-size="8.00" text-anchor="middle" fill="#171717">117 118 119 120</text>
+    <text x="915" y="19" font-size="8.00" text-anchor="middle" fill="#171717">121 122 123</text>
+    <text x="915" y="29.8" font-size="8.00" text-anchor="middle" fill="#171717">124</text>
+    <text x="973" y="19" font-size="8.00" text-anchor="middle" fill="#171717">125 126 127</text>
+    <text x="973" y="29.8" font-size="8.00" text-anchor="middle" fill="#171717">128</text>
+    <text x="491" y="28" font-size="16.00" text-anchor="middle" fill="#171717">...</text>
+    <text x="738" y="28" font-size="16.00" text-anchor="middle" fill="#171717">...</text>
+    <text x="121" y="435" font-size="12.00" text-anchor="middle" fill="#171717">32</text>
+    <text x="177" y="435" font-size="12.00" text-anchor="middle" fill="#171717">48</text>
+    <text x="232" y="435" font-size="12.00" text-anchor="middle" fill="#171717">64</text>
+    <text x="342" y="435" font-size="12.00" text-anchor="middle" fill="#171717">96</text>
+    <text x="452" y="435" font-size="12.00" text-anchor="middle" fill="#171717">128</text>
+    <text x="532" y="435" font-size="12.00" text-anchor="middle" fill="#171717">288</text>
+    <text x="588" y="435" font-size="12.00" text-anchor="middle" fill="#171717">304</text>
+    <text x="643" y="435" font-size="12.00" text-anchor="middle" fill="#171717">320</text>
+    <text x="698" y="435" font-size="12.00" text-anchor="middle" fill="#171717">336</text>
+    <text x="779" y="435" font-size="12.00" text-anchor="middle" fill="#171717">496</text>
+    <text x="888" y="435" font-size="12.00" text-anchor="middle" fill="#171717">528</text>
+    <text x="945" y="435" font-size="12.00" text-anchor="middle" fill="#171717">544</text>
+    <text x="1000" y="435" font-size="12.00" text-anchor="middle" fill="#171717">560</text>
+    <text x="198" y="406" font-size="8.00" text-anchor="middle" fill="#171717">1 2 3 4</text>
+    <text x="288" y="406" font-size="8.00" text-anchor="middle" fill="#171717">5 6 7 8 9 10 11 12</text>
+    <text x="395" y="406" font-size="8.00" text-anchor="middle" fill="#171717">13 14 15 16 17 18 19 20</text>
+    <text x="559" y="406" font-size="8.00" text-anchor="middle" fill="#171717">61 62 63 64</text>
+    <text x="615" y="406" font-size="8.00" text-anchor="middle" fill="#171717">65 66 67 68</text>
+    <text x="670" y="406" font-size="8.00" text-anchor="middle" fill="#171717">69 70 71 72</text>
+    <text x="834" y="398" font-size="8.00" text-anchor="middle" fill="#171717">113 114 115 116</text>
+    <text x="834" y="408.8" font-size="8.00" text-anchor="middle" fill="#171717">117 118 119 120</text>
+    <text x="915" y="398" font-size="8.00" text-anchor="middle" fill="#171717">121 122 123</text>
+    <text x="915" y="408.8" font-size="8.00" text-anchor="middle" fill="#171717">124</text>
+    <text x="973" y="398" font-size="8.00" text-anchor="middle" fill="#171717">125 126 127</text>
+    <text x="973" y="408.8" font-size="8.00" text-anchor="middle" fill="#171717">128</text>
+    <text x="491" y="407" font-size="16.00" text-anchor="middle" fill="#171717">...</text>
+    <text x="738" y="407" font-size="16.00" text-anchor="middle" fill="#171717">...</text>
+    <text x="177" y="177.55" font-size="13.00" text-anchor="middle" fill="#171717">ureg0</text>
+    <text x="588" y="177.55" font-size="13.00" text-anchor="middle" fill="#171717">ureg0</text>
+    <text x="588" y="328.55" font-size="13.00" text-anchor="middle" fill="#171717">ureg1</text>
+    <text x="1001" y="328.55" font-size="13.00" text-anchor="middle" fill="#171717">ureg1</text>
+    <text x="165" y="97" font-size="13.00" text-anchor="middle" fill="#171717">①</text>
+    <text x="410" y="59" font-size="13.00" text-anchor="middle" fill="#171717">②</text>
+    <text x="576" y="97" font-size="13.00" text-anchor="middle" fill="#171717">②</text>
+    <text x="820" y="59" font-size="13.00" text-anchor="middle" fill="#171717">④</text>
+    <text x="193" y="210.5" font-size="13.00" text-anchor="middle" fill="#171717">②</text>
+    <text x="410" y="172.5" font-size="13.00" text-anchor="middle" fill="#171717">②</text>
+    <text x="576" y="210.5" font-size="13.00" text-anchor="middle" fill="#171717">④</text>
+    <text x="773" y="172.5" font-size="13.00" text-anchor="middle" fill="#171717">④</text>
+    <text x="365" y="324" font-size="13.00" text-anchor="middle" fill="#171717">③</text>
+    <text x="549" y="286" font-size="13.00" text-anchor="middle" fill="#171717">③</text>
+    <text x="576" y="362" font-size="13.00" text-anchor="middle" fill="#171717">⑤</text>
+    <text x="988" y="286" font-size="13.00" text-anchor="middle" fill="#171717">⑤</text>
+    <text x="783" y="324" font-size="13.00" text-anchor="middle" fill="#171717">⑥</text>
+    <text x="961" y="362" font-size="13.00" text-anchor="middle" fill="#171717">⑥</text>
+    <text x="99" y="27" font-size="13.00" text-anchor="end" fill="#171717">UB</text>
+    <text x="99" y="102" font-size="13.00" text-anchor="end" fill="#171717">临时寄存器</text>
+    <text x="99" y="180" font-size="13.00" text-anchor="end" fill="#171717">非对齐寄存器</text>
+    <text x="99" y="254" font-size="13.00" text-anchor="end" fill="#171717">目标寄存器</text>
+    <text x="99" y="332" font-size="13.00" text-anchor="end" fill="#171717">非对齐寄存器</text>
+    <text x="99" y="410" font-size="13.00" text-anchor="end" fill="#171717">UB</text>
+  </g>
+</svg>

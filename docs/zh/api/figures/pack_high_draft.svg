@@ -1,0 +1,87 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="3190" height="725" viewBox="0 0 1000 228" role="img" aria-labelledby="pack_high_draft-title pack_high_draft-desc">
+  <title id="pack_high_draft-title">pack high draft示意图</title>
+  <desc id="pack_high_draft-desc">Editable vector diagram reconstructed from the preserved pack_high_draft.png; text uses FZLanTingHei-R-GBK.</desc>
+  <defs>
+    <marker id="pack_high_draft-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#696d75" />
+    </marker>
+    <marker id="pack_high_draft-ink-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#101843" />
+    </marker>
+    <marker id="pack_high_draft-blue-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#5277ff" />
+    </marker>
+  </defs>
+  <rect x="0" y="0" width="1000" height="228" fill="#fff" stroke="none" stroke-width="1" rx="0" />
+  <g>
+    <rect x="203" y="49" width="77" height="37" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="280" y="49" width="77" height="37" fill="#d3d3d3" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="357" y="49" width="77" height="37" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="434" y="49" width="77" height="37" fill="#d3d3d3" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="511" y="49" width="77" height="37" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="588" y="49" width="77" height="37" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="665" y="49" width="77" height="37" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="742" y="49" width="77" height="37" fill="#d3d3d3" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="819" y="49" width="77" height="37" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="896" y="49" width="77" height="37" fill="#d3d3d3" stroke="#101843" stroke-width="1" rx="0" />
+    <line x1="241.5" y1="38" x2="318.5" y2="38" stroke="#696d75" stroke-width="1.2" />
+    <line x1="241.5" y1="34" x2="241.5" y2="42" stroke="#696d75" stroke-width="1.2" />
+    <line x1="318.5" y1="34" x2="318.5" y2="42" stroke="#696d75" stroke-width="1.2" />
+    <rect x="249.793" y="28" width="60.414" height="20" fill="#fff" stroke="none" stroke-width="1" rx="0" />
+    <line x1="395.5" y1="38" x2="472.5" y2="38" stroke="#696d75" stroke-width="1.2" />
+    <line x1="395.5" y1="34" x2="395.5" y2="42" stroke="#696d75" stroke-width="1.2" />
+    <line x1="472.5" y1="34" x2="472.5" y2="42" stroke="#696d75" stroke-width="1.2" />
+    <rect x="404.745" y="28" width="58.51" height="20" fill="#fff" stroke="none" stroke-width="1" rx="0" />
+    <line x1="703.5" y1="38" x2="780.5" y2="38" stroke="#696d75" stroke-width="1.2" />
+    <line x1="703.5" y1="34" x2="703.5" y2="42" stroke="#696d75" stroke-width="1.2" />
+    <line x1="780.5" y1="34" x2="780.5" y2="42" stroke="#696d75" stroke-width="1.2" />
+    <rect x="703.876" y="28" width="76.248" height="20" fill="#fff" stroke="none" stroke-width="1" rx="0" />
+    <line x1="857.5" y1="38" x2="934.5" y2="38" stroke="#696d75" stroke-width="1.2" />
+    <line x1="857.5" y1="34" x2="857.5" y2="42" stroke="#696d75" stroke-width="1.2" />
+    <line x1="934.5" y1="34" x2="934.5" y2="42" stroke="#696d75" stroke-width="1.2" />
+    <rect x="857.9110000000001" y="28" width="76.178" height="20" fill="#fff" stroke="none" stroke-width="1" rx="0" />
+    <path d="M203 86 v18 h770 v-18" stroke="#101843" stroke-width="1" fill="none" />
+    <path d="M555 105 H561 V144.0 H573.0 L558 165 L543.0 144.0 H555 Z" stroke="none" stroke-width="1" fill="#000" />
+    <rect x="203" y="168" width="77" height="37" fill="#d3d3d3" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="280" y="168" width="77" height="37" fill="#d3d3d3" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="357" y="168" width="77" height="37" fill="#d3d3d3" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="434" y="168" width="77" height="37" fill="#d3d3d3" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="511" y="168" width="77" height="37" fill="#d3d3d3" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="588" y="168" width="77" height="37" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="665" y="168" width="77" height="37" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="742" y="168" width="77" height="37" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="819" y="168" width="77" height="37" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="896" y="168" width="77" height="37" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+  </g>
+  <g fill="#171717" font-family="FZLanTingHei-R-GBK, 方正兰亭黑_GBK, sans-serif" font-size="12" font-weight="400">
+    <text x="241.5" y="72.4" font-size="14.00" text-anchor="middle" fill="#171717">Low 0</text>
+    <text x="318.5" y="72.4" font-size="14.00" text-anchor="middle" fill="#171717">High 0</text>
+    <text x="395.5" y="72.4" font-size="14.00" text-anchor="middle" fill="#171717">Low 1</text>
+    <text x="472.5" y="72.4" font-size="14.00" text-anchor="middle" fill="#171717">High 1</text>
+    <text x="549.5" y="72.4" font-size="14.00" text-anchor="middle" fill="#171717">...</text>
+    <text x="626.5" y="72.4" font-size="14.00" text-anchor="middle" fill="#171717">...</text>
+    <text x="703.5" y="72.4" font-size="14.00" text-anchor="middle" fill="#171717">Low 126</text>
+    <text x="780.5" y="72.4" font-size="14.00" text-anchor="middle" fill="#171717">High 126</text>
+    <text x="857.5" y="72.4" font-size="14.00" text-anchor="middle" fill="#171717">Low 127</text>
+    <text x="934.5" y="72.4" font-size="14.00" text-anchor="middle" fill="#171717">High 127</text>
+    <text x="280" y="42" font-size="14.00" text-anchor="middle" fill="#171717">index 0</text>
+    <text x="434" y="42" font-size="14.00" text-anchor="middle" fill="#171717">index 1</text>
+    <text x="742" y="42" font-size="14.00" text-anchor="middle" fill="#171717">index 126</text>
+    <text x="896" y="42" font-size="14.00" text-anchor="middle" fill="#171717">index 127</text>
+    <text x="203" y="129" font-size="14.00" text-anchor="middle" fill="#171717">低位</text>
+    <text x="973" y="129" font-size="14.00" text-anchor="middle" fill="#171717">高位</text>
+    <text x="241.5" y="191.4" font-size="14.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="318.5" y="191.4" font-size="14.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="395.5" y="191.4" font-size="14.00" text-anchor="middle" fill="#171717">...</text>
+    <text x="472.5" y="191.4" font-size="14.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="549.5" y="191.4" font-size="14.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="626.5" y="191.4" font-size="14.00" text-anchor="middle" fill="#171717">Low 0</text>
+    <text x="703.5" y="191.4" font-size="14.00" text-anchor="middle" fill="#171717">Low 1</text>
+    <text x="780.5" y="191.4" font-size="14.00" text-anchor="middle" fill="#171717">...</text>
+    <text x="857.5" y="191.4" font-size="14.00" text-anchor="middle" fill="#171717">Low 126</text>
+    <text x="934.5" y="191.4" font-size="14.00" text-anchor="middle" fill="#171717">Low 127</text>
+    <text x="175" y="74" font-size="15.00" text-anchor="end" fill="#171717">src: dtypes.uint16</text>
+    <text x="175" y="185" font-size="15.00" text-anchor="end" fill="#171717">dst: dtypes.uint8</text>
+    <text x="175" y="205.25" font-size="15.00" text-anchor="end" fill="#171717">vpack: 写入高半部分</text>
+  </g>
+</svg>

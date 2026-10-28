@@ -1,0 +1,86 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="672" height="245" viewBox="0 0 672 245" role="img" aria-labelledby="vgather_ub-title vgather_ub-desc">
+  <title id="vgather_ub-title">UB源收集模式</title>
+  <desc id="vgather_ub-desc">Editable vector diagram reconstructed from the preserved vgather_ub.png; text uses FZLanTingHei-R-GBK.</desc>
+  <defs>
+    <marker id="vgather_ub-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#696d75" />
+    </marker>
+    <marker id="vgather_ub-ink-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#101843" />
+    </marker>
+    <marker id="vgather_ub-blue-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#5277ff" />
+    </marker>
+  </defs>
+  <rect x="0" y="0" width="672" height="245" fill="#fff" stroke="none" stroke-width="1" rx="0" />
+  <g>
+    <rect x="97" y="5" width="50" height="43" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="154" y="5" width="50" height="43" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="211" y="5" width="50" height="43" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="268" y="5" width="50" height="43" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="325" y="5" width="50" height="43" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="382" y="5" width="50" height="43" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="439" y="5" width="50" height="43" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="496" y="5" width="50" height="43" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="553" y="5" width="50" height="43" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="610" y="5" width="50" height="43" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="92" y="1" width="573" height="51" fill="none" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="97" y="79" width="50" height="43" fill="#b0f0e2" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="154" y="79" width="50" height="43" fill="#b0f0e2" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="211" y="79" width="50" height="43" fill="#b0f0e2" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="268" y="79" width="50" height="43" fill="#b0f0e2" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="325" y="79" width="50" height="43" fill="#b0f0e2" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="382" y="79" width="50" height="43" fill="#b0f0e2" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="439" y="79" width="50" height="43" fill="#b0f0e2" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="496" y="79" width="50" height="43" fill="#b0f0e2" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="92" y="75" width="459" height="51" fill="none" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="97" y="198" width="50" height="43" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="154" y="198" width="50" height="43" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="211" y="198" width="50" height="43" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="268" y="198" width="50" height="43" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="325" y="198" width="50" height="43" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="382" y="198" width="50" height="43" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="439" y="198" width="50" height="43" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="496" y="198" width="50" height="43" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="92" y="194" width="459" height="51" fill="none" stroke="#101843" stroke-width="1" rx="0" />
+    <line x1="122" y1="122" x2="122" y2="197" stroke="#696d75" stroke-width="1.5" marker-end="url(#vgather_ub-arrow)" />
+    <line x1="179" y1="122" x2="179" y2="197" stroke="#696d75" stroke-width="1.5" marker-end="url(#vgather_ub-arrow)" />
+    <line x1="236" y1="122" x2="236" y2="197" stroke="#696d75" stroke-width="1.5" marker-end="url(#vgather_ub-arrow)" />
+    <line x1="293" y1="122" x2="293" y2="197" stroke="#696d75" stroke-width="1.5" marker-end="url(#vgather_ub-arrow)" />
+    <line x1="350" y1="122" x2="350" y2="197" stroke="#696d75" stroke-width="1.5" marker-end="url(#vgather_ub-arrow)" />
+    <line x1="407" y1="122" x2="407" y2="197" stroke="#696d75" stroke-width="1.5" marker-end="url(#vgather_ub-arrow)" />
+    <line x1="521" y1="122" x2="521" y2="197" stroke="#696d75" stroke-width="1.5" marker-end="url(#vgather_ub-arrow)" />
+  </g>
+  <g fill="#171717" font-family="FZLanTingHei-R-GBK, 方正兰亭黑_GBK, sans-serif" font-size="12" font-weight="400">
+    <text x="122" y="30.7" font-size="12.00" text-anchor="middle" fill="#171717">elm0</text>
+    <text x="179" y="30.7" font-size="12.00" text-anchor="middle" fill="#171717">elm1</text>
+    <text x="236" y="30.7" font-size="12.00" text-anchor="middle" fill="#171717">elm2</text>
+    <text x="293" y="30.7" font-size="12.00" text-anchor="middle" fill="#171717">elm3</text>
+    <text x="350" y="30.7" font-size="12.00" text-anchor="middle" fill="#171717">elm4</text>
+    <text x="407" y="30.7" font-size="12.00" text-anchor="middle" fill="#171717">elm5</text>
+    <text x="464" y="30.7" font-size="12.00" text-anchor="middle" fill="#171717">...</text>
+    <text x="521" y="30.7" font-size="12.00" text-anchor="middle" fill="#171717">elmM</text>
+    <text x="578" y="30.7" font-size="12.00" text-anchor="middle" fill="#171717">...</text>
+    <text x="635" y="30.7" font-size="12.00" text-anchor="middle" fill="#171717">elmN</text>
+    <text x="122" y="104.7" font-size="12.00" text-anchor="middle" fill="#171717">3</text>
+    <text x="179" y="104.7" font-size="12.00" text-anchor="middle" fill="#171717">2</text>
+    <text x="236" y="104.7" font-size="12.00" text-anchor="middle" fill="#171717">4</text>
+    <text x="293" y="104.7" font-size="12.00" text-anchor="middle" fill="#171717">1</text>
+    <text x="350" y="104.7" font-size="12.00" text-anchor="middle" fill="#171717">N</text>
+    <text x="407" y="104.7" font-size="12.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="464" y="104.7" font-size="12.00" text-anchor="middle" fill="#171717">...</text>
+    <text x="521" y="104.7" font-size="12.00" text-anchor="middle" fill="#171717">3</text>
+    <text x="122" y="223.7" font-size="12.00" text-anchor="middle" fill="#171717">elm3</text>
+    <text x="179" y="223.7" font-size="12.00" text-anchor="middle" fill="#171717">elm2</text>
+    <text x="236" y="223.7" font-size="12.00" text-anchor="middle" fill="#171717">elm4</text>
+    <text x="293" y="223.7" font-size="12.00" text-anchor="middle" fill="#171717">elm1</text>
+    <text x="350" y="223.7" font-size="12.00" text-anchor="middle" fill="#171717">elmN</text>
+    <text x="407" y="223.7" font-size="12.00" text-anchor="middle" fill="#171717">elm0</text>
+    <text x="464" y="223.7" font-size="12.00" text-anchor="middle" fill="#171717">...</text>
+    <text x="521" y="223.7" font-size="12.00" text-anchor="middle" fill="#171717">elm3</text>
+    <text x="74" y="26" font-size="14.00" text-anchor="end" fill="#171717">tensor</text>
+    <text x="74" y="44.9" font-size="14.00" text-anchor="end" fill="#171717">(UB)</text>
+    <text x="74" y="105" font-size="14.00" text-anchor="end" fill="#171717">index</text>
+    <text x="74" y="224" font-size="14.00" text-anchor="end" fill="#171717">dst</text>
+  </g>
+</svg>

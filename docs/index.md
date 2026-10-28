@@ -1,7 +1,11 @@
+<meta http-equiv="refresh" content="0; url=/zh/">
 
-# CANNBot-DSL 文档
+<script setup>
+import { onMounted } from 'vue'
 
-请选择文档语言：
+onMounted(() => {
+  window.location.replace('/zh/')
+})
+</script>
 
-- [中文文档](/zh/)
-- [English documentation](/en/)
+正在打开中文文档……

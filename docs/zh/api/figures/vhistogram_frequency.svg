@@ -1,0 +1,128 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="780" height="468" viewBox="0 0 780 468" role="img" aria-labelledby="vhistogram_frequency-title vhistogram_frequency-desc">
+  <title id="vhistogram_frequency-title">频率统计</title>
+  <desc id="vhistogram_frequency-desc">Editable vector diagram reconstructed from the preserved vhistogram_frequency.png; text uses FZLanTingHei-R-GBK.</desc>
+  <defs>
+    <marker id="vhistogram_frequency-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#696d75" />
+    </marker>
+    <marker id="vhistogram_frequency-ink-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#101843" />
+    </marker>
+    <marker id="vhistogram_frequency-blue-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#5277ff" />
+    </marker>
+  </defs>
+  <rect x="0" y="0" width="780" height="468" fill="#fff" stroke="none" stroke-width="1" rx="0" />
+  <g>
+    <path d="M197 20 H670 l-16 -20 h22 l26 30 l-26 30 h-22 l16 -20 H197 Z" stroke="#696d75" stroke-width="0.8" fill="none" />
+    <rect x="197" y="104" width="38" height="38" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="235" y="104" width="38" height="38" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="273" y="104" width="38" height="38" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="311" y="104" width="38" height="38" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="349" y="104" width="38" height="38" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="387" y="104" width="38" height="38" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="425" y="104" width="38" height="38" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="463" y="104" width="38" height="38" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="501" y="104" width="38" height="38" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="539" y="104" width="38" height="38" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="577" y="104" width="38" height="38" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="615" y="104" width="38" height="38" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="653" y="104" width="38" height="38" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="691" y="104" width="38" height="38" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <path d="M368.0 104V86H596.0V104" stroke="#101843" stroke-width="1" fill="none" />
+    <rect x="170" y="172" width="76" height="36" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="246" y="172" width="76" height="36" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="322" y="172" width="76" height="36" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="398" y="172" width="76" height="36" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="474" y="172" width="76" height="36" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="550" y="172" width="76" height="36" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="626" y="172" width="76" height="36" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="702" y="172" width="76" height="36" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="170" y="232" width="76" height="36" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="246" y="232" width="76" height="36" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="322" y="232" width="76" height="36" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="398" y="232" width="76" height="36" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="474" y="232" width="76" height="36" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="550" y="232" width="76" height="36" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="626" y="232" width="76" height="36" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="702" y="232" width="76" height="36" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="170" y="370" width="76" height="36" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="246" y="370" width="76" height="36" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="322" y="370" width="76" height="36" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="398" y="370" width="76" height="36" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="474" y="370" width="76" height="36" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="550" y="370" width="76" height="36" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="626" y="370" width="76" height="36" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="702" y="370" width="76" height="36" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="170" y="432" width="76" height="36" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="246" y="432" width="76" height="36" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="322" y="432" width="76" height="36" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="398" y="432" width="76" height="36" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="474" y="432" width="76" height="36" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="550" y="432" width="76" height="36" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="626" y="432" width="76" height="36" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="702" y="432" width="76" height="36" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <path d="M447 288 H453 V327.65 H465.25 L450 349 L434.75 327.65 H447 Z" stroke="none" stroke-width="1" fill="#000" />
+  </g>
+  <g fill="#171717" font-family="FZLanTingHei-R-GBK, 方正兰亭黑_GBK, sans-serif" font-size="12" font-weight="400">
+    <text x="167" y="30" font-size="14.00" text-anchor="middle" fill="#171717" font-weight="700">低位</text>
+    <text x="717" y="30" font-size="14.00" text-anchor="middle" fill="#171717" font-weight="700">高位</text>
+    <text x="216" y="127.2" font-size="12.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="254" y="127.2" font-size="12.00" text-anchor="middle" fill="#171717">1</text>
+    <text x="292" y="127.2" font-size="12.00" text-anchor="middle" fill="#171717">1</text>
+    <text x="330" y="127.2" font-size="12.00" text-anchor="middle" fill="#171717">1</text>
+    <text x="368" y="127.2" font-size="12.00" text-anchor="middle" fill="#171717">4</text>
+    <text x="406" y="127.2" font-size="12.00" text-anchor="middle" fill="#171717">...</text>
+    <text x="444" y="127.2" font-size="12.00" text-anchor="middle" fill="#171717">126</text>
+    <text x="482" y="127.2" font-size="12.00" text-anchor="middle" fill="#171717">127</text>
+    <text x="520" y="127.2" font-size="12.00" text-anchor="middle" fill="#171717">128</text>
+    <text x="558" y="127.2" font-size="12.00" text-anchor="middle" fill="#171717">...</text>
+    <text x="596" y="127.2" font-size="12.00" text-anchor="middle" fill="#171717">252</text>
+    <text x="634" y="127.2" font-size="12.00" text-anchor="middle" fill="#171717">255</text>
+    <text x="672" y="127.2" font-size="12.00" text-anchor="middle" fill="#171717">255</text>
+    <text x="710" y="127.2" font-size="12.00" text-anchor="middle" fill="#171717">255</text>
+    <text x="482" y="76" font-size="14.00" text-anchor="middle" fill="#171717">连续</text>
+    <text x="171" y="124" font-size="13.00" text-anchor="end" fill="#171717">src&lt;dtypes.uint8&gt;</text>
+    <text x="208" y="194.2" font-size="12.00" text-anchor="middle" fill="#171717">1</text>
+    <text x="284" y="194.2" font-size="12.00" text-anchor="middle" fill="#171717">1</text>
+    <text x="360" y="194.2" font-size="12.00" text-anchor="middle" fill="#171717">1</text>
+    <text x="436" y="194.2" font-size="12.00" text-anchor="middle" fill="#171717">...</text>
+    <text x="512" y="194.2" font-size="12.00" text-anchor="middle" fill="#171717">...</text>
+    <text x="588" y="194.2" font-size="12.00" text-anchor="middle" fill="#171717">1</text>
+    <text x="664" y="194.2" font-size="12.00" text-anchor="middle" fill="#171717">1</text>
+    <text x="740" y="194.2" font-size="12.00" text-anchor="middle" fill="#171717">1</text>
+    <text x="150" y="181" font-size="14.00" text-anchor="end" fill="#171717" font-weight="700">低位模式</text>
+    <text x="150" y="202" font-size="11.62" text-anchor="end" fill="#171717">dst&lt;dtypes.uint16&gt;原数据</text>
+    <text x="208" y="254.2" font-size="12.00" text-anchor="middle" fill="#171717">1</text>
+    <text x="284" y="254.2" font-size="12.00" text-anchor="middle" fill="#171717">1</text>
+    <text x="360" y="254.2" font-size="12.00" text-anchor="middle" fill="#171717">1</text>
+    <text x="436" y="254.2" font-size="12.00" text-anchor="middle" fill="#171717">...</text>
+    <text x="512" y="254.2" font-size="12.00" text-anchor="middle" fill="#171717">...</text>
+    <text x="588" y="254.2" font-size="12.00" text-anchor="middle" fill="#171717">1</text>
+    <text x="664" y="254.2" font-size="12.00" text-anchor="middle" fill="#171717">1</text>
+    <text x="740" y="254.2" font-size="12.00" text-anchor="middle" fill="#171717">1</text>
+    <text x="150" y="241" font-size="14.00" text-anchor="end" fill="#171717" font-weight="700">高位模式</text>
+    <text x="150" y="262" font-size="11.62" text-anchor="end" fill="#171717">dst&lt;dtypes.uint16&gt;原数据</text>
+    <text x="208" y="392.2" font-size="12.00" text-anchor="middle" fill="#171717">2</text>
+    <text x="284" y="392.2" font-size="12.00" text-anchor="middle" fill="#171717">4</text>
+    <text x="360" y="392.2" font-size="12.00" text-anchor="middle" fill="#171717">1</text>
+    <text x="436" y="392.2" font-size="12.00" text-anchor="middle" fill="#171717">...</text>
+    <text x="512" y="392.2" font-size="12.00" text-anchor="middle" fill="#171717">...</text>
+    <text x="588" y="392.2" font-size="12.00" text-anchor="middle" fill="#171717">2</text>
+    <text x="664" y="392.2" font-size="12.00" text-anchor="middle" fill="#171717">2</text>
+    <text x="740" y="392.2" font-size="12.00" text-anchor="middle" fill="#171717">2</text>
+    <text x="150" y="379" font-size="14.00" text-anchor="end" fill="#171717" font-weight="700">低位模式</text>
+    <text x="150" y="400" font-size="12.00" text-anchor="end" fill="#171717">dst&lt;dtypes.uint16&gt;</text>
+    <text x="208" y="454.2" font-size="12.00" text-anchor="middle" fill="#171717">2</text>
+    <text x="284" y="454.2" font-size="12.00" text-anchor="middle" fill="#171717">2</text>
+    <text x="360" y="454.2" font-size="12.00" text-anchor="middle" fill="#171717">2</text>
+    <text x="436" y="454.2" font-size="12.00" text-anchor="middle" fill="#171717">...</text>
+    <text x="512" y="454.2" font-size="12.00" text-anchor="middle" fill="#171717">...</text>
+    <text x="588" y="454.2" font-size="12.00" text-anchor="middle" fill="#171717">1</text>
+    <text x="664" y="454.2" font-size="12.00" text-anchor="middle" fill="#171717">1</text>
+    <text x="740" y="454.2" font-size="12.00" text-anchor="middle" fill="#171717">4</text>
+    <text x="150" y="441" font-size="14.00" text-anchor="end" fill="#171717" font-weight="700">高位模式</text>
+    <text x="150" y="462" font-size="12.00" text-anchor="end" fill="#171717">dst&lt;dtypes.uint16&gt;</text>
+    <text x="107" y="328" font-size="14.00" text-anchor="middle" fill="#171717" font-weight="700">频率统计</text>
+  </g>
+</svg>

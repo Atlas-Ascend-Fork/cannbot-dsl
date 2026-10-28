@@ -1,0 +1,119 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="842" height="371" viewBox="0 0 842 371" role="img" aria-labelledby="mmad_nongemv_compare-title mmad_nongemv_compare-desc">
+  <title id="mmad_nongemv_compare-title">mmad nongemv compare示意图</title>
+  <desc id="mmad_nongemv_compare-desc">Editable vector diagram reconstructed from the preserved mmad_nongemv_compare.png; text uses FZLanTingHei-R-GBK.</desc>
+  <defs>
+    <marker id="mmad_nongemv_compare-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#696d75" />
+    </marker>
+    <marker id="mmad_nongemv_compare-ink-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#101843" />
+    </marker>
+    <marker id="mmad_nongemv_compare-blue-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#5277ff" />
+    </marker>
+  </defs>
+  <rect x="0" y="0" width="842" height="371" fill="#fff" stroke="none" stroke-width="1" rx="0" />
+  <g>
+    <rect x="48" y="124" width="243" height="82" fill="#fff" stroke="#101843" stroke-width="1" rx="3" />
+    <rect x="48.0" y="124" width="81.0" height="24" fill="#ffbd72" stroke="#101843" stroke-width="1" rx="3" />
+    <rect x="210.0" y="124" width="81.0" height="24" fill="#23be57" stroke="#101843" stroke-width="1" rx="3" />
+    <line x1="48" y1="107" x2="291" y2="107" stroke="#696d75" stroke-width="1.2" />
+    <line x1="48" y1="103" x2="48" y2="111" stroke="#696d75" stroke-width="1.2" />
+    <line x1="291" y1="103" x2="291" y2="111" stroke="#696d75" stroke-width="1.2" />
+    <rect x="142.894" y="97" width="53.212" height="20" fill="#fff" stroke="none" stroke-width="1" rx="0" />
+    <line x1="48" y1="119" x2="129.0" y2="119" stroke="#696d75" stroke-width="1.2" />
+    <line x1="48" y1="115" x2="48" y2="123" stroke="#696d75" stroke-width="1.2" />
+    <line x1="129.0" y1="115" x2="129.0" y2="123" stroke="#696d75" stroke-width="1.2" />
+    <rect x="76.624" y="109" width="23.752000000000002" height="20" fill="#fff" stroke="none" stroke-width="1" rx="0" />
+    <line x1="57" y1="136" x2="119" y2="136" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_nongemv_compare-ink-arrow)" />
+    <line x1="119" y1="136" x2="57" y2="196" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_nongemv_compare-ink-arrow)" />
+    <line x1="57" y1="196" x2="119" y2="196" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_nongemv_compare-ink-arrow)" />
+    <line x1="138" y1="136" x2="200" y2="136" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_nongemv_compare-ink-arrow)" />
+    <line x1="200" y1="136" x2="138" y2="196" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_nongemv_compare-ink-arrow)" />
+    <line x1="138" y1="196" x2="200" y2="196" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_nongemv_compare-ink-arrow)" />
+    <line x1="217" y1="136" x2="279" y2="136" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_nongemv_compare-ink-arrow)" />
+    <line x1="279" y1="136" x2="217" y2="196" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_nongemv_compare-ink-arrow)" />
+    <line x1="217" y1="196" x2="279" y2="196" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_nongemv_compare-ink-arrow)" />
+    <line x1="15" y1="124" x2="15" y2="206" stroke="#696d75" stroke-width="1" />
+    <line x1="48" y1="217" x2="125" y2="217" stroke="#101843" stroke-width="0.8" marker-end="url(#mmad_nongemv_compare-ink-arrow)" />
+    <line x1="128" y1="217" x2="205" y2="217" stroke="#101843" stroke-width="0.8" marker-end="url(#mmad_nongemv_compare-ink-arrow)" />
+    <line x1="210" y1="217" x2="291" y2="217" stroke="#101843" stroke-width="0.8" marker-end="url(#mmad_nongemv_compare-ink-arrow)" />
+    <rect x="398" y="41" width="160" height="243" fill="#fff" stroke="#101843" stroke-width="1" rx="3" />
+    <line x1="406" y1="48" x2="406" y2="95" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_nongemv_compare-ink-arrow)" />
+    <line x1="406" y1="95" x2="471" y2="48" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_nongemv_compare-ink-arrow)" />
+    <line x1="471" y1="48" x2="471" y2="95" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_nongemv_compare-ink-arrow)" />
+    <line x1="486" y1="48" x2="486" y2="95" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_nongemv_compare-ink-arrow)" />
+    <line x1="486" y1="95" x2="551" y2="48" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_nongemv_compare-ink-arrow)" />
+    <line x1="551" y1="48" x2="551" y2="95" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_nongemv_compare-ink-arrow)" />
+    <line x1="406" y1="111" x2="406" y2="158" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_nongemv_compare-ink-arrow)" />
+    <line x1="406" y1="158" x2="471" y2="111" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_nongemv_compare-ink-arrow)" />
+    <line x1="471" y1="111" x2="471" y2="158" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_nongemv_compare-ink-arrow)" />
+    <line x1="486" y1="111" x2="486" y2="158" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_nongemv_compare-ink-arrow)" />
+    <line x1="486" y1="158" x2="551" y2="111" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_nongemv_compare-ink-arrow)" />
+    <line x1="551" y1="111" x2="551" y2="158" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_nongemv_compare-ink-arrow)" />
+    <line x1="406" y1="174" x2="406" y2="221" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_nongemv_compare-ink-arrow)" />
+    <line x1="406" y1="221" x2="471" y2="174" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_nongemv_compare-ink-arrow)" />
+    <line x1="471" y1="174" x2="471" y2="221" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_nongemv_compare-ink-arrow)" />
+    <line x1="486" y1="174" x2="486" y2="221" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_nongemv_compare-ink-arrow)" />
+    <line x1="486" y1="221" x2="551" y2="174" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_nongemv_compare-ink-arrow)" />
+    <line x1="551" y1="174" x2="551" y2="221" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_nongemv_compare-ink-arrow)" />
+    <line x1="406" y1="237" x2="406" y2="284" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_nongemv_compare-ink-arrow)" />
+    <line x1="406" y1="284" x2="471" y2="237" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_nongemv_compare-ink-arrow)" />
+    <line x1="471" y1="237" x2="471" y2="284" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_nongemv_compare-ink-arrow)" />
+    <line x1="486" y1="237" x2="486" y2="284" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_nongemv_compare-ink-arrow)" />
+    <line x1="486" y1="284" x2="551" y2="237" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_nongemv_compare-ink-arrow)" />
+    <line x1="551" y1="237" x2="551" y2="284" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_nongemv_compare-ink-arrow)" />
+    <line x1="398" y1="17" x2="558" y2="17" stroke="#696d75" stroke-width="1.2" />
+    <line x1="398" y1="13" x2="398" y2="21" stroke="#696d75" stroke-width="1.2" />
+    <line x1="558" y1="13" x2="558" y2="21" stroke="#696d75" stroke-width="1.2" />
+    <rect x="455.177" y="7" width="45.646" height="20" fill="#fff" stroke="none" stroke-width="1" rx="0" />
+    <line x1="398" y1="32" x2="463" y2="32" stroke="#696d75" stroke-width="1.2" />
+    <line x1="398" y1="28" x2="398" y2="36" stroke="#696d75" stroke-width="1.2" />
+    <line x1="463" y1="28" x2="463" y2="36" stroke="#696d75" stroke-width="1.2" />
+    <rect x="418.624" y="22" width="23.752000000000002" height="20" fill="#fff" stroke="none" stroke-width="1" rx="0" />
+    <line x1="372" y1="41" x2="372" y2="284" stroke="#696d75" stroke-width="1" />
+    <rect x="677" y="123" width="160" height="83" fill="#d9d9d9" stroke="#101843" stroke-width="1" rx="3" />
+    <rect x="677" y="123" width="160" height="11" fill="#fff" stroke="none" stroke-width="1" rx="0" />
+    <line x1="686" y1="134" x2="748" y2="134" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_nongemv_compare-ink-arrow)" />
+    <line x1="748" y1="134" x2="686" y2="194" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_nongemv_compare-ink-arrow)" />
+    <line x1="686" y1="194" x2="748" y2="194" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_nongemv_compare-ink-arrow)" />
+    <line x1="765" y1="134" x2="827" y2="134" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_nongemv_compare-ink-arrow)" />
+    <line x1="827" y1="134" x2="765" y2="194" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_nongemv_compare-ink-arrow)" />
+    <line x1="765" y1="194" x2="827" y2="194" stroke="#101843" stroke-width="0.65" marker-end="url(#mmad_nongemv_compare-ink-arrow)" />
+    <line x1="677" y1="114" x2="837" y2="114" stroke="#696d75" stroke-width="1.2" />
+    <line x1="677" y1="110" x2="677" y2="118" stroke="#696d75" stroke-width="1.2" />
+    <line x1="837" y1="110" x2="837" y2="118" stroke="#696d75" stroke-width="1.2" />
+    <rect x="734.177" y="104" width="45.646" height="20" fill="#fff" stroke="none" stroke-width="1" rx="0" />
+    <rect x="135" y="327" width="70" height="42" fill="#eee" stroke="none" stroke-width="1" rx="5" />
+    <rect x="425" y="327" width="70" height="42" fill="#eee" stroke="none" stroke-width="1" rx="5" />
+    <rect x="725" y="327" width="70" height="42" fill="#eee" stroke="none" stroke-width="1" rx="5" />
+    <rect x="741" y="12" width="17" height="24" fill="#fff" stroke="#101843" stroke-width="1" rx="2" />
+    <rect x="741" y="43" width="17" height="24" fill="#d6d6d6" stroke="#101843" stroke-width="1" rx="2" />
+  </g>
+  <g fill="#171717" font-family="FZLanTingHei-R-GBK, 方正兰亭黑_GBK, sans-serif" font-size="12" font-weight="400">
+    <text x="169.5" y="141" font-size="13.00" text-anchor="middle" fill="#171717">...</text>
+    <text x="169.5" y="111" font-size="13.00" text-anchor="middle" fill="#171717">K=256</text>
+    <text x="88.5" y="123" font-size="12.00" text-anchor="middle" fill="#171717">16</text>
+    <text x="38" y="141" font-size="12.00" text-anchor="end" fill="#171717">M=1</text>
+    <text x="15" y="170" font-size="12.00" text-anchor="middle" fill="#171717">16</text>
+    <text x="86" y="238" font-size="12.00" text-anchor="middle" fill="#171717">第1次搬运</text>
+    <text x="259" y="238" font-size="12.00" text-anchor="middle" fill="#171717">第16次搬运</text>
+    <text x="171" y="238" font-size="12.00" text-anchor="middle" fill="#171717">...</text>
+    <text x="478" y="21" font-size="13.00" text-anchor="middle" fill="#171717">N=32</text>
+    <text x="430.5" y="36" font-size="12.00" text-anchor="middle" fill="#171717">16</text>
+    <text x="376" y="169" font-size="12.00" text-anchor="middle" fill="#171717">K=256</text>
+    <text x="387" y="264" font-size="12.00" text-anchor="middle" fill="#171717">16</text>
+    <text x="757" y="118" font-size="13.00" text-anchor="middle" fill="#171717">N=32</text>
+    <text x="667" y="139" font-size="12.00" text-anchor="end" fill="#171717">M=1</text>
+    <text x="667" y="172" font-size="12.00" text-anchor="end" fill="#171717">16</text>
+    <text x="327" y="151" font-size="42.00" text-anchor="middle" fill="#171717" font-weight="700">×</text>
+    <text x="603" y="151" font-size="42.00" text-anchor="middle" fill="#171717" font-weight="700">=</text>
+    <text x="170" y="353.25" font-size="15.00" text-anchor="middle" fill="#171717">矩阵A</text>
+    <text x="460" y="353.25" font-size="15.00" text-anchor="middle" fill="#171717">矩阵B</text>
+    <text x="760" y="353.25" font-size="15.00" text-anchor="middle" fill="#171717">矩阵C</text>
+    <text x="749.5" y="28.2" font-size="12.00" text-anchor="middle" fill="#171717" />
+    <text x="770" y="28" font-size="13.00" text-anchor="start" fill="#171717">有效数据</text>
+    <text x="749.5" y="59.2" font-size="12.00" text-anchor="middle" fill="#171717" />
+    <text x="770" y="59" font-size="13.00" text-anchor="start" fill="#171717">无效数据</text>
+  </g>
+</svg>

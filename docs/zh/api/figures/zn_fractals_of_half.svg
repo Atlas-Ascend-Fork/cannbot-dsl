@@ -1,0 +1,70 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="489" height="411" viewBox="0 0 489 411" role="img" aria-labelledby="zn_fractals_of_half-title zn_fractals_of_half-desc">
+  <title id="zn_fractals_of_half-title">zn fractals of half示意图</title>
+  <desc id="zn_fractals_of_half-desc">Editable vector diagram reconstructed from the preserved zn_fractals_of_half.png; text uses FZLanTingHei-R-GBK.</desc>
+  <defs>
+    <marker id="zn_fractals_of_half-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#696d75" />
+    </marker>
+    <marker id="zn_fractals_of_half-ink-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#101843" />
+    </marker>
+    <marker id="zn_fractals_of_half-blue-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#5277ff" />
+    </marker>
+  </defs>
+  <rect x="0" y="0" width="489" height="411" fill="#fff" stroke="none" stroke-width="1" rx="0" />
+  <g>
+    <line x1="64" y1="24" x2="466" y2="24" stroke="#101843" stroke-width="0.8" marker-end="url(#zn_fractals_of_half-ink-arrow)" />
+    <line x1="64" y1="31" x2="64" y2="327" stroke="#101843" stroke-width="0.8" marker-end="url(#zn_fractals_of_half-ink-arrow)" />
+    <line x1="89" y1="36" x2="89" y2="143" stroke="#101843" stroke-width="0.65" marker-end="url(#zn_fractals_of_half-ink-arrow)" />
+    <line x1="89" y1="143" x2="221" y2="36" stroke="#101843" stroke-width="0.65" marker-end="url(#zn_fractals_of_half-ink-arrow)" />
+    <line x1="221" y1="36" x2="221" y2="143" stroke="#101843" stroke-width="0.65" marker-end="url(#zn_fractals_of_half-ink-arrow)" />
+    <line x1="89" y1="195" x2="89" y2="302" stroke="#101843" stroke-width="0.65" marker-end="url(#zn_fractals_of_half-ink-arrow)" />
+    <line x1="89" y1="302" x2="221" y2="195" stroke="#101843" stroke-width="0.65" marker-end="url(#zn_fractals_of_half-ink-arrow)" />
+    <line x1="221" y1="195" x2="221" y2="302" stroke="#101843" stroke-width="0.65" marker-end="url(#zn_fractals_of_half-ink-arrow)" />
+    <line x1="282" y1="36" x2="282" y2="143" stroke="#101843" stroke-width="0.65" marker-end="url(#zn_fractals_of_half-ink-arrow)" />
+    <line x1="282" y1="143" x2="413" y2="36" stroke="#101843" stroke-width="0.65" marker-end="url(#zn_fractals_of_half-ink-arrow)" />
+    <line x1="413" y1="36" x2="413" y2="143" stroke="#101843" stroke-width="0.65" marker-end="url(#zn_fractals_of_half-ink-arrow)" />
+    <line x1="282" y1="195" x2="282" y2="302" stroke="#101843" stroke-width="0.65" marker-end="url(#zn_fractals_of_half-ink-arrow)" />
+    <line x1="282" y1="302" x2="413" y2="195" stroke="#101843" stroke-width="0.65" marker-end="url(#zn_fractals_of_half-ink-arrow)" />
+    <line x1="413" y1="195" x2="413" y2="302" stroke="#101843" stroke-width="0.65" marker-end="url(#zn_fractals_of_half-ink-arrow)" />
+    <line x1="221" y1="143" x2="282" y2="36" stroke="#101843" stroke-width="0.7" marker-end="url(#zn_fractals_of_half-ink-arrow)" />
+    <line x1="413" y1="143" x2="89" y2="195" stroke="#101843" stroke-width="0.7" marker-end="url(#zn_fractals_of_half-ink-arrow)" />
+    <line x1="221" y1="302" x2="282" y2="195" stroke="#101843" stroke-width="0.7" marker-end="url(#zn_fractals_of_half-ink-arrow)" />
+    <line x1="282" y1="335" x2="413" y2="335" stroke="#696d75" stroke-width="1.2" />
+    <line x1="282" y1="331" x2="282" y2="339" stroke="#696d75" stroke-width="1.2" />
+    <line x1="413" y1="331" x2="413" y2="339" stroke="#696d75" stroke-width="1.2" />
+    <rect x="291.014" y="325" width="112.972" height="20" fill="#fff" stroke="none" stroke-width="1" rx="0" />
+    <line x1="472" y1="195" x2="472" y2="302" stroke="#696d75" stroke-width="1" />
+    <line x1="465" y1="195" x2="479" y2="195" stroke="#696d75" stroke-width="1" />
+    <line x1="465" y1="302" x2="479" y2="302" stroke="#696d75" stroke-width="1" />
+    <rect x="174.5" y="357" width="140" height="51" fill="#eee" stroke="none" stroke-width="1" rx="8" />
+  </g>
+  <g fill="#171717" font-family="FZLanTingHei-R-GBK, 方正兰亭黑_GBK, sans-serif" font-size="12" font-weight="400">
+    <text x="251" y="16" font-size="18.00" text-anchor="middle" fill="#171717" font-weight="700">Col</text>
+    <text x="20" y="153" font-size="17.00" text-anchor="middle" fill="#171717" font-weight="700">Row</text>
+    <text x="59" y="47" font-size="15.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="47" y="285" font-size="15.00" text-anchor="middle" fill="#171717">31</text>
+    <text x="89" y="18" font-size="15.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="413" y="18" font-size="15.00" text-anchor="middle" fill="#171717">31</text>
+    <text x="89" y="46" font-size="14.00" text-anchor="middle" fill="#171717" font-weight="700">(0,0)</text>
+    <text x="221" y="46" font-size="14.00" text-anchor="middle" fill="#171717" font-weight="700">(0,15)</text>
+    <text x="282" y="46" font-size="14.00" text-anchor="middle" fill="#171717" font-weight="700">(0,16)</text>
+    <text x="413" y="46" font-size="14.00" text-anchor="middle" fill="#171717" font-weight="700">(0,31)</text>
+    <text x="89" y="153" font-size="14.00" text-anchor="middle" fill="#171717" font-weight="700">(15,0)</text>
+    <text x="221" y="153" font-size="14.00" text-anchor="middle" fill="#171717" font-weight="700">(15,15)</text>
+    <text x="282" y="153" font-size="14.00" text-anchor="middle" fill="#171717" font-weight="700">(15,16)</text>
+    <text x="413" y="153" font-size="14.00" text-anchor="middle" fill="#171717" font-weight="700">(15,31)</text>
+    <text x="89" y="205" font-size="14.00" text-anchor="middle" fill="#171717" font-weight="700">(16,0)</text>
+    <text x="221" y="205" font-size="14.00" text-anchor="middle" fill="#171717" font-weight="700">(16,15)</text>
+    <text x="282" y="205" font-size="14.00" text-anchor="middle" fill="#171717" font-weight="700">(16,16)</text>
+    <text x="413" y="205" font-size="14.00" text-anchor="middle" fill="#171717" font-weight="700">(16,31)</text>
+    <text x="89" y="312" font-size="14.00" text-anchor="middle" fill="#171717" font-weight="700">(31,0)</text>
+    <text x="221" y="312" font-size="14.00" text-anchor="middle" fill="#171717" font-weight="700">(31,15)</text>
+    <text x="282" y="312" font-size="14.00" text-anchor="middle" fill="#171717" font-weight="700">(31,16)</text>
+    <text x="413" y="312" font-size="14.00" text-anchor="middle" fill="#171717" font-weight="700">(31,31)</text>
+    <text x="347.5" y="339" font-size="12.00" text-anchor="middle" fill="#171717">32 / sizeof(dtype)</text>
+    <text x="474" y="254" font-size="14.00" text-anchor="middle" fill="#171717">16</text>
+    <text x="244.5" y="388.1" font-size="16.00" text-anchor="middle" fill="#171717">矩阵B</text>
+  </g>
+</svg>

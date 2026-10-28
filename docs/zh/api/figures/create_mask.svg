@@ -1,0 +1,101 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="522" height="367" viewBox="0 0 522 367" role="img" aria-labelledby="create_mask-title create_mask-desc">
+  <title id="create_mask-title">create_mask原理 / full_mask原理</title>
+  <desc id="create_mask-desc">Editable vector diagram reconstructed from the preserved create_mask.png; text uses FZLanTingHei-R-GBK.</desc>
+  <defs>
+    <marker id="create_mask-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#696d75" />
+    </marker>
+    <marker id="create_mask-ink-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#101843" />
+    </marker>
+    <marker id="create_mask-blue-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#5277ff" />
+    </marker>
+  </defs>
+  <rect x="0" y="0" width="522" height="367" fill="#fff" stroke="none" stroke-width="1" rx="0" />
+  <g>
+    <rect x="71" y="45" width="37" height="38" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="108" y="45" width="37" height="38" fill="#d2d3d3" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="145" y="45" width="37" height="38" fill="#d2d3d3" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="182" y="45" width="37" height="38" fill="#d2d3d3" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="219" y="45" width="37" height="38" fill="#d2d3d3" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="256" y="45" width="37" height="38" fill="#d2d3d3" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="293" y="45" width="37" height="38" fill="#d2d3d3" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="330" y="45" width="37" height="38" fill="#d2d3d3" stroke="#101843" stroke-width="1" rx="0" />
+    <line x1="90" y1="38" x2="348.5" y2="38" stroke="#696d75" stroke-width="1.2" />
+    <line x1="90" y1="34" x2="90" y2="42" stroke="#696d75" stroke-width="1.2" />
+    <line x1="348.5" y1="34" x2="348.5" y2="42" stroke="#696d75" stroke-width="1.2" />
+    <rect x="187.904" y="28" width="62.692" height="20" fill="#fff" stroke="none" stroke-width="1" rx="0" />
+    <rect x="71" y="165" width="37" height="38" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="108" y="165" width="37" height="38" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="145" y="165" width="37" height="38" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="182" y="165" width="37" height="38" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="219" y="165" width="37" height="38" fill="#d2d3d3" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="256" y="165" width="37" height="38" fill="#d2d3d3" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="293" y="165" width="37" height="38" fill="#d2d3d3" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="330" y="165" width="37" height="38" fill="#d2d3d3" stroke="#101843" stroke-width="1" rx="0" />
+    <line x1="90" y1="158" x2="200.5" y2="158" stroke="#696d75" stroke-width="1.2" />
+    <line x1="90" y1="154" x2="90" y2="162" stroke="#696d75" stroke-width="1.2" />
+    <line x1="200.5" y1="154" x2="200.5" y2="162" stroke="#696d75" stroke-width="1.2" />
+    <rect x="114.594" y="148" width="61.312" height="20" fill="#fff" stroke="none" stroke-width="1" rx="0" />
+    <rect x="71" y="284" width="37" height="38" fill="#d2d3d3" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="108" y="284" width="37" height="38" fill="#d2d3d3" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="145" y="284" width="37" height="38" fill="#d2d3d3" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="182" y="284" width="37" height="38" fill="#d2d3d3" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="219" y="284" width="37" height="38" fill="#d2d3d3" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="256" y="284" width="37" height="38" fill="#d2d3d3" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="293" y="284" width="37" height="38" fill="#d2d3d3" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="330" y="284" width="37" height="38" fill="#d2d3d3" stroke="#101843" stroke-width="1" rx="0" />
+    <line x1="90" y1="277" x2="348.5" y2="277" stroke="#696d75" stroke-width="1.2" />
+    <line x1="90" y1="273" x2="90" y2="281" stroke="#696d75" stroke-width="1.2" />
+    <line x1="348.5" y1="273" x2="348.5" y2="281" stroke="#696d75" stroke-width="1.2" />
+    <rect x="187.904" y="267" width="62.692" height="20" fill="#fff" stroke="none" stroke-width="1" rx="0" />
+    <rect x="391" y="8" width="38" height="38" fill="#c2d5fe" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="391" y="69" width="38" height="38" fill="#d2d3d3" stroke="#101843" stroke-width="1" rx="0" />
+  </g>
+  <g fill="#171717" font-family="FZLanTingHei-R-GBK, 方正兰亭黑_GBK, sans-serif" font-size="12" font-weight="400">
+    <text x="74" y="25" font-size="12.00" text-anchor="start" fill="#171717">LOW</text>
+    <text x="364" y="25" font-size="12.00" text-anchor="end" fill="#171717">HIGH</text>
+    <text x="56" y="69" font-size="12.00" text-anchor="end" fill="#171717">mask</text>
+    <text x="89.5" y="68.2" font-size="12.00" text-anchor="middle" fill="#171717">1</text>
+    <text x="126.5" y="68.2" font-size="12.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="163.5" y="68.2" font-size="12.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="200.5" y="68.2" font-size="12.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="237.5" y="68.2" font-size="12.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="274.5" y="68.2" font-size="12.00" text-anchor="middle" fill="#171717">...</text>
+    <text x="311.5" y="68.2" font-size="12.00" text-anchor="middle" fill="#171717">...</text>
+    <text x="348.5" y="68.2" font-size="12.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="219.25" y="42" font-size="12.00" text-anchor="middle" fill="#171717">32 Bytes</text>
+    <text x="219" y="113" font-size="16.00" text-anchor="middle" fill="#171717" font-weight="700">pat_mode = PAT_VL1</text>
+    <text x="74" y="145" font-size="12.00" text-anchor="start" fill="#171717">LOW</text>
+    <text x="364" y="145" font-size="12.00" text-anchor="end" fill="#171717">HIGH</text>
+    <text x="56" y="189" font-size="12.00" text-anchor="end" fill="#171717">mask</text>
+    <text x="89.5" y="188.2" font-size="12.00" text-anchor="middle" fill="#171717">1</text>
+    <text x="126.5" y="188.2" font-size="12.00" text-anchor="middle" fill="#171717">1</text>
+    <text x="163.5" y="188.2" font-size="12.00" text-anchor="middle" fill="#171717">...</text>
+    <text x="200.5" y="188.2" font-size="12.00" text-anchor="middle" fill="#171717">1</text>
+    <text x="237.5" y="188.2" font-size="12.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="274.5" y="188.2" font-size="12.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="311.5" y="188.2" font-size="12.00" text-anchor="middle" fill="#171717">...</text>
+    <text x="348.5" y="188.2" font-size="12.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="145.25" y="162" font-size="12.00" text-anchor="middle" fill="#171717">16 Bytes</text>
+    <text x="219" y="233" font-size="16.00" text-anchor="middle" fill="#171717" font-weight="700">pat_mode = PAT_H</text>
+    <text x="74" y="264" font-size="12.00" text-anchor="start" fill="#171717">LOW</text>
+    <text x="364" y="264" font-size="12.00" text-anchor="end" fill="#171717">HIGH</text>
+    <text x="56" y="308" font-size="12.00" text-anchor="end" fill="#171717">mask</text>
+    <text x="89.5" y="307.2" font-size="12.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="126.5" y="307.2" font-size="12.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="163.5" y="307.2" font-size="12.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="200.5" y="307.2" font-size="12.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="237.5" y="307.2" font-size="12.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="274.5" y="307.2" font-size="12.00" text-anchor="middle" fill="#171717">...</text>
+    <text x="311.5" y="307.2" font-size="12.00" text-anchor="middle" fill="#171717">...</text>
+    <text x="348.5" y="307.2" font-size="12.00" text-anchor="middle" fill="#171717">0</text>
+    <text x="219.25" y="281" font-size="12.00" text-anchor="middle" fill="#171717">32 Bytes</text>
+    <text x="219" y="352" font-size="16.00" text-anchor="middle" fill="#171717" font-weight="700">pat_mode = PAT_ALLF</text>
+    <text x="410" y="31.2" font-size="12.00" text-anchor="middle" fill="#171717" />
+    <text x="440" y="31" font-size="12.00" text-anchor="start" fill="#171717">表示有效数据</text>
+    <text x="410" y="92.2" font-size="12.00" text-anchor="middle" fill="#171717" />
+    <text x="440" y="92" font-size="12.00" text-anchor="start" fill="#171717">表示无效数据</text>
+  </g>
+</svg>

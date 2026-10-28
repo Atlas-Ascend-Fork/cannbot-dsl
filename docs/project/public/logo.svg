@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="CANNBot-DSL logo">
+  <defs>
+    <linearGradient id="g" x1="12" y1="12" x2="116" y2="116" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#315fec"/>
+      <stop offset="1" stop-color="#00a6a6"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="112" height="112" rx="30" fill="url(#g)"/>
+  <path d="M83 35c-7-5-15-8-24-8-22 0-39 16-39 37s17 37 39 37c10 0 19-3 26-9L74 78c-4 3-9 5-15 5-11 0-20-8-20-19s9-19 20-19c5 0 10 2 14 5l10-15Z" fill="#fff"/>
+  <path d="M67 55h38v18H67z" fill="#fff" opacity=".96"/>
+</svg>

@@ -1,0 +1,201 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="971" height="935" viewBox="0 0 971 935" role="img" aria-labelledby="npu_3510_hw_arch_cube-title npu_3510_hw_arch_cube-desc">
+  <title id="npu_3510_hw_arch_cube-title">npu 3510 hw arch cube示意图</title>
+  <desc id="npu_3510_hw_arch_cube-desc">Editable vector diagram reconstructed from the preserved npu_3510_hw_arch_cube.png; text uses FZLanTingHei-R-GBK.</desc>
+  <defs>
+    <marker id="npu_3510_hw_arch_cube-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#696d75" />
+    </marker>
+    <marker id="npu_3510_hw_arch_cube-ink-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#101843" />
+    </marker>
+    <marker id="npu_3510_hw_arch_cube-blue-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#5277ff" />
+    </marker>
+    <marker id="npu_3510_hw_arch_cube-arrow-737373" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#737373" />
+    </marker>
+  </defs>
+  <rect x="0" y="0" width="971" height="935" fill="#fff" stroke="none" stroke-width="1" rx="0" />
+  <g>
+    <rect x="211" y="68" width="718" height="809" fill="none" stroke="#737373" stroke-width="0.8" rx="12" />
+    <rect x="259" y="93" width="659" height="337" fill="none" stroke="#737373" stroke-width="0.8" rx="12" />
+    <rect x="259" y="509" width="632" height="354" fill="none" stroke="#737373" stroke-width="0.8" rx="12" />
+    <rect x="270" y="496" width="648" height="356" fill="none" stroke="#737373" stroke-width="0.8" rx="12" />
+    <rect x="45" y="70" width="61" height="805" fill="#ececec" stroke="#737373" stroke-width="1" rx="9" />
+    <rect x="134" y="72" width="63" height="803" fill="#ececec" stroke="#737373" stroke-width="1" rx="9" />
+    <rect x="389" y="116" width="79" height="152" fill="#3ca0de" stroke="#737373" stroke-width="1" rx="7" />
+    <rect x="720" y="110" width="54" height="122" fill="#16c6a0" stroke="#737373" stroke-width="1" rx="7" />
+    <rect x="843" y="147" width="70" height="49" fill="#3ca0de" stroke="#737373" stroke-width="1" rx="7" />
+    <rect x="522" y="351" width="72" height="61" fill="#ececec" stroke="#737373" stroke-width="1" rx="7" />
+    <rect x="522" y="442" width="71" height="35" fill="#ececec" stroke="#737373" stroke-width="1" rx="7" />
+    <rect x="522" y="522" width="71" height="58" fill="#ececec" stroke="#737373" stroke-width="1" rx="7" />
+    <rect x="369" y="657" width="154" height="139" fill="#ececec" stroke="#737373" stroke-width="1" rx="9" />
+    <rect x="824" y="688" width="80" height="101" fill="#ececec" stroke="#737373" stroke-width="1" rx="7" />
+    <rect x="400" y="350" width="72" height="24" fill="#ececec" stroke="#737373" stroke-width="1" rx="5" />
+    <rect x="400" y="388" width="72" height="24" fill="#ececec" stroke="#737373" stroke-width="1" rx="5" />
+    <rect x="401" y="522" width="73" height="24" fill="#ececec" stroke="#737373" stroke-width="1" rx="5" />
+    <rect x="401" y="557" width="73" height="24" fill="#ececec" stroke="#737373" stroke-width="1" rx="5" />
+    <rect x="585" y="128" width="83" height="24" fill="#3ca0de" stroke="#737373" stroke-width="1" rx="5" />
+    <rect x="585" y="169" width="83" height="24" fill="#3ca0de" stroke="#737373" stroke-width="1" rx="5" />
+    <rect x="585" y="211" width="83" height="24" fill="#3ca0de" stroke="#737373" stroke-width="1" rx="5" />
+    <rect x="585" y="248" width="83" height="24" fill="#3ca0de" stroke="#737373" stroke-width="1" rx="5" />
+    <line x1="468" y1="142" x2="499" y2="142" stroke="#737373" stroke-width="0.8" />
+    <rect x="499" y="132" width="60" height="20" fill="#ececec" stroke="#737373" stroke-width="1" rx="10" />
+    <line x1="559" y1="142" x2="585" y2="142" stroke="#737373" stroke-width="0.8" marker-end="url(#npu_3510_hw_arch_cube-arrow-737373)" />
+    <line x1="668" y1="142" x2="719" y2="142" stroke="#737373" stroke-width="0.8" marker-end="url(#npu_3510_hw_arch_cube-arrow-737373)" />
+    <line x1="468" y1="183" x2="499" y2="183" stroke="#737373" stroke-width="0.8" />
+    <rect x="499" y="173" width="60" height="20" fill="#ececec" stroke="#737373" stroke-width="1" rx="10" />
+    <line x1="559" y1="183" x2="585" y2="183" stroke="#737373" stroke-width="0.8" marker-end="url(#npu_3510_hw_arch_cube-arrow-737373)" />
+    <line x1="668" y1="183" x2="719" y2="183" stroke="#737373" stroke-width="0.8" marker-end="url(#npu_3510_hw_arch_cube-arrow-737373)" />
+    <line x1="468" y1="222" x2="499" y2="222" stroke="#737373" stroke-width="0.8" />
+    <rect x="499" y="212" width="60" height="20" fill="#ececec" stroke="#737373" stroke-width="1" rx="10" />
+    <line x1="559" y1="222" x2="585" y2="222" stroke="#737373" stroke-width="0.8" marker-end="url(#npu_3510_hw_arch_cube-arrow-737373)" />
+    <line x1="668" y1="222" x2="719" y2="222" stroke="#737373" stroke-width="0.8" marker-end="url(#npu_3510_hw_arch_cube-arrow-737373)" />
+    <line x1="468" y1="261" x2="499" y2="261" stroke="#737373" stroke-width="0.8" />
+    <rect x="499" y="251" width="60" height="20" fill="#ececec" stroke="#737373" stroke-width="1" rx="10" />
+    <line x1="559" y1="261" x2="585" y2="261" stroke="#737373" stroke-width="0.8" marker-end="url(#npu_3510_hw_arch_cube-arrow-737373)" />
+    <line x1="774" y1="171" x2="843" y2="171" stroke="#737373" stroke-width="0.8" marker-end="url(#npu_3510_hw_arch_cube-arrow-737373)" />
+    <line x1="878" y1="196" x2="878" y2="217" stroke="#737373" stroke-width="0.8" />
+    <rect x="869" y="217" width="20" height="59" fill="#ececec" stroke="#737373" stroke-width="0.8" rx="9" />
+    <path d="M869 257H668" stroke="#737373" stroke-width="0.8" fill="none" marker-end="url(#npu_3510_hw_arch_cube-arrow-737373)" />
+    <path d="M878 276V628H506V657" stroke="#737373" stroke-width="0.8" fill="none" marker-end="url(#npu_3510_hw_arch_cube-arrow-737373)" />
+    <path d="M628 272V299H197" stroke="#737373" stroke-width="0.8" fill="none" marker-end="url(#npu_3510_hw_arch_cube-arrow-737373)" />
+    <line x1="197" y1="206" x2="285" y2="206" stroke="#737373" stroke-width="0.8" />
+    <rect x="285" y="197" width="59" height="20" fill="#ececec" stroke="#737373" stroke-width="1" rx="10" />
+    <line x1="344" y1="206" x2="389" y2="206" stroke="#737373" stroke-width="0.8" marker-end="url(#npu_3510_hw_arch_cube-arrow-737373)" />
+    <line x1="134" y1="332" x2="106" y2="332" stroke="#737373" stroke-width="0.8" marker-end="url(#npu_3510_hw_arch_cube-arrow-737373)" />
+    <line x1="106" y1="428" x2="134" y2="428" stroke="#737373" stroke-width="0.8" marker-end="url(#npu_3510_hw_arch_cube-arrow-737373)" />
+    <line x1="197" y1="362" x2="400" y2="362" stroke="#737373" stroke-width="0.8" marker-end="url(#npu_3510_hw_arch_cube-arrow-737373)" />
+    <path d="M400 362H197" stroke="#737373" stroke-width="0.8" fill="none" marker-end="url(#npu_3510_hw_arch_cube-arrow-737373)" />
+    <line x1="197" y1="399" x2="400" y2="399" stroke="#737373" stroke-width="0.8" stroke-dasharray="1 2" />
+    <line x1="472" y1="362" x2="522" y2="362" stroke="#737373" stroke-width="0.8" marker-end="url(#npu_3510_hw_arch_cube-arrow-737373)" />
+    <line x1="522" y1="362" x2="472" y2="362" stroke="#737373" stroke-width="0.8" marker-end="url(#npu_3510_hw_arch_cube-arrow-737373)" />
+    <line x1="472" y1="399" x2="522" y2="399" stroke="#737373" stroke-width="0.8" stroke-dasharray="1 2" />
+    <line x1="197" y1="534" x2="401" y2="534" stroke="#737373" stroke-width="0.8" marker-end="url(#npu_3510_hw_arch_cube-arrow-737373)" />
+    <line x1="401" y1="534" x2="197" y2="534" stroke="#737373" stroke-width="0.8" marker-end="url(#npu_3510_hw_arch_cube-arrow-737373)" />
+    <line x1="197" y1="569" x2="401" y2="569" stroke="#737373" stroke-width="0.8" stroke-dasharray="1 2" />
+    <line x1="474" y1="569" x2="522" y2="569" stroke="#737373" stroke-width="0.8" stroke-dasharray="1 2" />
+    <line x1="474" y1="534" x2="522" y2="534" stroke="#737373" stroke-width="0.8" marker-end="url(#npu_3510_hw_arch_cube-arrow-737373)" />
+    <line x1="522" y1="534" x2="474" y2="534" stroke="#737373" stroke-width="0.8" marker-end="url(#npu_3510_hw_arch_cube-arrow-737373)" />
+    <line x1="559" y1="412" x2="559" y2="442" stroke="#737373" stroke-width="0.8" marker-end="url(#npu_3510_hw_arch_cube-arrow-737373)" />
+    <line x1="559" y1="442" x2="559" y2="412" stroke="#737373" stroke-width="0.8" marker-end="url(#npu_3510_hw_arch_cube-arrow-737373)" />
+    <line x1="559" y1="477" x2="559" y2="522" stroke="#737373" stroke-width="0.8" marker-end="url(#npu_3510_hw_arch_cube-arrow-737373)" />
+    <line x1="559" y1="522" x2="559" y2="477" stroke="#737373" stroke-width="0.8" marker-end="url(#npu_3510_hw_arch_cube-arrow-737373)" />
+    <path d="M398 268V335H333V435" stroke="#737373" stroke-width="0.8" fill="none" />
+    <rect x="324" y="435" width="20" height="59" fill="#ececec" stroke="#737373" stroke-width="0.8" rx="9" />
+    <path d="M333 494V615H393V657" stroke="#737373" stroke-width="0.8" fill="none" marker-end="url(#npu_3510_hw_arch_cube-arrow-737373)" />
+    <path d="M430 335V269" stroke="#737373" stroke-width="0.8" fill="none" marker-end="url(#npu_3510_hw_arch_cube-arrow-737373)" />
+    <path d="M454 269V318H858V607H441V657" stroke="#737373" stroke-width="0.8" fill="none" marker-end="url(#npu_3510_hw_arch_cube-arrow-737373)" />
+    <path d="M469 657V607H606" stroke="#737373" stroke-width="0.8" fill="none" />
+    <rect x="606" y="598" width="59" height="20" fill="#ececec" stroke="#737373" stroke-width="1" rx="10" />
+    <path d="M665 607H878" stroke="#737373" stroke-width="0.8" fill="none" />
+    <path d="M441 657V593H559V580" stroke="#737373" stroke-width="0.8" fill="none" marker-end="url(#npu_3510_hw_arch_cube-arrow-737373)" />
+    <path d="M594 382H609 M678 382H691" stroke="#737373" stroke-width="0.8" fill="none" stroke-dasharray="1 2" />
+    <path d="M646 351L679 382L646 413L614 382Z" stroke="none" stroke-width="1" fill="#ececec" />
+    <rect x="717" y="321" width="122" height="20" fill="#fff" stroke="#737373" stroke-width="1" rx="7" />
+    <path d="M691 382V331H717" stroke="#737373" stroke-width="0.8" fill="none" stroke-dasharray="1 2" />
+    <rect x="717" y="346" width="122" height="20" fill="#fff" stroke="#737373" stroke-width="1" rx="7" />
+    <path d="M691 382V356H717" stroke="#737373" stroke-width="0.8" fill="none" stroke-dasharray="1 2" />
+    <rect x="717" y="371" width="122" height="20" fill="#fff" stroke="#737373" stroke-width="1" rx="7" />
+    <path d="M691 382V381H717" stroke="#737373" stroke-width="0.8" fill="none" stroke-dasharray="1 2" />
+    <rect x="717" y="396" width="122" height="20" fill="#fff" stroke="#737373" stroke-width="1" rx="7" />
+    <path d="M691 382V406H717" stroke="#737373" stroke-width="0.8" fill="none" stroke-dasharray="1 2" />
+    <path d="M594 550H609 M678 550H691" stroke="#737373" stroke-width="0.8" fill="none" stroke-dasharray="1 2" />
+    <path d="M646 519L679 550L646 581L614 550Z" stroke="none" stroke-width="1" fill="#ececec" />
+    <rect x="717" y="500" width="122" height="20" fill="#fff" stroke="#737373" stroke-width="1" rx="7" />
+    <path d="M691 550V510H717" stroke="#737373" stroke-width="0.8" fill="none" stroke-dasharray="1 2" />
+    <rect x="717" y="525" width="122" height="20" fill="#fff" stroke="#737373" stroke-width="1" rx="7" />
+    <path d="M691 550V535H717" stroke="#737373" stroke-width="0.8" fill="none" stroke-dasharray="1 2" />
+    <rect x="717" y="550" width="131" height="20" fill="#fff" stroke="#737373" stroke-width="1" rx="7" />
+    <path d="M691 550V560H717" stroke="#737373" stroke-width="0.8" fill="none" stroke-dasharray="1 2" />
+    <rect x="717" y="575" width="131" height="20" fill="#fff" stroke="#737373" stroke-width="1" rx="7" />
+    <path d="M691 550V585H717" stroke="#737373" stroke-width="0.8" fill="none" stroke-dasharray="1 2" />
+    <rect x="589" y="637" width="185" height="103" fill="none" stroke="none" stroke-width="1" rx="0" />
+    <path d="M589 637H774V740H589Z" stroke="#737373" stroke-width="0.8" fill="none" stroke-dasharray="3 2" />
+    <path d="M589 745H774V848H589Z" stroke="#737373" stroke-width="0.8" fill="none" stroke-dasharray="3 2" />
+    <rect x="649" y="644" width="100" height="34" fill="#ececec" stroke="#737373" stroke-width="1" rx="5" />
+    <rect x="650" y="796" width="101" height="40" fill="#ececec" stroke="#737373" stroke-width="1" rx="5" />
+    <rect x="384" y="698" width="120" height="25" fill="#ececec" stroke="#737373" stroke-width="1" rx="5" />
+    <rect x="602" y="697" width="149" height="32" fill="#ececec" stroke="#737373" stroke-width="1" rx="9" />
+    <rect x="602" y="752" width="149" height="28" fill="#ececec" stroke="#737373" stroke-width="1" rx="9" />
+    <line x1="197" y1="711" x2="384" y2="711" stroke="#737373" stroke-width="0.8" marker-end="url(#npu_3510_hw_arch_cube-arrow-737373)" />
+    <line x1="504" y1="712" x2="602" y2="712" stroke="#737373" stroke-width="0.8" marker-end="url(#npu_3510_hw_arch_cube-arrow-737373)" />
+    <line x1="602" y1="712" x2="504" y2="712" stroke="#737373" stroke-width="0.8" marker-end="url(#npu_3510_hw_arch_cube-arrow-737373)" />
+    <line x1="523" y1="702" x2="602" y2="702" stroke="#737373" stroke-width="0.8" marker-end="url(#npu_3510_hw_arch_cube-arrow-737373)" />
+    <line x1="602" y1="702" x2="523" y2="702" stroke="#737373" stroke-width="0.8" marker-end="url(#npu_3510_hw_arch_cube-arrow-737373)" />
+    <line x1="751" y1="713" x2="824" y2="713" stroke="#737373" stroke-width="0.8" marker-end="url(#npu_3510_hw_arch_cube-arrow-737373)" />
+    <line x1="824" y1="713" x2="751" y2="713" stroke="#737373" stroke-width="0.8" marker-end="url(#npu_3510_hw_arch_cube-arrow-737373)" />
+    <line x1="523" y1="766" x2="602" y2="766" stroke="#737373" stroke-width="0.8" marker-end="url(#npu_3510_hw_arch_cube-arrow-737373)" />
+    <line x1="602" y1="766" x2="523" y2="766" stroke="#737373" stroke-width="0.8" marker-end="url(#npu_3510_hw_arch_cube-arrow-737373)" />
+    <line x1="751" y1="766" x2="824" y2="766" stroke="#737373" stroke-width="0.8" marker-end="url(#npu_3510_hw_arch_cube-arrow-737373)" />
+    <line x1="824" y1="766" x2="751" y2="766" stroke="#737373" stroke-width="0.8" marker-end="url(#npu_3510_hw_arch_cube-arrow-737373)" />
+    <line x1="197" y1="744" x2="283" y2="744" stroke="#737373" stroke-width="0.8" />
+    <rect x="283" y="733" width="59" height="20" fill="#ececec" stroke="#737373" stroke-width="1" rx="10" />
+    <line x1="342" y1="744" x2="369" y2="744" stroke="#737373" stroke-width="0.8" marker-end="url(#npu_3510_hw_arch_cube-arrow-737373)" />
+    <line x1="283" y1="782" x2="197" y2="782" stroke="#737373" stroke-width="0.8" marker-end="url(#npu_3510_hw_arch_cube-arrow-737373)" />
+    <rect x="283" y="772" width="59" height="20" fill="#ececec" stroke="#737373" stroke-width="1" rx="10" />
+    <line x1="342" y1="782" x2="369" y2="782" stroke="#737373" stroke-width="0.8" />
+    <line x1="106" y1="828" x2="280" y2="828" stroke="#737373" stroke-width="0.8" marker-end="url(#npu_3510_hw_arch_cube-arrow-737373)" />
+    <rect x="280" y="813" width="72" height="29" fill="#ececec" stroke="#737373" stroke-width="1" rx="6" />
+    <line x1="352" y1="828" x2="370" y2="828" stroke="#737373" stroke-width="0.8" />
+    <rect x="370" y="818" width="59" height="20" fill="#ececec" stroke="#737373" stroke-width="1" rx="10" />
+    <path d="M429 828H446V796" stroke="#737373" stroke-width="0.8" fill="none" marker-end="url(#npu_3510_hw_arch_cube-arrow-737373)" />
+  </g>
+  <g fill="#171717" font-family="FZLanTingHei-R-GBK, 方正兰亭黑_GBK, sans-serif" font-size="12" font-weight="400">
+    <text x="215" y="83" font-size="18.00" text-anchor="start" fill="#171717">AI Core</text>
+    <text x="263" y="108" font-size="18.00" text-anchor="start" fill="#171717">AIC</text>
+    <text x="275" y="517" font-size="18.00" text-anchor="start" fill="#171717">AIV</text>
+    <text x="75.5" y="467.95" font-size="14.00" text-anchor="middle" fill="#171717">Global</text>
+    <text x="75.5" y="486.85" font-size="12.89" text-anchor="middle" fill="#171717">Memory</text>
+    <text x="165.5" y="468.95" font-size="14.00" text-anchor="middle" fill="#171717">L2</text>
+    <text x="165.5" y="487.85" font-size="14.00" text-anchor="middle" fill="#171717">Cache</text>
+    <text x="428.5" y="196.55" font-size="13.00" text-anchor="middle" fill="#171717">L1 Buffer</text>
+    <text x="747" y="175.55" font-size="13.00" text-anchor="middle" fill="#171717">Cube</text>
+    <text x="878" y="176.05" font-size="11.84" text-anchor="middle" fill="#171717">L0C Buffer</text>
+    <text x="558" y="386.05" font-size="13.00" text-anchor="middle" fill="#171717">Scalar</text>
+    <text x="557.5" y="464.05" font-size="13.00" text-anchor="middle" fill="#171717">SSBuffer</text>
+    <text x="557.5" y="555.55" font-size="13.00" text-anchor="middle" fill="#171717">Scalar</text>
+    <text x="447" y="763" font-size="14.00" text-anchor="middle" fill="#171717">Unified Buffer</text>
+    <text x="864" y="743.05" font-size="13.00" text-anchor="middle" fill="#171717">Vector</text>
+    <text x="436" y="366.9" font-size="14.00" text-anchor="middle" fill="#171717">DCache</text>
+    <text x="436" y="404.9" font-size="14.00" text-anchor="middle" fill="#171717">ICache</text>
+    <text x="437.5" y="538.9" font-size="14.00" text-anchor="middle" fill="#171717">DCache</text>
+    <text x="437.5" y="573.9" font-size="14.00" text-anchor="middle" fill="#171717">ICache</text>
+    <text x="626.5" y="144.55" font-size="13.00" text-anchor="middle" fill="#171717">L0A Buffer</text>
+    <text x="626.5" y="185.55" font-size="13.00" text-anchor="middle" fill="#171717">L0B Buffer</text>
+    <text x="626.5" y="227.55" font-size="13.00" text-anchor="middle" fill="#171717">BT Buffer</text>
+    <text x="626.5" y="264.55" font-size="13.00" text-anchor="middle" fill="#171717">FP Buffer</text>
+    <text x="529" y="146.55" font-size="13.00" text-anchor="middle" fill="#171717">MTE1</text>
+    <text x="529" y="187.55" font-size="13.00" text-anchor="middle" fill="#171717">MTE1</text>
+    <text x="529" y="226.55" font-size="13.00" text-anchor="middle" fill="#171717">MTE1</text>
+    <text x="529" y="265.55" font-size="12.68" text-anchor="middle" fill="#171717">FIXPIPE</text>
+    <text x="879" y="246" font-size="13.00" text-anchor="middle" fill="#171717" transform="rotate(90 879 246)">FIXPIPE</text>
+    <text x="314.5" y="211.55" font-size="13.00" text-anchor="middle" fill="#171717">MTE2</text>
+    <text x="334" y="465" font-size="13.00" text-anchor="middle" fill="#171717" transform="rotate(90 334 465)">MTE1</text>
+    <text x="635.5" y="612.55" font-size="13.00" text-anchor="middle" fill="#171717">MTE3</text>
+    <text x="646" y="387" font-size="12.00" text-anchor="middle" fill="#171717">指令序列</text>
+    <text x="778" y="335.2" font-size="12.00" text-anchor="middle" fill="#171717">Cube 指令序列</text>
+    <text x="778" y="360.2" font-size="12.00" text-anchor="middle" fill="#171717">FixPipe 指令序列</text>
+    <text x="778" y="385.2" font-size="12.00" text-anchor="middle" fill="#171717">MTE1 指令序列</text>
+    <text x="778" y="410.2" font-size="12.00" text-anchor="middle" fill="#171717">MTE2 指令序列</text>
+    <text x="646" y="555" font-size="12.00" text-anchor="middle" fill="#171717">指令序列</text>
+    <text x="778" y="514.2" font-size="12.00" text-anchor="middle" fill="#171717">MTE2 指令序列</text>
+    <text x="778" y="539.2" font-size="12.00" text-anchor="middle" fill="#171717">MTE3 指令序列</text>
+    <text x="782.5" y="564.2" font-size="12.00" text-anchor="middle" fill="#171717">SIMD VF指令序列</text>
+    <text x="782.5" y="589.2" font-size="12.00" text-anchor="middle" fill="#171717">SIMT VF指令序列</text>
+    <text x="605" y="663" font-size="15.00" text-anchor="start" fill="#171717">SIMT</text>
+    <text x="605" y="789" font-size="15.00" text-anchor="start" fill="#171717">SIMD</text>
+    <text x="699" y="656.775" font-size="13.00" text-anchor="middle" fill="#171717">Warp</text>
+    <text x="699" y="674.325" font-size="13.00" text-anchor="middle" fill="#171717">Scheduler</text>
+    <text x="700.5" y="811.775" font-size="13.00" text-anchor="middle" fill="#171717">Aux</text>
+    <text x="700.5" y="829.325" font-size="13.00" text-anchor="middle" fill="#171717">Scalar</text>
+    <text x="444" y="715.4" font-size="14.00" text-anchor="middle" fill="#171717">SIMT DCache</text>
+    <text x="676.5" y="717.9" font-size="14.00" text-anchor="middle" fill="#171717">SIMT Register File</text>
+    <text x="676.5" y="770.9" font-size="14.00" text-anchor="middle" fill="#171717">SIMD Register File</text>
+    <text x="312.5" y="747.55" font-size="13.00" text-anchor="middle" fill="#171717">MTE2</text>
+    <text x="312.5" y="786.55" font-size="13.00" text-anchor="middle" fill="#171717">MTE3</text>
+    <text x="316" y="823.6" font-size="12.00" text-anchor="middle" fill="#171717">ND-DMA</text>
+    <text x="316" y="839.8" font-size="12.00" text-anchor="middle" fill="#171717">Cache</text>
+    <text x="399.5" y="832.55" font-size="13.00" text-anchor="middle" fill="#171717">MTE2</text>
+  </g>
+</svg>

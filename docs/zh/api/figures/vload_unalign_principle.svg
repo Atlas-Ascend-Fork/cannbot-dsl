@@ -1,0 +1,63 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="657" height="275" viewBox="0 0 657 275" role="img" aria-labelledby="vload_unalign_principle-title vload_unalign_principle-desc">
+  <title id="vload_unalign_principle-title">非对齐搬入示意图</title>
+  <desc id="vload_unalign_principle-desc">Editable vector diagram reconstructed from the preserved vload_unalign_principle.png; text uses FZLanTingHei-R-GBK.</desc>
+  <defs>
+    <marker id="vload_unalign_principle-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#696d75" />
+    </marker>
+    <marker id="vload_unalign_principle-ink-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#101843" />
+    </marker>
+    <marker id="vload_unalign_principle-blue-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#5277ff" />
+    </marker>
+  </defs>
+  <rect x="0" y="0" width="657" height="275" fill="#fff" stroke="none" stroke-width="1" rx="0" />
+  <g>
+    <rect x="121" y="8" width="46" height="39" fill="#fff" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="167" y="8" width="46" height="39" fill="#d9dcfc" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="213" y="8" width="92" height="39" fill="#d9dcfc" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="305" y="8" width="91" height="39" fill="#d9dcfc" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="457" y="8" width="92" height="39" fill="#d9dcfc" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="549" y="8" width="46" height="39" fill="#d9dcfc" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="595" y="8" width="45" height="39" fill="#fff" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="213" y="85" width="427" height="38" fill="#b0f0e2" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="121" y="161" width="92" height="38" fill="#ffd0af" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="549" y="161" width="92" height="38" fill="#ffd0af" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="167" y="237" width="428" height="38" fill="#b8e8fa" stroke="#101843" stroke-width="1" rx="0" />
+    <line x1="167" y1="47" x2="167" y2="237" stroke="#696d75" stroke-width="0.7" stroke-dasharray="4 3" />
+    <line x1="213" y1="47" x2="213" y2="237" stroke="#696d75" stroke-width="0.7" stroke-dasharray="4 3" />
+    <line x1="549" y1="47" x2="549" y2="237" stroke="#696d75" stroke-width="0.7" stroke-dasharray="4 3" />
+    <line x1="595" y1="47" x2="595" y2="237" stroke="#696d75" stroke-width="0.7" stroke-dasharray="4 3" />
+    <line x1="167" y1="47" x2="167" y2="161" stroke="#101843" stroke-width="1" marker-end="url(#vload_unalign_principle-ink-arrow)" />
+    <line x1="426" y1="47" x2="426" y2="84" stroke="#101843" stroke-width="1" marker-end="url(#vload_unalign_principle-ink-arrow)" />
+    <line x1="191" y1="199" x2="191" y2="236" stroke="#101843" stroke-width="1" marker-end="url(#vload_unalign_principle-ink-arrow)" />
+    <line x1="426" y1="123" x2="426" y2="236" stroke="#101843" stroke-width="1" marker-end="url(#vload_unalign_principle-ink-arrow)" />
+    <line x1="595" y1="47" x2="595" y2="160" stroke="#101843" stroke-width="1" marker-end="url(#vload_unalign_principle-ink-arrow)" />
+  </g>
+  <g fill="#171717" font-family="FZLanTingHei-R-GBK, 方正兰亭黑_GBK, sans-serif" font-size="12" font-weight="400">
+    <text x="121" y="61" font-size="13.00" text-anchor="middle" fill="#171717">32</text>
+    <text x="167" y="61" font-size="13.00" text-anchor="middle" fill="#171717">src</text>
+    <text x="213" y="61" font-size="13.00" text-anchor="middle" fill="#171717">64</text>
+    <text x="305" y="61" font-size="13.00" text-anchor="middle" fill="#171717">96</text>
+    <text x="396" y="61" font-size="13.00" text-anchor="middle" fill="#171717">128</text>
+    <text x="457" y="61" font-size="13.00" text-anchor="middle" fill="#171717">256</text>
+    <text x="549" y="61" font-size="13.00" text-anchor="middle" fill="#171717">288</text>
+    <text x="595" y="61" font-size="13.00" text-anchor="middle" fill="#171717">304</text>
+    <text x="640" y="61" font-size="13.00" text-anchor="middle" fill="#171717">320</text>
+    <text x="61" y="34" font-size="14.00" text-anchor="middle" fill="#171717">UB</text>
+    <text x="426" y="29" font-size="16.00" text-anchor="middle" fill="#171717">...</text>
+    <text x="426.5" y="108.9" font-size="14.00" text-anchor="middle" fill="#171717">tmp</text>
+    <text x="167" y="184.9" font-size="14.00" text-anchor="middle" fill="#171717">ureg</text>
+    <text x="595" y="184.9" font-size="14.00" text-anchor="middle" fill="#171717">ureg</text>
+    <text x="381" y="260.9" font-size="14.00" text-anchor="middle" fill="#171717">dst</text>
+    <text x="96" y="108" font-size="13.00" text-anchor="end" fill="#171717">临时寄存器</text>
+    <text x="96" y="185" font-size="13.00" text-anchor="end" fill="#171717">非对齐寄存器</text>
+    <text x="96" y="263" font-size="13.00" text-anchor="end" fill="#171717">目的寄存器</text>
+    <text x="156" y="104" font-size="13.00" text-anchor="middle" fill="#171717">①</text>
+    <text x="415" y="65.5" font-size="13.00" text-anchor="middle" fill="#171717">②</text>
+    <text x="180" y="217.5" font-size="13.00" text-anchor="middle" fill="#171717">②</text>
+    <text x="415" y="179.5" font-size="13.00" text-anchor="middle" fill="#171717">②</text>
+    <text x="584" y="103.5" font-size="13.00" text-anchor="middle" fill="#171717">②</text>
+  </g>
+</svg>

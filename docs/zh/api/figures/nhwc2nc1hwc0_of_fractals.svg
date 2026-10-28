@@ -1,0 +1,203 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="842" height="310" viewBox="0 0 842 310" role="img" aria-labelledby="nhwc2nc1hwc0_of_fractals-title nhwc2nc1hwc0_of_fractals-desc">
+  <title id="nhwc2nc1hwc0_of_fractals-title">nhwc2nc1hwc0 of fractals示意图</title>
+  <desc id="nhwc2nc1hwc0_of_fractals-desc">Editable vector diagram reconstructed from the preserved nhwc2nc1hwc0_of_fractals.png; text uses FZLanTingHei-R-GBK.</desc>
+  <defs>
+    <marker id="nhwc2nc1hwc0_of_fractals-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#696d75" />
+    </marker>
+    <marker id="nhwc2nc1hwc0_of_fractals-ink-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#101843" />
+    </marker>
+    <marker id="nhwc2nc1hwc0_of_fractals-blue-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#5277ff" />
+    </marker>
+    <marker id="nhwc2nc1hwc0_of_fractals-arrow-ff3434" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#ff3434" />
+    </marker>
+  </defs>
+  <rect x="0" y="0" width="842" height="310" fill="#fff" stroke="none" stroke-width="1" rx="0" />
+  <g>
+    <rect x="54" y="88" width="105" height="220" fill="none" stroke="#101843" stroke-width="1" rx="0" />
+    <line x1="64" y1="93" x2="147" y2="93" stroke="#101843" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-ink-arrow)" />
+    <line x1="147" y1="93" x2="64" y2="155" stroke="#101843" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-ink-arrow)" />
+    <line x1="64" y1="155" x2="147" y2="155" stroke="#101843" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-ink-arrow)" />
+    <line x1="64" y1="167" x2="147" y2="167" stroke="#101843" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-ink-arrow)" />
+    <line x1="147" y1="167" x2="64" y2="229" stroke="#101843" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-ink-arrow)" />
+    <line x1="64" y1="229" x2="147" y2="229" stroke="#101843" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-ink-arrow)" />
+    <line x1="64" y1="241" x2="147" y2="241" stroke="#101843" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-ink-arrow)" />
+    <line x1="147" y1="241" x2="64" y2="303" stroke="#101843" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-ink-arrow)" />
+    <line x1="64" y1="303" x2="147" y2="303" stroke="#101843" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-ink-arrow)" />
+    <line x1="147" y1="155" x2="64" y2="167" stroke="#696d75" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow)" />
+    <line x1="147" y1="229" x2="64" y2="241" stroke="#696d75" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow)" />
+    <rect x="171" y="88" width="105" height="220" fill="none" stroke="#101843" stroke-width="1" rx="0" />
+    <line x1="181" y1="93" x2="264" y2="93" stroke="#101843" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-ink-arrow)" />
+    <line x1="264" y1="93" x2="181" y2="155" stroke="#101843" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-ink-arrow)" />
+    <line x1="181" y1="155" x2="264" y2="155" stroke="#101843" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-ink-arrow)" />
+    <line x1="181" y1="167" x2="264" y2="167" stroke="#101843" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-ink-arrow)" />
+    <line x1="264" y1="167" x2="181" y2="229" stroke="#101843" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-ink-arrow)" />
+    <line x1="181" y1="229" x2="264" y2="229" stroke="#101843" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-ink-arrow)" />
+    <line x1="181" y1="241" x2="264" y2="241" stroke="#101843" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-ink-arrow)" />
+    <line x1="264" y1="241" x2="181" y2="303" stroke="#101843" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-ink-arrow)" />
+    <line x1="181" y1="303" x2="264" y2="303" stroke="#101843" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-ink-arrow)" />
+    <line x1="264" y1="155" x2="181" y2="167" stroke="#696d75" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow)" />
+    <line x1="264" y1="229" x2="181" y2="241" stroke="#696d75" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow)" />
+    <rect x="302" y="88" width="105" height="220" fill="none" stroke="#101843" stroke-width="1" rx="0" />
+    <line x1="312" y1="93" x2="395" y2="93" stroke="#101843" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-ink-arrow)" />
+    <line x1="395" y1="93" x2="312" y2="155" stroke="#101843" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-ink-arrow)" />
+    <line x1="312" y1="155" x2="395" y2="155" stroke="#101843" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-ink-arrow)" />
+    <line x1="312" y1="167" x2="395" y2="167" stroke="#101843" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-ink-arrow)" />
+    <line x1="395" y1="167" x2="312" y2="229" stroke="#101843" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-ink-arrow)" />
+    <line x1="312" y1="229" x2="395" y2="229" stroke="#101843" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-ink-arrow)" />
+    <line x1="312" y1="241" x2="395" y2="241" stroke="#101843" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-ink-arrow)" />
+    <line x1="395" y1="241" x2="312" y2="303" stroke="#101843" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-ink-arrow)" />
+    <line x1="312" y1="303" x2="395" y2="303" stroke="#101843" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-ink-arrow)" />
+    <line x1="395" y1="155" x2="312" y2="167" stroke="#696d75" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow)" />
+    <line x1="395" y1="229" x2="312" y2="241" stroke="#696d75" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow)" />
+    <rect x="484" y="88" width="105" height="220" fill="none" stroke="#101843" stroke-width="1" rx="0" />
+    <line x1="488" y1="93" x2="515" y2="93" stroke="#ff3434" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" />
+    <line x1="515" y1="93" x2="488" y2="155" stroke="#ff3434" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" />
+    <line x1="488" y1="155" x2="515" y2="155" stroke="#ff3434" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" />
+    <path d="M515 155 L522 93" stroke="#ff3434" stroke-width="0.7" fill="none" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" stroke-dasharray="5 4" />
+    <line x1="522" y1="93" x2="549" y2="93" stroke="#ff3434" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" />
+    <line x1="549" y1="93" x2="522" y2="155" stroke="#ff3434" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" />
+    <line x1="522" y1="155" x2="549" y2="155" stroke="#ff3434" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" />
+    <path d="M549 155 L556 93" stroke="#ff3434" stroke-width="0.7" fill="none" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" stroke-dasharray="5 4" />
+    <line x1="556" y1="93" x2="583" y2="93" stroke="#ff3434" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" />
+    <line x1="583" y1="93" x2="556" y2="155" stroke="#ff3434" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" />
+    <line x1="556" y1="155" x2="583" y2="155" stroke="#ff3434" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" />
+    <line x1="488" y1="167" x2="515" y2="167" stroke="#ff3434" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" />
+    <line x1="515" y1="167" x2="488" y2="229" stroke="#ff3434" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" />
+    <line x1="488" y1="229" x2="515" y2="229" stroke="#ff3434" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" />
+    <path d="M515 229 L522 167" stroke="#ff3434" stroke-width="0.7" fill="none" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" stroke-dasharray="5 4" />
+    <line x1="522" y1="167" x2="549" y2="167" stroke="#ff3434" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" />
+    <line x1="549" y1="167" x2="522" y2="229" stroke="#ff3434" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" />
+    <line x1="522" y1="229" x2="549" y2="229" stroke="#ff3434" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" />
+    <path d="M549 229 L556 167" stroke="#ff3434" stroke-width="0.7" fill="none" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" stroke-dasharray="5 4" />
+    <line x1="556" y1="167" x2="583" y2="167" stroke="#ff3434" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" />
+    <line x1="583" y1="167" x2="556" y2="229" stroke="#ff3434" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" />
+    <line x1="556" y1="229" x2="583" y2="229" stroke="#ff3434" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" />
+    <line x1="488" y1="241" x2="515" y2="241" stroke="#ff3434" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" />
+    <line x1="515" y1="241" x2="488" y2="303" stroke="#ff3434" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" />
+    <line x1="488" y1="303" x2="515" y2="303" stroke="#ff3434" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" />
+    <path d="M515 303 L522 241" stroke="#ff3434" stroke-width="0.7" fill="none" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" stroke-dasharray="5 4" />
+    <line x1="522" y1="241" x2="549" y2="241" stroke="#ff3434" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" />
+    <line x1="549" y1="241" x2="522" y2="303" stroke="#ff3434" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" />
+    <line x1="522" y1="303" x2="549" y2="303" stroke="#ff3434" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" />
+    <path d="M549 303 L556 241" stroke="#ff3434" stroke-width="0.7" fill="none" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" stroke-dasharray="5 4" />
+    <line x1="556" y1="241" x2="583" y2="241" stroke="#ff3434" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" />
+    <line x1="583" y1="241" x2="556" y2="303" stroke="#ff3434" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" />
+    <line x1="556" y1="303" x2="583" y2="303" stroke="#ff3434" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" />
+    <rect x="597" y="88" width="105" height="220" fill="none" stroke="#101843" stroke-width="1" rx="0" />
+    <line x1="601" y1="93" x2="628" y2="93" stroke="#ff3434" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" />
+    <line x1="628" y1="93" x2="601" y2="155" stroke="#ff3434" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" />
+    <line x1="601" y1="155" x2="628" y2="155" stroke="#ff3434" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" />
+    <path d="M628 155 L635 93" stroke="#ff3434" stroke-width="0.7" fill="none" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" stroke-dasharray="5 4" />
+    <line x1="635" y1="93" x2="662" y2="93" stroke="#ff3434" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" />
+    <line x1="662" y1="93" x2="635" y2="155" stroke="#ff3434" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" />
+    <line x1="635" y1="155" x2="662" y2="155" stroke="#ff3434" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" />
+    <path d="M662 155 L669 93" stroke="#ff3434" stroke-width="0.7" fill="none" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" stroke-dasharray="5 4" />
+    <line x1="669" y1="93" x2="696" y2="93" stroke="#ff3434" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" />
+    <line x1="696" y1="93" x2="669" y2="155" stroke="#ff3434" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" />
+    <line x1="669" y1="155" x2="696" y2="155" stroke="#ff3434" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" />
+    <line x1="601" y1="167" x2="628" y2="167" stroke="#ff3434" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" />
+    <line x1="628" y1="167" x2="601" y2="229" stroke="#ff3434" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" />
+    <line x1="601" y1="229" x2="628" y2="229" stroke="#ff3434" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" />
+    <path d="M628 229 L635 167" stroke="#ff3434" stroke-width="0.7" fill="none" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" stroke-dasharray="5 4" />
+    <line x1="635" y1="167" x2="662" y2="167" stroke="#ff3434" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" />
+    <line x1="662" y1="167" x2="635" y2="229" stroke="#ff3434" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" />
+    <line x1="635" y1="229" x2="662" y2="229" stroke="#ff3434" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" />
+    <path d="M662 229 L669 167" stroke="#ff3434" stroke-width="0.7" fill="none" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" stroke-dasharray="5 4" />
+    <line x1="669" y1="167" x2="696" y2="167" stroke="#ff3434" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" />
+    <line x1="696" y1="167" x2="669" y2="229" stroke="#ff3434" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" />
+    <line x1="669" y1="229" x2="696" y2="229" stroke="#ff3434" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" />
+    <line x1="601" y1="241" x2="628" y2="241" stroke="#ff3434" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" />
+    <line x1="628" y1="241" x2="601" y2="303" stroke="#ff3434" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" />
+    <line x1="601" y1="303" x2="628" y2="303" stroke="#ff3434" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" />
+    <path d="M628 303 L635 241" stroke="#ff3434" stroke-width="0.7" fill="none" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" stroke-dasharray="5 4" />
+    <line x1="635" y1="241" x2="662" y2="241" stroke="#ff3434" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" />
+    <line x1="662" y1="241" x2="635" y2="303" stroke="#ff3434" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" />
+    <line x1="635" y1="303" x2="662" y2="303" stroke="#ff3434" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" />
+    <path d="M662 303 L669 241" stroke="#ff3434" stroke-width="0.7" fill="none" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" stroke-dasharray="5 4" />
+    <line x1="669" y1="241" x2="696" y2="241" stroke="#ff3434" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" />
+    <line x1="696" y1="241" x2="669" y2="303" stroke="#ff3434" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" />
+    <line x1="669" y1="303" x2="696" y2="303" stroke="#ff3434" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" />
+    <rect x="734" y="88" width="105" height="220" fill="none" stroke="#101843" stroke-width="1" rx="0" />
+    <line x1="738" y1="93" x2="765" y2="93" stroke="#ff3434" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" />
+    <line x1="765" y1="93" x2="738" y2="155" stroke="#ff3434" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" />
+    <line x1="738" y1="155" x2="765" y2="155" stroke="#ff3434" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" />
+    <path d="M765 155 L772 93" stroke="#ff3434" stroke-width="0.7" fill="none" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" stroke-dasharray="5 4" />
+    <line x1="772" y1="93" x2="799" y2="93" stroke="#ff3434" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" />
+    <line x1="799" y1="93" x2="772" y2="155" stroke="#ff3434" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" />
+    <line x1="772" y1="155" x2="799" y2="155" stroke="#ff3434" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" />
+    <path d="M799 155 L806 93" stroke="#ff3434" stroke-width="0.7" fill="none" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" stroke-dasharray="5 4" />
+    <line x1="806" y1="93" x2="833" y2="93" stroke="#ff3434" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" />
+    <line x1="833" y1="93" x2="806" y2="155" stroke="#ff3434" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" />
+    <line x1="806" y1="155" x2="833" y2="155" stroke="#ff3434" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" />
+    <line x1="738" y1="167" x2="765" y2="167" stroke="#ff3434" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" />
+    <line x1="765" y1="167" x2="738" y2="229" stroke="#ff3434" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" />
+    <line x1="738" y1="229" x2="765" y2="229" stroke="#ff3434" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" />
+    <path d="M765 229 L772 167" stroke="#ff3434" stroke-width="0.7" fill="none" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" stroke-dasharray="5 4" />
+    <line x1="772" y1="167" x2="799" y2="167" stroke="#ff3434" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" />
+    <line x1="799" y1="167" x2="772" y2="229" stroke="#ff3434" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" />
+    <line x1="772" y1="229" x2="799" y2="229" stroke="#ff3434" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" />
+    <path d="M799 229 L806 167" stroke="#ff3434" stroke-width="0.7" fill="none" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" stroke-dasharray="5 4" />
+    <line x1="806" y1="167" x2="833" y2="167" stroke="#ff3434" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" />
+    <line x1="833" y1="167" x2="806" y2="229" stroke="#ff3434" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" />
+    <line x1="806" y1="229" x2="833" y2="229" stroke="#ff3434" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" />
+    <line x1="738" y1="241" x2="765" y2="241" stroke="#ff3434" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" />
+    <line x1="765" y1="241" x2="738" y2="303" stroke="#ff3434" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" />
+    <line x1="738" y1="303" x2="765" y2="303" stroke="#ff3434" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" />
+    <path d="M765 303 L772 241" stroke="#ff3434" stroke-width="0.7" fill="none" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" stroke-dasharray="5 4" />
+    <line x1="772" y1="241" x2="799" y2="241" stroke="#ff3434" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" />
+    <line x1="799" y1="241" x2="772" y2="303" stroke="#ff3434" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" />
+    <line x1="772" y1="303" x2="799" y2="303" stroke="#ff3434" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" />
+    <path d="M799 303 L806 241" stroke="#ff3434" stroke-width="0.7" fill="none" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" stroke-dasharray="5 4" />
+    <line x1="806" y1="241" x2="833" y2="241" stroke="#ff3434" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" />
+    <line x1="833" y1="241" x2="806" y2="303" stroke="#ff3434" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" />
+    <line x1="806" y1="303" x2="833" y2="303" stroke="#ff3434" stroke-width="0.65" marker-end="url(#nhwc2nc1hwc0_of_fractals-arrow-ff3434)" />
+    <line x1="54" y1="48" x2="407" y2="48" stroke="#696d75" stroke-width="1.2" />
+    <line x1="54" y1="44" x2="54" y2="52" stroke="#696d75" stroke-width="1.2" />
+    <line x1="407" y1="44" x2="407" y2="52" stroke="#696d75" stroke-width="1.2" />
+    <rect x="219.718" y="38" width="21.564" height="20" fill="#fff" stroke="none" stroke-width="1" rx="0" />
+    <line x1="54" y1="72" x2="159" y2="72" stroke="#696d75" stroke-width="1.2" />
+    <line x1="54" y1="68" x2="54" y2="76" stroke="#696d75" stroke-width="1.2" />
+    <line x1="159" y1="68" x2="159" y2="76" stroke="#696d75" stroke-width="1.2" />
+    <rect x="95.83" y="62" width="21.34" height="20" fill="#fff" stroke="none" stroke-width="1" rx="0" />
+    <line x1="484" y1="38" x2="839" y2="38" stroke="#696d75" stroke-width="1.2" />
+    <line x1="484" y1="34" x2="484" y2="42" stroke="#696d75" stroke-width="1.2" />
+    <line x1="839" y1="34" x2="839" y2="42" stroke="#696d75" stroke-width="1.2" />
+    <rect x="650.718" y="28" width="21.564" height="20" fill="#fff" stroke="none" stroke-width="1" rx="0" />
+    <line x1="484" y1="60" x2="589" y2="60" stroke="#696d75" stroke-width="1.2" />
+    <line x1="484" y1="56" x2="484" y2="64" stroke="#696d75" stroke-width="1.2" />
+    <line x1="589" y1="56" x2="589" y2="64" stroke="#696d75" stroke-width="1.2" />
+    <rect x="522.288" y="50" width="28.424" height="20" fill="#fff" stroke="none" stroke-width="1" rx="0" />
+    <line x1="484" y1="79" x2="518" y2="79" stroke="#696d75" stroke-width="1.2" />
+    <line x1="484" y1="75" x2="484" y2="83" stroke="#696d75" stroke-width="1.2" />
+    <line x1="518" y1="75" x2="518" y2="83" stroke="#696d75" stroke-width="1.2" />
+    <rect x="486.562" y="69" width="28.876" height="20" fill="#fff" stroke="none" stroke-width="1" rx="0" />
+    <line x1="18" y1="88" x2="18" y2="306" stroke="#696d75" stroke-width="1" />
+    <line x1="13" y1="88" x2="23" y2="88" stroke="#696d75" stroke-width="1" />
+    <line x1="13" y1="306" x2="23" y2="306" stroke="#696d75" stroke-width="1" />
+    <line x1="448" y1="88" x2="448" y2="306" stroke="#696d75" stroke-width="1" />
+    <line x1="443" y1="88" x2="453" y2="88" stroke="#696d75" stroke-width="1" />
+    <line x1="443" y1="306" x2="453" y2="306" stroke="#696d75" stroke-width="1" />
+    <line x1="465" y1="88" x2="465" y2="306" stroke="#696d75" stroke-width="1" />
+    <line x1="460" y1="88" x2="470" y2="88" stroke="#696d75" stroke-width="1" />
+    <line x1="460" y1="306" x2="470" y2="306" stroke="#696d75" stroke-width="1" />
+  </g>
+  <g fill="#171717" font-family="FZLanTingHei-R-GBK, 方正兰亭黑_GBK, sans-serif" font-size="12" font-weight="400">
+    <text x="208" y="20" font-size="14.00" text-anchor="middle" fill="#171717">NHWC</text>
+    <text x="670" y="20" font-size="14.00" text-anchor="middle" fill="#171717">NC1HWC0</text>
+    <text x="291" y="209" font-size="13.00" text-anchor="middle" fill="#171717">...</text>
+    <text x="720" y="209" font-size="13.00" text-anchor="middle" fill="#171717">...</text>
+    <text x="230.5" y="52" font-size="14.00" text-anchor="middle" fill="#171717">N</text>
+    <text x="106.5" y="76" font-size="14.00" text-anchor="middle" fill="#171717">C</text>
+    <text x="661.5" y="42" font-size="14.00" text-anchor="middle" fill="#171717">N</text>
+    <text x="536.5" y="64" font-size="14.00" text-anchor="middle" fill="#171717">C1</text>
+    <text x="501" y="83" font-size="13.00" text-anchor="middle" fill="#171717">C0</text>
+    <text x="35" y="129" font-size="14.00" text-anchor="middle" fill="#171717">W</text>
+    <text x="35" y="206" font-size="14.00" text-anchor="middle" fill="#171717">H</text>
+    <text x="432" y="206" font-size="14.00" text-anchor="middle" fill="#171717">H</text>
+    <text x="468" y="128" font-size="14.00" text-anchor="middle" fill="#171717">W</text>
+  </g>
+</svg>

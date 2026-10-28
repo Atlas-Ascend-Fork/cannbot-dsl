@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="842" height="482" viewBox="0 0 842 482" role="img" aria-labelledby="vmull-title vmull-desc">
+  <title id="vmull-title">vmull示意图</title>
+  <desc id="vmull-desc">Editable vector diagram reconstructed from the preserved vmull.png; text uses FZLanTingHei-R-GBK.</desc>
+  <defs>
+    <marker id="vmull-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#696d75" />
+    </marker>
+    <marker id="vmull-ink-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#101843" />
+    </marker>
+    <marker id="vmull-blue-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#5277ff" />
+    </marker>
+  </defs>
+  <rect x="0" y="0" width="842" height="482" fill="#fff" stroke="none" stroke-width="1" rx="0" />
+  <g>
+    <rect x="0" y="2" width="397" height="64" fill="#ffb77f" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="442" y="2" width="400" height="64" fill="#ffb77f" stroke="#101843" stroke-width="1" rx="0" />
+    <path d="M405 92H427V187H443L416 212L389 187H405Z" stroke="#101843" stroke-width="0.8" fill="none" />
+    <rect x="0" y="237" width="397" height="64" fill="#ffda8e" stroke="#101843" stroke-width="1" rx="0" />
+    <path d="M181 323h22v40h15l-26 28l-26 -28h15Z" stroke="#101843" stroke-width="0.8" fill="none" />
+    <rect x="0" y="418" width="397" height="63" fill="#ffda8e" stroke="#101843" stroke-width="1" rx="0" />
+    <rect x="442" y="237" width="397" height="64" fill="#ffedcc" stroke="#101843" stroke-width="1" rx="0" />
+    <path d="M623 323h22v40h15l-26 28l-26 -28h15Z" stroke="#101843" stroke-width="0.8" fill="none" />
+    <rect x="442" y="418" width="397" height="63" fill="#ffedcc" stroke="#101843" stroke-width="1" rx="0" />
+  </g>
+  <g fill="#171717" font-family="FZLanTingHei-R-GBK, 方正兰亭黑_GBK, sans-serif" font-size="12" font-weight="400">
+    <text x="198.5" y="42.05" font-size="23.00" text-anchor="middle" fill="#171717">uint32/int32 src0</text>
+    <text x="642" y="42.05" font-size="23.00" text-anchor="middle" fill="#171717">uint32/int32 src1</text>
+    <text x="416" y="41" font-size="23.00" text-anchor="middle" fill="#171717">x</text>
+    <text x="198.5" y="277.05" font-size="23.00" text-anchor="middle" fill="#171717">High 32bit</text>
+    <text x="198.5" y="457.55" font-size="23.00" text-anchor="middle" fill="#171717">uint32/int32 dst1</text>
+    <text x="640.5" y="277.05" font-size="23.00" text-anchor="middle" fill="#171717">Low 32bit</text>
+    <text x="640.5" y="457.55" font-size="23.00" text-anchor="middle" fill="#171717">uint32/int32 dst0</text>
+  </g>
+</svg>

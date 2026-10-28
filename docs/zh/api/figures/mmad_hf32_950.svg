@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="842" height="217" viewBox="0 0 842 217" role="img" aria-labelledby="mmad_hf32_950-title mmad_hf32_950-desc">
+  <title id="mmad_hf32_950-title">FP32与HF32格式精度示意图 / mmad hf32 950示意图</title>
+  <desc id="mmad_hf32_950-desc">Editable vector diagram reconstructed from the preserved mmad_hf32_950.png; text uses FZLanTingHei-R-GBK.</desc>
+  <defs>
+    <marker id="mmad_hf32_950-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#696d75" />
+    </marker>
+    <marker id="mmad_hf32_950-ink-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#101843" />
+    </marker>
+    <marker id="mmad_hf32_950-blue-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0L7 3L0 6Z" fill="#5277ff" />
+    </marker>
+  </defs>
+  <rect x="0" y="0" width="842" height="217" fill="#fff" stroke="none" stroke-width="1" rx="0" />
+  <g>
+    <rect x="82" y="57" width="47" height="56" fill="#fff" stroke="#101843" stroke-width="1" rx="3" />
+    <rect x="129" y="57" width="167" height="56" fill="#fff" stroke="#101843" stroke-width="1" rx="3" />
+    <rect x="296" y="57" width="544" height="56" fill="#fff" stroke="#101843" stroke-width="1" rx="3" />
+    <rect x="82" y="161" width="47" height="56" fill="#fff" stroke="#101843" stroke-width="1" rx="3" />
+    <rect x="129" y="161" width="167" height="56" fill="#fff" stroke="#101843" stroke-width="1" rx="3" />
+    <rect x="296" y="161" width="236" height="56" fill="#fff" stroke="#101843" stroke-width="1" rx="3" />
+  </g>
+  <g fill="#171717" font-family="FZLanTingHei-R-GBK, 方正兰亭黑_GBK, sans-serif" font-size="12" font-weight="400">
+    <text x="103" y="36" font-size="16.00" text-anchor="middle" fill="#171717" font-weight="700">sign</text>
+    <text x="210" y="36" font-size="16.00" text-anchor="middle" fill="#171717" font-weight="700">exponent</text>
+    <text x="551" y="36" font-size="16.00" text-anchor="middle" fill="#171717" font-weight="700">mantissa</text>
+    <text x="5" y="96" font-size="18.00" text-anchor="start" fill="#171717" font-weight="700">FP32:</text>
+    <text x="105.5" y="90.6" font-size="16.00" text-anchor="middle" fill="#171717">1</text>
+    <text x="212.5" y="90.6" font-size="16.00" text-anchor="middle" fill="#171717">8</text>
+    <text x="568" y="90.6" font-size="16.00" text-anchor="middle" fill="#171717">23</text>
+    <text x="5" y="200" font-size="18.00" text-anchor="start" fill="#171717" font-weight="700">HF32:</text>
+    <text x="105.5" y="194.6" font-size="16.00" text-anchor="middle" fill="#171717">1</text>
+    <text x="212.5" y="194.6" font-size="16.00" text-anchor="middle" fill="#171717">8</text>
+    <text x="414" y="194.6" font-size="16.00" text-anchor="middle" fill="#171717">10</text>
+  </g>
+</svg>
