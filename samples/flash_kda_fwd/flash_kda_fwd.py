@@ -515,6 +515,13 @@ def _sequence_spec(dtype, physical_batches, length, heads, width, stride_prefix)
     )
 
 
+def _chunk_cache_spec(dtype, batches, heads, chunks, width, stride_prefix):
+    outer_stride = tuple(cannbotdsl.Dim(f"{stride_prefix}_S{i}", min=1) for i in range(3))
+    return cannbotdsl.TensorSpec(
+        (batches, heads, chunks, width, width), dtype, stride=(*outer_stride, width, 1),
+    )
+
+
 def _get_compiled_kernel(template=0):
     global _COMPILED_KERNEL, _COMPILED_KERNEL_ENVIRONMENT, _COMPILED_KERNEL_LOCK
     from cannbotdsl.aot.runtime import COLLECTOR
@@ -561,11 +568,11 @@ def _get_compiled_kernel(template=0):
         state_spec = fake((batch, n_v, SUPPORTED_HEAD_DIM, SUPPORTED_HEAD_DIM), dtypes.float32)
         rstd_spec = _sequence_spec(dtypes.float32, physical_batches, storage_length, n_qk, 1, "RSTD")
         activated_spec = _sequence_spec(dtypes.float32, physical_batches, storage_length, n_v, 1, "ACT")
-        matrix_spec = fake((physical_batches, n_v, storage_chunks, CHUNK_SIZE, CHUNK_SIZE), dtypes.bfloat16)
+        matrix_spec = _chunk_cache_spec(dtypes.bfloat16, physical_batches, n_v, storage_chunks, CHUNK_SIZE, "MATRIX")
         gate_cumsum_spec = _sequence_spec(
             dtypes.float32, physical_batches, storage_length, n_v, SUPPORTED_HEAD_DIM, "G_CUMSUM",
         )
-        h_spec = fake((state_batches, n_v, state_chunks, SUPPORTED_HEAD_DIM, SUPPORTED_HEAD_DIM), dtypes.float32)
+        h_spec = _chunk_cache_spec(dtypes.float32, state_batches, n_v, state_chunks, SUPPORTED_HEAD_DIM, "H")
         runner = (FlashKDAFwd, StagedFlashKDAFwd, PersistentFlashKDAFwd)[template]()
         compiled_kernel = cannbotdsl.compile(
             runner.run, qk_spec, v_spec, qk_spec, beta_spec, v_spec, fake((core_num, 2, 2, CHUNK_SIZE), dtypes.float32),
@@ -830,15 +837,25 @@ def _flash_kda_fwd_impl(
         stride = ref.stride()[: len(shape)]
         return torch.empty_strided(shape, stride, dtype=ref.dtype if dtype is None else dtype, device=q.device)
 
+    def empty_inverse_norm(ref):
+        shape = ref.shape[:-1]
+        if internal_template == 2 and not disable_recompute:
+            return torch.as_strided(initial_state, shape, (0,) * len(shape))
+        if layout_qkv == "BNSD":
+            return torch.empty(shape, dtype=torch.float32, device=q.device)
+        # Keep sequence-major scalar storage for BSND/TND without the removed D stride.
+        storage = torch.empty((shape[0], shape[2], shape[1]), dtype=torch.float32, device=q.device)
+        return storage.transpose(1, 2)
+
     allocate_backward_inputs = disable_recompute or internal_template != 2
     if use_qk_l2norm_in_kernel and allocate_backward_inputs:
         q_norm = empty_with_layout(q_logical, dtype=torch.bfloat16)
         k_norm = empty_with_layout(k_logical, dtype=torch.bfloat16)
-        q_rstd = empty_with_layout(q_logical, shape=q_logical.shape[:-1], dtype=torch.float32)
-        k_rstd = empty_with_layout(k_logical, shape=k_logical.shape[:-1], dtype=torch.float32)
+        q_rstd = empty_inverse_norm(q_logical)
+        k_rstd = empty_inverse_norm(k_logical)
     else:
         q_norm, k_norm = (q_logical, k_logical)
-        q_rstd = empty_with_layout(q_logical, shape=q_logical.shape[:-1], dtype=torch.float32)
+        q_rstd = empty_inverse_norm(q_logical)
         k_rstd = q_rstd
     beta_activated = empty_with_layout(beta_logical, shape=beta_logical.shape[:-1], dtype=torch.float32)
     chunk_count = (
@@ -848,8 +865,14 @@ def _flash_kda_fwd_impl(
     )
     chunk_matrix_shape = (physical_batches, n_v, chunk_count, CHUNK_SIZE, CHUNK_SIZE)
     g_cumsum_shape = (physical_batches, n_v, storage_length, dim)
-    Aqk = torch.empty(chunk_matrix_shape, dtype=torch.bfloat16, device=q.device)
-    Akk = torch.empty(chunk_matrix_shape, dtype=torch.bfloat16, device=q.device)
+    def empty_chunk_cache():
+        if layout_qkv == "TND":
+            storage = torch.empty((chunk_count, n_v, CHUNK_SIZE, CHUNK_SIZE), dtype=torch.bfloat16, device=q.device)
+            return storage.permute(1, 0, 2, 3).unsqueeze(0)
+        return torch.empty(chunk_matrix_shape, dtype=torch.bfloat16, device=q.device)
+
+    Aqk = empty_chunk_cache()
+    Akk = empty_chunk_cache()
     w = (
         empty_with_layout(v_logical, dtype=torch.bfloat16)
         if allocate_backward_inputs
@@ -875,11 +898,13 @@ def _flash_kda_fwd_impl(
         if allocate_backward_inputs
         else v_logical
     )
-    g_cumsum = (
-        torch.empty(g_cumsum_shape, dtype=torch.float32, device=q.device)
-        if allocate_backward_inputs
-        else torch.as_strided(initial_state, g_cumsum_shape, (0,) * (len(g_cumsum_shape) - 1) + (1,))
-    )
+    if not allocate_backward_inputs:
+        g_cumsum = torch.as_strided(initial_state, g_cumsum_shape, (0,) * (len(g_cumsum_shape) - 1) + (1,))
+    elif layout_qkv == "TND":
+        storage = torch.empty((storage_length, n_v, dim), dtype=torch.float32, device=q.device)
+        g_cumsum = storage.transpose(0, 1).unsqueeze(0)
+    else:
+        g_cumsum = torch.empty(g_cumsum_shape, dtype=torch.float32, device=q.device)
     state_is_compact = int(layout_qkv == "TND")
     save_qg = int(disable_recompute)
     save_g_cumsum = int(disable_recompute or not use_gate_in_kernel)
@@ -887,9 +912,10 @@ def _flash_kda_fwd_impl(
         h = initial_state[:1].unsqueeze(2)
     elif state_is_compact:
         state_chunks = _tnd_state_chunk_capacity(storage_length, batch)
-        h = torch.empty(
-            (1, n_v, state_chunks, SUPPORTED_HEAD_DIM, SUPPORTED_HEAD_DIM), dtype=torch.float32, device=q.device,
+        storage = torch.empty(
+            (state_chunks, n_v, SUPPORTED_HEAD_DIM, SUPPORTED_HEAD_DIM), dtype=torch.float32, device=q.device,
         )
+        h = storage.permute(1, 0, 2, 3).unsqueeze(0)
     else:
         h = torch.empty(
             (batch, n_v, (storage_length + CHUNK_SIZE - 1) // CHUNK_SIZE, SUPPORTED_HEAD_DIM, SUPPORTED_HEAD_DIM,),

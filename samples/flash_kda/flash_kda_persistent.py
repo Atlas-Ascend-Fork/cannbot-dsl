@@ -432,7 +432,6 @@ class RecurrentStateUpdate:
             self.state_l1.produce(), self.ub_state_nz, engine=make_copy_engine(split_axis=1), part_id=self.subblock_idx,
         )
 
-
     @jit
     def update_recurrent_state(self):
         chunk_decay = self.gamma_ub.consume()
@@ -843,20 +842,8 @@ class ChunkMatmul:
         )
 
     def _load_resident_inv_to_l0a(self):
-        resident_inv = self.resident_inv_l1
         l0a_write = self.l0a_recurrent.produce()
-        mem_copy(reinterpret(l0a_write, shape=(CHUNK_SIZE, CHUNK_SIZE), offset=0), resident_inv)
-        for block in range_constexpr(DIAGONAL_BLOCK_COUNT):
-            source_column = block % 2 + 1
-            source = reinterpret(
-                self.tile_inv_l1, shape=(DIAGONAL_BLOCK_SIZE, DIAGONAL_BLOCK_SIZE),
-                offset=self._packed64_block_offset_elems(block, source_column) * 2, dtype=dtypes.bfloat16,
-            )
-            target = reinterpret(
-                l0a_write, shape=(DIAGONAL_BLOCK_SIZE, DIAGONAL_BLOCK_SIZE),
-                offset=self.l0_matrix_block_offset_elems(block, block) * 2,
-            )
-            mem_copy(target, source)
+        mem_copy(reinterpret(l0a_write, shape=(CHUNK_SIZE, CHUNK_SIZE), offset=0), self.resident_inv_l1)
         return l0a_write
 
 
@@ -890,6 +877,9 @@ class GateWeightedScoresAndDiagonalInverse:
             MemLoc.UB, (HALF_CHUNK_SIZE, CHUNK_SIZE), dtypes.float16, depth=1, data_format="nz", n1_pad=16,
         ).produce()
         self.ub_inverse_prefix = Buffer(MemLoc.UB, (16, 32), dtypes.float32)
+        self.ub_inverse_indices = reinterpret(
+            self.ub_inverse_prefix, shape=(2, 32), offset=11 * 32 * 4, dtype=dtypes.uint32,
+        )
 
     @jit
     def prepare_score_operands(self, preprocessing, q, k, chunk_idx, chunk_num):
@@ -1004,11 +994,17 @@ class GateWeightedScoresAndDiagonalInverse:
         mask_b16, _ = update_mask(32, elem_bits=16)
         zero = vdups(0.0, dtypes.float32, mask=lane_mask)
         one = vdups(1.0, dtypes.float32, mask=lane_mask)
-        lane_idx = varange(0, dtypes.uint32)
-        block_idx = vbitwise_and(lane_idx, vdups(16, dtypes.uint32), mask=lane_mask)
-        lane_in_block = vbitwise_and(lane_idx, vdups(15, dtypes.uint32), mask=lane_mask)
-        block_base = vadd(vshl(block_idx, 6, mask=lane_mask), block_idx, mask=lane_mask)
-        block_base = vadds(block_base, self.subblock_idx * 32, mask=lane_mask)
+        if const_expr(start == 0):
+            lane_idx = varange(0, dtypes.uint32)
+            block_idx = vbitwise_and(lane_idx, vdups(16, dtypes.uint32), mask=lane_mask)
+            lane_in_block = vbitwise_and(lane_idx, vdups(15, dtypes.uint32), mask=lane_mask)
+            block_base = vadd(vshl(block_idx, 6, mask=lane_mask), block_idx, mask=lane_mask)
+            block_base = vadds(block_base, self.subblock_idx * 32, mask=lane_mask)
+            vstore(self.ub_inverse_indices, 0, lane_in_block, lane_mask)
+            vstore(self.ub_inverse_indices, 32, block_base, lane_mask)
+        else:
+            lane_in_block = vload(self.ub_inverse_indices, 0)
+            block_base = vload(self.ub_inverse_indices, 32)
         inverse_rows = []
         for row in range_constexpr(start, start + count):
             diagonal = veq(lane_in_block, vdups(row, dtypes.uint32), mask=lane_mask)
@@ -1053,12 +1049,6 @@ class GateWeightedScoresAndDiagonalInverse:
             vstore_strided(
                 self.ub_diag_inv_nz, self.subblock_idx * 2 * self.ub_diag_inv_nz.physical_stride[0] + row * 16,
                 packed_inverse, mask_b16, block_stride=16 + self.ub_diag_inv_nz.physical_stride[0] // 16,
-            )
-            diagonal_final_bf16 = cast_and_pack_bf16(acc, lane_mask)
-            diagonal_final_bits = vreinterpret(diagonal_final_bf16, dtypes.float16)
-            vstore_strided(
-                self.ub_diag_inv_nz, self.ub_diag_inv_nz.physical_stride[0] + row * 16, diagonal_final_bits, mask_b16,
-                block_stride=16 + self.ub_diag_inv_nz.physical_stride[0] // 16,
             )
 
     @jit

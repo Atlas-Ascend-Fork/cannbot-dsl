@@ -1104,7 +1104,8 @@ def decode_metadata(raw: Sequence[int]) -> dict[str, object]:
 SUPPORTED_HEAD_DIM = 128
 
 _AICPU_COMPILED = None
-_AICPU_LOCK = threading.Lock()
+_AICPU_LOCK = threading.RLock()
+_AICPU_STREAMS = {}
 
 
 def _device_block_num(ref: Optional[torch.Tensor] = None) -> int:
@@ -1142,57 +1143,6 @@ def _get_aicpu_kernel():
         return _AICPU_COMPILED
 
 
-_STATUS_NAMES = (
-    "STATUS_OK",
-    "STATUS_BAD_CORE_NUM",
-    "STATUS_BAD_WORKSPACE_SLOTS",
-    "STATUS_BAD_FLAGS",
-    "STATUS_BAD_SHAPE",
-    "STATUS_BAD_CU_START",
-    "STATUS_BAD_LENGTH",
-    "STATUS_BAD_PADDED_LENGTH",
-    "STATUS_BAD_PACKED_END",
-    "STATUS_BAD_METADATA_CAPACITY",
-)
-
-
-def _host_validate_cu_seqlens(cu_seqlens, batch, storage_length, is_packed) -> None:
-    """Reject empty sequences on the host before AICPU can fault the stream."""
-
-    prefix = [int(value) for value in cu_seqlens.detach().to("cpu").tolist()]
-    if len(prefix) != batch + 1:
-        raise ValueError(f"cu_seqlens length must be {batch + 1}, got {len(prefix)}")
-    if prefix[0] != 0:
-        raise ValueError("cu_seqlens must start at 0")
-    empty = []
-    for index, (start, end) in enumerate(zip(prefix, prefix[1:])):
-        length = end - start
-        if length <= 0:
-            empty.append(index)
-        elif not is_packed and length > storage_length:
-            raise ValueError(
-                f"cu_seqlens batch {index} length {length} exceeds storage length {storage_length}"
-            )
-    if empty:
-        raise ValueError(
-            "cu_seqlens has non-positive lengths at batch indices "
-            f"{empty}; drop empty sequences before calling flash_kda_metadata"
-        )
-    if is_packed and prefix[-1] != int(storage_length):
-        raise ValueError(
-            f"packed cu_seqlens end {prefix[-1]} must equal storage length {int(storage_length)}"
-        )
-
-
-def _raise_if_metadata_failed(metadata: torch.Tensor) -> None:
-    if metadata.device.type in {"npu", "privateuseone"}:
-        torch.npu.synchronize()
-    status = int(metadata[HEADER_STATUS].item())
-    if status != STATUS_OK:
-        name = _STATUS_NAMES[status] if 0 <= status < len(_STATUS_NAMES) else str(status)
-        raise ValueError(f"flash_kda_metadata failed with {name} ({status})")
-
-
 def flash_kda_metadata(
     q: torch.Tensor,
     v: torch.Tensor,
@@ -1202,7 +1152,7 @@ def flash_kda_metadata(
     *,
     template: str = "auto",
 ) -> torch.Tensor:
-    """Build reusable FlashKDA scheduling metadata on the current stream."""
+    """Submit metadata asynchronously; consume it on this same stream."""
     if template not in ("auto", "staged", "persistent"):
         raise ValueError("template must be auto, staged, or persistent")
     template_id = {
@@ -1268,34 +1218,44 @@ def flash_kda_metadata(
     )
     if cu_seqlens is not None:
         assert cu_seqlens.device == q.device, "all inputs must be on the same device"
-        _host_validate_cu_seqlens(cu_seqlens, int(batch), int(storage_length), is_packed)
 
     core_num = _device_block_num(q)
     metadata_capacity = metadata_capacity_upper_bound(batch, storage_length, is_packed=is_packed, value_heads=n_v)
     # AICPU initializes every consumed word; capacity beyond its schedule is undefined.
     metadata = torch.empty(metadata_capacity, dtype=torch.int32, device=q.device)
     route_parameters, calibration_enabled = _get_route_parameters(q.device)
-    aicpu = _get_aicpu_kernel()
-    device_id = (
-        q.get_device() if hasattr(q, "get_device") and q.device.type != "cpu" else 0
-    )
-    stream = current_raw_stream(device_id)
-    aicpu.launch(
-        stream, route_coefficients=0 if route_parameters is None else route_parameters.data_ptr(),
-        calibration_enabled=calibration_enabled, layout_kind=0 if layout_qkv == "BNSD" else 1,
-        cu_seqlens=0 if cu_seqlens is None else cu_seqlens.data_ptr(), metadata=metadata.data_ptr(),
-        metadata_word_capacity=metadata.numel(), batch=batch, physical_batches=physical_batches,
-        storage_length=storage_length, value_heads=n_v, has_cu=int(cu_seqlens is not None), is_packed=int(is_packed),
-        core_num=core_num, workspace_slots=WORKSPACE_SLOTS, template_kind=template_id,
-    )
-    _raise_if_metadata_failed(metadata)
+    device_id = q.get_device()
+    with torch.npu.device(device_id), _AICPU_LOCK:
+        stream = torch.npu.current_stream(device_id)
+        for tensor in (cu_seqlens, route_parameters, metadata):
+            if tensor is not None:
+                tensor.record_stream(stream)
+        _AICPU_STREAMS[(device_id, stream.npu_stream)] = stream
+        try:
+            aicpu = _get_aicpu_kernel()
+            aicpu.launch(
+                current_raw_stream(device_id), route_coefficients=0 if route_parameters is None else route_parameters.data_ptr(),
+                calibration_enabled=calibration_enabled, layout_kind=0 if layout_qkv == "BNSD" else 1,
+                cu_seqlens=0 if cu_seqlens is None else cu_seqlens.data_ptr(), metadata=metadata.data_ptr(),
+                metadata_word_capacity=metadata.numel(), batch=batch, physical_batches=physical_batches,
+                storage_length=storage_length, value_heads=n_v, has_cu=int(cu_seqlens is not None), is_packed=int(is_packed),
+                core_num=core_num, workspace_slots=WORKSPACE_SLOTS, template_kind=template_id,
+            )
+        except Exception:
+            # Retire any raw-pointer work submitted before the launch failed.
+            stream.synchronize()
+            raise
     return metadata
 
 
 def clear_metadata_caches():
-    """Drop the compiled metadata executable."""
+    """Wait for used streams before releasing the metadata executable."""
     global _AICPU_COMPILED
     with _AICPU_LOCK:
+        for (device_id, _), stream in _AICPU_STREAMS.items():
+            with torch.npu.device(device_id):
+                stream.synchronize()
+        _AICPU_STREAMS.clear()
         if _AICPU_COMPILED is not None:
             close = getattr(_AICPU_COMPILED, "close", None)
             if callable(close):
@@ -1344,11 +1304,13 @@ _ROUTE_PARAMETER_LOCK = threading.Lock()
 
 def _get_route_parameters(device):
     device = torch.device(device)
-    with _ROUTE_PARAMETER_LOCK:
-        tensor = _ROUTE_TENSORS.get(device)
-        if tensor is None:
-            tensor = torch.tensor(_ROUTE_PARAMETERS, dtype=torch.int64).to(device=device)
-            _ROUTE_TENSORS[device] = tensor
-    if device.type in ("npu", "privateuseone"):
-        tensor.record_stream(torch.npu.current_stream(device))
+    with torch.npu.device(device):
+        stream = torch.npu.current_stream(device)
+        key = (device, stream.npu_stream)
+        with _ROUTE_PARAMETER_LOCK:
+            tensor = _ROUTE_TENSORS.get(key)
+            if tensor is None:
+                tensor = torch.tensor(_ROUTE_PARAMETERS, dtype=torch.int64).to(device=device, non_blocking=True)
+                _ROUTE_TENSORS[key] = tensor
+        tensor.record_stream(stream)
     return tensor, 1
