@@ -692,7 +692,7 @@ def _check_stg_capacity(context, epn, w_elems, num_groups, grad_bf16=False):
     return stg_off, flags_off
 
 
-def reduce_grad(context, experts_to_copy, grad_view, epn, *, barrier=True):
+def reduce_grad(context, experts_to_copy, grad_view, epn, *, async_finish=False):
     """副本专家权重梯度归并回 home 并清零预取槽。
 
     Args:
@@ -704,14 +704,14 @@ def reduce_grad(context, experts_to_copy, grad_view, epn, *, barrier=True):
             （各组行宽 W 一致；与 prefetch_weight 的组数需一致）。
             多组时共享一次清单与屏障，各组独立 staging 区与 epoch flag
         epn: 每 rank 真实本地专家数
-        barrier: 末尾完成屏障（缺省 True 保持原语义：独立 sym_barrier +
-            host 级流等待，返回即全组本轮 staging 读写全部完成）。
-            **侧流并发调用传 False（async_finish）**：组间 barrier 改为
-            只发射 kernel 不做 host 同步（跨 rank staging 保序由 barrier
-            kernel 的自旋协议在设备序上保证），末尾屏障跳过，返回发起流
-            上的 NPU 事件——调用方 `wait_event` 汇合，跨 rank 的
-            staging/槽位复用安全由调用方在合适位置（如下一轮迭代的
-            barrier）负责；plan 延迟溢出检查顺延到下一个我方算子尾部。
+        async_finish: 完成语义开关（缺省 False：独立 sym_barrier + host 级
+            流等待，返回即全组本轮 staging 读写全部完成）。
+            **侧流并发调用传 True**：组间 barrier 改为只发射 kernel 不做
+            host 同步（跨 rank staging 保序由 barrier kernel 的自旋协议在
+            设备序上保证），末尾屏障跳过，返回发起流上的 NPU 事件——调用方
+            `wait_event` 汇合，跨 rank 的 staging/槽位复用安全由调用方在合适
+            位置（如下一轮迭代的 barrier）负责；plan 延迟溢出检查顺延到
+            下一个我方算子尾部。
 
     语义：home 的 grad_view[e_local] += Σ_{r 托管 e} 副本梯度；副本槽梯度清零。
     清单按 etc 身份单槽缓存于 context（同 plan 免回读/重建），且为定长数组 +
@@ -750,10 +750,10 @@ def reduce_grad(context, experts_to_copy, grad_view, epn, *, barrier=True):
             # staging 组间复用的配套：前一组的 staging 读写全组完成后才覆盖
             # （flag epoch 跨组单调，残值不会提前放行）。不内联进 kernel：
             # xfer 出现在重 vf 归并段之后会撞编译器复杂度上限（冷编译病态
-            # 慢），独立 barrier launch 是已验证形态。async 路径（barrier=
-            # False）改只发射不 host 同步：跨 rank staging 覆写安全由
-            # barrier kernel 自旋协议在设备序保证，后继组 kernel 排在其后
-            sym_barrier(context, sync=barrier)
+            # 慢），独立 barrier launch 是已验证形态。async_finish=True 时
+            # 只发射不 host 同步：跨 rank staging 覆写安全由 barrier kernel
+            # 自旋协议在设备序保证，后继组 kernel 排在其后
+            sym_barrier(context, sync=not async_finish)
         # 每组独立数据 epoch flag：跨组/跨次调用都不会被上一轮残留 flag 提前放行
         _EPOCH += 1
         gm_flag.fill_(_EPOCH)
@@ -776,4 +776,4 @@ def reduce_grad(context, experts_to_copy, grad_view, epn, *, barrier=True):
             context.ctx_tensor,
         )
     # 尾段契约见 finish_op（阻塞=独立 barrier+流级等待+溢出检查；async=返回事件）
-    return finish_op(context, barrier)
+    return finish_op(context, async_finish)

@@ -1091,7 +1091,7 @@ def test_moonep_general_spec_8192_h7168_k16_epn28():
 
 
 # ---------------------------------------------------------------------------
-# async_finish（barrier=False）：侧流并发路径——host 不被末尾屏障阻塞
+# async_finish=True：侧流并发路径——host 不被末尾屏障阻塞
 # ---------------------------------------------------------------------------
 
 
@@ -1107,7 +1107,7 @@ def _side_stream_load(stream, iters=200):
 @pytest.mark.npu
 @_requires_dsl
 def test_moonep_prefetch_overlap_async():
-    """prefetch barrier=False：侧流发射后 host 立即返回，事件汇合后数据正确。
+    """prefetch async_finish=True：侧流发射后 host 立即返回，事件汇合后数据正确。
 
     侧流先挂长负载再发射 prefetch：若末尾 barrier 仍做 host 同步，调用会
     阻塞到侧流全部完成（负载 + 直推，数百 ms）；async 路径应在负载仍在
@@ -1139,8 +1139,8 @@ def test_moonep_prefetch_overlap_async():
     side = torch.npu.Stream()
     _side_stream_load(side)
     with torch.npu.stream(side):
-        ev = prefetch_weight(ctx, etc, reals, views, epn, barrier=False)
-    assert ev is not None, "barrier=False 应返回发起流完成事件"
+        ev = prefetch_weight(ctx, etc, reals, views, epn, async_finish=True)
+    assert ev is not None, "async_finish=True 应返回发起流完成事件"
     still_busy = not side.query()
     assert still_busy, (
         "prefetch 返回时侧流前置负载应仍在执行——host 被末尾屏障阻塞的证据"
@@ -1174,7 +1174,7 @@ def test_moonep_prefetch_overlap_async():
 @pytest.mark.npu
 @_requires_dsl
 def test_moonep_reduce_overlap_async():
-    """reduce_grad barrier=False：组间发射式 barrier + 末尾跳过，host 立即返回。
+    """reduce_grad async_finish=True：组间发射式 barrier + 末尾跳过，host 立即返回。
 
     3 组归并（覆盖组间 launch-only barrier 路径）；汇合后逐组校验归并值
     与副本槽清零。
@@ -1197,8 +1197,8 @@ def test_moonep_reduce_overlap_async():
     side = torch.npu.Stream()
     _side_stream_load(side)
     with torch.npu.stream(side):
-        ev = reduce_grad(ctx, etc, grads, epn, barrier=False)
-    assert ev is not None, "barrier=False 应返回发起流完成事件"
+        ev = reduce_grad(ctx, etc, grads, epn, async_finish=True)
+    assert ev is not None, "async_finish=True 应返回发起流完成事件"
     still_busy = not side.query()
     assert still_busy, (
         "reduce_grad 返回时侧流前置负载应仍在执行——host 被组间/末尾屏障"

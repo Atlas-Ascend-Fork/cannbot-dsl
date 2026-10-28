@@ -137,13 +137,14 @@ reduce_grad(context, experts_to_copy, grad_view, epn)
 | `grad_view` | `[2*epn, H*H']` | `torch.float32` | 梯度视图：前 `epn` 行真实专家，后 `epn` 行副本槽 |
 | `epn` | 标量 | int | 每 rank 本地专家数（行宽由张量 shape 自取） |
 
-两接口均原地生效、无返回值（`barrier=True` 缺省形态）；gate / up / down 三个
+两接口均原地生效、无返回值（`async_finish=False` 缺省形态）；gate / up / down 三个
 projection 各调一次（或传 list 共享清单）。每次调用末尾含一次对称堆自旋完成
 屏障（独立 launch，不走 HCCL 集合通信）；调用末尾为发起流级等待（不等无关流）。
-prefetch 每个 block 独占一个目的 rank，同一 peer 的 put/flush 只由该 block
-发起；清单在 kernel 内逐 block 扫 etc 生成，末尾完成 barrier 保持独立 launch。
+prefetch 的 peer 按 round-robin 分给 `min(R-1, resident_blocks())` 个 block
+（块数受本机 AIV 数约束），每个 peer 的 put/flush 只由一个 block 发起；清单在
+kernel 内用 64-lane 向量比较生成（UB 内，不落 GM），末尾完成 barrier 独立 launch。
 reduce 发送侧按一卡一源选择唯一 home block；接收侧保留同一 home 行的多 sender 归并。
-**侧流并发（async_finish）**：两接口均可传 `barrier=False`——跳过末尾屏障
+**侧流并发（`async_finish=True`）**：两接口均可传 `async_finish=True`——跳过末尾屏障
 及其 host 同步（reduce 的组间 barrier 同时改为只发射 kernel），**返回发起流
 上的 NPU 事件**；调用方 `wait_event` 汇合，跨 rank 的槽位/staging 复用安全由
 调用方在合适位置（如下一轮迭代的 barrier）负责，plan 延迟溢出检查顺延到下一
@@ -152,8 +153,9 @@ reduce 发送侧按一卡一源选择唯一 home block；接收侧保留同一 h
 对称堆容量在 `create_moonep_context` 与 `create_weight_view` 处前置校验，
 不足即报所需/现有容量。对称窗权重视图进 grouped_matmul 前先
 `materialize_weights(view)` 落地普通显存（GMM host 路径限制）。
-两接口的清单均由设备侧 kernel 从 `etc` 生成（host 零回读/零 H2D），
-清单缓冲按形状缓存——路由变化不触发重编译，新 plan 自动重建。
+两接口的清单均由设备侧 kernel 从 `etc` 生成（host 零回读/零 H2D）：
+prefetch 清单留在 UB（不落 GM），reduce 清单缓冲按形状缓存——路由变化不
+触发重编译，新 plan 自动重建。
 
 ### 使用约束
 
@@ -219,7 +221,7 @@ samples/moonep/
 ├── README.md               # 本文档（接口参考）
 ├── moonep_context.py       # 通信上下文/容量校验/对称堆 barrier/跨流护栏/resident_blocks 核数探测（共享）
 ├── moonep_plan.py          # 规划（单 launch、2 次 global_sync_all：Exchange/Count/UB GreedyAll → Tables/Pfx → Assign；vhistogram + vgather 快路径 + 慢路径压缩）
-├── prefetch_weight.py      # 权重预取（每 block 独占一个目的 rank：单 peer 直推 + 融合多组发射 + 独立 barrier）
+├── prefetch_weight.py      # 权重预取（peer 按 AIV 约束 round-robin 分块：向量清单 + 融合多组直推 + 独立 barrier）
 ├── reduce_grad.py          # 副本梯度归并（独立清单 kernel + send/recv 融合单 kernel + 独立 barrier）
 └── npu_blob.py             # from_blob 扩展（对称区权重视图用；C++ 源内嵌）
 ```

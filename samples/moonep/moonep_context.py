@@ -144,19 +144,19 @@ def resident_blocks(cap: int = 64) -> int:
     return min(cap, _RESIDENT_BLOCKS)
 
 
-def finish_op(context, barrier):
+def finish_op(context, async_finish=False):
     """算子尾部公共段（prefetch_weight / reduce_grad 共用）。
 
-    barrier=True（缺省语义）：独立 sym_barrier（多 block kernel 内联尾段须先
-    global_sync_all 保序、与运行时取模分派组合撞编译器已知问题——独立 launch
-    是已验证形态）+ 发起流级等待（返回即全组本轮完成，连续调用无槽位竞态）
-    + plan 延迟溢出检查（.item() 微秒级）；返回 None。
-    barrier=False（async_finish，侧流并发路径）：跳过 host 阻塞，返回发起流
-    完成事件——调用方 wait_event 汇合，跨 rank 槽位/staging 复用安全由调用方
-    在合适位置（如下一轮迭代的 barrier）负责；plan 溢出检查顺延到下一个我方
-    算子尾部（context.pending_overflow 机制）。
+    async_finish=False（缺省语义）：独立 sym_barrier（多 block kernel 内联尾段
+    须先 global_sync_all 保序、与运行时取模分派组合撞编译器已知问题——独立
+    launch 是已验证形态）+ 发起流级等待（返回即全组本轮完成，连续调用无槽位
+    竞态）+ plan 延迟溢出检查（.item() 微秒级）；返回 None。
+    async_finish=True（侧流并发路径）：跳过 host 阻塞，返回发起流完成事件——
+    调用方 wait_event 汇合，跨 rank 槽位/staging 复用安全由调用方在合适位置
+    （如下一轮迭代的 barrier）负责；plan 溢出检查顺延到下一个我方算子尾部
+    （context.pending_overflow 机制）。
     """
-    if barrier:
+    if not async_finish:
         sym_barrier(context)
         record_transport_event(context)  # 跨流护栏 fork 点（只等我方算子）
         check_pending_overflow(context)
@@ -237,9 +237,8 @@ class MoonepContext:
                 f"moonep 暂支持 EP 组 rank 数 <= 64（COMM_MAX_RANK_NUM），当前 {self.rank_size}"
             )
         # 单槽清单缓存：(etc 张量强引用, 清单 NPU 张量组)。同一 plan 的 etc 不变时，
-        # prefetch/reduce 重复调用免清单重建（清单由设备侧 kernel 从 etc 生成）；
-        # 新 etc（新 plan）自动重建。（内部状态，外部只读，勿改）
-        self.prefetch_manifest = None
+        # reduce 重复调用免清单重建（清单由设备侧 kernel 从 etc 生成）；新 etc
+        # （新 plan）自动重建。（内部状态，外部只读，勿改）
         self.reduce_manifest = None
         # plan 中间 workspace 缓存：((S,K,E,R), (dem/topk_all/rem/order))。
         # A/B kernel 对四表全量覆写，同 shape 重复调用免分配。（内部状态，勿改）
@@ -461,9 +460,21 @@ class _MoonepBarrierKernel:
         for r in range_constexpr(world_size):
             if const_expr(r != me):
                 xfer.flush(r)
+        # 共享一对轮询缓冲：range_constexpr 逐 peer 展开时缺省现配会让每个
+        # busy_wait_flag 实例各占一对 UB 缓冲——R=8 时 7 对耗尽 VEC buf_id
+        # （aivec 271 "scalar access internal buffer out of bounds"；R=4 的
+        # 3 对未触界）。与 reduce _poll_row 的共享形态同源。
+        ub_flag = Buffer(MemLoc.UB, (1,), dtypes.int32)
+        ub_epoch = Buffer(MemLoc.UB, (1,), dtypes.int32)
         for r in range_constexpr(world_size):
             if const_expr(r != me):
-                busy_wait_flag(tile_slice(flags, (1,), (r,)), gm_epoch, _BAR_EVENT_ID)
+                busy_wait_flag(
+                    tile_slice(flags, (1,), (r,)),
+                    gm_epoch,
+                    _BAR_EVENT_ID,
+                    ub_flag,
+                    ub_epoch,
+                )
 
 
 @host
