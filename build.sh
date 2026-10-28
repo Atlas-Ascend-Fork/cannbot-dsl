@@ -32,7 +32,7 @@ CHANGED_LIST=""
 # 自动激活 conda 环境（self-hosted runner 为独立进程，默认不激活 conda）。
 # CANNBOT_CONDA_ENV 指定环境名；CANNBOT_CONDA_BASE 显式指定 conda 安装路径
 # （root 运行下 PATH 无 conda 时必需）；置空或设 CANNBOT_NO_CONDA=1 可禁用。
-CANNBOT_CONDA_ENV="${CANNBOT_CONDA_ENV:-cannbot}"
+CANNBOT_CONDA_ENV="${CANNBOT_CONDA_ENV:-cannbot_beta}"
 if [[ "${CANNBOT_NO_CONDA:-0}" != "1" && -n "$CANNBOT_CONDA_ENV" ]]; then
     CONDA_BASE="${CANNBOT_CONDA_BASE:-}"
     if [[ -z "$CONDA_BASE" ]] && command -v conda >/dev/null 2>&1; then

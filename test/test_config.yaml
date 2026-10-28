@@ -39,6 +39,7 @@ skip_all_tests: false
 
 ignore:
   - .pre-commit-config.yaml
+  - build.sh
   - install_deps.sh
   - scripts/ci/operator_list.yaml
   - scripts/ci/parse_changed_ops.py
