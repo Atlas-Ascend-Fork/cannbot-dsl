@@ -17,29 +17,25 @@
   vtopk[N]               每个 (s,k) 的虚拟专家 id 投影（扩展空间 2E，供 ep dispatch 路由）
 
 形状约束：E<=1024、R<=64、E%R==0；S*K 不设上限且任意 N 原生整除
-（topk host 侧直拷 workspace；分块粒度降档到 N 的因子，无尾补机制）。
+（topk 直接使用调用方 [S,K] 扁平视图；分块粒度降档到 N 的因子，无尾补机制）。
 
 算法（与 test/moonep/moonep_golden.py 的规划器同语义）：
-  整段（_MoonepPlanComputeKernel，一次 launch；阶段间 global_sync_all 栅栏）：
-    阶段0  A Exchange（仅 block 0）：跨卡交换各 rank 的 tokens_per_expert 直方图
-           （put + flag + 轮询）；本 rank topk 由 wrapper 直接以调用方张量的
-           扁平视图喂给后续阶段（kernel 零 UB 中转）
-    阶段1  B0 GreedyInit（bi<bdp，按专家切）：dem → rem/order 初态 + 各 block
-           局部 loads 行  |  Cnt（bi<bd，按 chunk 切）：分块 per-expert token 数
-           ——两者互不依赖，同阶段并行
-    阶段2  B Greedy（仅 block 0）：loads 汇总 + 运行时 cap + 贪心修正 +
-           cu_seqlens（含副本槽溢出写保护）
-    阶段3  Tab（bi<R，每 block 一个 rank）：jrep 与 experts_to_copy（含溢出写保护）
-    阶段4  Pfx（bi<bdp，按专家切）：pcnt chunk 前缀/dpre/ord 落位查表 +
+  整段（_MoonepPlanComputeKernel，一次 launch、两次 global_sync_all）：
+    阶段0  Exchange（仅 block 0）：跨卡交换 tokens_per_expert（put + flag + 轮询）
+           Cnt（bi<bd，按 chunk 切）：分块 per-expert token 数
+            GreedyAll（仅 block 0）：dem 在 UB 中完成 rem/order/loads 初始化、
+            运行时 cap、一卡一源贪心修正与 cu_seqlens（每个目的 rank 的
+            远程专家只来自一个 home rank，天然不超过 epn 个副本槽）
+
+    阶段1  Tab（bi<R，每 block 一个 rank）：按唯一远程 home 生成压缩 jrep
+           与 experts_to_copy；Pfx（按专家切）：全局 chunk 位置/ord 落位查表 +
            快路径 vid 表（无远程副本的专家 vid 恒定）
-    阶段5  Asg（bi<bd，按 chunk 切）：段倒计时落位——快路径专家查 vid 表 O(1)，
-           其余只在段边界重定位（pos 越过段尾才扫 ord 表），与逐 token 串行扫描
-           语义逐位等价，产出 vtopk
+    阶段2  Asg（bi<bd，按 chunk 切）：快路径经 vgather 查 vid 表；慢路径下标
+           压缩后按原顺序处理，只在段边界重定位，与逐 token 串行扫描语义逐位等价
 
 Kernel split rationale（历史）：早期把通信（xfer）与重 vf 区直接混在一个
-kernel 里会撞 DSL 编译器 SIGSEGV，所以曾经拆成 7 次 launch。现在的结构是
-“xfer 只出现在阶段 0 的 block 0 上、且紧跟一个 global_sync_all 栅栏”，
-实测可以编过并正确运行，plan 因此收敛到单次 launch。
+kernel 里会撞 DSL 编译器 SIGSEGV，所以曾经拆成 7 次 launch。现在 xfer 只在
+block 0 上执行，与其余阶段共同收敛到单次 launch。
 
 约束备忘：通信只在单 block 内；不用 load_bypass；UB 标量点读写只在 vf(simt) 区域；
 大循环用 cannbotdsl.range 动态循环；tile 写出用单行 tile + 运行时坐标
@@ -60,6 +56,7 @@ try:
     from cannbotdsl.lang.jit import jit
     from cannbotdsl.lang.kernel import kernel
     from cannbotdsl.lang.vf import vf
+    from cannbotdsl.ops import simt
     from cannbotdsl.ops.arch import get_block_idx
     from cannbotdsl.ops.distributed import (
         CommContext,
@@ -68,7 +65,28 @@ try:
         create_transfer_context,
     )
     from cannbotdsl.ops.memcpy import mem_copy
-    from cannbotdsl.ops.sync import global_sync_all
+    from cannbotdsl.ops.reg import (
+        PackMode,
+        full_mask,
+        vadd,
+        varange,
+        vdups,
+        vgather,
+        vhistogram_frequency,
+        vlts,
+        vload,
+        vmem_bar,
+        vunpack,
+        vreinterpret,
+        vsqueeze_and_storeunalign,
+        vsqueeze_and_storeunalign_finalize,
+        vsqueeze_and_storeunalign_init,
+        vstore,
+        vstore_pack,
+        vstore_unalign_begin,
+        vstorealign_squeeze_status,
+    )
+    from cannbotdsl.ops.sync import global_sync_all, vec_sync_all
     from cannbotdsl.tensor import MemLoc, tile_slice
     from cannbotdsl.types.datastruct import StructRef
 
@@ -135,13 +153,20 @@ _MAX_PLAN_BLOCKS = 64
 # 分块粒度下限（token/块）：再小则每 chunk 的 O(E) 状态重建开销占比过高
 _CHUNK_MIN = 128
 
+_I32_LANES = 64
+_HISTOGRAM_BINS_PER_VL = 128
+_HISTOGRAM_U8_LANES = 256
+_HISTOGRAM_MAX_CHUNK = 1 << 16
+_PLAN_INIT_THREADS = 32
+_INT32_BYTES = 4
+
 # 贪心 argmax/argmin 初值（比任何可能的 token 数都大；int32 安全）
 _GREEDY_NEG_INF = -(1 << 30)
 _GREEDY_POS_INF = 1 << 30
 
 
 # ---------------------------------------------------------------------------
-# Kernel A：跨卡需求交换 + 全局汇总（单 block 通信）
+# plan 单 kernel：跨卡交换、规划与 token 落位
 # ---------------------------------------------------------------------------
 @kernel
 class _MoonepPlanComputeKernel:
@@ -151,24 +176,30 @@ class _MoonepPlanComputeKernel:
     下发成本按 “每次 ≈0.09ms + 0.028ms×参数个数” 线性累计；合并后只剩一次。
 
     阶段（块角色由 block_idx 决定；所有 block 都参与每个栅栏）：
-      1. GreedyInit（bi<bdp，按专家切）  |  Count（bi<bd，按 chunk 切）——互不依赖
-      2. Greedy（仅 block 0：串行贪心 + cu）
-      3. Tables（bi<R，每 block 一个 rank） | Pfx（bi<bdp，按专家切）——同依赖
-      4. Assign（bi<bd，按 chunk 切）
+      1. Exchange（block 0） | Count（bi<token_blocks） | GreedyAll（block 0，UB）
+      2. Tables（bi<R） | Pfx（bi<pfx_blocks，按专家切）
+      3. Assign（bi<token_blocks，按 chunk 切）
     """
 
     def __init__(
-        self, rank, rank_size, num_expert, n_tokens, n_chunks, block_dim, init_blocks
+        self,
+        rank,
+        rank_size,
+        num_experts,
+        num_rows,
+        num_chunks,
+        token_blocks,
+        pfx_blocks,
     ):
         self._me = int(rank)
         self._r = int(rank_size)
-        self._e = int(num_expert)
+        self._e = int(num_experts)
         self._epn = self._e // self._r
-        self._chunk = int(n_tokens) // int(n_chunks)
-        self._nc = int(n_chunks)
-        self._bd = int(block_dim)
-        self._bdp = int(init_blocks)
-        self._ws = _ws_layout(self._r, self._e, self._nc, self._bdp)
+        self._chunk = int(num_rows) // int(num_chunks)
+        self._num_chunks = int(num_chunks)
+        self._token_blocks = int(token_blocks)
+        self._pfx_blocks = int(pfx_blocks)
+        self._ws = _ws_layout(self._r, self._e, self._num_chunks)
 
     def __call__(
         self,
@@ -182,47 +213,36 @@ class _MoonepPlanComputeKernel:
         gm_vtopk,
         ctx: StructRef[CommContext],
     ):
-        r, e, nc, bdp = self._r, self._e, self._nc, self._bdp
+        r, e, nc = self._r, self._e, self._num_chunks
         o = self._ws
-        # 扁平 workspace 按编译期偏移切视图（10 个表 → program 1 个参数；
+        # 扁平 workspace 按编译期偏移切视图（9 个表 → program 1 个参数；
         # dem_by_rank 单独传：Exchange 的 peer 寻址需要原始指针）
         gm_rem = gm_ws[o["rem"] : o["rem"] + e * r,].view(e, r)
         gm_order = gm_ws[o["order"] : o["order"] + e * r,].view(e, r)
-        gm_loads_part = gm_ws[o["loads_part"] : o["loads_part"] + bdp * r,].view(bdp, r)
         gm_counts = gm_ws[o["counts"] : o["counts"] + nc * e,].view(nc, e)
         gm_pcnt = gm_ws[o["pcnt"] : o["pcnt"] + e * nc,].view(e, nc)
-        gm_dpre = gm_ws[o["dpre"] : o["dpre"] + e,]
         gm_vid = gm_ws[o["vid"] : o["vid"] + e,]
-        gm_ord_rank = gm_ws[o["ord_rank"] : o["ord_rank"] + e * (r + 1),].view(e, r + 1)
-        gm_ord_end = gm_ws[o["ord_end"] : o["ord_end"] + e * (r + 1),].view(e, r + 1)
-        gm_jrep = gm_ws[o["jrep"] : o["jrep"] + r * e,].view(r, e)
+        gm_ord_rank = gm_ws[o["ord_rank"] : o["ord_rank"] + e * r,].view(e, r)
+        gm_ord_end = gm_ws[o["ord_end"] : o["ord_end"] + e * r,].view(e, r)
+        gm_jrep = gm_ws[o["jrep"] : o["jrep"] + e,].view(r, self._epn)
+        gm_rhome = gm_ws[o["rhome"] : o["rhome"] + r,]
         bi = get_block_idx()
+        ub_dem = Buffer(MemLoc.UB, (r, e), dtypes.int32)
 
-        # ---- 阶段 0：跨卡需求交换（仅 block 0；put+flag+轮询） ----
         if bi == dtypes.int64(0):
-            self._exchange(ctx, gm_tpe, gm_flag, gm_dem_by_rank)
-
-        global_sync_all()
-
-        # ---- 阶段 1：需求初始化（按专家） + 分块计数（按 chunk），互不依赖 ----
-        if bi < dtypes.int64(self._bdp):
-            self._greedy_init(bi, gm_dem_by_rank, gm_rem, gm_order, gm_loads_part)
-        if bi < dtypes.int64(self._bd):
+            self._exchange(ctx, gm_tpe, gm_flag, gm_dem_by_rank, ub_dem)
+        if bi < dtypes.int64(self._token_blocks):
             self._count(bi, gm_topk, gm_counts)
-
-        global_sync_all()
-
-        # ---- 阶段 2：贪心修正 + cu（单 block 串行） ----
         if bi == dtypes.int64(0):
-            self._greedy(gm_rem, gm_order, gm_loads_part, gm_cu)
+            self._greedy_all(ub_dem, gm_rem, gm_order, gm_rhome, gm_cu)
 
         global_sync_all()
 
-        # ---- 阶段 3：jrep/etc 表（每 block 一个 rank）∥ 前缀/查表（按专家） ----
-        # 两者都只依赖阶段 2 的 order/counts，写不同输出，同阶段并行
+        # ---- 阶段 1：jrep/etc 表（每 block 一个 rank）∥ 前缀/查表（按专家） ----
+        # 两者都只依赖阶段 0 的 order/counts，写不同输出，同阶段并行
         if bi < dtypes.int64(self._r):
-            self._tables(bi, gm_order, gm_jrep, gm_etc)
-        if bi < dtypes.int64(self._bdp):
+            self._tables(bi, gm_order, gm_rhome, gm_jrep, gm_etc)
+        if bi < dtypes.int64(self._pfx_blocks):
             self._pfx(
                 bi,
                 gm_dem_by_rank,
@@ -230,7 +250,6 @@ class _MoonepPlanComputeKernel:
                 gm_rem,
                 gm_order,
                 gm_pcnt,
-                gm_dpre,
                 gm_vid,
                 gm_ord_rank,
                 gm_ord_end,
@@ -238,13 +257,12 @@ class _MoonepPlanComputeKernel:
 
         global_sync_all()
 
-        # ---- 阶段 4：token 落位（按 chunk） ----
-        if bi < dtypes.int64(self._bd):
+        # ---- 阶段 2：token 落位（按 chunk） ----
+        if bi < dtypes.int64(self._token_blocks):
             self._assign(
                 bi,
                 gm_topk,
                 gm_pcnt,
-                gm_dpre,
                 gm_ord_rank,
                 gm_ord_end,
                 gm_jrep,
@@ -254,7 +272,7 @@ class _MoonepPlanComputeKernel:
 
     # ---------------- 阶段 0：Exchange（单 block 通信） ----------------
     @jit
-    def _exchange(self, ctx, gm_tpe, gm_flag, gm_dem_by_rank):
+    def _exchange(self, ctx, gm_tpe, gm_flag, gm_dem_by_rank, ub_dem):
         world_size, num_experts, me = self._r, self._e, self._me
         dem_all = SymBuffer(
             ctx,
@@ -290,98 +308,141 @@ class _MoonepPlanComputeKernel:
         for r in range_constexpr(world_size):
             if const_expr(r != me):
                 busy_wait_flag(tile_slice(ready, (1,), (r,)), gm_flag, _EVENT_ID)
-        ub_dem = Buffer(MemLoc.UB, (world_size, num_experts), dtypes.int32)
         mem_copy(ub_dem, tile_slice(dem_all, (world_size, num_experts), (0, 0)))
         mem_copy(gm_dem_by_rank, ub_dem)
 
-    # ---------------- 阶段 1a：GreedyInit ----------------
-    @jit
-    def _greedy_init(self, bi, gm_dem_by_rank, gm_rem, gm_order, gm_loads_part):
-        world_size, num_experts = self._r, self._e
-        e_per = num_experts // self._bdp
-        e_lo = bi * e_per
-
-        ub_dem = Buffer(MemLoc.UB, (world_size, num_experts), dtypes.int32)
-        mem_copy(ub_dem, gm_dem_by_rank)
-        ub_rem_row = Buffer(MemLoc.UB, (1, world_size), dtypes.int32)
-        ub_order_row = Buffer(MemLoc.UB, (1, world_size), dtypes.int32)
-        ub_part = Buffer(MemLoc.UB, (world_size,), dtypes.int32)
-
-        with vf(mode="simt", thread=1):
-            for r in range_constexpr(world_size):
-                ub_part[dtypes.int64(r)] = dtypes.int32(0)
-        for k in cannbotdsl.range(e_per):
-            e = e_lo + k
-            self._init_expert_row(e, ub_dem, ub_rem_row, ub_order_row, ub_part)
-            mem_copy(tile_slice(gm_rem, (1, world_size), (e, 0)), ub_rem_row)
-            mem_copy(tile_slice(gm_order, (1, world_size), (e, 0)), ub_order_row)
-        mem_copy(tile_slice(gm_loads_part, (1, world_size), (bi, 0)), ub_part)
-
-    @jit
-    def _init_expert_row(self, e, ub_dem, ub_rem_row, ub_order_row, ub_part):
-        """单专家：全局需求求和 → home 放置 + 负载累计。"""
-        epn = self._epn
-        with vf(mode="simt", thread=1):
-            total = dtypes.int32(0)
-            for r in range_constexpr(self._r):
-                total = total + ub_dem[dtypes.int64(r), dtypes.int64(e)]
-            h = e // epn
-            for r in range_constexpr(self._r):
-                ub_rem_row[dtypes.int64(0), dtypes.int64(r)] = dtypes.int32(0)
-                ub_order_row[dtypes.int64(0), dtypes.int64(r)] = dtypes.int32(0)
-            ub_rem_row[dtypes.int64(0), h] = total
-            ub_order_row[dtypes.int64(0), h] = dtypes.int32(1)
-            ub_part[dtypes.int64(h)] = ub_part[dtypes.int64(h)] + total
-
-    # ---------------- 阶段 1b：Count ----------------
+    # ---------------- 阶段 0：Count ----------------
     @jit
     def _count(self, bi, gm_topk, gm_counts):
-        num_experts, chunk, nc, bd = self._e, self._chunk, self._nc, self._bd
+        num_experts, chunk, nc, bd = (
+            self._e,
+            self._chunk,
+            self._num_chunks,
+            self._token_blocks,
+        )
         ub_topk = Buffer(MemLoc.UB, (chunk,), dtypes.int32)
-        ub_cnt = Buffer(MemLoc.UB, (num_experts,), dtypes.int32)
+        use_vec = (
+            num_experts <= 2 * _HISTOGRAM_BINS_PER_VL
+            and chunk % _HISTOGRAM_U8_LANES == 0
+            and chunk < _HISTOGRAM_MAX_CHUNK
+        )
 
         for k in cannbotdsl.range(nc // bd):
             ci = bi + k * bd
-            with vf(mode="simt", thread=1):
-                for e in cannbotdsl.range(num_experts):
-                    ub_cnt[dtypes.int64(e)] = dtypes.int32(0)
-            mem_copy(ub_topk, tile_slice(gm_topk, (chunk,), (ci,)))
-            with vf(mode="simt", thread=1):
-                for i in cannbotdsl.range(chunk):
-                    e = ub_topk[dtypes.int64(i)]
-                    ub_cnt[e] = ub_cnt[e] + dtypes.int32(1)
-            mem_copy(tile_slice(gm_counts, (1, num_experts), (ci, 0)), ub_cnt)
+            if const_expr(use_vec):
+                ub_u8 = Buffer(MemLoc.UB, (chunk,), dtypes.uint8)
+                ub_hist = Buffer(MemLoc.UB, (2 * _HISTOGRAM_BINS_PER_VL,), dtypes.int32)
+                mem_copy(ub_topk, tile_slice(gm_topk, (chunk,), (ci,)))
+                with vf(mode="simd"):
+                    mask8 = full_mask(8)
+                    mask16 = full_mask(16)
+                    mask32 = full_mask(32)
+                    for off in range_constexpr(0, chunk, _I32_LANES):
+                        vstore_pack(
+                            ub_u8,
+                            off,
+                            vload(ub_topk, off),
+                            mask32,
+                            pack_mode=PackMode.PACK_QUARTER,
+                        )
+                    vmem_bar("vst_vld")
+                    acc0 = vdups(0, dtypes.uint16, mask=mask16)
+                    if const_expr(num_experts > _HISTOGRAM_BINS_PER_VL):
+                        acc1 = vdups(0, dtypes.uint16, mask=mask16)
+                    for off in range_constexpr(0, chunk, _HISTOGRAM_U8_LANES):
+                        ids = vload(ub_u8, off)
+                        freq0 = vhistogram_frequency(ids, mask=mask8, bin=0)
+                        acc0 = vadd(acc0, freq0, mask=mask16)
+                        if const_expr(num_experts > _HISTOGRAM_BINS_PER_VL):
+                            freq1 = vhistogram_frequency(ids, mask=mask8, bin=1)
+                            acc1 = vadd(acc1, freq1, mask=mask16)
+                    lo = vreinterpret(
+                        vunpack(acc0, dtypes.uint32, part="lower"), dtypes.int32
+                    )
+                    vstore(ub_hist, 0, lo, mask32)
+                    if const_expr(num_experts > _I32_LANES):
+                        hi = vreinterpret(
+                            vunpack(acc0, dtypes.uint32, part="upper"), dtypes.int32
+                        )
+                        vstore(ub_hist, _I32_LANES, hi, mask32)
+                    if const_expr(num_experts > _HISTOGRAM_BINS_PER_VL):
+                        lo1 = vreinterpret(
+                            vunpack(acc1, dtypes.uint32, part="lower"), dtypes.int32
+                        )
+                        vstore(ub_hist, _HISTOGRAM_BINS_PER_VL, lo1, mask32)
+                        if const_expr(
+                            num_experts > _HISTOGRAM_BINS_PER_VL + _I32_LANES
+                        ):
+                            hi1 = vreinterpret(
+                                vunpack(acc1, dtypes.uint32, part="upper"), dtypes.int32
+                            )
+                            vstore(
+                                ub_hist,
+                                _HISTOGRAM_BINS_PER_VL + _I32_LANES,
+                                hi1,
+                                mask32,
+                            )
+                mem_copy(
+                    tile_slice(gm_counts, (1, num_experts), (ci, 0)),
+                    tile_slice(ub_hist, (num_experts,), (0,)),
+                )
+            else:
+                ub_cnt = Buffer(MemLoc.UB, (num_experts,), dtypes.int32)
+                with vf(mode="simt", thread=1):
+                    for e in cannbotdsl.range(num_experts):
+                        ub_cnt[dtypes.int64(e)] = dtypes.int32(0)
+                mem_copy(ub_topk, tile_slice(gm_topk, (chunk,), (ci,)))
+                with vf(mode="simt", thread=1):
+                    for i in cannbotdsl.range(chunk):
+                        e = ub_topk[dtypes.int64(i)]
+                        ub_cnt[e] = ub_cnt[e] + dtypes.int32(1)
+                mem_copy(tile_slice(gm_counts, (1, num_experts), (ci, 0)), ub_cnt)
 
-    # ---------------- 阶段 2：Greedy ----------------
     @jit
-    def _greedy(self, gm_rem, gm_order, gm_loads_part, gm_cu):
+    def _greedy_all(self, ub_dem, gm_rem, gm_order, gm_rhome, gm_cu):
         world_size, num_experts = self._r, self._e
+        epn = self._epn
         ub_rem = Buffer(MemLoc.UB, (num_experts, world_size), dtypes.int32)
-        mem_copy(ub_rem, gm_rem)
         ub_order = Buffer(MemLoc.UB, (num_experts, world_size), dtypes.int32)
-        mem_copy(ub_order, gm_order)
         ub_loads = Buffer(MemLoc.UB, (world_size,), dtypes.int32)
-        ub_part_all = Buffer(MemLoc.UB, (self._bdp, world_size), dtypes.int32)
-        mem_copy(ub_part_all, gm_loads_part)
-        ub_sizes = Buffer(MemLoc.UB, (2 * self._epn,), dtypes.int32)
-        ub_cu = Buffer(MemLoc.UB, (2 * self._epn,), dtypes.int32)
+        ub_rhome = Buffer(MemLoc.UB, (world_size,), dtypes.int32)
+        ub_sizes = Buffer(MemLoc.UB, (2 * epn,), dtypes.int32)
+        ub_cu = Buffer(MemLoc.UB, (2 * epn,), dtypes.int32)
 
-        with vf(mode="simt", thread=1):
-            for r in range_constexpr(world_size):
+        with vf(mode="simt", thread=_PLAN_INIT_THREADS):
+            tid = simt.thread_idx()[0]
+            nt = simt.thread_dim()[0]
+            for e in cannbotdsl.range(tid, num_experts, nt):
+                total = dtypes.int32(0)
+                for r in range_constexpr(world_size):
+                    total = total + ub_dem[dtypes.int64(r), dtypes.int64(e)]
+                home_rank = e // epn
+                for r in range_constexpr(world_size):
+                    ub_rem[dtypes.int64(e), dtypes.int64(r)] = dtypes.int32(0)
+                    ub_order[dtypes.int64(e), dtypes.int64(r)] = dtypes.int32(0)
+                ub_rem[dtypes.int64(e), home_rank] = total
+                ub_order[dtypes.int64(e), home_rank] = dtypes.int32(1)
+            simt.syncthreads()
+            for r in cannbotdsl.range(tid, world_size, nt):
                 acc = dtypes.int32(0)
-                for b in range_constexpr(self._bdp):
-                    acc = acc + ub_part_all[dtypes.int64(b), dtypes.int64(r)]
+                for e in cannbotdsl.range(num_experts):
+                    acc = acc + ub_rem[dtypes.int64(e), dtypes.int64(r)]
                 ub_loads[dtypes.int64(r)] = acc
-            cap = dtypes.int32(0)
-            for r in range_constexpr(world_size):
-                cap = cap + ub_loads[dtypes.int64(r)]
-            cap = cap // world_size
-            for _it in cannbotdsl.range(num_experts):
-                if self._loads_max(ub_loads) > cap:
-                    self._greedy_round(ub_rem, ub_order, ub_loads, cap)
-            self._fill_sizes_cu(ub_rem, ub_order, ub_sizes, ub_cu)
+                ub_rhome[dtypes.int64(r)] = dtypes.int32(-1)
+            simt.syncthreads()
+            if tid == 0:
+                cap = dtypes.int32(0)
+                for r in range_constexpr(world_size):
+                    cap = cap + ub_loads[dtypes.int64(r)]
+                cap = cap // world_size
+                for _it in cannbotdsl.range(world_size):
+                    if self._loads_max(ub_loads) > cap:
+                        self._greedy_round(ub_rem, ub_order, ub_loads, ub_rhome, cap)
+                self._fill_sizes_cu(ub_rem, ub_order, ub_rhome, ub_sizes, ub_cu)
+            simt.syncthreads()
         mem_copy(gm_rem, ub_rem)
         mem_copy(gm_order, ub_order)
+        mem_copy(gm_rhome, ub_rhome)
         mem_copy(gm_cu, ub_cu)
 
     @jit
@@ -414,39 +475,47 @@ class _MoonepPlanComputeKernel:
 
     @jit
     def _max_rem_expert(self, ub_rem, src_r):
+        epn = self._epn
+        e_lo = src_r * epn
         e_best = dtypes.int32(-1)
         rem_best = dtypes.int32(0)
-        for e in cannbotdsl.range(self._e):
+        for i in cannbotdsl.range(epn):
+            e = dtypes.int32(e_lo + i)
             rem_er = ub_rem[dtypes.int64(e), src_r]
             if rem_er > rem_best:
                 rem_best = rem_er
-                e_best = dtypes.int32(e)
+                e_best = e
         return e_best, rem_best
 
     @jit
-    def _greedy_round(self, ub_rem, ub_order, ub_loads, cap):
+    def _greedy_round(self, ub_rem, ub_order, ub_loads, ub_rhome, cap):
         src_r = self._loads_argmax(ub_loads)
         dst_r = self._loads_argmin(ub_loads)
-        e_best, rem_best = self._max_rem_expert(ub_rem, src_r)
-        move = ub_loads[src_r] - cap
-        room = cap - ub_loads[dst_r]
-        if room < move:
-            move = room
-        if rem_best < move:
-            move = rem_best
-        if ub_order[e_best, dst_r] == dtypes.int32(0):
-            n_copy = dtypes.int32(0)
-            for r in range_constexpr(self._r):
-                if ub_order[e_best, dtypes.int64(r)] > dtypes.int32(0):
-                    n_copy = n_copy + dtypes.int32(1)
-            ub_order[e_best, dst_r] = n_copy + dtypes.int32(1)
-        ub_rem[e_best, src_r] = ub_rem[e_best, src_r] - move
-        ub_rem[e_best, dst_r] = ub_rem[e_best, dst_r] + move
-        ub_loads[src_r] = ub_loads[src_r] - move
-        ub_loads[dst_r] = ub_loads[dst_r] + move
+        move = cap - ub_loads[dst_r]
+        moved = dtypes.int32(0)
+        ub_rhome[dst_r] = src_r
+        for _ in cannbotdsl.range(self._epn):
+            if move > dtypes.int32(0):
+                e_best, rem_best = self._max_rem_expert(ub_rem, src_r)
+                if rem_best > dtypes.int32(0):
+                    take = rem_best
+                    if move < take:
+                        take = move
+                    if ub_order[e_best, dst_r] == dtypes.int32(0):
+                        n_copy = dtypes.int32(0)
+                        for r in range_constexpr(self._r):
+                            if ub_order[e_best, dtypes.int64(r)] > dtypes.int32(0):
+                                n_copy = n_copy + dtypes.int32(1)
+                        ub_order[e_best, dst_r] = n_copy + dtypes.int32(1)
+                    ub_rem[e_best, src_r] = ub_rem[e_best, src_r] - take
+                    ub_rem[e_best, dst_r] = ub_rem[e_best, dst_r] + take
+                    move = move - take
+                    moved = moved + take
+        ub_loads[src_r] = ub_loads[src_r] - moved
+        ub_loads[dst_r] = cap
 
     @jit
-    def _fill_sizes_cu(self, ub_rem, ub_order, ub_sizes, ub_cu):
+    def _fill_sizes_cu(self, ub_rem, ub_order, ub_rhome, ub_sizes, ub_cu):
         me = self._me
         epn = self._epn
         for i in range_constexpr(epn):
@@ -456,51 +525,49 @@ class _MoonepPlanComputeKernel:
         for i in range_constexpr(epn):
             ub_sizes[dtypes.int64(epn + i)] = dtypes.int32(0)
         rep_cnt = dtypes.int32(0)
-        for e in cannbotdsl.range(self._e):
-            o = ub_order[dtypes.int64(e), dtypes.int64(me)]
-            if o >= dtypes.int32(2):
-                if rep_cnt < dtypes.int32(epn):
+        home = ub_rhome[dtypes.int64(me)]
+        if home >= dtypes.int32(0):
+            for i in cannbotdsl.range(epn):
+                e = home * epn + i
+                if ub_order[dtypes.int64(e), dtypes.int64(me)] >= dtypes.int32(2):
                     ub_sizes[dtypes.int32(epn) + rep_cnt] = ub_rem[
                         dtypes.int64(e), dtypes.int64(me)
                     ]
-                rep_cnt = rep_cnt + dtypes.int32(1)
+                    rep_cnt = rep_cnt + dtypes.int32(1)
         acc = dtypes.int32(0)
         for i in range_constexpr(2 * epn):
             acc = acc + ub_sizes[dtypes.int64(i)]
             ub_cu[dtypes.int64(i)] = acc
 
-    # ---------------- 阶段 3：Tables ----------------
+    # ---------------- 阶段 1：Tables ----------------
     @jit
-    def _tables(self, r, gm_order, gm_jrep, gm_etc):
-        num_experts, epn = self._e, self._epn
-        ub_order = Buffer(MemLoc.UB, (num_experts, self._r), dtypes.int32)
-        mem_copy(ub_order, gm_order)
-        ub_jrep_row = Buffer(MemLoc.UB, (1, num_experts), dtypes.int32)
+    def _tables(self, r, gm_order, gm_rhome, gm_jrep, gm_etc):
+        epn = self._epn
+        ub_jrep_row = Buffer(MemLoc.UB, (1, epn), dtypes.int32)
         ub_etc_row = Buffer(MemLoc.UB, (1, epn), dtypes.int32)
 
         with vf(mode="simt", thread=1):
-            self._fill_jrep_etc(ub_order, ub_jrep_row, ub_etc_row, r, epn)
-        mem_copy(tile_slice(gm_jrep, (1, num_experts), (r, 0)), ub_jrep_row)
+            self._fill_jrep_etc(gm_order, gm_rhome, ub_jrep_row, ub_etc_row, r, epn)
+        mem_copy(tile_slice(gm_jrep, (1, epn), (r, 0)), ub_jrep_row)
         mem_copy(tile_slice(gm_etc, (1, epn), (r, 0)), ub_etc_row)
 
     @jit
-    def _fill_jrep_etc(self, ub_order, ub_jrep_row, ub_etc_row, r, epn):
-        jc = dtypes.int32(0)
-        for e in cannbotdsl.range(self._e):
-            ub_jrep_row[dtypes.int64(0), dtypes.int64(e)] = jc
-            if ub_order[dtypes.int64(e), dtypes.int64(r)] >= dtypes.int32(2):
-                jc = jc + dtypes.int32(1)
+    def _fill_jrep_etc(self, gm_order, gm_rhome, ub_jrep_row, ub_etc_row, r, epn):
         for j in range_constexpr(epn):
+            ub_jrep_row[dtypes.int64(0), dtypes.int64(j)] = dtypes.int32(0)
             ub_etc_row[dtypes.int64(0), dtypes.int64(j)] = dtypes.int32(-1)
-        rc = dtypes.int32(0)
-        for e in cannbotdsl.range(self._e):
-            o = ub_order[dtypes.int64(e), dtypes.int64(r)]
-            if o >= dtypes.int32(2):
-                if rc < dtypes.int32(epn):
+        home = simt.l2cache_load(gm_rhome.ptr((dtypes.int64(r),)))
+        if home >= dtypes.int32(0):
+            rc = dtypes.int32(0)
+            for i in cannbotdsl.range(epn):
+                e = home * epn + i
+                o = simt.l2cache_load(gm_order.ptr((dtypes.int64(e), dtypes.int64(r))))
+                if o >= dtypes.int32(2):
+                    ub_jrep_row[dtypes.int64(0), dtypes.int64(i)] = rc
                     ub_etc_row[dtypes.int64(0), rc] = dtypes.int32(e)
-                rc = rc + dtypes.int32(1)
+                    rc = rc + dtypes.int32(1)
 
-    # ---------------- 阶段 4：Pfx ----------------
+    # ---------------- 阶段 1：Pfx ----------------
     @jit
     def _pfx(
         self,
@@ -510,14 +577,13 @@ class _MoonepPlanComputeKernel:
         gm_rem,
         gm_order,
         gm_pcnt,
-        gm_dpre,
         gm_vid,
         gm_ord_rank,
         gm_ord_end,
     ):
         world_size, num_experts = self._r, self._e
-        nc = self._nc
-        e_per = num_experts // self._bdp
+        nc = self._num_chunks
+        e_per = num_experts // self._pfx_blocks
         e_lo = bi * e_per
 
         ub_dem = Buffer(MemLoc.UB, (world_size, num_experts), dtypes.int32)
@@ -530,33 +596,30 @@ class _MoonepPlanComputeKernel:
         mem_copy(ub_order, gm_order)
 
         pcnt_row = Buffer(MemLoc.UB, (1, nc), dtypes.int32)
-        dpre_row = Buffer(MemLoc.UB, (1,), dtypes.int32)
         vid_row = Buffer(MemLoc.UB, (1,), dtypes.int32)
-        ord_rank_row = Buffer(MemLoc.UB, (1, world_size + 1), dtypes.int32)
-        ord_end_row = Buffer(MemLoc.UB, (1, world_size + 1), dtypes.int32)
+        ord_rank_row = Buffer(MemLoc.UB, (1, world_size), dtypes.int32)
+        ord_end_row = Buffer(MemLoc.UB, (1, world_size), dtypes.int32)
 
         for k in cannbotdsl.range(e_per):
             e = e_lo + k
-            self._build_row(
+            self._build_pfx_row(
                 e,
                 ub_dem,
                 ub_counts,
                 ub_rem,
                 ub_order,
                 pcnt_row,
-                dpre_row,
                 vid_row,
                 ord_rank_row,
                 ord_end_row,
             )
             mem_copy(tile_slice(gm_pcnt, (1, nc), (e, 0)), pcnt_row)
-            mem_copy(tile_slice(gm_dpre, (1,), (e,)), dpre_row)
             mem_copy(tile_slice(gm_vid, (1,), (e,)), vid_row)
-            mem_copy(tile_slice(gm_ord_rank, (1, world_size + 1), (e, 0)), ord_rank_row)
-            mem_copy(tile_slice(gm_ord_end, (1, world_size + 1), (e, 0)), ord_end_row)
+            mem_copy(tile_slice(gm_ord_rank, (1, world_size), (e, 0)), ord_rank_row)
+            mem_copy(tile_slice(gm_ord_end, (1, world_size), (e, 0)), ord_end_row)
 
     @jit
-    def _build_row(
+    def _build_pfx_row(
         self,
         e,
         ub_dem,
@@ -564,56 +627,55 @@ class _MoonepPlanComputeKernel:
         ub_rem,
         ub_order,
         pcnt_row,
-        dpre_row,
         vid_row,
         ord_rank_row,
         ord_end_row,
     ):
         world_size = self._r
         me = self._me
-        nc = self._nc
+        nc = self._num_chunks
         epn = self._e // self._r
         with vf(mode="simt", thread=1):
-            acc_c = dtypes.int32(0)
-            for c in range_constexpr(nc):
-                pcnt_row[dtypes.int64(0), dtypes.int64(c)] = acc_c
-                acc_c = acc_c + ub_counts[dtypes.int64(c), dtypes.int64(e)]
             acc_p = dtypes.int32(0)
             for r in range_constexpr(world_size):
                 if r < me:
                     acc_p = acc_p + ub_dem[dtypes.int64(r), dtypes.int64(e)]
-            dpre_row[dtypes.int64(0)] = acc_p
-            hh = e // epn
+            acc_c = dtypes.int32(0)
+            for c in range_constexpr(nc):
+                pcnt_row[dtypes.int64(0), dtypes.int64(c)] = acc_p + acc_c
+                acc_c = acc_c + ub_counts[dtypes.int64(c), dtypes.int64(e)]
+            home_rank = e // epn
             fast = dtypes.int32(1)
             for r in range_constexpr(world_size):
-                if dtypes.int64(r) != hh:
+                if dtypes.int64(r) != home_rank:
                     if ub_rem[dtypes.int64(e), dtypes.int64(r)] > dtypes.int32(0):
                         fast = dtypes.int32(0)
             if fast != dtypes.int32(0):
-                vid_row[dtypes.int64(0)] = dtypes.int32(hh * (2 * epn) + (e % epn))
+                vid_row[dtypes.int64(0)] = dtypes.int32(
+                    home_rank * (2 * epn) + (e % epn)
+                )
             else:
                 vid_row[dtypes.int64(0)] = dtypes.int32(-1)
-            for o in range_constexpr(world_size + 1):
+            for o in range_constexpr(world_size):
                 ord_rank_row[dtypes.int64(0), dtypes.int64(o)] = dtypes.int32(-1)
             for r in range_constexpr(world_size):
                 o = ub_order[dtypes.int64(e), dtypes.int64(r)]
                 if o >= dtypes.int32(1):
                     ord_rank_row[dtypes.int64(0), dtypes.int64(o - 1)] = dtypes.int32(r)
             acc_o = dtypes.int32(0)
-            for o in range_constexpr(world_size + 1):
+            for o in range_constexpr(world_size):
                 rnk = ord_rank_row[dtypes.int64(0), dtypes.int64(o)]
                 if rnk >= dtypes.int32(0):
                     acc_o = acc_o + ub_rem[dtypes.int64(e), dtypes.int64(rnk)]
                 ord_end_row[dtypes.int64(0), dtypes.int64(o)] = acc_o
 
-    # ---------------- 阶段 5：Assign ----------------
+    # ---------------- 阶段 2：Assign ----------------
     @jit
     def _assign(
         self,
         bi,
         gm_topk,
         gm_pcnt,
-        gm_dpre,
         gm_ord_rank,
         gm_ord_end,
         gm_jrep,
@@ -621,59 +683,80 @@ class _MoonepPlanComputeKernel:
         gm_vtopk,
     ):
         world_size, num_experts = self._r, self._e
-        nc, bd = self._nc, self._bd
+        nc, bd = self._num_chunks, self._token_blocks
 
-        self._pcnt = Buffer(MemLoc.UB, (num_experts, nc), dtypes.int32)
-        mem_copy(self._pcnt, gm_pcnt)
-        self._dpre = Buffer(MemLoc.UB, (num_experts,), dtypes.int32)
-        mem_copy(self._dpre, gm_dpre)
-        self._ord_rank = Buffer(MemLoc.UB, (num_experts, world_size + 1), dtypes.int32)
+        self._ord_rank = Buffer(MemLoc.UB, (num_experts, world_size), dtypes.int32)
         mem_copy(self._ord_rank, gm_ord_rank)
-        self._ord_end = Buffer(MemLoc.UB, (num_experts, world_size + 1), dtypes.int32)
+        self._ord_end = Buffer(MemLoc.UB, (num_experts, world_size), dtypes.int32)
         mem_copy(self._ord_end, gm_ord_end)
-        self._jrep = Buffer(MemLoc.UB, (world_size, num_experts), dtypes.int32)
+        self._jrep = Buffer(MemLoc.UB, (world_size, self._epn), dtypes.int32)
         mem_copy(self._jrep, gm_jrep)
         self._vid = Buffer(MemLoc.UB, (num_experts,), dtypes.int32)
         mem_copy(self._vid, gm_vid)
 
         for k in cannbotdsl.range(nc // bd):
-            self._assign_chunk(bi + k * bd, gm_topk, gm_vtopk)
+            self._assign_chunk(bi + k * bd, gm_topk, gm_pcnt, gm_vtopk)
 
     @jit
-    def _assign_chunk(self, ci, gm_topk, gm_vtopk):
+    def _assign_chunk(self, ci, gm_topk, gm_pcnt, gm_vtopk):
         num_experts = self._e
         chunk = self._chunk
         ub_topk = Buffer(MemLoc.UB, (chunk,), dtypes.int32)
         ub_vtopk = Buffer(MemLoc.UB, (chunk,), dtypes.int32)
+        ub_slow = Buffer(MemLoc.UB, (chunk,), dtypes.int32)
+        ub_nslow = Buffer(MemLoc.UB, (1,), dtypes.int32)
         ub_pos = Buffer(MemLoc.UB, (num_experts,), dtypes.int32)
-        ub_send = Buffer(MemLoc.UB, (num_experts,), dtypes.int32)
-        ub_cvid = Buffer(MemLoc.UB, (num_experts,), dtypes.int32)
+        ub_seg_end = Buffer(MemLoc.UB, (num_experts,), dtypes.int32)
+        ub_cur_vid = Buffer(MemLoc.UB, (num_experts,), dtypes.int32)
 
         with vf(mode="simt", thread=1):
             for e in cannbotdsl.range(num_experts):
                 if self._vid[dtypes.int64(e)] < dtypes.int32(0):
-                    ub_pos[dtypes.int64(e)] = (
-                        self._dpre[dtypes.int64(e)]
-                        + self._pcnt[dtypes.int64(e), dtypes.int64(ci)]
+                    ub_pos[dtypes.int64(e)] = simt.l2cache_load(
+                        gm_pcnt.ptr((dtypes.int64(e), dtypes.int64(ci)))
                     )
-                    ub_send[dtypes.int64(e)] = dtypes.int32(0)
+                    ub_seg_end[dtypes.int64(e)] = dtypes.int32(0)
         mem_copy(ub_topk, tile_slice(gm_topk, (chunk,), (ci,)))
+        vec_end = chunk - chunk % _I32_LANES
+        if const_expr(vec_end > 0):
+            with vf(mode="simd"):
+                mask = full_mask(32)
+                cursor = vstore_unalign_begin(ub_slow)
+                for off in range_constexpr(0, vec_end, _I32_LANES):
+                    indices = vreinterpret(vload(ub_topk, off), dtypes.uint32)
+                    values = vgather(self._vid, indices, mask=mask)
+                    vstore(ub_vtopk, off, values, mask)
+                    slow = vlts(values, 0, mask=mask)
+                    positions = varange(off, dtypes.int32)
+                    squeezed = vsqueeze_and_storeunalign_init(positions, mask=slow)
+                    vsqueeze_and_storeunalign(ub_slow, 0, squeezed, cursor)
+                vsqueeze_and_storeunalign_finalize(ub_slow, 0, cursor)
+                vstorealign_squeeze_status(ub_nslow, 0)
+            vec_sync_all()
         with vf(mode="simt", thread=1):
-            for i in cannbotdsl.range(chunk):
+            if const_expr(vec_end > 0):
+                nslow = ub_nslow[dtypes.int64(0)] // dtypes.int32(_INT32_BYTES)
+            else:
+                nslow = dtypes.int32(0)
+            for i in range_constexpr(vec_end, chunk):
                 e = ub_topk[dtypes.int64(i)]
                 fv = self._vid[dtypes.int64(e)]
-                if fv >= dtypes.int32(0):
-                    ub_vtopk[dtypes.int64(i)] = fv
-                else:
-                    pos = ub_pos[dtypes.int64(e)]
-                    if pos >= ub_send[dtypes.int64(e)]:
-                        vid, seg_idx = self._relocate(e, pos)
-                        ub_send[dtypes.int64(e)] = self._ord_end[
-                            dtypes.int64(e), seg_idx
-                        ]
-                        ub_cvid[dtypes.int64(e)] = vid
-                    ub_vtopk[dtypes.int64(i)] = ub_cvid[dtypes.int64(e)]
-                    ub_pos[dtypes.int64(e)] = pos + dtypes.int32(1)
+                ub_vtopk[dtypes.int64(i)] = fv
+                if fv < dtypes.int32(0):
+                    ub_slow[dtypes.int64(nslow)] = dtypes.int32(i)
+                    nslow = nslow + dtypes.int32(1)
+            for j in cannbotdsl.range(nslow):
+                i = ub_slow[dtypes.int64(j)]
+                e = ub_topk[dtypes.int64(i)]
+                pos = ub_pos[dtypes.int64(e)]
+                if pos >= ub_seg_end[dtypes.int64(e)]:
+                    vid, seg_idx = self._relocate(e, pos)
+                    ub_seg_end[dtypes.int64(e)] = self._ord_end[
+                        dtypes.int64(e), seg_idx
+                    ]
+                    ub_cur_vid[dtypes.int64(e)] = vid
+                ub_vtopk[dtypes.int64(i)] = ub_cur_vid[dtypes.int64(e)]
+                ub_pos[dtypes.int64(e)] = pos + dtypes.int32(1)
         mem_copy(tile_slice(gm_vtopk, (chunk,), (ci,)), ub_vtopk)
 
     @jit
@@ -681,7 +764,7 @@ class _MoonepPlanComputeKernel:
         world_size, epn = self._r, self._epn
         dst_rank = dtypes.int32(-1)
         ord_idx = dtypes.int32(1)
-        for o in range_constexpr(world_size + 1):
+        for o in range_constexpr(world_size):
             if (dst_rank < 0) and (
                 pos < self._ord_end[dtypes.int64(e), dtypes.int64(o)]
             ):
@@ -693,7 +776,7 @@ class _MoonepPlanComputeKernel:
             vid = (
                 dst_rank * dtypes.int32(2 * epn)
                 + dtypes.int32(epn)
-                + self._jrep[dtypes.int64(dst_rank), dtypes.int64(e)]
+                + self._jrep[dtypes.int64(dst_rank), dtypes.int64(e % epn)]
             )
         return vid, seg_idx
 
@@ -704,37 +787,36 @@ class _MoonepPlanComputeKernel:
 
 
 def _plan_chunking(num_rows):
-    """分块：block 数（=nc=N/chunk）尽量逼近核数上限（块内 token 循环是串行
-    串行依赖链，实测耗时随块数单调下降）；chunk 向上取 2 的幂后降档到整除因子
-    （保证 nc*chunk==N，无尾块）；下限 _CHUNK_MIN 防状态重建占比过高。
+    """分块：chunk 数尽量逼近核数上限；chunk 取 2 的幂并降档到 N 的整除因子
+    （保证 chunk 数 × chunk == N，无尾块）；下限 _CHUNK_MIN 防止每块状态重建
+    占比过高。
     """
     cap = resident_blocks(_MAX_PLAN_BLOCKS)
     want = max(_CHUNK_MIN, -(-num_rows // cap))
     chunk = 1 << (want - 1).bit_length() if want > 1 else 1
     while chunk > 1 and num_rows % chunk != 0:
         chunk //= 2
-    nc = num_rows // chunk
-    bd = min(nc, cap)
-    while bd > 1 and nc % bd != 0:
-        bd -= 1
-    return chunk, nc, bd
+    num_chunks = num_rows // chunk
+    token_blocks = min(num_chunks, cap)
+    while token_blocks > 1 and num_chunks % token_blocks != 0:
+        token_blocks -= 1
+    return chunk, num_chunks, token_blocks
 
 
 def _expert_blocks(num_experts):
-    """GreedyInit/Pfx 的 block 数：E 的可整除因子，且不超过本机可常驻核数。"""
-    bd = min(num_experts, resident_blocks(_MAX_PLAN_BLOCKS))
-    while bd > 1 and num_experts % bd != 0:
-        bd -= 1
-    return bd
+    """Pfx 的 block 数：E 的可整除因子，且不超过本机可常驻核数。"""
+    block_count = min(num_experts, resident_blocks(_MAX_PLAN_BLOCKS))
+    while block_count > 1 and num_experts % block_count != 0:
+        block_count -= 1
+    return block_count
 
 
 class _PlanBlocks(NamedTuple):
-    """plan 分块全量（chunk/nc/bd 为 token 侧，bdp 为专家侧）。"""
+    """plan 分块：chunk 总数、token block 数与 Pfx block 数。"""
 
-    chunk: int
-    nc: int
-    bd: int
-    bdp: int
+    num_chunks: int
+    token_blocks: int
+    pfx_blocks: int
 
 
 def _plan_blocks(num_rows, num_experts):
@@ -743,8 +825,8 @@ def _plan_blocks(num_rows, num_experts):
     不做 lru_cache：块数回归测试 monkeypatch _RESIDENT_BLOCKS，缓存会把
     钉住的核数焊死。
     """
-    chunk, nc, bd = _plan_chunking(num_rows)
-    return _PlanBlocks(chunk, nc, bd, _expert_blocks(num_experts))
+    _, num_chunks, token_blocks = _plan_chunking(num_rows)
+    return _PlanBlocks(num_chunks, token_blocks, _expert_blocks(num_experts))
 
 
 @host
@@ -764,11 +846,17 @@ def _moonep_plan_host(
     me = _ME
     num_rows = gm_topk.shape[0]  # 本 rank topk 扁平视图，直接作 Cnt/Asg 输入
     blocks = _plan_blocks(num_rows, num_experts)
-    # plan 全部 7 个 kernel 合成 1 个 launch：阶段 0 跨卡交换（block 0）→
-    # 栅栏 → 6 个纯计算阶段；workspace 打包后 program 参数 17→9。
+    # 单 launch：Exchange/Count/GreedyAll → Tables/Pfx → Assign，两次栅栏；
+    # workspace 打包后 program 参数 17→9。
     _MoonepPlanComputeKernel(
-        me, world_size, num_experts, num_rows, blocks.nc, blocks.bd, blocks.bdp
-    )[max(blocks.bd, blocks.bdp, world_size)](
+        me,
+        world_size,
+        num_experts,
+        num_rows,
+        blocks.num_chunks,
+        blocks.token_blocks,
+        blocks.pfx_blocks,
+    )[max(blocks.token_blocks, blocks.pfx_blocks, world_size)](
         gm_tpe,
         gm_flag,
         gm_dem_by_rank,
@@ -798,26 +886,25 @@ class _PlanDims(NamedTuple):
     world_size: int
 
 
-# workspace 打包：11 个中间表放进一个扁平 int32 张量，program 只收 1 个参数
+# workspace 打包：中间表放进一个扁平 int32 张量，program 只收 1 个参数
 # （host 下发成本按 “≈0.09ms + 0.024ms×参数个数” 线性计，17 参数≈0.45ms/次）。
 # 每段按 16 元素（64B）对齐；各表由 kernel 全量覆写，同 shape 缓存复用安全。
 _WS_ALIGN = 16
 
 
-def _ws_layout(rank_size, num_experts, nc, bdp):
+def _ws_layout(rank_size, num_experts, nc):
     """返回 {表名: 元素偏移} 与 total 元素数（编译期常量，host/kernel 共用）。"""
     r, e = rank_size, num_experts
     sizes = (
         ("rem", e * r),
         ("order", e * r),
-        ("loads_part", bdp * r),
         ("counts", nc * e),
         ("pcnt", e * nc),
-        ("dpre", e),
         ("vid", e),
-        ("ord_rank", e * (r + 1)),
-        ("ord_end", e * (r + 1)),
-        ("jrep", r * e),
+        ("ord_rank", e * r),
+        ("ord_end", e * r),
+        ("jrep", e),
+        ("rhome", r),
     )
     offs = {}
     cur = 0
@@ -837,15 +924,15 @@ def _zero_placeholder(num_rows):
     return t
 
 
-def _alloc_plan_tables(dims, num_rows, nc, bdp):
+def _alloc_plan_tables(dims, nc):
     """plan workspace 分配：(dem_by_rank, 打包扁平张量)。
 
     dem_by_rank 单独一块：Exchange 的 peer 寻址要从张量取原始地址，
-    interval slice 的 provenance 不支持 extract_pointer；其余 10 张表按
+    interval slice 的 provenance 不支持 extract_pointer；其余 9 张表按
     _ws_layout 的编译期偏移放在同一块里，program 只收 1 个参数。
     """
     i32 = torch.int32
-    total = _ws_layout(dims.world_size, dims.num_experts, nc, bdp)["total"]
+    total = _ws_layout(dims.world_size, dims.num_experts, nc)["total"]
     return (
         torch.zeros(dims.world_size, dims.num_experts, dtype=i32, device="npu"),
         torch.zeros(total, dtype=i32, device="npu"),
@@ -858,7 +945,7 @@ def _plan_tables(context, dims, num_rows):
     if ws is not None and ws[0] == dims:
         return ws[1]
     blocks = _plan_blocks(num_rows, dims.num_experts)
-    tables = _alloc_plan_tables(dims, num_rows, blocks.nc, blocks.bdp)
+    tables = _alloc_plan_tables(dims, blocks.num_chunks)
     context.plan_workspace = (dims, tables)
     return tables
 
@@ -870,7 +957,7 @@ def _get_plan_program(num_tokens, top_k, num_experts, world_size, me):
     _ME/_R 的烘焙与编译在锁内原子完成（多线程并发首次编译不同
     EP 组时，烘焙窗口互污会产出错误 program）。
     """
-    # 块数进键：bd/bdp 是 kernel 编译期常量（角色分派），核数不同的机器
+    # 块数进键：token/Pfx block 数是 kernel 编译期常量（角色分派），核数不同的机器
     # 不能复用同一 program
     key = (
         num_tokens,
@@ -886,7 +973,7 @@ def _get_plan_program(num_tokens, top_k, num_experts, world_size, me):
             return prog
         num_rows = num_tokens * top_k
         blocks = _plan_blocks(num_rows, num_experts)
-        ws_total = _ws_layout(world_size, num_experts, blocks.nc, blocks.bdp)["total"]
+        ws_total = _ws_layout(world_size, num_experts, blocks.num_chunks)["total"]
         global _ME, _R
         _ME, _R = me, world_size
         epn = num_experts // world_size

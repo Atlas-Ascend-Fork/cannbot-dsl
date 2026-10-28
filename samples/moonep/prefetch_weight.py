@@ -13,8 +13,8 @@ the consumer's symmetric prefetch slot. A trailing barrier guards against
 slot-reuse races. Supports multiple weight groups (gate/up/down) in a single
 call.
 
-副本清单由 kernel 内逐 block 扫 etc 生成（GM 点读写与 xfer 共存，段间按
-专家行取模分派）：host 侧零回读/零 Python 扫描/零 H2D，编译键与路由结构
+副本清单由 kernel 内逐 block 扫 etc 生成（GM 点读写与 xfer 共存，每 block
+独占一个目的 rank）：host 侧零回读/零 Python 扫描/零 H2D，编译键与路由结构
 解耦（流序写入纪律：清单只经同流 kernel 全量覆写，免疫 host 写竞态）。
 """
 
@@ -28,15 +28,15 @@ from cannbotdsl import TensorSpec
 from cannbotdsl.types.datastruct import StructRef
 from cannbotdsl.buffer import Buffer
 from cannbotdsl.tensor import MemLoc, tile_slice
-from cannbotdsl.lang.constexpr import const_expr, range_constexpr
+from cannbotdsl.lang.constexpr import range_constexpr
 from cannbotdsl.lang.host import host
 from cannbotdsl.lang.kernel import kernel
-from cannbotdsl.ops.arch import get_block_idx, get_block_num
+from cannbotdsl.ops.arch import get_block_idx
 from cannbotdsl.ops.distributed import (
     CommContext,
-    create_transfer_context,
     SymBuffer,
     TransferRole,
+    create_transfer_context,
 )
 
 from moonep_context import (
@@ -51,30 +51,24 @@ from moonep_context import (
 )
 from npu_blob import npu_from_blob
 
-PUSH_BLOCKS = 16  # 清单条目按 block 分派；每条 put 的发起/完成延迟可并行
-
 
 @kernel
 class _MoonepPrefetchPushKernel:
     """home 把有副本需求的真实专家行直推到各消费 rank 的预取槽。
 
-    清单条目按 block 取模分派（单 block 顺序 put 时每条目 ~35µs 的发起/
-    完成延迟串行，小 W 下整段 prefetch 被它主导）。副本清单在 kernel 内算：
-    直接点读 GM 上的 etc[R, epn]——GM 点读写不需要 SIMT VF 区，可与 xfer
-    共存（UB 点读只在 VF 区内合法，VF 区与 xfer 同 kernel 会 SIGSEGV）；
-    每 block 自算自己的清单段，无跨 block 栅栏（运行时取模分派 +
-    global_sync_all 组合会撞编译器已知问题）。put 循环保持扁平（清单从
-    GM 读回，put 不嵌在编译期展开里）。
+    每 block 独占一个目的 rank，扫描该目的 rank 的 etc 行并筛选本 rank 的
+    home 专家；同一 peer 的 put/flush 只由一个 block 发起，避免多 block 并发
+    写同一通道。副本清单直接点读 GM，无需 SIMT VF 区，可与 xfer 共存；put
+    循环保持扁平，所有 put 完成后只对活跃 peer flush 一次。
     """
 
-    def __init__(self, rank, rank_size, epn, w_elems, weight_offs, max_ent):
+    def __init__(self, rank, rank_size, epn, w_elems, weight_offs):
         self._me = int(rank)
         self._r = int(rank_size)
         self._epn = int(epn)
         self._w = int(w_elems)
         self._offs = tuple(int(o) for o in weight_offs)
         self._num_g = len(self._offs)
-        self._max_ent = int(max_ent)
 
     def __call__(
         self,
@@ -102,41 +96,30 @@ class _MoonepPrefetchPushKernel:
         ub_xfer = Buffer(MemLoc.UB, (512,), dtypes.uint8)
         xfer = create_transfer_context(ktx, ub_xfer, role=TransferRole.VEC)
 
-        # 每 block 的清单段：dst[max_ent] | slot[max_ent] | row[max_ent] | cnt
-        # （本 rank 的专家行按 block 取模分派，段间天然不重叠）
-        blk = dtypes.int64(get_block_idx())
-        nblk = dtypes.int64(get_block_num())
-        nent = self._max_ent
-        base = blk * dtypes.int64(3 * nent + 1)
+        # 每 block 的清单段：slot[epn] | row[epn] | cnt；目的 rank 即 block id。
+        dst_r = dtypes.int64(get_block_idx())
+        base = dst_r * dtypes.int64(2 * epn + 1)
         c = dtypes.int32(0)
-        for j in cannbotdsl.range(dtypes.int64(epn)):
-            if j % nblk == blk:
-                e = dtypes.int32(me * epn) + dtypes.int32(j)
-                for r in range_constexpr(world_size):
-                    if const_expr(r != me):
-                        for i in cannbotdsl.range(dtypes.int64(epn)):
-                            if gm_etc[dtypes.int64(r), i] == e:
-                                if c < dtypes.int32(nent):
-                                    gm_mf[base + dtypes.int64(c)] = dtypes.int32(r)
-                                    gm_mf[
-                                        base + dtypes.int64(nent) + dtypes.int64(c)
-                                    ] = dtypes.int32(epn) + dtypes.int32(i)
-                                    gm_mf[
-                                        base + dtypes.int64(2 * nent) + dtypes.int64(c)
-                                    ] = dtypes.int32(j)
-                                c = c + dtypes.int32(1)
-        gm_mf[base + dtypes.int64(3 * nent)] = c
-        # 扁平 put 循环（清单从 GM 读回；put 不放在嵌套循环里）
+        for i in cannbotdsl.range(dtypes.int64(epn)):
+            e = gm_etc[dst_r, i]
+            if e >= dtypes.int32(me * epn):
+                if e < dtypes.int32((me + 1) * epn):
+                    gm_mf[base + dtypes.int64(c)] = dtypes.int32(epn) + dtypes.int32(i)
+                    gm_mf[base + dtypes.int64(epn) + dtypes.int64(c)] = (
+                        e - dtypes.int32(me * epn)
+                    )
+                    c = c + dtypes.int32(1)
+        gm_mf[base + dtypes.int64(2 * epn)] = c
         for k in cannbotdsl.range(dtypes.int64(c)):
-            dst_r = dtypes.int64(gm_mf[base + k])
-            slot = dtypes.int64(gm_mf[base + dtypes.int64(nent) + k])
-            row = dtypes.int64(gm_mf[base + dtypes.int64(2 * nent) + k])
+            slot = dtypes.int64(gm_mf[base + k])
+            row = dtypes.int64(gm_mf[base + dtypes.int64(epn) + k])
             for g in range_constexpr(self._num_g):
                 xfer.put(
                     dst_r,
                     tile_slice(wsyms[g], (1, w_elems), (slot, 0)).peer(dst_r),
                     tile_slice(reals[g], (1, w_elems), (row, 0)),
                 )
+        if c > dtypes.int32(0):
             xfer.flush(dst_r)
 
 
@@ -149,11 +132,8 @@ _ME = 0  # 组内 rank（清单寻址依赖，进编译键）
 def _push_host(
     gm_real0, gm_real1, gm_real2, gm_etc, gm_mf, ctx: StructRef[CommContext]
 ):
-    epn2, w_elems = gm_real0.shape
-    nblk = min(PUSH_BLOCKS, epn2)
-    per_blk = (epn2 + nblk - 1) // nblk
-    max_ent = per_blk * (_R - 1)
-    _MoonepPrefetchPushKernel(_ME, _R, epn2, w_elems, _WEIGHT_OFFS, max_ent)[nblk](
+    epn, w_elems = gm_real0.shape
+    _MoonepPrefetchPushKernel(_ME, _R, epn, w_elems, _WEIGHT_OFFS)[_R](
         gm_real0, gm_real1, gm_real2, gm_etc, gm_mf, ctx
     )
 
@@ -175,10 +155,7 @@ def _get_push_program(epn, w_elems, weight_offs, rank_size, me):
         if prog is None:
             global _WEIGHT_OFFS, _R, _ME
             _WEIGHT_OFFS, _R, _ME = tuple(weight_offs), rank_size, me
-            nblk = min(PUSH_BLOCKS, epn)
-            per_blk = (epn + nblk - 1) // nblk
-            max_ent = per_blk * (rank_size - 1)
-            mf_elems = nblk * (3 * max_ent + 1)
+            mf_elems = rank_size * (2 * epn + 1)
             prog = cannbotdsl.compile(
                 _push_host,
                 TensorSpec((epn, w_elems), dtypes.bfloat16),
@@ -258,17 +235,12 @@ def create_weight_view(context, epn, w_elems, *, group=0, groups=1, slot=0, slot
 
 
 def _manifest_buf(context, epn, world_size):
-    """按 (nblk, max_ent) 缓存的设备端清单缓冲（不落 host、无 H2D）。
-
-    每 block 一段：dst[max_ent] | slot[max_ent] | row[max_ent] | cnt。
-    """
-    nblk = min(PUSH_BLOCKS, epn)
-    max_ent = ((epn + nblk - 1) // nblk) * (world_size - 1)
-    key = (nblk, max_ent)
+    """设备端清单：每个目的 rank 一段 slot[epn] | row[epn] | cnt。"""
+    key = (world_size, epn)
     cached = context.prefetch_manifest
     if cached is not None and cached[0] == key:
         return cached[1]
-    buf = torch.empty(nblk * (3 * max_ent + 1), dtype=torch.int32, device="npu")
+    buf = torch.empty(world_size * (2 * epn + 1), dtype=torch.int32, device="npu")
     context.prefetch_manifest = (key, buf)
     return buf
 
@@ -340,7 +312,8 @@ def prefetch_weight(
 
     Args:
         context: MoonepContext
-        experts_to_copy: [R, epn] int32，moonep_plan 输出（-1 填充）
+        experts_to_copy: [R, epn] int32，moonep_plan 输出（-1 填充；
+            每行副本槽至多来自一个远程 home rank）
         real_weights: 普通 NPU 张量 [epn, W] bf16（或多组 list/tuple），
             真实本地专家权重（当前参数值）。本函数会先把它写入视图前 epn 行（home 行），
             再直推副本——调用方无需自己做 home 行写回。
@@ -357,7 +330,7 @@ def prefetch_weight(
 
     说明：
     - home 仅推送有副本需求的行（规划不产生自承载副本：home 的 order 恒为 1）。
-    - 清单条目按 block 取模分派（PUSH_BLOCKS=16 并行 put）。
+    - 每 block 独占一个目的 rank，同一 peer 的所有权重行由同一 block 推送。
     """
     real_weights, local_weights, w_elems = _normalize_weight_groups(
         context, real_weights, local_weights
@@ -385,21 +358,3 @@ def prefetch_weight(
         )
     # 尾段契约见 finish_op（阻塞=独立 barrier+流级等待+溢出检查；async=返回事件）
     return finish_op(context, barrier)
-    if False:  # noqa: dead marker
-        # 末尾完成屏障：对称堆自旋 barrier（多 block 直推下 kernel 内联尾段须先
-        # global_sync_all 才能保证全部 block 的 put 落地，而"运行时取模分派 +
-        # global_sync_all"组合撞编译器已知问题——独立 barrier launch 是已验证
-        # 形态）。返回即全组本轮直推完成，连续多次调用无槽位竞态
-        sym_barrier(context)
-        record_transport_event(context)  # 跨流护栏 fork 点（只等我方算子）
-        # plan 延迟溢出检查（sym_barrier 已排空发起流，.item() 微秒级）
-        check_pending_overflow(context)
-        return None
-    # async_finish（barrier=False，侧流并发路径）：host 不等直推完成——
-    # 返回发起流完成事件，调用方 wait_event 汇合；跨 rank 槽位复用安全由
-    # 调用方在合适位置（如下一轮迭代的 barrier）负责；plan 溢出检查顺延到
-    # 下一个我方算子尾部（context.pending_overflow 机制）
-    ev = torch.npu.Event()
-    ev.record(torch.npu.current_stream())
-    record_transport_event(context)
-    return ev

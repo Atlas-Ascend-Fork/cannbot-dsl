@@ -19,10 +19,10 @@
     同时按条目跨 block 分派把本地预取槽梯度清零（槽位复用契约，必须在所有
     put 完成之后）。
 
-清单为定长数组 + 运行时计数（send: epn 槽 + cnt；recv: epn×(R-1) 定步长 +
-逐行 cnt）——编译键只含形状/布局，**与路由结构彻底解耦**（随机路由每步变化
-也不会触发重编译；早期版本把 recv_groups 结构烘进编译键，随机路由下约两成
-步长触发 6.6s 重编译）。
+清单为定长数组 + 运行时计数（send: epn 槽 + cnt + 唯一 home；recv:
+epn×(R-1) 定步长 + 逐行 cnt）——编译键只含形状/布局，**与路由结构彻底解耦**
+（随机路由每步变化也不会触发重编译；早期版本把 recv_groups 结构烘进编译键，
+随机路由下约两成步长触发 6.6s 重编译）。
 
 staging 为全宽 (world_size, epn, W) 且组间复用同一块（组间自旋 barrier 串行，
 占用与组数解耦：3 组生产配置 45GB→15GB）：各 chunk 有独立 slice，无块间
@@ -121,8 +121,8 @@ class _MoonepReduceGradKernel:
     用栅栏隔离（与 plan 的 Exchange 同款结构，实测可编过）。
 
     发送侧：副本梯度整行 put 到 home staging + flag 通知 + 本地预取槽清零。
-    清单运行时化：gm_sh/gm_sj 为 epn 定长数组（前 cnt 项有效），cnt 为运行时
-    标量（gm_scnt）——编译键不再含清单结构。
+    清单运行时化：gm_sj 为 epn 定长数组（前 cnt 项有效），gm_scnt 为
+    运行时计数，gm_shome 标记唯一发送 home——编译键不再含清单结构。
     """
 
     def __init__(self, rank, rank_size, epn, w_elems, stg_off, chunk):
@@ -140,22 +140,22 @@ class _MoonepReduceGradKernel:
         gm_flag,
         ctx: StructRef[CommContext],
     ):
-        # 清单六段打包成单张 gm_rm（host 下发按参数个数线性收费，9→4 参）
-        gm_sh, gm_sj, gm_scnt, gm_rs, gm_rj, gm_rcnt = _manifest_views(
+        # 清单打包成单张 gm_rm（host 下发按参数个数线性收费）
+        gm_sj, gm_scnt, gm_shome, gm_rs, gm_rj, gm_rcnt = _manifest_views(
             gm_rm, self._epn, self._r
         )
         blk = get_block_idx()
         # 发送段按目的 peer 分块（每个 peer 一个 block，flush 只碰自己的通道——
         # 同一 peer 被多个 block 并发 flush 会挂，早期 8 块按条目分派就这样挂过）
         if blk < dtypes.int64(self._r):
-            self._send(ctx, gm_sh, gm_sj, gm_scnt, gm_grad, gm_flag, blk)
+            self._send(ctx, gm_sj, gm_scnt, gm_shome, gm_grad, gm_flag, blk)
         global_sync_all()
         # 清本地预取槽必须在所有 put 完成之后（数据源是这些槽行）
         self._clear_slots(gm_sj, gm_scnt, gm_grad, blk)
         self._recv(ctx, gm_rs, gm_rj, gm_rcnt, gm_grad, gm_flag)
 
     @jit
-    def _send(self, ctx, gm_sh, gm_sj, gm_scnt, gm_grad, gm_flag, blk):
+    def _send(self, ctx, gm_sj, gm_scnt, gm_shome, gm_grad, gm_flag, blk):
         world_size, epn = self._r, self._epn
         me = self._me
         w_elems = self._w
@@ -167,21 +167,18 @@ class _MoonepReduceGradKernel:
 
         scalar_read_fence_pre(_EVENT_ID)  # 与 busy_wait_flag 同款完整握手
         ub_scnt = Buffer(MemLoc.UB, (1,), dtypes.int32)
+        ub_shome = Buffer(MemLoc.UB, (1,), dtypes.int32)
         mem_copy(ub_scnt, gm_scnt)
-        ub_sh = Buffer(MemLoc.UB, (epn,), dtypes.int32)
+        mem_copy(ub_shome, gm_shome)
         ub_sj = Buffer(MemLoc.UB, (epn,), dtypes.int32)
-        mem_copy(ub_sh, gm_sh)
         mem_copy(ub_sj, gm_sj)
         scalar_read_fence_post(_EVENT_ID)  # 标量读前等清单拷贝落地
         cnt_send = ub_scnt[dtypes.int64(0)]  # 运行时标量
 
         if cnt_send > dtypes.int32(0):
-            # 只处理 home == 本 block 的条目：整行数据 put → flag → flush
-            # （同一 peer 的传输在一条通道上保序，跨 peer 由不同 block 并行）
-            blk32 = dtypes.int32(blk)
-            sent = dtypes.int32(0)
-            for i in cannbotdsl.range(cnt_send):
-                if ub_sh[i] == blk32:
+            # 一卡一源：本 rank 的全部副本槽只发往唯一 home block。
+            if dtypes.int32(blk) == ub_shome[dtypes.int64(0)]:
+                for i in cannbotdsl.range(cnt_send):
                     j = ub_sj[i]
                     xfer.put(
                         dtypes.int64(blk),
@@ -190,16 +187,13 @@ class _MoonepReduceGradKernel:
                         ),
                         tile_slice(gm_grad, (1, w_elems), (epn + j, 0)),
                     )
-                    sent = dtypes.int32(1)
-            for i in cannbotdsl.range(cnt_send):
-                if ub_sh[i] == blk32:
+                for i in cannbotdsl.range(cnt_send):
                     j = ub_sj[i]
                     xfer.put(
                         dtypes.int64(blk),
                         tile_slice(flags, (1, 1), (me, j)).peer(dtypes.int64(blk)),
                         gm_flag,
                     )
-            if sent > dtypes.int32(0):
                 xfer.flush(dtypes.int64(blk))
 
     @jit
@@ -452,7 +446,7 @@ class _MoonepReduceManifestKernel:
     """设备侧生成发送/接收清单（替代 host 侧 etc 扫描）。
 
     单 block 扫描 etc [R, epn]：
-    - 发送：本 rank 承载的副本槽 j → (home=e//epn, j)，前 scnt 项有效；
+    - 发送：本 rank 承载的副本槽 j → (唯一 home=e//epn, j)，前 scnt 项有效；
     - 接收：本 rank 真实专家 e=me*epn+i 的远端副本来源 → 行 i 占
       [i*(R-1), i*(R-1)+rcnt[i])，行号即 home 行。
     输出定长数组 + 运行时计数（编译键与路由结构解耦）；host 侧零回读。
@@ -465,27 +459,29 @@ class _MoonepReduceManifestKernel:
 
     def __call__(self, gm_etc, gm_rm):
         world_size, epn, me = self._r, self._epn, self._me
-        gm_sh, gm_sj, gm_scnt, gm_rs, gm_rj, gm_rcnt = _manifest_views(
+        gm_sj, gm_scnt, gm_shome, gm_rs, gm_rj, gm_rcnt = _manifest_views(
             gm_rm, epn, world_size
         )
         stride = world_size - 1
         ub_etc = Buffer(MemLoc.UB, (world_size, epn), dtypes.int32)
         mem_copy(ub_etc, gm_etc)
-        ub_sh = Buffer(MemLoc.UB, (epn,), dtypes.int32)
         ub_sj = Buffer(MemLoc.UB, (epn,), dtypes.int32)
         ub_scnt = Buffer(MemLoc.UB, (1,), dtypes.int32)
+        ub_shome = Buffer(MemLoc.UB, (1,), dtypes.int32)
         ub_rs = Buffer(MemLoc.UB, (epn * stride,), dtypes.int32)
         ub_rj = Buffer(MemLoc.UB, (epn * stride,), dtypes.int32)
         ub_rcnt = Buffer(MemLoc.UB, (epn,), dtypes.int32)
 
         with vf(mode="simt", thread=1):
             ub_scnt[dtypes.int64(0)] = dtypes.int32(0)
+            ub_shome[dtypes.int64(0)] = dtypes.int32(-1)
             for j in cannbotdsl.range(epn):
                 e = ub_etc[dtypes.int64(me), dtypes.int64(j)]
                 if e >= dtypes.int32(0):
                     c = ub_scnt[dtypes.int64(0)]
-                    ub_sh[c] = e // dtypes.int32(epn)
                     ub_sj[c] = dtypes.int32(j)
+                    if c == dtypes.int32(0):
+                        ub_shome[dtypes.int64(0)] = e // dtypes.int32(epn)
                     ub_scnt[dtypes.int64(0)] = c + dtypes.int32(1)
             for k in cannbotdsl.range(epn * stride):
                 ub_rs[dtypes.int64(k)] = dtypes.int32(-1)
@@ -495,9 +491,9 @@ class _MoonepReduceManifestKernel:
             for r in range_constexpr(world_size):
                 if const_expr(r != me):
                     self._scan_peer_row(r, ub_etc, ub_rs, ub_rj, ub_rcnt)
-        mem_copy(gm_sh, ub_sh)
         mem_copy(gm_sj, ub_sj)
         mem_copy(gm_scnt, ub_scnt)
+        mem_copy(gm_shome, ub_shome)
         mem_copy(gm_rs, ub_rs)
         mem_copy(gm_rj, ub_rj)
         mem_copy(gm_rcnt, ub_rcnt)
@@ -548,31 +544,30 @@ def _get_reduce_manifest_program(epn, world_size, me):
 def _manifest_layout(epn, world_size):
     """清单缓冲区段的元素偏移（编译期常量，host/kernel 共用）。
 
-    段序：sh[epn] | sj[epn] | scnt[1] | rs[epn·(R-1)] | rj[epn·(R-1)] | rcnt[epn]
-    打包成一块，kernel 只收 1 个参数（host 下发按参数个数线性收费，
-    发射成本模型 0.024ms/参——reduce kernel 9→4 参、清单 kernel 7→2 参）。
+    段序：sj[epn] | scnt[1] | shome[1] | rs/rj[epn·(R-1)] | rcnt[epn]
+    打包成一块，kernel 只收 1 个参数。shome 为唯一发送 home，无副本写 -1。
     """
     stride = world_size - 1
     n_rs = epn * stride
     return {
-        "sh": 0,
-        "sj": epn,
-        "scnt": 2 * epn,
-        "rs": 2 * epn + 1,
-        "rj": 2 * epn + 1 + n_rs,
-        "rcnt": 2 * epn + 1 + 2 * n_rs,
-        "total": 3 * epn + 1 + 2 * n_rs,
+        "sj": 0,
+        "scnt": epn,
+        "shome": epn + 1,
+        "rs": epn + 2,
+        "rj": epn + 2 + n_rs,
+        "rcnt": epn + 2 + 2 * n_rs,
+        "total": 2 * epn + 2 + 2 * n_rs,
     }
 
 
 def _manifest_views(gm_rm, epn, world_size):
-    """清单六段的切片视图（元组索引形式 t[a:b,]——DSL kernel 内切片约束）。"""
+    """清单各段的切片视图（元组索引形式 t[a:b,]——DSL kernel 内切片约束）。"""
     off = _manifest_layout(epn, world_size)
     n_rs = epn * (world_size - 1)
     return (
-        gm_rm[off["sh"] : off["sh"] + epn,],
         gm_rm[off["sj"] : off["sj"] + epn,],
         gm_rm[off["scnt"] : off["scnt"] + 1,],
+        gm_rm[off["shome"] : off["shome"] + 1,],
         gm_rm[off["rs"] : off["rs"] + n_rs,],
         gm_rm[off["rj"] : off["rj"] + n_rs,],
         gm_rm[off["rcnt"] : off["rcnt"] + epn,],
@@ -583,10 +578,11 @@ def _build_reduce_manifest(context, experts_to_copy, epn):
     """发送/接收清单（设备侧 kernel 生成，按 etc 身份单槽缓存）。
 
     定长数组 + 运行时计数（编译键与路由解耦）：
-    - 发送：sh/sj 为 epn 定长（前 cnt 项有效），scnt 为计数标量；
+    - 发送：sj 为 epn 定长（前 cnt 项有效），scnt 为计数标量，shome 为
+      唯一 home（无副本 -1）；
     - 接收：rs/rj 为 epn×(R-1) 定步长（行 i 的 sender 占
       [i*stride, i*stride+rcnt[i])），rcnt 为逐行计数；行号即 home 行。
-    六段打包成单块（_manifest_layout），kernel 只收 1 个参数。
+    各段打包成单块（_manifest_layout），kernel 只收 1 个参数。
     清单由 _MoonepReduceManifestKernel 在设备侧从 etc 生成——host 侧零回读/
     零 Python 扫描/零 H2D（流序写入纪律：清单只经同流 kernel 全量覆写）。
     返回打包后的 NPU 张量。
@@ -702,6 +698,7 @@ def reduce_grad(context, experts_to_copy, grad_view, epn, *, barrier=True):
     Args:
         context: MoonepContext
         experts_to_copy: [world_size, epn] int32，moonep_plan 输出
+            （每行副本槽至多来自一个远程 home rank）
         grad_view: [2*epn, W] fp32 或 bf16 本地梯度视图（bf16 时 staging/传输
             减半、UB 内 fp32 累加保精度、写回 bf16），或多组视图 list/tuple
             （各组行宽 W 一致；与 prefetch_weight 的组数需一致）。

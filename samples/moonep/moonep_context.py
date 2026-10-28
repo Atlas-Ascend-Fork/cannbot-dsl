@@ -335,7 +335,7 @@ def check_pending_overflow(context):
         raise RuntimeError(
             f"副本槽溢出：极端路由下单 rank 副本数超过 epn={cu_seqlens.shape[0] // 2}"
             f" 个预留槽（cu_seqlens 尾值={cu_tail} != N={num_rows}）。"
-            "当前版本拒绝继续，请反馈算子侧（槽位感知贪心在规划中）"
+            "当前版本拒绝继续（一卡一源贪心已保证不溢出；此错误表示规划不变量被破坏）"
         )
 
 

@@ -118,7 +118,7 @@ dst_n, cu_seqlens, experts_to_copy, src_n, vtopk = moonep_plan(
 | `topk_experts_sk` | `[S, K]` | `torch.int32` | top-k 专家索引 |
 | 返回 `dst_n` | `[N]` | `torch.int32` | **零占位**（vtopk-only 快路径不计算；原语义：落位编码 `rank × NvS + offset`） |
 | 返回 `cu_seqlens` | `[2*epn]` | `torch.int32` | 分组 GEMM 分段偏移（本地专家 + 预取槽，均按专家 id 升序） |
-| 返回 `experts_to_copy` | `[R, epn]` | `torch.int32` | 各 rank 需预取的远程专家清单，空槽 -1 |
+| 返回 `experts_to_copy` | `[R, epn]` | `torch.int32` | 各 rank 需预取的远程专家清单，空槽 -1；每行至多一个远程 home rank |
 | 返回 `src_n` | `[N]` | `torch.int32` | **零占位**（vtopk-only 快路径不计算；原语义：slot 反查表） |
 | 返回 `vtopk` | `[N]` | `torch.int32` | 虚拟专家 id（扩展空间 `E' = 2E`），供 ep 复用链路由改写 |
 
@@ -131,7 +131,7 @@ reduce_grad(context, experts_to_copy, grad_view, epn)
 
 | 参数 | shape | dtype | 说明 |
 | :--- | :--- | :--- | :--- |
-| `experts_to_copy` | `[R, epn]` | `torch.int32` | `moonep_plan` 的预取/归并清单 |
+| `experts_to_copy` | `[R, epn]` | `torch.int32` | `moonep_plan` 的预取/归并清单；每行至多一个远程 home rank |
 | `real_weights` | `[epn, H*H']` | `torch.bfloat16` | 真实本地专家权重（普通张量，home 直推的数据源；多组用 list） |
 | `local_weights` | `[2*epn, H*H']` | `torch.bfloat16` | 对称区权重视图（`create_weight_view` 创建）：前 `epn` 行本地专家（调用前就位），后 `epn` 行预取槽（本函数填充） |
 | `grad_view` | `[2*epn, H*H']` | `torch.float32` | 梯度视图：前 `epn` 行真实专家，后 `epn` 行副本槽 |
@@ -140,10 +140,9 @@ reduce_grad(context, experts_to_copy, grad_view, epn)
 两接口均原地生效、无返回值（`barrier=True` 缺省形态）；gate / up / down 三个
 projection 各调一次（或传 list 共享清单）。每次调用末尾含一次对称堆自旋完成
 屏障（独立 launch，不走 HCCL 集合通信）；调用末尾为发起流级等待（不等无关流）。
-prefetch 直推按 block 取模分派（`PUSH_BLOCKS=16` 并行 put，清单在 kernel
-内逐 block 扫 etc 生成）；多 block 下 kernel 内联 barrier 尾段须先
-global_sync_all 保序、与运行时取模分派组合撞编译器已知问题，故 barrier
-保持独立 launch 形态。
+prefetch 每个 block 独占一个目的 rank，同一 peer 的 put/flush 只由该 block
+发起；清单在 kernel 内逐 block 扫 etc 生成，末尾完成 barrier 保持独立 launch。
+reduce 发送侧按一卡一源选择唯一 home block；接收侧保留同一 home 行的多 sender 归并。
 **侧流并发（async_finish）**：两接口均可传 `barrier=False`——跳过末尾屏障
 及其 host 同步（reduce 的组间 barrier 同时改为只发射 kernel），**返回发起流
 上的 NPU 事件**；调用方 `wait_event` 汇合，跨 rank 的槽位/staging 复用安全由
@@ -160,7 +159,7 @@ global_sync_all 保序、与运行时取模分派组合撞编译器已知问题�
 
 - 所有张量须连续且位于同一 NPU；通信形态为 EP 组内 all-to-all（UB 链路 URMA）。
 - v1 `NvS = S × K`（无 padding），`E ≤ 1024`、`R ≤ 64`、`E % R == 0`；
-  `S × K` 不设上限且任意 N 原生整除（topk host 侧直拷 workspace、
+  `S × K` 不设上限且任意 N 原生整除（topk 直接使用调用方 `[S,K]` 扁平视图；
   分块粒度降档到 N 的因子，无尾补机制）。
 - ⚠️ **通信域分离**：`ElasticBuffer`（dispatch/combine）与 `create_moonep_context`
   （plan/prefetch/reduce）**必须各用独立通信器**（各自 `dist.new_group`，且均不可用
@@ -195,7 +194,7 @@ global_sync_all 保序、与运行时取模分派组合撞编译器已知问题�
   ——只允许整段拷贝，或"外层 extent=1 的 tile + 循环 IV"（`(1,R)@(e,0)` 逐行推进）；
   单行 tile 的坐标用运行时值在多 block 下已验证可靠。
 - 原子累加的目标 tile 有 **32B 粒度要求**（不足须 padding 到 32B 倍数，
-  见 plan 的 per-block 局部 loads 行方案——本仓直接避免了原子路径）。
+  本仓通过私有计数与归并路径避免该原子约束）。
 - UB 标量点读只在 vf(simt) 或完整 S↔MTE2 双向握手（notify+wait 成对）后进行。
 - **kernel 内张量切片须用元组索引形式**：`t[a:b,]`（尾逗号）合法，普通
   `t[a:b]` 触发 "non-trivial Tensor slice may only index a shape leaf" 编译错
@@ -203,12 +202,8 @@ global_sync_all 保序、与运行时取模分派组合撞编译器已知问题�
 - **流序写入纪律**：跨调用复用的设备缓冲只允许 kernel 全量覆写或设备侧
   `copy_`，禁止 host 侧 H2D 直写复用缓冲（会与上一轮仍在读的 kernel 竞争，
   表现为轮询/握手永久等待）；epoch 类小标量每次新分配。
-- 已验证形态：单机 4 卡与 8 卡全机（Ascend 950PR）——默认门禁 21 用例
-  （前向/反向/预取各代表 shape + 多组 + 多槽 + 双槽零拷贝 + 归并 + bf16 +
-  K6/EPN32 典型形状 + 数值漏斗 + 布局公式自检 + 块数回归 + async overlap）
-  4P/8P 全 PASS，`--full` 全量矩阵按需执行（倾斜/中间档 shape + 双槽 +
-  经典规格泛化）；推荐配置（S=4096/K=8/E=256/H=7168）三档 maxvio
-  （0.1/1/8）性能基准全通过。
+- 已验证形态：单机 4 卡与 8 卡全机（Ascend 950PR）默认门禁 4P/8P 全 PASS；
+  `--full` 全量矩阵按需执行。
 
 ## 通信上下文
 
@@ -223,8 +218,8 @@ global_sync_all 保序、与运行时取模分派组合撞编译器已知问题�
 samples/moonep/
 ├── README.md               # 本文档（接口参考）
 ├── moonep_context.py       # 通信上下文/容量校验/对称堆 barrier/跨流护栏/resident_blocks 核数探测（共享）
-├── moonep_plan.py          # 规划（单 launch 融合 kernel：Exchange 交换 → Greedy 贪心+cu → Tables/Pfx → Count → Assign，阶段间 global_sync_all；workspace 打包 9 参）
-├── prefetch_weight.py      # 权重预取（16-block 并行直推：清单 kernel 内按 block 分段生成 + 融合多组发射 + 独立 barrier）
+├── moonep_plan.py          # 规划（单 launch、2 次 global_sync_all：Exchange/Count/UB GreedyAll → Tables/Pfx → Assign；vhistogram + vgather 快路径 + 慢路径压缩）
+├── prefetch_weight.py      # 权重预取（每 block 独占一个目的 rank：单 peer 直推 + 融合多组发射 + 独立 barrier）
 ├── reduce_grad.py          # 副本梯度归并（独立清单 kernel + send/recv 融合单 kernel + 独立 barrier）
 └── npu_blob.py             # from_blob 扩展（对称区权重视图用；C++ 源内嵌）
 ```
@@ -260,23 +255,3 @@ golden 参考实现见 [moonep_golden.py](../../test/moonep/moonep_golden.py)：
 | :--- | :--- | :--- |
 | `test_moonep.py` | golden 自测 4 组（均衡不变量 / cu_seqlens 一致性 / 往返一致 ×2） | CPU 常跑 |
 | `test_moonep_ep.py` | ep 复用链 E2E 3 组（前向 / 反向 / 含权重全链），三档路由参数化 | `torchrun --nproc_per_node≥2`，无 NPU 或未装 `cann_ops_transformer` 自动 skip |
-
-已验证记录（8×Ascend950PR，DSL 0.7.1）：默认门禁 21 用例 4P/8P 全 PASS；
-vtopk 全量对拍 N=32768 mismatch=0；推荐配置三档 maxvio 全通过。
-
-## 性能验证
-
-8P 推荐配置（S=4096/K=8/E=256/H=7168，孤立口径）：plan ~1.6ms（多 block 化
-移植后，19M+ tokens/s，三档 maxvio 平坦）、dispatch 246GB/s、combine 177GB/s
-（孤立口径）、prefetch 1.1ms / reduce_grad 4.9ms（背靠背口径）。背靠背口径存在
-~3× URMA 跨迭代干扰（背靠背口径固有现象，孤立口径为准）；**清单由设备侧 kernel 从
-etc 生成（host 零回读/零扫描/零 H2D，plan 返回路径零同步）**；plan/prefetch/reduce
-编译键均只含形状与布局——路由变化不触发重编译（清单为定长数组 + 运行时计数）。
-
-融合形态经典规格台账（4P，S=8192/K=16/E=112/H=7168，feat/fuse 口径）：
-plan 1.843→**1.069ms**（-42%）、prefetch 2.009→**0.759ms**（-62%，16-block
-并行直推）、reduce_grad 12.790→**5.19ms**（-59%），三算子合计 16.6→7.0ms
-（**-58%**）、训练步 **-16.2%**；MoonEP vs 标准 EP 前向 **1.52×**（37.07 vs
-56.31ms，收益全部来自负载均衡）。前向构成：FFN 42.1% + combine 45.2%——87%
-在外部算子，三 DSL 算子仅 12.7%（plan/prefetch 设备段已到 host 边界，进一步
-收敛依赖框架发射器优化，见 cann/cannbot-dsl #65）。

@@ -109,6 +109,17 @@ def _init_ep_group():
     return rank, world
 
 
+def _assert_cu_matches_vtopk(cu, vtopk, num_experts):
+    hist = torch.bincount(vtopk.to(torch.int64), minlength=2 * num_experts)
+    dist.all_reduce(hist)
+    rows = cu.numel()
+    rank = dist.get_rank()
+    expected = torch.cumsum(hist[rank * rows : (rank + 1) * rows], dim=0).to(
+        torch.int32
+    )
+    assert torch.equal(cu.cpu(), expected.cpu()), "cu_seqlens 与全组 vtopk 行计数不一致"
+
+
 _EP_POOL = {}
 
 
@@ -179,6 +190,15 @@ class _PlanOut(NamedTuple):
     vtopk: torch.Tensor
 
 
+def _assert_one_source_etc(etc_cpu, epn):
+    """plan 契约：每个 destination rank 的副本槽至多来自一个 home rank。"""
+    for rank, row in enumerate(etc_cpu.tolist()):
+        homes = {int(e) // epn for e in row if int(e) >= 0}
+        assert len(homes) <= 1, (
+            f"etc[{rank}] 同时来自多个 home rank：{sorted(homes)}（一卡一源契约被破坏）"
+        )
+
+
 def _plan_case(rank, shape, mode="balanced", seed=42):
     """plan 测试样板：路由输入 → ctx → moonep_plan → 同步。"""
     topk_all, _, _ = _make_case(shape, mode, seed)
@@ -191,6 +211,8 @@ def _plan_case(rank, shape, mode="balanced", seed=42):
     ctx = create_moonep_context()
     dst_n, cu, etc, src_n, vtopk = moonep_plan(ctx, tpe_my, topk_my)
     torch.npu.synchronize()
+    etc_cpu = etc.cpu()
+    _assert_one_source_etc(etc_cpu, etc_cpu.shape[1])
     return _PlanOut(ctx=ctx, etc=etc, dst_n=dst_n, cu=cu, src_n=src_n, vtopk=vtopk)
 
 
@@ -292,6 +314,7 @@ def _expect_merged_row(case, g, row, base):
 
 def _verify_reduce_group(dw_cpu, case, g=0, base=0.0, tag=""):
     """校验单组：home 行归并值 + 副本槽清零。tag 为断言消息前缀。"""
+    _assert_one_source_etc(case.etc_cpu, case.epn)
     for i in range(case.epn):
         exp_val = _expect_merged_row(case, g, i, base)
         assert torch.allclose(
@@ -412,6 +435,7 @@ class _PrefetchCase(NamedTuple):
 
 def _verify_prefetch_view(w_cpu, etc_cpu, case, g=0, tag=""):
     """校验单个权重视图：副本槽 == home 发布值 (home*1000+e)*(g+1)；空槽保持 -1。"""
+    _assert_one_source_etc(etc_cpu, case.epn)
     rank, epn, w_elems = case.rank, case.epn, case.w_elems
     for j in range(epn):
         e = int(etc_cpu[rank][j])
@@ -479,6 +503,41 @@ def test_moonep_prefetch_weight(num_tokens, top_k, epn, mode, seed):
     assert torch.equal(materialize_weights(w_local).cpu(), w_local.cpu()), (
         "materialize_weights 拷贝内容不符"
     )
+
+
+@pytest.mark.npu
+@_requires_dsl
+def test_moonep_one_source_full_slot_fanout():
+    """满副本槽 + 单 home 多目的 fan-out + home 多 sender 梯度归并。"""
+    from prefetch_weight import create_weight_view, prefetch_weight
+    from reduce_grad import reduce_grad
+
+    rank, world_size = _init_ep_group()
+    num_tokens, top_k, epn = 32, 8, 4
+    shape = RouteShape(world_size, num_tokens, top_k, epn * world_size)
+    w_elems = _H * 16
+    ctx, *_ = _plan_case(rank, shape, "balanced", 2026)
+
+    etc_cpu = torch.full((world_size, epn), -1, dtype=torch.int32)
+    for dst in range(1, world_size):
+        etc_cpu[dst] = torch.arange(epn, dtype=torch.int32)
+    _assert_one_source_etc(etc_cpu, epn)
+    etc = etc_cpu.npu()
+
+    w_real = _fill_weight_real(rank, epn, w_elems)
+    w_view = create_weight_view(ctx, epn, w_elems)
+    w_view.fill_(-1.0)
+    prefetch_weight(ctx, etc, w_real, w_view, epn)
+    torch.npu.synchronize()
+    _verify_prefetch_view(
+        w_view.cpu(), etc_cpu, _PrefetchCase(rank, epn, w_elems), tag="full-slot "
+    )
+
+    grads = _fill_grad_views(1, epn, w_elems, 0.0)
+    reduce_grad(ctx, etc, grads, epn)
+    torch.npu.synchronize()
+    case = _ReduceCase(rank, world_size, epn, w_elems, "full-slot", etc_cpu)
+    _verify_reduce_views(grads, case, 0.0, "full-slot ")
 
 
 @pytest.mark.npu
@@ -718,18 +777,26 @@ def test_moonep_precision_pipeline_fp32_then_bf16():
     )
     etc_cpu = etc.cpu()
     v_cpu = vtopk.cpu()
+    for r in range(world_size):
+        remote_homes = {int(e) // epn for e in etc_cpu[r].tolist() if int(e) >= 0}
+        assert len(remote_homes) <= 1, (
+            f"rank {r} 的副本槽来自多个 home rank：{sorted(remote_homes)}"
+        )
     assert int(v_cpu.min()) >= 0 and int(v_cpu.max()) < 2 * shape.num_experts, (
         f"vtopk 越界：[{int(v_cpu.min())},{int(v_cpu.max())}) 应为 [0,{2 * shape.num_experts})"
     )
-    carrier = []
-    for r in range(world_size):
-        row = {r * epn + j for j in range(epn)}
-        row |= {int(e) for e in etc_cpu[r].tolist() if int(e) >= 0}
-        carrier.append(row)
-    for i, (d, e) in enumerate(
-        zip((v_cpu // (2 * epn)).tolist(), topk_all[rank].flatten().tolist())
-    ):
-        assert e in carrier[d], f"token {i} 的专家 {e} 被派到不承载它的 rank {d}"
+    _assert_cu_matches_vtopk(cu, vtopk, shape.num_experts)
+    for i, (v, e) in enumerate(zip(v_cpu.tolist(), topk_all[rank].flatten().tolist())):
+        d, slot = v // (2 * epn), v % (2 * epn)
+        if slot < epn:
+            assert d == e // epn and slot == e % epn, (
+                f"token {i} 的 home 编码错误：expert={e}, vtopk={v}"
+            )
+        else:
+            assert int(etc_cpu[d, slot - epn]) == e, (
+                f"token {i} 的副本槽编码错误：expert={e}, vtopk={v}, "
+                f"etc[{d},{slot - epn}]={int(etc_cpu[d, slot - epn])}"
+            )
     # etc 语义护栏（下面 prefetch 期望值依赖它）：副本表只记别人的专家
     for r in range(world_size):
         for j in range(epn):
@@ -974,22 +1041,27 @@ def test_moonep_general_spec_8192_h7168_k16_epn28():
     )
     etc_cpu = etc.cpu()
     v_cpu = vtopk.cpu()
+    for r in range(world_size):
+        remote_homes = {int(e) // epn for e in etc_cpu[r].tolist() if int(e) >= 0}
+        assert len(remote_homes) <= 1, (
+            f"rank {r} 的副本槽来自多个 home rank：{sorted(remote_homes)}"
+        )
     assert int(v_cpu.min()) >= 0 and int(v_cpu.max()) < 2 * shape.num_experts, (
         f"vtopk 越界：min={int(v_cpu.min())} max={int(v_cpu.max())} "
         f"（合法范围 [0, 2E)={2 * shape.num_experts}）"
     )
-    carrier = []
-    for r in range(world_size):
-        row = {r * epn + j for j in range(epn)}
-        row |= {int(e) for e in etc_cpu[r].tolist() if int(e) >= 0}
-        carrier.append(row)
-    dst_rank = (v_cpu // (2 * epn)).tolist()
-    expert_of = topk_all[rank].flatten().tolist()
-    for i, (d, e) in enumerate(zip(dst_rank, expert_of)):
-        assert e in carrier[d], (
-            f"token {i} 的专家 {e} 被派到不承载它的 rank {d}"
-            f"（carrier[{d}] 大小 {len(carrier[d])}）"
-        )
+    _assert_cu_matches_vtopk(cu, vtopk, shape.num_experts)
+    for i, (v, e) in enumerate(zip(v_cpu.tolist(), topk_all[rank].flatten().tolist())):
+        d, slot = v // (2 * epn), v % (2 * epn)
+        if slot < epn:
+            assert d == e // epn and slot == e % epn, (
+                f"token {i} 的 home 编码错误：expert={e}, vtopk={v}"
+            )
+        else:
+            assert int(etc_cpu[d, slot - epn]) == e, (
+                f"token {i} 的副本槽编码错误：expert={e}, vtopk={v}, "
+                f"etc[{d},{slot - epn}]={int(etc_cpu[d, slot - epn])}"
+            )
 
     # ---- prefetch：3 组权重 ----
     reals, views = [], []
