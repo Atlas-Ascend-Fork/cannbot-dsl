@@ -74,7 +74,11 @@ def tiling_for_cores(block_num, t=72, m_pad=None):
         raise ValueError("m_pad must cover T and be a multiple of 16")
     candidates = []
     widths = range(16, 257, 16) if block_num == 32 else (192,)
-    for base_m in range(16, min(aligned_t, 256) + 1, 16):
+    large_t_32_core = block_num == 32 and t >= 1000
+    max_m = 128 if large_t_32_core else 256
+    for base_m in range(16, min(aligned_t, max_m) + 1, 16):
+        if large_t_32_core and aligned_t % base_m:
+            continue
         legal_n = [n for n in widths if _tile_fits(base_m, n, block_num)]
         if not legal_n:
             continue

@@ -271,6 +271,14 @@ def test_tiling_capacity_and_padding_independence():
             assert (m, n1, n2) == tp1.tiling_for_cores(cores, t, padded + 16)
 
 
+@pytest.mark.parametrize("t", [1000, 1024])
+def test_large_t_32_core_tiling_uses_dividing_m_tile(t):
+    m, _, _ = tp1.tiling_for_cores(32, t)
+    aligned_t = (t + 15) // 16 * 16
+    assert m <= 128
+    assert aligned_t % m == 0
+
+
 @pytest.mark.parametrize(
     "cores,t,mpad", [(0, 72, 80), (32, 0, 16), (32, 72, 64), (32, 72, 81)]
 )
@@ -601,7 +609,7 @@ def benchmark():
                 aiv=vector,
                 tiling=tp1.tiling_for_cores(cube, t),
                 calls=96,
-                cannbotdsl=version("cannbotdsl"),
+                cannbotdsl=version("cannbot-dsl"),
                 exact=True,
             )
         ),

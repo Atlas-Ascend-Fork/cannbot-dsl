@@ -10,13 +10,15 @@
 
 from collections import OrderedDict
 from dataclasses import dataclass
+import inspect
 import threading
 
 import cannbotdsl as dsl
 import torch
 import torch_npu
+from cannbotdsl import make_layout
 from cannbotdsl import Buffer, RegLayout, dtypes
-from cannbotdsl.channel import Channel, ChannelKind
+from cannbotdsl.ring_buffer import RingBuffer
 from cannbotdsl.lang.control_flow import range as dsl_range
 from cannbotdsl.lang.jit import jit
 from cannbotdsl.lang.constexpr import const_expr
@@ -27,10 +29,10 @@ from cannbotdsl.ops.arch import (
     get_subblock_dim,
     get_subblock_id,
 )
-from cannbotdsl.ops.memcpy import mem_copy
+from cannbotdsl.ops.memcpy import copy_options, mem_copy
 from cannbotdsl.ops import reg
 from cannbotdsl.ops.reg.cast import RoundingMode
-from cannbotdsl.tensor import MemLoc, reinterpret, tile_slice
+from cannbotdsl.tensor import MemLoc, tile_slice
 
 from cannbotdsl.ops.sync import (
     PIPE,
@@ -39,7 +41,6 @@ from cannbotdsl.ops.sync import (
     cube_sync_block_wait,
 )
 from cannbotdsl.ops.matmul import matmul
-from cannbotdsl.ops.memcpy import make_copy_engine
 
 
 NG = 8
@@ -51,6 +52,33 @@ BASE_N = 192
 
 BASE_K = 128
 STEPK = 4
+
+
+# Keep the sample usable with both layout-based DSL builds and the 0.8.0
+# CI wheel, whose constructors still expose the shape-based call convention.
+_RING_BUFFER_USES_LAYOUT = "layout" in inspect.signature(RingBuffer).parameters
+_BUFFER_POSITIONAL_PARAMETERS = tuple(
+    name
+    for name, parameter in inspect.signature(Buffer).parameters.items()
+    if parameter.kind
+    in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+)
+_BUFFER_USES_LAYOUT = _BUFFER_POSITIONAL_PARAMETERS[1:3] == ("dtype", "layout")
+_REINTERPRET_USES_LAYOUT = "layout" in inspect.signature(dsl.reinterpret).parameters
+_SCALE_CHANNEL_USES_LAYOUT = _RING_BUFFER_USES_LAYOUT
+
+
+def _make_ring_buffer(location, dtype, shape, *, depth, data_format=None):
+    if _RING_BUFFER_USES_LAYOUT:
+        return RingBuffer(location, dtype, make_layout(shape), depth=depth)
+    return RingBuffer(location, shape, dtype, depth=depth, data_format=data_format)
+
+
+def _make_buffer(location, dtype, shape):
+    if _BUFFER_USES_LAYOUT:
+        return Buffer(location, dtype, make_layout(shape))
+    return Buffer(location, shape, dtype)
+
 
 HEAD_DIM = 512
 ROPE_DIM = 64
@@ -70,8 +98,12 @@ def matrix_view(tensor, row_begin, row_end, col_begin, col_end):
 
 @jit
 def scale_view(tensor, row_begin, row_end, group_begin, group_end):
-    """View packed MX scales while retaining the two scale bytes per group."""
-    return tensor[row_begin:row_end, group_begin:group_end, 0:2]
+    """View packed MX scales as rows of interleaved scale-byte pairs."""
+    if const_expr(len(tensor.shape) == 3):
+        return tensor[row_begin:row_end, group_begin:group_end, 0:2].reshape(
+            row_end - row_begin, (group_end - group_begin) * 2
+        )
+    return tensor[row_begin:row_end, group_begin * 2 : group_end * 2]
 
 
 @dataclass(frozen=True)
@@ -266,9 +298,9 @@ def _operand_channel(
 ):
     """Build an owned channel or identically laid out views of shared storage."""
     if storage is None:
-        if data_format is None:
-            return Channel(location, shape, dtype, depth=depth)
-        return Channel(location, shape, dtype, depth=depth, data_format=data_format)
+        return _make_ring_buffer(
+            location, dtype, shape, depth=depth, data_format=data_format
+        )
     buffers = []
     stride = shape[0] * shape[1] * element_bytes
     for slot in range(depth):
@@ -276,12 +308,16 @@ def _operand_channel(
             dsl.reinterpret(
                 storage,
                 dtype=dtype,
-                shape=shape,
+                **(
+                    {"layout": make_layout(shape)}
+                    if _REINTERPRET_USES_LAYOUT
+                    else {"shape": shape}
+                ),
                 offset=offset + slot * stride,
                 data_format=data_format or "nz",
             )
         )
-    return dsl.make_channel(buffers)
+    return dsl.make_ring_buffer(buffers)
 
 
 @dataclass(frozen=True)
@@ -377,17 +413,12 @@ class MatmulMx:
             raise ValueError("reuse_n must cover the physical N tile")
         self._init_l1_channels(reuse_n)
         self._init_l0_channels(reuse_n, l0c_depth)
-        self.eng_a = make_copy_engine(format_transform="nd2nz")
-        self.eng_b = make_copy_engine(format_transform="nd2nz")
-        self.eng_sa = make_copy_engine(format_transform="mx_scale_and")
-        self.eng_sb = make_copy_engine(format_transform="mx_scale_bdn")
-        self.fp = make_copy_engine()
 
     @jit
     def prefetch(self, b, n0, sb=None):
         for kk in range(self.prefetch_tiles):
             mem_copy(
-                self.l1_b.produce(),
+                self.l1_b.next_write(),
                 matrix_view(
                     b,
                     n0 * self.base_n,
@@ -395,19 +426,17 @@ class MatmulMx:
                     kk * self.k_l1,
                     (kk + 1) * self.k_l1,
                 ),
-                engine=self.eng_b,
             )
         if const_expr(self.prefetch_scales):
             mem_copy(
-                self.l1_sb.produce(),
-                scale_view(
+                self.l1_sb.next_write(),
+                matrix_view(
                     sb,
                     n0 * self.base_n,
                     min((n0 + 1) * self.base_n, b.shape[0]),
                     0,
-                    b.shape[1] // MX_DIVISOR,
-                ),
-                engine=self.eng_sb,
+                    sb.shape[1],
+                ).permute(1, 0),
             )
 
     @jit
@@ -416,8 +445,8 @@ class MatmulMx:
         n_end = min((index.n + 1) * self.base_n, operands.b.shape[0])
         actual_m = m_end - index.m * self.base_m
         actual_n = n_end - index.n * self.base_n
-        b_scales = self._load_scales(operands, index, actual_n)
-        accumulator = self.l0c.produce()
+        b_scales = self._load_scales(operands, index)
+        accumulator = self.l0c.next_write()
         state = MxAccumulator(accumulator, b_scales, actual_m, actual_n)
         scale_k = self.stream_k or index.k
         for chunk in range(index.k // scale_k):
@@ -438,30 +467,35 @@ class MatmulMx:
                 min((n0 + 1) * self.base_n, b.shape[0]),
             ),
             accumulator,
-            engine=self.fp,
-            unit_flag=3,
+            options=copy_options(unit_flag=3),
         )
 
     @jit
-    def _load_scales(self, operands, index, actual_n):
+    def _load_scales(self, operands, index):
         g = index.k // MX_DIVISOR
         m_begin = index.m * self.base_m
         n_begin = index.n * self.base_n
         m_end = min(m_begin + self.base_m, operands.a_scale.shape[0])
         n_end = min(n_begin + self.base_n, operands.b.shape[0])
         if const_expr(not self.stream_k):
+            if const_expr(_SCALE_CHANNEL_USES_LAYOUT):
+                sa_dst = self.l1_sa.next_write().permute(1, 0)
+            else:
+                sa_dst = self.l1_sa.next_write()
             mem_copy(
-                self.l1_sa.produce(),
-                scale_view(operands.a_scale, m_begin, m_end, 0, g),
-                engine=self.eng_sa,
+                sa_dst,
+                matrix_view(
+                    operands.a_scale, m_begin, m_end, 0, operands.a_scale.shape[1]
+                ),
             )
         if not self.prefetch_scales or index.prefetched == 0:
             mem_copy(
-                self.l1_sb.produce(),
-                scale_view(operands.b_scale, n_begin, n_end, 0, g),
-                engine=self.eng_sb,
+                self.l1_sb.next_write(),
+                matrix_view(
+                    operands.b_scale, n_begin, n_end, 0, operands.b_scale.shape[1]
+                ).permute(1, 0),
             )
-        return reinterpret(self.l1_sb.consume(), shape=(2 * g, actual_n))
+        return self.l1_sb.next_read()[0 : 2 * g, 0 : self.base_n]
 
     @jit
     def _compute_chunk(self, operands, index, state, chunk):
@@ -474,12 +508,20 @@ class MatmulMx:
             m_end = min(m_begin + self.base_m, operands.a_scale.shape[0])
             g_begin = chunk * (scale_k // 64)
             g_end = (chunk + 1) * (scale_k // 64)
+            if const_expr(_SCALE_CHANNEL_USES_LAYOUT):
+                sa_dst = self.l1_sa.next_write().permute(1, 0)
+            else:
+                sa_dst = self.l1_sa.next_write()
             mem_copy(
-                self.l1_sa.produce(),
-                scale_view(operands.a_scale, m_begin, m_end, g_begin, g_end),
-                engine=self.eng_sa,
+                sa_dst,
+                matrix_view(operands.a_scale, m_begin, m_end, g_begin * 2, g_end * 2),
             )
-        a_scales = reinterpret(self.l1_sa.consume(), shape=(state.m, scale_k // 32))
+        if const_expr(_SCALE_CHANNEL_USES_LAYOUT):
+            a_scales = self.l1_sa.next_read().permute(1, 0)[
+                0 : self.base_m, 0 : scale_k // 32
+            ]
+        else:
+            a_scales = self.l1_sa.next_read()[0 : self.base_m, 0 : scale_k // 32]
         for local_kk in range(scale_k // self.k_l1):
             kk = chunk * (scale_k // self.k_l1) + local_kk
             position = KTileIndex(kk, local_kk, index.k, index.prefetched)
@@ -494,18 +536,16 @@ class MatmulMx:
         k_begin = position.global_tile * self.k_l1
         k_end = k_begin + self.k_l1
         mem_copy(
-            self.l1_a.produce(),
+            self.l1_a.next_write(),
             matrix_view(operands.a, m_begin, m_end, k_begin, k_end),
-            engine=self.eng_a,
         )
         if position.global_tile >= self.prefetch_tiles or position.prefetched == 0:
             mem_copy(
-                self.l1_b.produce(),
+                self.l1_b.next_write(),
                 matrix_view(operands.b, n_begin, n_end, k_begin, k_end),
-                engine=self.eng_b,
             )
-        a_tile = reinterpret(self.l1_a.consume(), shape=(state.m, self.k_l1))
-        b_tile = reinterpret(self.l1_b.consume(), shape=(state.n, self.k_l1))
+        a_tile = self.l1_a.next_read()[0 : self.base_m, 0 : self.k_l1]
+        b_tile = self.l1_b.next_read()[0 : self.base_n, 0 : self.k_l1]
         tiles = L1Operands(a_tile, b_tile, a_scales)
         self._compute_l0(tiles, state, position)
 
@@ -515,8 +555,8 @@ class MatmulMx:
         steps = position.k // self.k_l1
         for j in range(self.step_k):
             kstep = kk * self.step_k + j
-            a_operand = reinterpret(self.l0a.produce(), shape=(state.m, self.base_k))
-            b_operand = reinterpret(self.l0b.produce(), shape=(state.n, self.base_k))
+            a_operand = self.l0a.next_write()
+            b_operand = self.l0b.next_write()
             a_slice = tile_slice(tiles.a, (self.base_m, self.base_k), (0, j))
             b_slice = tile_slice(tiles.b, (self.base_n, self.base_k), (0, j))
             a_scale = tile_slice(
@@ -525,21 +565,29 @@ class MatmulMx:
                 (0, local_kk * self.step_k + j),
             )
             b_scale = tile_slice(state.b_scale, (self.sk_l0, self.base_n), (kstep, 0))
-            mem_copy(a_operand, a_slice, mx_scale=a_scale)
-            mem_copy(b_operand, b_slice, mx_scale=b_scale)
+            mem_copy(a_operand, a_slice, options=copy_options(mx_scale=a_scale))
+            mem_copy(b_operand, b_slice, options=copy_options(mx_scale=b_scale))
             matmul(
                 state.output,
                 a_operand,
                 b_operand,
                 init=(kk == 0 and j == 0),
                 unit_flag=3 if (kk == steps - 1 and j == self.step_k - 1) else 2,
+                mx_mode=True,
             )
 
     def _init_l1_channels(self, reuse_n):
         storage = dsl.L1.view(524288) if reuse_n else None
         a_shape = (self.base_m, self.k_l1)
         b_shape = (self.base_n, self.k_l1)
-        sa_shape = (self.base_m, self.scale_k // 32)
+        # The layout API uses (scale, M); shape-based builds require (M, scale)
+        # with the legacy zn physical format for MX ScaleA operands.
+        if _SCALE_CHANNEL_USES_LAYOUT:
+            sa_shape = (self.scale_k // 32, self.base_m)
+            sa_format = "nz"
+        else:
+            sa_shape = (self.base_m, self.scale_k // 32)
+            sa_format = "zn"
         sb_shape = (self.sk_full, self.base_n)
         b_addr = self.base_m * self.k_l1 * 2
         sa_addr = (self.base_m + reuse_n) * self.k_l1 * 2
@@ -551,7 +599,7 @@ class MatmulMx:
             storage, MemLoc.L1, b_shape, FP8, 2, offset=b_addr, data_format="nz"
         )
         self.l1_sa = _operand_channel(
-            storage, MemLoc.L1, sa_shape, E8M0, 1, offset=sa_addr, data_format="zn"
+            storage, MemLoc.L1, sa_shape, E8M0, 1, offset=sa_addr, data_format=sa_format
         )
         self.l1_sb = _operand_channel(
             storage, MemLoc.L1, sb_shape, E8M0, 1, offset=sb_addr, data_format="nz"
@@ -605,35 +653,33 @@ class QuantTile:
         self.padded_rows = self.chunks * self.chunk_rows
         self.count = self.chunk_rows * self.cols
         count = self.count
-        self.x = Channel(
-            MemLoc.UB,
-            (self.padded_rows, self.cols),
-            dtypes.float32,
-            depth=1,
-            kind=ChannelKind.CrossCore,
+        self.x = _make_ring_buffer(
+            MemLoc.UB, dtypes.float32, (self.padded_rows, self.cols), depth=1
         )
-        self.bf = Buffer(MemLoc.UB, (1, count), dtypes.bfloat16)
-        self.q = Buffer(MemLoc.UB, (1, 2 * count), dtypes.uint8)
-        self.s = Buffer(MemLoc.UB, (1, count // 32 + 256), dtypes.uint8)
-        self.spad = Buffer(MemLoc.UB, (self.chunk_rows, 32), dtypes.uint8)
-        self.recip = Buffer(MemLoc.UB, (count // 16,), dtypes.uint16)
-        self.qz = Buffer(MemLoc.UB, (count // 2,), dtypes.uint8)
-        self.qo = Buffer(MemLoc.UB, (count // 2,), dtypes.uint8)
-        self.fp = make_copy_engine(split_axis=0)
+        self.bf = _make_buffer(MemLoc.UB, dtypes.bfloat16, (1, count))
+        self.q = _make_buffer(MemLoc.UB, dtypes.uint8, (1, 2 * count))
+        self.s = _make_buffer(MemLoc.UB, dtypes.uint8, (1, count // 32 + 256))
+        self.spad = _make_buffer(MemLoc.UB, dtypes.uint8, (self.chunk_rows, 32))
+        self.recip = _make_buffer(MemLoc.UB, dtypes.uint16, (count // 16,))
+        self.qz = _make_buffer(MemLoc.UB, dtypes.uint8, (count // 2,))
+        self.qo = _make_buffer(MemLoc.UB, dtypes.uint8, (count // 2,))
 
     @jit
     def run(self, accumulator, output, tile):
         actual_m = tile.rows
         if const_expr(self.padded_rows == self.rows):
-            mem_copy(self.x.produce(), accumulator, engine=self.fp, unit_flag=3)
+            mem_copy(
+                self.x.next_write(),
+                accumulator.partition(dim=0),
+                options=copy_options(unit_flag=3),
+            )
         else:
             mem_copy(
-                matrix_view(self.x.produce(), 0, self.rows, 0, self.cols),
+                matrix_view(self.x.next_write(), 0, self.rows, 0, self.cols),
                 accumulator,
-                engine=self.fp,
-                unit_flag=3,
+                options=copy_options(unit_flag=3),
             )
-        src = self.x.consume()
+        src = self.x.next_read()
         half_m = actual_m // 2
         if const_expr(self.chunks == 1):
             self._chunk(src, output, tile, 0, half_m)
@@ -669,7 +715,7 @@ class QuantTile:
                 sv = reg.vload_unalign(self.s, offset)
                 reg.vstore(self.spad, row_index * 32, sv, smask)
         begin = row + get_subblock_id() * half_m + rb
-        q = reinterpret(self.q, shape=(self.chunk_rows, self.cols))
+        q = self.q[0:1, 0 : self.count].reshape(self.chunk_rows, self.cols)
         mem_copy(
             matrix_view(gm_q, begin, begin + valid, col, col + actual_n),
             q[0:valid, 0:actual_n],
@@ -696,41 +742,32 @@ class RopeQuant:
         self.extra_ub = (self.input_depth - 1) * (
             2 * self.count + 8 * self.rows * ROPE_DIM
         )
-        self.in_ch = Channel(
-            MemLoc.UB,
-            shape=(self.rows, self.f),
-            dtype=dtypes.bfloat16,
-            depth=self.input_depth,
+        self.in_ch = _make_ring_buffer(
+            MemLoc.UB, dtypes.bfloat16, (self.rows, self.f), depth=self.input_depth
         )
-        self.out_ch = Channel(
-            MemLoc.UB, shape=(self.rows, self.f), dtype=dtypes.bfloat16, depth=1
+        self.out_ch = _make_ring_buffer(
+            MemLoc.UB, dtypes.bfloat16, (self.rows, self.f), depth=1
         )
         # q_ch is 2x: reg.vstore_interleave(b8) writes ~2x the logical bytes.
-        self.q_ch = Channel(
-            MemLoc.UB, shape=(1, 2 * self.count), dtype=dtypes.uint8, depth=1
+        self.q_ch = _make_ring_buffer(
+            MemLoc.UB, dtypes.uint8, (1, 2 * self.count), depth=1
         )
-        self.s_ch = Channel(
-            MemLoc.UB, shape=(self.rows, self.ngroups), dtype=dtypes.uint8, depth=1
+        self.s_ch = _make_ring_buffer(
+            MemLoc.UB, dtypes.uint8, (self.rows, self.ngroups), depth=1
         )
-        self.cos_ch = Channel(
-            MemLoc.UB,
-            shape=(self.rows, ROPE_DIM),
-            dtype=dtypes.float32,
-            depth=self.input_depth,
+        self.cos_ch = _make_ring_buffer(
+            MemLoc.UB, dtypes.float32, (self.rows, ROPE_DIM), depth=self.input_depth
         )
-        self.sin_ch = Channel(
-            MemLoc.UB,
-            shape=(self.rows, ROPE_DIM),
-            dtype=dtypes.float32,
-            depth=self.input_depth,
+        self.sin_ch = _make_ring_buffer(
+            MemLoc.UB, dtypes.float32, (self.rows, ROPE_DIM), depth=self.input_depth
         )
-        self.rope_buf = Buffer(
-            MemLoc.UB, (self.rows * self.num_heads, ROPE_DIM), dtypes.float32
+        self.rope_buf = _make_buffer(
+            MemLoc.UB, dtypes.float32, (self.rows * self.num_heads, ROPE_DIM)
         )
         nchunk = self.count // 256
-        self.recip_f = Buffer(MemLoc.UB, (nchunk * 16,), dtypes.uint16)
-        self.scr_qz = Buffer(MemLoc.UB, (nchunk * 128,), dtypes.uint8)
-        self.scr_qo = Buffer(MemLoc.UB, (nchunk * 128,), dtypes.uint8)
+        self.recip_f = _make_buffer(MemLoc.UB, dtypes.uint16, (nchunk * 16,))
+        self.scr_qz = _make_buffer(MemLoc.UB, dtypes.uint8, (nchunk * 128,))
+        self.scr_qo = _make_buffer(MemLoc.UB, dtypes.uint8, (nchunk * 128,))
 
     @jit
     def run(self, inputs, output, num_token, m_pad):
@@ -756,23 +793,23 @@ class RopeQuant:
                 t = u // ng
                 g = u % ng
                 mem_copy(
-                    self.in_ch.produce(), tile_slice(gm_o, (1, f), (t * ng + g, 0))
+                    self.in_ch.next_write(), tile_slice(gm_o, (1, f), (t * ng + g, 0))
                 )
                 mem_copy(
-                    self.cos_ch.produce(), tile_slice(gm_cos, (1, ROPE_DIM), (t, 0))
+                    self.cos_ch.next_write(), tile_slice(gm_cos, (1, ROPE_DIM), (t, 0))
                 )
                 mem_copy(
-                    self.sin_ch.produce(), tile_slice(gm_sin, (1, ROPE_DIM), (t, 0))
+                    self.sin_ch.next_write(), tile_slice(gm_sin, (1, ROPE_DIM), (t, 0))
                 )
                 self.apply_inverse_rope()
                 self.quant_row_fast()
                 mem_copy(
                     tile_slice(gm_aq, (1, f), (g * m_pad + t, 0)),
-                    tile_slice(self.q_ch.consume(), (1, f), (0, 0)),
+                    tile_slice(self.q_ch.next_read(), (1, f), (0, 0)),
                 )
                 mem_copy(
                     tile_slice(gm_asc, (1, ngroups), (g * m_pad + t, 0)),
-                    tile_slice(self.s_ch.consume(), (1, ngroups), (0, 0)),
+                    tile_slice(self.s_ch.next_read(), (1, ngroups), (0, 0)),
                 )
 
     @jit
@@ -800,15 +837,15 @@ class RopeQuant:
         col_begin = batch.group * self.full_f + batch.chunk * f
         col_end = col_begin + f
         mem_copy(
-            self.in_ch.produce()[0:actual, 0:f],
+            self.in_ch.next_write()[0:actual, 0:f],
             matrix_view(inputs.source, t, row_end, col_begin, col_end),
         )
         mem_copy(
-            self.cos_ch.produce()[0:actual, 0:ROPE_DIM],
+            self.cos_ch.next_write()[0:actual, 0:ROPE_DIM],
             matrix_view(inputs.cos, t, row_end, 0, ROPE_DIM),
         )
         mem_copy(
-            self.sin_ch.produce()[0:actual, 0:ROPE_DIM],
+            self.sin_ch.next_write()[0:actual, 0:ROPE_DIM],
             matrix_view(inputs.sin, t, row_end, 0, ROPE_DIM),
         )
         self.apply_inverse_rope()
@@ -823,20 +860,20 @@ class RopeQuant:
         q_begin, q_end = batch.chunk * f, (batch.chunk + 1) * f
         s_begin = batch.chunk * ngroups
         s_end = (batch.chunk + 1) * ngroups
-        q = reinterpret(self.q_ch.consume(), shape=(self.rows, f))
+        q = self.q_ch.next_read()[0:1, 0 : self.count].reshape(self.rows, f)
         mem_copy(matrix_view(output.data, begin, end, q_begin, q_end), q[0:actual, 0:f])
         mem_copy(
             matrix_view(output.scales, begin, end, s_begin, s_end),
-            self.s_ch.consume()[0:actual, 0:ngroups],
+            self.s_ch.next_read()[0:actual, 0:ngroups],
         )
 
     @jit
     def quant_row_fast(self):
         _quant_row(
             QuantBuffers(
-                self.out_ch.consume(),
-                self.q_ch.produce(),
-                self.s_ch.produce(),
+                self.out_ch.next_read(),
+                self.q_ch.next_write(),
+                self.s_ch.next_write(),
                 self.recip_f,
                 self.scr_qz,
                 self.scr_qo,
@@ -847,10 +884,10 @@ class RopeQuant:
     @jit
     def apply_inverse_rope(self):
         num_heads = self.num_heads
-        src = self.in_ch.consume()
-        cos = self.cos_ch.consume()
-        sin = self.sin_ch.consume()
-        dst = self.out_ch.produce()
+        src = self.in_ch.next_read()
+        cos = self.cos_ch.next_read()
+        sin = self.sin_ch.next_read()
+        dst = self.out_ch.next_write()
         with vf(mode="simd"):
             full = reg.full_mask()
             if const_expr(self.stream_k):
