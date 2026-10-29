@@ -24,6 +24,7 @@ from the tensors at runtime.  One compiled binary therefore serves every
 the per-launch core counts are runtime scalar arguments.
 """
 
+import inspect
 import json
 import os
 
@@ -38,10 +39,11 @@ from cannbotdsl import (
     const_expr,
     dtypes,
     get_platform_info,
+    make_layout,
 )
 from cannbotdsl.aot import export
 from cannbotdsl.buffer import Buffer
-from cannbotdsl.channel import Channel
+from cannbotdsl.ring_buffer import RingBuffer
 from cannbotdsl.lang.host import host
 from cannbotdsl.lang.jit import jit
 from cannbotdsl.lang.kernel import kernel
@@ -50,7 +52,7 @@ from cannbotdsl.ops import reg as rr
 from cannbotdsl.ops import scalar
 from cannbotdsl.ops.arch import get_block_idx, get_block_num
 from cannbotdsl.ops.matmul import matmul
-from cannbotdsl.ops.memcpy import make_copy_engine, mem_copy
+from cannbotdsl.ops.memcpy import mem_copy
 from cannbotdsl.ops.sync import vec_sync_all
 from cannbotdsl.tensor import ceil_div, tile_slice
 
@@ -75,6 +77,30 @@ E2M1_VALUES_PER_BYTE = 2  # two 4-bit E2M1 codes packed per byte
 ROPE_PAIR_SIZE = 2  # adjacent even/odd lanes form one rope pair
 DMA_ALIGN_BYTES = 32  # UB<->GM fast-path DMA alignment
 CACHE_ABI_DIM2 = 1  # the 4-D cache ABI keeps axis 2 fixed
+
+# Keep the sample usable with both layout-based DSL builds and the 0.8.0
+# CI wheel, whose constructors still expose the shape-based call convention.
+_RING_BUFFER_USES_LAYOUT = "layout" in inspect.signature(RingBuffer).parameters
+_BUFFER_POSITIONAL_PARAMETERS = tuple(
+    name
+    for name, parameter in inspect.signature(Buffer).parameters.items()
+    if parameter.kind
+    in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+)
+_BUFFER_USES_LAYOUT = _BUFFER_POSITIONAL_PARAMETERS[1:3] == ("dtype", "layout")
+
+
+def _make_ring_buffer(location, dtype, shape, *, depth):
+    if _RING_BUFFER_USES_LAYOUT:
+        return RingBuffer(location, dtype, make_layout(shape), depth=depth)
+    return RingBuffer(location, shape, dtype, depth=depth)
+
+
+def _make_buffer(location, dtype, shape):
+    if _BUFFER_USES_LAYOUT:
+        return Buffer(location, dtype, make_layout(shape))
+    return Buffer(location, shape, dtype)
+
 
 # Module-level AOT caches: one compiled ProviderCallable per key.
 _FUSED_AOT_CALLABLE_CACHE = {}
@@ -102,7 +128,14 @@ def get_effective_core_counts():
         props = torch.npu.get_device_properties(torch.npu.current_device())
         cube = int(getattr(props, "cube_core_num", 0))
         vector = int(getattr(props, "vector_core_num", 0)) or 2 * cube
-    except (AttributeError, AssertionError, OSError, RuntimeError, TypeError, ValueError):
+    except (
+        AttributeError,
+        AssertionError,
+        OSError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+    ):
         pass
     try:
         info = get_platform_info()
@@ -145,18 +178,11 @@ class _ProjectionKernel:
     def kernel(self, gm_latent: Tensor, gm_weight: Tensor, gm_projected: Tensor):
         base_n = self.base_n
         base_k = self.base_k
-        l1_a = Channel(MemLoc.L1, (BASE_M, base_k), dtypes.bfloat16, depth=2)
-        l1_b = Channel(
-            MemLoc.L1,
-            (base_n, base_k),
-            dtypes.bfloat16,
-            depth=2,
-            data_format="nz",
-        )
-        l0a = Channel(MemLoc.L0A, (BASE_M, base_k), dtypes.bfloat16, depth=2)
-        l0b = Channel(MemLoc.L0B, (base_n, base_k), dtypes.bfloat16, depth=2)
-        l0c = Channel(MemLoc.L0C, (BASE_M, base_n), dtypes.float32, depth=1)
-        nd2nz = make_copy_engine(format_transform="nd2nz")
+        l1_a = _make_ring_buffer(MemLoc.L1, dtypes.bfloat16, (BASE_M, base_k), depth=2)
+        l1_b = _make_ring_buffer(MemLoc.L1, dtypes.bfloat16, (base_n, base_k), depth=2)
+        l0a = _make_ring_buffer(MemLoc.L0A, dtypes.bfloat16, (BASE_M, base_k), depth=2)
+        l0b = _make_ring_buffer(MemLoc.L0B, dtypes.bfloat16, (base_n, base_k), depth=2)
+        l0c = _make_ring_buffer(MemLoc.L0C, dtypes.float32, (BASE_M, base_n), depth=1)
 
         block_idx = get_block_idx()
         block_num = get_block_num()
@@ -168,26 +194,25 @@ class _ProjectionKernel:
             n_idx = tile_idx % self.n_tiles
             for k_idx in range(self.k_tiles):
                 mem_copy(
-                    l1_a.produce(),
+                    l1_a.next_write(),
                     tile_slice(gm_latent, (BASE_M, base_k), (m_idx, k_idx)),
-                    engine=nd2nz,
                 )
                 mem_copy(
-                    l1_b.produce(),
+                    l1_b.next_write(),
                     tile_slice(gm_weight, (base_n, base_k), (n_idx, k_idx)),
                 )
-                mem_copy(l0a.produce(), l1_a.consume())
-                mem_copy(l0b.produce(), l1_b.consume())
+                mem_copy(l0a.next_write(), l1_a.next_read())
+                mem_copy(l0b.next_write(), l1_b.next_read())
                 matmul(
-                    l0c.produce(),
-                    l0a.consume(),
-                    l0b.consume(),
+                    l0c.next_write(),
+                    l0a.next_read(),
+                    l0b.next_read(),
                     init=(k_idx == 0),
                 )
 
             mem_copy(
                 tile_slice(gm_projected, (BASE_M, base_n), (m_idx, n_idx)),
-                l0c.consume(),
+                l0c.next_read(),
             )
 
     @host
@@ -349,9 +374,7 @@ class _FusedPostScatterKernel:
                 local_end = min(VL, dim - segment_start)
                 end_mask = rr.update_mask(local_end, elem_bits=32)[0]
                 prefix_mask = rr.update_mask(local_start, elem_bits=32)[0]
-                range_mask = rr.mask_xor(
-                    end_mask, prefix_mask, exec_mask=full_mask
-                )
+                range_mask = rr.mask_xor(end_mask, prefix_mask, exec_mask=full_mask)
                 rotated_offset = VL + segment_start - rope_start
                 rr.vload_unalign_init(rotated, rotated_offset)
                 shifted = rr.vload_unalign(rotated, rotated_offset)
@@ -426,9 +449,7 @@ class _FusedPostScatterKernel:
                 code = rr.vadd(code, sign, mask=mask)
                 even_code, odd_code = rr.vdeinterleave(code, code)
                 high_nibble = rr.vshl(odd_code, 4, mask=packed_mask)
-                packed_code = rr.vbitwise_or(
-                    even_code, high_nibble, mask=packed_mask
-                )
+                packed_code = rr.vbitwise_or(even_code, high_nibble, mask=packed_mask)
                 rr.vstore(
                     code_scratch,
                     group * VL,
@@ -519,12 +540,12 @@ class _FusedPostScatterKernel:
         """Store one packed byte range via the DMA or the scalar fallback.
 
         dest_col_tile is a tile index along the cache width axis; src_col is
-        the element offset inside packed_output.  Each produce is colocated
-        with its consume so the staging FIFO ledger stays balanced.
+        the element offset inside packed_output.  Each next_write is colocated
+        with its next_read so the staging FIFO ledger stays balanced.
         """
         if aligned:
             mem_copy(
-                staging.produce(),
+                staging.next_write(),
                 tile_slice(packed_output, (1, count), (0, src_col // count)),
             )
             mem_copy(
@@ -533,7 +554,7 @@ class _FusedPostScatterKernel:
                     (1, 1, 1, count),
                     (dest_block, dest_slot, 0, dest_col_tile),
                 ).view(1, count),
-                staging.consume(),
+                staging.next_read(),
             )
         else:
             for byte_idx in range(count):
@@ -568,13 +589,27 @@ class _FusedPostScatterKernel:
             slot = cache_row % raw_block_size
             aligned = value_bytes % DMA_ALIGN_BYTES == 0
             self._store_bytes(
-                packed_output, packed_data, gm_cache,
-                block_id, slot, 0, value_bytes, 0, aligned,
+                packed_output,
+                packed_data,
+                gm_cache,
+                block_id,
+                slot,
+                0,
+                value_bytes,
+                0,
+                aligned,
             )
             if const_expr(self.write_scale_cache):
                 self._store_bytes(
-                    packed_output, packed_scale, gm_scale_cache,
-                    block_id, slot, 0, scale_bytes, value_bytes, aligned,
+                    packed_output,
+                    packed_scale,
+                    gm_scale_cache,
+                    block_id,
+                    slot,
+                    0,
+                    scale_bytes,
+                    value_bytes,
+                    aligned,
                 )
         else:
             group_size = self.combined_block_size
@@ -586,15 +621,26 @@ class _FusedPostScatterKernel:
             scale_offset = group_size * value_bytes + sub_slot * scale_bytes
             combined_width = group_size * (value_bytes + scale_bytes)
             self._store_bytes(
-                packed_output, packed_data, gm_cache,
-                block_id, cache_group, sub_slot, value_bytes, 0,
+                packed_output,
+                packed_data,
+                gm_cache,
+                block_id,
+                cache_group,
+                sub_slot,
+                value_bytes,
+                0,
                 value_bytes % DMA_ALIGN_BYTES == 0
                 and combined_width % DMA_ALIGN_BYTES == 0,
             )
             self._store_bytes(
-                packed_output, packed_scale, gm_cache,
-                block_id, cache_group, scale_offset // scale_bytes,
-                scale_bytes, value_bytes,
+                packed_output,
+                packed_scale,
+                gm_cache,
+                block_id,
+                cache_group,
+                scale_offset // scale_bytes,
+                scale_bytes,
+                value_bytes,
                 value_bytes % DMA_ALIGN_BYTES == 0,
             )
 
@@ -624,28 +670,23 @@ class _FusedPostScatterKernel:
         dim = self.index_head_dim
         rd = self.rope_head_dim
         mem_copy(
-            projected.produce(),
+            projected.next_write(),
             tile_slice(gm_projected, (1, dim), (row, 0)),
         )
         mem_copy(rope_sin, tile_slice(gm_rope_sin, (1, rd), (row, 0)))
         mem_copy(rope_cos, tile_slice(gm_rope_cos, (1, rd), (row, 0)))
         # Preserve both BF16 publication boundaries from the reference path.
-        self._normalize(projected.consume(), gamma, output, epsilon)
+        self._normalize(projected.next_read(), gamma, output, epsilon)
         self._load_bf16_rope_work(output, work)
         self._apply_rope(work, rope_sin, rope_cos, rotated)
         self._cast_output(work, output)
         self._pack_mxfp4(output, packed_output, code_scratch)
         value_bytes = self.index_head_dim // E2M1_VALUES_PER_BYTE
         scale_bytes = self.index_head_dim // FP4_GROUP_SIZE
-        combined_width = self.combined_block_size * (
-            value_bytes + scale_bytes
-        )
+        combined_width = self.combined_block_size * (value_bytes + scale_bytes)
         if const_expr(
             value_bytes % 32 != 0
-            or (
-                self.storage_mode == 1
-                and combined_width % 32 != 0
-            )
+            or (self.storage_mode == 1 and combined_width % 32 != 0)
         ):
             # The unaligned cache path consumes vector-produced packed bytes
             # from PIPE_S.  Make the V->S dependency explicit before scalar
@@ -675,32 +716,29 @@ class _FusedPostScatterKernel:
         rd = self.rope_head_dim
         padded_dim = self.padded_dim
         padded_rd = _ceil_div(rd, VL) * VL
-        projected = Channel(
-            MemLoc.UB, (1, padded_dim), dtypes.bfloat16, depth=2
+        projected = _make_ring_buffer(
+            MemLoc.UB, dtypes.bfloat16, (1, padded_dim), depth=2
         )
         # This storage is reused by several V->V rounding boundaries before
         # the final MTE3 write, so it is a Buffer rather than a FIFO Channel.
         # One extra vector keeps the final masked BF16 unpack in bounds when
         # MXFP4 groups begin at a 32-element (half-vector) offset.
-        output = Buffer(MemLoc.UB, (1, padded_dim + VL), dtypes.bfloat16)
-        packed_output = Buffer(MemLoc.UB, (1, padded_dim), dtypes.uint8)
-        packed_data = Channel(
-            MemLoc.UB, (1, dim // E2M1_VALUES_PER_BYTE), dtypes.uint8, depth=1
+        output = _make_buffer(MemLoc.UB, dtypes.bfloat16, (1, padded_dim + VL))
+        packed_output = _make_buffer(MemLoc.UB, dtypes.uint8, (1, padded_dim))
+        packed_data = _make_ring_buffer(
+            MemLoc.UB, dtypes.uint8, (1, dim // E2M1_VALUES_PER_BYTE), depth=1
         )
-        packed_scale = Channel(
-            MemLoc.UB,
-            (1, dim // FP4_GROUP_SIZE),
-            dtypes.uint8,
-            depth=1,
+        packed_scale = _make_ring_buffer(
+            MemLoc.UB, dtypes.uint8, (1, dim // FP4_GROUP_SIZE), depth=1
         )
-        code_scratch = Buffer(
-            MemLoc.UB, (dim // FP4_GROUP_SIZE, VL), dtypes.uint32
+        code_scratch = _make_buffer(
+            MemLoc.UB, dtypes.uint32, (dim // FP4_GROUP_SIZE, VL)
         )
-        gamma = Buffer(MemLoc.UB, (padded_dim,), dtypes.float32)
-        work = Buffer(MemLoc.UB, (padded_dim + 2 * VL,), dtypes.float32)
-        rope_sin = Buffer(MemLoc.UB, (1, padded_rd), dtypes.float32)
-        rope_cos = Buffer(MemLoc.UB, (1, padded_rd), dtypes.float32)
-        rotated = Buffer(MemLoc.UB, (padded_rd + 2 * VL,), dtypes.float32)
+        gamma = _make_buffer(MemLoc.UB, dtypes.float32, (padded_dim,))
+        work = _make_buffer(MemLoc.UB, dtypes.float32, (padded_dim + 2 * VL,))
+        rope_sin = _make_buffer(MemLoc.UB, dtypes.float32, (1, padded_rd))
+        rope_cos = _make_buffer(MemLoc.UB, dtypes.float32, (1, padded_rd))
+        rotated = _make_buffer(MemLoc.UB, dtypes.float32, (padded_rd + 2 * VL,))
 
         mem_copy(gamma, gm_gamma)
         block_idx = get_block_idx()
@@ -721,17 +759,29 @@ class _FusedPostScatterKernel:
                     block_id = cache_row // raw_block_size
                     slot = cache_row % raw_block_size
                     cache_group = slot // group_size
-                    owner_key = (
-                        block_id * (raw_block_size // group_size) + cache_group
-                    )
+                    owner_key = block_id * (raw_block_size // group_size) + cache_group
                 if owner_key % block_num == block_idx:
-                        self._process_owned_row(
-                            gm_projected, gm_rope_sin, gm_rope_cos, gamma,
-                            gm_cache, gm_scale_cache, projected, output,
-                            packed_output, packed_data, packed_scale,
-                            code_scratch, work, rope_sin, rope_cos, rotated,
-                            row, cache_row, epsilon,
-                        )
+                    self._process_owned_row(
+                        gm_projected,
+                        gm_rope_sin,
+                        gm_rope_cos,
+                        gamma,
+                        gm_cache,
+                        gm_scale_cache,
+                        projected,
+                        output,
+                        packed_output,
+                        packed_data,
+                        packed_scale,
+                        code_scratch,
+                        work,
+                        rope_sin,
+                        rope_cos,
+                        rotated,
+                        row,
+                        cache_row,
+                        epsilon,
+                    )
 
 
 class IndexerPrologueKPostprocess:
@@ -793,9 +843,7 @@ class _IndexerPrologueKPipeline:
         raw_block_size: int,
         write_scale_cache: bool,
     ):
-        self.projection = _ProjectionKernel(
-            total_rows, index_head_dim, head_dim
-        )
+        self.projection = _ProjectionKernel(total_rows, index_head_dim, head_dim)
         self.postprocess = IndexerPrologueKPostprocess(
             total_rows=total_rows,
             index_head_dim=index_head_dim,
@@ -1027,9 +1075,7 @@ def _get_pipeline_callable(
         TensorSpec((total_rows, rope_head_dim), dtypes.float32),
         TensorSpec((total_rows, rope_head_dim), dtypes.float32),
         TensorSpec((total_rows,), dtypes.int64),
-        TensorSpec(
-            tuple(cache_shape), dtypes.uint8, stride=tuple(cache_stride)
-        ),
+        TensorSpec(tuple(cache_shape), dtypes.uint8, stride=tuple(cache_stride)),
         TensorSpec(
             tuple(scale_cache_shape),
             dtypes.uint8,
@@ -1044,7 +1090,6 @@ def _get_pipeline_callable(
     compiled = dsl_compile(pipeline.run, *specs)
     _AOT_CALLABLE_CACHE[key] = compiled
     return compiled
-
 
 
 def _validate_operator_geometry(latent, wk, rope_sin, storage_mode):
@@ -1105,8 +1150,7 @@ def _validate_cache_layout(
         expected_width = combined_block_size * (value_bytes + scale_bytes)
         if int(k_cache.shape[3]) != expected_width:
             raise ValueError(
-                "storage_mode=1 requires k_cache.shape[-1] == "
-                f"{expected_width}"
+                f"storage_mode=1 requires k_cache.shape[-1] == {expected_width}"
             )
 
 
@@ -1157,8 +1201,8 @@ def indexer_prologue_k(
     binary per model shape (H, D, Dr) and storage configuration serves every
     token count, cache size, and axis-0/1 cache stride.
     """
-    total_rows, head_dim, index_head_dim, rope_head_dim = (
-        _validate_operator_geometry(latent, wk, rope_sin, storage_mode)
+    total_rows, head_dim, index_head_dim, rope_head_dim = _validate_operator_geometry(
+        latent, wk, rope_sin, storage_mode
     )
     value_bytes = index_head_dim // E2M1_VALUES_PER_BYTE
     scale_bytes = index_head_dim // FP4_GROUP_SIZE
@@ -1246,8 +1290,7 @@ def export_indexer_prologue_k():
         for storage in (
             {"storage_mode": 0, "write_scale_cache": True},
             {"storage_mode": 0, "write_scale_cache": False},
-            {"storage_mode": 1, "combined_block_size": 8,
-             "write_scale_cache": False},
+            {"storage_mode": 1, "combined_block_size": 8, "write_scale_cache": False},
         )
     ]
     profile_path = os.environ.get("CANNBOTDSL_DS41_PROFILES")
@@ -1259,9 +1302,7 @@ def export_indexer_prologue_k():
         for profile in profiles:
             unknown = set(profile) - set(_EXPORT_DEFAULTS)
             if unknown:
-                raise ValueError(
-                    f"Unknown export profile fields: {sorted(unknown)}"
-                )
+                raise ValueError(f"Unknown export profile fields: {sorted(unknown)}")
             _get_fused_pipeline_callable(**dict(_EXPORT_DEFAULTS, **profile))
     finally:
         clear_caches()

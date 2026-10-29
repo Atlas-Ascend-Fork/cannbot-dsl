@@ -8,6 +8,7 @@
 
 """CANNBot-DSL implementation of the Engram residual gate."""
 
+import inspect
 import math
 
 import torch
@@ -19,6 +20,7 @@ from cannbotdsl import (
     compile as dsl_compile,
     const_expr,
     dtypes,
+    make_layout,
 )
 from cannbotdsl.aot import export
 from cannbotdsl.buffer import Buffer
@@ -41,6 +43,22 @@ BYTES_PER_ELEMENT_RESIDENT = 30  # 11 BF16 row buffers + out pair + FP32 weight/
 BYTES_PER_ELEMENT_CHUNKED = 12  # 4 BF16 chunk buffers + one FP32 weight chunk buffer
 CHUNKED_UB_RESERVE = 8192  # FP32 accumulators, gate buffer and alignment slack
 PAIRS_PER_GROUP = 3  # row pairs unrolled per pipeline group
+
+# Keep the sample usable with both layout-based DSL builds and the 0.8.0
+# CI wheel, whose constructors still expose the shape-based call convention.
+_BUFFER_POSITIONAL_PARAMETERS = tuple(
+    name
+    for name, parameter in inspect.signature(Buffer).parameters.items()
+    if parameter.kind
+    in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+)
+_BUFFER_USES_LAYOUT = _BUFFER_POSITIONAL_PARAMETERS[1:3] == ("dtype", "layout")
+
+
+def _make_buffer(location, dtype, shape):
+    if _BUFFER_USES_LAYOUT:
+        return Buffer(location, dtype, make_layout(shape))
+    return Buffer(location, shape, dtype)
 
 
 def _vector_core_count() -> int:
@@ -65,25 +83,29 @@ class EngramGateKernel:
         self.hc_mult = int(hc_mult)
         self.dim = int(dim)
         self.num_full = self.dim // VL  # number of full 64-lane segments per row
-        self.tail = self.dim - self.num_full * VL  # lanes in the trailing partial segment
-        self.w = self.dim + (VL - self.tail) % VL  # padded row width in elements, a multiple of VL
+        self.tail = (
+            self.dim - self.num_full * VL
+        )  # lanes in the trailing partial segment
+        self.w = (
+            self.dim + (VL - self.tail) % VL
+        )  # padded row width in elements, a multiple of VL
 
         ub_capacity = get_mem_size("ub")
         if self.w * BYTES_PER_ELEMENT_RESIDENT <= ub_capacity:
             self.chunked = False
-            self.x_a = Buffer(MemLoc.UB, (self.w,), dtypes.bfloat16)
-            self.x_b = Buffer(MemLoc.UB, (self.w,), dtypes.bfloat16)
-            self.x_c = Buffer(MemLoc.UB, (self.w,), dtypes.bfloat16)
-            self.key_a = Buffer(MemLoc.UB, (self.w,), dtypes.bfloat16)
-            self.key_b = Buffer(MemLoc.UB, (self.w,), dtypes.bfloat16)
-            self.key_c = Buffer(MemLoc.UB, (self.w,), dtypes.bfloat16)
-            self.value_a = Buffer(MemLoc.UB, (self.w,), dtypes.bfloat16)
-            self.value_b = Buffer(MemLoc.UB, (self.w,), dtypes.bfloat16)
-            self.value_c = Buffer(MemLoc.UB, (self.w,), dtypes.bfloat16)
-            self.weight_ub = Buffer(MemLoc.UB, (self.w,), dtypes.float32)
-            self.out_a = Buffer(MemLoc.UB, (self.w,), dtypes.bfloat16)
-            self.out_b = Buffer(MemLoc.UB, (self.w,), dtypes.bfloat16)
-            self.x_fp32_ub = Buffer(MemLoc.UB, (self.w,), dtypes.float32)
+            self.x_a = _make_buffer(MemLoc.UB, dtypes.bfloat16, (self.w,))
+            self.x_b = _make_buffer(MemLoc.UB, dtypes.bfloat16, (self.w,))
+            self.x_c = _make_buffer(MemLoc.UB, dtypes.bfloat16, (self.w,))
+            self.key_a = _make_buffer(MemLoc.UB, dtypes.bfloat16, (self.w,))
+            self.key_b = _make_buffer(MemLoc.UB, dtypes.bfloat16, (self.w,))
+            self.key_c = _make_buffer(MemLoc.UB, dtypes.bfloat16, (self.w,))
+            self.value_a = _make_buffer(MemLoc.UB, dtypes.bfloat16, (self.w,))
+            self.value_b = _make_buffer(MemLoc.UB, dtypes.bfloat16, (self.w,))
+            self.value_c = _make_buffer(MemLoc.UB, dtypes.bfloat16, (self.w,))
+            self.weight_ub = _make_buffer(MemLoc.UB, dtypes.float32, (self.w,))
+            self.out_a = _make_buffer(MemLoc.UB, dtypes.bfloat16, (self.w,))
+            self.out_b = _make_buffer(MemLoc.UB, dtypes.bfloat16, (self.w,))
+            self.x_fp32_ub = _make_buffer(MemLoc.UB, dtypes.float32, (self.w,))
             self.x_ub = self.x_a
             self.key_ub = self.key_a
             self.value_ub = self.value_a
@@ -102,15 +124,15 @@ class EngramGateKernel:
             self.last_len = self.w - (self.num_chunks - 1) * self.chunk
             self.last_gm_len = self.dim - (self.num_chunks - 1) * self.chunk
             self.last_full = self.last_gm_len // VL
-            self.x_ch = Buffer(MemLoc.UB, (self.chunk,), dtypes.bfloat16)
-            self.key_ch = Buffer(MemLoc.UB, (self.chunk,), dtypes.bfloat16)
-            self.value_ch = Buffer(MemLoc.UB, (self.chunk,), dtypes.bfloat16)
-            self.weight_ch = Buffer(MemLoc.UB, (self.chunk,), dtypes.float32)
-            self.out_ch = Buffer(MemLoc.UB, (self.chunk,), dtypes.bfloat16)
-            self.acc_x2 = Buffer(MemLoc.UB, (VL,), dtypes.float32)
-            self.acc_k2 = Buffer(MemLoc.UB, (VL,), dtypes.float32)
-            self.acc_dot = Buffer(MemLoc.UB, (VL,), dtypes.float32)
-            self.gate_buf = Buffer(MemLoc.UB, (VL,), dtypes.float32)
+            self.x_ch = _make_buffer(MemLoc.UB, dtypes.bfloat16, (self.chunk,))
+            self.key_ch = _make_buffer(MemLoc.UB, dtypes.bfloat16, (self.chunk,))
+            self.value_ch = _make_buffer(MemLoc.UB, dtypes.bfloat16, (self.chunk,))
+            self.weight_ch = _make_buffer(MemLoc.UB, dtypes.float32, (self.chunk,))
+            self.out_ch = _make_buffer(MemLoc.UB, dtypes.bfloat16, (self.chunk,))
+            self.acc_x2 = _make_buffer(MemLoc.UB, dtypes.float32, (VL,))
+            self.acc_k2 = _make_buffer(MemLoc.UB, dtypes.float32, (VL,))
+            self.acc_dot = _make_buffer(MemLoc.UB, dtypes.float32, (VL,))
+            self.gate_buf = _make_buffer(MemLoc.UB, dtypes.float32, (VL,))
 
     @jit
     def _compute(self, epsilon: dtypes.float32, clamp_value: dtypes.float32):
@@ -134,7 +156,9 @@ class EngramGateKernel:
                 rr.vstore(self.x_fp32_ub, segment_offset, x, full_mask)
                 key = rr.vcast(
                     rr.vload_unpack(
-                        self.key_ub, segment_offset, unpack_mode=rr.UnpackMode.B16_TO_B32
+                        self.key_ub,
+                        segment_offset,
+                        unpack_mode=rr.UnpackMode.B16_TO_B32,
                     ),
                     dtypes.float32,
                     mask=full_mask,
@@ -185,14 +209,18 @@ class EngramGateKernel:
                 )
                 key_square_sum = rr.vadd(
                     key_square_sum,
-                    rr.vreduce_sum(rr.vmul(key_t, key_t, mask=tail_mask), mask=tail_mask),
+                    rr.vreduce_sum(
+                        rr.vmul(key_t, key_t, mask=tail_mask), mask=tail_mask
+                    ),
                     mask=lane0,
                 )
                 dot_sum = rr.vadd(
                     dot_sum,
                     rr.vreduce_sum(
                         rr.vmul(
-                            rr.vmul(x_t, weight_t, mask=tail_mask), key_t, mask=tail_mask
+                            rr.vmul(x_t, weight_t, mask=tail_mask),
+                            key_t,
+                            mask=tail_mask,
                         ),
                         mask=tail_mask,
                     ),
@@ -249,7 +277,9 @@ class EngramGateKernel:
                 x = rr.vload(self.x_fp32_ub, segment_offset)
                 value = rr.vcast(
                     rr.vload_unpack(
-                        self.value_ub, segment_offset, unpack_mode=rr.UnpackMode.B16_TO_B32
+                        self.value_ub,
+                        segment_offset,
+                        unpack_mode=rr.UnpackMode.B16_TO_B32,
                     ),
                     dtypes.float32,
                     mask=full_mask,
@@ -273,7 +303,9 @@ class EngramGateKernel:
                     dtypes.float32,
                     mask=tail_mask,
                 )
-                out_t = rr.vadd(x_t, rr.vmul(gate, value_t, mask=tail_mask), mask=tail_mask)
+                out_t = rr.vadd(
+                    x_t, rr.vmul(gate, value_t, mask=tail_mask), mask=tail_mask
+                )
                 rr.vstore_pack(
                     self.out_ub,
                     tail_offset,
@@ -311,32 +343,51 @@ class EngramGateKernel:
                 )
                 key = rr.vcast(
                     rr.vload_unpack(
-                        self.key_ch, segment_offset, unpack_mode=rr.UnpackMode.B16_TO_B32
+                        self.key_ch,
+                        segment_offset,
+                        unpack_mode=rr.UnpackMode.B16_TO_B32,
                     ),
                     dtypes.float32,
                     mask=full_mask,
                 )
                 weight = rr.vload(self.weight_ch, segment_offset)
                 x_acc = rr.vadd(x_acc, rr.vmul(x, x, mask=full_mask), mask=full_mask)
-                k_acc = rr.vadd(k_acc, rr.vmul(key, key, mask=full_mask), mask=full_mask)
+                k_acc = rr.vadd(
+                    k_acc, rr.vmul(key, key, mask=full_mask), mask=full_mask
+                )
                 d_acc = rr.vadd(
                     d_acc,
                     rr.vmul(rr.vmul(x, weight, mask=full_mask), key, mask=full_mask),
                     mask=full_mask,
                 )
             rr.vstore(
-                self.acc_x2, 0,
-                rr.vadd(rr.vload(self.acc_x2, 0), rr.vreduce_sum(x_acc, mask=full_mask), mask=lane0),
+                self.acc_x2,
+                0,
+                rr.vadd(
+                    rr.vload(self.acc_x2, 0),
+                    rr.vreduce_sum(x_acc, mask=full_mask),
+                    mask=lane0,
+                ),
                 full_mask,
             )
             rr.vstore(
-                self.acc_k2, 0,
-                rr.vadd(rr.vload(self.acc_k2, 0), rr.vreduce_sum(k_acc, mask=full_mask), mask=lane0),
+                self.acc_k2,
+                0,
+                rr.vadd(
+                    rr.vload(self.acc_k2, 0),
+                    rr.vreduce_sum(k_acc, mask=full_mask),
+                    mask=lane0,
+                ),
                 full_mask,
             )
             rr.vstore(
-                self.acc_dot, 0,
-                rr.vadd(rr.vload(self.acc_dot, 0), rr.vreduce_sum(d_acc, mask=full_mask), mask=lane0),
+                self.acc_dot,
+                0,
+                rr.vadd(
+                    rr.vload(self.acc_dot, 0),
+                    rr.vreduce_sum(d_acc, mask=full_mask),
+                    mask=lane0,
+                ),
                 full_mask,
             )
 
@@ -359,14 +410,18 @@ class EngramGateKernel:
                 )
                 key = rr.vcast(
                     rr.vload_unpack(
-                        self.key_ch, segment_offset, unpack_mode=rr.UnpackMode.B16_TO_B32
+                        self.key_ch,
+                        segment_offset,
+                        unpack_mode=rr.UnpackMode.B16_TO_B32,
                     ),
                     dtypes.float32,
                     mask=full_mask,
                 )
                 weight = rr.vload(self.weight_ch, segment_offset)
                 x_acc = rr.vadd(x_acc, rr.vmul(x, x, mask=full_mask), mask=full_mask)
-                k_acc = rr.vadd(k_acc, rr.vmul(key, key, mask=full_mask), mask=full_mask)
+                k_acc = rr.vadd(
+                    k_acc, rr.vmul(key, key, mask=full_mask), mask=full_mask
+                )
                 d_acc = rr.vadd(
                     d_acc,
                     rr.vmul(rr.vmul(x, weight, mask=full_mask), key, mask=full_mask),
@@ -376,7 +431,8 @@ class EngramGateKernel:
                 tail_mask = rr.update_mask(self.tail, elem_bits=32)[0]
                 x_t = rr.vcast(
                     rr.vload_unpack(
-                        self.x_ch, self.last_full * VL,
+                        self.x_ch,
+                        self.last_full * VL,
                         unpack_mode=rr.UnpackMode.B16_TO_B32,
                     ),
                     dtypes.float32,
@@ -384,57 +440,97 @@ class EngramGateKernel:
                 )
                 key_t = rr.vcast(
                     rr.vload_unpack(
-                        self.key_ch, self.last_full * VL,
+                        self.key_ch,
+                        self.last_full * VL,
                         unpack_mode=rr.UnpackMode.B16_TO_B32,
                     ),
                     dtypes.float32,
                     mask=tail_mask,
                 )
                 weight_t = rr.vload(self.weight_ch, self.last_full * VL)
-                x_sum_t = rr.vreduce_sum(rr.vmul(x_t, x_t, mask=tail_mask), mask=tail_mask)
-                k_sum_t = rr.vreduce_sum(rr.vmul(key_t, key_t, mask=tail_mask), mask=tail_mask)
+                x_sum_t = rr.vreduce_sum(
+                    rr.vmul(x_t, x_t, mask=tail_mask), mask=tail_mask
+                )
+                k_sum_t = rr.vreduce_sum(
+                    rr.vmul(key_t, key_t, mask=tail_mask), mask=tail_mask
+                )
                 d_sum_t = rr.vreduce_sum(
-                    rr.vmul(rr.vmul(x_t, weight_t, mask=tail_mask), key_t, mask=tail_mask),
+                    rr.vmul(
+                        rr.vmul(x_t, weight_t, mask=tail_mask), key_t, mask=tail_mask
+                    ),
                     mask=tail_mask,
                 )
                 rr.vstore(
-                    self.acc_x2, 0,
+                    self.acc_x2,
+                    0,
                     rr.vadd(
-                        rr.vadd(rr.vload(self.acc_x2, 0), rr.vreduce_sum(x_acc, mask=full_mask), mask=lane0),
-                        x_sum_t, mask=lane0,
+                        rr.vadd(
+                            rr.vload(self.acc_x2, 0),
+                            rr.vreduce_sum(x_acc, mask=full_mask),
+                            mask=lane0,
+                        ),
+                        x_sum_t,
+                        mask=lane0,
                     ),
                     full_mask,
                 )
                 rr.vstore(
-                    self.acc_k2, 0,
+                    self.acc_k2,
+                    0,
                     rr.vadd(
-                        rr.vadd(rr.vload(self.acc_k2, 0), rr.vreduce_sum(k_acc, mask=full_mask), mask=lane0),
-                        k_sum_t, mask=lane0,
+                        rr.vadd(
+                            rr.vload(self.acc_k2, 0),
+                            rr.vreduce_sum(k_acc, mask=full_mask),
+                            mask=lane0,
+                        ),
+                        k_sum_t,
+                        mask=lane0,
                     ),
                     full_mask,
                 )
                 rr.vstore(
-                    self.acc_dot, 0,
+                    self.acc_dot,
+                    0,
                     rr.vadd(
-                        rr.vadd(rr.vload(self.acc_dot, 0), rr.vreduce_sum(d_acc, mask=full_mask), mask=lane0),
-                        d_sum_t, mask=lane0,
+                        rr.vadd(
+                            rr.vload(self.acc_dot, 0),
+                            rr.vreduce_sum(d_acc, mask=full_mask),
+                            mask=lane0,
+                        ),
+                        d_sum_t,
+                        mask=lane0,
                     ),
                     full_mask,
                 )
             else:
                 rr.vstore(
-                    self.acc_x2, 0,
-                    rr.vadd(rr.vload(self.acc_x2, 0), rr.vreduce_sum(x_acc, mask=full_mask), mask=lane0),
+                    self.acc_x2,
+                    0,
+                    rr.vadd(
+                        rr.vload(self.acc_x2, 0),
+                        rr.vreduce_sum(x_acc, mask=full_mask),
+                        mask=lane0,
+                    ),
                     full_mask,
                 )
                 rr.vstore(
-                    self.acc_k2, 0,
-                    rr.vadd(rr.vload(self.acc_k2, 0), rr.vreduce_sum(k_acc, mask=full_mask), mask=lane0),
+                    self.acc_k2,
+                    0,
+                    rr.vadd(
+                        rr.vload(self.acc_k2, 0),
+                        rr.vreduce_sum(k_acc, mask=full_mask),
+                        mask=lane0,
+                    ),
                     full_mask,
                 )
                 rr.vstore(
-                    self.acc_dot, 0,
-                    rr.vadd(rr.vload(self.acc_dot, 0), rr.vreduce_sum(d_acc, mask=full_mask), mask=lane0),
+                    self.acc_dot,
+                    0,
+                    rr.vadd(
+                        rr.vload(self.acc_dot, 0),
+                        rr.vreduce_sum(d_acc, mask=full_mask),
+                        mask=lane0,
+                    ),
                     full_mask,
                 )
 
@@ -449,11 +545,15 @@ class EngramGateKernel:
             dot_sum = rr.vload(self.acc_dot, 0)
             one = rr.vdups(1.0, dtypes.float32, mask=lane0)
             x_rms = rr.vsqrt(
-                rr.vadds(rr.vmuls(x_square_sum, 1.0 / dim, mask=lane0), epsilon, mask=lane0),
+                rr.vadds(
+                    rr.vmuls(x_square_sum, 1.0 / dim, mask=lane0), epsilon, mask=lane0
+                ),
                 mask=lane0,
             )
             key_rms = rr.vsqrt(
-                rr.vadds(rr.vmuls(key_square_sum, 1.0 / dim, mask=lane0), epsilon, mask=lane0),
+                rr.vadds(
+                    rr.vmuls(key_square_sum, 1.0 / dim, mask=lane0), epsilon, mask=lane0
+                ),
                 mask=lane0,
             )
             normalized_dot = rr.vdiv(
@@ -496,7 +596,9 @@ class EngramGateKernel:
                 )
                 value = rr.vcast(
                     rr.vload_unpack(
-                        self.value_ch, segment_offset, unpack_mode=rr.UnpackMode.B16_TO_B32
+                        self.value_ch,
+                        segment_offset,
+                        unpack_mode=rr.UnpackMode.B16_TO_B32,
                     ),
                     dtypes.float32,
                     mask=full_mask,
@@ -527,7 +629,9 @@ class EngramGateKernel:
                 )
                 value = rr.vcast(
                     rr.vload_unpack(
-                        self.value_ch, segment_offset, unpack_mode=rr.UnpackMode.B16_TO_B32
+                        self.value_ch,
+                        segment_offset,
+                        unpack_mode=rr.UnpackMode.B16_TO_B32,
                     ),
                     dtypes.float32,
                     mask=full_mask,
@@ -544,7 +648,8 @@ class EngramGateKernel:
                 tail_mask = rr.update_mask(self.tail, elem_bits=32)[0]
                 x_t = rr.vcast(
                     rr.vload_unpack(
-                        self.x_ch, self.last_full * VL,
+                        self.x_ch,
+                        self.last_full * VL,
                         unpack_mode=rr.UnpackMode.B16_TO_B32,
                     ),
                     dtypes.float32,
@@ -552,13 +657,16 @@ class EngramGateKernel:
                 )
                 value_t = rr.vcast(
                     rr.vload_unpack(
-                        self.value_ch, self.last_full * VL,
+                        self.value_ch,
+                        self.last_full * VL,
                         unpack_mode=rr.UnpackMode.B16_TO_B32,
                     ),
                     dtypes.float32,
                     mask=tail_mask,
                 )
-                out_t = rr.vadd(x_t, rr.vmul(gate, value_t, mask=tail_mask), mask=tail_mask)
+                out_t = rr.vadd(
+                    x_t, rr.vmul(gate, value_t, mask=tail_mask), mask=tail_mask
+                )
                 rr.vstore_pack(
                     self.out_ch,
                     self.last_full * VL,
@@ -577,21 +685,41 @@ class EngramGateKernel:
                 dtypes.bfloat16,
                 mask=full_mask,
             )
-            rr.vstore_pack(self.x_b, 0, zero_reg, full_mask, pack_mode=rr.PackMode.B32_TO_B16)
-            rr.vstore_pack(self.x_c, 0, zero_reg, full_mask, pack_mode=rr.PackMode.B32_TO_B16)
-            rr.vstore_pack(self.key_b, 0, zero_reg, full_mask, pack_mode=rr.PackMode.B32_TO_B16)
-            rr.vstore_pack(self.key_c, 0, zero_reg, full_mask, pack_mode=rr.PackMode.B32_TO_B16)
-            rr.vstore_pack(self.value_b, 0, zero_reg, full_mask, pack_mode=rr.PackMode.B32_TO_B16)
-            rr.vstore_pack(self.value_c, 0, zero_reg, full_mask, pack_mode=rr.PackMode.B32_TO_B16)
+            rr.vstore_pack(
+                self.x_b, 0, zero_reg, full_mask, pack_mode=rr.PackMode.B32_TO_B16
+            )
+            rr.vstore_pack(
+                self.x_c, 0, zero_reg, full_mask, pack_mode=rr.PackMode.B32_TO_B16
+            )
+            rr.vstore_pack(
+                self.key_b, 0, zero_reg, full_mask, pack_mode=rr.PackMode.B32_TO_B16
+            )
+            rr.vstore_pack(
+                self.key_c, 0, zero_reg, full_mask, pack_mode=rr.PackMode.B32_TO_B16
+            )
+            rr.vstore_pack(
+                self.value_b, 0, zero_reg, full_mask, pack_mode=rr.PackMode.B32_TO_B16
+            )
+            rr.vstore_pack(
+                self.value_c, 0, zero_reg, full_mask, pack_mode=rr.PackMode.B32_TO_B16
+            )
 
     @jit
-    def _chunked_row(self, x_row, key_row, w_row, v_row, o_row,
-                     epsilon: dtypes.float32, clamp_value: dtypes.float32):
+    def _chunked_row(
+        self,
+        x_row,
+        key_row,
+        w_row,
+        v_row,
+        o_row,
+        epsilon: dtypes.float32,
+        clamp_value: dtypes.float32,
+    ):
         """Accumulate and emit one (token, hc) row through the chunk buffers."""
         self._acc_init()
         for chunk_idx in range(self.num_chunks):
-            mem_copy(self.x_ch, tile_slice(x_row, (1, self.chunk), (0, chunk_idx)))
-            mem_copy(self.key_ch, tile_slice(key_row, (1, self.chunk), (0, chunk_idx)))
+            mem_copy(self.x_ch, tile_slice(x_row, (self.chunk,), (chunk_idx,)))
+            mem_copy(self.key_ch, tile_slice(key_row, (self.chunk,), (chunk_idx,)))
             mem_copy(self.weight_ch, tile_slice(w_row, (self.chunk,), (chunk_idx,)))
             if chunk_idx + 1 < self.num_chunks:
                 self._acc_full_chunk()
@@ -600,78 +728,125 @@ class EngramGateKernel:
         self._finalize_gate(epsilon, clamp_value)
         for chunk_idx in range(self.num_chunks):
             if self.num_chunks > 1:
-                mem_copy(self.x_ch, tile_slice(x_row, (1, self.chunk), (0, chunk_idx)))
+                mem_copy(self.x_ch, tile_slice(x_row, (self.chunk,), (chunk_idx,)))
             mem_copy(self.value_ch, tile_slice(v_row, (self.chunk,), (chunk_idx,)))
             if chunk_idx + 1 < self.num_chunks:
                 self._emit_full_chunk()
+                mem_copy(
+                    tile_slice(o_row, (self.chunk,), (chunk_idx,)),
+                    self.out_ch,
+                )
             else:
                 self._emit_last_chunk()
-            mem_copy(tile_slice(o_row, (1, self.chunk), (0, chunk_idx)), self.out_ch)
+                # The GM row tile only covers the valid tail extent; clip the
+                # chunk-sized UB source to it so the store cannot overrun
+                # into the next cache row.
+                mem_copy(
+                    tile_slice(o_row, (self.chunk,), (chunk_idx,)),
+                    tile_slice(self.out_ch, (self.last_gm_len,), (0,)),
+                )
 
     @jit
     def _load_row(self, slot, gm_x, gm_key, gm_value, gm_mask, token, hc):
         """Prefetch one row into a rotation slot, trimmed by the mask."""
         if gm_mask is None:
-            mem_copy(slot[2], gm_value[token, None])
-            mem_copy(slot[0], gm_x[token, hc, None])
-            mem_copy(slot[1], gm_key[token, hc, None])
+            mem_copy(slot[2], gm_value[token, None].flatten())
+            mem_copy(slot[0], gm_x[token, hc, None].flatten())
+            mem_copy(slot[1], gm_key[token, hc, None].flatten())
         else:
             masked = gm_mask[token]
-            if masked:
-                mem_copy(slot[0], gm_x[token, hc, None])
+            if masked != 0:
+                mem_copy(slot[0], gm_x[token, hc, None].flatten())
             else:
-                mem_copy(slot[2], gm_value[token, None])
-                mem_copy(slot[0], gm_x[token, hc, None])
-                mem_copy(slot[1], gm_key[token, hc, None])
+                mem_copy(slot[2], gm_value[token, None].flatten())
+                mem_copy(slot[0], gm_x[token, hc, None].flatten())
+                mem_copy(slot[1], gm_key[token, hc, None].flatten())
 
     @jit
-    def _emit_row(self, gm_out, gm_mask, gm_weight, token, hc,
-                  epsilon: dtypes.float32, clamp_value: dtypes.float32,
-                  weight_resident):
+    def _emit_row(
+        self,
+        gm_out,
+        gm_mask,
+        gm_weight,
+        token,
+        hc,
+        epsilon: dtypes.float32,
+        clamp_value: dtypes.float32,
+        weight_resident,
+    ):
         """Compute (or pass through) the bound row and store it."""
+        # The UB row is padded to a multiple of VL; clip the stored source to
+        # the row's valid extent so a padded tail cannot overrun the GM row.
+        out_valid = tile_slice(self.out_ub, (self.dim,), (0,))
         if gm_mask is None:
             if not weight_resident:
-                mem_copy(self.weight_ub, gm_weight[hc, None])
+                mem_copy(self.weight_ub, gm_weight[hc, None].flatten())
             self._compute(epsilon, clamp_value)
-            mem_copy(gm_out[token, hc, None], self.out_ub)
+            mem_copy(gm_out[token, hc, None].flatten(), out_valid)
         else:
             masked = gm_mask[token]
-            if masked:
+            if masked != 0:
                 mem_copy(self.out_ub, self.x_ub)
-                mem_copy(gm_out[token, hc, None], self.out_ub)
+                mem_copy(gm_out[token, hc, None].flatten(), out_valid)
             else:
                 if not weight_resident:
-                    mem_copy(self.weight_ub, gm_weight[hc, None])
+                    mem_copy(self.weight_ub, gm_weight[hc, None].flatten())
                 self._compute(epsilon, clamp_value)
-                mem_copy(gm_out[token, hc, None], self.out_ub)
+                mem_copy(gm_out[token, hc, None].flatten(), out_valid)
 
     @jit
-    def _prologue(self, gm_x, gm_key, gm_value, gm_weight, gm_mask,
-                  first_token, first_hc, weight_resident):
+    def _prologue(
+        self,
+        gm_x,
+        gm_key,
+        gm_value,
+        gm_weight,
+        gm_mask,
+        first_token,
+        first_hc,
+        weight_resident,
+    ):
         """Preload the first row into slot a before the pair pipeline."""
         if gm_mask is None:
-            mem_copy(self.x_a, gm_x[first_token, first_hc, None])
-            mem_copy(self.key_a, gm_key[first_token, first_hc, None])
-            mem_copy(self.weight_ub, gm_weight[first_hc, None])
-            mem_copy(self.value_a, gm_value[first_token, None])
+            mem_copy(self.x_a, gm_x[first_token, first_hc, None].flatten())
+            mem_copy(self.key_a, gm_key[first_token, first_hc, None].flatten())
+            mem_copy(self.weight_ub, gm_weight[first_hc, None].flatten())
+            mem_copy(self.value_a, gm_value[first_token, None].flatten())
         else:
             first_masked = gm_mask[first_token]
-            if first_masked:
-                mem_copy(self.x_a, gm_x[first_token, first_hc, None])
+            if first_masked != 0:
+                mem_copy(self.x_a, gm_x[first_token, first_hc, None].flatten())
                 if weight_resident:
-                    mem_copy(self.weight_ub, gm_weight[first_hc, None])
+                    mem_copy(self.weight_ub, gm_weight[first_hc, None].flatten())
             else:
-                mem_copy(self.x_a, gm_x[first_token, first_hc, None])
-                mem_copy(self.key_a, gm_key[first_token, first_hc, None])
-                mem_copy(self.weight_ub, gm_weight[first_hc, None])
-                mem_copy(self.value_a, gm_value[first_token, None])
+                mem_copy(self.x_a, gm_x[first_token, first_hc, None].flatten())
+                mem_copy(self.key_a, gm_key[first_token, first_hc, None].flatten())
+                mem_copy(self.weight_ub, gm_weight[first_hc, None].flatten())
+                mem_copy(self.value_a, gm_value[first_token, None].flatten())
 
     @jit
-    def _pair_step(self, gm_x, gm_key, gm_value, gm_weight, gm_out, gm_mask,
-                   row0, rows, block_num, pair_stride,
-                   epsilon: dtypes.float32, clamp_value: dtypes.float32,
-                   weight_resident, s0, s1, s2,
-                   load_s0, prefetch_row2, guard_row2):
+    def _pair_step(
+        self,
+        gm_x,
+        gm_key,
+        gm_value,
+        gm_weight,
+        gm_out,
+        gm_mask,
+        row0,
+        rows,
+        block_num,
+        pair_stride,
+        epsilon: dtypes.float32,
+        clamp_value: dtypes.float32,
+        weight_resident,
+        s0,
+        s1,
+        s2,
+        load_s0,
+        prefetch_row2,
+        guard_row2,
+    ):
         """Run one (row0, row0 + block_num) pair of the rotation pipeline.
 
         s0/s1/s2 are (x, key, value) buffer triples for the current row, the
@@ -696,8 +871,16 @@ class EngramGateKernel:
         self.key_ub = s0[1]
         self.value_ub = s0[2]
         self.out_ub = self.out_a
-        self._emit_row(gm_out, gm_mask, gm_weight, token0, hc0,
-                       epsilon, clamp_value, weight_resident)
+        self._emit_row(
+            gm_out,
+            gm_mask,
+            gm_weight,
+            token0,
+            hc0,
+            epsilon,
+            clamp_value,
+            weight_resident,
+        )
         if prefetch_row2:
             if guard_row2:
                 if row2 < rows:
@@ -709,14 +892,33 @@ class EngramGateKernel:
             self.key_ub = s1[1]
             self.value_ub = s1[2]
             self.out_ub = self.out_b
-            self._emit_row(gm_out, gm_mask, gm_weight, token1, hc1,
-                           epsilon, clamp_value, weight_resident)
+            self._emit_row(
+                gm_out,
+                gm_mask,
+                gm_weight,
+                token1,
+                hc1,
+                epsilon,
+                clamp_value,
+                weight_resident,
+            )
 
     @jit
-    def _resident_pipeline(self, gm_x, gm_key, gm_value, gm_weight, gm_out,
-                           gm_mask, block_idx, block_num, rows,
-                           epsilon: dtypes.float32, clamp_value: dtypes.float32,
-                           weight_resident):
+    def _resident_pipeline(
+        self,
+        gm_x,
+        gm_key,
+        gm_value,
+        gm_weight,
+        gm_out,
+        gm_mask,
+        block_idx,
+        block_num,
+        rows,
+        epsilon: dtypes.float32,
+        clamp_value: dtypes.float32,
+        weight_resident,
+    ):
         """Row-pair rotation pipeline over this block's rows.
 
         The three slots rotate (a, b, c) -> (c, a, b) -> (b, c, a) per pair,
@@ -730,44 +932,127 @@ class EngramGateKernel:
         pairs = (rows - first_row + pair_stride - 1) // pair_stride
         first_token = first_row // self.hc_mult
         first_hc = first_row - first_token * self.hc_mult
-        self._prologue(gm_x, gm_key, gm_value, gm_weight, gm_mask,
-                       first_token, first_hc, weight_resident)
+        self._prologue(
+            gm_x,
+            gm_key,
+            gm_value,
+            gm_weight,
+            gm_mask,
+            first_token,
+            first_hc,
+            weight_resident,
+        )
         n_groups = pairs // PAIRS_PER_GROUP
         for group_idx in range(n_groups):
             base = first_row + group_idx * PAIRS_PER_GROUP * pair_stride
             self._pair_step(
-                gm_x, gm_key, gm_value, gm_weight, gm_out, gm_mask,
-                base, rows, block_num, pair_stride,
-                epsilon, clamp_value, weight_resident,
-                slot_a, slot_b, slot_c, False, True, False,
+                gm_x,
+                gm_key,
+                gm_value,
+                gm_weight,
+                gm_out,
+                gm_mask,
+                base,
+                rows,
+                block_num,
+                pair_stride,
+                epsilon,
+                clamp_value,
+                weight_resident,
+                slot_a,
+                slot_b,
+                slot_c,
+                False,
+                True,
+                False,
             )
             self._pair_step(
-                gm_x, gm_key, gm_value, gm_weight, gm_out, gm_mask,
-                base + pair_stride, rows, block_num, pair_stride,
-                epsilon, clamp_value, weight_resident,
-                slot_c, slot_a, slot_b, False, True, False,
+                gm_x,
+                gm_key,
+                gm_value,
+                gm_weight,
+                gm_out,
+                gm_mask,
+                base + pair_stride,
+                rows,
+                block_num,
+                pair_stride,
+                epsilon,
+                clamp_value,
+                weight_resident,
+                slot_c,
+                slot_a,
+                slot_b,
+                False,
+                True,
+                False,
             )
             self._pair_step(
-                gm_x, gm_key, gm_value, gm_weight, gm_out, gm_mask,
-                base + (PAIRS_PER_GROUP - 1) * pair_stride, rows, block_num, pair_stride,
-                epsilon, clamp_value, weight_resident,
-                slot_b, slot_c, slot_a, False, True, True,
+                gm_x,
+                gm_key,
+                gm_value,
+                gm_weight,
+                gm_out,
+                gm_mask,
+                base + (PAIRS_PER_GROUP - 1) * pair_stride,
+                rows,
+                block_num,
+                pair_stride,
+                epsilon,
+                clamp_value,
+                weight_resident,
+                slot_b,
+                slot_c,
+                slot_a,
+                False,
+                True,
+                True,
             )
         rem = pairs - PAIRS_PER_GROUP * n_groups
         if rem >= 1:
             base = first_row + n_groups * PAIRS_PER_GROUP * pair_stride
             self._pair_step(
-                gm_x, gm_key, gm_value, gm_weight, gm_out, gm_mask,
-                base, rows, block_num, pair_stride,
-                epsilon, clamp_value, weight_resident,
-                slot_a, slot_b, slot_c, False, False, False,
+                gm_x,
+                gm_key,
+                gm_value,
+                gm_weight,
+                gm_out,
+                gm_mask,
+                base,
+                rows,
+                block_num,
+                pair_stride,
+                epsilon,
+                clamp_value,
+                weight_resident,
+                slot_a,
+                slot_b,
+                slot_c,
+                False,
+                False,
+                False,
             )
             if rem >= 2:
                 self._pair_step(
-                    gm_x, gm_key, gm_value, gm_weight, gm_out, gm_mask,
-                    base + pair_stride, rows, block_num, pair_stride,
-                    epsilon, clamp_value, weight_resident,
-                    slot_c, slot_a, slot_b, True, False, False,
+                    gm_x,
+                    gm_key,
+                    gm_value,
+                    gm_weight,
+                    gm_out,
+                    gm_mask,
+                    base + pair_stride,
+                    rows,
+                    block_num,
+                    pair_stride,
+                    epsilon,
+                    clamp_value,
+                    weight_resident,
+                    slot_c,
+                    slot_a,
+                    slot_b,
+                    True,
+                    False,
+                    False,
                 )
 
     def __call__(
@@ -790,48 +1075,82 @@ class EngramGateKernel:
                     dtypes.int64(0), dtypes.int64(self.hc_mult), dtypes.int64(1)
                 ):
                     if gm_mask is None:
-                        x_row = gm_x[token_idx, hc_idx, None]
-                        key_row = gm_key[token_idx, hc_idx, None]
-                        w_row = gm_weight[hc_idx, None]
-                        v_row = gm_value[token_idx, None]
-                        o_row = gm_out[token_idx, hc_idx, None]
+                        x_row = gm_x[token_idx, hc_idx, None].flatten()
+                        key_row = gm_key[token_idx, hc_idx, None].flatten()
+                        w_row = gm_weight[hc_idx, None].flatten()
+                        v_row = gm_value[token_idx, None].flatten()
+                        o_row = gm_out[token_idx, hc_idx, None].flatten()
                         self._chunked_row(
                             x_row, key_row, w_row, v_row, o_row, epsilon, clamp_value
                         )
                     else:
                         masked = gm_mask[token_idx]
-                        if masked:
-                            x_row = gm_x[token_idx, hc_idx, None]
-                            o_row = gm_out[token_idx, hc_idx, None]
+                        if masked != 0:
+                            x_row = gm_x[token_idx, hc_idx, None].flatten()
+                            o_row = gm_out[token_idx, hc_idx, None].flatten()
                             for chunk_idx in range(self.num_chunks):
                                 mem_copy(
                                     self.x_ch,
-                                    tile_slice(x_row, (1, self.chunk), (0, chunk_idx)),
+                                    tile_slice(x_row, (self.chunk,), (chunk_idx,)),
                                 )
-                                mem_copy(
-                                    tile_slice(o_row, (1, self.chunk), (0, chunk_idx)),
-                                    self.x_ch,
-                                )
+                                if chunk_idx + 1 < self.num_chunks:
+                                    mem_copy(
+                                        tile_slice(o_row, (self.chunk,), (chunk_idx,)),
+                                        self.x_ch,
+                                    )
+                                else:
+                                    mem_copy(
+                                        tile_slice(o_row, (self.chunk,), (chunk_idx,)),
+                                        tile_slice(
+                                            self.x_ch, (self.last_gm_len,), (0,)
+                                        ),
+                                    )
                         else:
-                            x_row = gm_x[token_idx, hc_idx, None]
-                            key_row = gm_key[token_idx, hc_idx, None]
-                            w_row = gm_weight[hc_idx, None]
-                            v_row = gm_value[token_idx, None]
-                            o_row = gm_out[token_idx, hc_idx, None]
+                            x_row = gm_x[token_idx, hc_idx, None].flatten()
+                            key_row = gm_key[token_idx, hc_idx, None].flatten()
+                            w_row = gm_weight[hc_idx, None].flatten()
+                            v_row = gm_value[token_idx, None].flatten()
+                            o_row = gm_out[token_idx, hc_idx, None].flatten()
                             self._chunked_row(
-                                x_row, key_row, w_row, v_row, o_row, epsilon, clamp_value
+                                x_row,
+                                key_row,
+                                w_row,
+                                v_row,
+                                o_row,
+                                epsilon,
+                                clamp_value,
                             )
             return
         self._init_rotation_buffers()
         if block_num % self.hc_mult == 0:
             self._resident_pipeline(
-                gm_x, gm_key, gm_value, gm_weight, gm_out, gm_mask,
-                block_idx, block_num, rows, epsilon, clamp_value, True,
+                gm_x,
+                gm_key,
+                gm_value,
+                gm_weight,
+                gm_out,
+                gm_mask,
+                block_idx,
+                block_num,
+                rows,
+                epsilon,
+                clamp_value,
+                True,
             )
         else:
             self._resident_pipeline(
-                gm_x, gm_key, gm_value, gm_weight, gm_out, gm_mask,
-                block_idx, block_num, rows, epsilon, clamp_value, False,
+                gm_x,
+                gm_key,
+                gm_value,
+                gm_weight,
+                gm_out,
+                gm_mask,
+                block_idx,
+                block_num,
+                rows,
+                epsilon,
+                clamp_value,
+                False,
             )
 
 
@@ -927,7 +1246,6 @@ class EngramGate:
         )
 
 
-
 _RUN_CALLABLE_CACHE = {}
 
 
@@ -979,12 +1297,17 @@ def _validate_engram_gate_inputs(x, key, value, weight, image_mask):
     return lead, hc_mult, dim, total_tokens
 
 
-def _get_run_callable(eps, clamp_value, dim, hc_mult, max_blocks, total_tokens, has_mask):
+def _get_run_callable(
+    eps, clamp_value, dim, hc_mult, max_blocks, total_tokens, has_mask
+):
     """Return a cached compiled launcher; each specialization compiles once.
 
     eps/clamp_value are baked into the instance at compile time, so they are
     part of the cache key.  Repeated calls reuse the compiled artifact and
     launch directly instead of re-tracing the @host entry.
+
+    The mask ABI is uint8: 0.8.0 cannot lower an i1 GM point load, and the
+    public entry reinterprets the bool torch mask as uint8 without a copy.
     """
     key = (eps, clamp_value, dim, hc_mult, max_blocks, total_tokens, has_mask)
     fn = _RUN_CALLABLE_CACHE.get(key)
@@ -997,7 +1320,7 @@ def _get_run_callable(eps, clamp_value, dim, hc_mult, max_blocks, total_tokens, 
             TensorSpec((total_tokens, hc_mult, dim), dtypes.bfloat16),
         )
         if has_mask:
-            specs = specs + (TensorSpec((total_tokens,), dtypes.bool_),)
+            specs = specs + (TensorSpec((total_tokens,), dtypes.uint8),)
         fn = dsl_compile(
             EngramGate(eps, clamp_value, dim, hc_mult, max_blocks).run, *specs
         )
@@ -1046,7 +1369,8 @@ def engram_gate(
         eps, clamp_value, dim, hc_mult, max_blocks, total_tokens, mask1 is not None
     )
     if mask1 is not None:
-        fn(x3, key3, value2, weight, out3, mask1)
+        # Zero-copy reinterpret: bool and uint8 share the one-byte layout.
+        fn(x3, key3, value2, weight, out3, mask1.view(torch.uint8))
     else:
         fn(x3, key3, value2, weight, out3)
     return out
