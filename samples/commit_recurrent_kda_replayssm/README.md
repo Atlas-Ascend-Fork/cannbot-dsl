@@ -1,5 +1,7 @@
 # commit_recurrent_kda_replayssm
 
+依赖版本：CANNBot-DSL 0.8.0。
+
 ## 产品支持情况
 
 - Ascend 950：支持。

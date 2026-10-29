@@ -20,9 +20,9 @@ from functools import lru_cache
 from typing import NamedTuple, Optional, Tuple
 
 import cannbotdsl
-from cannbotdsl import PIPE, MemLoc, Tensor, aot, dtypes
+import torch
+from cannbotdsl import PIPE, Array, MemLoc, Tensor, aot, dtypes, make_layout
 from cannbotdsl.buffer import Buffer
-from cannbotdsl.channel import Channel as RingBuffer
 from cannbotdsl.lang import vf
 from cannbotdsl.lang.constexpr import const_expr, range_constexpr
 from cannbotdsl.lang.control_flow import range as dsl_range
@@ -32,7 +32,7 @@ from cannbotdsl.lang.kernel import kernel
 from cannbotdsl.ops import reg as reg_ops
 from cannbotdsl.ops.arch import get_block_idx, get_block_num, get_subblock_id
 from cannbotdsl.ops.matmul import matmul
-from cannbotdsl.ops.memcpy import make_copy_engine, mem_copy
+from cannbotdsl.ops.memcpy import copy_options, mem_copy
 from cannbotdsl.ops.reg import (
     PackMode,
     UnpackMode,
@@ -60,21 +60,20 @@ from cannbotdsl.ops.reg import (
 )
 from cannbotdsl.ops.reg import vselect as vselect_raw
 from cannbotdsl.ops.sync import (
-    channel_rewind,
     cube_fill_l1_zero,
     cube_sync_all,
     cube_sync_block_arrive,
     cube_sync_block_wait,
     cube_sync_pipe,
+    onchip_rewind,
     vec_sync_all,
     vec_sync_block_arrive,
     vec_sync_block_wait,
     vec_sync_notify,
     vec_sync_wait,
 )
+from cannbotdsl.ring_buffer import RingBuffer
 from cannbotdsl.tensor import idx2crd, reinterpret, tile_slice
-from cannbotdsl.types.delay_line import DelayLineGroup
-import torch
 
 from .flash_kda_metadata import (
     ABI_VERSION,
@@ -90,7 +89,6 @@ from .flash_kda_metadata import (
     STATUS_OK,
     TEMPLATE_STAGED,
 )
-
 
 compile_cache = getattr(aot, "compile_cache", lru_cache(maxsize=1))
 CHUNK_SIZE = 64
@@ -278,31 +276,40 @@ class StageOneMatmul:
     """StageOne Cube 侧矩阵乘计算。"""
 
     def __init__(self):
-        self.tile_power_l1 = RingBuffer(MemLoc.L1, (CHUNK_SIZE, CHUNK_SIZE), dtypes.float16, depth=1).produce()
-        self.packed_inv64_l1 = RingBuffer(MemLoc.L1, (CHUNK_SIZE, CHUNK_SIZE), dtypes.float16, depth=1).produce()
-        self.tile_inv_l1 = RingBuffer(MemLoc.L1, (CHUNK_SIZE, CHUNK_SIZE), dtypes.float16, depth=1).produce()
-        self.scratch_l1 = RingBuffer(MemLoc.L1, (CHUNK_SIZE, CHUNK_SIZE), dtypes.float16, depth=1).produce()
+        self.tile_power_l1 = RingBuffer(MemLoc.L1, dtypes.float16, make_layout((CHUNK_SIZE, CHUNK_SIZE)), depth=1).next_write()
+        self.packed_inv64_l1 = RingBuffer(MemLoc.L1, dtypes.float16, make_layout((CHUNK_SIZE, CHUNK_SIZE)), depth=1).next_write()
+        self.tile_inv_l1 = RingBuffer(MemLoc.L1, dtypes.float16, make_layout((CHUNK_SIZE, CHUNK_SIZE)), depth=1).next_write()
+        self.scratch_l1 = RingBuffer(MemLoc.L1, dtypes.float16, make_layout((CHUNK_SIZE, CHUNK_SIZE)), depth=1).next_write()
         self.neumann_power_handoff_l1 = RingBuffer(
-            MemLoc.L1, (CHUNK_SIZE, CHUNK_SIZE), dtypes.float16, depth=1,
-        ).produce()
-        self.packed_identity_l1 = RingBuffer(MemLoc.L1, (CHUNK_SIZE, CHUNK_SIZE), dtypes.float16, depth=1).produce()
-        self.zero_l1 = Buffer(MemLoc.L1, (CHUNK_SIZE, CHUNK_SIZE), dtypes.float16)
-        self.resident_inv_l1 = RingBuffer(MemLoc.L1, (CHUNK_SIZE, CHUNK_SIZE), dtypes.bfloat16, depth=1).produce()
-        self.l0a_db = RingBuffer(MemLoc.L0A, (CHUNK_SIZE, SUPPORTED_HEAD_DIM), dtypes.bfloat16, depth=2)
-        self.l0b_db = RingBuffer(MemLoc.L0B, (CHUNK_SIZE, SUPPORTED_HEAD_DIM), dtypes.bfloat16, depth=1)
-        self.beta_l0b = RingBuffer(MemLoc.L0B, (SUPPORTED_HEAD_DIM, CHUNK_SIZE), dtypes.bfloat16, depth=1).produce()
-        self.l0c_db = RingBuffer(MemLoc.L0C, (CHUNK_SIZE, SUPPORTED_HEAD_DIM), dtypes.float32, depth=2)
+            MemLoc.L1,
+            dtypes.float16,
+            make_layout((CHUNK_SIZE, CHUNK_SIZE)),
+            depth=1,
+        ).next_write()
+        self.packed_identity_l1 = RingBuffer(MemLoc.L1, dtypes.float16, make_layout((CHUNK_SIZE, CHUNK_SIZE)), depth=1).next_write()
+        self.zero_l1 = Buffer(MemLoc.L1, dtypes.float16, make_layout((CHUNK_SIZE, CHUNK_SIZE)))
+        self.resident_inv_l1 = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((CHUNK_SIZE, CHUNK_SIZE)), depth=1).next_write()
+        self.l0a_db = RingBuffer(MemLoc.L0A, dtypes.bfloat16, make_layout((CHUNK_SIZE, SUPPORTED_HEAD_DIM)), depth=2)
+        self.l0b_db = RingBuffer(MemLoc.L0B, dtypes.bfloat16, make_layout((CHUNK_SIZE, SUPPORTED_HEAD_DIM)), depth=1)
+        self.beta_l0b = RingBuffer(MemLoc.L0B, dtypes.bfloat16, make_layout((SUPPORTED_HEAD_DIM, CHUNK_SIZE)), depth=1).next_write()
+        self.l0c_db = RingBuffer(MemLoc.L0C, dtypes.float32, make_layout((CHUNK_SIZE, SUPPORTED_HEAD_DIM)), depth=2)
         self.per_d_left_k_l0a = RingBuffer(
-            MemLoc.L0A, (NEUMANN_BLOCK_SIZE, SUPPORTED_HEAD_DIM), dtypes.bfloat16, depth=1,
-        ).produce()
+            MemLoc.L0A,
+            dtypes.bfloat16,
+            make_layout((NEUMANN_BLOCK_SIZE, SUPPORTED_HEAD_DIM)),
+            depth=1,
+        ).next_write()
         self.per_d_left_q_l0a = RingBuffer(
-            MemLoc.L0A, (NEUMANN_BLOCK_SIZE, SUPPORTED_HEAD_DIM), dtypes.bfloat16, depth=1,
-        ).produce()
-        self.per_d_l0b_db = RingBuffer(MemLoc.L0B, (NEUMANN_BLOCK_SIZE, SUPPORTED_HEAD_DIM), dtypes.bfloat16, depth=2)
-        self.raw_l0a_db = RingBuffer(MemLoc.L0A, (CHUNK_SIZE, CHUNK_SIZE), dtypes.float16, depth=2)
-        self.raw_l0b_db = RingBuffer(MemLoc.L0B, (CHUNK_SIZE, CHUNK_SIZE), dtypes.float16, depth=2)
-        self.raw_l0c_main = RingBuffer(MemLoc.L0C, (CHUNK_SIZE, CHUNK_SIZE), dtypes.float32, depth=1).produce()
-        self.raw_l0c_aux = RingBuffer(MemLoc.L0C, (CHUNK_SIZE, CHUNK_SIZE), dtypes.float32, depth=1).produce()
+            MemLoc.L0A,
+            dtypes.bfloat16,
+            make_layout((NEUMANN_BLOCK_SIZE, SUPPORTED_HEAD_DIM)),
+            depth=1,
+        ).next_write()
+        self.per_d_l0b_db = RingBuffer(MemLoc.L0B, dtypes.bfloat16, make_layout((NEUMANN_BLOCK_SIZE, SUPPORTED_HEAD_DIM)), depth=2)
+        self.raw_l0a_db = RingBuffer(MemLoc.L0A, dtypes.float16, make_layout((CHUNK_SIZE, CHUNK_SIZE)), depth=2)
+        self.raw_l0b_db = RingBuffer(MemLoc.L0B, dtypes.float16, make_layout((CHUNK_SIZE, CHUNK_SIZE)), depth=2)
+        self.raw_l0c_main = RingBuffer(MemLoc.L0C, dtypes.float32, make_layout((CHUNK_SIZE, CHUNK_SIZE)), depth=1).next_write()
+        self.raw_l0c_aux = RingBuffer(MemLoc.L0C, dtypes.float32, make_layout((CHUNK_SIZE, CHUNK_SIZE)), depth=1).next_write()
 
     @staticmethod
     def packed64_block(l1_matrix, row_block: int, col_block: int):
@@ -322,11 +329,11 @@ class StageOneMatmul:
 
     @staticmethod
     def fixpipe_packed64_full_to_half_l1(dst_ring_buffer, c_tile):
-        mem_copy(dst_ring_buffer, c_tile, unit_flag=3)
+        mem_copy(dst_ring_buffer, c_tile, options=copy_options(unit_flag=3))
 
     @staticmethod
     def fixpipe_packed64_full_to_bf16_l1(dst_ring_buffer, c_tile):
-        mem_copy(dst_ring_buffer, c_tile, unit_flag=3)
+        mem_copy(dst_ring_buffer, c_tile, options=copy_options(unit_flag=3))
 
     @staticmethod
     def _packed64_block_offset_elems(row_block: int, col_block: int):
@@ -336,52 +343,54 @@ class StageOneMatmul:
         )
 
     def load_k_decayed(self, k_decayed_l1):
-        mem_copy(self.l0a_db.produce(), k_decayed_l1)
+        mem_copy(self.l0a_db.next_write(), k_decayed_l1)
 
     def load_q_decayed(self, q_decayed_l1):
-        mem_copy(self.l0a_db.produce(), q_decayed_l1)
+        mem_copy(self.l0a_db.next_write(), q_decayed_l1)
 
     def load_k_inv(self, k_inv_l1):
-        mem_copy(self.l0b_db.produce(), k_inv_l1)
+        mem_copy(self.l0b_db.next_write(), k_inv_l1)
 
     def mm_kkt(self):
-        k_inv = self.l0b_db.consume()
-        result = reinterpret(self.l0c_db.produce(), shape=(CHUNK_SIZE, CHUNK_SIZE))
-        matmul(result, self.l0a_db.consume(), k_inv, init=True)
+        k_inv = self.l0b_db.next_read()
+        result = self.l0c_db.next_write()[0:CHUNK_SIZE, 0:CHUNK_SIZE]
+        matmul(result, self.l0a_db.next_read(), k_inv, init=True)
         return k_inv
 
     def mm_mqk(self, k_inv_l0b):
-        result = reinterpret(self.l0c_db.produce(), shape=(CHUNK_SIZE, CHUNK_SIZE))
-        matmul(result, self.l0a_db.consume(), k_inv_l0b, init=True)
+        result = self.l0c_db.next_write()[0:CHUNK_SIZE, 0:CHUNK_SIZE]
+        matmul(result, self.l0a_db.next_read(), k_inv_l0b, init=True)
 
     def load_per_d_left_k(self, l1_ring_buffer):
-        mem_copy(self.per_d_left_k_l0a, l1_ring_buffer.consume())
+        mem_copy(self.per_d_left_k_l0a, l1_ring_buffer.next_read())
 
     def load_per_d_left_q(self, l1_ring_buffer):
-        mem_copy(self.per_d_left_q_l0a, l1_ring_buffer.consume())
+        mem_copy(self.per_d_left_q_l0a, l1_ring_buffer.next_read())
 
     def load_per_d_right_k(self, l1_ring_buffer):
-        right = self.per_d_l0b_db.produce()
-        mem_copy(right, l1_ring_buffer.consume())
-        return right
+        destination = self.per_d_l0b_db.next_write()
+        destination_source = l1_ring_buffer.next_read()
+        destination = destination[tuple(map(slice, destination_source.shape))]
+        mem_copy(destination, destination_source)
+        return destination
 
     def mm_per_d_kkt(self, row_block: int, col_block: int, right):
         kkt_tile = tile_slice(self.raw_l0c_main, (NEUMANN_BLOCK_SIZE, NEUMANN_BLOCK_SIZE), (row_block, col_block))
-        matmul(kkt_tile, self.per_d_left_k_l0a, right, init=True)
+        matmul(kkt_tile.reinterpret(layout=make_layout((NEUMANN_BLOCK_SIZE, NEUMANN_BLOCK_SIZE)), data_format="nz"), self.per_d_left_k_l0a, right, init=True)
 
     def mm_per_d_mqk(self, row_block: int, col_block: int, right):
         mqk_tile = tile_slice(self.raw_l0c_aux, (NEUMANN_BLOCK_SIZE, NEUMANN_BLOCK_SIZE), (row_block, col_block))
-        matmul(mqk_tile, self.per_d_left_q_l0a, right, init=True)
+        matmul(mqk_tile.reinterpret(layout=make_layout((NEUMANN_BLOCK_SIZE, NEUMANN_BLOCK_SIZE)), data_format="nz"), self.per_d_left_q_l0a, right, init=True)
 
     def finish_per_d_kkt(self, ub_kkt):
-        mem_copy(ub_kkt, self.raw_l0c_main, engine=make_copy_engine(split_axis=0))
+        mem_copy(ub_kkt, (self.raw_l0c_main).partition(dim=0))
 
     def finish_per_d_mqk(self, ub_mqk):
-        mem_copy(ub_mqk.produce(), self.raw_l0c_aux, engine=make_copy_engine(split_axis=0))
+        mem_copy(ub_mqk.next_write(), (self.raw_l0c_aux).partition(dim=0))
 
     def store_l0c_to_gm(self, gm_tile):
-        value = reinterpret(self.l0c_db.consume(), shape=(CHUNK_SIZE, gm_tile.shape[1]))
-        mem_copy(gm_tile, value)
+        value = self.l0c_db.next_read()[0:CHUNK_SIZE, 0:gm_tile.shape[1]]
+        mem_copy(gm_tile, value[:gm_tile.shape[0], :gm_tile.shape[1]])
 
     def c64_odd_even_pair_dst_gap_fractals(self):
         return self.c64_diag_nz_offset_elems(2) // NEUMANN_FRACTAL_ELEMS - 1
@@ -403,20 +412,20 @@ class StageOneMatmul:
         for diagonal_tile in range_constexpr(NEUMANN_DIAG_BLOCK_NUM):
             mem_copy(
                 tile_slice(l0b_slot, (16, 16), (diagonal_tile, diagonal_tile)),
-                tile_slice(right_l1, (16, 16), (diagonal_tile, diagonal_tile)), transpose=True,
+                (tile_slice(right_l1, (16, 16), (diagonal_tile, diagonal_tile))).permute(1, 0),
             )
 
     def issue_packed64_diag_only_operands_to_l0_db(
         self, left_l1, right_l1, *, clear_l0: bool = True
     ):
-        l0a_write = self.raw_l0a_db.produce()
-        l0b_write = self.raw_l0b_db.produce()
+        l0a_write = self.raw_l0a_db.next_write()
+        l0b_write = self.raw_l0b_db.next_write()
         self.load_packed64_diag_only_operands_to_l0(left_l1, right_l1, l0a_write, l0b_write, clear_l0=clear_l0)
 
     def begin_mmad_raw_l0ab_db_packed64(self, c_tile, *, init_c: bool, unit_flag: int):
         """发起 full64 raw MMAD，显式指定 init/accumulate。"""
-        l0a_read = self.raw_l0a_db.consume()
-        l0b_read = self.raw_l0b_db.consume()
+        l0a_read = self.raw_l0a_db.next_read()
+        l0b_read = self.raw_l0b_db.next_read()
         matmul(c_tile, l0a_read, l0b_read, init=init_c, unit_flag=unit_flag)
 
     def raw_mmad_packed64_diag_only(
@@ -472,14 +481,14 @@ class StageOneMatmul:
         return self.packed_identity_l1
 
     def issue_negative_t_identity_operands(self, negative_t, identity):
-        l0a_write = self.raw_l0a_db.produce()
-        l0b_write = self.raw_l0b_db.produce()
+        l0a_write = self.raw_l0a_db.next_write()
+        l0b_write = self.raw_l0b_db.next_write()
         mem_copy(l0a_write, negative_t)
         mem_copy(l0b_write, identity)
 
     def issue_identity_identity_operands(self, identity):
-        l0a_write = self.raw_l0a_db.produce()
-        l0b_write = self.raw_l0b_db.produce()
+        l0a_write = self.raw_l0a_db.next_write()
+        l0b_write = self.raw_l0b_db.next_write()
         mem_copy(l0a_write, identity)
         mem_copy(l0b_write, identity)
 
@@ -531,8 +540,8 @@ class StageOneMatmul:
         return self.packed_inv64_l1
 
     def issue_odd_lower_even_inv_full64(self, scratch, packed_inv):
-        l0a_write = self.raw_l0a_db.produce()
-        l0b_write = self.raw_l0b_db.produce()
+        l0a_write = self.raw_l0a_db.next_write()
+        l0b_write = self.raw_l0b_db.next_write()
         self.zero_packed64_l0_operands(l0a_write, l0b_write)
         self._load_packed16_pair_to_full64_l0a_with_gap(
             scratch, l0a_write, src0_row_block=1, src0_col_block=0, src1_row_block=3, src1_col_block=2,
@@ -546,8 +555,8 @@ class StageOneMatmul:
         )
 
     def issue_odd_inv_odd_tmp_full64(self, packed_inv, tmp64):
-        l0a_write = self.raw_l0a_db.produce()
-        l0b_write = self.raw_l0b_db.produce()
+        l0a_write = self.raw_l0a_db.next_write()
+        l0b_write = self.raw_l0b_db.next_write()
         self.zero_packed64_l0_operands(l0a_write, l0b_write)
         self._load_l1_block_to_l0a_block(self.packed64_block(packed_inv, 1, 1), l0a_write, 1, 1)
         self._load_l1_block_to_l0a_block(self.packed64_block(packed_inv, 3, 3), l0a_write, 3, 3)
@@ -573,8 +582,8 @@ class StageOneMatmul:
         return self.packed_inv64_l1
 
     def issue_odd32_lower_even32_inv_full64(self, scratch, packed_inv):
-        l0a_write = self.raw_l0a_db.produce()
-        l0b_write = self.raw_l0b_db.produce()
+        l0a_write = self.raw_l0a_db.next_write()
+        l0b_write = self.raw_l0b_db.next_write()
         self.zero_packed64_l0_operands(l0a_write, l0b_write)
         mem_copy(l0a_write, scratch)
         self._load_packed32_block_to_full64_l0b(
@@ -582,8 +591,8 @@ class StageOneMatmul:
         )
 
     def prepare_odd32_inv_odd32_tmp_full64(self, packed_inv):
-        l0a_write = self.raw_l0a_db.produce()
-        l0b_write = self.raw_l0b_db.produce()
+        l0a_write = self.raw_l0a_db.next_write()
+        l0b_write = self.raw_l0b_db.next_write()
         self.zero_packed64_l0_operands(l0a_write, l0b_write)
         mem_copy(l0a_write, packed_inv)
         return (l0a_write, l0b_write)
@@ -622,16 +631,10 @@ class StageOneMatmul:
         self.store_l0c_to_gm(u_pre_part)
 
     def _raw_l0a_block(self, l0a_slot, row_block: int, col_block: int):
-        return reinterpret(
-            l0a_slot, shape=(NEUMANN_BLOCK_SIZE, NEUMANN_BLOCK_SIZE),
-            offset=self.l0_matrix_block_offset_elems(row_block, col_block) * 2,
-        )
+        return reinterpret(l0a_slot, layout=make_layout((NEUMANN_BLOCK_SIZE, NEUMANN_BLOCK_SIZE)), offset=self.l0_matrix_block_offset_elems(row_block, col_block) * 2, physical_layout=make_layout(((NEUMANN_BLOCK_SIZE + 15) // 16, (NEUMANN_BLOCK_SIZE + 15) // 16, 16, 16), stride=l0a_slot.physical_layout.stride))
 
     def _raw_l0b_block(self, l0b_slot, row_block: int, col_block: int):
-        return reinterpret(
-            l0b_slot, shape=(NEUMANN_BLOCK_SIZE, NEUMANN_BLOCK_SIZE),
-            offset=self.l0_matrix_block_offset_elems(row_block, col_block) * 2,
-        )
+        return reinterpret(l0b_slot, layout=make_layout((NEUMANN_BLOCK_SIZE, NEUMANN_BLOCK_SIZE)), offset=self.l0_matrix_block_offset_elems(row_block, col_block) * 2, physical_layout=make_layout(((NEUMANN_BLOCK_SIZE + 15) // 16, (NEUMANN_BLOCK_SIZE + 15) // 16, 16, 16), stride=l0b_slot.physical_layout.stride))
 
     def _load_l1_block_to_l0a_block(
         self, l1_block, l0a_slot, row_block: int, col_block: int,
@@ -639,12 +642,7 @@ class StageOneMatmul:
         """把一个 packed L1 16x16 fractal 装入 full64 L0A 的指定块位置。"""
         _, l1_parent, _, _ = l1_block
         l0_tile = self._raw_l0a_block(l0a_slot, row_block, col_block)
-        l1_tile = reinterpret(
-            l1_parent,
-            shape=(NEUMANN_BLOCK_SIZE, NEUMANN_BLOCK_SIZE),
-            offset=(col_block * CHUNK_SIZE * NEUMANN_BLOCK_SIZE + row_block * NEUMANN_BLOCK_SIZE * NEUMANN_BLOCK_SIZE)
-            * 2,
-        )
+        l1_tile = tile_slice(l1_parent, (NEUMANN_BLOCK_SIZE, NEUMANN_BLOCK_SIZE), (row_block, col_block))
         mem_copy(l0_tile, l1_tile)
 
     def _load_l1_block_to_l0b_block(
@@ -653,13 +651,8 @@ class StageOneMatmul:
         """把一个 packed L1 16x16 fractal 转置装入 full64 L0B 的指定块位置。"""
         _, l1_parent, _, _ = l1_block
         l0_tile = self._raw_l0b_block(l0b_slot, row_block, col_block)
-        l1_tile = reinterpret(
-            l1_parent,
-            shape=(NEUMANN_BLOCK_SIZE, NEUMANN_BLOCK_SIZE),
-            offset=(col_block * CHUNK_SIZE * NEUMANN_BLOCK_SIZE + row_block * NEUMANN_BLOCK_SIZE * NEUMANN_BLOCK_SIZE)
-            * 2,
-        )
-        mem_copy(l0_tile, l1_tile, transpose=True)
+        l1_tile = tile_slice(l1_parent, (NEUMANN_BLOCK_SIZE, NEUMANN_BLOCK_SIZE), (row_block, col_block))
+        mem_copy(l0_tile, (l1_tile).permute(1, 0))
 
     def _load_packed32_block_to_full64_l0b(
         self,
@@ -677,11 +670,17 @@ class StageOneMatmul:
             l1_offset = (src_col // NEUMANN_BLOCK_SIZE) * src_packed_size * NEUMANN_BLOCK_SIZE
             l1_offset += (src_row + row_offset) * NEUMANN_BLOCK_SIZE + (src_col % NEUMANN_BLOCK_SIZE)
             l0_offset = self.l0_matrix_block_offset_elems(
-                (dst_row + row_offset) // NEUMANN_BLOCK_SIZE, dst_col // NEUMANN_BLOCK_SIZE
+                (dst_row + row_offset) // NEUMANN_BLOCK_SIZE, dst_col // NEUMANN_BLOCK_SIZE,
             )
-            l0_tile = reinterpret(l0b_slot, shape=(NEUMANN_BLOCK_SIZE, HALF_CHUNK_SIZE), offset=l0_offset * 2)
-            l1_tile = reinterpret(l1_matrix, shape=(NEUMANN_BLOCK_SIZE, HALF_CHUNK_SIZE), offset=l1_offset * 2)
-            mem_copy(l0_tile, l1_tile, transpose=transpose)
+            l1_tile = reinterpret(l1_matrix, layout=make_layout((NEUMANN_BLOCK_SIZE, HALF_CHUNK_SIZE)), offset=l1_offset * 2, physical_layout=make_layout(((HALF_CHUNK_SIZE + 15) // 16, (NEUMANN_BLOCK_SIZE + 15) // 16, 16, 16), stride=l1_matrix.physical_layout.stride))
+            if const_expr(transpose):
+                mem_copy(
+                    reinterpret(l0b_slot, layout=make_layout((HALF_CHUNK_SIZE, NEUMANN_BLOCK_SIZE)), offset=l0_offset * 2, data_format="nz"),
+                    (l1_tile).permute(1, 0,),
+                )
+            else:
+                l0_tile = reinterpret(l0b_slot, layout=make_layout((NEUMANN_BLOCK_SIZE, HALF_CHUNK_SIZE)), offset=l0_offset * 2, physical_layout=make_layout(((HALF_CHUNK_SIZE + 15) // 16, (NEUMANN_BLOCK_SIZE + 15) // 16, 16, 16), stride=l0b_slot.physical_layout.stride))
+                mem_copy(l0_tile, l1_tile)
 
     def _load_packed32_block_to_full64_l0a(
         self,
@@ -700,12 +699,15 @@ class StageOneMatmul:
             l1_offset = (src_col // NEUMANN_BLOCK_SIZE) * src_packed_size * NEUMANN_BLOCK_SIZE
             l1_offset += (src_row + row_offset) * NEUMANN_BLOCK_SIZE + (src_col % NEUMANN_BLOCK_SIZE)
             l0_offset = self.l0_matrix_block_offset_elems(
-                (dst_row + row_offset) // NEUMANN_BLOCK_SIZE, dst_col // NEUMANN_BLOCK_SIZE
+                (dst_row + row_offset) // NEUMANN_BLOCK_SIZE, dst_col // NEUMANN_BLOCK_SIZE,
             )
             l0_offset -= 6 * NEUMANN_FRACTAL_ELEMS
-            l0_tile = reinterpret(l0a_slot, shape=(NEUMANN_BLOCK_SIZE, HALF_CHUNK_SIZE), offset=l0_offset * 2)
-            l1_tile = reinterpret(l1_matrix, shape=(NEUMANN_BLOCK_SIZE, HALF_CHUNK_SIZE), offset=l1_offset * 2)
-            mem_copy(l0_tile, l1_tile, transpose=transpose)
+            l0_tile = reinterpret(l0a_slot, layout=make_layout((NEUMANN_BLOCK_SIZE, HALF_CHUNK_SIZE)), offset=l0_offset * 2, physical_layout=make_layout(((HALF_CHUNK_SIZE + 15) // 16, (NEUMANN_BLOCK_SIZE + 15) // 16, 16, 16), stride=l0a_slot.physical_layout.stride))
+            l1_tile = reinterpret(l1_matrix, layout=make_layout((NEUMANN_BLOCK_SIZE, HALF_CHUNK_SIZE)), offset=l1_offset * 2, physical_layout=make_layout(((HALF_CHUNK_SIZE + 15) // 16, (NEUMANN_BLOCK_SIZE + 15) // 16, 16, 16), stride=l1_matrix.physical_layout.stride))
+            if const_expr(transpose):
+                mem_copy(l0_tile, (l1_tile).permute(1, 0))
+            else:
+                mem_copy(l0_tile, l1_tile)
 
     def _load_packed16_pair_to_full64_l0a_with_gap(
         self,
@@ -726,11 +728,10 @@ class StageOneMatmul:
             (src0_row_block, src0_col_block, dst0_block),
             (src1_row_block, src1_col_block, dst1_block),
         ):
-            src_offset = self._packed64_block_offset_elems(src_row_block, src_col_block)
             # 3510 L0A 的 16x16 单块地址仍需补偿一个 full64 M span。
             dst_offset = (dst_block - (NEUMANN_DIAG_BLOCK_NUM - 1)) * NEUMANN_FRACTAL_ELEMS
-            l0_tile = reinterpret(l0a_slot, shape=(NEUMANN_BLOCK_SIZE, NEUMANN_BLOCK_SIZE), offset=dst_offset * 2)
-            l1_tile = reinterpret(l1_matrix, shape=(NEUMANN_BLOCK_SIZE, NEUMANN_BLOCK_SIZE), offset=src_offset * 2)
+            l0_tile = reinterpret(l0a_slot, layout=make_layout((NEUMANN_BLOCK_SIZE, NEUMANN_BLOCK_SIZE)), offset=dst_offset * 2, physical_layout=make_layout(((NEUMANN_BLOCK_SIZE + 15) // 16, (NEUMANN_BLOCK_SIZE + 15) // 16, 16, 16), stride=l0a_slot.physical_layout.stride))
+            l1_tile = tile_slice(l1_matrix, (NEUMANN_BLOCK_SIZE, NEUMANN_BLOCK_SIZE), (src_row_block, src_col_block))
             mem_copy(l0_tile, l1_tile)
 
     def _load_packed16_pair_to_full64_l0b_trans_with_gap(
@@ -758,18 +759,21 @@ class StageOneMatmul:
         )
 
     def _load_resident_inv_to_l0a(self):
-        operand = reinterpret(self.l0a_db.produce(), shape=(CHUNK_SIZE, CHUNK_SIZE))
-        mem_copy(operand, self.resident_inv_l1)
-        return operand
+        destination_2 = self.l0a_db.next_write()
+        destination_2 = destination_2[tuple(map(slice, self.resident_inv_l1.shape))]
+        mem_copy(destination_2, self.resident_inv_l1)
+        return destination_2
 
     def _load_beta_to_l0b(self, beta_ring_buffer):
-        operand = self.beta_l0b
-        mem_copy(operand, beta_ring_buffer, transpose=True)
-        return operand
+        destination_3 = self.beta_l0b
+        destination_3_source = beta_ring_buffer.permute(1, 0)
+        destination_3 = destination_3[tuple(map(slice, destination_3_source.shape))]
+        mem_copy(destination_3, destination_3_source)
+        return destination_3
 
     def _mm_resident_inv_beta(self, l0a_resident, l0b_beta):
-        l0c_write = self.l0c_db.produce()
-        matmul(l0c_write, reinterpret(l0a_resident, shape=(CHUNK_SIZE, CHUNK_SIZE), offset=0), l0b_beta, init=True)
+        l0c_write = self.l0c_db.next_write()
+        matmul(l0c_write, l0a_resident[0:CHUNK_SIZE, 0:CHUNK_SIZE], l0b_beta, init=True)
 
 
 @jit
@@ -779,8 +783,13 @@ def _copy_padded_normalized_k(dst, src):
     Raw stores initialize padding without widening the earlier DMA's valid
     extent. An explicit full-tile view includes padding needed by delayed work.
     """
-    full_tile = reinterpret(src, shape=(CHUNK_SIZE, D_HALF), stride=(D_HALF, 1), offset=0)
-    mem_copy(dst, full_tile)
+    full_tile = src[0:CHUNK_SIZE, 0:D_HALF]
+    with vf(mode="simd"):
+        copy_mask, _ = update_mask(2 * VL, elem_bits=16)
+        for offset in dsl_range(0, CHUNK_SIZE * D_HALF, 2 * VL):
+            normalized_k = vload(full_tile, offset)
+            vstore(dst, offset, normalized_k, copy_mask)
+        vmem_bar("vst_vld")
 
 
 class StageOneVector:
@@ -790,52 +799,79 @@ class StageOneVector:
         self.scale_value = scale_value
         self.subblock_idx = subblock_idx
         self.ub_q = [
-            Buffer(MemLoc.UB, (CHUNK_SIZE, D_HALF), dtypes.bfloat16) for _ in range(2)
+            Buffer(MemLoc.UB, dtypes.bfloat16, make_layout((CHUNK_SIZE, D_HALF))) for _ in range(2)
         ]
         self.ub_k = [
-            Buffer(MemLoc.UB, (CHUNK_SIZE, D_HALF), dtypes.bfloat16) for _ in range(2)
+            Buffer(MemLoc.UB, dtypes.bfloat16, make_layout((CHUNK_SIZE, D_HALF))) for _ in range(2)
         ]
-        self.ub_qk_exchange = Buffer(MemLoc.UB, (CHUNK_SIZE, D_HALF), dtypes.float32)
-        self.ub_g_raw = RingBuffer(MemLoc.UB, (CHUNK_SIZE, D_HALF), dtypes.bfloat16, depth=1).produce()
-        self.ub_gate_activated = Buffer(MemLoc.UB, (CHUNK_SIZE, D_HALF), dtypes.float32)
-        self.ub_dt_bias = RingBuffer(MemLoc.UB, (D_HALF,), dtypes.float32, depth=1).produce()
-        self.ub_alpha = RingBuffer(MemLoc.UB, (1,), dtypes.float32, depth=1).produce()
-        self.ub_beta_raw = RingBuffer(MemLoc.UB, (CHUNK_SIZE, 1), dtypes.bfloat16, depth=1).produce()
-        self.ub_beta = Buffer(MemLoc.UB, (CHUNK_SIZE, 1), dtypes.float32)
-        self.ub_v_raw = RingBuffer(MemLoc.UB, (CHUNK_SIZE, D_HALF), dtypes.bfloat16, depth=1).produce()
-        self.ub_gamma_c = RingBuffer(MemLoc.UB, (1, D_HALF), dtypes.float32, depth=1).produce()
+        self.ub_qk_exchange = Buffer(MemLoc.UB, dtypes.float32, make_layout((CHUNK_SIZE, D_HALF)))
+        self.ub_g_raw = RingBuffer(MemLoc.UB, dtypes.bfloat16, make_layout((CHUNK_SIZE, D_HALF)), depth=1).next_write()
+        self.ub_gate_activated = Buffer(MemLoc.UB, dtypes.float32, make_layout((CHUNK_SIZE, D_HALF)))
+        self.ub_dt_bias = RingBuffer(MemLoc.UB, dtypes.float32, make_layout((D_HALF,)), depth=1).next_write()
+        self.ub_alpha = RingBuffer(MemLoc.UB, dtypes.float32, make_layout((1,)), depth=1).next_write()
+        self.ub_beta_raw = RingBuffer(MemLoc.UB, dtypes.bfloat16, make_layout((CHUNK_SIZE, 1)), depth=1).next_write()
+        self.ub_beta = Buffer(MemLoc.UB, dtypes.float32, make_layout((CHUNK_SIZE, 1)))
+        self.ub_v_raw = RingBuffer(MemLoc.UB, dtypes.bfloat16, make_layout((CHUNK_SIZE, D_HALF)), depth=1).next_write()
+        self.ub_gamma_c = RingBuffer(MemLoc.UB, dtypes.float32, make_layout((1, D_HALF)), depth=1).next_write()
         self.ub_cs_snapshot = [
-            Buffer(MemLoc.UB, (CHUNK_SIZE, D_HALF), dtypes.float32) for _ in range(2)
+            Buffer(MemLoc.UB, dtypes.float32, make_layout((CHUNK_SIZE, D_HALF))) for _ in range(2)
         ]
-        self.ub_mqk = RingBuffer(MemLoc.UB, (HALF_CHUNK_SIZE, CHUNK_SIZE), dtypes.float32, depth=2)
+        self.ub_mqk = RingBuffer(MemLoc.UB, dtypes.float32, make_layout((HALF_CHUNK_SIZE, CHUNK_SIZE)), depth=2)
         self.ub_bf16_nz = RingBuffer(
-            MemLoc.UB, (CHUNK_SIZE, D_HALF), dtypes.bfloat16, depth=2, data_format="nz", n1_pad=16,
+            MemLoc.UB,
+            dtypes.bfloat16,
+            make_layout((CHUNK_SIZE, D_HALF)),
+            depth=2,
+            physical_layout=make_layout((((D_HALF) + 16 - 1) // 16, ((CHUNK_SIZE) + 15) // 16, 16, 16), stride=((((CHUNK_SIZE) + 15) // 16) * 256 + 16, 256, 16, 1)),
+            data_format="nz",
         )
         self.ub_cast_bf16 = RingBuffer(
-            MemLoc.UB, (CHUNK_SIZE, D_HALF), dtypes.bfloat16, depth=1, data_format="nd",
-        ).produce()
-        self.ub_kkt_fp16 = Buffer(MemLoc.UB, (HALF_CHUNK_SIZE, CHUNK_SIZE), dtypes.float16)
+            MemLoc.UB,
+            dtypes.bfloat16,
+            make_layout((CHUNK_SIZE, D_HALF)),
+            depth=1,
+        ).next_write()
+        self.ub_kkt_fp16 = Buffer(MemLoc.UB, dtypes.float16, make_layout((HALF_CHUNK_SIZE, CHUNK_SIZE)))
         self.ub_mqk_bf16 = RingBuffer(
-            MemLoc.UB, (HALF_CHUNK_SIZE, CHUNK_SIZE), dtypes.bfloat16, depth=1, data_format="nd",
-        ).produce()
+            MemLoc.UB,
+            dtypes.bfloat16,
+            make_layout((HALF_CHUNK_SIZE, CHUNK_SIZE)),
+            depth=1,
+        ).next_write()
         self.ub_raw_k = [
-            Buffer(MemLoc.UB, (CHUNK_SIZE, D_HALF), dtypes.bfloat16) for _ in range(2)
+            Buffer(MemLoc.UB, dtypes.bfloat16, make_layout((CHUNK_SIZE, D_HALF))) for _ in range(2)
         ]
-        self.ub_kkt = RingBuffer(MemLoc.UB, (HALF_CHUNK_SIZE, CHUNK_SIZE), dtypes.float32, depth=1).produce()
+        self.ub_kkt = RingBuffer(MemLoc.UB, dtypes.float32, make_layout((HALF_CHUNK_SIZE, CHUNK_SIZE)), depth=1).next_write()
         self.ub_kkt_nz = RingBuffer(
-            MemLoc.UB, (HALF_CHUNK_SIZE, CHUNK_SIZE), dtypes.float16, depth=1, data_format="nz", n1_pad=16,
-        ).produce()
-        self.ub_per_d_nd = RingBuffer(MemLoc.UB, (NEUMANN_BLOCK_SIZE, D_HALF), dtypes.bfloat16, depth=2)
+            MemLoc.UB,
+            dtypes.float16,
+            make_layout((HALF_CHUNK_SIZE, CHUNK_SIZE)),
+            depth=1,
+            physical_layout=make_layout((((CHUNK_SIZE) + 16 - 1) // 16, ((HALF_CHUNK_SIZE) + 15) // 16, 16, 16), stride=((((HALF_CHUNK_SIZE) + 15) // 16) * 256 + 16, 256, 16, 1)),
+            data_format="nz",
+        ).next_write()
+        self.ub_per_d_nd = RingBuffer(MemLoc.UB, dtypes.bfloat16, make_layout((NEUMANN_BLOCK_SIZE, D_HALF)), depth=2)
         self.ub_per_d_nz = RingBuffer(
-            MemLoc.UB, (NEUMANN_BLOCK_SIZE, D_HALF), dtypes.bfloat16, depth=2, data_format="nz", n1_pad=16,
+            MemLoc.UB,
+            dtypes.bfloat16,
+            make_layout((NEUMANN_BLOCK_SIZE, D_HALF)),
+            depth=2,
+            physical_layout=make_layout((((D_HALF) + 16 - 1) // 16, ((NEUMANN_BLOCK_SIZE) + 15) // 16, 16, 16), stride=((((NEUMANN_BLOCK_SIZE) + 15) // 16) * 256 + 16, 256, 16, 1)),
+            data_format="nz",
         )
         self.l1_per_d_operand = RingBuffer(
-            MemLoc.L1, (NEUMANN_BLOCK_SIZE, SUPPORTED_HEAD_DIM), dtypes.bfloat16, depth=3,
+            MemLoc.L1,
+            dtypes.bfloat16,
+            make_layout((NEUMANN_BLOCK_SIZE, SUPPORTED_HEAD_DIM)),
+            depth=3,
         )
-        self.l1_v_beta = RingBuffer(MemLoc.L1, (CHUNK_SIZE, SUPPORTED_HEAD_DIM), dtypes.bfloat16, depth=1).produce()
+        self.l1_v_beta = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((CHUNK_SIZE, SUPPORTED_HEAD_DIM)), depth=1).next_write()
         self.l1_K_decayed_beta_for_W = RingBuffer(
-            MemLoc.L1, (CHUNK_SIZE, SUPPORTED_HEAD_DIM), dtypes.bfloat16, depth=1,
-        ).produce()
+            MemLoc.L1,
+            dtypes.bfloat16,
+            make_layout((CHUNK_SIZE, SUPPORTED_HEAD_DIM)),
+            depth=1,
+        ).next_write()
 
     @staticmethod
     def _copy_bf16_gm_half_tile_to_ub(
@@ -854,14 +890,14 @@ class StageOneVector:
         """Publish this AIV's Q/K partial sums before unrelated gate work."""
         vec_sync_notify(PIPE.V, PIPE.MTE3, QK_V_TO_MTE3_EVENT_ID)
         vec_sync_wait(PIPE.V, PIPE.MTE3, QK_V_TO_MTE3_EVENT_ID)
-        mem_copy(exchange, outgoing_partials)
+        mem_copy(exchange.flatten(), outgoing_partials.flatten())
         vec_sync_block_arrive(PIPE.MTE3, QK_PUBLISH_FLAG_ID, mode=1)
 
     @jit
     def issue_qk_partials(self, exchange, incoming_partials):
         """Issue the peer's Q/K partial sums before independent gate work."""
         vec_sync_block_wait(PIPE.MTE2, QK_PUBLISH_FLAG_ID, mode=1)
-        mem_copy(incoming_partials, exchange)
+        mem_copy(incoming_partials.flatten(), exchange.flatten())
         vec_sync_notify(PIPE.MTE2, PIPE.V, QK_MTE2_TO_V_EVENT_ID)
 
     @jit
@@ -991,9 +1027,9 @@ class StageOneVector:
         if valid_rows < CHUNK_SIZE:
             self._fill_bf16_invalid_rows(q_half, valid_rows=valid_rows, cols=D_HALF, value=0.0)
             self._fill_bf16_invalid_rows(k_half, valid_rows=valid_rows, cols=D_HALF, value=0.0)
-        local_partials = reinterpret(self.ub_qk_exchange, shape=(2, CHUNK_SIZE), offset=0)
+        local_partials = self.ub_qk_exchange.flatten()[0:2 * CHUNK_SIZE,].reshape((2, CHUNK_SIZE))
         self.compute_qk_partial_sums(q_half, k_half, local_partials)
-        local_partials = reinterpret(self.ub_qk_exchange, shape=(2, CHUNK_SIZE), offset=0)
+        local_partials = self.ub_qk_exchange.flatten()[0:2 * CHUNK_SIZE,].reshape((2, CHUNK_SIZE))
         if self.subblock_idx == 0:
             self.publish_qk_partials(gm_qk_exchange[block_idx, 0, None, None], local_partials)
         else:
@@ -1002,7 +1038,7 @@ class StageOneVector:
     @jit
     def issue_peer_qk_partials(self, gm_qk_exchange, block_idx):
         """Start receiving both partial-sum vectors from the peer AIV."""
-        incoming_partials = reinterpret(self.ub_qk_exchange, shape=(2, CHUNK_SIZE), offset=2 * CHUNK_SIZE * ELEM_BYTES)
+        incoming_partials = self.ub_qk_exchange.flatten()[2 * CHUNK_SIZE:2 * CHUNK_SIZE + 2 * CHUNK_SIZE,].reshape((2, CHUNK_SIZE))
         if self.subblock_idx == 0:
             self.issue_qk_partials(gm_qk_exchange[block_idx, 1, None, None], incoming_partials)
         else:
@@ -1013,8 +1049,8 @@ class StageOneVector:
         """Finish the one-round exchange and normalize both local halves."""
         self.finish_issued_qk_partials()
         local_partials = self.ub_qk_exchange
-        peer_partials = reinterpret(self.ub_qk_exchange, shape=(2, CHUNK_SIZE), offset=2 * CHUNK_SIZE * ELEM_BYTES)
-        inverse_norms = reinterpret(self.ub_qk_exchange, shape=(2, CHUNK_SIZE), offset=4 * CHUNK_SIZE * ELEM_BYTES)
+        peer_partials = self.ub_qk_exchange.flatten()[2 * CHUNK_SIZE:2 * CHUNK_SIZE + 2 * CHUNK_SIZE,].reshape((2, CHUNK_SIZE))
+        inverse_norms = self.ub_qk_exchange.flatten()[4 * CHUNK_SIZE:4 * CHUNK_SIZE + 2 * CHUNK_SIZE,].reshape((2, CHUNK_SIZE))
         q_half = self.ub_q[buffer_parity]
         k_half = self.ub_k[buffer_parity]
         self.compute_qk_inverse_vectors(local_partials, peer_partials, inverse_norms)
@@ -1154,7 +1190,7 @@ class StageOneVector:
         buffer_parity: int,
     ):
         raw_k_snapshot = self.ub_raw_k[buffer_parity]
-        gate_cumsum_tile = reinterpret(gate_cumsum_dhalf, shape=(CHUNK_SIZE, D_HALF), offset=0)
+        gate_cumsum_tile = gate_cumsum_dhalf[0:CHUNK_SIZE, 0:D_HALF]
         _copy_padded_normalized_k(raw_k_snapshot, normalized_k_dhalf)
         cast_write = self.ub_cast_bf16
         with vf(mode="simd"):
@@ -1182,13 +1218,12 @@ class StageOneVector:
     ):
         Mqk_part = self.scratch_half_tile(gm_Mqk_scratch, block_idx, CHUNK_SIZE)
         self._store_masked_mqk_to_bf16_gm(Mqk_part, buffer_parity)
-        return reinterpret(
-            self.ub_cs_snapshot[buffer_parity], shape=(1, D_HALF), offset=(CHUNK_SIZE - 1) * D_HALF * ELEM_BYTES,
-        )
+        return self.ub_cs_snapshot[buffer_parity][CHUNK_SIZE - 1:CHUNK_SIZE, None]
 
     def store_q_decayed_scratch(self, gm_Q_decayed_scratch, block_idx, q_decayed_slot):
         Q_decayed_slot_part = self.scratch_dhalf_tile(gm_Q_decayed_scratch, block_idx)
-        mem_copy(Q_decayed_slot_part, q_decayed_slot)
+        mem_copy(Q_decayed_slot_part,
+                 q_decayed_slot[:Q_decayed_slot_part.shape[0], :Q_decayed_slot_part.shape[1]])
 
     @jit
     def store_restored_state_inputs(
@@ -1216,7 +1251,7 @@ class StageOneVector:
                 restored_bf16 = vcast(restored, dtypes.bfloat16, mask=row_mask)
                 vstore_pack(cast_write, offset, restored_bf16, row_mask, pack_mode="b32_to_b16")
         cast_read = self.ub_cast_bf16
-        mem_copy(K_restored_dhalf, cast_read)
+        mem_copy(K_restored_dhalf, cast_read[:K_restored_dhalf.shape[0], :K_restored_dhalf.shape[1]])
         gamma_c_write = self.ub_gamma_c
         with vf(mode="simd"):
             row_mask, _ = update_mask(VL, elem_bits=32)
@@ -1234,7 +1269,7 @@ class StageOneVector:
         k_read = tile_slice(normalized_k_dhalf, (NEUMANN_BLOCK_SIZE, D_HALF), (row_block, 0))
         decay_scratch = tile_slice(self.ub_qk_exchange, (NEUMANN_BLOCK_SIZE, D_HALF), (0, 0))
         ref_offset = row_block * NEUMANN_BLOCK_SIZE * D_HALF
-        nd_write = self.ub_per_d_nd.produce()
+        nd_write = self.ub_per_d_nd.next_write()
         with vf(mode="simd"):
             mask, _ = update_mask(D_HALF, elem_bits=32)
             ref = vload(gate_cumsum_dhalf, ref_offset)
@@ -1250,7 +1285,7 @@ class StageOneVector:
                 k_decayed_bf16 = vcast(k_decayed, dtypes.bfloat16, mask=mask)
                 vstore_pack(nd_write, offset, k_decayed_bf16, mask, pack_mode="b32_to_b16")
             vmem_bar("vst_vld")
-        nd_read = self.ub_per_d_nd.consume()
+        nd_read = self.ub_per_d_nd.next_read()
         self._write_per_d_full_d_handoff(left_k_l1_operand, nd_read)
 
     @jit
@@ -1259,7 +1294,7 @@ class StageOneVector:
     ):
         q_read = tile_slice(normalized_q_dhalf, (NEUMANN_BLOCK_SIZE, D_HALF), (row_block, 0))
         decay_scratch = tile_slice(self.ub_qk_exchange, (NEUMANN_BLOCK_SIZE, D_HALF), (0, 0))
-        nd_write = self.ub_per_d_nd.produce()
+        nd_write = self.ub_per_d_nd.next_write()
         with vf(mode="simd"):
             mask, _ = update_mask(D_HALF, elem_bits=32)
             for row in dsl_range(0, NEUMANN_BLOCK_SIZE, 1, unroll=2):
@@ -1271,7 +1306,7 @@ class StageOneVector:
                 scaled_q = vmuls(q_decayed, self.scale_value, mask=mask)
                 scaled_q_bf16 = vcast(scaled_q, dtypes.bfloat16, mask=mask)
                 vstore_pack(nd_write, offset, scaled_q_bf16, mask, pack_mode="b32_to_b16")
-        nd_read = self.ub_per_d_nd.consume()
+        nd_read = self.ub_per_d_nd.next_read()
         self._write_per_d_full_d_handoff(left_q_l1_operand, nd_read)
 
     @jit
@@ -1285,7 +1320,7 @@ class StageOneVector:
     ):
         k_read = tile_slice(normalized_k_dhalf, (NEUMANN_BLOCK_SIZE, D_HALF), (col_block, 0))
         ref_offset = row_block * NEUMANN_BLOCK_SIZE * D_HALF
-        nd_write = self.ub_per_d_nd.produce()
+        nd_write = self.ub_per_d_nd.next_write()
         with vf(mode="simd"):
             mask, _ = update_mask(D_HALF, elem_bits=32)
             ref = vload(gate_cumsum_dhalf, ref_offset)
@@ -1299,7 +1334,7 @@ class StageOneVector:
                 restored_k = vmul(k, decay, mask=mask)
                 restored_k_bf16 = vcast(restored_k, dtypes.bfloat16, mask=mask)
                 vstore_pack(nd_write, offset, restored_k_bf16, mask, pack_mode="b32_to_b16")
-        nd_read = self.ub_per_d_nd.consume()
+        nd_read = self.ub_per_d_nd.next_read()
         self._write_per_d_full_d_handoff(right_k_l1_operand, nd_read)
 
     @jit
@@ -1332,8 +1367,8 @@ class StageOneVector:
                 k_decayed_beta_bf16 = vcast(k_decayed_beta, dtypes.bfloat16, mask=row_mask)
                 vstore_pack(cast_write, offset, k_decayed_beta_bf16, row_mask, pack_mode="b32_to_b16")
         cast_read = self.ub_cast_bf16
-        nd2nz_tile(self.ub_bf16_nz.produce(), cast_read)
-        self._store_dhalf_nz_ub_to_full_l1(self.l1_K_decayed_beta_for_W, self.ub_bf16_nz.consume())
+        nd2nz_tile(self.ub_bf16_nz.next_write(), cast_read)
+        self._store_dhalf_nz_ub_to_full_l1(self.l1_K_decayed_beta_for_W, self.ub_bf16_nz.next_read())
         vec_sync_wait(PIPE.MTE2, PIPE.V, MTE2_TO_V_V_STAGING_EVENT_ID)
         if valid_rows < CHUNK_SIZE:
             self._fill_bf16_invalid_rows(v_slot, valid_rows=valid_rows, cols=D_HALF, value=0.0)
@@ -1349,12 +1384,12 @@ class StageOneVector:
                 v_beta_bf16 = vcast(v_beta, dtypes.bfloat16, mask=row_mask)
                 vstore_pack(cast_write, offset, v_beta_bf16, row_mask, pack_mode="b32_to_b16")
         cast_read = self.ub_cast_bf16
-        nd2nz_tile(self.ub_bf16_nz.produce(), cast_read)
-        self._store_dhalf_nz_ub_to_full_l1(self.l1_v_beta, self.ub_bf16_nz.consume())
+        nd2nz_tile(self.ub_bf16_nz.next_write(), cast_read)
+        self._store_dhalf_nz_ub_to_full_l1(self.l1_v_beta, self.ub_bf16_nz.next_read())
 
     @jit
     def _store_masked_mqk_to_bf16_gm(self, gm_tile, buffer_parity: int):
-        mqk_slot = self.ub_mqk.consume()
+        mqk_slot = self.ub_mqk.next_read()
         bf16_write = self.ub_mqk_bf16
         with vf(mode="simd"):
             row_mask, _ = update_mask(VL, elem_bits=32)
@@ -1370,15 +1405,21 @@ class StageOneVector:
 
     @jit
     def _write_per_d_full_d_handoff(self, full_ring_buffer, nd_slot):
-        nz_slot = self.ub_per_d_nz.produce()
+        nz_slot = self.ub_per_d_nz.next_write()
         nd2nz_tile(nz_slot, nd_slot)
-        mem_copy(full_ring_buffer.produce(), nz_slot, engine=make_copy_engine(split_axis=1), part_id=self.subblock_idx)
+        copy_destination = full_ring_buffer.next_write().partition(dim=1, part_id=self.subblock_idx)
+        copy_source = nz_slot
+        mem_copy(copy_destination, copy_source[:copy_destination.shape[0], :copy_destination.shape[1]])
 
     def _store_dhalf_nz_ub_to_full_l1(self, l1_dst, ub_nz_src):
-        mem_copy(l1_dst, ub_nz_src, engine=make_copy_engine(split_axis=1), part_id=self.subblock_idx)
+        copy_destination = l1_dst.partition(dim=1, part_id=self.subblock_idx)
+        copy_source = ub_nz_src
+        mem_copy(copy_destination, copy_source[:copy_destination.shape[0], :copy_destination.shape[1]])
 
     def _store_neumann_tmp_to_handoff_l1(self, l1_dst, subblock_base: int):
-        mem_copy(l1_dst, self.ub_kkt_nz, engine=make_copy_engine(split_axis=0), part_id=subblock_base)
+        copy_destination = l1_dst.partition(dim=0, part_id=subblock_base)
+        copy_source = self.ub_kkt_nz
+        mem_copy(copy_destination, copy_source[:copy_destination.shape[0], :copy_destination.shape[1]])
 
 
 @jit
@@ -1431,7 +1472,8 @@ def _run_stage1_body(
     if block_idx < active_core_num:
         stage1_matmul = StageOneMatmul()
         vector = StageOneVector(scale_value=scale_value, subblock_idx=subblock_idx)
-        task_delay_line = DelayLineGroup(2, "idx", "valid_rows")
+        task_indices = Array(dtypes.int64, 2)
+        task_valid_row_counts = Array(dtypes.int64, 2)
         identity = stage1_matmul.prepare_packed64_identity_l1(gm_identity16)
         stage1_matmul.zero_half_l1(stage1_matmul.zero_l1)
         pipeline_tick = 0
@@ -1467,14 +1509,15 @@ def _run_stage1_body(
             else:
                 vector.notify_qk_local_halves_ready()
             if pipeline_tick >= 1 and pipeline_tick - 1 < issued_task_count:
-                delayed_task_index = task_delay_line.idx.tap(1)
+                delayed_task_slot = (pipeline_tick - 1) % 2
+                delayed_task_index = task_indices[delayed_task_slot]
                 local_head_index = delayed_task_index // group_count
                 group_chunk_index = delayed_task_index - local_head_index * group_count
                 chunk_index = group_start + group_chunk_index
                 global_head_index = head_base + local_head_index
                 batch_index, value_head_index = idx2crd(global_head_index, [batch_count, value_head_count])
                 buffer_parity = delayed_task_index % 2
-                delayed_valid_rows = task_delay_line.valid_rows.tap(1)
+                delayed_valid_rows = task_valid_row_counts[delayed_task_slot]
                 vector.apply_beta_and_finish_t_for_neumann(
                     vector.ub_beta, stage1_matmul.neumann_power_handoff_l1, subblock_idx, buffer_parity,
                 )
@@ -1496,7 +1539,9 @@ def _run_stage1_body(
             vector.issue_beta_weighted_v(
                 gm_V, current_batch_index, current_value_head_index, current_chunk_index, current_valid_rows,
             )
-            task_delay_line.push(idx=local_task_index, valid_rows=current_valid_rows)
+            task_write_slot = pipeline_tick % 2
+            task_indices[task_write_slot] = dtypes.int64(local_task_index)
+            task_valid_row_counts[task_write_slot] = dtypes.int64(current_valid_rows)
             local_head_index = current_local_head_index
             group_chunk_index = current_group_chunk_index
             chunk_index = current_chunk_index
@@ -1606,7 +1651,8 @@ def _run_stage1_body(
             stage1_matmul.finish_per_d_mqk(vector.ub_mqk)
             issued_task_count = issued_task_count + 1
             if pipeline_tick >= 1 and pipeline_tick - 1 < issued_task_count:
-                delayed_task_index = task_delay_line.idx.tap(1)
+                delayed_task_slot = (pipeline_tick - 1) % 2
+                delayed_task_index = task_indices[delayed_task_slot]
                 local_head_index = delayed_task_index // group_count
                 group_chunk_index = delayed_task_index - local_head_index * group_count
                 workspace_task_index = (
@@ -1622,10 +1668,10 @@ def _run_stage1_body(
                 stage1_matmul.compute_u_pre_and_w_from_resident_inv_beta(
                     gm_U_pre, gm_w, workspace_task_index, vector.l1_v_beta, vector.l1_K_decayed_beta_for_W,
                 )
-            task_delay_line.advance()
             pipeline_tick = pipeline_tick + 1
         if pipeline_tick >= 1 and pipeline_tick - 1 < issued_task_count:
-            delayed_task_index = task_delay_line.idx.tap(1)
+            delayed_task_slot = (pipeline_tick - 1) % 2
+            delayed_task_index = task_indices[delayed_task_slot]
             local_head_index = delayed_task_index // group_count
             group_chunk_index = delayed_task_index - local_head_index * group_count
             chunk_index = group_start + group_chunk_index
@@ -1635,7 +1681,7 @@ def _run_stage1_body(
                 workspace_task_base + global_head_index * eff_group + group_chunk_index
             )
             buffer_parity = delayed_task_index % 2
-            delayed_valid_rows = task_delay_line.valid_rows.tap(1)
+            delayed_valid_rows = task_valid_row_counts[delayed_task_slot]
             vector.apply_beta_and_finish_t_for_neumann(
                 vector.ub_beta, stage1_matmul.neumann_power_handoff_l1, subblock_idx, buffer_parity,
             )
@@ -1666,32 +1712,55 @@ class StageTwoMatmul:
         self.dv_base = dv_base
         if shared is None:
             self.l0a_chunk = RingBuffer(
-                MemLoc.L0A, shape=(CHUNK_SIZE, SUPPORTED_HEAD_DIM), dtype=dtypes.bfloat16, depth=2,
+                MemLoc.L0A,
+                dtypes.bfloat16,
+                make_layout((CHUNK_SIZE, SUPPORTED_HEAD_DIM)),
+                depth=2,
             )
             self.l0a_kr_t = RingBuffer(
-                MemLoc.L0A, shape=(dv_base, CHUNK_SIZE), dtype=dtypes.bfloat16, depth=1, data_format="zn",
-            ).produce()
+                MemLoc.L0A,
+                dtypes.bfloat16,
+                make_layout((dv_base, CHUNK_SIZE)),
+                depth=1,
+            ).next_write()
             self.l0a_mqk = RingBuffer(
-                MemLoc.L0A, shape=(CHUNK_SIZE, CHUNK_SIZE), dtype=dtypes.bfloat16, depth=1,
-            ).produce()
-            self.l0b_u = RingBuffer(MemLoc.L0B, shape=(dv_base, CHUNK_SIZE), dtype=dtypes.bfloat16, depth=1).produce()
+                MemLoc.L0A,
+                dtypes.bfloat16,
+                make_layout((CHUNK_SIZE, CHUNK_SIZE)),
+                depth=1,
+            ).next_write()
+            self.l0b_u = RingBuffer(
+                MemLoc.L0B,
+                dtypes.bfloat16,
+                make_layout((dv_base, CHUNK_SIZE)),
+                depth=1,
+            ).next_write()
             self.l0b_state = RingBuffer(
-                MemLoc.L0B, shape=(dv_base, SUPPORTED_HEAD_DIM), dtype=dtypes.bfloat16, depth=1,
-            ).produce()
+                MemLoc.L0B,
+                dtypes.bfloat16,
+                make_layout((dv_base, SUPPORTED_HEAD_DIM)),
+                depth=1,
+            ).next_write()
             self.l0b_kr = RingBuffer(
-                MemLoc.L0B, shape=(SUPPORTED_HEAD_DIM, CHUNK_SIZE), dtype=dtypes.bfloat16, depth=1,
-            ).produce()
-            self.l0c_u = RingBuffer(MemLoc.L0C, shape=(CHUNK_SIZE, dv_base), dtype=dtypes.float32, depth=1).produce()
-            self.l0c_o = RingBuffer(MemLoc.L0C, shape=(CHUNK_SIZE, dv_base), dtype=dtypes.float32, depth=1).produce()
+                MemLoc.L0B,
+                dtypes.bfloat16,
+                make_layout((SUPPORTED_HEAD_DIM, CHUNK_SIZE)),
+                depth=1,
+            ).next_write()
+            self.l0c_u = RingBuffer(MemLoc.L0C, dtypes.float32, make_layout((CHUNK_SIZE, dv_base)), depth=1).next_write()
+            self.l0c_o = RingBuffer(MemLoc.L0C, dtypes.float32, make_layout((CHUNK_SIZE, dv_base)), depth=1).next_write()
             self.l0c_state = RingBuffer(
-                MemLoc.L0C, shape=(dv_base, SUPPORTED_HEAD_DIM), dtype=dtypes.float32, depth=1,
-            ).produce()
+                MemLoc.L0C,
+                dtypes.float32,
+                make_layout((dv_base, SUPPORTED_HEAD_DIM)),
+                depth=1,
+            ).next_write()
         else:
             self.l0a_chunk = shared.l0a_chunk
-            self.l0a_kr_t = reinterpret(shared.l0a_kr_t, shape=(dv_base, CHUNK_SIZE), data_format="zn")
+            self.l0a_kr_t = reinterpret(shared.l0a_kr_t, layout=make_layout((dv_base, CHUNK_SIZE)), data_format="nz")
             self.l0a_mqk = shared.l0a_mqk
-            self.l0b_u = reinterpret(shared.l0b_u, shape=(dv_base, CHUNK_SIZE))
-            self.l0b_state = reinterpret(shared.l0b_state, shape=(dv_base, SUPPORTED_HEAD_DIM), data_format="nz")
+            self.l0b_u = reinterpret(shared.l0b_u, layout=make_layout((dv_base, CHUNK_SIZE)), data_format="nz")
+            self.l0b_state = reinterpret(shared.l0b_state, layout=make_layout((dv_base, SUPPORTED_HEAD_DIM)), data_format="nz")
             self.l0b_kr = shared.l0b_kr
             self.l0c_u = shared.l0c_u
             self.l0c_o = shared.l0c_o
@@ -1699,47 +1768,48 @@ class StageTwoMatmul:
 
     @staticmethod
     def load_k_cumdecay(k_cumdecay_l1, gm_tile):
-        mem_copy(k_cumdecay_l1.produce(), gm_tile)
+        mem_copy(k_cumdecay_l1.next_write(), gm_tile)
 
     @staticmethod
     def load_q_decayed(q_decayed_l1, gm_tile):
-        mem_copy(q_decayed_l1.produce(), gm_tile)
+        mem_copy(q_decayed_l1.next_write(), gm_tile)
 
     @staticmethod
     def load_k_restored(k_restored_l1, gm_tile):
-        mem_copy(k_restored_l1.produce(), gm_tile, l2_cache_ctl=_L2_CACHE_LAST_USE)
+        mem_copy(k_restored_l1.next_write(), gm_tile, options=copy_options(l2_cache_ctl=_L2_CACHE_LAST_USE))
 
     @staticmethod
     def load_mqk(mqk_l1, gm_tile):
-        mem_copy(mqk_l1.produce(), gm_tile, l2_cache_ctl=_L2_CACHE_LAST_USE)
+        mem_copy(mqk_l1.next_write(), gm_tile, options=copy_options(l2_cache_ctl=_L2_CACHE_LAST_USE))
 
     def load_state(self, state_l1):
         mem_copy(
-            self.l0b_state, reinterpret(state_l1.consume(), shape=(self.dv_base, SUPPORTED_HEAD_DIM), data_format="nz"),
+            self.l0b_state,
+            reinterpret(state_l1.next_read(), layout=make_layout((self.dv_base, SUPPORTED_HEAD_DIM)), data_format="nz"),
         )
 
     def compute_w_state(self, w_l1):
-        mem_copy(self.l0a_chunk.produce(), w_l1.consume())
+        mem_copy(self.l0a_chunk.next_write(), w_l1.next_read())
         matmul(
-            reinterpret(self.l0c_u, shape=(CHUNK_SIZE, self.dv_base), data_format="nz"), self.l0a_chunk.consume(),
+            self.l0c_u[0:CHUNK_SIZE, 0:self.dv_base], self.l0a_chunk.next_read(),
             self.l0b_state, init=True,
         )
 
     def compute_q_state(self, q_decayed_l1):
-        mem_copy(self.l0a_chunk.produce(), q_decayed_l1.consume())
+        mem_copy(self.l0a_chunk.next_write(), q_decayed_l1.next_read())
         matmul(
-            reinterpret(self.l0c_o, shape=(CHUNK_SIZE, self.dv_base), data_format="nz"), self.l0a_chunk.consume(),
+            self.l0c_o[0:CHUNK_SIZE, 0:self.dv_base], self.l0a_chunk.next_read(),
             self.l0b_state, init=True,
         )
 
     @jit
     def load_k_restored_operand(self, k_restored_l1, valid_rows):
-        source = k_restored_l1.consume()
-        mem_copy(self._k_restored_operand(CHUNK_SIZE), source, transpose=True)
+        source = k_restored_l1.next_read()
+        mem_copy(self.l0b_kr, (source).permute(1, 0))
 
     @jit
     def load_mqk_operand(self, mqk_l1, valid_rows):
-        source = mqk_l1.consume()
+        source = mqk_l1.next_read()
         mem_copy(self._mqk_operand(CHUNK_SIZE), source)
 
     @jit
@@ -1753,51 +1823,54 @@ class StageTwoMatmul:
     def store_u_delta(self, ub):
         mem_copy(
             ub,
-            tile_slice(
-                reinterpret(self.l0c_u, shape=(CHUNK_SIZE, self.dv_base), data_format="nz"), (CHUNK_SIZE, self.dv_base),
+            (tile_slice(
+                self.l0c_u[0:CHUNK_SIZE, 0:self.dv_base], (CHUNK_SIZE, self.dv_base),
                 (0, 0),
+            )).partition(
+                dim=0,
             ),
-            engine=make_copy_engine(split_axis=0),
         )
 
     def store_output(self, gm_tile):
-        """FIXPIPE 按目的 GM Access.actual_rows 写入逻辑尾块。"""
+        """用源视图的有效行列限定 FIXPIPE 尾块写回。"""
         mem_copy(
-            gm_tile, reinterpret(self.l0c_o, shape=(CHUNK_SIZE, self.dv_base), data_format="nz"),
-            l2_cache_ctl=_L2_CACHE_DISABLE,
+            gm_tile, self.l0c_o[0:CHUNK_SIZE, 0:self.dv_base][:gm_tile.shape[0], :gm_tile.shape[1]],
+            options=copy_options(l2_cache_ctl=_L2_CACHE_DISABLE),
         )
 
     def store_state_delta(self, ub):
         mem_copy(
-            ub, reinterpret(self.l0c_state, shape=(self.dv_base, SUPPORTED_HEAD_DIM), data_format="nz"),
-            engine=make_copy_engine(split_axis=1),
+            ub,
+            (reinterpret(self.l0c_state, layout=make_layout((self.dv_base, SUPPORTED_HEAD_DIM)), data_format="nz")).partition(dim=1),
         )
 
     def _k_restored_operand(self, valid_rows):
-        return reinterpret(self.l0b_kr, shape=(valid_rows, SUPPORTED_HEAD_DIM), data_format="nz")
+        return self.l0b_kr[0:SUPPORTED_HEAD_DIM, 0:valid_rows]
 
     def _mqk_operand(self, valid_rows):
-        return reinterpret(self.l0a_mqk, shape=(CHUNK_SIZE, valid_rows), data_format="nz")
+        return self.l0a_mqk[0:CHUNK_SIZE, 0:valid_rows]
 
     def _update_state_tail(self, u_slot, valid_rows):
-        source = reinterpret(u_slot, shape=(CHUNK_SIZE, self.dv_base), offset=0)[
+        source = u_slot[0:CHUNK_SIZE, 0:self.dv_base][
             :CHUNK_SIZE, None
         ]
-        operand = reinterpret(self.l0a_kr_t, shape=(CHUNK_SIZE, self.dv_base), data_format="zn")
-        mem_copy(operand, source, transpose=True)
+        operand = self.l0a_kr_t
+        write_operand = self.l0a_kr_t
+        mem_copy(write_operand, source.permute(1, 0))
         matmul(
-            reinterpret(self.l0c_state, shape=(self.dv_base, SUPPORTED_HEAD_DIM), data_format="nz"), operand,
+            reinterpret(self.l0c_state, layout=make_layout((self.dv_base, SUPPORTED_HEAD_DIM)), data_format="nz"), operand,
             self._k_restored_operand(CHUNK_SIZE), init=True,
         )
 
     def _accumulate_mqk_u_tail(self, u_slot, valid_rows):
-        source = reinterpret(u_slot, shape=(CHUNK_SIZE, self.dv_base), offset=0)[
+        source = u_slot[0:CHUNK_SIZE, 0:self.dv_base][
             :CHUNK_SIZE, None
         ]
-        operand = reinterpret(self.l0b_u, shape=(CHUNK_SIZE, self.dv_base), data_format="nz")
-        mem_copy(operand, source, transpose=True)
+        operand = self.l0b_u
+        write_operand = self.l0b_u
+        mem_copy(write_operand, source.permute(1, 0))
         matmul(
-            reinterpret(self.l0c_o, shape=(CHUNK_SIZE, self.dv_base), data_format="nz"), self._mqk_operand(CHUNK_SIZE),
+            self.l0c_o[0:CHUNK_SIZE, 0:self.dv_base], self._mqk_operand(CHUNK_SIZE),
             operand, init=False,
         )
 
@@ -1808,24 +1881,34 @@ class StageTwoVector:
         self.u_row_block = u_row_block
         self.half_dk = D_HALF
         if shared is None:
-            self.ub_state_fp32 = Buffer(MemLoc.UB, (self.dv_base, self.half_dk), dtypes.float32)
-            self.tmp_state_bf16 = Buffer(MemLoc.UB, (self.dv_base, self.half_dk), dtypes.bfloat16)
-            self.tmp_u_bf16 = Buffer(MemLoc.UB, (u_row_block, dv_base), dtypes.bfloat16)
-            self.state_nd = RingBuffer(MemLoc.UB, (self.dv_base, self.half_dk), dtypes.bfloat16, depth=1).produce()
+            self.ub_state_fp32 = Buffer(MemLoc.UB, dtypes.float32, make_layout((self.dv_base, self.half_dk)))
+            self.tmp_state_bf16 = Buffer(MemLoc.UB, dtypes.bfloat16, make_layout((self.dv_base, self.half_dk)))
+            self.tmp_u_bf16 = Buffer(MemLoc.UB, dtypes.bfloat16, make_layout((u_row_block, dv_base)))
+            self.state_nd = RingBuffer(MemLoc.UB, dtypes.bfloat16, make_layout((self.dv_base, self.half_dk)), depth=1).next_write()
             self.state_nz = RingBuffer(
-                MemLoc.UB, (self.dv_base, self.half_dk), dtypes.bfloat16, depth=1, data_format="nz", n1_pad=16,
-            ).produce()
+                MemLoc.UB,
+                dtypes.bfloat16,
+                make_layout((self.dv_base, self.half_dk)),
+                depth=1,
+                physical_layout=make_layout((((self.half_dk) + 16 - 1) // 16, ((self.dv_base) + 15) // 16, 16, 16), stride=((((self.dv_base) + 15) // 16) * 256 + 16, 256, 16, 1)),
+                data_format="nz",
+            ).next_write()
             self.u_nz = RingBuffer(
-                MemLoc.UB, (u_row_block, dv_base), dtypes.bfloat16, depth=1, data_format="nz", n1_pad=16,
-            ).produce()
-            self.state_in = RingBuffer(MemLoc.UB, (self.dv_base, self.half_dk), dtypes.float32, depth=1).produce()
-            self.state_out = RingBuffer(MemLoc.UB, (self.dv_base, self.half_dk), dtypes.float32, depth=1).produce()
-            self.u_in = RingBuffer(MemLoc.UB, (u_row_block, dv_base), dtypes.bfloat16, depth=2)
+                MemLoc.UB,
+                dtypes.bfloat16,
+                make_layout((u_row_block, dv_base)),
+                depth=1,
+                physical_layout=make_layout((((dv_base) + 16 - 1) // 16, ((u_row_block) + 15) // 16, 16, 16), stride=((((u_row_block) + 15) // 16) * 256 + 16, 256, 16, 1)),
+                data_format="nz",
+            ).next_write()
+            self.state_in = RingBuffer(MemLoc.UB, dtypes.float32, make_layout((self.dv_base, self.half_dk)), depth=1).next_write()
+            self.state_out = RingBuffer(MemLoc.UB, dtypes.float32, make_layout((self.dv_base, self.half_dk)), depth=1).next_write()
+            self.u_in = RingBuffer(MemLoc.UB, dtypes.bfloat16, make_layout((u_row_block, dv_base)), depth=2)
         else:
             self.ub_state_fp32 = shared.ub_state_fp32
-            self.tmp_state_bf16 = reinterpret(shared.tmp_state_bf16, shape=(dv_base, self.half_dk))
-            self.tmp_u_bf16 = reinterpret(shared.tmp_u_bf16, shape=(u_row_block, dv_base))
-            self.state_nd = reinterpret(shared.state_nd, shape=(dv_base, self.half_dk))
+            self.tmp_state_bf16 = shared.tmp_state_bf16.flatten()[0:dv_base * self.half_dk,].reshape((dv_base, self.half_dk))
+            self.tmp_u_bf16 = shared.tmp_u_bf16.flatten()[0:u_row_block * dv_base,].reshape((u_row_block, dv_base))
+            self.state_nd = shared.state_nd.flatten()[0:dv_base * self.half_dk,].reshape((dv_base, self.half_dk))
             self.state_nz = shared.state_nz
             self.u_nz = shared.u_nz
             self.state_in = shared.state_in
@@ -1834,14 +1917,15 @@ class StageTwoVector:
 
     @staticmethod
     def load_gamma_col(gamma_ub, gamma_col):
-        slot = gamma_ub.produce()
+        slot = gamma_ub.next_write()
         mem_copy(slot, gamma_col)
 
     def load_initial_state_and_write_l1(self, current_state, state_l1, subblock_idx):
-        in_slot = reinterpret(self.state_in, shape=(self.dv_base, self.half_dk))
-        mem_copy(in_slot, current_state)
-        in_read = reinterpret(self.state_in, shape=(self.dv_base, self.half_dk))
-        ub_state = reinterpret(self.ub_state_fp32, shape=(self.dv_base, self.half_dk))
+        in_slot = self.state_in.flatten()[0:self.dv_base * self.half_dk,].reshape((self.dv_base, self.half_dk))
+        in_read = in_slot
+        in_read = in_read[tuple(map(slice, current_state.shape))]
+        mem_copy(in_read, current_state)
+        ub_state = self.ub_state_fp32.flatten()[0:self.dv_base * self.half_dk,].reshape((self.dv_base, self.half_dk))
         mem_copy(ub_state, in_read)
         self._produce_state_l1(state_l1, subblock_idx)
 
@@ -1852,9 +1936,9 @@ class StageTwoVector:
     @jit
     def scale_and_add_delta(self, tmp_delta, gamma_ub):
         """Fuse state decay and delta accumulation into one full-state VF pass."""
-        gamma_read = gamma_ub.consume()
+        gamma_read = gamma_ub.next_read()
         ub_gamma = gamma_read
-        ub_state = reinterpret(self.ub_state_fp32, shape=(self.dv_base, self.half_dk))
+        ub_state = self.ub_state_fp32.flatten()[0:self.dv_base * self.half_dk,].reshape((self.dv_base, self.half_dk))
         delta = tmp_delta
         with vf(mode="simd"):
             mask, _ = update_mask(VL, elem_bits=32)
@@ -1868,13 +1952,13 @@ class StageTwoVector:
 
     def issue_u_rows(self, gm_u_tile, subblock_idx):
         gm_u_rows = tile_slice(gm_u_tile, (self.u_row_block, self.dv_base), (subblock_idx, 0))
-        slot = reinterpret(self.u_in.produce(), shape=(self.u_row_block, self.dv_base))
+        slot = self.u_in.next_write().flatten()[0:self.u_row_block * self.dv_base,].reshape((self.u_row_block, self.dv_base))
         mem_copy(slot, gm_u_rows)
 
     @jit
     def finish_u_delta_to_l1(self, u_l1, tmp_u_delta, subblock_idx):
-        u_l1_rows = tile_slice(u_l1.produce(), (self.u_row_block, self.dv_base), (subblock_idx, 0))
-        u_in_read = reinterpret(self.u_in.consume(), shape=(self.u_row_block, self.dv_base))
+        u_l1_rows = tile_slice(u_l1.next_write(), (self.u_row_block, self.dv_base), (subblock_idx, 0))
+        u_in_read = self.u_in.next_read().flatten()[0:self.u_row_block * self.dv_base,].reshape((self.u_row_block, self.dv_base))
         delta = tmp_u_delta
         with vf(mode="simd"):
             mask, _ = update_mask(VL, elem_bits=32)
@@ -1891,28 +1975,36 @@ class StageTwoVector:
                 u_bf16_post = vcast(u_next_post, dtypes.bfloat16, mask=mask)
                 vstore_pack(self.tmp_u_bf16, base, u_bf16_pre, mask, pack_mode=PackMode.B32_TO_B16)
                 vstore_pack(self.tmp_u_bf16, base + VL, u_bf16_post, mask, pack_mode=PackMode.B32_TO_B16)
-        u_nz_slot = reinterpret(self.u_nz, shape=(self.u_row_block, self.dv_base), data_format="nz", n1_pad=16)
+        u_nz_slot = self.u_nz[0:self.u_row_block, 0:self.dv_base]
         nd2nz_tile(u_nz_slot, self.tmp_u_bf16)
-        u_nz_read = reinterpret(self.u_nz, shape=(self.u_row_block, self.dv_base), data_format="nz", n1_pad=16)
+        u_nz_read = self.u_nz[0:self.u_row_block, 0:self.dv_base]
         mem_copy(u_l1_rows, u_nz_read)
 
+    @jit
     def store_state_to_gm(self, gm_state_rows):
         """末态 ub_state_fp32 → GM（FP32）。累加在 V pipe、写 GM 在 MTE3，跨 pipe，经 RingBuffer 交接。"""
-        ub_state = reinterpret(self.ub_state_fp32, shape=(self.dv_base, self.half_dk))
-        out_slot = reinterpret(self.state_out, shape=(self.dv_base, self.half_dk))
-        mem_copy(out_slot, ub_state)
-        out_read = reinterpret(self.state_out, shape=(self.dv_base, self.half_dk))
+        ub_state = self.ub_state_fp32.flatten()[0:self.dv_base * self.half_dk,].reshape((self.dv_base, self.half_dk))
+        out_slot = self.state_out.flatten()[0:self.dv_base * self.half_dk,].reshape((self.dv_base, self.half_dk))
+        with vf(mode="simd"):
+            copy_mask, _ = update_mask(VL, elem_bits=32)
+            for offset in dsl_range(0, self.dv_base * self.half_dk, VL):
+                state_values = vload(ub_state, offset)
+                vstore(out_slot, offset, state_values, copy_mask)
+            vmem_bar("vst_vld")
+        out_read = self.state_out.flatten()[0:self.dv_base * self.half_dk,].reshape((self.dv_base, self.half_dk))
         mem_copy(gm_state_rows, out_read)
 
     def _produce_state_l1(self, state_l1, subblock_idx):
-        ub_state = reinterpret(self.ub_state_fp32, shape=(self.dv_base, self.half_dk))
+        ub_state = self.ub_state_fp32.flatten()[0:self.dv_base * self.half_dk,].reshape((self.dv_base, self.half_dk))
         nd_slot = self.state_nd
         cast_tile(nd_slot, ub_state)
         nd_read = self.state_nd
-        nz_slot = reinterpret(self.state_nz, shape=(self.dv_base, self.half_dk), data_format="nz", n1_pad=16)
+        # This shared slot is repacked at the active DV height. A slice
+        # would retain the maximum-height N1 pitch instead.
+        nz_slot = reinterpret(self.state_nz, layout=make_layout((self.dv_base, self.half_dk)), data_format="nz", physical_layout=make_layout(((self.half_dk + 15) // 16, (self.dv_base + 15) // 16, 16, 16), stride=(((self.dv_base + 15) // 16) * 256 + (16), 256, 16, 1)))
         nd2nz_tile(nz_slot, nd_read)
-        nz_read = reinterpret(self.state_nz, shape=(self.dv_base, self.half_dk), data_format="nz", n1_pad=16)
-        slot = reinterpret(state_l1.produce(), shape=(self.dv_base, SUPPORTED_HEAD_DIM), data_format="nz")
+        nz_read = reinterpret(self.state_nz, layout=make_layout((self.dv_base, self.half_dk)), data_format="nz", physical_layout=make_layout(((self.half_dk + 15) // 16, (self.dv_base + 15) // 16, 16, 16), stride=(((self.dv_base + 15) // 16) * 256 + (16), 256, 16, 1)))
+        slot = reinterpret(state_l1.next_write(), layout=make_layout((self.dv_base, SUPPORTED_HEAD_DIM)), data_format="nz")
         state_l1_rows = tile_slice(slot, (self.dv_base, self.half_dk), (0, subblock_idx))
         mem_copy(state_l1_rows, nz_read)
 
@@ -1921,22 +2013,31 @@ class _StageTwoResources:
     """One allocation per round, shared by mutually exclusive DV variants."""
 
     def __init__(self):
-        self.q_l1 = RingBuffer(MemLoc.L1, (CHUNK_SIZE, SUPPORTED_HEAD_DIM), dtypes.bfloat16, depth=2)
-        self.w_l1 = RingBuffer(MemLoc.L1, (CHUNK_SIZE, SUPPORTED_HEAD_DIM), dtypes.bfloat16, depth=2)
+        self.q_l1 = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((CHUNK_SIZE, SUPPORTED_HEAD_DIM)), depth=2)
+        self.w_l1 = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((CHUNK_SIZE, SUPPORTED_HEAD_DIM)), depth=2)
         self.k_restored_l1 = RingBuffer(
-            MemLoc.L1, (CHUNK_SIZE, SUPPORTED_HEAD_DIM), dtypes.bfloat16, depth=2, data_format="nz",
+            MemLoc.L1,
+            dtypes.bfloat16,
+            make_layout((CHUNK_SIZE, SUPPORTED_HEAD_DIM)),
+            depth=2,
         )
-        self.mqk_l1 = RingBuffer(MemLoc.L1, (CHUNK_SIZE, CHUNK_SIZE), dtypes.bfloat16, depth=2)
+        self.mqk_l1 = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((CHUNK_SIZE, CHUNK_SIZE)), depth=2)
         self.state_l1 = RingBuffer(
-            MemLoc.L1, (SUPPORTED_HEAD_DIM, SUPPORTED_HEAD_DIM), dtypes.bfloat16, depth=2, data_format="nz",
+            MemLoc.L1,
+            dtypes.bfloat16,
+            make_layout((SUPPORTED_HEAD_DIM, SUPPORTED_HEAD_DIM)),
+            depth=2,
         )
-        self.u_l1 = RingBuffer(MemLoc.L1, (CHUNK_SIZE, SUPPORTED_HEAD_DIM), dtypes.bfloat16, depth=2)
+        self.u_l1 = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((CHUNK_SIZE, SUPPORTED_HEAD_DIM)), depth=2)
         self.matmul = StageTwoMatmul(dv_base=SUPPORTED_HEAD_DIM)
-        self.gamma_ub = RingBuffer(MemLoc.UB, (D_HALF, 1), dtypes.float32, depth=2)
-        self.tmp_delta = RingBuffer(MemLoc.UB, (SUPPORTED_HEAD_DIM, D_HALF), dtypes.float32, depth=1).produce()
+        self.gamma_ub = RingBuffer(MemLoc.UB, dtypes.float32, make_layout((D_HALF, 1)), depth=2)
+        self.tmp_delta = RingBuffer(MemLoc.UB, dtypes.float32, make_layout((SUPPORTED_HEAD_DIM, D_HALF)), depth=1).next_write()
         self.tmp_u_delta = RingBuffer(
-            MemLoc.UB, (CHUNK_SIZE // 2, SUPPORTED_HEAD_DIM), dtypes.float32, depth=1,
-        ).produce()
+            MemLoc.UB,
+            dtypes.float32,
+            make_layout((CHUNK_SIZE // 2, SUPPORTED_HEAD_DIM)),
+            depth=1,
+        ).next_write()
         self.vector = StageTwoVector(u_row_block=CHUNK_SIZE // 2, dv_base=SUPPORTED_HEAD_DIM)
 
 
@@ -1980,8 +2081,8 @@ def _run_stage2_body(
     u_l1 = resources.u_l1
     s2_matmul = StageTwoMatmul(dv_base=dv_base, shared=resources.matmul)
     gamma_ub = resources.gamma_ub
-    tmp_delta = reinterpret(resources.tmp_delta, shape=(dv_base, half_dk))
-    tmp_u_delta = reinterpret(resources.tmp_u_delta, shape=(u_row_block, dv_base))
+    tmp_delta = resources.tmp_delta.flatten()[0:dv_base * half_dk,].reshape((dv_base, half_dk))
+    tmp_u_delta = resources.tmp_u_delta.flatten()[0:u_row_block * dv_base,].reshape((u_row_block, dv_base))
     s2_vector = StageTwoVector(u_row_block=u_row_block, dv_base=dv_base, shared=resources.vector)
     if block_idx < logical_core_num:
         for item in range(item_start, item_end):
@@ -2036,7 +2137,7 @@ def _run_stage2_body(
                     s2_vector.issue_u_rows(next_u_tile, subblock_idx)
                 s2_matmul.store_u_delta(tmp_u_delta)
                 s2_vector.finish_u_delta_to_l1(u_l1, tmp_u_delta, subblock_idx)
-                u_slot = u_l1.consume()
+                u_slot = u_l1.next_read()
                 s2_matmul.update_state(u_slot, valid_rows)
                 s2_matmul.store_state_delta(tmp_delta)
                 s2_matmul.accumulate_mqk_u(u_slot, valid_rows)
@@ -2072,7 +2173,7 @@ GATE_MTE2_TO_V_EVENT_ID = 5
 
 
 def _rewind_buffers():
-    channel_rewind(reset_sync_id=False)
+    onchip_rewind(reset_sync_id=False)
 
 
 def _stage_boundary_reset(flag_id: int):

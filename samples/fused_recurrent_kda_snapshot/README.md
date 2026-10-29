@@ -1,5 +1,7 @@
 # fused_recurrent_kda_snapshot
 
+依赖版本：CANNBot-DSL 0.8.0。
+
 基于 CANNBot-DSL 的 Kimi Delta Attention decode 融合算子，面向 Ascend 950。实现位于 [`fused_recurrent_kda_snapshot.py`](fused_recurrent_kda_snapshot.py)，公开 Python 函数名为 `fused_recurrent_kda`。算子从 state pool 读取初态，计算本轮全部候选 token，并为每个 token 保存完整递归状态快照。
 
 ## 功能说明
@@ -166,7 +168,7 @@ python -m pytest -q test/fused_recurrent_kda_snapshot/test_fused_recurrent_kda_s
 
 ## 性能
 
-以下结果于 2026-09-14 使用 CANN 9.2、Release 构建和 msprof `Task Duration` 采集。固定形状为 `B=16,N=6,S=8,D=128`，采用 BSND、FP32 state 和 `accepted=4`；先运行 10 次 warmup，再保留 100 个 Snapshot 任务。
+测试使用 CANN 9.2、Release 构建和 msprof `Task Duration` 采集。固定形状为 `B=16,N=6,S=8,D=128`，采用 BSND、FP32 state 和 `accepted=4`；先运行 10 次 warmup，再保留 100 个 Snapshot 任务。
 
 | Task Duration 中位数 (us) | 最小值 (us) | 平均值 (us) | P90 (us) | 最大值 (us) |
 |--:|--:|--:|--:|--:|

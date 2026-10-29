@@ -6,6 +6,8 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 
+# fmt: off
+
 """FlashKDA CP main metadata producer."""
 
 import os
@@ -21,10 +23,10 @@ from cannbotdsl.aicpu import (
     I32,
     I64,
     U32,
-    GmIn,
-    GmOut,
     aicpu_kernel,
     current_raw_stream,
+    gm_in,
+    gm_out,
 )
 from cannbotdsl.aicpu.toolchain import compile_aicpu_kernel
 
@@ -167,8 +169,8 @@ def chunk_capacity_upper_bound(batch: int, storage_length: int) -> int:
 
 
 class FlashKDAMetadataArgs:
-    cu_seqlens: GmIn(I32)
-    metadata: GmOut(U32)
+    cu_seqlens: gm_in(I32)
+    metadata: gm_out(U32)
     metadata_word_capacity: U32
     batch: U32
     physical_batches: U32

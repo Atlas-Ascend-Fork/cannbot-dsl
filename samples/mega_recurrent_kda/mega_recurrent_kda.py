@@ -6,6 +6,8 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 
+# fmt: off
+
 """One mixed MegaKDA kernel for TP4/8/16, model batch 1..32 and stream-controlled cores.
 
 The original public API is preserved. The current stream quota selects the
@@ -21,30 +23,18 @@ from typing import NamedTuple
 
 import cannbotdsl
 import torch
-from cannbotdsl import (
-    PIPE,
-    ChannelKind,
-    MemLoc,
-    Tensor,
-    TensorSpec,
-    dtypes)
+from cannbotdsl import PIPE, MemLoc, Tensor, TensorSpec, dtypes, make_layout
 from cannbotdsl.aot import export
 from cannbotdsl.buffer import Buffer
-from cannbotdsl.channel import Channel
 from cannbotdsl.lang.constexpr import const_expr
 from cannbotdsl.lang.control_flow import range as dsl_range
 from cannbotdsl.lang.host import host
 from cannbotdsl.lang.jit import jit
 from cannbotdsl.lang.kernel import kernel
 from cannbotdsl.lang.vf import vf
-from cannbotdsl.ops.arch import (
-    get_block_idx,
-    get_block_num,
-    get_subblock_id)
+from cannbotdsl.ops.arch import get_block_idx, get_block_num, get_subblock_id
 from cannbotdsl.ops.matmul import matmul
-from cannbotdsl.ops.memcpy import (
-    make_copy_engine,
-    mem_copy)
+from cannbotdsl.ops.memcpy import copy_options, mem_copy
 from cannbotdsl.ops.reg import (
     PackMode,
     UnpackMode,
@@ -69,24 +59,22 @@ from cannbotdsl.ops.reg import (
     vstore,
     vstore_first,
     vstore_pack,
-    vsub)
+    vsub,
+)
 from cannbotdsl.ops.sync import (
-    channel_rewind,
     cube_sync_all,
     cube_sync_block_arrive,
     cube_sync_block_wait,
     global_sync_all,
+    onchip_rewind,
     vec_sync_all,
     vec_sync_block_arrive,
     vec_sync_block_wait,
     vec_sync_notify,
-    vec_sync_wait)
-from cannbotdsl.tensor import (
-    ceil_div,
-    idx2crd,
-    make_tiler,
-    reinterpret,
-    tile_slice)
+    vec_sync_wait,
+)
+from cannbotdsl.ring_buffer import RingBuffer
+from cannbotdsl.tensor import ceil_div, idx2crd, make_tiler, tile_slice
 
 TILE = 128
 HIDDEN_SIZE = 7168
@@ -170,50 +158,56 @@ class _ProjectionOperations:
     @jit
     def matmul_hidden(self, hidden_gm: Tensor, weight_gm: Tensor, output_tile, k_tiles):
         """Compute ``hidden @ weight.T`` from model-layout ``[out,in]``."""
-        accumulator = self.l0c.produce()
+        accumulator = self.l0c.next_write().reinterpret(layout=make_layout(self.l0c_shape), data_format="nz")
         if const_expr(self.tile_width == BETA_TILE):
-            beta_l1 = Buffer(MemLoc.L1, dtype=weight_gm.dtype, capacity=(BETA_TILE, HIDDEN_SIZE),
-                layout=weight_gm.layout, physical_layout=weight_gm.physical_layout, data_format="nz")
-            mem_copy(beta_l1, weight_gm, l2_cache_ctl=self.weight_l2_cache_ctl)
+            beta_l1 = Buffer(
+                MemLoc.L1,
+                weight_gm.dtype,
+                weight_gm.layout,
+                physical_layout=weight_gm.physical_layout,
+            )
+            mem_copy(beta_l1, weight_gm, options=copy_options(l2_cache_ctl=self.weight_l2_cache_ctl))
         for kc_idx in range(k_tiles * TILE // PROJECTION_KC):
-            a_l1_slot = self.a_l1.produce()
+            a_l1_slot = self.a_l1.next_write().reinterpret(layout=make_layout(self.a_l1_shape), data_format="nz")
             mem_copy(a_l1_slot, tile_slice(hidden_gm, (self.row_capacity, PROJECTION_KC), (0, kc_idx)),
-                l2_cache_ctl=self.input_l2_cache_ctl, engine=self.nd2nz)
+                options=copy_options(l2_cache_ctl=self.input_l2_cache_ctl))
             if const_expr(self.tile_width == BETA_TILE):
                 self._accumulate_panel(
                     accumulator, a_l1_slot, beta_l1, kc_idx * (PROJECTION_KC // PROJECTION_KS), kc_idx == 0)
             else:
-                b_l1_slot = self.b_l1.produce()
+                b_l1_slot = self.b_l1.next_write()
                 mem_copy(b_l1_slot, tile_slice(weight_gm, (self.tile_width, PROJECTION_KC), (output_tile, kc_idx)),
-                    l2_cache_ctl=self.weight_l2_cache_ctl)
+                    options=copy_options(l2_cache_ctl=self.weight_l2_cache_ctl))
                 self._accumulate_panel(accumulator, a_l1_slot, b_l1_slot, 0, kc_idx == 0)
 
     @jit
     def _accumulate_panel(self, accumulator, a_l1_slot, b_l1_slot, first_k, init):
         for ks_idx in range(PROJECTION_KC // PROJECTION_KS):
-            l0a_slot = self.l0a.produce()
-            l0b_slot = self.l0b.produce()
+            l0a_slot = self.l0a.next_write().reinterpret(layout=make_layout(self.l0a_shape), data_format="nz")
+            l0b_slot = self.l0b.next_write()
             mem_copy(l0a_slot, tile_slice(a_l1_slot, (self.row_capacity, PROJECTION_KS), (0, ks_idx)))
             mem_copy(l0b_slot, tile_slice(b_l1_slot, (self.tile_width, PROJECTION_KS), (0, first_k + ks_idx)))
             matmul(accumulator, l0a_slot, l0b_slot, init=init and ks_idx == 0)
 
     @jit
-    def matmul_resident(self, resident_l1, weight_l1, resident_copy_engine=None):
+    def matmul_resident(self, resident_l1, weight_l1):
         """Compute one K=128 projection from a resident BF16 L1 tile."""
-        accumulator = self.l0c.produce()
+        accumulator = self.l0c.next_write().reinterpret(layout=make_layout(self.l0c_shape), data_format="nz")
         for ks_idx in range(TILE // PROJECTION_KS):
-            l0a_slot = self.l0a.produce()
-            mem_copy(l0a_slot, tile_slice(resident_l1, (self.row_capacity, PROJECTION_KS), (0, ks_idx)),
-                engine=resident_copy_engine)
-            l0b_slot = self.l0b.produce()
-            mem_copy(l0b_slot, tile_slice(weight_l1, (self.tile_width, PROJECTION_KS), (0, ks_idx)))
+            l0a_slot = self.l0a.next_write().reinterpret(layout=make_layout(self.l0a_shape), data_format='nz')
+            l0a_slot_source = tile_slice(resident_l1, (self.row_capacity, PROJECTION_KS), (0, ks_idx))
+            l0a_slot = l0a_slot[tuple(map(slice, l0a_slot_source.shape))]
+            mem_copy(l0a_slot, l0a_slot_source)
+            l0b_slot = self.l0b.next_write()
+            l0b_slot_source = tile_slice(weight_l1, (self.tile_width, PROJECTION_KS), (0, ks_idx))
+            l0b_slot = l0b_slot[tuple(map(slice, l0b_slot_source.shape))]
+            mem_copy(l0b_slot, l0b_slot_source)
             matmul(accumulator, l0a_slot, l0b_slot, init=ks_idx == 0)
 
     @jit
     def acquire_result(self):
         """Send L0C to both paired AIVs and hold the FP32 half tile."""
-        mem_copy(self.projection_half, reinterpret(self.l0c.consume(), shape=(self.row_count, self.tile_width)),
-            engine=self.fixpipe)
+        mem_copy(self.projection_half, self.l0c.next_read().reinterpret(layout=make_layout(self.l0c_shape), data_format="nz").partition(dim=0))
         self.projection_fp32 = self.projection_half
 
     @jit
@@ -243,8 +237,7 @@ class _ProjectionOperations:
 
     @jit
     def publish_result(self, workspace_tile):
-        result = reinterpret(self.l0c.consume(), shape=(self.row_count, self.tile_width))
-        mem_copy(workspace_tile[0:self.row_count, 0:self.tile_width], result, engine=make_copy_engine())
+        mem_copy(workspace_tile[0:self.row_count, 0:self.tile_width], self.l0c.next_read().reinterpret(layout=make_layout(self.l0c_shape), data_format="nz"))
 
     def publish(self, workspace_tile, subblock_idx):
         out_half = tile_slice(
@@ -273,21 +266,23 @@ class ProjectionStage(_ProjectionOperations):
         self.row_block = self.row_count // 2
         self.input_l2_cache_ctl = int(input_l2_cache_ctl)
         self.weight_l2_cache_ctl = int(weight_l2_cache_ctl)
-        self.a_l1 = Channel(MemLoc.L1, (self.row_count, PROJECTION_KC), dtypes.bfloat16, depth=2,
-            capacity=(self.row_capacity, PROJECTION_KC))
+        self.a_l1 = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((self.row_capacity * PROJECTION_KC,)), depth=2, data_format="nd")
+        self.a_l1_shape = (self.row_count, PROJECTION_KC)
         if self.tile_width != BETA_TILE:
-            self.b_l1 = Channel(MemLoc.L1, (self.tile_width, PROJECTION_KC), dtypes.bfloat16, depth=2, data_format="nz")
-        self.l0a = Channel(MemLoc.L0A, (self.row_count, PROJECTION_KS), dtypes.bfloat16, depth=2,
-            capacity=(self.row_capacity, PROJECTION_KS))
-        self.l0b = Channel(MemLoc.L0B, (self.tile_width, PROJECTION_KS), dtypes.bfloat16, depth=2)
-        self.l0c = Channel(MemLoc.L0C, (self.row_count, self.tile_width), dtypes.float32, depth=2,
-            capacity=(self.row_capacity, self.tile_width))
-        self.projection_half = Channel(MemLoc.UB, (self.row_block, self.tile_width), dtypes.float32, depth=1,
-            kind=ChannelKind.CrossCore, capacity=(self.row_capacity // 2, self.tile_width)).produce()
-        self.projection_bf16 = Buffer(MemLoc.UB, (self.row_block, self.tile_width), dtypes.bfloat16,
-            capacity=(self.row_capacity // 2, self.tile_width))
-        self.nd2nz = make_copy_engine(format_transform="nd2nz")
-        self.fixpipe = make_copy_engine(split_axis=0)
+            self.b_l1 = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((self.tile_width, PROJECTION_KC)), depth=2)
+        self.l0a = RingBuffer(MemLoc.L0A, dtypes.bfloat16, make_layout((self.row_capacity * PROJECTION_KS,)), depth=2, data_format="nd")
+        self.l0a_shape = (self.row_count, PROJECTION_KS)
+        self.l0b = RingBuffer(MemLoc.L0B, dtypes.bfloat16, make_layout((self.tile_width, PROJECTION_KS)), depth=2)
+        self.l0c = RingBuffer(MemLoc.L0C, dtypes.float32, make_layout((self.row_capacity * self.tile_width,)), depth=2, data_format="nd")
+        self.l0c_shape = (self.row_count, self.tile_width)
+        self.projection_half = RingBuffer(MemLoc.UB, dtypes.float32, make_layout((self.row_capacity // 2 * self.tile_width,)), depth=1).next_write().view(
+            (self.row_block, self.tile_width),
+        )
+        self.projection_bf16 = Buffer(
+            MemLoc.UB,
+            dtypes.bfloat16,
+            make_layout((self.row_capacity // 2 * self.tile_width,)),
+        ).view(self.row_block, self.tile_width)
         self.projection_fp32: object
 
 
@@ -300,54 +295,71 @@ class _ResidentN384ProjectionStage:
         weight_l2_cache_ctl: int = 0):
         self.input_l2_cache_ctl = int(input_l2_cache_ctl)
         self.weight_l2_cache_ctl = int(weight_l2_cache_ctl)
-        self.a_l1 = Channel(MemLoc.L1, (TILE, PROJECTION_KC), dtypes.bfloat16, depth=2)
-        self.b_l1 = Channel(MemLoc.L1, (3 * TILE, PROJECTION_KC), dtypes.bfloat16, depth=2, data_format="nz")
-        self.l0a = Channel(MemLoc.L0A, (TILE, PROJECTION_KS), dtypes.bfloat16, depth=2)
-        self.l0b = Channel(MemLoc.L0B, (TILE, PROJECTION_KS), dtypes.bfloat16, depth=2)
-        self.l0c0 = Channel(MemLoc.L0C, (TILE, TILE), dtypes.float32, depth=1).produce()
-        self.l0c1 = Channel(MemLoc.L0C, (TILE, TILE), dtypes.float32, depth=1).produce()
-        self.l0c2 = Channel(MemLoc.L0C, (TILE, TILE), dtypes.float32, depth=1).produce()
-        self.projection_half0 = Channel(
-            MemLoc.UB, (TILE // 2, TILE), dtypes.float32, depth=1, kind=ChannelKind.CrossCore
-        ).produce()
-        self.projection_half1 = Channel(
-            MemLoc.UB, (TILE // 2, TILE), dtypes.float32, depth=1, kind=ChannelKind.CrossCore
-        ).produce()
-        self.projection_half2 = Channel(
-            MemLoc.UB, (TILE // 2, TILE), dtypes.float32, depth=1, kind=ChannelKind.CrossCore
-        ).produce()
-        self.projection_bf16 = Buffer(MemLoc.UB, (TILE // 2, TILE), dtypes.bfloat16)
-        self.nd2nz = make_copy_engine(format_transform="nd2nz")
-        self.fixpipe = make_copy_engine(split_axis=0)
+        self.a_l1 = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((TILE, PROJECTION_KC)), depth=2)
+        self.a_l1_shape = (TILE, PROJECTION_KC)
+        self.b_l1 = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((3 * TILE, PROJECTION_KC)), depth=2)
+        self.l0a = RingBuffer(MemLoc.L0A, dtypes.bfloat16, make_layout((TILE, PROJECTION_KS)), depth=2)
+        self.l0a_shape = (TILE, PROJECTION_KS)
+        self.l0b = RingBuffer(MemLoc.L0B, dtypes.bfloat16, make_layout((TILE, PROJECTION_KS)), depth=2)
+        self.l0c0 = RingBuffer(MemLoc.L0C, dtypes.float32, make_layout((TILE, TILE)), depth=1).next_write()
+        self.l0c1 = RingBuffer(MemLoc.L0C, dtypes.float32, make_layout((TILE, TILE)), depth=1).next_write()
+        self.l0c2 = RingBuffer(MemLoc.L0C, dtypes.float32, make_layout((TILE, TILE)), depth=1).next_write()
+        self.projection_half0 = RingBuffer(
+            MemLoc.UB,
+            dtypes.float32,
+            make_layout((TILE // 2, TILE)),
+            depth=1,
+        ).next_write()
+        self.projection_half1 = RingBuffer(
+            MemLoc.UB,
+            dtypes.float32,
+            make_layout((TILE // 2, TILE)),
+            depth=1,
+        ).next_write()
+        self.projection_half2 = RingBuffer(
+            MemLoc.UB,
+            dtypes.float32,
+            make_layout((TILE // 2, TILE)),
+            depth=1,
+        ).next_write()
+        self.projection_bf16 = Buffer(MemLoc.UB, dtypes.bfloat16, make_layout((TILE // 2, TILE)))
         self.projection_fp32: object
 
     @jit
     def matmul_hidden3(self, hidden_gm, weight_gm, m_group, n_macro, k_tiles):
         for kc_idx in range(k_tiles * TILE // PROJECTION_KC):
-            a_l1_slot = self.a_l1.produce()
-            mem_copy(a_l1_slot, tile_slice(hidden_gm, (TILE, PROJECTION_KC), (m_group, kc_idx)), engine=self.nd2nz,
-                l2_cache_ctl=self.input_l2_cache_ctl)
-            b_l1_slot = self.b_l1.produce()
+            a_l1_slot = self.a_l1.next_write().reinterpret(layout=make_layout(self.a_l1_shape), data_format="nz")
+            mem_copy(a_l1_slot, tile_slice(hidden_gm, (TILE, PROJECTION_KC), (m_group, kc_idx)),
+                options=copy_options(l2_cache_ctl=self.input_l2_cache_ctl))
+            b_l1_slot = self.b_l1.next_write()
             mem_copy(b_l1_slot, tile_slice(weight_gm, (3 * TILE, PROJECTION_KC), (n_macro, kc_idx)),
-                l2_cache_ctl=self.weight_l2_cache_ctl)
+                options=copy_options(l2_cache_ctl=self.weight_l2_cache_ctl))
             for ks_idx in range(PROJECTION_KC // PROJECTION_KS):
-                l0a_slot = self.l0a.produce()
-                mem_copy(l0a_slot, tile_slice(a_l1_slot, (TILE, PROJECTION_KS), (0, ks_idx)))
-                l0b_slot = self.l0b.produce()
-                mem_copy(l0b_slot, tile_slice(b_l1_slot, (TILE, PROJECTION_KS), (0, ks_idx)))
+                l0a_slot = self.l0a.next_write().reinterpret(layout=make_layout(self.l0a_shape), data_format='nz')
+                l0a_slot_source_2 = tile_slice(a_l1_slot, (TILE, PROJECTION_KS), (0, ks_idx))
+                l0a_slot = l0a_slot[tuple(map(slice, l0a_slot_source_2.shape))]
+                mem_copy(l0a_slot, l0a_slot_source_2)
+                l0b_slot = self.l0b.next_write()
+                l0b_slot_source_5 = tile_slice(b_l1_slot, (TILE, PROJECTION_KS), (0, ks_idx))
+                l0b_slot = l0b_slot[tuple(map(slice, l0b_slot_source_5.shape))]
+                mem_copy(l0b_slot, l0b_slot_source_5)
                 matmul(self.l0c0, l0a_slot, l0b_slot, init=kc_idx == 0 and ks_idx == 0)
                 if kc_idx == k_tiles * TILE // PROJECTION_KC - 1 and ks_idx == PROJECTION_KC // PROJECTION_KS - 1:
-                    mem_copy(self.projection_half0, reinterpret(self.l0c0, shape=(TILE, TILE)), engine=self.fixpipe)
-                l0b_slot = self.l0b.produce()
-                mem_copy(l0b_slot, tile_slice(b_l1_slot, (TILE, PROJECTION_KS), (1, ks_idx)))
+                    mem_copy(self.projection_half0, self.l0c0.partition(dim=0))
+                l0b_slot = self.l0b.next_write()
+                l0b_slot_source_6 = tile_slice(b_l1_slot, (TILE, PROJECTION_KS), (1, ks_idx))
+                l0b_slot = l0b_slot[tuple(map(slice, l0b_slot_source_6.shape))]
+                mem_copy(l0b_slot, l0b_slot_source_6)
                 matmul(self.l0c1, l0a_slot, l0b_slot, init=kc_idx == 0 and ks_idx == 0)
                 if kc_idx == k_tiles * TILE // PROJECTION_KC - 1 and ks_idx == PROJECTION_KC // PROJECTION_KS - 1:
-                    mem_copy(self.projection_half1, reinterpret(self.l0c1, shape=(TILE, TILE)), engine=self.fixpipe)
-                l0b_slot = self.l0b.produce()
-                mem_copy(l0b_slot, tile_slice(b_l1_slot, (TILE, PROJECTION_KS), (2, ks_idx)))
+                    mem_copy(self.projection_half1, self.l0c1.partition(dim=0))
+                l0b_slot = self.l0b.next_write()
+                l0b_slot_source_7 = tile_slice(b_l1_slot, (TILE, PROJECTION_KS), (2, ks_idx))
+                l0b_slot = l0b_slot[tuple(map(slice, l0b_slot_source_7.shape))]
+                mem_copy(l0b_slot, l0b_slot_source_7)
                 matmul(self.l0c2, l0a_slot, l0b_slot, init=kc_idx == 0 and ks_idx == 0)
                 if kc_idx == k_tiles * TILE // PROJECTION_KC - 1 and ks_idx == PROJECTION_KC // PROJECTION_KS - 1:
-                    mem_copy(self.projection_half2, reinterpret(self.l0c2, shape=(TILE, TILE)), engine=self.fixpipe)
+                    mem_copy(self.projection_half2, self.l0c2.partition(dim=0))
 
     @jit
     def acquire_result0(self):
@@ -386,52 +398,58 @@ class GateDecayProjectionStage:
         weight_l2_cache_ctl: int = 0):
         self.input_l2_cache_ctl = int(input_l2_cache_ctl)
         self.weight_l2_cache_ctl = int(weight_l2_cache_ctl)
-        self.a_l1 = Channel(MemLoc.L1, (TILE, TILE), dtypes.bfloat16, depth=2)
-        self.g_l1 = Channel(MemLoc.L1, (3 * TILE, TILE), dtypes.bfloat16, depth=2, data_format="nz")
-        self.fa_weight_l1 = Channel(MemLoc.L1, (TILE, TILE), dtypes.bfloat16, depth=2, data_format="nz")
-        self.l0a = Channel(MemLoc.L0A, (TILE, TILE), dtypes.bfloat16, depth=2)
-        self.l0b = Channel(MemLoc.L0B, (TILE, TILE), dtypes.bfloat16, depth=2)
-        self.l0c0 = Channel(MemLoc.L0C, (TILE, TILE), dtypes.float32, depth=1).produce()
-        self.l0c1 = Channel(MemLoc.L0C, (TILE, TILE), dtypes.float32, depth=1).produce()
-        self.l0c2 = Channel(MemLoc.L0C, (TILE, TILE), dtypes.float32, depth=1).produce()
-        self.l0c_fa = Channel(MemLoc.L0C, (TILE, TILE), dtypes.float32, depth=1).produce()
-        self.fa_l1 = Channel(MemLoc.L1, (TILE, TILE), dtypes.bfloat16, depth=1).produce()
-        self.fb_l1 = Channel(MemLoc.L1, (TILE, TILE), dtypes.bfloat16, depth=1, data_format="nz").produce()
-        self.nd2nz = make_copy_engine(format_transform="nd2nz")
-        self.fixpipe = make_copy_engine()
-        self.fa_copy_engine = make_copy_engine()
+        self.a_l1 = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((TILE, TILE)), depth=2)
+        self.a_l1_shape = (TILE, TILE)
+        self.g_l1 = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((3 * TILE, TILE)), depth=2)
+        self.fa_weight_l1 = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((TILE, TILE)), depth=2)
+        self.l0a = RingBuffer(MemLoc.L0A, dtypes.bfloat16, make_layout((TILE, TILE)), depth=2)
+        self.l0a_shape = (TILE, TILE)
+        self.l0b = RingBuffer(MemLoc.L0B, dtypes.bfloat16, make_layout((TILE, TILE)), depth=2)
+        self.l0c0 = RingBuffer(MemLoc.L0C, dtypes.float32, make_layout((TILE, TILE)), depth=1).next_write()
+        self.l0c1 = RingBuffer(MemLoc.L0C, dtypes.float32, make_layout((TILE, TILE)), depth=1).next_write()
+        self.l0c2 = RingBuffer(MemLoc.L0C, dtypes.float32, make_layout((TILE, TILE)), depth=1).next_write()
+        self.l0c_fa = RingBuffer(MemLoc.L0C, dtypes.float32, make_layout((TILE, TILE)), depth=1).next_write()
+        self.fa_l1 = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((TILE, TILE)), depth=1).next_write()
+        self.fb_l1 = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((TILE, TILE)), depth=1).next_write()
 
     @jit
     def matmul_hidden3_fa(self, hidden_gm, gate_weight_gm, fa_weight_gm, m_group, k_tiles):
         for k_idx in range(k_tiles):
-            a_l1_slot = self.a_l1.produce()
-            mem_copy(a_l1_slot, tile_slice(hidden_gm, (TILE, TILE), (m_group, k_idx)), engine=self.nd2nz,
-                l2_cache_ctl=self.input_l2_cache_ctl)
-            g_l1_slot = self.g_l1.produce()
+            a_l1_slot = self.a_l1.next_write().reinterpret(layout=make_layout(self.a_l1_shape), data_format="nz")
+            mem_copy(a_l1_slot, tile_slice(hidden_gm, (TILE, TILE), (m_group, k_idx)), options=copy_options(l2_cache_ctl=self.input_l2_cache_ctl))
+            g_l1_slot = self.g_l1.next_write()
             mem_copy(g_l1_slot, tile_slice(gate_weight_gm, (3 * TILE, TILE), (1, k_idx)),
-                l2_cache_ctl=self.weight_l2_cache_ctl)
-            fa_weight_l1_slot = self.fa_weight_l1.produce()
+                options=copy_options(l2_cache_ctl=self.weight_l2_cache_ctl))
+            fa_weight_l1_slot = self.fa_weight_l1.next_write()
             mem_copy(fa_weight_l1_slot, tile_slice(fa_weight_gm, (TILE, TILE), (0, k_idx)),
-                l2_cache_ctl=self.weight_l2_cache_ctl)
-            l0a_slot = self.l0a.produce()
+                options=copy_options(l2_cache_ctl=self.weight_l2_cache_ctl))
+            l0a_slot = self.l0a.next_write().reinterpret(layout=make_layout(self.l0a_shape), data_format='nz')
+            l0a_slot = l0a_slot[tuple(map(slice, a_l1_slot.shape))]
             mem_copy(l0a_slot, a_l1_slot)
-            l0b_slot = self.l0b.produce()
-            mem_copy(l0b_slot, tile_slice(g_l1_slot, (TILE, TILE), (0, 0)))
+            l0b_slot = self.l0b.next_write()
+            l0b_slot_source_2 = tile_slice(g_l1_slot, (TILE, TILE), (0, 0))
+            l0b_slot = l0b_slot[tuple(map(slice, l0b_slot_source_2.shape))]
+            mem_copy(l0b_slot, l0b_slot_source_2)
             matmul(self.l0c0, l0a_slot, l0b_slot, init=k_idx == 0)
-            l0b_slot = self.l0b.produce()
-            mem_copy(l0b_slot, tile_slice(g_l1_slot, (TILE, TILE), (1, 0)))
+            l0b_slot = self.l0b.next_write()
+            l0b_slot_source_3 = tile_slice(g_l1_slot, (TILE, TILE), (1, 0))
+            l0b_slot = l0b_slot[tuple(map(slice, l0b_slot_source_3.shape))]
+            mem_copy(l0b_slot, l0b_slot_source_3)
             matmul(self.l0c1, l0a_slot, l0b_slot, init=k_idx == 0)
-            l0b_slot = self.l0b.produce()
-            mem_copy(l0b_slot, tile_slice(g_l1_slot, (TILE, TILE), (2, 0)))
+            l0b_slot = self.l0b.next_write()
+            l0b_slot_source_4 = tile_slice(g_l1_slot, (TILE, TILE), (2, 0))
+            l0b_slot = l0b_slot[tuple(map(slice, l0b_slot_source_4.shape))]
+            mem_copy(l0b_slot, l0b_slot_source_4)
             matmul(self.l0c2, l0a_slot, l0b_slot, init=k_idx == 0)
-            l0b_slot = self.l0b.produce()
+            l0b_slot = self.l0b.next_write()
+            l0b_slot = l0b_slot[tuple(map(slice, fa_weight_l1_slot.shape))]
             mem_copy(l0b_slot, fa_weight_l1_slot)
             matmul(self.l0c_fa, l0a_slot, l0b_slot, init=k_idx == 0)
 
     @jit
     def _publish_l0c(self, workspace_gm, source_l0c, m_group, output_head, subblock_idx):
         whole_tile = tile_slice(workspace_gm, (TILE, TILE), (m_group, output_head))
-        mem_copy(whole_tile, source_l0c, engine=self.fixpipe)
+        mem_copy(whole_tile, source_l0c)
 
     @jit
     def publish_gate(self, output_gate_workspace_gm, m_group, subblock_idx):
@@ -441,13 +459,15 @@ class GateDecayProjectionStage:
 
     @jit
     def project_fb(self, decay_workspace_gm, fb_weight_gm, m_group, subblock_idx):
-        mem_copy(self.fa_l1, reinterpret(self.l0c_fa, shape=(TILE, TILE)))
+        mem_copy(self.fa_l1, self.l0c_fa)
         for output_head in range(6):
             mem_copy(self.fb_l1, tile_slice(fb_weight_gm, (TILE, TILE), (output_head, 0)),
-                l2_cache_ctl=self.weight_l2_cache_ctl)
-            l0a_slot = self.l0a.produce()
-            mem_copy(l0a_slot, self.fa_l1, engine=self.fa_copy_engine)
-            l0b_slot = self.l0b.produce()
+                options=copy_options(l2_cache_ctl=self.weight_l2_cache_ctl))
+            l0a_slot = self.l0a.next_write().reinterpret(layout=make_layout(self.l0a_shape), data_format='nz')
+            l0a_slot = l0a_slot[tuple(map(slice, self.fa_l1.shape))]
+            mem_copy(l0a_slot, self.fa_l1)
+            l0b_slot = self.l0b.next_write()
+            l0b_slot = l0b_slot[tuple(map(slice, self.fb_l1.shape))]
             mem_copy(l0b_slot, self.fb_l1)
             matmul(self.l0c_fa, l0a_slot, l0b_slot, init=True)
             self._publish_l0c(decay_workspace_gm, self.l0c_fa, m_group, output_head, subblock_idx)
@@ -462,22 +482,20 @@ class LowRankDecayStage:
         num_heads: int):
         self.projection_stage = projection_stage
         self.num_heads = int(num_heads)
-        self.fa_l1 = Channel(MemLoc.L1, (self.projection_stage.row_count, TILE), dtypes.bfloat16, depth=1,
-            capacity=(self.projection_stage.row_capacity, TILE)).produce()
-        self.fb_l1 = Channel(MemLoc.L1, (TILE, TILE), dtypes.bfloat16, depth=1, data_format="nz").produce()
-        self.fa_copy_engine = make_copy_engine()
+        self.fa_l1 = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((self.projection_stage.row_capacity * TILE,)), depth=1, data_format="nd").next_write().reinterpret(layout=make_layout((self.projection_stage.row_count, TILE)), data_format="nz")
+        self.fb_l1 = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((TILE, TILE)), depth=1).next_write()
 
     @jit
     def project(self, decay_workspace_gm: Tensor, hidden_gm: Tensor, fa_weight_gm: Tensor, fb_weight_gm: Tensor,
         k_tiles, subblock_idx):
         """Compute ``f_b(f_a(hidden))`` without a GM intermediate."""
         self.projection_stage.matmul_hidden(hidden_gm, fa_weight_gm, 0, k_tiles)
-        fa_result = reinterpret(self.projection_stage.l0c.consume(), shape=(self.projection_stage.row_count, TILE))
+        fa_result = self.projection_stage.l0c.next_read().reinterpret(layout=make_layout(self.projection_stage.l0c_shape), data_format="nz")
         mem_copy(self.fa_l1, fa_result)
         for output_head in range(self.num_heads):
             mem_copy(self.fb_l1, tile_slice(fb_weight_gm, (TILE, TILE), (output_head, 0)),
-                l2_cache_ctl=self.projection_stage.weight_l2_cache_ctl)
-            self.projection_stage.matmul_resident(self.fa_l1, self.fb_l1, self.fa_copy_engine)
+                options=copy_options(l2_cache_ctl=self.projection_stage.weight_l2_cache_ctl))
+            self.projection_stage.matmul_resident(self.fa_l1, self.fb_l1)
             self.projection_stage.publish_result(
                 tile_slice(decay_workspace_gm, (self.projection_stage.row_capacity, TILE), (0, output_head)))
             vec_sync_all()
@@ -493,11 +511,11 @@ class ConvSiluStage:
         row_capacity: int = 64):
         self.seq_len = seq_len
         self.row_block = row_block
-        self.window = Buffer(MemLoc.UB, (CONV_KERNEL, TILE), dtypes.bfloat16)
-        self.weight = Buffer(MemLoc.UB, (3 * CONV_KERNEL, TILE), dtypes.bfloat16)
-        self.output_bf16 = Buffer(MemLoc.UB, (self.row_block, TILE), dtypes.bfloat16, capacity=(row_capacity, TILE))
-        self.raw_bf16 = Buffer(MemLoc.UB, (self.row_block, TILE), dtypes.bfloat16, capacity=(row_capacity, TILE))
-        self.weight_ch = Channel(MemLoc.UB, (CONV_KERNEL, TILE), dtypes.bfloat16, depth=1).produce()
+        self.window = Buffer(MemLoc.UB, dtypes.bfloat16, make_layout((CONV_KERNEL, TILE)))
+        self.weight = Buffer(MemLoc.UB, dtypes.bfloat16, make_layout((3 * CONV_KERNEL, TILE)))
+        self.output_bf16 = Buffer(MemLoc.UB, dtypes.bfloat16, make_layout((row_capacity * TILE,))).view(self.row_block, TILE)
+        self.raw_bf16 = Buffer(MemLoc.UB, dtypes.bfloat16, make_layout((row_capacity * TILE,))).view(self.row_block, TILE)
+        self.weight_ch = RingBuffer(MemLoc.UB, dtypes.bfloat16, make_layout((CONV_KERNEL, TILE)), depth=1).next_write()
 
     @jit
     def install_history(self, history_ub):
@@ -585,42 +603,42 @@ class RecurrentKDAStage:
         self.num_heads = int(num_heads)
         self.state_key_unroll = int(state_key_unroll)
         self.state_update_unroll = int(state_update_unroll)
-        self.state = Channel(MemLoc.UB, (self.row_block, TILE), dtypes.float32, depth=1).produce()
-        self.state_snapshot = Channel(MemLoc.UB, (self.row_block, TILE), dtypes.float32, depth=2)
-        self.key = Buffer(MemLoc.UB, (1, TILE), dtypes.float32)
-        self.query = Buffer(MemLoc.UB, (1, TILE), dtypes.float32)
-        self.decay_exp = Buffer(MemLoc.UB, (1, TILE), dtypes.float32)
-        self.ub_value = Buffer(MemLoc.UB, (1, self.row_block), dtypes.float32)
-        self.ub_beta = Buffer(MemLoc.UB, (1, VL), dtypes.float32)
-        self.out = Buffer(MemLoc.UB, (1, self.row_block), dtypes.float32)
-        self.value = Channel(MemLoc.UB, (1, self.row_block), dtypes.bfloat16, depth=2)
-        self.state_key_sums = Buffer(MemLoc.UB, (1, self.row_block), dtypes.float32)
-        self.delta_row = Buffer(MemLoc.UB, (1, self.row_block), dtypes.float32)
-        self.raw_query = Channel(MemLoc.UB, (1, TILE), dtypes.bfloat16, depth=2)
-        self.raw_key = Channel(MemLoc.UB, (1, TILE), dtypes.bfloat16, depth=2)
-        self.raw_g = Channel(MemLoc.UB, (1, TILE), dtypes.bfloat16, depth=2)
-        self.raw_beta = Channel(MemLoc.UB, (1, VL), dtypes.bfloat16, depth=2)
-        self.dt_bias = Buffer(MemLoc.UB, (self.num_heads, TILE), dtypes.float32)
-        self.a_log = Buffer(MemLoc.UB, (self.num_heads,), dtypes.float32)
+        self.state = RingBuffer(MemLoc.UB, dtypes.float32, make_layout((self.row_block, TILE)), depth=1).next_write()
+        self.state_snapshot = RingBuffer(MemLoc.UB, dtypes.float32, make_layout((self.row_block, TILE)), depth=2)
+        self.key = Buffer(MemLoc.UB, dtypes.float32, make_layout((1, TILE)))
+        self.query = Buffer(MemLoc.UB, dtypes.float32, make_layout((1, TILE)))
+        self.decay_exp = Buffer(MemLoc.UB, dtypes.float32, make_layout((1, TILE)))
+        self.ub_value = Buffer(MemLoc.UB, dtypes.float32, make_layout((1, self.row_block)))
+        self.ub_beta = Buffer(MemLoc.UB, dtypes.float32, make_layout((1, VL)))
+        self.out = Buffer(MemLoc.UB, dtypes.float32, make_layout((1, self.row_block)))
+        self.value = RingBuffer(MemLoc.UB, dtypes.bfloat16, make_layout((1, self.row_block)), depth=2)
+        self.state_key_sums = Buffer(MemLoc.UB, dtypes.float32, make_layout((1, self.row_block)))
+        self.delta_row = Buffer(MemLoc.UB, dtypes.float32, make_layout((1, self.row_block)))
+        self.raw_query = RingBuffer(MemLoc.UB, dtypes.bfloat16, make_layout((1, TILE)), depth=2)
+        self.raw_key = RingBuffer(MemLoc.UB, dtypes.bfloat16, make_layout((1, TILE)), depth=2)
+        self.raw_g = RingBuffer(MemLoc.UB, dtypes.bfloat16, make_layout((1, TILE)), depth=2)
+        self.raw_beta = RingBuffer(MemLoc.UB, dtypes.bfloat16, make_layout((1, VL)), depth=2)
+        self.dt_bias = Buffer(MemLoc.UB, dtypes.float32, make_layout((self.num_heads, TILE)))
+        self.a_log = Buffer(MemLoc.UB, dtypes.float32, make_layout((self.num_heads,)))
 
     def load_gate_params(self, a_log_gm, dt_bias_gm):
         mem_copy(self.a_log, a_log_gm)
         mem_copy(self.dt_bias, dt_bias_gm)
 
     def load_state(self, state_gm):
-        mem_copy(self.state, state_gm, l2_cache_ctl=2)
+        mem_copy(self.state, state_gm, options=copy_options(l2_cache_ctl=2))
 
     def prefetch_inputs(self, raw_key_gm, raw_query_gm, raw_g_gm, value_gm, raw_beta_gm):
-        mem_copy(self.raw_query.produce(), raw_query_gm)
-        mem_copy(self.raw_key.produce(), raw_key_gm)
-        mem_copy(self.raw_g.produce(), raw_g_gm)
-        mem_copy(tile_slice(self.raw_beta.produce(), (1, 1), (0, 0)), raw_beta_gm)
-        mem_copy(self.value.produce(), value_gm)
+        mem_copy(self.raw_query.next_write(), raw_query_gm)
+        mem_copy(self.raw_key.next_write(), raw_key_gm)
+        mem_copy(self.raw_g.next_write(), raw_g_gm)
+        mem_copy(tile_slice(self.raw_beta.next_write(), (1, 1), (0, 0)), raw_beta_gm)
+        mem_copy(self.value.next_write(), value_gm)
 
     @jit
     def normalize_qk(self, scale_value: float):
-        raw_query_slot = self.raw_query.consume()
-        raw_key_slot = self.raw_key.consume()
+        raw_query_slot = self.raw_query.next_read()
+        raw_key_slot = self.raw_key.next_read()
         with vf(mode="simd"):
             full, _ = update_mask(VL, elem_bits=32)
             query_pre_bf16 = vload_unpack(raw_query_slot, 0, unpack_mode=UnpackMode.B16_TO_B32)
@@ -662,9 +680,9 @@ class RecurrentKDAStage:
 
     @jit
     def activate_g_beta(self, lower_bound: float, value_head):
-        raw_g_slot = self.raw_g.consume()
-        raw_beta_slot = self.raw_beta.consume()
-        value_slot = self.value.consume()
+        raw_g_slot = self.raw_g.next_read()
+        raw_beta_slot = self.raw_beta.next_read()
+        value_slot = self.value.next_read()
         with vf(mode="simd"):
             full, _ = update_mask(VL, elem_bits=32)
             one = vdups(1.0, dtypes.float32)
@@ -710,7 +728,7 @@ class RecurrentKDAStage:
 
     @jit
     def recur_step(self):
-        state_snapshot_slot = self.state_snapshot.produce()
+        state_snapshot_slot = self.state_snapshot.next_write()
         with vf(mode="simd"):
             mask, _ = update_mask(VL, elem_bits=32)
             decay_pre = vload(self.decay_exp, 0)
@@ -770,25 +788,25 @@ class RecurrentKDAStage:
                 vstore_first(self.out, dv, output)
 
     def store_state(self, state_gm):
-        mem_copy(state_gm, self.state_snapshot.consume(), l2_cache_ctl=self.store_policy)
+        mem_copy(state_gm, self.state_snapshot.next_read(), options=copy_options(l2_cache_ctl=self.store_policy))
 
 
 class OutputGateStage:
     """RMSNorm and sigmoid output gate for one complete value head."""
 
     def __init__(self):
-        self.gamma_fp32 = Buffer(MemLoc.UB, (TILE,), dtypes.float32)
-        self.gate_input = Channel(MemLoc.UB, (1, TILE), dtypes.bfloat16, depth=2)
-        self.output = Channel(MemLoc.UB, (1, TILE), dtypes.bfloat16, depth=2)
-        self.raw_fp32 = Buffer(MemLoc.UB, (1, TILE), dtypes.float32)
-        self.local_sum = Buffer(MemLoc.UB, (1, 8), dtypes.float32)
+        self.gamma_fp32 = Buffer(MemLoc.UB, dtypes.float32, make_layout((TILE,)))
+        self.gate_input = RingBuffer(MemLoc.UB, dtypes.bfloat16, make_layout((1, TILE)), depth=2)
+        self.output = RingBuffer(MemLoc.UB, dtypes.bfloat16, make_layout((1, TILE)), depth=2)
+        self.raw_fp32 = Buffer(MemLoc.UB, dtypes.float32, make_layout((1, TILE)))
+        self.local_sum = Buffer(MemLoc.UB, dtypes.float32, make_layout((1, 8)))
 
     @jit
     def load_gamma(self, output_norm_weight_gm: Tensor):
         mem_copy(self.gamma_fp32, output_norm_weight_gm)
 
     def issue_gate(self, gate_gm):
-        mem_copy(self.gate_input.produce(), gate_gm)
+        mem_copy(self.gate_input.next_write(), gate_gm)
 
     @jit
     def prepare_local_sum(self, recurrent_output):
@@ -812,8 +830,8 @@ class OutputGateStage:
     @jit
     def apply_and_store(self, output_gm, rms_norm_eps: float):
         """Apply FP32 RMSNorm and sigmoid, then publish final BF16."""
-        gate_input_slot = self.gate_input.consume()
-        output_slot = self.output.produce()
+        gate_input_slot = self.gate_input.next_read()
+        output_slot = self.output.next_write()
         with vf(mode="simd"):
             full, _ = update_mask(VL, elem_bits=32)
             one = vdups(1.0, dtypes.float32)
@@ -975,19 +993,16 @@ class _TiledOutputProjectionStage:
         self.ks = OPROJ_KS
         if self.resident_weight:
             self.resident_weight_rows = self.tile_width * self.tiles_per_core
-            self.b_l1 = Buffer(MemLoc.L1, (self.resident_weight_rows, 6 * TILE), dtypes.bfloat16, data_format="nz")
+            self.b_l1 = Buffer(MemLoc.L1, dtypes.bfloat16, make_layout((self.resident_weight_rows, 6 * TILE)))
         else:
-            self.b_l1 = Channel(MemLoc.L1, (self.tile_width, self.kc), dtypes.bfloat16, depth=2, data_format="nz")
-        self.a_l1 = Channel(MemLoc.L1, (self.row_count, 768 if self.resident_input else self.kc), dtypes.bfloat16,
-            depth=1 if self.resident_input else 2,
-            capacity=(self.row_capacity, 768 if self.resident_input else self.kc))
-        self.l0a = Channel(
-            MemLoc.L0A, (self.row_count, self.ks), dtypes.bfloat16, depth=2, capacity=(self.row_capacity, self.ks))
-        self.l0b = Channel(MemLoc.L0B, (self.tile_width, self.ks), dtypes.bfloat16, depth=2)
-        self.l0c = Channel(MemLoc.L0C, (self.row_count, self.tile_width), dtypes.float32, depth=l0c_depth,
-            capacity=(self.row_capacity, self.tile_width))
-        self.nd2nz = make_copy_engine(format_transform="nd2nz")
-        self.fixpipe = make_copy_engine()
+            self.b_l1 = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((self.tile_width, self.kc)), depth=2)
+        self.a_l1 = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((self.row_capacity * (768 if self.resident_input else self.kc),)), depth=1 if self.resident_input else 2, data_format="nd")
+        self.a_l1_shape = (self.row_count, 768 if self.resident_input else self.kc)
+        self.l0a = RingBuffer(MemLoc.L0A, dtypes.bfloat16, make_layout((self.row_capacity * self.ks,)), depth=2, data_format="nd")
+        self.l0a_shape = (self.row_count, self.ks)
+        self.l0b = RingBuffer(MemLoc.L0B, dtypes.bfloat16, make_layout((self.tile_width, self.ks)), depth=2)
+        self.l0c = RingBuffer(MemLoc.L0C, dtypes.float32, make_layout((self.row_capacity * self.tile_width,)), depth=l0c_depth, data_format="nd")
+        self.l0c_shape = (self.row_count, self.tile_width)
 
     @jit
     def prefetch_weight(self, weight_gm: Tensor):
@@ -996,7 +1011,7 @@ class _TiledOutputProjectionStage:
             resident_shards = ceil_div(weight_gm.shape[0], self.resident_weight_rows)
             if get_block_idx() < resident_shards:
                 mem_copy(self.b_l1, tile_slice(weight_gm, (self.resident_weight_rows, 6 * TILE), (get_block_idx(), 0)),
-                    l2_cache_ctl=self.weight_l2_cache_ctl)
+                    options=copy_options(l2_cache_ctl=self.weight_l2_cache_ctl))
 
     @jit
     def project(self, out_gm: Tensor, gated_workspace_gm: Tensor, weight_gm: Tensor, k_tiles: int, row_tile: int):
@@ -1007,9 +1022,9 @@ class _TiledOutputProjectionStage:
         gated_wave = gated_workspace_gm[wave_start:wave_end, None]
         out_wave = out_gm[wave_start:wave_end, None]
         if const_expr(self.resident_input):
-            resident_a = self.a_l1.produce()
+            resident_a = self.a_l1.next_write().reinterpret(layout=make_layout(self.a_l1_shape), data_format="nz")
             mem_copy(resident_a, tile_slice(gated_wave, (self.row_capacity, 768), (0, 0)),
-                l2_cache_ctl=self.input_l2_cache_ctl, engine=self.nd2nz)
+                options=copy_options(l2_cache_ctl=self.input_l2_cache_ctl))
         first_tile = get_block_idx() * self.tiles_per_core
         for local_tile in range(self.tiles_per_core):
             if const_expr(self.resident_input):
@@ -1019,28 +1034,32 @@ class _TiledOutputProjectionStage:
             else:
                 output_tile = first_tile + local_tile
             if output_tile < tile_count:
-                accumulator = self.l0c.produce()
+                accumulator = self.l0c.next_write().reinterpret(layout=make_layout(self.l0c_shape), data_format="nz")
                 for kc_idx in range(k_tiles * TILE // self.kc):
                     if const_expr(self.resident_input):
                         a_panel = tile_slice(resident_a, (self.row_capacity, self.kc), (0, kc_idx))
                     else:
-                        a_panel = self.a_l1.produce()
+                        a_panel = self.a_l1.next_write().reinterpret(layout=make_layout(self.a_l1_shape), data_format="nz")
                         mem_copy(a_panel, tile_slice(gated_wave, (self.row_capacity, self.kc), (0, kc_idx)),
-                            engine=self.nd2nz, l2_cache_ctl=self.input_l2_cache_ctl)
+                            options=copy_options(l2_cache_ctl=self.input_l2_cache_ctl))
                     if const_expr(self.resident_weight):
                         b_panel = tile_slice(self.b_l1, (self.tile_width, self.kc), (local_tile, kc_idx))
                     else:
-                        b_panel = self.b_l1.produce()
+                        b_panel = self.b_l1.next_write()
                         mem_copy(b_panel, tile_slice(weight_gm, (self.tile_width, self.kc), (output_tile, kc_idx)),
-                            l2_cache_ctl=self.weight_l2_cache_ctl)
+                            options=copy_options(l2_cache_ctl=self.weight_l2_cache_ctl))
                     for ks_idx in range(self.kc // self.ks):
-                        l0a_slot = self.l0a.produce()
-                        mem_copy(l0a_slot, tile_slice(a_panel, (self.row_capacity, self.ks), (0, ks_idx)))
-                        l0b_slot = self.l0b.produce()
-                        mem_copy(l0b_slot, tile_slice(b_panel, (self.tile_width, self.ks), (0, ks_idx)))
+                        l0a_slot = self.l0a.next_write().reinterpret(layout=make_layout(self.l0a_shape), data_format='nz')
+                        l0a_slot_source_5 = tile_slice(a_panel, (self.row_capacity, self.ks), (0, ks_idx))
+                        l0a_slot = l0a_slot[tuple(map(slice, l0a_slot_source_5.shape))]
+                        mem_copy(l0a_slot, l0a_slot_source_5)
+                        l0b_slot = self.l0b.next_write()
+                        l0b_slot_source_14 = tile_slice(b_panel, (self.tile_width, self.ks), (0, ks_idx))
+                        l0b_slot = l0b_slot[tuple(map(slice, l0b_slot_source_14.shape))]
+                        mem_copy(l0b_slot, l0b_slot_source_14)
                         matmul(accumulator, l0a_slot, l0b_slot, init=kc_idx == 0 and ks_idx == 0)
                 mem_copy(tile_slice(out_wave, (self.row_capacity, self.tile_width), (0, output_tile)), accumulator,
-                    l2_cache_ctl=self.store_l2_cache_ctl, engine=self.fixpipe)
+                    options=copy_options(l2_cache_ctl=self.store_l2_cache_ctl))
 
 
 class BetaZSharedStage:
@@ -1055,38 +1074,43 @@ class BetaZSharedStage:
         self.weight_l2_cache_ctl = int(weight_l2_cache_ctl)
         self.rows = rows
         self.half = rows // 2
-        self.a = Channel(MemLoc.L1, (rows, 256), dtypes.bfloat16, depth=2, capacity=(128, 256))
-        self.z = Channel(MemLoc.L1, (128, 256), dtypes.bfloat16, depth=2, data_format="nz")
-        self.la = Channel(MemLoc.L0A, (rows, 128), dtypes.bfloat16, depth=2, capacity=(128, 128))
-        self.lz = Channel(MemLoc.L0B, (128, 128), dtypes.bfloat16, depth=1).produce()
-        self.lb = Channel(MemLoc.L0B, (16, 128), dtypes.bfloat16, depth=2)
-        self.cz = Channel(MemLoc.L0C, (rows, 128), dtypes.float32, depth=1, capacity=(128, 128)).produce()
-        self.cb = Channel(MemLoc.L0C, (rows, 16), dtypes.float32, depth=1, capacity=(128, 16)).produce()
-        self.nd = make_copy_engine(format_transform="nd2nz")
-        self.fix = make_copy_engine()
+        self.a = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((128 * 256,)), depth=2, data_format="nd")
+        self.a_shape = (rows, 256)
+        self.z = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((128, 256)), depth=2)
+        self.la = RingBuffer(MemLoc.L0A, dtypes.bfloat16, make_layout((128 * 128,)), depth=2, data_format="nd")
+        self.la_shape = (rows, 128)
+        self.lz = RingBuffer(MemLoc.L0B, dtypes.bfloat16, make_layout((128, 128)), depth=1).next_write()
+        self.lb = RingBuffer(MemLoc.L0B, dtypes.bfloat16, make_layout((16, 128)), depth=2)
+        self.cz = RingBuffer(MemLoc.L0C, dtypes.float32, make_layout((128 * 128,)), depth=1, data_format="nd").next_write().reinterpret(layout=make_layout((rows, 128)), data_format="nz")
+        self.cb = RingBuffer(MemLoc.L0C, dtypes.float32, make_layout((128 * 16,)), depth=1, data_format="nd").next_write().reinterpret(layout=make_layout((rows, 16)), data_format="nz")
 
     @jit
     def project(self, hidden_gm, z_weight_gm, beta_weight_gm, z_gm, beta_gm, subblock):
-        beta_l1 = Buffer(MemLoc.L1, dtype=beta_weight_gm.dtype, capacity=(BETA_TILE, HIDDEN_SIZE),
-            layout=beta_weight_gm.layout, physical_layout=beta_weight_gm.physical_layout, data_format="nz")
-        mem_copy(beta_l1, beta_weight_gm, l2_cache_ctl=self.weight_l2_cache_ctl)
+        beta_l1 = Buffer(
+            MemLoc.L1,
+            beta_weight_gm.dtype,
+            beta_weight_gm.layout,
+            physical_layout=beta_weight_gm.physical_layout,
+        )
+        mem_copy(beta_l1, beta_weight_gm, options=copy_options(l2_cache_ctl=self.weight_l2_cache_ctl))
         for kc in range(HIDDEN_SIZE // PROJECTION_KC):
-            a_slot = self.a.produce()
-            mem_copy(
-                a_slot, tile_slice(hidden_gm, (128, 256), (0, kc)), engine=self.nd,
-                    l2_cache_ctl=self.input_l2_cache_ctl)
-            z_slot = self.z.produce()
-            mem_copy(z_slot, tile_slice(z_weight_gm, (128, 256), (5, kc)), l2_cache_ctl=self.weight_l2_cache_ctl)
+            a_slot = self.a.next_write().reinterpret(layout=make_layout(self.a_shape), data_format="nz")
+            mem_copy(a_slot, tile_slice(hidden_gm, (128, 256), (0, kc)), options=copy_options(l2_cache_ctl=self.input_l2_cache_ctl))
+            z_slot = self.z.next_write()
+            mem_copy(z_slot, tile_slice(z_weight_gm, (128, 256), (5, kc)),
+                options=copy_options(l2_cache_ctl=self.weight_l2_cache_ctl))
             for ks in range(2):
-                la_slot = self.la.produce()
-                mem_copy(la_slot, tile_slice(a_slot, (128, 128), (0, ks)))
+                la_slot = self.la.next_write().reinterpret(layout=make_layout(self.la_shape), data_format='nz')
+                la_slot_source = tile_slice(a_slot, (128, 128), (0, ks))
+                la_slot = la_slot[tuple(map(slice, la_slot_source.shape))]
+                mem_copy(la_slot, la_slot_source)
                 mem_copy(self.lz, tile_slice(z_slot, (128, 128), (0, ks)))
                 matmul(self.cz, la_slot, self.lz, init=kc == 0 and ks == 0)
-                lb_slot = self.lb.produce()
+                lb_slot = self.lb.next_write()
                 mem_copy(lb_slot, tile_slice(beta_l1, (16, 128), (0, kc * 2 + ks)))
                 matmul(self.cb, la_slot, lb_slot, init=kc == 0 and ks == 0)
-        mem_copy(z_gm[0:self.rows, None], reinterpret(self.cz, shape=(self.rows, 128)), engine=self.fix)
-        mem_copy(beta_gm[0:self.rows, None], reinterpret(self.cb, shape=(self.rows, 16)), engine=self.fix)
+        mem_copy(z_gm[0:self.rows, None], self.cz)
+        mem_copy(beta_gm[0:self.rows, None], self.cb)
         cube_sync_all()
 
 
@@ -1116,9 +1140,6 @@ class _GridSchedule:
             <= cannbotdsl.get_mem_size("l1"))
         self.projection_input_l2_cache_ctl = 0
         self.projection_weight_l2_cache_ctl = 4
-        self.output_input_l2_cache_ctl = 0
-        self.output_weight_l2_cache_ctl = 0
-        self.output_store_l2_cache_ctl = 0
         self.batch_groups: object
         self.seq_len: object
         self.row_count: object
@@ -1135,7 +1156,7 @@ class _GridSchedule:
         if projection_kind == 0:
             projection_stage.matmul_hidden(hidden_gm, qkv_weight_gm, projection_head, k_tiles)
             batches_per_subblock = batch_count // 2
-            selected_history = Buffer(MemLoc.UB, (batches_per_subblock * (CONV_KERNEL - 1), TILE), dtypes.bfloat16)
+            selected_history = Buffer(MemLoc.UB, dtypes.bfloat16, make_layout((batches_per_subblock * (CONV_KERNEL - 1), TILE)))
             for candidate_head in range(3 * self.num_heads):
                 if projection_head == candidate_head:
                     projection = candidate_head // self.num_heads
@@ -1348,7 +1369,7 @@ class _GridSchedule:
             n_macro = task_idx // self.batch_groups
             m_group = task_idx - n_macro * self.batch_groups
             batch_base = m_group * BATCH_TILE + subblock_idx * batches_per_subblock
-            channel_rewind(reset_sync_id=True)
+            onchip_rewind(reset_sync_id=True)
             if n_macro == 7 and task_count <= block_num:
                 projection_stage = GateDecayProjectionStage(
                     self.projection_input_l2_cache_ctl, self.projection_weight_l2_cache_ctl)
@@ -1360,7 +1381,10 @@ class _GridSchedule:
                     self.projection_input_l2_cache_ctl, self.projection_weight_l2_cache_ctl)
                 conv_stage = ConvSiluStage(self.seq_len, TILE // 2)
                 selected_history = Buffer(
-                    MemLoc.UB, (3 * batches_per_subblock * (CONV_KERNEL - 1), TILE), dtypes.bfloat16)
+                    MemLoc.UB,
+                    dtypes.bfloat16,
+                    make_layout((3 * batches_per_subblock * (CONV_KERNEL - 1), TILE)),
+                )
                 if n_macro < 6:
                     projection_stage.matmul_hidden3(hidden_gm, qkv_weight_gm, m_group, n_macro, k_tiles)
                 else:
@@ -1383,7 +1407,7 @@ class _GridSchedule:
         auxiliary_count = self.batch_groups if task_count <= block_num else 2 * self.batch_groups
         k_tiles = ceil_div(hidden_gm.shape[1], TILE)
         for auxiliary_idx in range(aux_slot, auxiliary_count, block_num):
-            channel_rewind(reset_sync_id=True)
+            onchip_rewind(reset_sync_id=True)
             if auxiliary_idx < self.batch_groups:
                 m_group = auxiliary_idx
                 beta_stage = ProjectionStage(row_count=TILE, row_capacity=TILE, tile_width=BETA_TILE,
@@ -1441,7 +1465,7 @@ class _GridSchedule:
                 conv_weight_gm, projection_kind, projection_head, group * 16, 16, subblock_idx, k_tiles)
         cube_sync_all()
         vec_sync_all()
-        channel_rewind(reset_sync_id=True)
+        onchip_rewind(reset_sync_id=True)
         if groups == 2 or (groups == 3 and block_idx < 12):
             half_stage = ProjectionStage(row_count=64, row_capacity=64,
                 input_l2_cache_ctl=self.projection_input_l2_cache_ctl,
@@ -1468,7 +1492,7 @@ class _GridSchedule:
                 conv_weight_gm, projection_kind, projection_head, batch_start, 8, subblock_idx, k_tiles)
             cube_sync_all()
             vec_sync_all()
-        channel_rewind(reset_sync_id=True)
+        onchip_rewind(reset_sync_id=True)
         quarter_core = 0 if groups == 2 else 12 if groups == 3 else 8
         quarter_count = 8 if groups == 2 else 20 if groups == 3 else 16
         if block_idx >= quarter_core and block_idx < quarter_core + quarter_count:
@@ -1487,7 +1511,7 @@ class _GridSchedule:
                 tile_slice(output_gate_workspace_gm, (32, TILE), (row_tile, projection_head)), subblock_idx)
             cube_sync_all()
             vec_sync_all()
-        channel_rewind(reset_sync_id=True)
+        onchip_rewind(reset_sync_id=True)
         beta_group = -1
         if groups == 2:
             if block_idx >= 8 and block_idx < 10:
@@ -1541,7 +1565,7 @@ class _GridSchedule:
                     projection_head=projection if projection < 18 else projection - 18, batch_start=batch_start,
                     batch_count=16, subblock_idx=subblock_idx, k_tiles=k_tiles)
         cube_sync_all()
-        channel_rewind(reset_sync_id=True)
+        onchip_rewind(reset_sync_id=True)
         aux_kind = -1
         aux_group = 0
         tail_tasks = task_count % get_block_num()
@@ -1591,7 +1615,7 @@ class _GridSchedule:
             vec_sync_block_wait(PIPE.S, 3, mode=0)
             vec_sync_block_wait(PIPE.S, 4, mode=0)
         else:
-            channel_rewind(reset_sync_id=True)
+            onchip_rewind(reset_sync_id=True)
             if block_idx < 23:
                 vec_sync_block_arrive(PIPE.MTE3, 0, mode=0)
                 vec_sync_block_arrive(PIPE.MTE3, 4, mode=0)
@@ -1602,22 +1626,22 @@ class _GridSchedule:
                     self.row_count, self.projection_input_l2_cache_ctl, self.projection_weight_l2_cache_ctl)
                 first_kc = (block_idx - 18) * 6 if block_idx < 21 else 18 + (block_idx - 21) * 5
                 kc_count = 6 if block_idx < 21 else 5
-                accumulator = projection_stage.l0c.produce()
+                accumulator = projection_stage.l0c.next_write().reinterpret(layout=make_layout(projection_stage.l0c_shape), data_format="nz")
                 for local_kc in range(kc_count):
                     kc = first_kc + local_kc
-                    a_slot = projection_stage.a_l1.produce()
-                    b_slot = projection_stage.b_l1.produce()
-                    mem_copy(a_slot, tile_slice(hidden_gm, (128, 256), (0, kc)), engine=projection_stage.nd2nz,
-                        l2_cache_ctl=self.projection_input_l2_cache_ctl)
+                    a_slot = projection_stage.a_l1.next_write().reinterpret(layout=make_layout(projection_stage.a_l1_shape), data_format="nz")
+                    b_slot = projection_stage.b_l1.next_write()
+                    mem_copy(a_slot, tile_slice(hidden_gm, (128, 256), (0, kc)),
+                        options=copy_options(l2_cache_ctl=self.projection_input_l2_cache_ctl))
                     mem_copy(b_slot, tile_slice(fa_weight_gm, (128, 256), (0, kc)),
-                        l2_cache_ctl=self.projection_weight_l2_cache_ctl)
+                        options=copy_options(l2_cache_ctl=self.projection_weight_l2_cache_ctl))
                     for ks in range(2):
-                        a_input = projection_stage.l0a.produce()
-                        b_input = projection_stage.l0b.produce()
+                        a_input = projection_stage.l0a.next_write().reinterpret(layout=make_layout(projection_stage.l0a_shape), data_format="nz")
+                        b_input = projection_stage.l0b.next_write()
                         mem_copy(a_input, tile_slice(a_slot, (128, 128), (0, ks)))
                         mem_copy(b_input, tile_slice(b_slot, (128, 128), (0, ks)))
                         matmul(accumulator, a_input, b_input, init=local_kc == 0 and ks == 0)
-                mem_copy(norm_exchange_gm, projection_stage.l0c.consume(), engine=make_copy_engine(), atomic_add=True)
+                mem_copy(norm_exchange_gm, projection_stage.l0c.next_read().reinterpret(layout=make_layout(projection_stage.l0c_shape), data_format="nz"), options=copy_options(atomic_add=True))
                 cube_sync_block_arrive(PIPE.FIXPIPE, 2, mode=2)
                 vec_sync_block_wait(PIPE.S, 2, mode=2)
                 vec_sync_block_arrive(PIPE.MTE3, 3, mode=0)
@@ -1628,19 +1652,17 @@ class _GridSchedule:
                     tile_slice(output_gate_workspace_gm, (128, 128), (0, block_idx - 18)), subblock_idx)
                 vec_sync_all()
                 cube_sync_block_wait(PIPE.S, 5, mode=2)
-                f_l1 = Channel(
-                    MemLoc.L1, (self.row_count, 128), dtypes.bfloat16, depth=1, capacity=(128, 128)
-                ).produce()
-                fb_l1 = Channel(MemLoc.L1, (128, 128), dtypes.bfloat16, depth=1, data_format="nz").produce()
-                mem_copy(f_l1, fa_workspace_gm, engine=projection_stage.nd2nz)
+                f_l1 = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((128 * 128,)), depth=1, data_format="nd").next_write().reinterpret(layout=make_layout((self.row_count, 128)), data_format="nz")
+                fb_l1 = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((128, 128)), depth=1).next_write()
+                mem_copy(f_l1, fa_workspace_gm)
                 mem_copy(fb_l1, tile_slice(fb_weight_gm, (128, 128), (block_idx - 18, 0)))
                 projection_stage.matmul_resident(f_l1, fb_l1)
                 projection_stage.publish_result(tile_slice(decay_workspace_gm, (128, 128), (0, block_idx - 18)))
                 vec_sync_all()
                 vec_sync_block_wait(PIPE.S, 3, mode=0)
             else:
-                acc_half = Buffer(MemLoc.UB, (self.projection_row_block, 128), dtypes.float32, capacity=(64, 128))
-                f_half = Buffer(MemLoc.UB, (self.projection_row_block, 128), dtypes.bfloat16, capacity=(64, 128))
+                acc_half = Buffer(MemLoc.UB, dtypes.float32, make_layout((64 * 128,))).view(self.projection_row_block, 128)
+                f_half = Buffer(MemLoc.UB, dtypes.bfloat16, make_layout((64 * 128,))).view(self.projection_row_block, 128)
                 with vf(mode="simd"):
                     full, _ = update_mask(VL, elem_bits=32)
                     zero = vdups(0.0, dtypes.float32, mask=full)
@@ -1678,14 +1700,12 @@ class _GridSchedule:
                 fused.project(hidden_gm, output_gate_weight_gm, beta_weight_gm,
                     tile_slice(output_gate_workspace_gm, (128, 128), (0, 5)), beta_workspace_gm, subblock_idx)
                 cube_sync_block_wait(PIPE.S, 5, mode=2)
-                channel_rewind(reset_sync_id=True)
+                onchip_rewind(reset_sync_id=True)
                 projection_stage = ProjectionStage(
                     self.row_count, self.projection_input_l2_cache_ctl, self.projection_weight_l2_cache_ctl)
-                f_l1 = Channel(
-                    MemLoc.L1, (self.row_count, 128), dtypes.bfloat16, depth=1, capacity=(128, 128)
-                ).produce()
-                fb_l1 = Channel(MemLoc.L1, (128, 128), dtypes.bfloat16, depth=1, data_format="nz").produce()
-                mem_copy(f_l1, fa_workspace_gm, engine=projection_stage.nd2nz)
+                f_l1 = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((128 * 128,)), depth=1, data_format="nd").next_write().reinterpret(layout=make_layout((self.row_count, 128)), data_format="nz")
+                fb_l1 = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((128, 128)), depth=1).next_write()
+                mem_copy(f_l1, fa_workspace_gm)
                 mem_copy(fb_l1, tile_slice(fb_weight_gm, (128, 128), (5, 0)))
                 projection_stage.matmul_resident(f_l1, fb_l1)
                 projection_stage.publish_result(tile_slice(decay_workspace_gm, (128, 128), (0, 5)))
@@ -1727,12 +1747,12 @@ class _GridSchedule:
                 self.projection_weight_l2_cache_ctl, tile_width=BETA_TILE)
             beta_stage.project_to_gm(hidden_gm, beta_weight_gm, beta_workspace_gm, 0, k_tiles)
         else:
-            channel_rewind(reset_sync_id=True)
+            onchip_rewind(reset_sync_id=True)
             projection_stage = ProjectionStage(
                 self.row_count, self.projection_input_l2_cache_ctl, self.projection_weight_l2_cache_ctl)
             low_rank_stage = LowRankDecayStage(projection_stage, self.num_heads)
             conv_stage = ConvSiluStage(self.seq_len, self.projection_row_block)
-            selected_history = Buffer(MemLoc.UB, (batches_per_subblock * (CONV_KERNEL - 1), TILE), dtypes.bfloat16)
+            selected_history = Buffer(MemLoc.UB, dtypes.bfloat16, make_layout((batches_per_subblock * (CONV_KERNEL - 1), TILE)))
             for n_idx in range(block_idx, n_tiles, block_num):
                 projection_stage.matmul_hidden(hidden_gm, qkv_weight_gm, n_idx, k_tiles)
                 for projection_head in range(3 * self.num_heads):
@@ -1835,7 +1855,7 @@ class _GridSchedule:
                 state_indices_gm, accepted_gm, conv_state_gm, conv_state_indices_gm, conv_accepted_gm, conv_weight_gm,
                 scale_value, lower_bound, rms_norm_eps)
         global_sync_all()
-        channel_rewind(reset_sync_id=True)
+        onchip_rewind(reset_sync_id=True)
         state_row_block = TILE
         block_idx = get_block_idx()
         subblock_idx = get_subblock_id()
@@ -1932,7 +1952,7 @@ class _GridSchedule:
                     tile_slice(final_state_gm[snapshot_index, value_head, None, None], (TILE, TILE), (0, 0)))
             for chunk in range(ready_before, ready_after):
                 output_projection_stage.project(out_gm, q_workspace_gm, o_proj_weight_gm, k_tiles=6, row_tile=chunk)
-            channel_rewind(reset_sync_id=True)
+            onchip_rewind(reset_sync_id=True)
 
     @jit
     def _execute_task_pool_s8(self, out_gm: Tensor, q_workspace_gm: Tensor, k_workspace_gm: Tensor,
@@ -1956,7 +1976,7 @@ class _GridSchedule:
                 output_gate_workspace_gm, hidden_gm, qkv_weight_gm, fa_weight_gm, fb_weight_gm, output_gate_weight_gm,
                 conv_state_gm, conv_state_indices_gm, conv_accepted_gm, conv_weight_gm)
             cube_sync_all()
-            channel_rewind(reset_sync_id=True)
+            onchip_rewind(reset_sync_id=True)
             self._frontend_adaptive_auxiliary(
                 decay_workspace_gm, beta_workspace_gm, hidden_gm, fa_weight_gm, fb_weight_gm, beta_weight_gm)
         elif use_32core_g2_tail:
@@ -1970,7 +1990,7 @@ class _GridSchedule:
                 beta_weight_gm, output_gate_weight_gm, accepted_gm, conv_state_gm, conv_state_indices_gm,
                 conv_accepted_gm, conv_weight_gm)
         global_sync_all()
-        channel_rewind(reset_sync_id=True)
+        onchip_rewind(reset_sync_id=True)
         self._run_backend_stream(out_gm, q_workspace_gm, k_workspace_gm, v_workspace_gm, decay_workspace_gm,
             output_gate_workspace_gm, beta_workspace_gm, fa_workspace_gm, norm_exchange_gm, hidden_gm, qkv_weight_gm,
             fa_weight_gm, fb_weight_gm, beta_weight_gm, output_gate_weight_gm, output_norm_weight_gm, o_proj_weight_gm,
@@ -2158,33 +2178,38 @@ class _Projection384Operations:
     @jit
     def matmul_hidden3(self, hidden_gm, weight_gm, m_group, n_macro, k_tiles):
         for kc_idx in range(k_tiles * TILE // PROJECTION_KC):
-            a_l1_slot = self.a_l1.produce()
+            a_l1_slot = self.a_l1.next_write().reinterpret(layout=make_layout(self.a_l1_shape), data_format="nz")
             mem_copy(a_l1_slot, tile_slice(hidden_gm, (self.rows, PROJECTION_KC), (m_group, kc_idx)),
-                engine=self.nd2nz, l2_cache_ctl=self.input_l2_cache_ctl)
-            b_l1_slot = self.b_l1.produce()
+                options=copy_options(l2_cache_ctl=self.input_l2_cache_ctl))
+            b_l1_slot = self.b_l1.next_write()
             mem_copy(b_l1_slot, tile_slice(weight_gm, (3 * TILE, PROJECTION_KC), (n_macro, kc_idx)),
-                l2_cache_ctl=self.weight_l2_cache_ctl)
+                options=copy_options(l2_cache_ctl=self.weight_l2_cache_ctl))
             for ks_idx in range(PROJECTION_KC // PROJECTION_KS):
-                l0a_slot = self.l0a.produce()
-                mem_copy(l0a_slot, tile_slice(a_l1_slot, (self.rows, PROJECTION_KS), (0, ks_idx)))
-                l0b_slot = self.l0b.produce()
-                mem_copy(l0b_slot, tile_slice(b_l1_slot, (TILE, PROJECTION_KS), (0, ks_idx)))
+                l0a_slot = self.l0a.next_write().reinterpret(layout=make_layout(self.l0a_shape), data_format='nz')
+                l0a_slot_source_3 = tile_slice(a_l1_slot, (self.rows, PROJECTION_KS), (0, ks_idx))
+                l0a_slot = l0a_slot[tuple(map(slice, l0a_slot_source_3.shape))]
+                mem_copy(l0a_slot, l0a_slot_source_3)
+                l0b_slot = self.l0b.next_write()
+                l0b_slot_source_8 = tile_slice(b_l1_slot, (TILE, PROJECTION_KS), (0, ks_idx))
+                l0b_slot = l0b_slot[tuple(map(slice, l0b_slot_source_8.shape))]
+                mem_copy(l0b_slot, l0b_slot_source_8)
                 matmul(self.l0c0, l0a_slot, l0b_slot, init=kc_idx == 0 and ks_idx == 0)
                 if kc_idx == k_tiles * TILE // PROJECTION_KC - 1 and ks_idx == PROJECTION_KC // PROJECTION_KS - 1:
-                    mem_copy(
-                        self.projection_half0, reinterpret(self.l0c0, shape=(self.rows, TILE)), engine=self.fixpipe)
-                l0b_slot = self.l0b.produce()
-                mem_copy(l0b_slot, tile_slice(b_l1_slot, (TILE, PROJECTION_KS), (1, ks_idx)))
+                    mem_copy(self.projection_half0, self.l0c0.partition(dim=0))
+                l0b_slot = self.l0b.next_write()
+                l0b_slot_source_9 = tile_slice(b_l1_slot, (TILE, PROJECTION_KS), (1, ks_idx))
+                l0b_slot = l0b_slot[tuple(map(slice, l0b_slot_source_9.shape))]
+                mem_copy(l0b_slot, l0b_slot_source_9)
                 matmul(self.l0c1, l0a_slot, l0b_slot, init=kc_idx == 0 and ks_idx == 0)
                 if kc_idx == k_tiles * TILE // PROJECTION_KC - 1 and ks_idx == PROJECTION_KC // PROJECTION_KS - 1:
-                    mem_copy(
-                        self.projection_half1, reinterpret(self.l0c1, shape=(self.rows, TILE)), engine=self.fixpipe)
-                l0b_slot = self.l0b.produce()
-                mem_copy(l0b_slot, tile_slice(b_l1_slot, (TILE, PROJECTION_KS), (2, ks_idx)))
+                    mem_copy(self.projection_half1, self.l0c1.partition(dim=0))
+                l0b_slot = self.l0b.next_write()
+                l0b_slot_source_10 = tile_slice(b_l1_slot, (TILE, PROJECTION_KS), (2, ks_idx))
+                l0b_slot = l0b_slot[tuple(map(slice, l0b_slot_source_10.shape))]
+                mem_copy(l0b_slot, l0b_slot_source_10)
                 matmul(self.l0c2, l0a_slot, l0b_slot, init=kc_idx == 0 and ks_idx == 0)
                 if kc_idx == k_tiles * TILE // PROJECTION_KC - 1 and ks_idx == PROJECTION_KC // PROJECTION_KS - 1:
-                    mem_copy(
-                        self.projection_half2, reinterpret(self.l0c2, shape=(self.rows, TILE)), engine=self.fixpipe)
+                    mem_copy(self.projection_half2, self.l0c2.partition(dim=0))
 
     @jit
     def acquire_result0(self):
@@ -2239,25 +2264,34 @@ class _BaseProjection384(_Projection384Operations):
         self.allow_tail = False
         self.input_l2_cache_ctl = int(input_l2_cache_ctl)
         self.weight_l2_cache_ctl = int(weight_l2_cache_ctl)
-        self.a_l1 = Channel(MemLoc.L1, (self.rows, PROJECTION_KC), dtypes.bfloat16, depth=2)
-        self.b_l1 = Channel(MemLoc.L1, (3 * TILE, PROJECTION_KC), dtypes.bfloat16, depth=2, data_format="nz")
-        self.l0a = Channel(MemLoc.L0A, (self.rows, PROJECTION_KS), dtypes.bfloat16, depth=2)
-        self.l0b = Channel(MemLoc.L0B, (TILE, PROJECTION_KS), dtypes.bfloat16, depth=2)
-        self.l0c0 = Channel(MemLoc.L0C, (self.rows, TILE), dtypes.float32, depth=1).produce()
-        self.l0c1 = Channel(MemLoc.L0C, (self.rows, TILE), dtypes.float32, depth=1).produce()
-        self.l0c2 = Channel(MemLoc.L0C, (self.rows, TILE), dtypes.float32, depth=1).produce()
-        self.projection_half0 = Channel(
-            MemLoc.UB, (self.rows // 2, TILE), dtypes.float32, depth=1, kind=ChannelKind.CrossCore
-        ).produce()
-        self.projection_half1 = Channel(
-            MemLoc.UB, (self.rows // 2, TILE), dtypes.float32, depth=1, kind=ChannelKind.CrossCore
-        ).produce()
-        self.projection_half2 = Channel(
-            MemLoc.UB, (self.rows // 2, TILE), dtypes.float32, depth=1, kind=ChannelKind.CrossCore
-        ).produce()
-        self.projection_bf16 = Buffer(MemLoc.UB, (self.rows // 2, TILE), dtypes.bfloat16)
-        self.nd2nz = make_copy_engine(format_transform="nd2nz")
-        self.fixpipe = make_copy_engine(split_axis=0)
+        self.a_l1 = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((self.rows, PROJECTION_KC)), depth=2)
+        self.a_l1_shape = (self.rows, PROJECTION_KC)
+        self.b_l1 = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((3 * TILE, PROJECTION_KC)), depth=2)
+        self.l0a = RingBuffer(MemLoc.L0A, dtypes.bfloat16, make_layout((self.rows, PROJECTION_KS)), depth=2)
+        self.l0a_shape = (self.rows, PROJECTION_KS)
+        self.l0b = RingBuffer(MemLoc.L0B, dtypes.bfloat16, make_layout((TILE, PROJECTION_KS)), depth=2)
+        self.l0c0 = RingBuffer(MemLoc.L0C, dtypes.float32, make_layout((self.rows, TILE)), depth=1).next_write()
+        self.l0c1 = RingBuffer(MemLoc.L0C, dtypes.float32, make_layout((self.rows, TILE)), depth=1).next_write()
+        self.l0c2 = RingBuffer(MemLoc.L0C, dtypes.float32, make_layout((self.rows, TILE)), depth=1).next_write()
+        self.projection_half0 = RingBuffer(
+            MemLoc.UB,
+            dtypes.float32,
+            make_layout((self.rows // 2, TILE)),
+            depth=1,
+        ).next_write()
+        self.projection_half1 = RingBuffer(
+            MemLoc.UB,
+            dtypes.float32,
+            make_layout((self.rows // 2, TILE)),
+            depth=1,
+        ).next_write()
+        self.projection_half2 = RingBuffer(
+            MemLoc.UB,
+            dtypes.float32,
+            make_layout((self.rows // 2, TILE)),
+            depth=1,
+        ).next_write()
+        self.projection_bf16 = Buffer(MemLoc.UB, dtypes.bfloat16, make_layout((self.rows // 2, TILE)))
         self.projection_fp32: object
 
 
@@ -2272,50 +2306,58 @@ class _BaseProjection256(_Projection384Operations):
         self.allow_tail = bool(allow_tail)
         self.input_l2_cache_ctl = 0
         self.weight_l2_cache_ctl = 4
-        self.a_l1 = Channel(MemLoc.L1, (rows, 256), dtypes.bfloat16, depth=2)
-        self.b_l1 = Channel(MemLoc.L1, (256, 256), dtypes.bfloat16, depth=2, data_format="nz")
-        self.l0a = Channel(MemLoc.L0A, (rows, 64), dtypes.bfloat16, depth=2)
-        self.l0b = Channel(MemLoc.L0B, (128, 64), dtypes.bfloat16, depth=2)
-        self.l0c0 = Channel(MemLoc.L0C, (rows, 128), dtypes.float32, depth=1).produce()
-        self.l0c1 = Channel(MemLoc.L0C, (rows, 128), dtypes.float32, depth=1).produce()
-        self.half = Channel(MemLoc.UB, (rows // 2, 128), dtypes.float32, depth=1, kind=ChannelKind.CrossCore)
-        self.projection_bf16 = Buffer(MemLoc.UB, (rows // 2, 128), dtypes.bfloat16)
-        self.nd2nz = make_copy_engine(format_transform="nd2nz")
-        self.fixpipe = make_copy_engine(split_axis=0)
+        self.a_l1 = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((rows, 256)), depth=2)
+        self.a_l1_shape = (rows, 256)
+        self.b_l1 = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((256, 256)), depth=2)
+        self.l0a = RingBuffer(MemLoc.L0A, dtypes.bfloat16, make_layout((rows, 64)), depth=2)
+        self.l0a_shape = (rows, 64)
+        self.l0b = RingBuffer(MemLoc.L0B, dtypes.bfloat16, make_layout((128, 64)), depth=2)
+        self.l0c0 = RingBuffer(MemLoc.L0C, dtypes.float32, make_layout((rows, 128)), depth=1).next_write()
+        self.l0c1 = RingBuffer(MemLoc.L0C, dtypes.float32, make_layout((rows, 128)), depth=1).next_write()
+        self.half = RingBuffer(MemLoc.UB, dtypes.float32, make_layout((rows // 2, 128)), depth=1)
+        self.half_shape = (rows // 2, 128)
+        self.projection_bf16 = Buffer(MemLoc.UB, dtypes.bfloat16, make_layout((rows // 2, 128)))
 
     @jit
     def matmul_hidden2(self, x, w, group, macro):
         for kc in range(28):
-            a = self.a_l1.produce()
-            b = self.b_l1.produce()
+            a = self.a_l1.next_write().reinterpret(layout=make_layout(self.a_l1_shape), data_format="nz")
+            b = self.b_l1.next_write()
             if const_expr(self.allow_tail):
                 valid = x.shape[0] - group * self.rows
                 if valid > self.rows:
                     valid = self.rows
                 mem_copy(a[0:valid, None], x[group * self.rows: group * self.rows + valid, kc * 256: (kc + 1) * 256],
-                    engine=self.nd2nz, l2_cache_ctl=0)
+                    options=copy_options(l2_cache_ctl=0))
             else:
-                mem_copy(a, tile_slice(x, (self.rows, 256), (group, kc)), engine=self.nd2nz, l2_cache_ctl=0)
-            mem_copy(b, tile_slice(w, (256, 256), (macro, kc)), l2_cache_ctl=self.weight_l2_cache_ctl)
+                mem_copy(a, tile_slice(x, (self.rows, 256), (group, kc)), options=copy_options(l2_cache_ctl=0))
+            mem_copy(b, tile_slice(w, (256, 256), (macro, kc)),
+                options=copy_options(l2_cache_ctl=self.weight_l2_cache_ctl))
             for ks in range(4):
-                l0a = self.l0a.produce()
-                mem_copy(l0a, tile_slice(a, (self.rows, 64), (0, ks)))
-                l0b = self.l0b.produce()
-                mem_copy(l0b, tile_slice(b, (128, 64), (0, ks)))
+                l0a = self.l0a.next_write().reinterpret(layout=make_layout(self.l0a_shape), data_format='nz')
+                l0a_source = tile_slice(a, (self.rows, 64), (0, ks))
+                l0a = l0a[tuple(map(slice, l0a_source.shape))]
+                mem_copy(l0a, l0a_source)
+                l0b = self.l0b.next_write()
+                l0b_source = tile_slice(b, (128, 64), (0, ks))
+                l0b = l0b[tuple(map(slice, l0b_source.shape))]
+                mem_copy(l0b, l0b_source)
                 matmul(self.l0c0, l0a, l0b, init=kc == 0 and ks == 0)
-                l0b = self.l0b.produce()
-                mem_copy(l0b, tile_slice(b, (128, 64), (1, ks)))
+                l0b = self.l0b.next_write()
+                l0b_source_2 = tile_slice(b, (128, 64), (1, ks))
+                l0b = l0b[tuple(map(slice, l0b_source_2.shape))]
+                mem_copy(l0b, l0b_source_2)
                 matmul(self.l0c1, l0a, l0b, init=kc == 0 and ks == 0)
 
     @jit
     def acquire_result0(self):
-        self.projection_fp32 = self.half.produce()
-        mem_copy(self.projection_fp32, reinterpret(self.l0c0, shape=(self.rows, 128)), engine=self.fixpipe)
+        self.projection_fp32 = self.half.next_write().view(self.half_shape)
+        mem_copy(self.projection_fp32, self.l0c0.partition(dim=0))
 
     @jit
     def acquire_result1(self):
-        self.projection_fp32 = self.half.produce()
-        mem_copy(self.projection_fp32, reinterpret(self.l0c1, shape=(self.rows, 128)), engine=self.fixpipe)
+        self.projection_fp32 = self.half.next_write().view(self.half_shape)
+        mem_copy(self.projection_fp32, self.l0c1.partition(dim=0))
 
 
 class OutputProjectionStage:
@@ -2355,19 +2397,19 @@ class OutputProjectionStage:
         if self.resident_weight:
             self.resident_weight_rows = self.tile_width * self.tiles_per_core
             self.b_l1 = Buffer(
-                MemLoc.L1, (self.resident_weight_rows, self.num_heads * TILE), dtypes.bfloat16, data_format="nz")
+                MemLoc.L1,
+                dtypes.bfloat16,
+                make_layout((self.resident_weight_rows, self.num_heads * TILE)),
+            )
         else:
-            self.b_l1 = Channel(MemLoc.L1, (self.tile_width, self.kc), dtypes.bfloat16, depth=2, data_format="nz")
-        self.a_l1 = Channel(MemLoc.L1, (self.row_count, self.num_heads * TILE if self.resident_input else self.kc),
-            dtypes.bfloat16, depth=1 if self.resident_input else 2,
-            capacity=(self.row_capacity, self.num_heads * TILE if self.resident_input else self.kc))
-        self.l0a = Channel(
-            MemLoc.L0A, (self.row_count, self.ks), dtypes.bfloat16, depth=2, capacity=(self.row_capacity, self.ks))
-        self.l0b = Channel(MemLoc.L0B, (self.tile_width, self.ks), dtypes.bfloat16, depth=2)
-        self.l0c = Channel(MemLoc.L0C, (self.row_count, self.tile_width), dtypes.float32, depth=l0c_depth,
-            capacity=(self.row_capacity, self.tile_width))
-        self.nd2nz = make_copy_engine(format_transform="nd2nz")
-        self.fixpipe = make_copy_engine()
+            self.b_l1 = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((self.tile_width, self.kc)), depth=2)
+        self.a_l1 = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((self.row_capacity * (self.num_heads * TILE if self.resident_input else self.kc),)), depth=1 if self.resident_input else 2, data_format="nd")
+        self.a_l1_shape = (self.row_count, self.num_heads * TILE if self.resident_input else self.kc)
+        self.l0a = RingBuffer(MemLoc.L0A, dtypes.bfloat16, make_layout((self.row_capacity * self.ks,)), depth=2, data_format="nd")
+        self.l0a_shape = (self.row_count, self.ks)
+        self.l0b = RingBuffer(MemLoc.L0B, dtypes.bfloat16, make_layout((self.tile_width, self.ks)), depth=2)
+        self.l0c = RingBuffer(MemLoc.L0C, dtypes.float32, make_layout((self.row_capacity * self.tile_width,)), depth=l0c_depth, data_format="nd")
+        self.l0c_shape = (self.row_count, self.tile_width)
 
     @jit
     def prefetch_weight(self, weight_gm: Tensor):
@@ -2375,10 +2417,8 @@ class OutputProjectionStage:
         if const_expr(self.resident_weight):
             resident_shards = ceil_div(weight_gm.shape[0], self.resident_weight_rows)
             if get_block_idx() < resident_shards:
-                mem_copy(
-                    self.b_l1,
-                    tile_slice(weight_gm, (self.resident_weight_rows, self.num_heads * TILE), (get_block_idx(), 0)),
-                    l2_cache_ctl=self.weight_l2_cache_ctl)
+                mem_copy(self.b_l1, tile_slice(weight_gm, (self.resident_weight_rows, self.num_heads * TILE),
+                    (get_block_idx(), 0)), options=copy_options(l2_cache_ctl=self.weight_l2_cache_ctl))
 
     @jit
     def project(self, out_gm: Tensor, gated_workspace_gm: Tensor, weight_gm: Tensor, k_tiles: int, row_tile: int):
@@ -2393,9 +2433,9 @@ class OutputProjectionStage:
         gated_wave = gated_workspace_gm[wave_start:wave_end, None]
         out_wave = out_gm[wave_start:wave_end, None]
         if const_expr(self.resident_input):
-            resident_a = self.a_l1.produce()
+            resident_a = self.a_l1.next_write().reinterpret(layout=make_layout(self.a_l1_shape), data_format="nz")
             mem_copy(resident_a, tile_slice(gated_wave, (self.row_capacity, self.num_heads * TILE), (0, 0)),
-                l2_cache_ctl=self.input_l2_cache_ctl, engine=self.nd2nz)
+                options=copy_options(l2_cache_ctl=self.input_l2_cache_ctl))
         first_tile = get_block_idx() * self.tiles_per_core
         for local_tile in range(self.tiles_per_core):
             if const_expr(self.resident_input):
@@ -2405,48 +2445,51 @@ class OutputProjectionStage:
             else:
                 output_tile = first_tile + local_tile
             if output_tile < tile_count:
-                accumulator = self.l0c.produce()
+                accumulator = self.l0c.next_write().reinterpret(layout=make_layout(self.l0c_shape), data_format="nz")
                 for kc_idx in range(k_tiles * TILE // self.kc):
                     if const_expr(self.resident_input):
                         a_panel = tile_slice(resident_a, (self.row_capacity, self.kc), (0, kc_idx))
                     else:
-                        a_panel = self.a_l1.produce()
+                        a_panel = self.a_l1.next_write().reinterpret(layout=make_layout(self.a_l1_shape), data_format="nz")
                         if const_expr(self.allow_tail):
-                            mem_copy(a_panel[0:valid, None],
-                                gated_wave[None, kc_idx * self.kc: (kc_idx + 1) * self.kc], engine=self.nd2nz,
-                                l2_cache_ctl=self.input_l2_cache_ctl)
+                            mem_copy(a_panel[0:valid, None], gated_wave[None, kc_idx * self.kc: (kc_idx + 1) * self.kc],
+                                options=copy_options(l2_cache_ctl=self.input_l2_cache_ctl))
                         else:
                             mem_copy(a_panel, tile_slice(gated_wave, (self.row_capacity, self.kc), (0, kc_idx)),
-                                engine=self.nd2nz, l2_cache_ctl=self.input_l2_cache_ctl)
+                                options=copy_options(l2_cache_ctl=self.input_l2_cache_ctl))
                     if const_expr(self.resident_weight):
                         b_panel = tile_slice(self.b_l1, (self.tile_width, self.kc), (local_tile, kc_idx))
                     else:
-                        b_panel = self.b_l1.produce()
+                        b_panel = self.b_l1.next_write()
                         mem_copy(b_panel, tile_slice(weight_gm, (self.tile_width, self.kc), (output_tile, kc_idx)),
-                            l2_cache_ctl=self.weight_l2_cache_ctl)
+                            options=copy_options(l2_cache_ctl=self.weight_l2_cache_ctl))
                     for ks_idx in range(self.kc // self.ks):
-                        l0a_slot = self.l0a.produce()
-                        mem_copy(l0a_slot, tile_slice(a_panel, (self.row_capacity, self.ks), (0, ks_idx)))
-                        l0b_slot = self.l0b.produce()
-                        mem_copy(l0b_slot, tile_slice(b_panel, (self.tile_width, self.ks), (0, ks_idx)))
+                        l0a_slot = self.l0a.next_write().reinterpret(layout=make_layout(self.l0a_shape), data_format='nz')
+                        l0a_slot_source_6 = tile_slice(a_panel, (self.row_capacity, self.ks), (0, ks_idx))
+                        l0a_slot = l0a_slot[tuple(map(slice, l0a_slot_source_6.shape))]
+                        mem_copy(l0a_slot, l0a_slot_source_6)
+                        l0b_slot = self.l0b.next_write()
+                        l0b_slot_source_15 = tile_slice(b_panel, (self.tile_width, self.ks), (0, ks_idx))
+                        l0b_slot = l0b_slot[tuple(map(slice, l0b_slot_source_15.shape))]
+                        mem_copy(l0b_slot, l0b_slot_source_15)
                         matmul(accumulator, l0a_slot, l0b_slot, init=kc_idx == 0 and ks_idx == 0)
                 if const_expr(self.allow_tail):
                     if valid < self.row_count:
                         for row in range(valid // 32):
                             mem_copy(tile_slice(out_wave, (32, self.tile_width), (row, output_tile)),
                                 tile_slice(accumulator, (32, self.tile_width), (row, 0)),
-                                l2_cache_ctl=self.store_l2_cache_ctl, engine=self.fixpipe)
+                                options=copy_options(l2_cache_ctl=self.store_l2_cache_ctl))
                     else:
                         mem_copy(tile_slice(out_wave, (self.row_capacity, self.tile_width), (0, output_tile)),
-                            accumulator, l2_cache_ctl=self.store_l2_cache_ctl, engine=self.fixpipe)
+                            accumulator, options=copy_options(l2_cache_ctl=self.store_l2_cache_ctl))
                 else:
                     mem_copy(tile_slice(out_wave, (self.row_capacity, self.tile_width), (0, output_tile)), accumulator,
-                        l2_cache_ctl=self.store_l2_cache_ctl, engine=self.fixpipe)
+                        options=copy_options(l2_cache_ctl=self.store_l2_cache_ctl))
 
 
 @dataclasses.dataclass(frozen=True)
 class Schedule:
-    """Compile-time candidates. Timings select the public default per TP/batch."""
+    """Compile-time geometry and cache policies for each TP and batch."""
 
     ragged_output: bool = False
     ragged_main: bool = False
@@ -2456,7 +2499,6 @@ class Schedule:
     split_fb: bool = True
     publish_rows: int = 64
     resident_output_weight: bool = True
-    phase: str = "full"
     state_update_unroll: int = 2
     main_weight_l2_cache_ctl: int = 4
     state_store_l2_cache_ctl: int = 4
@@ -2488,16 +2530,6 @@ class Schedule:
             raise ValueError("publish_rows must be 16,32,64,128,256")
         if self.state_update_unroll not in (1, 2, 4):
             raise ValueError("state_update_unroll must be 1,2,4")
-        if self.phase not in (
-            "full",
-            "frontend",
-            "main",
-            "auxiliary",
-            "backend",
-            "recurrent",
-            "oproj",
-            "backend_no_output",):
-            raise ValueError("unsupported benchmark phase")
 
 
 class BetaProjectionStage(_ProjectionOperations):
@@ -2514,26 +2546,30 @@ class BetaProjectionStage(_ProjectionOperations):
         self.row_block = self.row_count // 2
         self.input_l2_cache_ctl = int(input_l2_cache_ctl)
         self.weight_l2_cache_ctl = int(weight_l2_cache_ctl)
-        self.a_l1 = Channel(MemLoc.L1, (rows, 128), dtypes.bfloat16, depth=2)
-        self.l0a = Channel(MemLoc.L0A, (rows, 64), dtypes.bfloat16, depth=2)
-        self.l0b = Channel(MemLoc.L0B, (tile_width, 64), dtypes.bfloat16, depth=2)
-        self.l0c = Channel(MemLoc.L0C, (rows, tile_width), dtypes.float32, depth=2)
-        self.nd2nz = make_copy_engine(format_transform="nd2nz")
-        self.fixpipe = make_copy_engine(split_axis=0)
+        self.a_l1 = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((rows, 128)), depth=2)
+        self.a_l1_shape = (rows, 128)
+        self.l0a = RingBuffer(MemLoc.L0A, dtypes.bfloat16, make_layout((rows, 64)), depth=2)
+        self.l0a_shape = (rows, 64)
+        self.l0b = RingBuffer(MemLoc.L0B, dtypes.bfloat16, make_layout((tile_width, 64)), depth=2)
+        self.l0c = RingBuffer(MemLoc.L0C, dtypes.float32, make_layout((rows, tile_width)), depth=2)
+        self.l0c_shape = (rows, tile_width)
 
     @jit
     def matmul_hidden(self, hidden_gm, weight_gm, output_tile, k_tiles):
-        accumulator = self.l0c.produce()
-        beta_l1 = Buffer(MemLoc.L1, dtype=weight_gm.dtype, capacity=(self.tile_width, HIDDEN_SIZE),
-            layout=weight_gm.layout, physical_layout=weight_gm.physical_layout, data_format="nz")
-        mem_copy(beta_l1, weight_gm, l2_cache_ctl=self.weight_l2_cache_ctl)
+        accumulator = self.l0c.next_write().reinterpret(layout=make_layout(self.l0c_shape), data_format="nz")
+        beta_l1 = Buffer(
+            MemLoc.L1,
+            weight_gm.dtype,
+            weight_gm.layout,
+            physical_layout=weight_gm.physical_layout,
+        )
+        mem_copy(beta_l1, weight_gm, options=copy_options(l2_cache_ctl=self.weight_l2_cache_ctl))
         for kc_idx in range(k_tiles):
-            a = self.a_l1.produce()
-            mem_copy(a, tile_slice(hidden_gm, (self.row_capacity, 128), (0, kc_idx)), engine=self.nd2nz,
-                l2_cache_ctl=self.input_l2_cache_ctl)
+            a = self.a_l1.next_write().reinterpret(layout=make_layout(self.a_l1_shape), data_format="nz")
+            mem_copy(a, tile_slice(hidden_gm, (self.row_capacity, 128), (0, kc_idx)), options=copy_options(l2_cache_ctl=self.input_l2_cache_ctl))
             for ks_idx in range(2):
-                l0a = self.l0a.produce()
-                l0b = self.l0b.produce()
+                l0a = self.l0a.next_write().reinterpret(layout=make_layout(self.l0a_shape), data_format="nz")
+                l0b = self.l0b.next_write()
                 mem_copy(l0a, tile_slice(a, (self.row_capacity, 64), (0, ks_idx)))
                 mem_copy(l0b, tile_slice(beta_l1, (self.tile_width, 64), (0, kc_idx * 2 + ks_idx)))
                 matmul(accumulator, l0a, l0b, init=kc_idx == 0 and ks_idx == 0)
@@ -2542,15 +2578,15 @@ class BetaProjectionStage(_ProjectionOperations):
 class FaResident(BetaProjectionStage):
     @jit
     def matmul_hidden(self, hidden_gm, weight_gm, output_tile, k_tiles):
-        accumulator = self.l0c.produce()
-        wb = Buffer(MemLoc.L1, (self.tile_width, HIDDEN_SIZE), dtypes.bfloat16, data_format="nz")
-        mem_copy(wb, weight_gm, l2_cache_ctl=0)
+        accumulator = self.l0c.next_write().reinterpret(layout=make_layout(self.l0c_shape), data_format="nz")
+        wb = Buffer(MemLoc.L1, dtypes.bfloat16, make_layout((self.tile_width, HIDDEN_SIZE)))
+        mem_copy(wb, weight_gm, options=copy_options(l2_cache_ctl=0))
         for kc in range(k_tiles):
-            a = self.a_l1.produce()
-            mem_copy(a, tile_slice(hidden_gm, (self.row_count, 128), (0, kc)), engine=self.nd2nz)
+            a = self.a_l1.next_write().reinterpret(layout=make_layout(self.a_l1_shape), data_format="nz")
+            mem_copy(a, tile_slice(hidden_gm, (self.row_count, 128), (0, kc)))
             for ks in range(2):
-                la = self.l0a.produce()
-                lb = self.l0b.produce()
+                la = self.l0a.next_write().reinterpret(layout=make_layout(self.l0a_shape), data_format="nz")
+                lb = self.l0b.next_write()
                 mem_copy(la, tile_slice(a, (self.row_count, 64), (0, ks)))
                 mem_copy(lb, tile_slice(wb, (self.tile_width, 64), (0, kc * 2 + ks)))
                 matmul(accumulator, la, lb, init=kc == 0 and ks == 0)
@@ -2569,7 +2605,7 @@ class RecurrentStage(RecurrentKDAStage):
         self.load_policy = config.state_load_l2_cache_ctl
 
     def load_state(self, state_gm):
-        mem_copy(self.state, state_gm, l2_cache_ctl=self.load_policy)
+        mem_copy(self.state, state_gm, options=copy_options(l2_cache_ctl=self.load_policy))
 
 
 class TPSchedule(_GridSchedule):
@@ -2670,11 +2706,11 @@ class TPSchedule(_GridSchedule):
             for task in range(get_block_idx(), task_count, 32):
                 macro = task // groups
                 group = task % groups
-                channel_rewind(reset_sync_id=True)
+                onchip_rewind(reset_sync_id=True)
                 projection = _BaseProjection256(self.main_rows, self.config.ragged_main)
                 projection.weight_l2_cache_ctl = self.config.main_weight_l2_cache_ctl
                 convolution = ConvSiluStage(8, self.main_rows // 2, self.main_rows // 2)
-                history = Buffer(MemLoc.UB, (2 * batches * 3, 128), dtypes.bfloat16)
+                history = Buffer(MemLoc.UB, dtypes.bfloat16, make_layout((2 * batches * 3, 128)))
                 batch_base = group * (self.main_rows // 8) + subblock * batches
                 if macro < 3 * self.num_heads // 2:
                     projection.matmul_hidden2(x, wqkv, group, macro)
@@ -2698,11 +2734,11 @@ class TPSchedule(_GridSchedule):
             for task in range(get_block_idx(), task_count, CORE_NUM):
                 macro = task // groups
                 group = task % groups
-                channel_rewind(reset_sync_id=True)
+                onchip_rewind(reset_sync_id=True)
                 projection = _BaseProjection384(self.main_rows, 0, self.config.main_weight_l2_cache_ctl)
                 convolution = ConvSiluStage(8, self.main_rows // 2, self.main_rows // 2)
                 batches = self.main_rows // 16
-                history = Buffer(MemLoc.UB, (3 * batches * 3, TILE), dtypes.bfloat16)
+                history = Buffer(MemLoc.UB, dtypes.bfloat16, make_layout((3 * batches * 3, TILE)))
                 if macro < self.num_heads:
                     projection.matmul_hidden3(x, wqkv, group, macro, 56)
                 else:
@@ -2714,7 +2750,7 @@ class TPSchedule(_GridSchedule):
             for task in range(get_block_idx(), groups * 4 * self.num_heads, CORE_NUM):
                 head = task // groups
                 group = task % groups
-                channel_rewind(reset_sync_id=True)
+                onchip_rewind(reset_sync_id=True)
                 projection = ProjectionStage(
                     self.main_rows, 0, self.config.main_weight_l2_cache_ctl, row_capacity=self.main_rows)
                 convolution = ConvSiluStage(8, self.main_rows // 2, self.main_rows // 2)
@@ -2731,7 +2767,7 @@ class TPSchedule(_GridSchedule):
     def frontend_auxiliary_partitioned(self, decay, beta, fa, x, wa, wb, wbeta):
         groups = x.shape[0] // self.auxiliary_rows
         for task in range(get_block_idx(), groups * (1 + 128 // self.config.fa_width), 32):
-            channel_rewind(reset_sync_id=True)
+            onchip_rewind(reset_sync_id=True)
             group = task % groups
             part = task // groups
             hidden = tile_slice(x, (self.auxiliary_rows, HIDDEN_SIZE), (group, 0))
@@ -2769,7 +2805,7 @@ class TPSchedule(_GridSchedule):
             groups = x.shape[0] // self.auxiliary_rows
             subblock = get_subblock_id()
             for task in range(get_block_idx(), 2 * groups, CORE_NUM):
-                channel_rewind(reset_sync_id=True)
+                onchip_rewind(reset_sync_id=True)
                 group = task % groups
                 hidden = tile_slice(x, (self.auxiliary_rows, HIDDEN_SIZE), (group, 0))
                 if task < groups:
@@ -2796,7 +2832,7 @@ class TPSchedule(_GridSchedule):
             groups = x.shape[0] // self.auxiliary_rows
             subblock = get_subblock_id()
             for group in range(get_block_idx(), groups, CORE_NUM):
-                channel_rewind(reset_sync_id=True)
+                onchip_rewind(reset_sync_id=True)
                 stage = BetaProjectionStage(self.auxiliary_rows, 0, 4, tile_width=(self.num_heads + 15) // 16 * 16,
                     row_capacity=self.auxiliary_rows)
                 hidden = tile_slice(x, (self.auxiliary_rows, HIDDEN_SIZE), (group, 0))
@@ -2804,9 +2840,9 @@ class TPSchedule(_GridSchedule):
                     tile_slice(beta, (self.auxiliary_rows, (self.num_heads + 15) // 16 * 16), (group, 0)), 0, 56)
                 vec_sync_all()
             global_sync_all()
-            channel_rewind(reset_sync_id=True)
+            onchip_rewind(reset_sync_id=True)
             for group in range(get_block_idx(), groups, CORE_NUM):
-                channel_rewind(reset_sync_id=True)
+                onchip_rewind(reset_sync_id=True)
                 stage = ProjectionStage(self.auxiliary_rows, 0, 4, row_capacity=self.auxiliary_rows)
                 hidden = tile_slice(x, (self.auxiliary_rows, HIDDEN_SIZE), (group, 0))
                 if const_expr(self.config.split_fb):
@@ -2823,11 +2859,11 @@ class TPSchedule(_GridSchedule):
         for task in range(get_block_idx(), groups * self.num_heads, CORE_NUM):
             group = task // self.num_heads
             head = task % self.num_heads
-            channel_rewind(reset_sync_id=True)
+            onchip_rewind(reset_sync_id=True)
             stage = ProjectionStage(self.auxiliary_rows, 0, 0, row_capacity=self.auxiliary_rows)
-            a = Channel(MemLoc.L1, (self.auxiliary_rows, TILE), dtypes.bfloat16, depth=1).produce()
-            b = Channel(MemLoc.L1, (TILE, TILE), dtypes.bfloat16, depth=1, data_format="nz").produce()
-            mem_copy(a, tile_slice(fa, (self.auxiliary_rows, TILE), (group, 0)), engine=stage.nd2nz)
+            a = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((self.auxiliary_rows, TILE)), depth=1).next_write()
+            b = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((TILE, TILE)), depth=1).next_write()
+            mem_copy(a, tile_slice(fa, (self.auxiliary_rows, TILE), (group, 0)))
             mem_copy(b, tile_slice(wb, (TILE, TILE), (head, 0)))
             stage.matmul_resident(a, b)
             stage.publish_result(tile_slice(decay, (self.auxiliary_rows, TILE), (group, head)))
@@ -2853,50 +2889,42 @@ class TPSchedule(_GridSchedule):
         output = OutputProjectionStage(self.output_tile_width, self.publish_rows, kc=kc, tiles_per_core=1,
             resident_weight=resident, row_capacity=self.publish_rows, num_heads=self.num_heads,
             allow_tail=self.config.ragged_output)
-        if const_expr(self.config.phase != "recurrent"):
-            output.prefetch_weight(wo)
-        if const_expr(self.config.phase != "oproj"):
-            recurrent.load_gate_params(alog, bias)
-            output_gate.load_gamma(gamma)
-        if const_expr(self.config.phase == "oproj"):
-            for chunk in range(ceil_div(q.shape[0], self.publish_rows)):
+        output.prefetch_weight(wo)
+        recurrent.load_gate_params(alog, bias)
+        output_gate.load_gamma(gamma)
+        first = get_block_idx() * 2 + get_subblock_id()
+        if first < total:
+            prefetch_recurrent_item(
+                recurrent, output_gate, q, k, v, decay, gate, beta, first, accepted.shape[0], 8,
+                    self.num_heads, 128, nb_group_batch=self.publish_rows // 8)
+            prefetch_recurrent_state(
+                recurrent, initial, indices, accepted, first, accepted.shape[0], 8, self.num_heads, 128,
+                    nb_group_batch=self.publish_rows // 8)
+        for slot in range(slots):
+            item = slot * 64 + first
+            if item < total:
+                run_recurrent_wave(recurrent, output_gate, q, k, v, decay, gate, beta, initial, final, indices,
+                    accepted, item, item + 1, accepted.shape[0], 8, self.num_heads, 128, scale, lower, eps,
+                    defer_final_snapshot=True, first_inputs_prefetched=True, first_state_prefetched=True,
+                    next_item_stride=64, nb_group_batch=self.publish_rows // 8)
+            before = slot * 64
+            after = (slot + 1) * 64 if (slot + 1) * 64 < total else total
+            jobs = self.publish_rows // 8 * self.num_heads
+            ready_before = before // jobs
+            ready_after = after // jobs
+            if const_expr(self.config.ragged_output):
+                if after == total:
+                    ready_after = ceil_div(after, jobs)
+            publish_vector_grid_to_cube(3, 4, ack_flag=5)
+            if item < total:
+                batch, head = idx2crd(
+                    _recurrent_item_index(item, accepted.shape[0], self.num_heads, self.publish_rows // 8),
+                    [accepted.shape[0], self.num_heads])
+                index = dtypes.int64(indices[batch * 8 + 7])
+                recurrent.store_state(tile_slice(final[index, head, None, None], (128, 128), (0, 0)))
+            for chunk in range(ready_before, ready_after):
                 output.project(out, q, wo, self.num_heads, chunk)
-        else:
-            first = get_block_idx() * 2 + get_subblock_id()
-            if first < total:
-                prefetch_recurrent_item(
-                    recurrent, output_gate, q, k, v, decay, gate, beta, first, accepted.shape[0], 8,
-                        self.num_heads, 128, nb_group_batch=self.publish_rows // 8)
-                prefetch_recurrent_state(
-                    recurrent, initial, indices, accepted, first, accepted.shape[0], 8, self.num_heads, 128,
-                        nb_group_batch=self.publish_rows // 8)
-            for slot in range(slots):
-                item = slot * 64 + first
-                if item < total:
-                    run_recurrent_wave(recurrent, output_gate, q, k, v, decay, gate, beta, initial, final, indices,
-                        accepted, item, item + 1, accepted.shape[0], 8, self.num_heads, 128, scale, lower, eps,
-                        defer_final_snapshot=True, first_inputs_prefetched=True, first_state_prefetched=True,
-                        next_item_stride=64, nb_group_batch=self.publish_rows // 8)
-                before = slot * 64
-                after = (slot + 1) * 64 if (slot + 1) * 64 < total else total
-                jobs = self.publish_rows // 8 * self.num_heads
-                ready_before = before // jobs
-                ready_after = after // jobs
-                if const_expr(self.config.ragged_output):
-                    if after == total:
-                        ready_after = ceil_div(after, jobs)
-                if const_expr(self.config.phase != "recurrent"):
-                    publish_vector_grid_to_cube(3, 4, ack_flag=5)
-                if item < total:
-                    batch, head = idx2crd(
-                        _recurrent_item_index(item, accepted.shape[0], self.num_heads, self.publish_rows // 8),
-                        [accepted.shape[0], self.num_heads])
-                    index = dtypes.int64(indices[batch * 8 + 7])
-                    recurrent.store_state(tile_slice(final[index, head, None, None], (128, 128), (0, 0)))
-                if const_expr(self.config.phase not in ("recurrent", "backend_no_output")):
-                    for chunk in range(ready_before, ready_after):
-                        output.project(out, q, wo, self.num_heads, chunk)
-                channel_rewind(reset_sync_id=True)
+            onchip_rewind(reset_sync_id=True)
 
 
 def _validate_mega_hidden(hidden_states, beta_weight):
@@ -2946,7 +2974,7 @@ _SHORT_SCHEDULES = {
 
 _LARGE_SCHEDULES = {
     heads: dict(ragged_output=True, ragged_main=True, main_rows=256, auxiliary_rows=0, main_width=256,
-        split_fb=True, publish_rows=128 if heads == 24 else 64, resident_output_weight=True, phase="full",
+        split_fb=True, publish_rows=128 if heads == 24 else 64, resident_output_weight=True,
         state_update_unroll=2, main_weight_l2_cache_ctl=0, state_store_l2_cache_ctl=4,
         state_load_l2_cache_ctl=4 if heads == 12 else 2)
     for heads in (24, 12, 6)}
@@ -3001,42 +3029,43 @@ class _Core32ProjectionOperations(_Projection384Operations):
 
     @jit
     def _copy_projection_weight(self, dst, src):
-        mem_copy(dst, src, l2_cache_ctl=self.weight_l2_cache_ctl)
+        mem_copy(dst, src, options=copy_options(l2_cache_ctl=self.weight_l2_cache_ctl))
 
     @jit
     def matmul_hidden3(self, hidden_gm, weight_gm, m_group, n_macro, k_tiles):
         for kc_idx in range(k_tiles * TILE // PROJECTION_KC):
-            a_l1_slot = self.a_l1.produce()
-            mem_copy(
-                a_l1_slot,
-                tile_slice(hidden_gm, make_tiler((self.rows, PROJECTION_KC), alignment=(16, 16)), (m_group, kc_idx)),
-                engine=self.nd2nz,
-                l2_cache_ctl=self.input_l2_cache_ctl)
-            b_l1_slot = self.b_l1.produce()
+            a_l1_slot = self.a_l1.next_write().reinterpret(layout=make_layout(self.a_l1_shape), data_format="nz")
+            mem_copy(a_l1_slot, tile_slice(hidden_gm, make_tiler((self.rows, PROJECTION_KC), alignment=(16, 16)),
+                (m_group, kc_idx)), options=copy_options(l2_cache_ctl=self.input_l2_cache_ctl))
+            b_l1_slot = self.b_l1.next_write()
             self._copy_projection_weight(b_l1_slot,
                 tile_slice(weight_gm, (3 * TILE, PROJECTION_KC), (n_macro, kc_idx)))
             for ks_idx in range(PROJECTION_KC // PROJECTION_KS):
-                l0a_slot = self.l0a.produce()
-                mem_copy(
-                    l0a_slot, tile_slice(a_l1_slot, (128, 128), (0, ks_idx * PROJECTION_KS // 128))[0: self.rows, None])
-                l0b_slot = self.l0b.produce()
-                mem_copy(l0b_slot, tile_slice(b_l1_slot, (TILE, PROJECTION_KS), (0, ks_idx)))
+                l0a_slot = self.l0a.next_write().reinterpret(layout=make_layout(self.l0a_shape), data_format='nz')
+                l0a_slot_source_4 = tile_slice(a_l1_slot, (128, 128), (0, ks_idx * PROJECTION_KS // 128))[0:self.rows, None]
+                l0a_slot = l0a_slot[tuple(map(slice, l0a_slot_source_4.shape))]
+                mem_copy(l0a_slot, l0a_slot_source_4)
+                l0b_slot = self.l0b.next_write()
+                l0b_slot_source_11 = tile_slice(b_l1_slot, (TILE, PROJECTION_KS), (0, ks_idx))
+                l0b_slot = l0b_slot[tuple(map(slice, l0b_slot_source_11.shape))]
+                mem_copy(l0b_slot, l0b_slot_source_11)
                 matmul(self.l0c0, l0a_slot, l0b_slot, init=kc_idx == 0 and ks_idx == 0)
                 if kc_idx == k_tiles * TILE // PROJECTION_KC - 1 and ks_idx == PROJECTION_KC // PROJECTION_KS - 1:
-                    mem_copy(
-                        self.projection_half0, reinterpret(self.l0c0, shape=(self.rows, TILE)), engine=self.fixpipe)
-                l0b_slot = self.l0b.produce()
-                mem_copy(l0b_slot, tile_slice(b_l1_slot, (TILE, PROJECTION_KS), (1, ks_idx)))
+                    mem_copy(self.projection_half0, self.l0c0.partition(dim=0))
+                l0b_slot = self.l0b.next_write()
+                l0b_slot_source_12 = tile_slice(b_l1_slot, (TILE, PROJECTION_KS), (1, ks_idx))
+                l0b_slot = l0b_slot[tuple(map(slice, l0b_slot_source_12.shape))]
+                mem_copy(l0b_slot, l0b_slot_source_12)
                 matmul(self.l0c1, l0a_slot, l0b_slot, init=kc_idx == 0 and ks_idx == 0)
                 if kc_idx == k_tiles * TILE // PROJECTION_KC - 1 and ks_idx == PROJECTION_KC // PROJECTION_KS - 1:
-                    mem_copy(
-                        self.projection_half1, reinterpret(self.l0c1, shape=(self.rows, TILE)), engine=self.fixpipe)
-                l0b_slot = self.l0b.produce()
-                mem_copy(l0b_slot, tile_slice(b_l1_slot, (TILE, PROJECTION_KS), (2, ks_idx)))
+                    mem_copy(self.projection_half1, self.l0c1.partition(dim=0))
+                l0b_slot = self.l0b.next_write()
+                l0b_slot_source_13 = tile_slice(b_l1_slot, (TILE, PROJECTION_KS), (2, ks_idx))
+                l0b_slot = l0b_slot[tuple(map(slice, l0b_slot_source_13.shape))]
+                mem_copy(l0b_slot, l0b_slot_source_13)
                 matmul(self.l0c2, l0a_slot, l0b_slot, init=kc_idx == 0 and ks_idx == 0)
                 if kc_idx == k_tiles * TILE // PROJECTION_KC - 1 and ks_idx == PROJECTION_KC // PROJECTION_KS - 1:
-                    mem_copy(
-                        self.projection_half2, reinterpret(self.l0c2, shape=(self.rows, TILE)), engine=self.fixpipe)
+                    mem_copy(self.projection_half2, self.l0c2.partition(dim=0))
 
 
     def publish_full(self, workspace_gm, m_group, output_head, subblock_idx, source):
@@ -3048,31 +3077,32 @@ class _Core32ProjectionOperations(_Projection384Operations):
     @jit
     def matmul_hidden2(self, x, w, group, macro):
         for kc in range(28):
-            a = self.a_l1.produce()
-            b = self.b_l1.produce()
+            a = self.a_l1.next_write().reinterpret(layout=make_layout(self.a_l1_shape), data_format="nz")
+            b = self.b_l1.next_write()
             if const_expr(self.allow_tail):
                 valid = x.shape[0] - group * self.rows
                 if valid > self.rows:
                     valid = self.rows
-                mem_copy(
-                    a[0:valid, None],
-                    x[
-                        group * self.rows: group * self.rows + valid,
-                        kc * 256: (kc + 1) * 256, ],
-                    engine=self.nd2nz,
-                    l2_cache_ctl=0)
+                mem_copy(a[0:valid, None], x[group * self.rows: group * self.rows + valid,
+                    kc * 256: (kc + 1) * 256,], options=copy_options(l2_cache_ctl=0))
             else:
                 mem_copy(a, tile_slice(x, make_tiler((self.rows, 256), alignment=(16, 16)), (group, kc)),
-                    engine=self.nd2nz, l2_cache_ctl=0)
+                    options=copy_options(l2_cache_ctl=0))
             self._copy_projection_weight(b, tile_slice(w, (256, 256), (macro, kc)))
             for ks in range(4):
-                l0a = self.l0a.produce()
-                mem_copy(l0a, tile_slice(a, (256, 64), (0, ks * 64 // 64))[0: self.rows, None])
-                l0b = self.l0b.produce()
-                mem_copy(l0b, tile_slice(b, (128, 64), (0, ks)))
+                l0a = self.l0a.next_write().reinterpret(layout=make_layout(self.l0a_shape), data_format='nz')
+                l0a_source_2 = tile_slice(a, (256, 64), (0, ks * 64 // 64))[0:self.rows, None]
+                l0a = l0a[tuple(map(slice, l0a_source_2.shape))]
+                mem_copy(l0a, l0a_source_2)
+                l0b = self.l0b.next_write()
+                l0b_source_3 = tile_slice(b, (128, 64), (0, ks))
+                l0b = l0b[tuple(map(slice, l0b_source_3.shape))]
+                mem_copy(l0b, l0b_source_3)
                 matmul(self.l0c0, l0a, l0b, init=kc == 0 and ks == 0)
-                l0b = self.l0b.produce()
-                mem_copy(l0b, tile_slice(b, (128, 64), (1, ks)))
+                l0b = self.l0b.next_write()
+                l0b_source_4 = tile_slice(b, (128, 64), (1, ks))
+                l0b = l0b[tuple(map(slice, l0b_source_4.shape))]
+                mem_copy(l0b, l0b_source_4)
                 matmul(self.l0c1, l0a, l0b, init=kc == 0 and ks == 0)
 
 
@@ -3088,24 +3118,19 @@ class _Core32Projection384(_Core32ProjectionOperations):
         self.allow_tail = False
         self.input_l2_cache_ctl = int(input_l2_cache_ctl)
         self.weight_l2_cache_ctl = int(weight_l2_cache_ctl)
-        self.a_l1 = Channel(MemLoc.L1, (self.rows, PROJECTION_KC), dtypes.bfloat16, depth=2,
-            capacity=(128, PROJECTION_KC), data_format="nz")
-        self.b_l1 = Channel(MemLoc.L1, (3 * TILE, PROJECTION_KC), dtypes.bfloat16, depth=2, data_format="nz")
-        self.l0a = Channel(
-            MemLoc.L0A, (self.rows, PROJECTION_KS), dtypes.bfloat16, depth=2, capacity=(128, PROJECTION_KS))
-        self.l0b = Channel(MemLoc.L0B, (TILE, PROJECTION_KS), dtypes.bfloat16, depth=2)
-        self.l0c0 = Channel(MemLoc.L0C, (self.rows, TILE), dtypes.float32, depth=1, capacity=(128, TILE)).produce()
-        self.l0c1 = Channel(MemLoc.L0C, (self.rows, TILE), dtypes.float32, depth=1, capacity=(128, TILE)).produce()
-        self.l0c2 = Channel(MemLoc.L0C, (self.rows, TILE), dtypes.float32, depth=1, capacity=(128, TILE)).produce()
-        self.projection_half0 = Channel(MemLoc.UB, (self.rows // 2, TILE), dtypes.float32, depth=1,
-            kind=ChannelKind.CrossCore, capacity=(128 // 2, TILE)).produce()
-        self.projection_half1 = Channel(MemLoc.UB, (self.rows // 2, TILE), dtypes.float32, depth=1,
-            kind=ChannelKind.CrossCore, capacity=(128 // 2, TILE)).produce()
-        self.projection_half2 = Channel(MemLoc.UB, (self.rows // 2, TILE), dtypes.float32, depth=1,
-            kind=ChannelKind.CrossCore, capacity=(128 // 2, TILE)).produce()
-        self.projection_bf16 = Buffer(MemLoc.UB, (self.rows // 2, TILE), dtypes.bfloat16, capacity=(128 // 2, TILE))
-        self.nd2nz = make_copy_engine(format_transform="nd2nz")
-        self.fixpipe = make_copy_engine(split_axis=0)
+        self.a_l1 = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((128 * PROJECTION_KC,)), depth=2, data_format="nd")
+        self.a_l1_shape = (self.rows, PROJECTION_KC)
+        self.b_l1 = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((3 * TILE, PROJECTION_KC)), depth=2)
+        self.l0a = RingBuffer(MemLoc.L0A, dtypes.bfloat16, make_layout((128 * PROJECTION_KS,)), depth=2, data_format="nd")
+        self.l0a_shape = (self.rows, PROJECTION_KS)
+        self.l0b = RingBuffer(MemLoc.L0B, dtypes.bfloat16, make_layout((TILE, PROJECTION_KS)), depth=2)
+        self.l0c0 = RingBuffer(MemLoc.L0C, dtypes.float32, make_layout((128 * TILE,)), depth=1, data_format="nd").next_write().reinterpret(layout=make_layout((self.rows, TILE)), data_format="nz")
+        self.l0c1 = RingBuffer(MemLoc.L0C, dtypes.float32, make_layout((128 * TILE,)), depth=1, data_format="nd").next_write().reinterpret(layout=make_layout((self.rows, TILE)), data_format="nz")
+        self.l0c2 = RingBuffer(MemLoc.L0C, dtypes.float32, make_layout((128 * TILE,)), depth=1, data_format="nd").next_write().reinterpret(layout=make_layout((self.rows, TILE)), data_format="nz")
+        self.projection_half0 = RingBuffer(MemLoc.UB, dtypes.float32, make_layout(((128 // 2) * TILE,)), depth=1).next_write().view((self.rows // 2, TILE))
+        self.projection_half1 = RingBuffer(MemLoc.UB, dtypes.float32, make_layout(((128 // 2) * TILE,)), depth=1).next_write().view((self.rows // 2, TILE))
+        self.projection_half2 = RingBuffer(MemLoc.UB, dtypes.float32, make_layout(((128 // 2) * TILE,)), depth=1).next_write().view((self.rows // 2, TILE))
+        self.projection_bf16 = Buffer(MemLoc.UB, dtypes.bfloat16, make_layout((128 // 2 * TILE,))).view(self.rows // 2, TILE)
         self.projection_fp32: object
 
 
@@ -3120,28 +3145,28 @@ class _Core32Projection256(_Core32ProjectionOperations):
         self.allow_tail = bool(allow_tail)
         self.input_l2_cache_ctl = 0
         self.weight_l2_cache_ctl = 4
-        self.a_l1 = Channel(MemLoc.L1, (rows, 256), dtypes.bfloat16, depth=2, capacity=(256, 256), data_format="nz")
-        self.b_l1 = Channel(MemLoc.L1, (256, 256), dtypes.bfloat16, depth=2, data_format="nz")
-        self.l0a = Channel(MemLoc.L0A, (rows, 64), dtypes.bfloat16, depth=2, capacity=(256, 64))
-        self.l0b = Channel(MemLoc.L0B, (128, 64), dtypes.bfloat16, depth=2)
-        self.l0c0 = Channel(MemLoc.L0C, (rows, 128), dtypes.float32, depth=1, capacity=(256, 128)).produce()
-        self.l0c1 = Channel(MemLoc.L0C, (rows, 128), dtypes.float32, depth=1, capacity=(256, 128)).produce()
-        self.half = Channel(
-            MemLoc.UB, (rows // 2, 128), dtypes.float32, depth=1, kind=ChannelKind.CrossCore, capacity=(256 // 2, 128))
-        self.projection_bf16 = Buffer(MemLoc.UB, (rows // 2, 128), dtypes.bfloat16, capacity=(256 // 2, 128))
-        self.nd2nz = make_copy_engine(format_transform="nd2nz")
-        self.fixpipe = make_copy_engine(split_axis=0)
+        self.a_l1 = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((256 * 256,)), depth=2, data_format="nd")
+        self.a_l1_shape = (rows, 256)
+        self.b_l1 = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((256, 256)), depth=2)
+        self.l0a = RingBuffer(MemLoc.L0A, dtypes.bfloat16, make_layout((256 * 64,)), depth=2, data_format="nd")
+        self.l0a_shape = (rows, 64)
+        self.l0b = RingBuffer(MemLoc.L0B, dtypes.bfloat16, make_layout((128, 64)), depth=2)
+        self.l0c0 = RingBuffer(MemLoc.L0C, dtypes.float32, make_layout((256 * 128,)), depth=1, data_format="nd").next_write().reinterpret(layout=make_layout((rows, 128)), data_format="nz")
+        self.l0c1 = RingBuffer(MemLoc.L0C, dtypes.float32, make_layout((256 * 128,)), depth=1, data_format="nd").next_write().reinterpret(layout=make_layout((rows, 128)), data_format="nz")
+        self.half = RingBuffer(MemLoc.UB, dtypes.float32, make_layout(((256 // 2) * 128,)), depth=1)
+        self.half_shape = (rows // 2, 128)
+        self.projection_bf16 = Buffer(MemLoc.UB, dtypes.bfloat16, make_layout((256 // 2 * 128,))).view(rows // 2, 128)
 
 
     @jit
     def acquire_result0(self):
-        self.projection_fp32 = self.half.produce()
-        mem_copy(self.projection_fp32, reinterpret(self.l0c0, shape=(self.rows, 128)), engine=self.fixpipe)
+        self.projection_fp32 = self.half.next_write().view(self.half_shape)
+        mem_copy(self.projection_fp32, self.l0c0.partition(dim=0))
 
     @jit
     def acquire_result1(self):
-        self.projection_fp32 = self.half.produce()
-        mem_copy(self.projection_fp32, reinterpret(self.l0c1, shape=(self.rows, 128)), engine=self.fixpipe)
+        self.projection_fp32 = self.half.next_write().view(self.half_shape)
+        mem_copy(self.projection_fp32, self.l0c1.partition(dim=0))
 
 
 class _ProjectionScheduleOperations(TPSchedule):
@@ -3177,13 +3202,12 @@ class _ProjectionScheduleOperations(TPSchedule):
                 if cache_index != 0:
                     state_view = conv_state_gm[cache_index, None, None]
                     mem_copy(
-                        reinterpret(
-                            tile_slice(selected_history, (CONV_KERNEL - 1, TILE), (local_batch, 0)), shape=(3, 128)),
+                        tile_slice(selected_history, (CONV_KERNEL - 1, TILE), (local_batch, 0)),
                         tile_slice(
                             state_view[
                                 None,
                                 history_offset: history_offset + CONV_KERNEL - 1,
-                                None, ],
+                                None,],
                             (CONV_KERNEL - 1, TILE),
                             (0, logical_n)))
 
@@ -3208,14 +3232,12 @@ class _ProjectionScheduleOperations(TPSchedule):
                     if cache_index != 0:
                         state_view = conv_state_gm[cache_index, None, None]
                         mem_copy(
-                            reinterpret(
-                                tile_slice(selected_history, (CONV_KERNEL - 1, TILE), (local_batch, 0)), shape=(3,
-                                    128)),
+                            tile_slice(selected_history, (CONV_KERNEL - 1, TILE), (local_batch, 0)),
                             tile_slice(
                                 state_view[
                                     None,
                                     history_offset: history_offset + CONV_KERNEL - 1,
-                                    None, ],
+                                    None,],
                                 (CONV_KERNEL - 1, TILE),
                                 (0, logical_n)))
 
@@ -3228,13 +3250,13 @@ class _ProjectionScheduleOperations(TPSchedule):
         subblock_idx):
         history0 = selected_history[
             0 * (batches_per_subblock * (CONV_KERNEL - 1)): (0 + 1) * (batches_per_subblock * (CONV_KERNEL - 1)),
-            0 * TILE: (0 + 1) * TILE, ]
+            0 * TILE: (0 + 1) * TILE,]
         history1 = selected_history[
             1 * (batches_per_subblock * (CONV_KERNEL - 1)): (1 + 1) * (batches_per_subblock * (CONV_KERNEL - 1)),
-            0 * TILE: (0 + 1) * TILE, ]
+            0 * TILE: (0 + 1) * TILE,]
         history2 = selected_history[
             2 * (batches_per_subblock * (CONV_KERNEL - 1)): (2 + 1) * (batches_per_subblock * (CONV_KERNEL - 1)),
-            0 * TILE: (0 + 1) * TILE, ]
+            0 * TILE: (0 + 1) * TILE,]
         weight0 = tile_slice(conv_stage.weight, (CONV_KERNEL, TILE), (0, 0))
         weight1 = tile_slice(conv_stage.weight, (CONV_KERNEL, TILE), (1, 0))
         weight2 = tile_slice(conv_stage.weight, (CONV_KERNEL, TILE), (2, 0))
@@ -3275,8 +3297,7 @@ class _ProjectionScheduleOperations(TPSchedule):
                     if cache_index == 0:
                         conv_stage.zero_sequence(local_batch)
                     else:
-                        history_view = reinterpret(
-                            tile_slice(selected_history, (CONV_KERNEL - 1, TILE), (local_batch, 0)), shape=(3, 128))
+                        history_view = tile_slice(selected_history, (CONV_KERNEL - 1, TILE), (local_batch, 0))
                         conv_stage.install_history(history_view)
                         state_view = conv_state_gm[cache_index, None, None]
                         mem_copy(
@@ -3331,12 +3352,15 @@ class _Core32ProjectionSchedule(_ProjectionScheduleOperations):
             for task in range(get_block_idx(), task_count, get_block_num()):
                 macro = task // groups
                 group = task % groups
-                channel_rewind(reset_sync_id=True)
+                onchip_rewind(reset_sync_id=True)
                 projection = _Core32Projection256(self.main_rows, self.config.ragged_main)
                 projection.weight_l2_cache_ctl = self.main_policy
                 convolution = ConvSiluStage(8, self.main_rows // 2, self.row_capacity // 2)
-                history = Buffer(MemLoc.UB, (2 * batches * 3, 128), dtypes.bfloat16,
-                    capacity=(3 * (self.row_capacity // 16) * 3, TILE))
+                history = Buffer(
+                    MemLoc.UB,
+                    dtypes.bfloat16,
+                    make_layout((3 * (self.row_capacity // 16) * 3 * TILE,)),
+                ).view(2 * batches * 3, 128)
                 batch_base = group * (self.main_rows // 8) + subblock * batches
                 if macro < 3 * self.num_heads // 2:
                     projection.matmul_hidden2(x, wqkv, group, macro)
@@ -3362,13 +3386,16 @@ class _Core32ProjectionSchedule(_ProjectionScheduleOperations):
             for task in range(get_block_idx(), task_count, get_block_num()):
                 macro = task // groups
                 group = task % groups
-                channel_rewind(reset_sync_id=True)
+                onchip_rewind(reset_sync_id=True)
                 projection = _Core32Projection384(self.main_rows, 0, self.config.main_weight_l2_cache_ctl)
                 projection.weight_l2_cache_ctl = self.main_policy
                 convolution = ConvSiluStage(8, self.main_rows // 2, self.row_capacity // 2)
                 batches = self.main_rows // 16
-                history = Buffer(MemLoc.UB, (3 * batches * 3, TILE), dtypes.bfloat16,
-                    capacity=(3 * (self.row_capacity // 16) * 3, TILE))
+                history = Buffer(
+                    MemLoc.UB,
+                    dtypes.bfloat16,
+                    make_layout((3 * (self.row_capacity // 16) * 3 * TILE,)),
+                ).view(3 * batches * 3, TILE)
                 if macro < self.num_heads:
                     projection.matmul_hidden3(x, wqkv, group, macro, 56)
                 else:
@@ -3380,7 +3407,7 @@ class _Core32ProjectionSchedule(_ProjectionScheduleOperations):
             for task in range(get_block_idx(), groups * 4 * self.num_heads, get_block_num()):
                 head = task // groups
                 group = task % groups
-                channel_rewind(reset_sync_id=True)
+                onchip_rewind(reset_sync_id=True)
                 projection = ProjectionStage(
                     self.main_rows, 0, self.config.main_weight_l2_cache_ctl, row_capacity=self.main_rows)
                 projection.weight_l2_cache_ctl = self.main_policy
@@ -3417,16 +3444,16 @@ class _HeadOutputStage:
         heads):
         self.rows = rows
         self.heads = heads
-        self.a_l1 = Channel(MemLoc.L1, (rows, TILE), dtypes.bfloat16, depth=2)
-        self.b_l1 = Channel(MemLoc.L1, (256, TILE), dtypes.bfloat16, depth=2, data_format="nz")
-        self.l0a = Channel(MemLoc.L0A, (rows, OPROJ_KS), dtypes.bfloat16, depth=2)
-        self.l0b = Channel(MemLoc.L0B, (256, OPROJ_KS), dtypes.bfloat16, depth=2)
-        self.nd2nz = make_copy_engine(format_transform="nd2nz")
-        self.fixpipe = make_copy_engine()
-        self.c0 = Channel(MemLoc.L0C, (rows, 256), dtypes.float32, depth=1).produce()
-        self.c1 = Channel(MemLoc.L0C, (rows, 256), dtypes.float32, depth=1).produce()
-        self.c2 = Channel(MemLoc.L0C, (rows, 256), dtypes.float32, depth=1).produce()
-        self.c3 = Channel(MemLoc.L0C, (rows, 256), dtypes.float32, depth=1).produce()
+        self.a_l1 = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((rows, TILE)), depth=2)
+        self.a_l1_shape = (rows, TILE)
+        self.b_l1 = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((256, TILE)), depth=2)
+        self.l0a = RingBuffer(MemLoc.L0A, dtypes.bfloat16, make_layout((rows, OPROJ_KS)), depth=2)
+        self.l0a_shape = (rows, OPROJ_KS)
+        self.l0b = RingBuffer(MemLoc.L0B, dtypes.bfloat16, make_layout((256, OPROJ_KS)), depth=2)
+        self.c0 = RingBuffer(MemLoc.L0C, dtypes.float32, make_layout((rows, 256)), depth=1).next_write()
+        self.c1 = RingBuffer(MemLoc.L0C, dtypes.float32, make_layout((rows, 256)), depth=1).next_write()
+        self.c2 = RingBuffer(MemLoc.L0C, dtypes.float32, make_layout((rows, 256)), depth=1).next_write()
+        self.c3 = RingBuffer(MemLoc.L0C, dtypes.float32, make_layout((rows, 256)), depth=1).next_write()
 
     @jit
     def _accumulate_tile(self, tensors, accumulator, column, head_range):
@@ -3434,18 +3461,18 @@ class _HeadOutputStage:
         first_head, last_head = head_range
         if column < HIDDEN_SIZE // 256:
             for head in range(first_head, last_head):
-                a = self.a_l1.produce()
-                b = self.b_l1.produce()
-                mem_copy(a, tile_slice(gated, (self.rows, TILE), (0, head)), engine=self.nd2nz)
+                a = self.a_l1.next_write().reinterpret(layout=make_layout(self.a_l1_shape), data_format="nz")
+                b = self.b_l1.next_write()
+                mem_copy(a, tile_slice(gated, (self.rows, TILE), (0, head)))
                 mem_copy(b, tile_slice(weight, (256, TILE), (column, head)))
                 for ks in range(TILE // OPROJ_KS):
-                    la = self.l0a.produce()
-                    lb = self.l0b.produce()
+                    la = self.l0a.next_write().reinterpret(layout=make_layout(self.l0a_shape), data_format="nz")
+                    lb = self.l0b.next_write()
                     mem_copy(la, tile_slice(a, (self.rows, OPROJ_KS), (0, ks)))
                     mem_copy(lb, tile_slice(b, (256, OPROJ_KS), (0, ks)))
                     matmul(accumulator, la, lb, init=head == 0 and ks == 0)
             if last_head == self.heads:
-                mem_copy(tile_slice(out, (self.rows, 256), (0, column)), accumulator, engine=self.fixpipe)
+                mem_copy(tile_slice(out, (self.rows, 256), (0, column)), accumulator)
 
     @jit
     def accumulate(self, out, gated, weight, first_head, last_head):
@@ -3498,7 +3525,7 @@ class _HeadPanelBackend:
                 recurrent.store_state(tile_slice(final[index, head, None, None], (128, 128), (0, 0)))
             output.accumulate(out, q, wo, slot * stride // batch, ready // batch)
             # Keep the Cube accumulator alive across head-group publications.
-        channel_rewind(reset_sync_id=True)
+        onchip_rewind(reset_sync_id=True)
 
 
 class _PhaseSchedule(TPSchedule):
@@ -3529,11 +3556,11 @@ class _TP16N384Schedule(_GridSchedule):
             output_gate_workspace_gm, hidden_gm, qkv_weight_gm, fa_weight_gm, fb_weight_gm, output_gate_weight_gm,
             conv_state_gm, conv_state_indices_gm, conv_accepted_gm, conv_weight_gm)
         cube_sync_all()
-        channel_rewind(reset_sync_id=True)
+        onchip_rewind(reset_sync_id=True)
         self._frontend_adaptive_auxiliary(
             decay_workspace_gm, beta_workspace_gm, hidden_gm, fa_weight_gm, fb_weight_gm, beta_weight_gm)
         global_sync_all()
-        channel_rewind(reset_sync_id=True)
+        onchip_rewind(reset_sync_id=True)
         self._run_backend_stream(out_gm, q_workspace_gm, k_workspace_gm, v_workspace_gm, decay_workspace_gm,
             output_gate_workspace_gm, beta_workspace_gm, fa_workspace_gm, norm_exchange_gm, hidden_gm, qkv_weight_gm,
             fa_weight_gm, fb_weight_gm, beta_weight_gm, output_gate_weight_gm, output_norm_weight_gm, o_proj_weight_gm,
@@ -3565,16 +3592,16 @@ class _Runtime32Logic:
                 beta_workspace_gm[0:128, None], fa_workspace_gm[0:128, None], norm_exchange_gm, hidden_gm[0:128, None],
                 qkv_weight_gm, fa_weight_gm, fb_weight_gm, beta_weight_gm, output_gate_weight_gm,
                 output_norm_weight_gm, o_proj_weight_gm, a_log_gm, dt_bias_gm, initial_state_gm, final_state_gm,
-                state_indices_gm[0:128, ], accepted_gm[0:16, ], conv_state_gm, conv_state_indices_gm[0:16, ],
-                conv_accepted_gm[0:16, ], conv_weight_gm, scale_value, lower_bound, rms_norm_eps)
+                state_indices_gm[0:128,], accepted_gm[0:16,], conv_state_gm, conv_state_indices_gm[0:16,],
+                conv_accepted_gm[0:16,], conv_weight_gm, scale_value, lower_bound, rms_norm_eps)
         elif accepted_gm.shape[0] == 32:
             self._short(out_gm[0:256, None], q_workspace_gm[0:256, None], k_workspace_gm[0:256, None],
                 v_workspace_gm[0:256, None], decay_workspace_gm[0:256, None], output_gate_workspace_gm[0:256, None],
                 beta_workspace_gm[0:256, None], fa_workspace_gm[0:256, None], norm_exchange_gm, hidden_gm[0:256, None],
                 qkv_weight_gm, fa_weight_gm, fb_weight_gm, beta_weight_gm, output_gate_weight_gm,
                 output_norm_weight_gm, o_proj_weight_gm, a_log_gm, dt_bias_gm, initial_state_gm, final_state_gm,
-                state_indices_gm[0:256, ], accepted_gm[0:32, ], conv_state_gm, conv_state_indices_gm[0:32, ],
-                conv_accepted_gm[0:32, ], conv_weight_gm, scale_value, lower_bound, rms_norm_eps)
+                state_indices_gm[0:256,], accepted_gm[0:32,], conv_state_gm, conv_state_indices_gm[0:32,],
+                conv_accepted_gm[0:32,], conv_weight_gm, scale_value, lower_bound, rms_norm_eps)
         else:
             policy = dtypes.int32(0)
             if accepted_gm.shape[0] >= 112:
@@ -3600,14 +3627,14 @@ class _Runtime32Logic:
             qkv_weight_gm, output_gate_weight_gm, conv_state_gm, conv_state_indices_gm, conv_accepted_gm,
             conv_weight_gm)
         cube_sync_all()
-        channel_rewind(reset_sync_id=True)
+        onchip_rewind(reset_sync_id=True)
         self.short.frontend_auxiliary(decay_workspace_gm, beta_workspace_gm, fa_workspace_gm, hidden_gm, fa_weight_gm,
             fb_weight_gm, beta_weight_gm)
         global_sync_all()
-        channel_rewind(reset_sync_id=True)
+        onchip_rewind(reset_sync_id=True)
         self.short.frontend_fb(decay_workspace_gm, fa_workspace_gm, fb_weight_gm)
         global_sync_all()
-        channel_rewind(reset_sync_id=True)
+        onchip_rewind(reset_sync_id=True)
         self.short.backend(out_gm, q_workspace_gm, k_workspace_gm, v_workspace_gm, decay_workspace_gm,
             output_gate_workspace_gm, beta_workspace_gm, output_norm_weight_gm, o_proj_weight_gm, a_log_gm, dt_bias_gm,
             initial_state_gm, final_state_gm, state_indices_gm, accepted_gm, scale_value, lower_bound, rms_norm_eps)
@@ -3656,20 +3683,21 @@ class _TP12Logic:
         self.main256.main(q, k, v, gate, x, wqkv, wz, conv, conv_indices, conv_accepted, wc, 12, main_rows, not use384)
         self.main384.main_policy = main_policy
         self.main384.main(q, k, v, gate, x, wqkv, wz, conv, conv_indices, conv_accepted, wc, 12, main_rows, use384)
-        cube_sync_all()
-        channel_rewind(reset_sync_id=True)
+        # Close paired projection credits before the auxiliary phase reuses their IDs.
+        global_sync_all()
+        onchip_rewind(reset_sync_id=True)
         if mb == 1:
             self.aux0.frontend_auxiliary(decay, beta, fa, x, wa, wb, wbeta)
         else:
             self.aux1.frontend_auxiliary(decay, beta, fa, x, wa, wb, wbeta)
         global_sync_all()
-        channel_rewind(reset_sync_id=True)
+        onchip_rewind(reset_sync_id=True)
         if mb == 1:
             self.aux0.frontend_fb(decay, fa, wb)
         else:
             self.aux1.frontend_fb(decay, fa, wb)
         global_sync_all()
-        channel_rewind(reset_sync_id=True)
+        onchip_rewind(reset_sync_id=True)
         if mb == 1:
             self.head_backend.backend(out, q, k, v, decay, gate, beta, gamma, wo, alog, bias, initial,
                 final, indices, accepted, scale, lower, eps)
@@ -3740,17 +3768,18 @@ class _TP24Logic:
         self.main256.main(q, k, v, gate, x, wqkv, wz, conv, conv_indices, conv_accepted, wc, 24, main_rows, not use384)
         self.main384.main_policy = main_policy
         self.main384.main(q, k, v, gate, x, wqkv, wz, conv, conv_indices, conv_accepted, wc, 24, main_rows, use384)
-        cube_sync_all()
-        channel_rewind(reset_sync_id=True)
+        # Close paired projection credits before the auxiliary phase reuses their IDs.
+        global_sync_all()
+        onchip_rewind(reset_sync_id=True)
         if mb == 1:
             self.aux0.frontend_auxiliary(decay, beta, fa, x, wa, wb, wbeta)
         else:
             self.aux1.frontend_auxiliary(decay, beta, fa, x, wa, wb, wbeta)
         global_sync_all()
-        channel_rewind(reset_sync_id=True)
+        onchip_rewind(reset_sync_id=True)
         self.aux0.frontend_fb(decay, fa, wb)
         global_sync_all()
-        channel_rewind(reset_sync_id=True)
+        onchip_rewind(reset_sync_id=True)
         if mb == 1:
             self.head_backend.backend(out, q, k, v, decay, gate, beta, gamma, wo, alog, bias, initial,
                 final, indices, accepted, scale, lower, eps)
@@ -3876,24 +3905,27 @@ class DynamicRecurrentStage(RecurrentStage):
     @jit
     def load_gate_params(self, a_log_gm, dt_bias_gm):
         n = a_log_gm.shape[0]
-        mem_copy(self.a_log[0:n, ], a_log_gm)
+        mem_copy(self.a_log[0:n,], a_log_gm)
         mem_copy(self.dt_bias[0:n, None], dt_bias_gm)
 
 
 class DynamicBetaStage(BetaProjectionStage):
     @jit
     def matmul_hidden(self, hidden_gm, weight_gm, output_tile, k_tiles):
-        accumulator = self.l0c.produce()
-        beta_l1 = Buffer(MemLoc.L1, dtype=weight_gm.dtype, capacity=(32, HIDDEN_SIZE), layout=weight_gm.layout,
-            physical_layout=weight_gm.physical_layout, data_format="nz")
-        mem_copy(beta_l1, weight_gm, l2_cache_ctl=self.weight_l2_cache_ctl)
+        accumulator = self.l0c.next_write().reinterpret(layout=make_layout(self.l0c_shape), data_format="nz")
+        beta_l1 = Buffer(
+            MemLoc.L1,
+            weight_gm.dtype,
+            weight_gm.layout,
+            physical_layout=weight_gm.physical_layout,
+        )
+        mem_copy(beta_l1, weight_gm, options=copy_options(l2_cache_ctl=self.weight_l2_cache_ctl))
         for kc_idx in range(k_tiles):
-            a = self.a_l1.produce()
-            mem_copy(a, tile_slice(hidden_gm, (self.row_capacity, 128), (0, kc_idx)), engine=self.nd2nz,
-                l2_cache_ctl=self.input_l2_cache_ctl)
+            a = self.a_l1.next_write().reinterpret(layout=make_layout(self.a_l1_shape), data_format="nz")
+            mem_copy(a, tile_slice(hidden_gm, (self.row_capacity, 128), (0, kc_idx)), options=copy_options(l2_cache_ctl=self.input_l2_cache_ctl))
             for ks_idx in range(2):
-                l0a = self.l0a.produce()
-                l0b = self.l0b.produce()
+                l0a = self.l0a.next_write().reinterpret(layout=make_layout(self.l0a_shape), data_format="nz")
+                l0b = self.l0b.next_write()
                 mem_copy(l0a, tile_slice(a, (self.row_capacity, 64), (0, ks_idx)))
                 mem_copy(l0b, tile_slice(beta_l1, (self.tile_width, 64), (0, kc_idx * 2 + ks_idx)))
                 matmul(accumulator, l0a, l0b, init=kc_idx == 0 and ks_idx == 0)
@@ -3902,9 +3934,9 @@ class DynamicBetaStage(BetaProjectionStage):
 @jit
 def _copy_weight_with_policy(dst, src, policy):
     if policy == 0:
-        mem_copy(dst, src, l2_cache_ctl=0)
+        mem_copy(dst, src, options=copy_options(l2_cache_ctl=0))
     else:
-        mem_copy(dst, src, l2_cache_ctl=4)
+        mem_copy(dst, src, options=copy_options(l2_cache_ctl=4))
 
 
 class _DynamicProjectionOperations(_Core32ProjectionOperations):
@@ -3925,24 +3957,19 @@ class N384ProjectionStage(_DynamicProjectionOperations):
         self.allow_tail = False
         self.input_l2_cache_ctl = int(input_l2_cache_ctl)
         self.weight_l2_cache_ctl = int(weight_l2_cache_ctl)
-        self.a_l1 = Channel(MemLoc.L1, (self.rows, PROJECTION_KC), dtypes.bfloat16, depth=2,
-            capacity=(128, PROJECTION_KC), data_format="nz")
-        self.b_l1 = Channel(MemLoc.L1, (3 * TILE, PROJECTION_KC), dtypes.bfloat16, depth=2, data_format="nz")
-        self.l0a = Channel(
-            MemLoc.L0A, (self.rows, PROJECTION_KS), dtypes.bfloat16, depth=2, capacity=(128, PROJECTION_KS))
-        self.l0b = Channel(MemLoc.L0B, (TILE, PROJECTION_KS), dtypes.bfloat16, depth=2)
-        self.l0c0 = Channel(MemLoc.L0C, (self.rows, TILE), dtypes.float32, depth=1, capacity=(128, TILE)).produce()
-        self.l0c1 = Channel(MemLoc.L0C, (self.rows, TILE), dtypes.float32, depth=1, capacity=(128, TILE)).produce()
-        self.l0c2 = Channel(MemLoc.L0C, (self.rows, TILE), dtypes.float32, depth=1, capacity=(128, TILE)).produce()
-        self.projection_half0 = Channel(MemLoc.UB, (self.rows // 2, TILE), dtypes.float32, depth=1,
-            kind=ChannelKind.CrossCore, capacity=(128 // 2, TILE)).produce()
-        self.projection_half1 = Channel(MemLoc.UB, (self.rows // 2, TILE), dtypes.float32, depth=1,
-            kind=ChannelKind.CrossCore, capacity=(128 // 2, TILE)).produce()
-        self.projection_half2 = Channel(MemLoc.UB, (self.rows // 2, TILE), dtypes.float32, depth=1,
-            kind=ChannelKind.CrossCore, capacity=(128 // 2, TILE)).produce()
-        self.projection_bf16 = Buffer(MemLoc.UB, (self.rows // 2, TILE), dtypes.bfloat16, capacity=(128 // 2, TILE))
-        self.nd2nz = make_copy_engine(format_transform="nd2nz")
-        self.fixpipe = make_copy_engine(split_axis=0)
+        self.a_l1 = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((128 * PROJECTION_KC,)), depth=2, data_format="nd")
+        self.a_l1_shape = (self.rows, PROJECTION_KC)
+        self.b_l1 = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((3 * TILE, PROJECTION_KC)), depth=2)
+        self.l0a = RingBuffer(MemLoc.L0A, dtypes.bfloat16, make_layout((128 * PROJECTION_KS,)), depth=2, data_format="nd")
+        self.l0a_shape = (self.rows, PROJECTION_KS)
+        self.l0b = RingBuffer(MemLoc.L0B, dtypes.bfloat16, make_layout((TILE, PROJECTION_KS)), depth=2)
+        self.l0c0 = RingBuffer(MemLoc.L0C, dtypes.float32, make_layout((128 * TILE,)), depth=1, data_format="nd").next_write().reinterpret(layout=make_layout((self.rows, TILE)), data_format="nz")
+        self.l0c1 = RingBuffer(MemLoc.L0C, dtypes.float32, make_layout((128 * TILE,)), depth=1, data_format="nd").next_write().reinterpret(layout=make_layout((self.rows, TILE)), data_format="nz")
+        self.l0c2 = RingBuffer(MemLoc.L0C, dtypes.float32, make_layout((128 * TILE,)), depth=1, data_format="nd").next_write().reinterpret(layout=make_layout((self.rows, TILE)), data_format="nz")
+        self.projection_half0 = RingBuffer(MemLoc.UB, dtypes.float32, make_layout(((128 // 2) * TILE,)), depth=1).next_write().view((self.rows // 2, TILE))
+        self.projection_half1 = RingBuffer(MemLoc.UB, dtypes.float32, make_layout(((128 // 2) * TILE,)), depth=1).next_write().view((self.rows // 2, TILE))
+        self.projection_half2 = RingBuffer(MemLoc.UB, dtypes.float32, make_layout(((128 // 2) * TILE,)), depth=1).next_write().view((self.rows // 2, TILE))
+        self.projection_bf16 = Buffer(MemLoc.UB, dtypes.bfloat16, make_layout((128 // 2 * TILE,))).view(self.rows // 2, TILE)
         self.projection_fp32: object
 
 
@@ -3955,28 +3982,28 @@ class N256ProjectionStage(_DynamicProjectionOperations):
         self.allow_tail = bool(allow_tail)
         self.input_l2_cache_ctl = 0
         self.weight_l2_cache_ctl = 4
-        self.a_l1 = Channel(MemLoc.L1, (rows, 256), dtypes.bfloat16, depth=2, capacity=(256, 256), data_format="nz")
-        self.b_l1 = Channel(MemLoc.L1, (256, 256), dtypes.bfloat16, depth=2, data_format="nz")
-        self.l0a = Channel(MemLoc.L0A, (rows, 64), dtypes.bfloat16, depth=2, capacity=(256, 64))
-        self.l0b = Channel(MemLoc.L0B, (128, 64), dtypes.bfloat16, depth=2)
-        self.l0c0 = Channel(MemLoc.L0C, (rows, 128), dtypes.float32, depth=1, capacity=(256, 128)).produce()
-        self.l0c1 = Channel(MemLoc.L0C, (rows, 128), dtypes.float32, depth=1, capacity=(256, 128)).produce()
-        self.half = Channel(
-            MemLoc.UB, (rows // 2, 128), dtypes.float32, depth=1, kind=ChannelKind.CrossCore, capacity=(256 // 2, 128))
-        self.projection_bf16 = Buffer(MemLoc.UB, (rows // 2, 128), dtypes.bfloat16, capacity=(256 // 2, 128))
-        self.nd2nz = make_copy_engine(format_transform="nd2nz")
-        self.fixpipe = make_copy_engine(split_axis=0)
+        self.a_l1 = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((256 * 256,)), depth=2, data_format="nd")
+        self.a_l1_shape = (rows, 256)
+        self.b_l1 = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((256, 256)), depth=2)
+        self.l0a = RingBuffer(MemLoc.L0A, dtypes.bfloat16, make_layout((256 * 64,)), depth=2, data_format="nd")
+        self.l0a_shape = (rows, 64)
+        self.l0b = RingBuffer(MemLoc.L0B, dtypes.bfloat16, make_layout((128, 64)), depth=2)
+        self.l0c0 = RingBuffer(MemLoc.L0C, dtypes.float32, make_layout((256 * 128,)), depth=1, data_format="nd").next_write().reinterpret(layout=make_layout((rows, 128)), data_format="nz")
+        self.l0c1 = RingBuffer(MemLoc.L0C, dtypes.float32, make_layout((256 * 128,)), depth=1, data_format="nd").next_write().reinterpret(layout=make_layout((rows, 128)), data_format="nz")
+        self.half = RingBuffer(MemLoc.UB, dtypes.float32, make_layout(((256 // 2) * 128,)), depth=1)
+        self.half_shape = (rows // 2, 128)
+        self.projection_bf16 = Buffer(MemLoc.UB, dtypes.bfloat16, make_layout((256 // 2 * 128,))).view(rows // 2, 128)
 
 
     @jit
     def acquire_result0(self):
-        self.projection_fp32 = self.half.produce()
-        mem_copy(self.projection_fp32, reinterpret(self.l0c0, shape=(self.rows, 128)), engine=self.fixpipe)
+        self.projection_fp32 = self.half.next_write().view(self.half_shape)
+        mem_copy(self.projection_fp32, self.l0c0.partition(dim=0))
 
     @jit
     def acquire_result1(self):
-        self.projection_fp32 = self.half.produce()
-        mem_copy(self.projection_fp32, reinterpret(self.l0c1, shape=(self.rows, 128)), engine=self.fixpipe)
+        self.projection_fp32 = self.half.next_write().view(self.half_shape)
+        mem_copy(self.projection_fp32, self.l0c1.partition(dim=0))
 
 
 class MultiCoreSchedule(_ProjectionScheduleOperations):
@@ -4001,12 +4028,15 @@ class MultiCoreSchedule(_ProjectionScheduleOperations):
             for task in range(get_block_idx(), task_count, get_block_num()):
                 macro = task // groups
                 group = task % groups
-                channel_rewind(reset_sync_id=True)
+                onchip_rewind(reset_sync_id=True)
                 projection = N256ProjectionStage(self.main_rows, self.config.ragged_main)
                 projection.weight_l2_cache_ctl = self.main_policy
                 convolution = ConvSiluStage(8, self.main_rows // 2, self.row_capacity // 2)
-                history = Buffer(MemLoc.UB, (2 * batches * 3, 128), dtypes.bfloat16,
-                    capacity=(3 * (self.row_capacity // 16) * 3, TILE))
+                history = Buffer(
+                    MemLoc.UB,
+                    dtypes.bfloat16,
+                    make_layout((3 * (self.row_capacity // 16) * 3 * TILE,)),
+                ).view(2 * batches * 3, 128)
                 batch_base = group * (self.main_rows // 8) + subblock * batches
                 if macro < 3 * self.num_heads // 2:
                     projection.matmul_hidden2(x, wqkv, group, macro)
@@ -4030,13 +4060,16 @@ class MultiCoreSchedule(_ProjectionScheduleOperations):
             for task in range(get_block_idx(), task_count, get_block_num()):
                 macro = task // groups
                 group = task % groups
-                channel_rewind(reset_sync_id=True)
+                onchip_rewind(reset_sync_id=True)
                 projection = N384ProjectionStage(self.main_rows, 0, self.config.main_weight_l2_cache_ctl)
                 projection.weight_l2_cache_ctl = self.main_policy
                 convolution = ConvSiluStage(8, self.main_rows // 2, self.row_capacity // 2)
                 batches = self.main_rows // 16
-                history = Buffer(MemLoc.UB, (3 * batches * 3, TILE), dtypes.bfloat16,
-                    capacity=(3 * (self.row_capacity // 16) * 3, TILE))
+                history = Buffer(
+                    MemLoc.UB,
+                    dtypes.bfloat16,
+                    make_layout((3 * (self.row_capacity // 16) * 3 * TILE,)),
+                ).view(3 * batches * 3, TILE)
                 if macro < self.num_heads:
                     projection.matmul_hidden3(x, wqkv, group, macro, 56)
                 else:
@@ -4048,7 +4081,7 @@ class MultiCoreSchedule(_ProjectionScheduleOperations):
             for task in range(get_block_idx(), groups * 4 * self.num_heads, get_block_num()):
                 head = task // groups
                 group = task % groups
-                channel_rewind(reset_sync_id=True)
+                onchip_rewind(reset_sync_id=True)
                 projection = ProjectionStage(
                     self.main_rows, 0, self.config.main_weight_l2_cache_ctl, row_capacity=self.main_rows)
                 convolution = ConvSiluStage(8, self.main_rows // 2, self.row_capacity // 2)
@@ -4087,7 +4120,7 @@ class AuxiliarySchedule(TPSchedule):
     def beta_tasks(self, beta, x, wbeta, width):
         groups = x.shape[0] // self.auxiliary_rows
         for group in range(get_block_idx(), groups, get_block_num()):
-            channel_rewind(reset_sync_id=True)
+            onchip_rewind(reset_sync_id=True)
             stage = DynamicBetaStage(self.auxiliary_rows, 0, 4, tile_width=width, row_capacity=self.auxiliary_rows)
             stage.project_to_gm(
                 tile_slice(x, make_tiler((self.auxiliary_rows, HIDDEN_SIZE), alignment=(16, 16)), (group, 0)), wbeta,
@@ -4102,17 +4135,17 @@ class AuxiliarySchedule(TPSchedule):
         else:
             self.beta_tasks(beta, x, wbeta, 16)
         global_sync_all()
-        channel_rewind(reset_sync_id=True)
+        onchip_rewind(reset_sync_id=True)
         groups = x.shape[0] // self.auxiliary_rows
         for group in range(get_block_idx(), groups, get_block_num()):
-            channel_rewind(reset_sync_id=True)
+            onchip_rewind(reset_sync_id=True)
             stage = ProjectionStage(self.auxiliary_rows, 0, 4, row_capacity=self.auxiliary_rows)
             stage.project_to_gm(
                 tile_slice(x, make_tiler((self.auxiliary_rows, HIDDEN_SIZE), alignment=(16, 16)), (group, 0)), wa,
                 tile_slice(fa, make_tiler((self.auxiliary_rows, TILE), alignment=(16, 16)), (group, 0)), 0, 56)
             vec_sync_all()
         global_sync_all()
-        channel_rewind(reset_sync_id=True)
+        onchip_rewind(reset_sync_id=True)
         self.frontend_fb(decay, fa, wb)
 
     @jit
@@ -4121,12 +4154,11 @@ class AuxiliarySchedule(TPSchedule):
         for task in range(get_block_idx(), groups * self.num_heads, get_block_num()):
             group = task // self.num_heads
             head = task % self.num_heads
-            channel_rewind(reset_sync_id=True)
+            onchip_rewind(reset_sync_id=True)
             stage = ProjectionStage(self.auxiliary_rows, 0, 0, row_capacity=self.auxiliary_rows)
-            a = Channel(MemLoc.L1, (self.auxiliary_rows, TILE), dtypes.bfloat16, depth=1).produce()
-            b = Channel(MemLoc.L1, (TILE, TILE), dtypes.bfloat16, depth=1, data_format="nz").produce()
-            mem_copy(a, tile_slice(fa, make_tiler((self.auxiliary_rows, TILE), alignment=(16, 16)), (group, 0)),
-                engine=stage.nd2nz)
+            a = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((self.auxiliary_rows, TILE)), depth=1).next_write()
+            b = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((TILE, TILE)), depth=1).next_write()
+            mem_copy(a, tile_slice(fa, make_tiler((self.auxiliary_rows, TILE), alignment=(16, 16)), (group, 0)))
             mem_copy(b, tile_slice(wb, (TILE, TILE), (head, 0)))
             stage.matmul_resident(a, b)
             stage.publish_result(
@@ -4145,35 +4177,33 @@ class DynamicOutputStage(OutputProjectionStage):
         gated_wave = gated_workspace_gm[wave_start: wave_start + valid, None]
         out_wave = out_gm[wave_start: wave_start + valid, None]
         if const_expr(self.resident_input):
-            resident_a = self.a_l1.produce()
-            mem_copy(resident_a[0:valid, None], gated_wave[None, 0: self.num_heads * TILE], engine=self.nd2nz)
+            resident_a = self.a_l1.next_write().reinterpret(layout=make_layout(self.a_l1_shape), data_format="nz")
+            mem_copy(resident_a[0:valid, None], gated_wave[None, 0: self.num_heads * TILE])
         for output_tile in range(get_block_idx(), tile_count, get_block_num()):
-            accumulator = self.l0c.produce()
+            accumulator = self.l0c.next_write().reinterpret(layout=make_layout(self.l0c_shape), data_format="nz")
             for kc_idx in range(k_tiles * TILE // self.kc):
                 if const_expr(self.resident_input):
                     a_panel = tile_slice(resident_a, (self.row_capacity, self.kc), (0, kc_idx))
                 else:
-                    a_panel = self.a_l1.produce()
-                    mem_copy(a_panel[0:valid, None], gated_wave[None, kc_idx * self.kc: (kc_idx + 1) * self.kc],
-                        engine=self.nd2nz)
+                    a_panel = self.a_l1.next_write().reinterpret(layout=make_layout(self.a_l1_shape), data_format="nz")
+                    mem_copy(a_panel[0:valid, None], gated_wave[None, kc_idx * self.kc: (kc_idx + 1) * self.kc])
                 if const_expr(self.resident_weight):
                     b_panel = tile_slice(self.b_l1, (self.tile_width, self.kc), (0, kc_idx))
                 else:
-                    b_panel = self.b_l1.produce()
+                    b_panel = self.b_l1.next_write()
                     mem_copy(b_panel, tile_slice(weight_gm, (self.tile_width, self.kc), (output_tile, kc_idx)))
                 for ks in range(self.kc // self.ks):
-                    a = self.l0a.produce()
-                    b = self.l0b.produce()
+                    a = self.l0a.next_write().reinterpret(layout=make_layout(self.l0a_shape), data_format="nz")
+                    b = self.l0b.next_write()
                     mem_copy(a, tile_slice(a_panel, (self.row_capacity, self.ks), (0, ks)))
                     mem_copy(b, tile_slice(b_panel, (self.tile_width, self.ks), (0, ks)))
                     matmul(accumulator, a, b, init=kc_idx == 0 and ks == 0)
             if valid < self.row_count:
                 for row in range(valid // 32):
-                    mem_copy(tile_slice(out_wave, (32, self.tile_width), (row, output_tile)),
-                        tile_slice(accumulator, (32, self.tile_width), (row, 0)), engine=self.fixpipe)
+                    mem_copy(tile_slice(out_wave, (32, self.tile_width), (row, output_tile)), tile_slice(accumulator,
+                        (32, self.tile_width), (row, 0)))
             else:
-                mem_copy(tile_slice(out_wave, (self.row_capacity, self.tile_width), (0, output_tile)), accumulator,
-                    engine=self.fixpipe)
+                mem_copy(tile_slice(out_wave, (self.row_capacity, self.tile_width), (0, output_tile)), accumulator)
             cube_sync_all()
 
 
@@ -4181,11 +4211,13 @@ class BackendSchedule:
     def __init__(
         self,
         heads):
-        self.config = Schedule(ragged_output=True)
         self.heads = heads
 
     @jit
     def project_template(self, out, q, wo, n, chunk, width, rows, heads, resident_input, resident_weight):
+        # Complete the previous Cube phase before declaring this branch's resources.
+        cube_sync_all()
+        onchip_rewind(reset_sync_id=True)
         output = DynamicOutputStage(width, rows, kc=384 if resident_weight else 256, row_capacity=rows,
             allow_tail=True, num_heads=heads, resident_input=resident_input, resident_weight=resident_weight,
             tiles_per_core=1)
@@ -4194,7 +4226,7 @@ class BackendSchedule:
                 output.prefetch_weight(wo)
         output.project(out, q, wo, n, chunk)
         cube_sync_all()
-        channel_rewind(reset_sync_id=True)
+        onchip_rewind(reset_sync_id=True)
 
     @jit
     def project_output(self, out, q, wo, n, chunk):
@@ -4211,6 +4243,8 @@ class BackendSchedule:
             self.project_template(out, q, wo, n, chunk, 128, 128, 12, True, False)
         else:
             self.project_template(out, q, wo, n, chunk, 256, 128, 24, False, False)
+        # Complete every template arm on the common chunk-loop backedge.
+        cube_sync_all()
 
     @jit
     def backend(self, out, q, k, v, decay, gate, beta, gamma, wo, alog, bias, initial, final, indices, accepted, scale,
@@ -4229,46 +4263,39 @@ class BackendSchedule:
             publish_rows = 64
         elif n == 6:
             publish_rows = 256
-        if const_expr(self.config.phase != "oproj"):
-            recurrent.load_gate_params(alog, bias)
-            output_gate.load_gamma(gamma)
-        if const_expr(self.config.phase == "oproj"):
-            for chunk in range(ceil_div(q.shape[0], publish_rows)):
-                self.project_output(out, q, wo, n, chunk)
-        else:
-            first = get_block_idx() * 2 + get_subblock_id()
-            if first < total:
-                prefetch_recurrent_item(
-                    recurrent, output_gate, q, k, v, decay, gate, beta, first, accepted.shape[0], 8, n, 128,
-                        nb_group_batch=publish_rows // 8)
-                prefetch_recurrent_state(recurrent, initial, indices, accepted, first, accepted.shape[0], 8, n, 128,
+        recurrent.load_gate_params(alog, bias)
+        output_gate.load_gamma(gamma)
+        first = get_block_idx() * 2 + get_subblock_id()
+        if first < total:
+            prefetch_recurrent_item(
+                recurrent, output_gate, q, k, v, decay, gate, beta, first, accepted.shape[0], 8, n, 128,
                     nb_group_batch=publish_rows // 8)
-            for slot in range(slots):
-                item = slot * stride + first
-                if item < total:
-                    run_recurrent_wave(recurrent, output_gate, q, k, v, decay, gate, beta, initial, final, indices,
-                        accepted, item, item + 1, accepted.shape[0], 8, n, 128, scale, lower, eps,
-                        defer_final_snapshot=True, first_inputs_prefetched=True, first_state_prefetched=True,
-                        next_item_stride=stride, nb_group_batch=publish_rows // 8)
-                before = slot * stride
-                after = (slot + 1) * stride if (slot + 1) * stride < total else total
-                jobs = publish_rows // 8 * n
-                ready_before = before // jobs
-                ready_after = after // jobs
-                if const_expr(self.config.ragged_output):
-                    if after == total:
-                        ready_after = ceil_div(after, jobs)
-                if const_expr(self.config.phase != "recurrent"):
-                    publish_vector_grid_to_cube(3, 4, ack_flag=5)
-                if item < total:
-                    batch, head = idx2crd(
-                        _recurrent_item_index(item, accepted.shape[0], n, publish_rows // 8), [accepted.shape[0], n])
-                    index = dtypes.int64(indices[batch * 8 + 7])
-                    recurrent.store_state(tile_slice(final[index, head, None, None], (128, 128), (0, 0)))
-                if const_expr(self.config.phase not in ("recurrent", "backend_no_output")):
-                    for chunk in range(ready_before, ready_after):
-                        self.project_output(out, q, wo, n, chunk)
-                channel_rewind(reset_sync_id=True)
+            prefetch_recurrent_state(recurrent, initial, indices, accepted, first, accepted.shape[0], 8, n, 128,
+                nb_group_batch=publish_rows // 8)
+        for slot in range(slots):
+            item = slot * stride + first
+            if item < total:
+                run_recurrent_wave(recurrent, output_gate, q, k, v, decay, gate, beta, initial, final, indices,
+                    accepted, item, item + 1, accepted.shape[0], 8, n, 128, scale, lower, eps,
+                    defer_final_snapshot=True, first_inputs_prefetched=True, first_state_prefetched=True,
+                    next_item_stride=stride, nb_group_batch=publish_rows // 8)
+            before = slot * stride
+            after = (slot + 1) * stride if (slot + 1) * stride < total else total
+            jobs = publish_rows // 8 * n
+            ready_before = before // jobs
+            ready_after = after // jobs
+            if after == total:
+                ready_after = ceil_div(after, jobs)
+            publish_vector_grid_to_cube(3, 4, ack_flag=5)
+            if item < total:
+                batch, head = idx2crd(
+                    _recurrent_item_index(item, accepted.shape[0], n, publish_rows // 8), [accepted.shape[0], n])
+                index = dtypes.int64(indices[batch * 8 + 7])
+                recurrent.store_state(tile_slice(final[index, head, None, None], (128, 128), (0, 0)))
+            for chunk in range(ready_before, ready_after):
+                self.project_output(out, q, wo, n, chunk)
+            cube_sync_all()
+            onchip_rewind(reset_sync_id=True)
 
 
 class TPStages:
@@ -4296,7 +4323,7 @@ class TPStages:
         plan_width, plan_policy):
         if get_block_num() == 32:
             self.fast32.execute(out, q, k, v, decay, gate, beta, fa, norm, x, wqkv, wa, wb, wbeta, wz, gamma, wo,
-                alog[0: self.heads, ], bias[0: self.heads, None], initial, final, indices, accepted, conv,
+                alog[0: self.heads,], bias[0: self.heads, None], initial, final, indices, accepted, conv,
                 conv_indices, conv_accepted, wc, scale, lower, eps)
         else:
             n = self.heads
@@ -4308,7 +4335,7 @@ class TPStages:
                 self.main256.main(
                     q, k, v, gate, x, wqkv, wz, conv, conv_indices, conv_accepted, wc, n, logical_rows, plan_policy)
             global_sync_all()
-            channel_rewind(reset_sync_id=True)
+            onchip_rewind(reset_sync_id=True)
             if x.shape[0] % 128 == 0:
                 self.aux128.execute(decay, beta, fa, x, wa, wb, wbeta)
             elif x.shape[0] % 64 == 0:
@@ -4316,7 +4343,7 @@ class TPStages:
             else:
                 self.aux32.execute(decay, beta, fa, x, wa, wb, wbeta)
             global_sync_all()
-            channel_rewind(reset_sync_id=True)
+            onchip_rewind(reset_sync_id=True)
             if n != 6 and accepted.shape[0] * n == 96:
                 self.head_backend.backend(out, q, k, v, decay, gate, beta, gamma, wo, alog[0:n,], bias[0:n, None],
                     initial, final, indices, accepted, scale, lower, eps)

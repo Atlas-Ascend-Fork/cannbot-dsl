@@ -18,12 +18,12 @@ from functools import lru_cache
 from typing import Optional, Tuple
 
 import cannbotdsl
+import torch
 from cannbotdsl import Tensor, aot, dtypes, get_platform_info
 from cannbotdsl.lang.host import host
 from cannbotdsl.lang.kernel import kernel
 from cannbotdsl.ops.arch import get_block_num
-from cannbotdsl.ops.sync import channel_rewind
-import torch
+from cannbotdsl.ops.sync import onchip_rewind
 
 from .flash_kda_metadata import (
     ABI_VERSION,
@@ -130,14 +130,14 @@ class flash_kda_kernel:
         ):
             selected_template = gm_metadata[HEADER_TEMPLATE]
             if selected_template == TEMPLATE_STAGED:
-                channel_rewind(reset_sync_id=True)
+                onchip_rewind(reset_sync_id=True)
                 run_staged_flash_kda(
                     gm_K, gm_V, gm_Q, gm_beta, gm_g, gm_qk_exchange, gm_A_log, gm_dt_bias, gm_k_restored, gm_gamma,
                     gm_q_decayed, gm_w, gm_Mqk, gm_U, gm_O, gm_state_in, gm_state_out, gm_identity16, gm_metadata,
                     scale_value, lower_bound,
                 )
             else:
-                channel_rewind(reset_sync_id=True)
+                onchip_rewind(reset_sync_id=True)
                 run_persistent_flash_kda(
                     gm_Q, gm_K, gm_V, gm_g, gm_beta, gm_state_in, gm_A_log, gm_dt_bias, gm_identity16, gm_qk_exchange,
                     gm_O, gm_state_out, gm_metadata, scale_value, lower_bound,
@@ -566,5 +566,5 @@ def _flash_kda_graph(
 
 
 def __getattr__(name):
-    """Expose helper attributes from the staged template module."""
+    """Preserve the original module helpers after extracting the staged template."""
     return getattr(_staged_template, name)

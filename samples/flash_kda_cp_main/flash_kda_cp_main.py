@@ -6,6 +6,8 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 
+# fmt: off
+
 """FlashKDA CP main public operator."""
 
 import dataclasses
@@ -17,9 +19,8 @@ from typing import Optional
 
 import cannbotdsl
 import torch
-from cannbotdsl import PIPE, ChannelKind, MemLoc, Tensor, dtypes, get_platform_info
+from cannbotdsl import PIPE, MemLoc, Tensor, dtypes, get_platform_info, make_layout
 from cannbotdsl.buffer import Buffer
-from cannbotdsl.channel import Channel
 from cannbotdsl.lang import vf
 from cannbotdsl.lang.constexpr import const_expr
 from cannbotdsl.lang.control_flow import range as dsl_range
@@ -29,7 +30,7 @@ from cannbotdsl.lang.kernel import kernel
 from cannbotdsl.ops import reg as reg_ops
 from cannbotdsl.ops.arch import get_block_idx, get_block_num, get_subblock_id
 from cannbotdsl.ops.matmul import matmul
-from cannbotdsl.ops.memcpy import make_copy_engine, mem_copy
+from cannbotdsl.ops.memcpy import copy_options, mem_copy
 from cannbotdsl.ops.reg import (
     PackMode,
     UnpackMode,
@@ -45,14 +46,15 @@ from cannbotdsl.ops.reg import (
     vstore_pack,
 )
 from cannbotdsl.ops.sync import (
-    channel_rewind,
     cube_sync_all,
     cube_sync_block_arrive,
     cube_sync_block_wait,
+    onchip_rewind,
     vec_sync_all,
     vec_sync_block_arrive,
     vec_sync_block_wait,
 )
+from cannbotdsl.ring_buffer import RingBuffer
 from cannbotdsl.tensor import idx2crd, reinterpret, tile_slice
 
 try:
@@ -214,72 +216,68 @@ VL = CHUNK_SIZE  # A 256-byte register holds 64 f32 lanes.
 
 
 class Matmul:
-    def __init__(self, *, dv_base: int):
+    def __init__(self, *, dv_base: int, shared=None):
         self.dv_base = dv_base
-        self.l0a_chunk = Channel(MemLoc.L0A, shape=(CHUNK_SIZE, SUPPORTED_HEAD_DIM), dtype=dtypes.bfloat16, depth=2)
-        self.l0a_kr_t = Channel(
-            MemLoc.L0A, shape=(CHUNK_SIZE, dv_base), dtype=dtypes.bfloat16, depth=1, data_format="zn"
-        ).produce()
-        self.l0a_mqk = Channel(MemLoc.L0A, shape=(CHUNK_SIZE, CHUNK_SIZE), dtype=dtypes.bfloat16, depth=1).produce()
-        self.l0b_u = Channel(MemLoc.L0B, shape=(CHUNK_SIZE, dv_base), dtype=dtypes.bfloat16, depth=1).produce()
-        self.l0b_state = Channel(
-            MemLoc.L0B, shape=(dv_base, SUPPORTED_HEAD_DIM), dtype=dtypes.bfloat16, depth=1
-        ).produce()
-        self.l0b_kr = Channel(
-            MemLoc.L0B, shape=(CHUNK_SIZE, SUPPORTED_HEAD_DIM), dtype=dtypes.bfloat16, depth=1
-        ).produce()
-        self.l0c_u = Channel(MemLoc.L0C, shape=(CHUNK_SIZE, dv_base), dtype=dtypes.float32, depth=1).produce()
-        self.l0c_o = Channel(MemLoc.L0C, shape=(CHUNK_SIZE, dv_base), dtype=dtypes.float32, depth=1).produce()
-        self.l0c_state = Channel(
-            MemLoc.L0C, shape=(dv_base, SUPPORTED_HEAD_DIM), dtype=dtypes.float32, depth=1
-        ).produce()
-        self.gm2l1 = make_copy_engine(format_transform="nd2nz")
-        self.fixpipe_state = make_copy_engine(split_axis=1)
-        self.fixpipe_u = make_copy_engine(split_axis=0)
+        if shared is not None:
+            self.l0a_chunk = shared.l0a_chunk
+            self.l0a_kr_t = reinterpret(shared.l0a_kr_t, layout=make_layout((CHUNK_SIZE, dv_base)), data_format="zn")
+            self.l0a_mqk = shared.l0a_mqk
+            self.l0b_u = reinterpret(shared.l0b_u, layout=make_layout((CHUNK_SIZE, dv_base)), data_format="zn")
+            self.l0b_state = reinterpret(shared.l0b_state, layout=make_layout((dv_base, SUPPORTED_HEAD_DIM)), data_format="nz")
+            self.l0b_kr = shared.l0b_kr
+            self.l0c_u = reinterpret(shared.l0c_u, layout=make_layout((CHUNK_SIZE, dv_base)), data_format="nz")
+            self.l0c_o = reinterpret(shared.l0c_o, layout=make_layout((CHUNK_SIZE, dv_base)), data_format="nz")
+            self.l0c_state = reinterpret(shared.l0c_state, layout=make_layout((dv_base, SUPPORTED_HEAD_DIM)), data_format="nz")
+            return
+        self.l0a_chunk = RingBuffer(MemLoc.L0A, dtypes.bfloat16, make_layout((CHUNK_SIZE, SUPPORTED_HEAD_DIM)), depth=2)
+        self.l0a_kr_t = RingBuffer(MemLoc.L0A, dtypes.bfloat16, make_layout((dv_base, CHUNK_SIZE)), depth=1).next_write().permute(1, 0)
+        self.l0a_mqk = RingBuffer(MemLoc.L0A, dtypes.bfloat16, make_layout((CHUNK_SIZE, CHUNK_SIZE)), depth=1).next_write()
+        self.l0b_u = RingBuffer(MemLoc.L0B, dtypes.bfloat16, make_layout((dv_base, CHUNK_SIZE)), depth=1).next_write().permute(1, 0)
+        self.l0b_state = RingBuffer(MemLoc.L0B, dtypes.bfloat16, make_layout((dv_base, SUPPORTED_HEAD_DIM)), depth=1).next_write()
+        self.l0b_kr = RingBuffer(MemLoc.L0B, dtypes.bfloat16, make_layout((SUPPORTED_HEAD_DIM, CHUNK_SIZE)), depth=1).next_write().permute(1, 0)
+        self.l0c_u = RingBuffer(MemLoc.L0C, dtypes.float32, make_layout((CHUNK_SIZE, dv_base)), depth=1).next_write()
+        self.l0c_o = RingBuffer(MemLoc.L0C, dtypes.float32, make_layout((CHUNK_SIZE, dv_base)), depth=1).next_write()
+        self.l0c_state = RingBuffer(MemLoc.L0C, dtypes.float32, make_layout((dv_base, SUPPORTED_HEAD_DIM)), depth=1).next_write()
 
     def load_q_decayed(self, q_decayed_l1, gm_tile, valid_rows):
         self._load_padded_chunk(q_decayed_l1, gm_tile, valid_rows)
 
     def load_state(self, state_l1):
-        mem_copy(self.l0b_state, state_l1.consume())
+        mem_copy(self.l0b_state, reinterpret(state_l1.next_read(), layout=make_layout((self.dv_base, SUPPORTED_HEAD_DIM)), data_format="nz"))
 
     def compute_w_state(self, w_l1):
-        mem_copy(self.l0a_chunk.produce(), w_l1.consume())
-        matmul(self.l0c_u, self.l0a_chunk.consume(), self.l0b_state, init=True)
+        mem_copy(self.l0a_chunk.next_write(), w_l1.next_read())
+        matmul(self.l0c_u, self.l0a_chunk.next_read(), self.l0b_state, init=True)
 
     def compute_q_state(self, q_decayed_l1):
-        mem_copy(self.l0a_chunk.produce(), q_decayed_l1.consume())
-        matmul(self.l0c_o, self.l0a_chunk.consume(), self.l0b_state, init=True)
+        mem_copy(self.l0a_chunk.next_write(), q_decayed_l1.next_read())
+        matmul(self.l0c_o, self.l0a_chunk.next_read(), self.l0b_state, init=True)
 
     def load_k_restored_operand(self, k_restored_l1):
-        mem_copy(self.l0b_kr, k_restored_l1.consume(), transpose=True)
+        mem_copy(self.l0b_kr, k_restored_l1.next_read())
 
     def load_mqk_operand(self, mqk_l1):
-        mem_copy(self.l0a_mqk, mqk_l1.consume())
+        mem_copy(self.l0a_mqk, mqk_l1.next_read())
 
     def update_state(self, u_slot):
-        u_src = reinterpret(u_slot, shape=(CHUNK_SIZE, self.dv_base), offset=0)
-        mem_copy(self.l0a_kr_t, u_src, transpose=True)
-        matmul(self.l0c_state, self.l0a_kr_t, self.l0b_kr, init=True)
+        u_src = reinterpret(u_slot, offset=0, layout=make_layout((CHUNK_SIZE, self.dv_base)))
+        mem_copy(self.l0a_kr_t, u_src)
+        matmul(self.l0c_state, self.l0a_kr_t.permute(1, 0), self.l0b_kr, init=True)
 
     def accumulate_mqk_u(self, u_slot):
-        u_tile = reinterpret(u_slot, shape=(CHUNK_SIZE, self.dv_base), offset=0)
-        mem_copy(self.l0b_u, u_tile, transpose=True)
+        u_tile = reinterpret(u_slot, offset=0, layout=make_layout((CHUNK_SIZE, self.dv_base)))
+        mem_copy(self.l0b_u, u_tile)
         matmul(self.l0c_o, self.l0a_mqk, self.l0b_u, init=False)
 
     def store_u_delta(self, ub):
-        mem_copy(ub, tile_slice(self.l0c_u, (CHUNK_SIZE, self.dv_base), (0, 0)), engine=self.fixpipe_u)
+        mem_copy(ub, self.l0c_u.partition(dim=0))
 
     def store_output(self, gm_tile):
         """FIXPIPE 按目的 GM Access.actual_rows 写入逻辑尾块。"""
-        mem_copy(
-            gm_tile,
-            self.l0c_o,
-            l2_cache_ctl=_L2_CACHE_DISABLE,
-        )
+        mem_copy(gm_tile, self.l0c_o, options=copy_options(l2_cache_ctl=_L2_CACHE_DISABLE))
 
     def store_state_delta(self, ub):
-        mem_copy(ub, self.l0c_state, engine=self.fixpipe_state)
+        mem_copy(ub, self.l0c_state.partition(dim=1))
 
     def load_k_cumdecay(self, k_cumdecay_l1, gm_tile, valid_rows):
         self._load_padded_chunk(k_cumdecay_l1, gm_tile, valid_rows)
@@ -292,38 +290,44 @@ class Matmul:
 
     @jit
     def _load_padded_chunk(self, channel, gm_tile, valid_rows, *, l2_cache_ctl=0):
-        slot = channel.produce()
+        slot = channel.next_write()
         if valid_rows < CHUNK_SIZE:
             for col_block in range(gm_tile.shape[1] // 16):
                 gm_col = tile_slice(gm_tile, (CHUNK_SIZE, 16), (0, col_block))
                 l1_col = tile_slice(slot, (CHUNK_SIZE, 16), (0, col_block))
-                mem_copy(l1_col, _valid_rows_view(gm_col, valid_rows, 16), l2_cache_ctl=l2_cache_ctl, engine=self.gm2l1)
+                mem_copy(l1_col, _valid_rows_view(gm_col, valid_rows, 16), options=copy_options(l2_cache_ctl=l2_cache_ctl))
         else:
-            mem_copy(slot, gm_tile, l2_cache_ctl=l2_cache_ctl, engine=self.gm2l1)
+            mem_copy(slot, gm_tile, options=copy_options(l2_cache_ctl=l2_cache_ctl))
 
 
 class Vector:
-    def __init__(self, *, u_row_block: int, dv_base: int):
+    def __init__(self, *, u_row_block: int, dv_base: int, shared=None):
         self.dv_base = dv_base
         self.u_row_block = u_row_block
         self.half_dk = D_HALF
-        self.ub_state_fp32 = Buffer(MemLoc.UB, (self.dv_base, self.half_dk), dtypes.float32)
-        self.tmp_u_bf16 = Buffer(MemLoc.UB, (u_row_block, dv_base), dtypes.bfloat16)
-        self.state_nd = Channel(MemLoc.UB, (self.dv_base, self.half_dk), dtypes.bfloat16, depth=1).produce()
-        self.state_nz = Channel(
-            MemLoc.UB, (self.dv_base, self.half_dk), dtypes.bfloat16, depth=1, data_format="nz", n1_pad=16
-        ).produce()
-        self.u_nz = Channel(
-            MemLoc.UB, (u_row_block, dv_base), dtypes.bfloat16, depth=1, data_format="nz", n1_pad=16
-        ).produce()
-        self.state_in = Channel(MemLoc.UB, (self.dv_base, self.half_dk), dtypes.float32, depth=1).produce()
-        self.state_out = Channel(MemLoc.UB, (self.dv_base, self.half_dk), dtypes.float32, depth=1).produce()
-        self.u_in = Channel(MemLoc.UB, (u_row_block, dv_base), dtypes.bfloat16, depth=2)
+        if shared is not None:
+            self.ub_state_fp32 = reinterpret(shared.ub_state_fp32, layout=make_layout((dv_base, D_HALF)))
+            self.tmp_u_bf16 = reinterpret(shared.tmp_u_bf16, layout=make_layout((u_row_block, dv_base)))
+            self.state_nd = reinterpret(shared.state_nd, layout=make_layout((dv_base, D_HALF)))
+            self.state_nz = reinterpret(shared.state_nz, layout=make_layout((dv_base, D_HALF)), data_format="nz", physical_layout=make_layout(((D_HALF+15)//16, (dv_base+15)//16, 16, 16), stride=(((dv_base+15)//16*256+16),256,16,1)))
+            self.u_nz = reinterpret(shared.u_nz, layout=make_layout((u_row_block, dv_base)), data_format="nz", physical_layout=make_layout(((dv_base+15)//16, (u_row_block+15)//16, 16, 16), stride=(((u_row_block+15)//16*256+16),256,16,1)))
+            self.state_in = reinterpret(shared.state_in, layout=make_layout((dv_base, D_HALF)))
+            self.state_out = reinterpret(shared.state_out, layout=make_layout((dv_base, D_HALF)))
+            self.u_in = shared.u_in
+            return
+        self.ub_state_fp32 = Buffer(MemLoc.UB, dtypes.float32, make_layout((self.dv_base, self.half_dk)))
+        self.tmp_u_bf16 = Buffer(MemLoc.UB, dtypes.bfloat16, make_layout((u_row_block, dv_base)))
+        self.state_nd = RingBuffer(MemLoc.UB, dtypes.bfloat16, make_layout((self.dv_base, self.half_dk)), depth=1).next_write()
+        self.state_nz = RingBuffer(MemLoc.UB, dtypes.bfloat16, make_layout((self.dv_base, self.half_dk)), depth=1, data_format='nz', physical_layout=make_layout(((self.half_dk + 15) // 16, (self.dv_base + 15) // 16, 16, 16), stride=((self.dv_base + 15) // 16 * 256 + 16, 256, 16, 1))).next_write()
+        self.u_nz = RingBuffer(MemLoc.UB, dtypes.bfloat16, make_layout((u_row_block, dv_base)), depth=1, data_format='nz', physical_layout=make_layout(((dv_base + 15) // 16, (u_row_block + 15) // 16, 16, 16), stride=((u_row_block + 15) // 16 * 256 + 16, 256, 16, 1))).next_write()
+        self.state_in = RingBuffer(MemLoc.UB, dtypes.float32, make_layout((self.dv_base, self.half_dk)), depth=1).next_write()
+        self.state_out = RingBuffer(MemLoc.UB, dtypes.float32, make_layout((self.dv_base, self.half_dk)), depth=1).next_write()
+        self.u_in = RingBuffer(MemLoc.UB, dtypes.bfloat16, make_layout((u_row_block, dv_base)), depth=2)
 
     def load_gamma_row(self, gamma_ub, gamma_row, subblock_idx):
         """Load one row of ``decay[B,N,C,D]`` as the column consumed by VF."""
         row = tile_slice(gamma_row, (1, self.half_dk), (0, subblock_idx))
-        slot = gamma_ub.produce()
+        slot = gamma_ub.next_write()
         mem_copy(slot, row)
 
     def load_initial_state_and_write_l1(self, current_state, state_l1, subblock_idx):
@@ -341,7 +345,7 @@ class Vector:
     @jit
     def scale_and_add_delta(self, tmp_delta, gamma_ub):
         """Fuse state decay and delta accumulation into one full-state VF pass."""
-        gamma_read = gamma_ub.consume()
+        gamma_read = gamma_ub.next_read()
         ub_gamma = gamma_read
         ub_state = self.ub_state_fp32
         delta = tmp_delta
@@ -363,14 +367,11 @@ class Vector:
             if rows > self.u_row_block:
                 rows = self.u_row_block
             gm_u_rows = tile_slice(gm_u_tile, (self.u_row_block, self.dv_base), (subblock_idx, 0))
-            mem_copy(
-                _valid_rows_view(self.u_in.produce(), rows, self.dv_base),
-                _valid_rows_view(gm_u_rows, rows, self.dv_base),
-            )
+            mem_copy(_valid_rows_view(reinterpret(self.u_in.next_write(), layout=make_layout((self.u_row_block, self.dv_base))), rows, self.dv_base), _valid_rows_view(gm_u_rows, rows, self.dv_base))
 
     @jit
     def finish_u_delta_to_l1(self, u_l1, tmp_u_delta, subblock_idx, valid_rows):
-        u_l1_rows = tile_slice(u_l1.produce(), (self.u_row_block, self.dv_base), (subblock_idx, 0))
+        u_l1_rows = tile_slice(reinterpret(u_l1.next_write(), layout=make_layout((CHUNK_SIZE, self.dv_base)), data_format="nz"), (self.u_row_block, self.dv_base), (subblock_idx, 0))
 
         delta = tmp_u_delta
         row_start = subblock_idx * self.u_row_block
@@ -380,7 +381,7 @@ class Vector:
         if rows > self.u_row_block:
             rows = self.u_row_block
         if rows == self.u_row_block:
-            u_in_read = self.u_in.consume()
+            u_in_read = reinterpret(self.u_in.next_read(), layout=make_layout((self.u_row_block, self.dv_base)))
             with vf(mode="simd"):
                 mask, _ = update_mask(VL, elem_bits=32)
                 for base in range(0, self.u_row_block * self.dv_base, 2 * VL):
@@ -405,7 +406,7 @@ class Vector:
                     vstore(self.tmp_u_bf16, row * self.dv_base, zero, bf16_mask)
                 vmem_bar("vst_vld")
         if rows > 0 and rows < self.u_row_block:
-            u_tail_read = self.u_in.consume()
+            u_tail_read = reinterpret(self.u_in.next_read(), layout=make_layout((self.u_row_block, self.dv_base)))
             with vf(mode="simd"):
                 for row in dsl_range(0, rows, 1, unroll=2):
                     for col in range(0, self.dv_base, VL):
@@ -439,7 +440,7 @@ class Vector:
         nz_slot = self.state_nz
         nd2nz_tile(nz_slot, nd_read)
         nz_read = self.state_nz
-        slot = state_l1.produce()
+        slot = reinterpret(state_l1.next_write(), layout=make_layout((self.dv_base, SUPPORTED_HEAD_DIM)), data_format="nz")
         state_l1_rows = tile_slice(slot, (self.dv_base, self.half_dk), (0, subblock_idx))
         mem_copy(state_l1_rows, nz_read)
 
@@ -489,36 +490,30 @@ class _WorkPartition:
 class _Resources:
     """Own the channels for one allocation region and preserve their creation order."""
 
-    def __init__(self, dv_base):
-        self.q_l1 = Channel(MemLoc.L1, shape=(CHUNK_SIZE, SUPPORTED_HEAD_DIM), dtype=dtypes.bfloat16, depth=2)
-        self.w_l1 = Channel(MemLoc.L1, shape=(CHUNK_SIZE, SUPPORTED_HEAD_DIM), dtype=dtypes.bfloat16, depth=2)
-        self.k_restored_l1 = Channel(
-            MemLoc.L1, shape=(CHUNK_SIZE, SUPPORTED_HEAD_DIM), dtype=dtypes.bfloat16, depth=2, data_format="nz"
-        )
-        self.mqk_l1 = Channel(MemLoc.L1, shape=(CHUNK_SIZE, CHUNK_SIZE), dtype=dtypes.bfloat16, depth=2)
-        self.state_l1 = Channel(
-            MemLoc.L1,
-            shape=(dv_base, SUPPORTED_HEAD_DIM),
-            dtype=dtypes.bfloat16,
-            depth=2,
-            data_format="nz",
-            kind=ChannelKind.CrossCore,
-        )
-        self.u_l1 = Channel(
-            MemLoc.L1,
-            shape=(CHUNK_SIZE, SUPPORTED_HEAD_DIM),
-            dtype=dtypes.bfloat16,
-            depth=2,
-            kind=ChannelKind.CrossCore,
-        )
+    def __init__(self, dv_base, shared=None):
+        if shared is not None:
+            self.q_l1 = shared.q_l1
+            self.w_l1 = shared.w_l1
+            self.k_restored_l1 = shared.k_restored_l1
+            self.mqk_l1 = shared.mqk_l1
+            self.state_l1 = shared.state_l1
+            self.u_l1 = shared.u_l1
+            self.gamma_ub = shared.gamma_ub
+            self.matmul = Matmul(dv_base=dv_base, shared=shared.matmul)
+            self.tmp_delta = reinterpret(shared.tmp_delta, layout=make_layout((dv_base, D_HALF)))
+            self.tmp_u_delta = reinterpret(shared.tmp_u_delta, layout=make_layout((CHUNK_SIZE // 2, dv_base)))
+            self.vector = Vector(u_row_block=CHUNK_SIZE // 2, dv_base=dv_base, shared=shared.vector)
+            return
+        self.q_l1 = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((CHUNK_SIZE, SUPPORTED_HEAD_DIM)), depth=2)
+        self.w_l1 = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((CHUNK_SIZE, SUPPORTED_HEAD_DIM)), depth=2)
+        self.k_restored_l1 = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((CHUNK_SIZE, SUPPORTED_HEAD_DIM)), depth=2, data_format='nz')
+        self.mqk_l1 = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((CHUNK_SIZE, CHUNK_SIZE)), depth=2)
+        self.state_l1 = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((dv_base, SUPPORTED_HEAD_DIM)), depth=2, data_format='nz')
+        self.u_l1 = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((CHUNK_SIZE, SUPPORTED_HEAD_DIM)), depth=2)
         self.matmul = Matmul(dv_base=dv_base)
-        self.gamma_ub = Channel(MemLoc.UB, shape=(1, D_HALF), dtype=dtypes.float32, depth=2)
-        self.tmp_delta = Channel(
-            MemLoc.UB, shape=(dv_base, D_HALF), dtype=dtypes.float32, depth=1, kind=ChannelKind.CrossCore
-        ).produce()
-        self.tmp_u_delta = Channel(
-            MemLoc.UB, shape=(CHUNK_SIZE // 2, dv_base), dtype=dtypes.float32, depth=1, kind=ChannelKind.CrossCore
-        ).produce()
+        self.gamma_ub = RingBuffer(MemLoc.UB, dtypes.float32, make_layout((1, D_HALF)), depth=2)
+        self.tmp_delta = RingBuffer(MemLoc.UB, dtypes.float32, make_layout((dv_base, D_HALF)), depth=1).next_write()
+        self.tmp_u_delta = RingBuffer(MemLoc.UB, dtypes.float32, make_layout((CHUNK_SIZE // 2, dv_base)), depth=1).next_write()
         self.vector = Vector(u_row_block=CHUNK_SIZE // 2, dv_base=dv_base)
 
 
@@ -598,7 +593,7 @@ def _run_chunks(tensors, work, resources, position):
 
         resources.vector.finish_u_delta_to_l1(resources.u_l1, resources.tmp_u_delta, position.subblock, valid_rows)
 
-        u_slot = resources.u_l1.consume()
+        u_slot = resources.u_l1.next_read()
         resources.matmul.update_state(u_slot)
         resources.matmul.store_state_delta(resources.tmp_delta)
 
@@ -623,11 +618,11 @@ def _run_chunks(tensors, work, resources, position):
 
 
 @jit
-def _run_flash_kda_cp_body(tensors, work, partition):
+def _run_flash_kda_cp_body(tensors, work, partition, shared_resources):
     block_idx = get_block_idx()
     subblock_idx = get_subblock_id()
     num_dv_base = SUPPORTED_HEAD_DIM // partition.dv_base
-    resources = _Resources(partition.dv_base)
+    resources = _Resources(partition.dv_base, shared=shared_resources)
     if block_idx < partition.logical_core_num:
         for item in range(partition.item_start, partition.item_end):
             head_id, dv_idx = idx2crd(item, [partition.head_count, num_dv_base])
@@ -648,7 +643,7 @@ _ROUND_BOUNDARY_AIC_AIV_FLAG_OFFSET = 8
 
 
 def _rewind_buffers():
-    channel_rewind(reset_sync_id=False)
+    onchip_rewind(reset_sync_id=False)
 
 
 def _round_boundary_reset(flag_id: int):
@@ -672,7 +667,7 @@ def _round_boundary_reset(flag_id: int):
 
 def _rewind_split_branch():
     """End the allocation region before selecting another dv split variant."""
-    channel_rewind(reset_sync_id=True)
+    onchip_rewind(reset_sync_id=True)
 
 
 @dataclasses.dataclass
@@ -692,7 +687,7 @@ class _RoundSchedule:
 
 
 @jit
-def _run_flash_kda_cp_round(tensors, schedule, dv_base):
+def _run_flash_kda_cp_round(tensors, schedule, dv_base, shared_resources):
     for active_batch_idx in range(0, schedule.active_batch_num):
         prefix_start = tensors.metadata[schedule.task_prefix_base + active_batch_idx]
         prefix_end = tensors.metadata[schedule.task_prefix_base + active_batch_idx + 1]
@@ -729,23 +724,24 @@ def _run_flash_kda_cp_round(tensors, schedule, dv_base):
         bounded_tensors = _MainTensors(sequence, tensors.state, tensors.metadata)
         work = _SequenceWork(chunks_total, seq_len, group_start, group_count, logical_batch)
         partition = _WorkPartition(dv_base, schedule.head_count, schedule.logical_core_num, item_start, item_end)
-        _run_flash_kda_cp_body(bounded_tensors, work, partition)
+        _run_flash_kda_cp_body(bounded_tensors, work, partition, shared_resources)
 
 
 @jit
 def _run_flash_kda_cp_dynamic(tensors, schedule, dv_splits_num):
+    shared_resources = _Resources(SUPPORTED_HEAD_DIM)
     if dv_splits_num == 1:
         _rewind_split_branch()
-        _run_flash_kda_cp_round(tensors, schedule, 128)
+        _run_flash_kda_cp_round(tensors, schedule, 128, shared_resources)
     elif dv_splits_num == 2:
         _rewind_split_branch()
-        _run_flash_kda_cp_round(tensors, schedule, 64)
+        _run_flash_kda_cp_round(tensors, schedule, 64, shared_resources)
     elif dv_splits_num == 4:
         _rewind_split_branch()
-        _run_flash_kda_cp_round(tensors, schedule, 32)
+        _run_flash_kda_cp_round(tensors, schedule, 32, shared_resources)
     else:
         _rewind_split_branch()
-        _run_flash_kda_cp_round(tensors, schedule, 16)
+        _run_flash_kda_cp_round(tensors, schedule, 16, shared_resources)
 
 
 @kernel(

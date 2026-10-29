@@ -1,5 +1,7 @@
 # fused_recurrent_kda_replayssm
 
+依赖版本：CANNBot-DSL 0.8.0。
+
 基于 CANNBot-DSL 的独立 ReplaySSM verify 算子，面向 Ascend 950。实现位于 [`fused_recurrent_kda_replayssm.py`](fused_recurrent_kda_replayssm.py)。算子从只读 FP32 checkpoint 计算全部候选 token，返回 KDA 输出，并写出后续 Commit 使用的 replay record。
 
 ## 功能说明

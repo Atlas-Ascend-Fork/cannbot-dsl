@@ -1,5 +1,7 @@
 # mega_recurrent_kda
 
+依赖版本：CANNBot-DSL 0.8.0。
+
 ## 产品支持情况
 
 - Ascend 950。
@@ -166,7 +168,7 @@ Snapshot 检查全部 8 个 token 的 FP32 状态快照及完整 Conv 状态池�
 
 ## 性能
 
-验证环境为 Ascend 950、CANN 9.2.0-beta.2、DSL 0.7.1。
+测试设备为 Ascend 950，CANN 9.2.0-beta.2。
 
 性能测试覆盖 TP4/8/16 × 模型 batch 1/8/16/32 × 8/16/24/32 AIC，共 48 个代表点，精度检查全部通过。表中核数为 AIC 数，对应 AIV 配额为其两倍；32 AIC 列使用 32 AIC / 64 AIV。
 

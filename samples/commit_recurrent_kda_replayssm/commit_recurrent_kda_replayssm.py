@@ -6,6 +6,8 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 
+# fmt: off
+
 """Standalone accepted-prefix checkpoint replay for Mega KDA ReplaySSM."""
 
 # Tensor operands are explicit to preserve the kernel ABI and DSL lexical order.
@@ -17,10 +19,9 @@ from __future__ import annotations
 import cannbotdsl
 import torch
 import torch._dynamo as torch_dynamo
-from cannbotdsl import MemLoc, Tensor, TensorSpec, dtypes
+from cannbotdsl import MemLoc, Tensor, TensorSpec, dtypes, make_layout
 from cannbotdsl.aot import export
 from cannbotdsl.buffer import Buffer
-from cannbotdsl.channel import Channel
 from cannbotdsl.lang.control_flow import range as dsl_range
 from cannbotdsl.lang.host import host
 from cannbotdsl.lang.jit import jit
@@ -28,7 +29,6 @@ from cannbotdsl.lang.kernel import kernel
 from cannbotdsl.lang.vf import vf
 from cannbotdsl.ops.arch import get_block_idx, get_block_num
 from cannbotdsl.ops.memcpy import mem_copy
-from cannbotdsl.ops.sync import channel_rewind
 from cannbotdsl.ops.reg import (
     UnpackMode,
     update_mask,
@@ -40,6 +40,8 @@ from cannbotdsl.ops.reg import (
     vmul,
     vstore,
 )
+from cannbotdsl.ops.sync import onchip_rewind
+from cannbotdsl.ring_buffer import RingBuffer
 from cannbotdsl.tensor import idx2crd, reinterpret, tile_slice
 
 TILE = 128
@@ -159,15 +161,15 @@ class CommitRecurrentKDAReplaySSMStage:
     """Replay one accepted token stream for each batch/head checkpoint."""
 
     def __init__(self):
-        self.state_current = Buffer(MemLoc.UB, (TILE, TILE), dtypes.float32)
+        self.state_current = Buffer(MemLoc.UB, dtypes.float32, make_layout((TILE, TILE)))
         # The paired schedule keeps the next state tile in UB while the
         # current head drains its accepted-token stream.  The tile shape is
         # independent of B, N and S; only the scheduler is runtime-shaped.
-        self.state_next = Buffer(MemLoc.UB, (TILE, TILE), dtypes.float32)
-        self.replay_u = Channel(MemLoc.UB, (1, TILE), dtypes.float16, depth=2)
-        self.replay_k = Channel(MemLoc.UB, (1, TILE), dtypes.float16, depth=2)
-        self.replay_decay = Channel(MemLoc.UB, (1, TILE), dtypes.float32, depth=2)
-        self.u_fp32 = Buffer(MemLoc.UB, (1, TILE), dtypes.float32)
+        self.state_next = Buffer(MemLoc.UB, dtypes.float32, make_layout((TILE, TILE)))
+        self.replay_u = RingBuffer(MemLoc.UB, dtypes.float16, make_layout((1, TILE)), depth=2)
+        self.replay_k = RingBuffer(MemLoc.UB, dtypes.float16, make_layout((1, TILE)), depth=2)
+        self.replay_decay = RingBuffer(MemLoc.UB, dtypes.float32, make_layout((1, TILE)), depth=2)
+        self.u_fp32 = Buffer(MemLoc.UB, dtypes.float32, make_layout((1, TILE)))
 
     @jit
     def prefetch_record(
@@ -181,9 +183,9 @@ class CommitRecurrentKDAReplaySSMStage:
         row_index,
         active_rows: int,
     ):
-        replay_u = self.replay_u.produce()
+        replay_u = self.replay_u.next_write()
         if active_rows < TILE:
-            replay_u = reinterpret(replay_u, shape=(1, active_rows), offset=0)
+            replay_u = reinterpret(replay_u, offset=0, layout=make_layout((1, active_rows)))
         mem_copy(
             replay_u,
             tile_slice(
@@ -192,28 +194,14 @@ class CommitRecurrentKDAReplaySSMStage:
                 (value_head, row_index),
             ),
         )
-        mem_copy(
-            self.replay_k.produce(),
-            tile_slice(
-                replay_k_gm[batch_index, token, None, None],
-                (1, TILE),
-                (value_head, 0),
-            ),
-        )
-        mem_copy(
-            self.replay_decay.produce(),
-            tile_slice(
-                replay_decay_gm[batch_index, token, None, None],
-                (1, TILE),
-                (value_head, 0),
-            ),
-        )
+        mem_copy(self.replay_k.next_write(), tile_slice(replay_k_gm[batch_index, token, None, None], (1, TILE), (value_head, 0)))
+        mem_copy(self.replay_decay.next_write(), tile_slice(replay_decay_gm[batch_index, token, None, None], (1, TILE), (value_head, 0)))
 
     @jit
     def apply_current_record(self, state, active_rows: int):
-        replay_u = self.replay_u.consume()
-        replay_k = self.replay_k.consume()
-        replay_decay = self.replay_decay.consume()
+        replay_u = self.replay_u.next_read()
+        replay_k = self.replay_k.next_read()
+        replay_decay = self.replay_decay.next_read()
         # Keep U conversion separate: on current CANN 9.2 this is faster than
         # one VF region with an explicit vst_vld barrier.
         with vf(mode="simd"):
@@ -273,9 +261,7 @@ class CommitRecurrentKDAReplaySSMStage:
         if accepted > 0:
             state = self.state_current
             if active_rows < TILE:
-                state = reinterpret(
-                    self.state_current, shape=(active_rows, TILE), offset=0
-                )
+                state = reinterpret(self.state_current, offset=0, layout=make_layout((active_rows, TILE)))
             state_tile = tile_slice(
                 state_gm[batch_index, value_head, None, None],
                 (active_rows, TILE),
@@ -341,9 +327,7 @@ class CommitRecurrentKDAReplaySSMStage:
         )
         next_state = self.state_next
         if next_active_rows < TILE:
-            next_state = reinterpret(
-                self.state_next, shape=(next_active_rows, TILE), offset=0
-            )
+            next_state = reinterpret(self.state_next, offset=0, layout=make_layout((next_active_rows, TILE)))
 
         if current_accepted > 0:
             mem_copy(self.state_current, current_state_tile)
@@ -660,7 +644,7 @@ class CommitRecurrentKDAReplaySSMStage:
         accepted_gm: Tensor,
     ):
         batch_heads = state_gm.shape[0] * state_gm.shape[1]
-        channel_rewind(reset_sync_id=True)
+        onchip_rewind(reset_sync_id=True)
         if batch_heads <= SMALL_BATCH_HEAD_LIMIT:
             self.execute_row_blocks(
                 state_gm,

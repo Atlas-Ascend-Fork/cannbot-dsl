@@ -6,6 +6,8 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 
+# fmt: off
+
 """Packed-QKV decode with a read-only checkpoint and Mega-compatible replay records."""
 
 from __future__ import annotations
@@ -16,23 +18,42 @@ from dataclasses import dataclass
 
 import cannbotdsl
 import torch
-from cannbotdsl import MemLoc, Tensor, TensorSpec, dtypes
+from cannbotdsl import MemLoc, Tensor, TensorSpec, dtypes, make_layout
 from cannbotdsl.aot import export
 from cannbotdsl.buffer import Buffer
-from cannbotdsl.channel import Channel
 from cannbotdsl.lang.control_flow import range as dsl_range
 from cannbotdsl.lang.host import host
 from cannbotdsl.lang.jit import jit
 from cannbotdsl.lang.kernel import kernel
 from cannbotdsl.lang.vf import vf
 from cannbotdsl.ops.arch import get_block_idx, get_block_num
-from cannbotdsl.ops.memcpy import mem_copy
-from cannbotdsl.ops.sync import channel_rewind
+from cannbotdsl.ops.memcpy import copy_options, mem_copy
 from cannbotdsl.ops.reg import (
-    PackMode, UnpackMode, update_mask, vadd, vadds, vcast, vdiv, vdup,
-    vdups, vexp, vload, vload_broadcast, vload_unpack, vmul, vmuls, vneg,
-    vreduce_sum, vsqrt, vstore, vstore_first, vstore_pack, vsub,
+    PackMode,
+    UnpackMode,
+    update_mask,
+    vadd,
+    vadds,
+    vcast,
+    vdiv,
+    vdup,
+    vdups,
+    vexp,
+    vload,
+    vload_broadcast,
+    vload_unpack,
+    vmul,
+    vmuls,
+    vneg,
+    vreduce_sum,
+    vsqrt,
+    vstore,
+    vstore_first,
+    vstore_pack,
+    vsub,
 )
+from cannbotdsl.ops.sync import onchip_rewind
+from cannbotdsl.ring_buffer import RingBuffer
 from cannbotdsl.tensor import idx2crd, reinterpret, tile_slice
 
 TILE = SUPPORTED_HEAD_DIM = 128
@@ -116,50 +137,50 @@ class FusedRecurrentKDAReplaySSMVector:
         self.num_heads = int(num_heads)
         self.state_key_unroll = int(state_key_unroll)
         self.state_update_unroll = int(state_update_unroll)
-        self.state = Channel(MemLoc.UB, (self.row_block, TILE), dtypes.float32, depth=1)
+        self.state = RingBuffer(MemLoc.UB, dtypes.float32, make_layout((self.row_block, TILE)), depth=1)
         self.state_tensor = None
-        self.key = Buffer(MemLoc.UB, (1, TILE), dtypes.float32)
-        self.query = Buffer(MemLoc.UB, (1, TILE), dtypes.float32)
-        self.decay_exp = Buffer(MemLoc.UB, (1, TILE), dtypes.float32)
-        self.ub_value = Buffer(MemLoc.UB, (1, value_width), dtypes.float32)
-        self.ub_beta = Buffer(MemLoc.UB, (1, VL), dtypes.float32)
-        self.out = Buffer(MemLoc.UB, (1, value_width), dtypes.float32)
-        self.output = Channel(MemLoc.UB, (1, value_width), dtypes.bfloat16, depth=2)
-        self.value = Channel(MemLoc.UB, (1, value_width), dtypes.bfloat16, depth=2)
-        self.state_key_sums = Buffer(MemLoc.UB, (1, value_width), dtypes.float32)
-        self.delta_row = Buffer(MemLoc.UB, (1, value_width), dtypes.float32)
+        self.key = Buffer(MemLoc.UB, dtypes.float32, make_layout((1, TILE)))
+        self.query = Buffer(MemLoc.UB, dtypes.float32, make_layout((1, TILE)))
+        self.decay_exp = Buffer(MemLoc.UB, dtypes.float32, make_layout((1, TILE)))
+        self.ub_value = Buffer(MemLoc.UB, dtypes.float32, make_layout((1, value_width)))
+        self.ub_beta = Buffer(MemLoc.UB, dtypes.float32, make_layout((1, VL)))
+        self.out = Buffer(MemLoc.UB, dtypes.float32, make_layout((1, value_width)))
+        self.output = RingBuffer(MemLoc.UB, dtypes.bfloat16, make_layout((1, value_width)), depth=2)
+        self.value = RingBuffer(MemLoc.UB, dtypes.bfloat16, make_layout((1, value_width)), depth=2)
+        self.state_key_sums = Buffer(MemLoc.UB, dtypes.float32, make_layout((1, value_width)))
+        self.delta_row = Buffer(MemLoc.UB, dtypes.float32, make_layout((1, value_width)))
         # vLLM ReplaySSM PR #47576 stores GDN d/k records as FP16 when the
         # model activations are BF16.  Arithmetic remains FP32 in this stage.
-        self.replay_u = Channel(MemLoc.UB, (1, value_width), dtypes.float16, depth=1)
-        self.replay_k = Channel(MemLoc.UB, (1, TILE), dtypes.float16, depth=1)
-        self.replay_decay = Channel(MemLoc.UB, (1, TILE), dtypes.float32, depth=1)
-        self.raw_query = Channel(MemLoc.UB, (1, TILE), dtypes.bfloat16, depth=2)
-        self.raw_key = Channel(MemLoc.UB, (1, TILE), dtypes.bfloat16, depth=2)
-        self.raw_g = Channel(MemLoc.UB, (1, TILE), dtypes.bfloat16, depth=2)
-        self.raw_beta = Channel(MemLoc.UB, (1, VL), dtypes.bfloat16, depth=2)
-        self.dt_bias = Buffer(MemLoc.UB, (self.num_heads, TILE), dtypes.float32)
-        self.a_log = Buffer(MemLoc.UB, (self.num_heads,), dtypes.float32)
+        self.replay_u = RingBuffer(MemLoc.UB, dtypes.float16, make_layout((1, value_width)), depth=1)
+        self.replay_k = RingBuffer(MemLoc.UB, dtypes.float16, make_layout((1, TILE)), depth=1)
+        self.replay_decay = RingBuffer(MemLoc.UB, dtypes.float32, make_layout((1, TILE)), depth=1)
+        self.raw_query = RingBuffer(MemLoc.UB, dtypes.bfloat16, make_layout((1, TILE)), depth=2)
+        self.raw_key = RingBuffer(MemLoc.UB, dtypes.bfloat16, make_layout((1, TILE)), depth=2)
+        self.raw_g = RingBuffer(MemLoc.UB, dtypes.bfloat16, make_layout((1, TILE)), depth=2)
+        self.raw_beta = RingBuffer(MemLoc.UB, dtypes.bfloat16, make_layout((1, VL)), depth=2)
+        self.dt_bias = Buffer(MemLoc.UB, dtypes.float32, make_layout((self.num_heads, TILE)))
+        self.a_log = Buffer(MemLoc.UB, dtypes.float32, make_layout((self.num_heads,)))
 
     def load_gate_params(self, a_log_gm, dt_bias_gm, value_heads):
         mem_copy(self.a_log, a_log_gm)
         mem_copy(self.dt_bias, dt_bias_gm)
 
     def load_state(self, state_gm, active_rows: int):
-        self.state_tensor = reinterpret(self.state.produce(), shape=(active_rows, TILE), offset=0)
-        mem_copy(self.state_tensor, state_gm, l2_cache_ctl=2)
+        self.state_tensor = reinterpret(self.state.next_write(), offset=0, layout=make_layout((active_rows, TILE)))
+        mem_copy(self.state_tensor, state_gm, options=copy_options(l2_cache_ctl=2))
 
     def prefetch_inputs(self, raw_key_gm, raw_query_gm, raw_g_gm, value_gm, raw_beta_gm, active_rows: int):
-        mem_copy(self.raw_query.produce(), raw_query_gm)
-        mem_copy(self.raw_key.produce(), raw_key_gm)
-        mem_copy(self.raw_g.produce(), raw_g_gm)
-        mem_copy(tile_slice(self.raw_beta.produce(), (1, 1), (0, 0)), raw_beta_gm)
-        mem_copy(reinterpret(self.value.produce(), shape=(1, active_rows), offset=0), value_gm)
+        mem_copy(self.raw_query.next_write(), raw_query_gm)
+        mem_copy(self.raw_key.next_write(), raw_key_gm)
+        mem_copy(self.raw_g.next_write(), raw_g_gm)
+        mem_copy(tile_slice(self.raw_beta.next_write(), (1, 1), (0, 0)), raw_beta_gm)
+        mem_copy(reinterpret(self.value.next_write(), offset=0, layout=make_layout((1, active_rows))), value_gm)
 
     @jit
     def normalize_qk(self, scale_value: float):
-        raw_query = self.raw_query.consume()
-        raw_key = self.raw_key.consume()
-        replay_k = self.replay_k.produce()
+        raw_query = self.raw_query.next_read()
+        raw_key = self.raw_key.next_read()
+        replay_k = self.replay_k.next_write()
         with vf(mode="simd"):
             full, _ = update_mask(VL, elem_bits=32)
             query_pre_bf16 = vload_unpack(raw_query, 0, unpack_mode=UnpackMode.B16_TO_B32)
@@ -217,10 +238,10 @@ class FusedRecurrentKDAReplaySSMVector:
 
     @jit
     def activate_g_beta(self, lower_bound: float, value_head, active_rows: int):
-        raw_g = self.raw_g.consume()
-        raw_beta = self.raw_beta.consume()
-        value_slot = self.value.consume()
-        replay_decay = self.replay_decay.produce()
+        raw_g = self.raw_g.next_read()
+        raw_beta = self.raw_beta.next_read()
+        value_slot = self.value.next_read()
+        replay_decay = self.replay_decay.next_write()
         with vf(mode="simd"):
             full, _ = update_mask(VL, elem_bits=32)
             one = vdups(1.0, dtypes.float32)
@@ -271,7 +292,7 @@ class FusedRecurrentKDAReplaySSMVector:
 
     @jit
     def compute_delta(self, active_rows: int):
-        replay_u = self.replay_u.produce()
+        replay_u = self.replay_u.next_write()
         with vf(mode="simd"):
             mask, _ = update_mask(VL, elem_bits=32)
             decay_pre = vload(self.decay_exp, 0)
@@ -352,28 +373,28 @@ class FusedRecurrentKDAReplaySSMVector:
     @jit
     def publish_replay_k(self, replay_k_gm):
         """Publish the FP16 key produced by normalization."""
-        mem_copy(replay_k_gm, self.replay_k.consume())
+        mem_copy(replay_k_gm, self.replay_k.next_read())
 
     @jit
     def publish_replay_decay(self, replay_decay_gm):
         """Publish the FP32 decay produced by gate activation."""
-        mem_copy(replay_decay_gm, self.replay_decay.consume())
+        mem_copy(replay_decay_gm, self.replay_decay.next_read())
 
     @jit
     def publish_replay_u(self, replay_u_gm, active_rows: int):
         """Publish each lane's disjoint FP16 U rows."""
-        mem_copy(replay_u_gm, reinterpret(self.replay_u.consume(), shape=(1, active_rows), offset=0))
+        mem_copy(replay_u_gm, reinterpret(self.replay_u.next_read(), offset=0, layout=make_layout((1, active_rows))))
 
     @jit
     def store_output(self, out_gm, active_rows: int):
-        output = self.output.produce()
+        output = self.output.next_write()
         with vf(mode="simd"):
             for segment in range((active_rows + VL - 1) // VL):
                 offset = segment * VL
                 mask, _ = update_mask(active_rows - offset, elem_bits=32)
                 value = vcast(vload(self.out, offset), dtypes.bfloat16, mask=mask)
                 vstore_pack(output, offset, value, mask, pack_mode=PackMode.B32_TO_B16)
-        mem_copy(out_gm, reinterpret(output, shape=(1, active_rows), offset=0))
+        mem_copy(out_gm, reinterpret(output, offset=0, layout=make_layout((1, active_rows))))
 
 
 @jit
@@ -532,19 +553,19 @@ class FusedRecurrentKDAReplaySSMKernel:
                  batch: int, length: int):
         batch_heads = batch * gate.shape[1]
         if batch_heads > MEDIUM_BATCH_HEAD_LIMIT:
-            channel_rewind(reset_sync_id=True)
+            onchip_rewind(reset_sync_id=True)
             _run_minimal_split_recurrent_body(
                 mixed, gate, beta, a_log, bias, out, state, replay_u,
                 replay_k, replay_decay, cu, scale, lower_bound, layout,
                 batch, length)
         elif batch_heads <= SMALL_BATCH_HEAD_LIMIT:
-            channel_rewind(reset_sync_id=True)
+            onchip_rewind(reset_sync_id=True)
             _run_recurrent_body(
                 mixed, gate, beta, a_log, bias, out, state, replay_u,
                 replay_k, replay_decay, cu, scale, lower_bound, layout,
                 batch, length, row_block=SMALL_ROW_BLOCK)
         else:
-            channel_rewind(reset_sync_id=True)
+            onchip_rewind(reset_sync_id=True)
             _run_recurrent_body(
                 mixed, gate, beta, a_log, bias, out, state, replay_u,
                 replay_k, replay_decay, cu, scale, lower_bound, layout,

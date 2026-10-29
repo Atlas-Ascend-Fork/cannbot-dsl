@@ -1,5 +1,7 @@
 # FlashKDA
 
+依赖版本：CANNBot-DSL 0.8.0。
+
 基于 CANNBot-DSL 的 Kimi Delta Attention prefill 融合算子，面向 Ascend 950。实现位于 [`flash_kda.py`](flash_kda.py)，配套的 AICPU 调度实现在同目录的 [`flash_kda_metadata.py`](flash_kda_metadata.py)。先生成可复用的 metadata，再由 FlashKDA 消费它并计算序列输出和最终状态。
 
 ## 功能说明
@@ -110,14 +112,14 @@ OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 python -m pytest -q test/flash_kda/test_flas
 
 ## 性能测试
 
-测量环境：Ascend 950 PR，cannbotdsl 0.7.1、PyTorch 2.10.0、CANN 9.2.0，32 个 AIC。
+测量环境：Ascend 950 PR，cannbotdsl 0.8.0、PyTorch 2.10.0、CANN 9.2.0，32 个 AIC。
 
 `B=1`、`Nqk=Nv=96`、`S=16384`、`Dk=Dv=128`，BF16 输入、FP32 状态，`template="auto"`。
 
-每轮预热 50 次、采样 40 次，共 3 轮。下表为 120 次设备 kernel Task Duration 的中位数；未额外清理缓存，不包含 metadata 生成、编译和 host 分配时间。
+每轮预热 50 次、采样 40 次，共 3 轮。下表为 120 次设备 kernel Task Duration 的中位数。每次计时前使用 1 GiB 数据进行 L2 软件驱逐并同步；清 L2、metadata 生成、编译和 host 分配时间不计入延迟。
 
 | 布局 | Q/K/V shape | 延迟（μs） |
 |:---|:---|---:|
-| BNSD | `[1, 96, 16384, 128]` | 2491.377 |
-| BSND | `[1, 16384, 96, 128]` | 2501.178 |
-| TND | `[16384, 96, 128]` | 2497.461 |
+| BNSD | `[1, 96, 16384, 128]` | 2455.312 |
+| BSND | `[1, 16384, 96, 128]` | 2487.249 |
+| TND | `[16384, 96, 128]` | 2484.931 |

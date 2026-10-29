@@ -1,5 +1,7 @@
 # flash_kda_cp_preprocess
 
+依赖版本：CANNBot-DSL 0.8.0。
+
 ## 产品支持情况
 
 - Ascend 950：支持。
@@ -203,7 +205,7 @@ python -m pytest -q test/flash_kda_cp_preprocess/test_flash_kda_cp_preprocess.py
 
 ## 性能
 
-以下结果于 2026-10-13 在 Ascend 950、CANN 9.2.0 上用 `msprof --task-time=l1` 采集，形状为 `B=1, Nqk=32, Nv=32, S=8192, D=128`，覆盖 BNSD、BSND、TND 三种布局；rank 内摘要使用 FP32 递推。
+测试在 Ascend 950、CANN 9.2.0 上用 `msprof --task-time=l1` 采集，形状为 `B=1, Nqk=32, Nv=32, S=8192, D=128`，覆盖 BNSD、BSND、TND 三种布局；rank 内摘要使用 FP32 递推。
 
 metadata 在采样循环前生成一次，`Task Duration` 只统计 AICore kernel `flash_kda_cp_preprocess_kernel`。每种布局预热 2 次后连续采样 12 次，表中为 12 次采样的中位数。
 

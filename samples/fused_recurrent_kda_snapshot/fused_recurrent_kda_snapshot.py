@@ -6,6 +6,8 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 
+# fmt: off
+
 """Independent packed-QKV fused recurrent KDA decode operator.
 
 The public input is one contiguous ``mixedqkv`` tensor in ``[Q(P) | K(P) |
@@ -25,11 +27,9 @@ from typing import NamedTuple, Optional, Tuple
 
 import cannbotdsl
 import torch
-from cannbotdsl import MemLoc, Tensor, dtypes
+from cannbotdsl import MemLoc, Tensor, dtypes, make_layout
 from cannbotdsl.aot import export
 from cannbotdsl.buffer import Buffer
-from cannbotdsl.channel import Channel
-from cannbotdsl.ops.sync import channel_rewind
 from cannbotdsl.lang.control_flow import range as dsl_range
 from cannbotdsl.lang.host import host
 from cannbotdsl.lang.jit import jit
@@ -62,6 +62,8 @@ from cannbotdsl.ops.reg import (
     vstore_pack,
     vsub,
 )
+from cannbotdsl.ops.sync import onchip_rewind
+from cannbotdsl.ring_buffer import RingBuffer
 from cannbotdsl.tensor import idx2crd, reinterpret, tile_slice
 
 SUPPORTED_HEAD_DIM = 128
@@ -186,45 +188,29 @@ class FusedRecurrentKDASnapshotVector:
         self.state_is_bf16 = state_dtype == dtypes.bfloat16
         value_width = max(row_block, VL)
         state_depth = 1 if row_block == SUPPORTED_HEAD_DIM else 2
-        self.state = Channel(
-            MemLoc.UB, shape=(row_block, dk), dtype=dtypes.float32, depth=state_depth
-        )
-        self.key = Buffer(MemLoc.UB, (1, dk), dtypes.float32)
-        self.query = Buffer(MemLoc.UB, (1, dk), dtypes.float32)
-        self.decay_exp = Buffer(MemLoc.UB, (1, dk), dtypes.float32)
-        self.ub_value = Buffer(MemLoc.UB, (1, value_width), dtypes.float32)
-        self.ub_beta = Buffer(MemLoc.UB, (1, VL), dtypes.float32)
-        self.out = Buffer(MemLoc.UB, (1, row_block), dtypes.float32)
+        self.state = RingBuffer(MemLoc.UB, dtypes.float32, make_layout((row_block, dk)), depth=state_depth)
+        self.key = Buffer(MemLoc.UB, dtypes.float32, make_layout((1, dk)))
+        self.query = Buffer(MemLoc.UB, dtypes.float32, make_layout((1, dk)))
+        self.decay_exp = Buffer(MemLoc.UB, dtypes.float32, make_layout((1, dk)))
+        self.ub_value = Buffer(MemLoc.UB, dtypes.float32, make_layout((1, value_width)))
+        self.ub_beta = Buffer(MemLoc.UB, dtypes.float32, make_layout((1, VL)))
+        self.out = Buffer(MemLoc.UB, dtypes.float32, make_layout((1, row_block)))
         if self.state_is_bf16:
-            self.state_bf16 = Channel(
-                MemLoc.UB, shape=(row_block, dk), dtype=dtypes.bfloat16, depth=2
-            )
-            self.state_bf16_output = Channel(
-                MemLoc.UB, shape=(row_block, dk), dtype=dtypes.bfloat16, depth=2
-            )
+            self.state_bf16 = RingBuffer(MemLoc.UB, dtypes.bfloat16, make_layout((row_block, dk)), depth=2)
+            self.state_bf16_output = RingBuffer(MemLoc.UB, dtypes.bfloat16, make_layout((row_block, dk)), depth=2)
         else:
-            self.state_snapshot = Channel(
-                MemLoc.UB, shape=(row_block, dk), dtype=dtypes.float32, depth=2
-            )
-        self.value = Channel(
-            MemLoc.UB, shape=(1, max(row_block, VL)), dtype=dtypes.bfloat16, depth=2
-        )
-        self.output = Channel(
-            MemLoc.UB, shape=(1, row_block), dtype=dtypes.bfloat16, depth=2
-        )
-        self.qk_norm_sums = Buffer(MemLoc.UB, (1, D_SEGMENTS * 2), dtypes.float32)
-        self.state_key_sums = Buffer(MemLoc.UB, (1, value_width), dtypes.float32)
-        self.delta_row = Buffer(MemLoc.UB, (1, value_width), dtypes.float32)
-        self.raw_query = Channel(
-            MemLoc.UB, shape=(1, dk), dtype=dtypes.bfloat16, depth=2
-        )
-        self.raw_key = Channel(MemLoc.UB, shape=(1, dk), dtype=dtypes.bfloat16, depth=2)
-        self.raw_g = Channel(MemLoc.UB, shape=(1, dk), dtype=dtypes.bfloat16, depth=2)
-        self.raw_beta = Channel(
-            MemLoc.UB, shape=(1, VL), dtype=dtypes.bfloat16, depth=2
-        )
-        self.dt_bias = Buffer(MemLoc.UB, (num_heads, dk), dtypes.float32)
-        self.a_log = Buffer(MemLoc.UB, (num_heads,), dtypes.float32)
+            self.state_snapshot = RingBuffer(MemLoc.UB, dtypes.float32, make_layout((row_block, dk)), depth=2)
+        self.value = RingBuffer(MemLoc.UB, dtypes.bfloat16, make_layout((1, max(row_block, VL))), depth=2)
+        self.output = RingBuffer(MemLoc.UB, dtypes.bfloat16, make_layout((1, row_block)), depth=2)
+        self.qk_norm_sums = Buffer(MemLoc.UB, dtypes.float32, make_layout((1, D_SEGMENTS * 2)))
+        self.state_key_sums = Buffer(MemLoc.UB, dtypes.float32, make_layout((1, value_width)))
+        self.delta_row = Buffer(MemLoc.UB, dtypes.float32, make_layout((1, value_width)))
+        self.raw_query = RingBuffer(MemLoc.UB, dtypes.bfloat16, make_layout((1, dk)), depth=2)
+        self.raw_key = RingBuffer(MemLoc.UB, dtypes.bfloat16, make_layout((1, dk)), depth=2)
+        self.raw_g = RingBuffer(MemLoc.UB, dtypes.bfloat16, make_layout((1, dk)), depth=2)
+        self.raw_beta = RingBuffer(MemLoc.UB, dtypes.bfloat16, make_layout((1, VL)), depth=2)
+        self.dt_bias = Buffer(MemLoc.UB, dtypes.float32, make_layout((num_heads, dk)))
+        self.a_log = Buffer(MemLoc.UB, dtypes.float32, make_layout((num_heads,)))
         # Produced lazily to preserve the channel epoch and buffer lifetime.
         self.state_tensor: object
         self.snapshot_tensor: object
@@ -232,20 +218,20 @@ class FusedRecurrentKDASnapshotVector:
     def load_state(self, gm_state_tile, active_rows=None):
         if active_rows is None:
             active_rows = self.row_block
-        self.state_tensor = self.state.produce()
+        self.state_tensor = self.state.next_write()
         state = self.state_tensor
         if active_rows < self.row_block:
-            state = reinterpret(state, shape=(active_rows, self.dk), offset=0)
+            state = reinterpret(state, offset=0, layout=make_layout((active_rows, self.dk)))
         if self.state_is_bf16:
-            state_bf16 = self.state_bf16.produce()
+            state_bf16 = self.state_bf16.next_write()
             mem_copy(state_bf16, gm_state_tile)
             _cast_bf16_to_fp32_tile(state, state_bf16)
         else:
             mem_copy(state, gm_state_tile)
 
     def load_qk(self, raw_key_gm, raw_query_gm):
-        mem_copy(self.raw_query.produce(), raw_query_gm)
-        mem_copy(self.raw_key.produce(), raw_key_gm)
+        mem_copy(self.raw_query.next_write(), raw_query_gm)
+        mem_copy(self.raw_key.next_write(), raw_key_gm)
 
     def prefetch_verify_inputs(
         self,
@@ -261,8 +247,8 @@ class FusedRecurrentKDASnapshotVector:
 
     @jit
     def normalize_qk(self, scale_value: float):
-        raw_query = self.raw_query.consume()
-        raw_key = self.raw_key.consume()
+        raw_query = self.raw_query.next_read()
+        raw_key = self.raw_key.next_read()
         with vf(mode="simd"):
             full, _ = update_mask(VL, elem_bits=32)
             query_raw_pre = vload_unpack(
@@ -336,23 +322,20 @@ class FusedRecurrentKDASnapshotVector:
             mem_copy(self.dt_bias, dt_bias_gm)
         else:
             mem_copy(self.a_log, a_log_gm)
-            mem_copy(
-                reinterpret(self.dt_bias, shape=(value_heads, self.dk), offset=0),
-                dt_bias_gm,
-            )
+            mem_copy(reinterpret(self.dt_bias, offset=0, layout=make_layout((value_heads, self.dk))), dt_bias_gm)
 
     def load_g_beta_value(self, raw_g_gm, value_gm, raw_beta_gm):
-        mem_copy(self.raw_g.produce(), raw_g_gm)
-        mem_copy(self.raw_beta.produce(), raw_beta_gm)
-        mem_copy(self.value.produce(), value_gm)
+        mem_copy(self.raw_g.next_write(), raw_g_gm)
+        mem_copy(self.raw_beta.next_write(), raw_beta_gm)
+        mem_copy(self.value.next_write(), value_gm)
 
     @jit
     def activate_g_beta(self, lower_bound: float, value_head, active_rows=None):
         if active_rows is None:
             active_rows = self.row_block
-        raw_g = self.raw_g.consume()
-        raw_beta = self.raw_beta.consume()
-        value = self.value.consume()
+        raw_g = self.raw_g.next_read()
+        raw_beta = self.raw_beta.next_read()
+        value = self.value.next_read()
         with vf(mode="simd"):
             full, _ = update_mask(VL, elem_bits=32)
             one = vdups(1.0, dtypes.float32)
@@ -411,7 +394,7 @@ class FusedRecurrentKDASnapshotVector:
             row_block = active_rows
         state, out = self.state_tensor, self.out
         if write_snapshot and not self.state_is_bf16:
-            self.snapshot_tensor = self.state_snapshot.produce()
+            self.snapshot_tensor = self.state_snapshot.next_write()
         key, query = self.key, self.query
         state_key_sums, delta_row = self.state_key_sums, self.delta_row
 
@@ -481,10 +464,10 @@ class FusedRecurrentKDASnapshotVector:
     def store_output(self, gm_out_tile, active_rows=None):
         if active_rows is None:
             active_rows = self.row_block
-        output = self.output.produce()
+        output = self.output.next_write()
         out = self.out
         if active_rows < self.row_block:
-            output = reinterpret(output, shape=(1, active_rows), offset=0)
+            output = reinterpret(output, offset=0, layout=make_layout((1, active_rows)))
         _cast_fp32_to_bf16_tile(output, out)
         mem_copy(gm_out_tile, output)
 
@@ -492,17 +475,15 @@ class FusedRecurrentKDASnapshotVector:
         if active_rows is None:
             active_rows = self.row_block
         if self.state_is_bf16:
-            state_bf16_output = self.state_bf16_output.produce()
+            state_bf16_output = self.state_bf16_output.next_write()
             state = self.state_tensor
             if active_rows < self.row_block:
-                state_bf16_output = reinterpret(
-                    state_bf16_output, shape=(active_rows, self.dk), offset=0
-                )
+                state_bf16_output = reinterpret(state_bf16_output, offset=0, layout=make_layout((active_rows, self.dk)))
             _cast_fp32_to_bf16_tile(state_bf16_output, state)
             mem_copy(gm_state_tile, state_bf16_output)
         else:
-            state_snapshot = self.state_snapshot.consume()
-            mem_copy(gm_state_tile, state_snapshot)
+            state_snapshot = self.state_snapshot.next_read()
+            mem_copy(gm_state_tile, state_snapshot[:active_rows, :self.dk])
 
 
 @jit
@@ -831,7 +812,7 @@ def _run_recurrent_body(
 
 
 def _rewind_row_block_branch() -> None:
-    channel_rewind(reset_sync_id=True)
+    onchip_rewind(reset_sync_id=True)
 
 
 @kernel
