@@ -440,3 +440,11 @@ moonep:
     - test/moonep
   options:
     - moonep
+
+fused_norm_rope_attn_rope_cast_fwd:
+  module: True
+  src:
+    - samples/fused_norm_rope_attn_rope_cast_fwd
+    - test/fused_norm_rope_attn_rope_cast_fwd
+  options:
+    - fused_norm_rope_attn_rope_cast_fwd

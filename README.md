@@ -206,6 +206,7 @@ python3 -m pytest test/sparse_flash_attention/test_sparse_flash_attention.py -v
 | [engram_gate](samples/engram_gate) | `engram_gate()` | Engram 残差门：双路 RMS、加权点积与 signed-sqrt sigmoid 门控 |
 | [pointnet_sa](samples/pointnet_sa) | `pointnet_sa()` | PointNet++ SA 层的 shared MLP + max-pool |
 | [voxel_conv](samples/voxel_conv) | `voxel_conv()` | VoxelNet Convolutional Middle Layers |
+| [fused_norm_rope_attn_rope_cast_fwd](samples/fused_norm_rope_attn_rope_cast_fwd) | `fused_norm_rope_attn_rope_cast_fwd()` | Q RMSNorm、Q RoPE、Sparse Attention、O 共轭 RoPE 与 MXFP8 量化（含 SF 打包）的融合算子，其中 Q RMSNorm 为可选融合 |
 
 ## 📚 文档导航
 

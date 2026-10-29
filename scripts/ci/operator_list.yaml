@@ -9,6 +9,7 @@
 # -----------------------------------------------------------------------------------------------------------
 # 算子清单：供任务调度与 parse_changed_ops.py 的 all 展开使用。
 operators:
+  - fused_norm_rope_attn_rope_cast_fwd
   - add
   - attn_epilogue
   - voxel_conv
