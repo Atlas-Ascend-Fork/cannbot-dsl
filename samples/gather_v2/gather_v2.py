@@ -24,7 +24,7 @@ import torch
 import torch_npu  # noqa: F401 -- registers the NPU backend
 
 from cannbotdsl import (
-    Channel,
+    make_layout,
     MemLoc,
     Tensor,
     TensorSpec,
@@ -36,6 +36,7 @@ from cannbotdsl import (
     simt,
     vf,
 )
+from cannbotdsl.ring_buffer import RingBuffer
 from cannbotdsl.lang.host import host
 from cannbotdsl.lang.kernel import kernel
 from cannbotdsl.ops import reg
@@ -266,9 +267,9 @@ class GatherV2Kernel:
             lane = simt.thread_idx()[0]
             threads_per_block = simt.thread_dim()[0]
             if const_expr(not self.tiling.use_32bit_offsets):
-                core_index = simt.cast(core_index, dtype=dtypes.int64)
-                lane = simt.cast(lane, dtype=dtypes.int64)
-                threads_per_block = simt.cast(threads_per_block, dtype=dtypes.int64)
+                core_index = dtypes.int64(core_index)
+                lane = dtypes.int64(lane)
+                threads_per_block = dtypes.int64(threads_per_block)
             output_flat_start = core_index * self.tiling.per_core_elements
             for core_local_offset in range(
                 lane, self.tiling.per_core_elements, threads_per_block
@@ -290,9 +291,7 @@ class GatherV2Kernel:
                     selected_axis_index = gm_indices[indices_flat_offset]
                     # Keep int32-to-int64 widening for negative-index and large-axis safety.
                     if const_expr(gm_indices.dtype != dtypes.int64):
-                        selected_axis_index = simt.cast(
-                            selected_axis_index, dtype=dtypes.int64
-                        )
+                        selected_axis_index = dtypes.int64(selected_axis_index)
                     if self.tiling.negative_index_support:
                         if selected_axis_index < 0:
                             selected_axis_index += self.tiling.gather_dim_size
@@ -300,9 +299,7 @@ class GatherV2Kernel:
                         if selected_axis_index < self.tiling.gather_dim_size:
                             selected_axis_offset = selected_axis_index
                             if const_expr(address_dtype == dtypes.int32):
-                                selected_axis_offset = simt.cast(
-                                    selected_axis_index, dtype=dtypes.int32
-                                )
+                                selected_axis_offset = dtypes.int32(selected_axis_index)
                             input_flat_offset = (
                                 batch_outer_index * self.tiling.gather_dim_size
                                 + selected_axis_offset
@@ -344,7 +341,7 @@ class GatherPackedRowsKernel:
         with vf(mode="simt", thread=self.thread_num):
             lane = simt.thread_idx()[0]
             if const_expr(address_dtype == dtypes.int64):
-                lane = simt.cast(lane, dtype=dtypes.int64)
+                lane = dtypes.int64(lane)
             output_flat_offset = output_flat_start + lane
             if output_flat_offset < self.gather_size * self.inner_words:
                 output_row_index = output_flat_offset // self.inner_words
@@ -354,18 +351,14 @@ class GatherPackedRowsKernel:
                 selected_axis_index = gm_indices[output_row_index]
                 # Keep int32-to-int64 widening for negative-index and large-axis safety.
                 if const_expr(gm_indices.dtype != dtypes.int64):
-                    selected_axis_index = simt.cast(
-                        selected_axis_index, dtype=dtypes.int64
-                    )
+                    selected_axis_index = dtypes.int64(selected_axis_index)
                 if self.negative_indices:
                     if selected_axis_index < 0:
                         selected_axis_index += self.axis_size
                 if selected_axis_index >= 0 and selected_axis_index < self.axis_size:
                     selected_axis_offset = selected_axis_index
                     if const_expr(address_dtype == dtypes.int32):
-                        selected_axis_offset = simt.cast(
-                            selected_axis_index, dtype=dtypes.int32
-                        )
+                        selected_axis_offset = dtypes.int32(selected_axis_index)
                     gm_y[output_row_index * self.inner_words + inner_word_offset] = (
                         gm_x[
                             selected_axis_offset * self.inner_words + inner_word_offset
@@ -404,7 +397,7 @@ class GatherScalarRowsKernel:
         """Execute this kernel using the precomputed geometry and memory views."""
         output_flat_start = get_block_idx() * self.per_core_elements
         with vf(mode="simt", thread=self.thread_num):
-            lane = simt.cast(simt.thread_idx()[0], dtype=dtypes.int64)
+            lane = dtypes.int64(simt.thread_idx()[0])
             for core_local_offset in range(
                 lane, self.per_core_elements, self.thread_num
             ):
@@ -413,9 +406,7 @@ class GatherScalarRowsKernel:
                     selected_axis_index = gm_indices[output_row_index]
                     # Keep int32-to-int64 widening for negative-index and large-axis safety.
                     if const_expr(gm_indices.dtype != dtypes.int64):
-                        selected_axis_index = simt.cast(
-                            selected_axis_index, dtype=dtypes.int64
-                        )
+                        selected_axis_index = dtypes.int64(selected_axis_index)
                     if self.negative_indices:
                         if selected_axis_index < 0:
                             selected_axis_index += self.axis_size
@@ -456,13 +447,13 @@ class GatherOneIndexKernel:
     def __call__(self, gm_x: Tensor, gm_indices: Tensor, gm_y: Tensor):
         """Execute this kernel using the precomputed geometry and memory views."""
         with vf(mode="simt"):
-            core_index = simt.cast(simt.block_idx()[0], dtype=dtypes.int64)
-            lane = simt.cast(simt.thread_idx()[0], dtype=dtypes.int64)
-            threads_per_block = simt.cast(simt.thread_dim()[0], dtype=dtypes.int64)
+            core_index = dtypes.int64(simt.block_idx()[0])
+            lane = dtypes.int64(simt.thread_idx()[0])
+            threads_per_block = dtypes.int64(simt.thread_dim()[0])
             selected_axis_index = gm_indices[0]
             # Keep int32-to-int64 widening for negative-index and large-axis safety.
             if const_expr(gm_indices.dtype != dtypes.int64):
-                selected_axis_index = simt.cast(selected_axis_index, dtype=dtypes.int64)
+                selected_axis_index = dtypes.int64(selected_axis_index)
             if self.negative_indices:
                 if selected_axis_index < 0:
                     selected_axis_index += self.axis_size
@@ -512,16 +503,16 @@ class GatherRowsDmaKernel:
 
     def __call__(self, gm_x: Tensor, gm_indices: Tensor, gm_y: Tensor):
         """Execute this kernel using the precomputed geometry and memory views."""
-        row_slots = Channel(
+        row_slots = RingBuffer(
             MemLoc.UB,
-            (self.tile_rows, self.inner_elements),
             dtypes.int32,
+            make_layout((self.tile_rows, self.inner_elements)),
             depth=DMA_CHANNEL_DEPTH,
         )
         output_row_start = get_block_idx() * self.rows_per_core
         output_row_stop = min(output_row_start + self.rows_per_core, self.gather_size)
         if output_row_start < output_row_stop:
-            slot = row_slots.produce()
+            slot = row_slots.next_write()
             self._fill_slot(
                 slot,
                 gm_x,
@@ -534,7 +525,7 @@ class GatherRowsDmaKernel:
             ):
                 next_output_row = first_output_row + self.tile_rows
                 if next_output_row < output_row_stop:
-                    slot = row_slots.produce()
+                    slot = row_slots.next_write()
                     self._fill_slot(
                         slot,
                         gm_x,
@@ -542,7 +533,7 @@ class GatherRowsDmaKernel:
                         next_output_row,
                         min(self.tile_rows, output_row_stop - next_output_row),
                     )
-                ready = row_slots.consume()
+                ready = row_slots.next_read()
                 valid_row_count = min(
                     self.tile_rows, output_row_stop - first_output_row
                 )
@@ -552,7 +543,7 @@ class GatherRowsDmaKernel:
     @jit
     def _fill_slot(self, slot, gm_x, gm_indices, first_output_row, valid_row_count):
         # A three-entry FIFO cache is local to this tile. Cache hits point to
-        # rows filled by MTE2; they are materialized after Channel.consume().
+        # rows filled by MTE2; they are materialized after RingBuffer.next_read().
         """DMA-fill cache-miss input rows; defer duplicate and invalid rows."""
         cached_axis_newest = INVALID_AXIS_INDEX
         cached_axis_previous = INVALID_AXIS_INDEX

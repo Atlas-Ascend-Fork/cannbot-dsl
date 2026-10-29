@@ -18,6 +18,7 @@ import torch_npu  # noqa: F401 -- registers the NPU backend
 
 import cannbotdsl as cb
 from cannbotdsl import Tensor, dtypes
+from cannbotdsl.ring_buffer import RingBuffer
 from cannbotdsl.lang.host import host
 from cannbotdsl.lang.kernel import kernel
 from cannbotdsl.ops.arch import get_block_idx
@@ -118,13 +119,15 @@ class ScatterDmaCopyKernel:
     def __call__(self, data: Tensor, output: Tensor):
         """Execute this kernel using the precomputed geometry and memory views."""
         block = get_block_idx()
-        tiles = cb.Channel(cb.MemLoc.UB, (self.tile_elements,), self.dtype, depth=1)
+        tiles = RingBuffer(
+            cb.MemLoc.UB, self.dtype, cb.make_layout((self.tile_elements,)), depth=1
+        )
         copy_tile_start = block * self.tiles_per_core
         copy_tile_stop = min(copy_tile_start + self.tiles_per_core, self.full_tiles)
         for copy_tile_index in range(copy_tile_start, copy_tile_stop):
-            slot = tiles.produce()
+            slot = tiles.next_write()
             mem_copy(slot, tile_slice(data, (self.tile_elements,), (copy_tile_index,)))
-            ready = tiles.consume()
+            ready = tiles.next_read()
             mem_copy(
                 tile_slice(output, (self.tile_elements,), (copy_tile_index,)), ready
             )
@@ -323,10 +326,10 @@ def _scatter_simt(
 ):
     """Each output owner scans updates in source order, avoiding races."""
     with cb.vf(mode="simt"):
-        thread_index = cb.simt.cast(cb.simt.thread_idx()[0], dtype=dtypes.int64)
-        block = cb.simt.cast(cb.simt.block_idx()[0], dtype=dtypes.int64)
-        threads_per_block = cb.simt.cast(cb.simt.thread_dim()[0], dtype=dtypes.int64)
-        block_count = cb.simt.cast(cb.simt.grid_dim()[0], dtype=dtypes.int64)
+        thread_index = dtypes.int64(cb.simt.thread_idx()[0])
+        block = dtypes.int64(cb.simt.block_idx()[0])
+        threads_per_block = dtypes.int64(cb.simt.thread_dim()[0])
+        block_count = dtypes.int64(cb.simt.grid_dim()[0])
         copy_tile_start = block * threads_per_block + thread_index
         step = block_count * threads_per_block
         rank = params[RANK_PARAM]
@@ -337,9 +340,9 @@ def _scatter_simt(
         for output_index in range(copy_tile_start, data.shape[0], step):
             output[output_index] = data[output_index]
             remaining_flat_offset = output_index
-            index_non_axis_base = 0
-            update_non_axis_base = 0
-            output_axis_coord = 0
+            index_non_axis_base = dtypes.int64(0)
+            update_non_axis_base = dtypes.int64(0)
+            output_axis_coord = dtypes.int64(0)
             inside_indices = True
             for dim in range(rank):
                 data_stride = params[dim]
@@ -377,8 +380,8 @@ def _scatter_simt(
                         elif reduction == REDUCTION_ADD:
                             # Boolean addition is OR: normalize a nonzero sum to true.
                             if bool_reduction != 0:
-                                output[output_index] = cb.simt.cast(
-                                    output[output_index] + update != 0, dtype=data.dtype
+                                output[output_index] = data.dtype(
+                                    output[output_index] + update != 0
                                 )
                             else:
                                 output[output_index] = output[output_index] + update
@@ -393,10 +396,10 @@ def _scatter_none_simt(
     """Ordered replacement without routing payload bits through a loop phi."""
 
     with cb.vf(mode="simt"):
-        thread_index = cb.simt.cast(cb.simt.thread_idx()[0], dtype=dtypes.int64)
-        block = cb.simt.cast(cb.simt.block_idx()[0], dtype=dtypes.int64)
-        threads_per_block = cb.simt.cast(cb.simt.thread_dim()[0], dtype=dtypes.int64)
-        block_count = cb.simt.cast(cb.simt.grid_dim()[0], dtype=dtypes.int64)
+        thread_index = dtypes.int64(cb.simt.thread_idx()[0])
+        block = dtypes.int64(cb.simt.block_idx()[0])
+        threads_per_block = dtypes.int64(cb.simt.thread_dim()[0])
+        block_count = dtypes.int64(cb.simt.grid_dim()[0])
         rank = params[RANK_PARAM]
         axis = params[AXIS_PARAM]
         axis_size = params[AXIS_SIZE_PARAM]
@@ -407,9 +410,9 @@ def _scatter_none_simt(
             block_count * threads_per_block,
         ):
             remaining_flat_offset = output_index
-            index_non_axis_base = 0
-            update_non_axis_base = 0
-            output_axis_coord = 0
+            index_non_axis_base = dtypes.int64(0)
+            update_non_axis_base = dtypes.int64(0)
+            output_axis_coord = dtypes.int64(0)
             inside_indices = True
             for dim in range(rank):
                 data_stride = params[dim]
@@ -428,7 +431,7 @@ def _scatter_none_simt(
                     )
 
             found = False
-            last_update_offset = 0
+            last_update_offset = dtypes.int64(0)
             if inside_indices:
                 index_axis_size = params[INDEX_SHAPE_BASE + axis]
                 index_axis_stride = params[INDEX_STRIDES_BASE + axis]
@@ -459,10 +462,10 @@ def _scatter_int64_reduce_simt(
     """Ordered int64 add/mul via two 32-bit words per logical element."""
 
     with cb.vf(mode="simt"):
-        thread_index = cb.simt.cast(cb.simt.thread_idx()[0], dtype=dtypes.int64)
-        block = cb.simt.cast(cb.simt.block_idx()[0], dtype=dtypes.int64)
-        threads_per_block = cb.simt.cast(cb.simt.thread_dim()[0], dtype=dtypes.int64)
-        block_count = cb.simt.cast(cb.simt.grid_dim()[0], dtype=dtypes.int64)
+        thread_index = dtypes.int64(cb.simt.thread_idx()[0])
+        block = dtypes.int64(cb.simt.block_idx()[0])
+        threads_per_block = dtypes.int64(cb.simt.thread_dim()[0])
+        block_count = dtypes.int64(cb.simt.grid_dim()[0])
         rank = params[RANK_PARAM]
         axis = params[AXIS_PARAM]
         axis_size = params[AXIS_SIZE_PARAM]
@@ -477,9 +480,9 @@ def _scatter_int64_reduce_simt(
             low = data[output_low_word_offset]
             high = data[output_low_word_offset + 1]
             remaining_flat_offset = output_index
-            index_non_axis_base = 0
-            update_non_axis_base = 0
-            output_axis_coord = 0
+            index_non_axis_base = dtypes.int64(0)
+            update_non_axis_base = dtypes.int64(0)
+            output_axis_coord = dtypes.int64(0)
             inside_indices = True
             for dim in range(rank):
                 data_stride = params[dim]
@@ -517,21 +520,14 @@ def _scatter_int64_reduce_simt(
                         ) * INT64_WORD_COUNT
                         update_low = updates[update_word]
                         update_high = updates[update_word + 1]
-                        current_low_unsigned = cb.simt.cast(
-                            cb.simt.cast(current_low, dtype=dtypes.uint32),
-                            dtype=dtypes.int64,
-                        )
-                        update_low_unsigned = cb.simt.cast(
-                            cb.simt.cast(update_low, dtype=dtypes.uint32),
-                            dtype=dtypes.int64,
-                        )
+                        current_low_unsigned = dtypes.int64(dtypes.uint32(current_low))
+                        update_low_unsigned = dtypes.int64(dtypes.uint32(update_low))
                         # Add carries from the unsigned low word into the high word.
                         if reduction == REDUCTION_ADD:
                             new_low = current_low + update_low
-                            carry = cb.simt.cast(
+                            carry = dtypes.int32(
                                 current_low_unsigned + update_low_unsigned
-                                >= UINT32_MODULUS,
-                                dtype=dtypes.int32,
+                                >= UINT32_MODULUS
                             )
                             high = current_high + update_high + carry
                             low = new_low
@@ -557,10 +553,10 @@ def _scatter_int64_reduce_simt(
 def _copy_simt(data: Tensor, output: Tensor):
     """Copy raw one-dimensional storage using a SIMT grid-stride loop."""
     with cb.vf(mode="simt"):
-        thread_index = cb.simt.cast(cb.simt.thread_idx()[0], dtype=dtypes.int64)
-        block = cb.simt.cast(cb.simt.block_idx()[0], dtype=dtypes.int64)
-        threads_per_block = cb.simt.cast(cb.simt.thread_dim()[0], dtype=dtypes.int64)
-        block_count = cb.simt.cast(cb.simt.grid_dim()[0], dtype=dtypes.int64)
+        thread_index = dtypes.int64(cb.simt.thread_idx()[0])
+        block = dtypes.int64(cb.simt.block_idx()[0])
+        threads_per_block = dtypes.int64(cb.simt.thread_dim()[0])
+        block_count = dtypes.int64(cb.simt.grid_dim()[0])
         for output_index in range(
             block * threads_per_block + thread_index,
             data.shape[0],
@@ -576,10 +572,10 @@ def _scatter_direct_none_simt(
     """One writer per update; repeated destinations follow device scheduling."""
 
     with cb.vf(mode="simt"):
-        thread_index = cb.simt.cast(cb.simt.thread_idx()[0], dtype=dtypes.int64)
-        block = cb.simt.cast(cb.simt.block_idx()[0], dtype=dtypes.int64)
-        threads_per_block = cb.simt.cast(cb.simt.thread_dim()[0], dtype=dtypes.int64)
-        block_count = cb.simt.cast(cb.simt.grid_dim()[0], dtype=dtypes.int64)
+        thread_index = dtypes.int64(cb.simt.thread_idx()[0])
+        block = dtypes.int64(cb.simt.block_idx()[0])
+        threads_per_block = dtypes.int64(cb.simt.thread_dim()[0])
+        block_count = dtypes.int64(cb.simt.grid_dim()[0])
         axis = params[AXIS_PARAM]
         axis_size = params[AXIS_SIZE_PARAM]
         rank = params[RANK_PARAM]
@@ -613,10 +609,10 @@ def _scatter_direct_add_simt(
     """Atomic add for float32; host restricts use to supported types."""
 
     with cb.vf(mode="simt"):
-        thread_index = cb.simt.cast(cb.simt.thread_idx()[0], dtype=dtypes.int64)
-        block = cb.simt.cast(cb.simt.block_idx()[0], dtype=dtypes.int64)
-        threads_per_block = cb.simt.cast(cb.simt.thread_dim()[0], dtype=dtypes.int64)
-        block_count = cb.simt.cast(cb.simt.grid_dim()[0], dtype=dtypes.int64)
+        thread_index = dtypes.int64(cb.simt.thread_idx()[0])
+        block = dtypes.int64(cb.simt.block_idx()[0])
+        threads_per_block = dtypes.int64(cb.simt.thread_dim()[0])
+        block_count = dtypes.int64(cb.simt.grid_dim()[0])
         axis = params[AXIS_PARAM]
         axis_size = params[AXIS_SIZE_PARAM]
         rank = params[RANK_PARAM]
@@ -652,10 +648,10 @@ def _scatter_unique_add_simt(
     """Read-modify-write each distinct float32 destination without an atomic."""
 
     with cb.vf(mode="simt"):
-        thread_index = cb.simt.cast(cb.simt.thread_idx()[0], dtype=dtypes.int64)
-        block = cb.simt.cast(cb.simt.block_idx()[0], dtype=dtypes.int64)
-        threads_per_block = cb.simt.cast(cb.simt.thread_dim()[0], dtype=dtypes.int64)
-        block_count = cb.simt.cast(cb.simt.grid_dim()[0], dtype=dtypes.int64)
+        thread_index = dtypes.int64(cb.simt.thread_idx()[0])
+        block = dtypes.int64(cb.simt.block_idx()[0])
+        threads_per_block = dtypes.int64(cb.simt.thread_dim()[0])
+        block_count = dtypes.int64(cb.simt.grid_dim()[0])
         axis = params[AXIS_PARAM]
         axis_size = params[AXIS_SIZE_PARAM]
         rank = params[RANK_PARAM]
@@ -695,10 +691,10 @@ def _scatter_compact_unique_add_simt(
     """Indices occupy a prefix-one, contiguous last-axis segment."""
 
     with cb.vf(mode="simt"):
-        thread_index = cb.simt.cast(cb.simt.thread_idx()[0], dtype=dtypes.int64)
-        block = cb.simt.cast(cb.simt.block_idx()[0], dtype=dtypes.int64)
-        threads_per_block = cb.simt.cast(cb.simt.thread_dim()[0], dtype=dtypes.int64)
-        block_count = cb.simt.cast(cb.simt.grid_dim()[0], dtype=dtypes.int64)
+        thread_index = dtypes.int64(cb.simt.thread_idx()[0])
+        block = dtypes.int64(cb.simt.block_idx()[0])
+        threads_per_block = dtypes.int64(cb.simt.thread_dim()[0])
+        block_count = dtypes.int64(cb.simt.grid_dim()[0])
         for index_flat_offset in range(
             block * threads_per_block + thread_index,
             indices.shape[0],
@@ -709,7 +705,7 @@ def _scatter_compact_unique_add_simt(
                 selected64 = selected_axis_index
                 # Preserve int32 sign extension; int64 loads already have the target type.
                 if cb.const_expr(indices.dtype != dtypes.int64):
-                    selected64 = cb.simt.cast(selected_axis_index, dtype=dtypes.int64)
+                    selected64 = dtypes.int64(selected_axis_index)
                 output_flat_offset = selected64 * axis_stride + index_flat_offset
                 output[output_flat_offset] = (
                     output[output_flat_offset] + updates[index_flat_offset]
@@ -729,10 +725,10 @@ def _scatter_direct_flat_none_simt(
     """Map a flat update index to the output with one flattened axis split."""
 
     with cb.vf(mode="simt"):
-        thread_index = cb.simt.cast(cb.simt.thread_idx()[0], dtype=dtypes.int64)
-        block = cb.simt.cast(cb.simt.block_idx()[0], dtype=dtypes.int64)
-        threads_per_block = cb.simt.cast(cb.simt.thread_dim()[0], dtype=dtypes.int64)
-        block_count = cb.simt.cast(cb.simt.grid_dim()[0], dtype=dtypes.int64)
+        thread_index = dtypes.int64(cb.simt.thread_idx()[0])
+        block = dtypes.int64(cb.simt.block_idx()[0])
+        threads_per_block = dtypes.int64(cb.simt.thread_dim()[0])
+        block_count = dtypes.int64(cb.simt.grid_dim()[0])
         index_outer_span = index_axis_size * axis_inner_elements
         data_outer_span = axis_size * axis_inner_elements
 
@@ -743,13 +739,11 @@ def _scatter_direct_flat_none_simt(
         ):
             selected_axis_index = indices[index_flat_offset]
             if selected_axis_index >= 0 and selected_axis_index < axis_size:
-                linear32 = cb.simt.cast(index_flat_offset, dtype=dtypes.int32)
+                linear32 = dtypes.int32(index_flat_offset)
                 selected_axis_index32 = selected_axis_index
                 # Bounds were checked above; only int64 inputs need narrowing.
                 if cb.const_expr(indices.dtype != dtypes.int32):
-                    selected_axis_index32 = cb.simt.cast(
-                        selected_axis_index, dtype=dtypes.int32
-                    )
+                    selected_axis_index32 = dtypes.int32(selected_axis_index)
                 output_flat_offset = 0
                 # Leading axis: keep the inner coordinate and replace the outer axis.
                 if axis == 0:
@@ -781,19 +775,15 @@ def _scatter_direct_flat_add_simt(
     """Atomic float32 add using a flattened axis coordinate transform."""
 
     with cb.vf(mode="simt"):
-        thread_index = cb.simt.cast(cb.simt.thread_idx()[0], dtype=dtypes.int64)
-        block = cb.simt.cast(cb.simt.block_idx()[0], dtype=dtypes.int64)
-        threads_per_block = cb.simt.cast(cb.simt.thread_dim()[0], dtype=dtypes.int64)
-        block_count = cb.simt.cast(cb.simt.grid_dim()[0], dtype=dtypes.int64)
+        thread_index = dtypes.int64(cb.simt.thread_idx()[0])
+        block = dtypes.int64(cb.simt.block_idx()[0])
+        threads_per_block = dtypes.int64(cb.simt.thread_dim()[0])
+        block_count = dtypes.int64(cb.simt.grid_dim()[0])
         axis = params[AXIS_PARAM]
         data_axis_size_64 = params[AXIS_SIZE_PARAM]
-        data_axis_size = cb.simt.cast(data_axis_size_64, dtype=dtypes.int32)
-        index_axis_size = cb.simt.cast(
-            params[INDEX_SHAPE_BASE + axis], dtype=dtypes.int32
-        )
-        axis_inner_elements = cb.simt.cast(
-            params[INDEX_STRIDES_BASE + axis], dtype=dtypes.int32
-        )
+        data_axis_size = dtypes.int32(data_axis_size_64)
+        index_axis_size = dtypes.int32(params[INDEX_SHAPE_BASE + axis])
+        axis_inner_elements = dtypes.int32(params[INDEX_STRIDES_BASE + axis])
         index_outer_span = index_axis_size * axis_inner_elements
         data_outer_span = data_axis_size * axis_inner_elements
 
@@ -804,13 +794,11 @@ def _scatter_direct_flat_add_simt(
         ):
             selected_axis_index = indices[index_flat_offset]
             if selected_axis_index >= 0 and selected_axis_index < data_axis_size_64:
-                linear32 = cb.simt.cast(index_flat_offset, dtype=dtypes.int32)
+                linear32 = dtypes.int32(index_flat_offset)
                 selected_axis_index32 = selected_axis_index
                 # Bounds were checked above; only int64 inputs need narrowing.
                 if cb.const_expr(indices.dtype != dtypes.int32):
-                    selected_axis_index32 = cb.simt.cast(
-                        selected_axis_index, dtype=dtypes.int32
-                    )
+                    selected_axis_index32 = dtypes.int32(selected_axis_index)
                 output_flat_offset = 0
                 # Leading axis: keep the inner coordinate and replace the outer axis.
                 if axis == 0:
@@ -1086,16 +1074,16 @@ def _scatter_axis0_owner_add_simt(
     """One output owner sums axis-0 updates in source order, without atomics."""
 
     with cb.vf(mode="simt"):
-        thread_index = cb.simt.cast(cb.simt.thread_idx()[0], dtype=dtypes.int64)
-        block = cb.simt.cast(cb.simt.block_idx()[0], dtype=dtypes.int64)
-        threads_per_block = cb.simt.cast(cb.simt.thread_dim()[0], dtype=dtypes.int64)
-        block_count = cb.simt.cast(cb.simt.grid_dim()[0], dtype=dtypes.int64)
+        thread_index = dtypes.int64(cb.simt.thread_idx()[0])
+        block = dtypes.int64(cb.simt.block_idx()[0])
+        threads_per_block = dtypes.int64(cb.simt.thread_dim()[0])
+        block_count = dtypes.int64(cb.simt.grid_dim()[0])
         for output_index in range(
             block * threads_per_block + thread_index,
             data.shape[0],
             block_count * threads_per_block,
         ):
-            output_flat_index32 = cb.simt.cast(output_index, dtype=dtypes.int32)
+            output_flat_index32 = dtypes.int32(output_index)
             output_axis_coord = output_flat_index32 // axis_inner_elements
             inner_coord = output_flat_index32 % axis_inner_elements
             accumulated_value = data[output_index]
@@ -1430,27 +1418,30 @@ class ScatterNativeKernel:
     ):
         """Execute this kernel using the precomputed geometry and memory views."""
         block = get_block_idx()
-        queue = cb.Channel(
-            cb.MemLoc.UB, (self.tile_elements,), self.copy_dtype, depth=1
+        queue = RingBuffer(
+            cb.MemLoc.UB,
+            self.copy_dtype,
+            cb.make_layout((self.tile_elements,)),
+            depth=1,
         )
         for copy_tile_index in range(block, self.full_tiles, self.core_num):
-            slot = queue.produce()
+            slot = queue.next_write()
             mem_copy(
                 slot, tile_slice(copy_data, (self.tile_elements,), (copy_tile_index,))
             )
-            ready = queue.consume()
+            ready = queue.next_read()
             mem_copy(
                 tile_slice(copy_output, (self.tile_elements,), (copy_tile_index,)),
                 ready,
             )
         if self.tail:
             if block == 0:
-                slot = queue.produce()
+                slot = queue.next_write()
                 mem_copy(
                     slot[: self.tail,],
                     copy_data[self.full_tiles * self.tile_elements :,],
                 )
-                ready = queue.consume()
+                ready = queue.next_read()
                 mem_copy(
                     copy_output[self.full_tiles * self.tile_elements :,],
                     ready[: self.tail,],
@@ -1475,9 +1466,7 @@ class ScatterNativeKernel:
                     selected_axis_index32 = selected_axis_index
                     # Identity casts add no information; int64 indices still narrow after validation.
                     if cb.const_expr(indices.dtype != dtypes.int32):
-                        selected_axis_index32 = cb.simt.cast(
-                            selected_axis_index, dtype=dtypes.int32
-                        )
+                        selected_axis_index32 = dtypes.int32(selected_axis_index)
                     # Flat geometry shares source offsets; only the axis length changes.
                     if cb.const_expr(self.flat):
                         # Leading axis: preserve just the trailing coordinate.
