@@ -10,5 +10,3 @@
 - [Tiler](./tiler/index.md)
 - [片上存储与缓冲区](./storage/index.md)
 - [Array](./array/index.md)
-
-各接口页面只引用这里的数据类型和数据结构定义，不在操作页面重复列出成员表。
