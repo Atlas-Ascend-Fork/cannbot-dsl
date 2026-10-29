@@ -1576,6 +1576,45 @@ def check_changed_input_replay(cpu, actual, attrs, replay, original, before):
     )
 
 
+@pytest.mark.parametrize("mode", range(4))
+@pytest.mark.parametrize(
+    "cube, vector",
+    ((1, 2), (8, 16), (32, 64), (36, 72), (64, 128), (97, 194), (36, 64)),
+)
+def test_core_quota_uses_current_stream(mode, cube, vector, monkeypatch):
+    """Host selection contract; synthetic quotas do not claim hardware coverage."""
+    stream = object()
+    info = SimpleNamespace(available=True, cube_core_num=cube, vector_core_num=vector)
+    monkeypatch.setattr(torch.npu, "current_stream", lambda device: stream)
+
+    def platform_info(*, stream):
+        assert stream is expected_stream
+        return info
+
+    expected_stream = stream
+    monkeypatch.setattr(op.dsl, "get_platform_info", platform_info)
+    meta = SimpleNamespace(tokens=1, heads=1, qkv_quant_mode=mode)
+    assert op._core_num(torch.empty(0), meta) == min(cube, vector // 2)
+    # A subsequent call must use the new stream quota, not a cached device value.
+    info.cube_core_num, info.vector_core_num = 2, 4
+    assert op._core_num(torch.empty(0), meta) == 2
+
+
+@pytest.mark.parametrize(
+    "available, cube, vector",
+    ((False, 32, 64), (True, 0, 64), (True, 32, 1), (True, 32, 0)),
+)
+def test_core_quota_rejects_unavailable_mix(available, cube, vector, monkeypatch):
+    monkeypatch.setattr(torch.npu, "current_stream", lambda device: None)
+    info = SimpleNamespace(
+        available=available, cube_core_num=cube, vector_core_num=vector
+    )
+    monkeypatch.setattr(op.dsl, "get_platform_info", lambda **kwargs: info)
+    meta = SimpleNamespace(tokens=1, heads=1, qkv_quant_mode=3)
+    with pytest.raises(ValueError, match="no valid MIX-core capacity"):
+        op._core_num(torch.empty(0), meta)
+
+
 @pytest.mark.parametrize("name", ("norm_eps", "qr_scale", "kvr_scale"))
 @pytest.mark.parametrize("value", (True, False, "1.0", None, 1j))
 @pytest.mark.parametrize("compiling", (False, True))
@@ -1664,13 +1703,18 @@ def test_output_metadata(mode, return_qr, tokens):
 
 @pytest.mark.parametrize("mode", range(4))
 @pytest.mark.parametrize("return_qr", (False, True))
-def test_empty_public_entry(mode, return_qr, monkeypatch):
+@pytest.mark.parametrize("block_size", (16, 128, 1024))
+def test_empty_public_entry(mode, return_qr, block_size, monkeypatch):
     if not torch.npu.is_available():
         pytest.skip("Ascend NPU required")
     device = int(os.environ.get("MLA_PROLOG_DEVICE", "0"))
     torch.npu.set_device(device)
     case = (mode, "ND", "PA_BSND", 128, 64, 1, return_qr)
     _, actual, _, attrs = make_inputs(case, torch.device(f"npu:{device}"))
+    cache = actual["kv_cache"]
+    actual["kv_cache"] = torch.zeros(
+        (2, block_size, 1, cache.shape[-1]), dtype=torch.float32, device=cache.device
+    ).to(cache.dtype)
     for name in ("x", "cache_index", "rope_sin", "rope_cos"):
         actual[name] = actual[name][:0]
     before = actual["kv_cache"].cpu().view(torch.uint8).clone()
@@ -1733,3 +1777,99 @@ def test_mla_prolog(case):
             json.dumps(report, ensure_ascii=False, indent=2)
         )
     print(json.dumps(report, ensure_ascii=False), flush=True)
+
+
+def cache_slot_bytes(cache, cache_mode):
+    """Decode physical Cache bytes using its actual page size, without arithmetic."""
+    blocks, block_size, _, width = cache.shape
+    row_bytes = width * cache.element_size()
+    raw = cache.cpu().contiguous().view(torch.uint8)
+    if cache_mode == "PA_NZ":
+        raw = raw.reshape(blocks, row_bytes // 32, block_size, 32)
+        raw = raw.permute(0, 2, 1, 3).contiguous()
+    return raw.reshape(blocks * block_size, row_bytes)
+
+
+@pytest.mark.parametrize(
+    "case",
+    (
+        (0, "ND", "PA_BSND", 128, 64, 1, True),
+        (0, "NZ", "PA_NZ", 128, 64, 1, True),
+        (1, "NZ", "PA_BSND", 192, 64, 2, False),
+        (1, "ND", "PA_BSND", 256, 0, 0, False),
+        (2, "ND", "PA_BSND", 128, 64, 1, False),
+        (2, "NZ", "PA_NZ", 128, 64, 1, False),
+        (3, "ND", "PA_NZ", 256, 0, 0, True),
+        (3, "NZ", "PA_BSND", 128, 64, 1, True),
+    ),
+)
+def test_cache_block_size(case):
+    """Page geometry must not alter numerics or write any unselected slot.
+
+    The 128-page baseline is independently checked against frozen references.
+    Other page sizes are a byte-level layout metamorphic check against that
+    baseline; this does not redefine the numerical Golden or its thresholds.
+    """
+    if not torch.npu.is_available():
+        pytest.skip("Ascend NPU required")
+    verify_reference_integrity()
+    torch.set_num_threads(4)
+    device = int(os.environ.get("MLA_PROLOG_DEVICE", "0"))
+    torch.npu.set_device(device)
+    cpu, actual, attrs, public_attrs = make_inputs(case, torch.device(f"npu:{device}"))
+    before = cpu["kv_cache"].clone()
+    reference = op.mla_prolog(**actual, **public_attrs)
+    compare_outputs(cpu, actual, attrs, reference, before)
+    expected_outputs = [value.cpu().view(torch.uint8) for value in reference]
+    expected_payload = cache_slot_bytes(actual["kv_cache"], case[2])[
+        cpu["cache_index"]
+    ].clone()
+    dtype, width = actual["kv_cache"].dtype, actual["kv_cache"].shape[-1]
+    # Scan all 64 legal sizes on BSND, representative boundaries on other paths.
+    sizes = range(16, 1025, 16) if case == CASES[0] else (16, 48, 128, 256, 1024)
+    for block_size in sizes:
+        shape = (3, block_size, 1, width)
+        raw = torch.full(
+            (math.prod(shape) * actual["kv_cache"].element_size(),),
+            0xA5,
+            dtype=torch.uint8,
+        )
+        actual["kv_cache"] = raw.view(dtype).reshape(shape).to(device)
+        # Non-monotonic order: last legal slot, last slot in page 0, first in page 1.
+        indices = torch.tensor([3 * block_size - 1, block_size - 1, block_size])
+        actual["cache_index"] = indices.to(device)
+        identity = cache_identity(actual["kv_cache"])
+        outputs = op.mla_prolog(**actual, **public_attrs)
+        assert cache_identity(actual["kv_cache"]) == identity
+        for value, expected in zip(outputs, expected_outputs):
+            assert torch.equal(value.cpu().view(torch.uint8), expected), block_size
+        slots = cache_slot_bytes(actual["kv_cache"], case[2])
+        assert torch.equal(slots[indices], expected_payload), block_size
+        untouched = torch.ones(3 * block_size, dtype=torch.bool)
+        untouched[indices] = False
+        assert bool((slots[untouched] == 0xA5).all()), block_size
+
+
+@pytest.mark.parametrize("block_size", (0, 15, 17, 1025, 1040))
+@pytest.mark.parametrize("empty", (False, True))
+def test_cache_block_size_rejected(block_size, empty, monkeypatch):
+    if not torch.npu.is_available():
+        pytest.skip("Ascend NPU required")
+    device = int(os.environ.get("MLA_PROLOG_DEVICE", "0"))
+    torch.npu.set_device(device)
+    _, actual, _, attrs = make_inputs(CASES[0], torch.device(f"npu:{device}"))
+    actual["kv_cache"] = torch.zeros(
+        (2, block_size, 1, 576), dtype=torch.bfloat16, device=f"npu:{device}"
+    )
+    if empty:
+        for name in ("x", "cache_index", "rope_sin", "rope_cos"):
+            actual[name] = actual[name][:0]
+    before = actual["kv_cache"].cpu().view(torch.uint8).clone()
+
+    def forbidden_launch(*args, **kwargs):
+        pytest.fail("Invalid Cache page size reached Kernel launch")
+
+    monkeypatch.setattr(op, "_launch", forbidden_launch)
+    with pytest.raises(ValueError, match="kv_cache block_size"):
+        op.mla_prolog(**actual, **attrs)
+    assert torch.equal(actual["kv_cache"].cpu().view(torch.uint8), before)

@@ -95,8 +95,6 @@ _NATIVE_DIRECTORY = Path(__file__).resolve().parent / "_native"
 if _NATIVE_DIRECTORY.is_dir():
     register_directory(_NATIVE_DIRECTORY)
 
-PA_BLOCK_SIZE = 128
-
 
 PA_NZ_PLANE_ELEMS = 16
 
@@ -135,16 +133,16 @@ def write_row_panz(cache, cache_index, payload, token):
     if slot >= 0:
         planes = cache.shape[3] // PA_NZ_PLANE_ELEMS
         physical = cache.view(
-            (cache.shape[0] * planes * PA_BLOCK_SIZE, PA_NZ_PLANE_ELEMS)
+            (cache.shape[0] * planes * cache.shape[1], PA_NZ_PLANE_ELEMS)
         )
-        block = slot // PA_BLOCK_SIZE
-        row = slot % PA_BLOCK_SIZE
+        block = slot // cache.shape[1]
+        row = slot % cache.shape[1]
         for plane in cannbotdsl.range(0, planes):
             mem_copy(
                 tile_slice(
                     physical,
                     (1, PA_NZ_PLANE_ELEMS),
-                    ((block * planes + plane) * PA_BLOCK_SIZE + row, 0),
+                    ((block * planes + plane) * cache.shape[1] + row, 0),
                 ),
                 tile_slice(payload, (1, PA_NZ_PLANE_ELEMS), (0, plane)),
             )
@@ -153,7 +151,7 @@ def write_row_panz(cache, cache_index, payload, token):
 @jit
 def write_cache_row(cache, cache_index, payload, token, row_tiler, cache_mode):
     if cache_mode == 0:
-        cache_2d = cache_row_view(cache, PA_BLOCK_SIZE)
+        cache_2d = cache_row_view(cache, cache.shape[1])
         write_row_bsnd(cache_2d, cache_index, payload, token, row_tiler)
     else:
         write_row_panz(cache, cache_index, payload, token)
@@ -166,7 +164,7 @@ def write_cache_row_group_fp8(cache, cache_index, payload_read, token, rope_dim)
         dtile = dtile_for(rope_dim)
         words = dtile // 4
         cache_words = cache.view(dtype=dtypes.float32).view(
-            (cache.shape[0] * PA_BLOCK_SIZE * cache.shape[3] // 4,)
+            (cache.shape[0] * cache.shape[1] * cache.shape[3] // 4,)
         )
         payload_words = payload_read.reinterpret(
             dtype=dtypes.float32, layout=make_layout((1, DTILE_MAX // 4)), offset=0
@@ -1170,7 +1168,7 @@ PA_NZ_FP8_PLANE_ELEMS = 32
 HIF8_MAX = 32768.0
 
 
-WS_AMAX_SLOTS = 32
+AMAX_VECTOR_LANES = 64
 
 
 @jit
@@ -1179,16 +1177,16 @@ def write_row_panz_fp8(cache, cache_index, payload_read, token):
     if slot >= 0:
         planes = cache.shape[3] // PA_NZ_FP8_PLANE_ELEMS
         physical = cache.view(
-            (cache.shape[0] * planes * PA_BLOCK_SIZE, PA_NZ_FP8_PLANE_ELEMS)
+            (cache.shape[0] * planes * cache.shape[1], PA_NZ_FP8_PLANE_ELEMS)
         )
-        block = slot // PA_BLOCK_SIZE
-        row = slot % PA_BLOCK_SIZE
+        block = slot // cache.shape[1]
+        row = slot % cache.shape[1]
         for plane in cannbotdsl.range(0, planes):
             mem_copy(
                 tile_slice(
                     physical,
                     (1, PA_NZ_FP8_PLANE_ELEMS),
-                    ((block * planes + plane) * PA_BLOCK_SIZE + row, 0),
+                    ((block * planes + plane) * cache.shape[1] + row, 0),
                 ),
                 tile_slice(payload_read, (1, PA_NZ_FP8_PLANE_ELEMS), (0, plane)),
             )
@@ -1204,7 +1202,7 @@ def write_cache_row_fp8(cache, cache_index, payload_read, token, kvr, cache_mode
             dtype=dtypes.float8_e4m3fn, layout=make_layout((1, kvr)), offset=0
         )
     if cache_mode == 0:
-        cache_2d = cache_row_view(cache, PA_BLOCK_SIZE)
+        cache_2d = cache_row_view(cache, cache.shape[1])
         write_row_bsnd(cache_2d, cache_index, byte_view, token, row_tiler)
     else:
         write_row_panz_fp8(cache, cache_index, payload_read, token)
@@ -1216,16 +1214,16 @@ def write_row_panz_hif8(cache, cache_index, payload_read, token):
     if slot >= 0:
         planes = cache.shape[3] // PA_NZ_FP8_PLANE_ELEMS
         physical = cache.view(
-            (cache.shape[0] * planes * PA_BLOCK_SIZE, PA_NZ_FP8_PLANE_ELEMS)
+            (cache.shape[0] * planes * cache.shape[1], PA_NZ_FP8_PLANE_ELEMS)
         )
-        block = slot // PA_BLOCK_SIZE
-        row = slot % PA_BLOCK_SIZE
+        block = slot // cache.shape[1]
+        row = slot % cache.shape[1]
         for plane in cannbotdsl.range(0, planes):
             mem_copy(
                 tile_slice(
                     physical,
                     (1, PA_NZ_FP8_PLANE_ELEMS),
-                    ((block * planes + plane) * PA_BLOCK_SIZE + row, 0),
+                    ((block * planes + plane) * cache.shape[1] + row, 0),
                 ),
                 tile_slice(payload_read, (1, PA_NZ_FP8_PLANE_ELEMS), (0, plane)),
             )
@@ -1241,7 +1239,7 @@ def write_cache_row_hif8(cache, cache_index, payload_read, token, kvr, cache_mod
             dtype=dtypes.uint8, layout=make_layout((1, kvr)), offset=0
         )
     if cache_mode == 0:
-        cache_2d = cache_row_view(cache, PA_BLOCK_SIZE)
+        cache_2d = cache_row_view(cache, cache.shape[1])
         write_row_bsnd(cache_2d, cache_index, byte_view, token, row_tiler)
     else:
         write_row_panz_hif8(cache, cache_index, payload_read, token)
@@ -2797,10 +2795,11 @@ class QAmaxStage:
     @jit
     def partial_amax(self, q_fp2d, ws_amax, heads, kvr, block, blocks, rows):
         row_tiler = make_tiler((1, kvr), alignment=(1, VECTOR_SEG))
-        ws_col = ws_amax.view((WS_AMAX_SLOTS, 1))
+        ws_col = ws_amax.view((ws_amax.shape[0], 1))
         w_init = self.carry.next_write()
         with vf(mode="simd"):
             vstore(w_init, 0, vdups(0.0, dtypes.float32, mask=full_mask()), full_mask())
+            vstore_first(self.scalar, 0, vdups(0.0, dtypes.float32, mask=full_mask()))
             vmem_bar(mode="vst_vld")
         for r in cannbotdsl.range(block, rows, blocks):
             token = r // heads
@@ -2871,17 +2870,34 @@ class QGlobalQuant:
     ):
         row_tiler = make_tiler((1, kvr), alignment=(1, VECTOR_SEG))
         descale_2d = descale_q_gm.view((1, 1))
-        ws_row = ws_amax.view((1, WS_AMAX_SLOTS))
-        mem_copy(
-            self.slots.next_write(), tile_slice(ws_row, (1, WS_AMAX_SLOTS), (0, 0))
-        )
-        slots_read = self.slots.next_read()
+        ws_row = ws_amax.view((1, ws_amax.shape[0]))
+        with vf(mode="simd"):
+            init_mask = update_mask(1, elem_bits=32)[0]
+            vstore_first(self.scalar, 2, vdups(0.0, dtypes.float32, mask=init_mask))
+            vmem_bar(mode="vst_vld")
+        for first_slot in cannbotdsl.range(0, blocks, AMAX_VECTOR_LANES):
+            mem_copy(
+                self.slots.next_write(),
+                tile_slice(
+                    ws_row, (1, AMAX_VECTOR_LANES), (0, first_slot // AMAX_VECTOR_LANES)
+                ),
+            )
+            slots_read = self.slots.next_read()
+            with vf(mode="simd"):
+                partial_mask = update_mask(1, elem_bits=32)[0]
+                slot_mask = update_mask(
+                    min(blocks - first_slot, AMAX_VECTOR_LANES), elem_bits=32
+                )[0]
+                partial_max = vmax(
+                    vload_broadcast(self.scalar, 2),
+                    vreduce_max(vload(slots_read, 0), mask=slot_mask),
+                    mask=partial_mask,
+                )
+                vstore_first(self.scalar, 2, partial_max)
+                vmem_bar(mode="vst_vld")
         with vf(mode="simd"):
             one = update_mask(1, elem_bits=32)[0]
-            active_slots = min(max(blocks, 1), WS_AMAX_SLOTS)
-            mask32 = update_mask(active_slots, elem_bits=32)[0]
-            amax = vdups(0.0, dtypes.float32, mask=one)
-            amax = vmax(amax, vreduce_max(vload(slots_read, 0), mask=mask32), mask=one)
+            amax = vload_broadcast(self.scalar, 2)
             limit = vdups(HIF8_MAX, dtypes.float32, mask=one)
             descale = vdiv(amax, limit, mask=one, precision_mode=True)
             zero = vdups(0.0, dtypes.float32, mask=one)
@@ -5360,6 +5376,7 @@ def _dims_for(key):
         rope_dim = kvr - 512
     rows_qb = heads * (nope + rope_dim)
     blocks = Dim("Bn", min=1)
+    block_size = Dim("Bs", min=16, max=1024, multiple_of=16)
     q_lora_pad = (q_lora + BN - 1) // BN * BN
     kvr_pad = (kvr + BN - 1) // BN * BN
     rows_qb_pad = (rows_qb + BN - 1) // BN * BN
@@ -5374,6 +5391,7 @@ def _dims_for(key):
         "nope": nope,
         "rows_qb": rows_qb,
         "blocks": blocks,
+        "block_size": block_size,
         "q_lora_pad": q_lora_pad,
         "kvr_pad": kvr_pad,
         "rows_qb_pad": rows_qb_pad,
@@ -5482,7 +5500,7 @@ def build_program(key):
         spec((d["heads"], d["nope"], 512), dtypes.bfloat16),
         spec((1, d["q_lora"]), dtypes.float32),
         spec((1, 512), dtypes.float32),
-        spec((d["blocks"], 128, 1, cache_last_dim), cache_dtype),
+        spec((d["blocks"], d["block_size"], 1, cache_last_dim), cache_dtype),
         spec((d["tokens"],), dtypes.int64),
     )
     if key.qkv_quant_mode in (2, 3):
@@ -5541,7 +5559,10 @@ def build_program(key):
     if key.qkv_quant_mode in (2, 3):
         tail_specs += (spec((d["rows"], d["heads"], d["kvr"]), dtypes.float32),)
     if key.qkv_quant_mode == 3:
-        tail_specs += (spec((32,), dtypes.float32),)
+        amax_slots = Dim(
+            "AmaxSlots", min=AMAX_VECTOR_LANES, multiple_of=AMAX_VECTOR_LANES
+        )
+        tail_specs += (spec((amax_slots,), dtypes.float32),)
     tail_specs += (qb_aux_spec,)
     tail_specs += (
         dtypes.float32,
@@ -5758,9 +5779,10 @@ def _validate(
     (blocks, block_size, cache_heads, _) = kv_cache.shape
     _require(blocks > 0, "block_number must be positive")
     _require(
-        block_size == 128 and cache_heads == 1,
-        "kv_cache block_size must be 128 and Nkv must be 1",
+        16 <= block_size <= 1024 and block_size % 16 == 0,
+        "kv_cache block_size must be [16,1024] and divisible by 16",
     )
+    _require(cache_heads == 1, "kv_cache Nkv must be 1")
     expected_width = 512 + 2 * rope_dim + 16 if qkv_quant_mode == 1 else 512 + rope_dim
     cache_dtype = (
         torch.bfloat16
@@ -5769,7 +5791,13 @@ def _validate(
         if qkv_quant_mode == 3
         else torch.float8_e4m3fn
     )
-    _tensor("kv_cache", kv_cache, (blocks, 128, 1, expected_width), cache_dtype, device)
+    _tensor(
+        "kv_cache",
+        kv_cache,
+        (blocks, block_size, 1, expected_width),
+        cache_dtype,
+        device,
+    )
     _tensor("cache_index", cache_index, (tokens,), torch.int64, device)
     if qkv_quant_mode in (2, 3):
         _tensor("quant_scale_kv", quant_scale_kv, (1,), torch.float32, device)
@@ -5811,11 +5839,7 @@ def _core_num(x, meta):
         info.available and info.cube_core_num > 0 and (info.vector_core_num > 1),
         "current stream has no valid MIX-core capacity",
     )
-    launch_cap = 36 if meta.qkv_quant_mode == 0 else 32
-    cores = min(int(info.cube_core_num), int(info.vector_core_num) // 2, launch_cap)
-    if meta.qkv_quant_mode == 3:
-        cores = min(cores, meta.tokens * meta.heads)
-    return max(1, cores)
+    return min(int(info.cube_core_num), int(info.vector_core_num) // 2)
 
 
 def _empty_outputs(meta, device):
@@ -5916,7 +5940,11 @@ def _launch(
             (rows, meta.heads, meta.kvr), dtype=torch.float32, device=x.device
         )
     if meta.qkv_quant_mode == 3:
-        ws_amax = torch.empty((32,), dtype=torch.float32, device=x.device)
+        ws_amax = torch.empty(
+            (_ceil_align(core_num, AMAX_VECTOR_LANES),),
+            dtype=torch.float32,
+            device=x.device,
+        )
     ws_qb_aux = torch.empty((rows, meta.q_lora), dtype=torch.bfloat16, device=x.device)
     launch_args = (
         x,

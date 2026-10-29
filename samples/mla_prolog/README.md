@@ -13,8 +13,12 @@
 | (Dn,Dr) | (128,64)、(192,64)、(256,0) |
 | 权重 | 三路投影权重统一 ND 或统一真实 NZ；wkb 为 ND |
 | 输出模式 | 0/1/2/3；mode1 仅 PA_BSND，其余支持 PA_BSND/PA_NZ |
-| Cache | block_size=128，负 index 跳过写入，重复有效 index 非法 |
+| Cache | `16 ≤ block_size ≤ 1024`，16 对齐；从 `kv_cache.shape[1]` 获取。负 index 跳过写入，重复有效 index 非法 |
 | 空输入 | T=0 无主 Kernel 启动；返回固定三个 Tensor 槽位 |
+| 核资源 | 按当前 stream 的可用 MIX 资源选择 `min(AIC数, AIV数 // 2)`；四种输出模式均不额外限制为32/36核，mode3不按 `T*N` 限制启动核数 |
+
+核数不属于公开接口参数。调用方调整 stream 核资源配额后，后续调用重新读取配额；
+没有可用 MIX 资源时抛出 `ValueError`，不启动 Kernel。
 
 ## 算子接口
 
@@ -63,7 +67,7 @@ def mla_prolog(
 | `wkb` | `(N,Dn,512)` | `torch.bfloat16` | ND，将Q-Nope吸收到512维latent空间，不用于生成Cache |
 | `norm_weight_qa` | `(q_lora,)` | `torch.float32` | ND，QA RMSNorm gamma |
 | `norm_weight_kva` | `(512,)` | `torch.float32` | ND，Ckv RMSNorm gamma |
-| **`kv_cache`（原地输入输出）** | mode 0/2/3：`(block_number,128,1,512+Dr)`；mode 1：`(block_number,128,1,512+2*Dr+16)` | mode 0：`torch.bfloat16`；mode 1/2：`torch.float8_e4m3fn`；mode 3：`torch.uint8`承载HiF8字节 | 外部Tensor为ND载体，内部按 `cache_mode` 的PA_BSND/PA_NZ地址映射；mode 1仅PA_BSND |
+| **`kv_cache`（原地输入输出）** | mode 0/2/3：`(block_number,block_size,1,512+Dr)`；mode 1：`(block_number,block_size,1,512+2*Dr+16)` | mode 0：`torch.bfloat16`；mode 1/2：`torch.float8_e4m3fn`；mode 3：`torch.uint8`承载HiF8字节 | `block_size` 为 16～1024 内的 16 的倍数。外部Tensor为ND载体，内部按 `cache_mode` 的PA_BSND/PA_NZ地址映射；mode 1仅PA_BSND |
 | `cache_index` | `(T,)` | `torch.int64` | ND，token写入的线性Cache槽位；负值跳过写入 |
 | `quant_scale_kv` | `(1,)` | `torch.float32` | ND，mode 2/3必填且有限正数；mode 0/1必须为 `None` |
 | `rope_sin` | `(T,Dr)` | `torch.bfloat16` | ND，启用RoPE时必填 |
@@ -79,7 +83,7 @@ def mla_prolog(
 
 | 属性 | 类型与合法值 | 默认值 | 含义 |
 | --- | --- | --- | --- |
-| `norm_eps` | 转FP32后仍有限且大于0的数值，拒绝bool | `1e-5` | QA和Ckv两路RMSNorm共用epsilon |
+| `norm_eps` | 浮点属性，内核类型FP32；须有限且严格大于0，拒绝bool | `1e-5` | QA和Ckv两路RMSNorm共用epsilon |
 | `qkv_quant_mode` | `mlaprolog.QkvQuantMode` | `NO_QUANT` | 最终Q及Cache的量化模式 |
 | `cache_mode` | `mlaprolog.CacheMode` | `PA_BSND` | Cache内部地址映射 |
 | `qr_scale` | 转FP32后有限，允许负数和0，拒绝bool | `1.0` | QA RMSNorm后、WQB前缩放CQ；同时影响Q-Nope、Q-RoPE和qr |
@@ -88,7 +92,8 @@ def mla_prolog(
 | `return_qr` | 严格bool | `False` | 是否写出QA归一化并缩放后的qr，不改变主Q路径 |
 
 公开 Python 入口在进入 Torch dispatcher 前拒绝三个浮点属性的 bool 和非数值类型。
-`norm_eps` 必须在转为 FP32 后仍有限且严格大于0；省略时使用 `1e-5`。
+`norm_eps` 通过 Python 数值属性传入，例如 `norm_eps=1e-5`，不是 Tensor 参数；内核接收 FP32 标量。
+省略时使用 `1e-5`。Host 拒绝非有限值，以及超出 FP32 有限范围或转换为 FP32 后变为0的值，确保内核实际接收的 epsilon 有限且严格大于0。
 
 | 枚举成员 | 内部编码 | 语义 |
 | --- | ---: | --- |
@@ -127,7 +132,7 @@ HiF8的uint8仅承载编码，不表示UINT8数值量化。
 
 - QA：`cq=RMSNorm(x@wqa.T)*qr_scale`，再经WQB投影；Q-Nope经WKB吸收，Q-Rope按RoPE模式处理，拼接后按输出模式量化。
 - KVA：将 `x@wkva.T` 拆为Ckv和KR；仅Ckv执行RMSNorm及 `kvr_scale`，KR执行可选RoPE；之后量化并写Cache。
-- `cache_index>=0` 的项必须小于 `block_number*128` 且互不重复；所有INT64负值均跳过Cache写入，允许重复负值。跳过写入的token仍参与Q、qr及Q动态量化计算。
+- `cache_index>=0` 的项必须小于 `block_number*block_size` 且互不重复；所有INT64负值均跳过Cache写入，允许重复负值。跳过写入的token仍参与Q、qr及Q动态量化计算。
 - **T=0仍执行接口校验，在Host返回，不分配Kernel workspace、不启动DSL Kernel**；q为 `(0,N,512+Dr)`；mode 2的descale_q为 `(0,N,1)`，mode 0/1/3为 `(0,)`；qr按 `return_qr` 为 `(0,q_lora)` 或 `(0,)`。Cache的地址、storage identity、Shape、dtype及全部原始字节不变。
 - 元信息和属性错误在调用层报错；Eager额外回读index/scale值进行预检。图捕获与replay不做值回读，必须在图外保证合法性，详见后续图模式示例。
 - 不通过Cache clone、copy-back、TensorMove或隐式Format转换修复不合法输入；公开输出不支持自动求导。
@@ -379,10 +384,10 @@ $\operatorname{Decode}(P_t)/s_{KV}$ 反量化。Q的descale是输出乘子，Cac
 
 ### 9. Cache原地写入与最终返回
 
-令 $s_t=\texttt{cache\_index}[t]$。对非负有效index，计算页号和页内位置：
+令 $s_t=\texttt{cache\_index}[t]$，$B_s=\texttt{kv\_cache.shape[1]}$。对非负有效index，计算页号和页内位置：
 
 $$
-b_t=\left\lfloor\frac{s_t}{128}\right\rfloor,\qquad r_t=s_t\bmod128.
+b_t=\left\lfloor\frac{s_t}{B_s}\right\rfloor,\qquad r_t=s_t\bmod B_s.
 $$
 
 用 $C[b,r]$ 表示PA_BSND或PA_NZ布局下的逻辑payload槽位，更新规则为：
