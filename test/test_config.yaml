@@ -46,6 +46,14 @@ ignore:
   - scripts/run_codespell.sh
   - test/test_config.yaml
 
+mla_prolog:
+  module: True
+  src:
+    - samples/mla_prolog
+    - test/mla_prolog
+  options:
+    - mla_prolog
+
 add:
   module: True
   src:
