@@ -64,7 +64,7 @@ $$
 
 当 $t\ge L_Q$、候选长度为 0 或交集为空时，输出整行无效项。
 TopK 不足时填充尾部；`output_idx_offset` 只作用于有效索引。
-[QSLI Metadata](../quant_sparse_lightning_indexer_metadata_dsl/README.md) 在 AICPU 上根据候选长度和序列参数生成 LI/LD 调度信息，
+[QSLI Metadata](../quant_sparse_lightning_indexer_metadata/README.md) 在 AICPU 上根据候选长度和序列参数生成 LI/LD 调度信息，
 主 kernel 按该信息执行候选搬运、计算与归并。
 
 | 特性与约束 | 说明 |
@@ -78,7 +78,7 @@ TopK 不足时填充尾部；`output_idx_offset` 只作用于有效索引。
 | TopK / Mask | `topk` 范围 `[1,8192]`；`mask_mode=0/3`；`cmp_ratio` 范围 `[1,128]` |
 | Metadata | 同设备连续 `int32[1024]`，必须显式提供 |
 
-实现见 [quant_sparse_lightning_indexer_dsl.py](quant_sparse_lightning_indexer_dsl.py)。
+实现见 [quant_sparse_lightning_indexer.py](quant_sparse_lightning_indexer.py)。
 
 PA Key 打包格式：
 
@@ -100,7 +100,7 @@ PyTorch 需提供 `float8_e8m0fnu`，设备需支持 MXFP4。在仓库根目录�
 
 ```bash
 source ${install_path}/ascend-toolkit/set_env.sh
-export PYTHONPATH="$PWD/samples/quant_sparse_lightning_indexer_dsl:$PWD/samples/quant_sparse_lightning_indexer_metadata_dsl:$PYTHONPATH"
+export PYTHONPATH="$PWD/samples/quant_sparse_lightning_indexer:$PWD/samples/quant_sparse_lightning_indexer_metadata:$PYTHONPATH"
 ```
 
 以下示例演示 PA 数据打包和完整调用；随机字节只用于接口演示，不代替模型量化或精度基准。
@@ -108,8 +108,8 @@ export PYTHONPATH="$PWD/samples/quant_sparse_lightning_indexer_dsl:$PWD/samples/
 ```python
 import torch
 import torch_npu
-from quant_sparse_lightning_indexer_dsl import quant_sparse_lightning_indexer
-from quant_sparse_lightning_indexer_metadata_dsl import quant_sparse_lightning_indexer_metadata
+from quant_sparse_lightning_indexer import quant_sparse_lightning_indexer
+from quant_sparse_lightning_indexer_metadata import quant_sparse_lightning_indexer_metadata
 
 device = "npu:0"
 torch.npu.set_device(device)
@@ -177,13 +177,13 @@ TopK 不保证按分数排序；索引不是候选数组内的位置，也不是
 
 ## 精度测试
 
-测试代码位于 [test_quant_sparse_lightning_indexer_dsl.py](../../test/quant_sparse_lightning_indexer_dsl/test_quant_sparse_lightning_indexer_dsl.py)。
+测试代码位于 [test_quant_sparse_lightning_indexer.py](../../test/quant_sparse_lightning_indexer/test_quant_sparse_lightning_indexer.py)。
 在仓库根目录执行，MXFP4 输入、候选前缀、页表和 PyTorch CPU reference 均由测试生成：
 
 ```bash
-python -m pytest -q test/quant_sparse_lightning_indexer_dsl/test_quant_sparse_lightning_indexer_dsl.py
+python -m pytest -q test/quant_sparse_lightning_indexer/test_quant_sparse_lightning_indexer.py
 # 只运行典型长序列用例
-python -m pytest -q test/quant_sparse_lightning_indexer_dsl/test_quant_sparse_lightning_indexer_dsl.py -k typical_case
+python -m pytest -q test/quant_sparse_lightning_indexer/test_quant_sparse_lightning_indexer.py -k typical_case
 ```
 
 NPU 用例覆盖 PA128、PA64、TND、causal 压缩、零候选、尾块、索引偏移及返回分数开关，

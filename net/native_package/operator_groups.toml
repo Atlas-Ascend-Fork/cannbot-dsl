@@ -11,8 +11,8 @@
 # Operator names must match the `@export("...")` name in the source exactly.
 [operators]
 mqsmla = ["mixed_quant_sparse_flash_mla.py", "mixed_quant_sparse_flash_mla_metadata.py"]
-qli = ["quant_lightning_indexer_dsl.py", "quant_lightning_indexer_metadata_dsl.py"]
-qsli = ["quant_sparse_lightning_indexer_dsl.py", "quant_sparse_lightning_indexer_metadata_dsl.py"]
+qli = ["quant_lightning_indexer.py", "quant_lightning_indexer_metadata.py"]
+qsli = ["quant_sparse_lightning_indexer.py", "quant_sparse_lightning_indexer_metadata.py"]
 attn_epilogue = ["attn_epilogue.py", "attn_epilogue_common.py"]
 indexer_prologue_qw = ["indexer_prologue_qw.py", "indexer_prologue_qw_format.py"]
 indexer_prologue_k = ["indexer_prologue_k.py"]

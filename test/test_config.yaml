@@ -383,39 +383,39 @@ shared:
   options:
     - all
 
-quant_lightning_indexer_dsl:
+quant_lightning_indexer:
   module: True
   src:
-    - samples/quant_lightning_indexer_dsl
-    - test/quant_lightning_indexer_dsl
+    - samples/quant_lightning_indexer
+    - test/quant_lightning_indexer
   options:
-    - quant_lightning_indexer_dsl
+    - quant_lightning_indexer
 
-quant_lightning_indexer_metadata_dsl:
+quant_lightning_indexer_metadata:
   module: True
   src:
-    - samples/quant_lightning_indexer_metadata_dsl
-    - test/quant_lightning_indexer_metadata_dsl
+    - samples/quant_lightning_indexer_metadata
+    - test/quant_lightning_indexer_metadata
   options:
-    - quant_lightning_indexer_metadata_dsl
-    - quant_lightning_indexer_dsl
+    - quant_lightning_indexer_metadata
+    - quant_lightning_indexer
 
-quant_sparse_lightning_indexer_dsl:
+quant_sparse_lightning_indexer:
   module: True
   src:
-    - samples/quant_sparse_lightning_indexer_dsl
-    - test/quant_sparse_lightning_indexer_dsl
+    - samples/quant_sparse_lightning_indexer
+    - test/quant_sparse_lightning_indexer
   options:
-    - quant_sparse_lightning_indexer_dsl
+    - quant_sparse_lightning_indexer
 
-quant_sparse_lightning_indexer_metadata_dsl:
+quant_sparse_lightning_indexer_metadata:
   module: True
   src:
-    - samples/quant_sparse_lightning_indexer_metadata_dsl
-    - test/quant_sparse_lightning_indexer_metadata_dsl
+    - samples/quant_sparse_lightning_indexer_metadata
+    - test/quant_sparse_lightning_indexer_metadata
   options:
-    - quant_sparse_lightning_indexer_metadata_dsl
-    - quant_sparse_lightning_indexer_dsl
+    - quant_sparse_lightning_indexer_metadata
+    - quant_sparse_lightning_indexer
 mixed_quant_sparse_flash_mla:
   module: True
   src:

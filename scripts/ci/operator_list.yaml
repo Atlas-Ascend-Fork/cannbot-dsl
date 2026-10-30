@@ -36,10 +36,10 @@ operators:
   - engram_gate
   - quant_block_sparse_attn
   - indexer_prologue_qw
-  - quant_lightning_indexer_dsl
-  - quant_lightning_indexer_metadata_dsl
-  - quant_sparse_lightning_indexer_dsl
-  - quant_sparse_lightning_indexer_metadata_dsl
+  - quant_lightning_indexer
+  - quant_lightning_indexer_metadata
+  - quant_sparse_lightning_indexer
+  - quant_sparse_lightning_indexer_metadata
   - mixed_quant_sparse_flash_mla
   - mixed_quant_sparse_flash_mla_metadata
   - block_attn_res_update_rms_norm

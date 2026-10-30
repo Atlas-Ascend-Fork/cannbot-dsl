@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 
-"""Independent reference and precision tests for quant_lightning_indexer_dsl."""
+"""Independent reference and precision tests for quant_sparse_lightning_indexer."""
 
 import os
 from itertools import accumulate
@@ -33,8 +33,29 @@ def _decode_mxfp4(packed, scales):
     magnitudes = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6], dtype=torch.float32)
     codes = torch.stack((packed & 15, packed >> 4), dim=-1).flatten(-2).long()
     values = magnitudes[codes & 7] * torch.where(codes < 8, 1.0, -1.0)
-    exponents = scales.reshape(*packed.shape[:-1], -1).int() - 127
+    exponents = scales.flatten(-2).int() - 127
     return values * torch.exp2(exponents.float()).repeat_interleave(32, dim=-1)
+
+
+def _bf16_fma(lhs, rhs, acc):
+    """Round the exact BF16 product-plus-addend directly to BF16, ties to even."""
+    product, addend = lhs.double() * rhs.double(), acc.double()
+    summed = product + addend
+    recovered = summed - product
+    # TwoSum retains the direction of bits lost even by the FP64 addition.
+    residual = (product - (summed - recovered)) + (addend - recovered)
+    _, exponent = torch.frexp(summed.abs())
+    step = torch.ldexp(torch.ones_like(summed), (exponent - 8).clamp_min(-133))
+    scaled = summed.abs() / step
+    lower = torch.floor(scaled)
+    rounded = torch.round(scaled)
+    direction = torch.sign(summed) * residual
+    rounded = torch.where(
+        (scaled - lower == 0.5) & (direction != 0),
+        lower + (direction > 0),
+        rounded,
+    )
+    return (torch.sign(summed) * rounded * step).float()
 
 
 def _scores_reference(query, keys, weights, query_scale, key_scale):
@@ -45,10 +66,8 @@ def _scores_reference(query, keys, weights, query_scale, key_scale):
     bf16_weights = weights.to(torch.bfloat16).float()
     scores = torch.zeros((query.shape[0], keys.shape[0]), dtype=torch.float32)
     for head in range(HEADS):
-        scores = (
-            (scores + qk[:, head].clamp_min(0) * bf16_weights[:, head, None])
-            .to(torch.bfloat16)
-            .float()
+        scores = _bf16_fma(
+            qk[:, head].clamp_min(0), bf16_weights[:, head, None], scores
         )
     return scores
 
@@ -98,11 +117,16 @@ def _npu_device():
 
 
 def _load_operators():
-    kernel = load_sample("quant_lightning_indexer_dsl/quant_lightning_indexer_dsl.py")
-    metadata = load_sample(
-        "quant_lightning_indexer_metadata_dsl/quant_lightning_indexer_metadata_dsl.py"
+    kernel = load_sample(
+        "quant_sparse_lightning_indexer/quant_sparse_lightning_indexer.py"
     )
-    return kernel.quant_lightning_indexer, metadata.quant_lightning_indexer_metadata
+    metadata = load_sample(
+        "quant_sparse_lightning_indexer_metadata/quant_sparse_lightning_indexer_metadata.py"
+    )
+    return (
+        kernel.quant_sparse_lightning_indexer,
+        metadata.quant_sparse_lightning_indexer_metadata,
+    )
 
 
 def _make_inputs(
@@ -379,65 +403,95 @@ def _check_kernel(
                 )
 
 
-def test_mxfp4_decode():
-    packed = torch.tensor([[0x21, 0xF8] * 32], dtype=torch.uint8)
-    scales = torch.tensor([[[127, 128], [126, 127]]], dtype=torch.uint8)
-    expected = torch.tensor([0.5, 1.0, 0.0, -6.0] * 32)
-    expected *= torch.tensor([1.0, 2.0, 0.5, 1.0]).repeat_interleave(32)
-    torch.testing.assert_close(_decode_mxfp4(packed, scales)[0], expected)
+def test_bf16_fma_avoids_intermediate_rounding():
+    lhs = torch.tensor([7971459301376.0, 7971459301376.0, 1.0 + 3 / 128])
+    rhs = torch.tensor([-0.6875, -0.6875, 1.5])
+    acc = torch.tensor([1120.0, -1120.0, 2.0**-100])
+    expected = torch.tensor([-5463198400512.0, -5497558138880.0, 1.5390625])
+    torch.testing.assert_close(_bf16_fma(lhs, rhs, acc), expected, rtol=0, atol=0)
 
 
-def test_topk_reference_rejects_non_topk():
-    with pytest.raises(AssertionError):
-        _check_topk(
-            torch.tensor([0, 1]),
-            None,
-            torch.tensor([1.0, 2.0, 9.0]),
-            torch.ones(3, dtype=torch.bool),
+def test_sparse_topk_ignores_unselected_blocks():
+    _check_topk(
+        torch.tensor([0, 2]),
+        torch.tensor([2.0, 1.0]),
+        torch.tensor([2.0, 9.0, 1.0]),
+        torch.tensor([True, False, True]),
+    )
+
+
+@pytest.mark.npu
+@pytest.mark.parametrize("page_size", [48, 128])
+def test_pa_page_table_reload_across_empty_batches(page_size):
+    data = _make_inputs(
+        "PA_BBND",
+        page_size,
+        0,
+        sparse=True,
+        query_lengths=[1] * 96,
+        key_lengths=[129] * 96,
+        uniform_scale=True,
+    )
+    data["candidate_lengths"][1::2].zero_()
+    for row in range(1, 96, 2):
+        data["allowed"][row].zero_()
+    kernel, make_metadata = _load_operators()
+    metadata = make_metadata(
+        data["candidate_lengths"], **data["sequence"], **data["metadata_attributes"]
+    )
+    for _ in range(50):
+        indices, values = kernel(
+            data["q"],
+            data["k"],
+            data["w"],
+            data["descale_q"],
+            data["candidate_ids"],
+            data["candidate_lengths"],
+            descale_k=data["descale_k"],
+            **data["sequence"],
+            **data["attributes"],
+            quant_mode=1,
+            block_table=data["block_table"],
+            output_idx_offset=data["offsets"],
+            metadata=metadata,
+            return_value=True,
         )
-
-
-def test_topk_reference_rejects_zero_padding():
-    with pytest.raises(AssertionError, match="Invalid TopK values"):
-        _check_topk(
-            torch.tensor([-1]),
-            torch.tensor([0.0]),
-            torch.tensor([1.0]),
-            torch.tensor([False]),
-        )
+        indices, values = indices.cpu(), values.cpu()
+        for row, (scores, allowed) in enumerate(
+            zip(data["reference"], data["allowed"])
+        ):
+            _check_topk(indices[row, 0], values[row, 0], scores, allowed, row * 10000)
 
 
 @pytest.mark.npu
 @pytest.mark.parametrize(
-    "layout,page_size,mask,candidates",
+    "layout,page_size,mask",
     [
-        pytest.param("PA_BBND", 128, 0, False, id="pa128_ragged"),
-        pytest.param("PA_BBND", 64, 3, True, id="pa64_causal_candidates"),
-        pytest.param("TND", 128, 3, False, id="tnd_causal"),
+        pytest.param("PA_BBND", 128, 0, id="pa128_zero_candidate_tail"),
+        pytest.param("PA_BBND", 64, 3, id="pa64_causal_zero_candidate_tail"),
+        pytest.param("TND", 128, 3, id="tnd_causal_zero_candidate_tail"),
     ],
 )
-def test_quant_lightning_indexer(layout, page_size, mask, candidates):
-    _check_kernel(layout, page_size, mask, sparse=False, candidates=candidates)
+def test_quant_sparse_lightning_indexer(layout, page_size, mask):
+    _check_kernel(layout, page_size, mask, sparse=True)
 
 
 @pytest.mark.npu
-def test_candidate16_ld_tail():
-    _check_kernel(
-        "PA_BBND", 64, 3, sparse=False, candidates=True, candidate_capacity=16
-    )
+def test_topk16_ld_tail():
+    _check_kernel("PA_BBND", 128, 0, sparse=True, topk=16)
 
 
 @pytest.mark.npu
 @pytest.mark.parametrize("layout", ["PA_BBND", "TND"])
 def test_invalid_values_are_negative_infinity(layout):
-    _check_kernel(layout, 128, 0, sparse=False, key_lengths=(19, 73))
+    _check_kernel(layout, 128, 0, sparse=True, key_lengths=(19, 73))
 
 
 @pytest.mark.npu
 @pytest.mark.parametrize("layout", ["PA_BBND", "TND"])
-@pytest.mark.parametrize("empty", ["query", "key"])
+@pytest.mark.parametrize("empty", ["query", "candidate"])
 def test_all_rows_empty(layout, empty):
-    _check_kernel(layout, 128, 0, sparse=False, key_lengths=(19, 73), empty=empty)
+    _check_kernel(layout, 128, 0, sparse=True, key_lengths=(19, 73), empty=empty)
 
 
 @pytest.mark.npu
@@ -445,8 +499,7 @@ def test_all_rows_empty(layout, empty):
 @pytest.mark.parametrize(
     "batch_size,query_length,key_length",
     [
-        pytest.param(12, 6, 65536, id="b12_s1_6_n32_s2_64k"),
-        pytest.param(12, 6, 131072, id="b12_s1_6_n32_s2_128k"),
+        pytest.param(12, 6, 131072, id="b12_s1_6_n32_s2_128k_c2048"),
     ],
 )
 def test_typical_case(batch_size, query_length, key_length):
@@ -454,9 +507,73 @@ def test_typical_case(batch_size, query_length, key_length):
         "PA_BBND",
         128,
         3,
-        sparse=False,
+        sparse=True,
         query_lengths=(query_length,) * batch_size,
         key_lengths=(key_length,) * batch_size,
         signed_weights=True,
+        uniform_scale=True,
+    )
+
+
+@pytest.mark.npu
+@pytest.mark.parametrize(
+    "layout,page_size,mask,query_lengths,key_lengths,topk",
+    [
+        pytest.param(
+            "PA_BBND", 16, 3, (1, 5, 7), (255, 256, 257), 17, id="pa16_ragged_topk17"
+        ),
+        pytest.param(
+            "PA_BBND", 1024, 0, (7,), (1025,), 513, id="pa1024_page_tail_topk513"
+        ),
+        pytest.param(
+            "TND", 128, 3, (1, 6, 9), (511, 512, 513), 512, id="tnd_query_tile_tail"
+        ),
+        pytest.param(
+            "PA_BBND",
+            128,
+            3,
+            (6, 7),
+            (65535, 65537),
+            512,
+            id="pa128_64k_boundary_query_tail",
+        ),
+        pytest.param(
+            "PA_BBND", 128, 3, (0, 7), (0, 513), 512, id="pa128_mixed_empty_batch"
+        ),
+        pytest.param(
+            "PA_BBND",
+            128,
+            0,
+            (1,),
+            (8192,),
+            512,
+            id="pa128_single_query_multi_round_ld",
+        ),
+    ],
+)
+def test_generalized_case(layout, page_size, mask, query_lengths, key_lengths, topk):
+    _check_kernel(
+        layout,
+        page_size,
+        mask,
+        sparse=True,
+        query_lengths=query_lengths,
+        key_lengths=key_lengths,
+        topk=topk,
+        signed_weights=True,
+    )
+
+
+@pytest.mark.npu
+@pytest.mark.parametrize("topk", [2048, 8192])
+def test_large_topk_ld_workspace(topk):
+    _check_kernel(
+        "TND",
+        128,
+        0,
+        sparse=True,
+        query_lengths=(1,),
+        key_lengths=(16384,),
+        topk=topk,
         uniform_scale=True,
     )

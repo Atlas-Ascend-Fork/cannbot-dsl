@@ -13,7 +13,7 @@
 
 > **2026-09-30**
 >
-> - **✅ 支持 DeepSeek V4.1**：本仓算子集已覆盖相关算子，包括 [`indexer_prologue_qw`](samples/indexer_prologue_qw)、[`indexer_prologue_k`](samples/indexer_prologue_k)、[`attn_prologue`](samples/attn_prologue)、[`attn_epilogue`](samples/attn_epilogue)、[`quant_lightning_indexer_dsl`](samples/quant_lightning_indexer_dsl)、[`quant_sparse_lightning_indexer_dsl`](samples/quant_sparse_lightning_indexer_dsl)、[`mixed_quant_sparse_flash_mla`](samples/mixed_quant_sparse_flash_mla)。
+> - **✅ 支持 DeepSeek V4.1**：本仓算子集已覆盖相关算子，包括 [`indexer_prologue_qw`](samples/indexer_prologue_qw)、[`indexer_prologue_k`](samples/indexer_prologue_k)、[`attn_prologue`](samples/attn_prologue)、[`attn_epilogue`](samples/attn_epilogue)、[`quant_lightning_indexer`](samples/quant_lightning_indexer)、[`quant_sparse_lightning_indexer`](samples/quant_sparse_lightning_indexer)、[`mixed_quant_sparse_flash_mla`](samples/mixed_quant_sparse_flash_mla)。
 >
 > - **🚀 新增 17 个算子样例，并更新既有算子适配最新 CANNBot-DSL**。其中，[Sparse Flash Attention](samples/sparse_flash_attention) 在典型场景下**最高加速比达到 1.63 倍**；[Qwen Sparse Attention](samples/qwen_sparse_attn) 在长 KV decode 场景下**平均加速比达到 1.23 倍**。更多性能数据与测试口径请参见对应样例 README，其余算子的详细信息请参见下方的算子列表。
 >
@@ -196,10 +196,10 @@ python3 -m pytest test/sparse_flash_attention/test_sparse_flash_attention.py -v
 | [indexer_prologue_k](samples/indexer_prologue_k) | `indexer_prologue_k()` | Indexer K 路前处理：BF16 投影、RMSNorm、RoPE、MXFP4 量化与分页 cache 写入 |
 | [qsa_indexer](samples/qsa_indexer) | `qsa_indexer()`、`qsa_indexer_metadata()` | 压缩 Key 稀疏索引，选高分压缩块并展开为 token 索引 |
 | [stem_indexer](samples/stem_indexer) | `stem_indexer()`、`stem_indexer_metadata()` | 块级特征打分 + 动态 TopK 选择 Key Block |
-| [quant_lightning_indexer_dsl](samples/quant_lightning_indexer_dsl) | `quant_lightning_indexer()` | MXFP4 Lightning Indexer（QLI），遍历上下文选 TopK token |
-| [quant_lightning_indexer_metadata_dsl](samples/quant_lightning_indexer_metadata_dsl) | `quant_lightning_indexer_metadata()` | QLI 配套的 AICPU 调度算子 |
-| [quant_sparse_lightning_indexer_dsl](samples/quant_sparse_lightning_indexer_dsl) | `quant_sparse_lightning_indexer()` | MXFP4 Sparse Lightning Indexer（QSLI），仅访问候选 Key 块 |
-| [quant_sparse_lightning_indexer_metadata_dsl](samples/quant_sparse_lightning_indexer_metadata_dsl) | `quant_sparse_lightning_indexer_metadata()` | QSLI 配套的 AICPU 调度算子 |
+| [quant_lightning_indexer](samples/quant_lightning_indexer) | `quant_lightning_indexer()` | MXFP4 Lightning Indexer（QLI），遍历上下文选 TopK token |
+| [quant_lightning_indexer_metadata](samples/quant_lightning_indexer_metadata) | `quant_lightning_indexer_metadata()` | QLI 配套的 AICPU 调度算子 |
+| [quant_sparse_lightning_indexer](samples/quant_sparse_lightning_indexer) | `quant_sparse_lightning_indexer()` | MXFP4 Sparse Lightning Indexer（QSLI），仅访问候选 Key 块 |
+| [quant_sparse_lightning_indexer_metadata](samples/quant_sparse_lightning_indexer_metadata) | `quant_sparse_lightning_indexer_metadata()` | QSLI 配套的 AICPU 调度算子 |
 | [kv_compress_epilog](samples/kv_compress_epilog) | `kv_compress_epilog()` | KV Cache 量化压缩与按槽位原地更新 |
 | [reduce_scatter](samples/reduce_scatter) | `AivReduceScatterSoleMesh` | HIF8 多卡 ReduceScatter，支持 sum/max/min 与 UBMem/URMA |
 | [rms_norm](samples/rms_norm) | `rms_norm()` | RMSNorm，`y = x · rstd · γ` |

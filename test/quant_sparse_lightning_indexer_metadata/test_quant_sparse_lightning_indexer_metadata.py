@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 
-"""Independent reference and precision tests for quant_sparse_lightning_indexer_metadata_dsl."""
+"""Independent reference and precision tests for quant_sparse_lightning_indexer_metadata."""
 
 import os
 from collections import Counter, defaultdict
@@ -48,19 +48,20 @@ def _npu_device():
 
 def _load_metadata():
     return load_sample(
-        "quant_sparse_lightning_indexer_metadata_dsl/quant_sparse_lightning_indexer_metadata_dsl.py"
+        "quant_sparse_lightning_indexer_metadata/quant_sparse_lightning_indexer_metadata.py"
     ).quant_sparse_lightning_indexer_metadata
 
 
-def _assert_schedule(metadata, tasks, group_rows):
+def _assert_schedule(metadata, tasks, group_rows, workers=32):
     """Check coverage and LD fan-in independently of the load-balancing policy."""
     assert metadata.dtype == torch.int32 and metadata.shape == (1024,)
     records = metadata.reshape(128, 8).tolist()
-    assert not metadata.reshape(128, 8)[32:36].any()
+    assert not metadata.reshape(128, 8)[workers:36].any()
+    assert not metadata.reshape(128, 8)[36 + 2 * workers : 108].any()
     assert not metadata.reshape(128, 8)[108:].any()
     coverage = Counter()
     owners = defaultdict(set)
-    for core, record in enumerate(records[:32]):
+    for core, record in enumerate(records[:workers]):
         enabled, *fields = record
         assert enabled in (0, 1)
         if not enabled:
@@ -160,7 +161,8 @@ def _check_metadata(
                 (batch, group, tile)
                 for tile in range((length + tile_size - 1) // tile_size)
             )
-    _assert_schedule(metadata, tasks, group_rows)
+    workers = int(torch.npu.get_device_properties(device).cube_core_num)
+    _assert_schedule(metadata, tasks, group_rows, workers)
 
 
 def test_schedule_reference_rejects_duplicate_tile():

@@ -2,7 +2,7 @@
 
 基于 CANNBotDSL 实现的 MXFP4 Lightning Indexer（QLI），对 Query 与可见 Key
 计算加权相关性并选择 TopK token，面向 Ascend NPU。可同时输出供
-[QSLI](../quant_sparse_lightning_indexer_dsl/README.md) 使用的候选块。
+[QSLI](../quant_sparse_lightning_indexer/README.md) 使用的候选块。
 
 ## 算子介绍
 
@@ -68,7 +68,7 @@ $$
 `candidate_length` 表示候选数组的有效前缀长度，候选块号与主输出 token 索引是不同单位。
 关闭候选分支时，两个候选输出为空 Tensor。
 
-[QLI Metadata](../quant_lightning_indexer_metadata_dsl/README.md) 在 AICPU 上生成分核边界。
+[QLI Metadata](../quant_lightning_indexer_metadata/README.md) 在 AICPU 上生成分核边界。
 主 kernel 完成 QK、权重归约和分片 TopK；同一 Query 被多个核处理时，再在融合 kernel 内归并各分片结果。
 本 DSL 接口使用 `quant_mode=1` 表示 MXFP4，编号不等同于原生 QuantLightningIndexerV2 接口的量化模式枚举。
 
@@ -83,7 +83,7 @@ $$
 | 候选输出 | 关闭时两参数均为 `-1`；开启时 `candidate_topk_blocks>0`、`candidate_block_size=8` |
 | Metadata | 必须显式传入同设备、连续的 `int32[1024]` |
 
-实现见 [quant_lightning_indexer_dsl.py](quant_lightning_indexer_dsl.py)。
+实现见 [quant_lightning_indexer.py](quant_lightning_indexer.py)。
 
 ## 快速开始
 
@@ -93,7 +93,7 @@ PyTorch 需提供 `float8_e8m0fnu` 类型，设备需支持 MXFP4。
 
 ```bash
 source ${install_path}/ascend-toolkit/set_env.sh
-export PYTHONPATH="$PWD/samples/quant_lightning_indexer_dsl:$PWD/samples/quant_lightning_indexer_metadata_dsl:$PYTHONPATH"
+export PYTHONPATH="$PWD/samples/quant_lightning_indexer:$PWD/samples/quant_lightning_indexer_metadata:$PYTHONPATH"
 ```
 
 下面构造一组有效打包格式的 PA 输入，仅演示接口，不代替真实数据的量化过程或精度测试：
@@ -101,8 +101,8 @@ export PYTHONPATH="$PWD/samples/quant_lightning_indexer_dsl:$PWD/samples/quant_l
 ```python
 import torch
 import torch_npu
-from quant_lightning_indexer_dsl import quant_lightning_indexer
-from quant_lightning_indexer_metadata_dsl import quant_lightning_indexer_metadata
+from quant_lightning_indexer import quant_lightning_indexer
+from quant_lightning_indexer_metadata import quant_lightning_indexer_metadata
 
 device = "npu:0"
 torch.npu.set_device(device)
@@ -166,13 +166,13 @@ TND 多 batch 需同时提供 Q/K 前缀和；metadata 与主算子必须采用�
 
 ## 精度测试
 
-测试代码位于 [test_quant_lightning_indexer_dsl.py](../../test/quant_lightning_indexer_dsl/test_quant_lightning_indexer_dsl.py)。
+测试代码位于 [test_quant_lightning_indexer.py](../../test/quant_lightning_indexer/test_quant_lightning_indexer.py)。
 在仓库根目录执行，输入和 PyTorch CPU reference 均由测试生成：
 
 ```bash
-python -m pytest -q test/quant_lightning_indexer_dsl/test_quant_lightning_indexer_dsl.py
+python -m pytest -q test/quant_lightning_indexer/test_quant_lightning_indexer.py
 # 只运行典型长序列用例
-python -m pytest -q test/quant_lightning_indexer_dsl/test_quant_lightning_indexer_dsl.py -k typical_case
+python -m pytest -q test/quant_lightning_indexer/test_quant_lightning_indexer.py -k typical_case
 ```
 
 NPU 用例覆盖 PA128、PA64、TND、变长、causal 压缩、候选开关、索引偏移及返回分数开关，

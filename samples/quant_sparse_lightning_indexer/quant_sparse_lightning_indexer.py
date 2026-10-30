@@ -29,11 +29,10 @@ import cannbotdsl
 import torch
 from cannbotdsl.aot import export
 
-from cannbotdsl import MemLoc, ProfileSpec, Tensor, channel_rewind, dtypes
+from cannbotdsl import MemLoc, ProfileSpec, Tensor, dtypes
 from cannbotdsl.buffer import Buffer
-from cannbotdsl.channel import Channel
 from cannbotdsl.lang.control_flow import range as dsl_range
-from cannbotdsl.lang.constexpr import range_constexpr
+from cannbotdsl.lang.constexpr import range_constexpr, const_expr
 from cannbotdsl.lang.jit import jit
 from cannbotdsl.lang.host import host
 from cannbotdsl.lang.kernel import kernel
@@ -41,7 +40,7 @@ from cannbotdsl.lang.vf import vf
 from cannbotdsl.ops import reg as rr
 from cannbotdsl.ops.arch import get_block_idx, get_subblock_id
 from cannbotdsl.ops.matmul import matmul as dsl_matmul
-from cannbotdsl.ops.memcpy import make_copy_engine, mem_copy
+from cannbotdsl.ops.memcpy import mem_copy
 from cannbotdsl.ops.sync import (
     PIPE,
     global_sync_all,
@@ -59,6 +58,10 @@ from cannbotdsl.tensor import (
     make_layout,
     reinterpret,
 )
+
+from cannbotdsl import onchip_rewind
+from cannbotdsl.ring_buffer import RingBuffer
+from cannbotdsl.ops.memcpy import copy_options, pad
 
 
 TILE_M = 32
@@ -78,7 +81,7 @@ STAGING_DEPTH = 4
 VECTOR0_READY_ID = 6
 AIV1_SYNC_ID_OFFSET = 16
 TOPK_TRUNK_LEN = 16384
-MAX_CUBE_WORKERS = 32
+MAX_CUBE_WORKERS = 36
 
 # 每个 8-token 候选块：K 为 8×64B，E8M0 scale 为 8×4B。
 SCALE_GROUP_SIZE = 32
@@ -107,7 +110,7 @@ def _copy_pa_row(packed_ub, block_idx, key, key_address, address):
     destination = tile_view(packed_ub, (1, PACKED_BLOCK_BYTES), (block_idx, 0))
     source = make_tensor(
         make_pointer(dtypes.uint8, dtypes.int64(key_address + address), MemLoc.GM),
-        make_layout((PACKED_BLOCK_BYTES,), stride=(1,)),
+        make_layout((1, PACKED_BLOCK_BYTES), stride=(PACKED_BLOCK_BYTES, 1)),
     )
     mem_copy(destination, source)
 
@@ -125,8 +128,10 @@ def _copy_pa_pair(packed_ub, pair, key, key_address, first, second):
             make_pointer(dtypes.uint8, dtypes.int64(key_address + first), MemLoc.GM),
             make_layout((gap + PACKED_BLOCK_BYTES,), stride=(1,)),
         )
-        first_source = source[0:PACKED_BLOCK_BYTES,]
-        second_source = source[gap : gap + PACKED_BLOCK_BYTES,]
+        first_source = source[0:PACKED_BLOCK_BYTES,].view(1, PACKED_BLOCK_BYTES)
+        second_source = source[gap : gap + PACKED_BLOCK_BYTES,].view(
+            1, PACKED_BLOCK_BYTES
+        )
         mem_copy(
             tile_view(packed_ub, (2, PACKED_BLOCK_BYTES), (pair, 0)),
             (first_source, second_source),
@@ -184,23 +189,14 @@ class QsliMergeTopKWorkspace:
         self.max_topk = int(max_topk)
         self.topk_pad = ceil_div(self.max_topk, 256) * 256
         self.merge_len_pad = ceil_div(self.topk_pad + self.max_trunk_len, 128) * 128
-        self.current_trunk = Buffer(
-            MemLoc.UB,
-            (1, self.max_trunk_len),
-            dtypes.uint16,
+        self.merge_key = Buffer(
+            MemLoc.UB, dtypes.uint16, make_layout((1, self.merge_len_pad))
         )
-        self.merge_key = Buffer(MemLoc.UB, (1, self.merge_len_pad), dtypes.uint16)
-        self.tmp_idx = Buffer(MemLoc.UB, (self.merge_len_pad,), dtypes.uint16)
-        self.histogram = Buffer(MemLoc.UB, (256,), dtypes.uint16)
-        self.high_target_carrier = Buffer(MemLoc.UB, (64,), dtypes.int32)
-        self.history_key = Buffer(MemLoc.UB, (2, self.topk_pad), dtypes.uint16)
-        self.next_history_key = Buffer(
-            MemLoc.UB,
-            (1, self.topk_pad),
-            dtypes.uint16,
+        self.tmp_idx = Buffer(
+            MemLoc.UB, dtypes.uint16, make_layout((self.merge_len_pad,))
         )
-        self.history_idx = Buffer(MemLoc.UB, (2, self.topk_pad), dtypes.int32)
-        self.next_idx = Buffer(MemLoc.UB, (self.topk_pad,), dtypes.int32)
+        self.histogram = Buffer(MemLoc.UB, dtypes.uint16, make_layout((256,)))
+        self.high_target_carrier = Buffer(MemLoc.UB, dtypes.int32, make_layout((64,)))
 
 
 class QsliRawTopKSelector:
@@ -230,8 +226,12 @@ class QsliRawTopKSelector:
             raise ValueError("TopK selector exceeds the shared UB workspace")
         # Final V->MTE3 stages are selector-owned so Sparse and Candidate can
         # share computational scratch without racing each other's GM writes.
-        self.output_idx_stage = Buffer(MemLoc.UB, (1, self.topk), dtypes.int32)
-        self.output_value_bits_stage = Buffer(MemLoc.UB, (1, self.topk), dtypes.uint16)
+        self.output_idx_stage = Buffer(
+            MemLoc.UB, dtypes.int32, make_layout((1, self.topk))
+        )
+        self.output_value_bits_stage = Buffer(
+            MemLoc.UB, dtypes.uint16, make_layout((1, self.topk))
+        )
 
     @jit
     def _find_indices(
@@ -255,7 +255,6 @@ class QsliRawTopKSelector:
             rr.vstore(histogram, 128, histogram_high_reg, full16)
             rr.vmem_bar("vst_vld")
 
-        with vf(mode="simd"):
             full16 = rr.update_mask(128, elem_bits=16)[0]
             lane0 = rr.update_mask(1, elem_bits=16)[0]
             bottom_k = valid_len - self.topk + 1
@@ -362,7 +361,6 @@ class QsliRawTopKSelector:
             rr.vstore(tmp_idx, 0, low_target, lane0)
             rr.vmem_bar("vst_vld")
 
-        with vf(mode="simd"):
             full16 = rr.update_mask(128, elem_bits=16)[0]
             high_target = rr.vreinterpret_lanes(
                 rr.vload_broadcast(high_target_carrier, 0, width="b16"),
@@ -402,8 +400,13 @@ class LdTopKSelector(QsliRawTopKSelector):
     def __init__(self, topk, workspace, splits):
         super().__init__(topk, workspace)
         self.ld_length = int(splits) * self.topk
-        self.ld_indices = Buffer(MemLoc.UB, (1, self.ld_length), dtypes.int32)
-        self.ld_bits = Buffer(MemLoc.UB, (1, self.ld_length), dtypes.uint16)
+        storage_length = ceil_div(self.ld_length, 128) * 128
+        self.ld_indices = Buffer(
+            MemLoc.UB, dtypes.int32, make_layout((1, storage_length))
+        )
+        self.ld_bits = Buffer(
+            MemLoc.UB, dtypes.uint16, make_layout((1, storage_length))
+        )
 
     @jit
     def merge_ld(
@@ -418,16 +421,14 @@ class LdTopKSelector(QsliRawTopKSelector):
     ):
         if not preloaded:
             mem_copy(
-                reinterpret(self.ld_indices, shape=(1, valid_length)),
+                reinterpret(self.ld_indices, layout=make_layout((1, valid_length))),
                 partial_indices[0:1, 0:valid_length],
             )
             mem_copy(
-                reinterpret(self.ld_bits, shape=(1, valid_length)),
+                reinterpret(self.ld_bits, layout=make_layout((1, valid_length))),
                 partial_bits[0:1, 0:valid_length],
             )
         current_trunk = self.workspace.merge_key
-        _history_key = self.workspace.history_key
-        history_idx = self.workspace.history_idx
         with vf(mode="simd"):
             mask16 = rr.update_mask(64, elem_bits=16)[0]
             mask32 = rr.update_mask(64, elem_bits=32)[0]
@@ -477,7 +478,6 @@ class LdTopKSelector(QsliRawTopKSelector):
         output_idx_stage = self.output_idx_stage
         out_value_bits = self.output_value_bits_stage
         output_valid_count = dtypes.int32(self.topk)
-        _final_idx = history_idx
         with vf(mode="simd"):
             for chunk in dsl_range(ceil_div(self.topk, 64), unroll=1):
                 count = self.topk - chunk * 64
@@ -500,12 +500,12 @@ class LdTopKSelector(QsliRawTopKSelector):
                 positions16 = rr.vload(self.workspace.tmp_idx, chunk * 64)
                 keys = rr.vgather(current_trunk, positions16, mask=mask16)
                 value_bits = rr.vgather(self.ld_bits, positions16, mask=mask16)
-                _valid_rank32 = rr.vlts(
+                rr.vlts(
                     rr.varange(chunk * 64, dtypes.uint32),
                     output_valid_count,
                     mask=mask32,
                 )
-                _valid_rank16 = rr.vlts(
+                rr.vlts(
                     rr.varange(chunk * 64, dtypes.uint16),
                     output_valid_count,
                     mask=mask16,
@@ -609,32 +609,62 @@ class LdMergeStage:
                     vec_sync_notify(PIPE.V, PIPE.MTE2, 5)
                     vec_sync_wait(PIPE.V, PIPE.MTE2, 5)
                     if first > 0:
-                        mem_copy(
-                            reinterpret(self.selector.ld_indices, shape=(1, self.topk)),
-                            tile_view(indices, (1, self.topk), (row, 0)),
-                        )
-                        mem_copy(
-                            reinterpret(self.selector.ld_bits, shape=(1, self.topk)),
-                            tile_view(bits, (1, self.topk), (row, 0)),
-                        )
+                        if const_expr(self.topk % 16 != 0):
+                            for element in dsl_range(self.topk, unroll=1):
+                                self.selector.ld_indices[0, element] = indices[
+                                    row, element
+                                ]
+                                self.selector.ld_bits[0, element] = bits[row, element]
+                        else:
+                            mem_copy(
+                                reinterpret(
+                                    self.selector.ld_indices,
+                                    layout=make_layout((1, self.topk)),
+                                ),
+                                tile_view(indices, (1, self.topk), (row, 0)),
+                            )
+                            mem_copy(
+                                reinterpret(
+                                    self.selector.ld_bits,
+                                    layout=make_layout((1, self.topk)),
+                                ),
+                                tile_view(bits, (1, self.topk), (row, 0)),
+                            )
                     for part in dsl_range(0, count, unroll=1):
                         source_row = (
                             workspace_begin + first + part
                         ) * query_tile_rows + m
-                        mem_copy(
-                            tile_view(
-                                self.selector.ld_indices,
-                                (1, self.topk),
-                                (0, part + carry),
-                            ),
-                            tile_view(partial_indices, (1, self.topk), (source_row, 0)),
-                        )
-                        mem_copy(
-                            tile_view(
-                                self.selector.ld_bits, (1, self.topk), (0, part + carry)
-                            ),
-                            tile_view(partial_bits, (1, self.topk), (source_row, 0)),
-                        )
+                        if const_expr(self.topk % 16 != 0):
+                            # Packed row offsets are not DMA aligned; keep these copies on the scalar unit.
+                            for element in dsl_range(self.topk, unroll=1):
+                                destination = (part + carry) * self.topk + element
+                                self.selector.ld_indices[0, destination] = (
+                                    partial_indices[source_row, element]
+                                )
+                                self.selector.ld_bits[0, destination] = partial_bits[
+                                    source_row, element
+                                ]
+                        else:
+                            mem_copy(
+                                tile_view(
+                                    self.selector.ld_indices,
+                                    (1, self.topk),
+                                    (0, part + carry),
+                                ),
+                                tile_view(
+                                    partial_indices, (1, self.topk), (source_row, 0)
+                                ),
+                            )
+                            mem_copy(
+                                tile_view(
+                                    self.selector.ld_bits,
+                                    (1, self.topk),
+                                    (0, part + carry),
+                                ),
+                                tile_view(
+                                    partial_bits, (1, self.topk), (source_row, 0)
+                                ),
+                            )
                     vec_sync_notify(PIPE.MTE2, PIPE.V, 5)
                     vec_sync_wait(PIPE.MTE2, PIPE.V, 5)
                     offset = dtypes.int32(
@@ -662,9 +692,11 @@ class QsliLocalTopKWorkspace:
         self.merge_len_pad = (
             ceil_div(ceil_div(self.max_topk, 256) * 256 + self.max_trunk_len, 128) * 128
         )
-        self.tmp_idx = Buffer(MemLoc.UB, (self.merge_len_pad,), dtypes.uint16)
-        self.histogram = Buffer(MemLoc.UB, (256,), dtypes.uint16)
-        self.high_target_carrier = Buffer(MemLoc.UB, (64,), dtypes.int32)
+        self.tmp_idx = Buffer(
+            MemLoc.UB, dtypes.uint16, make_layout((self.merge_len_pad,))
+        )
+        self.histogram = Buffer(MemLoc.UB, dtypes.uint16, make_layout((256,)))
+        self.high_target_carrier = Buffer(MemLoc.UB, dtypes.int32, make_layout((64,)))
 
 
 class QsliLocalTopKSelector(QsliRawTopKSelector):
@@ -753,84 +785,97 @@ class QsliCube:
     """AIC-owned native MXFP4 QK resources."""
 
     def __init__(self):
-        self.q_l1 = Channel(
+        self.q_l1 = RingBuffer(
             MemLoc.L1,
-            (TILE_M, LOGICAL_D),
             dtypes.fp4x2_e2m1,
+            make_layout((TILE_M, LOGICAL_D)),
             depth=1,
             data_format="nz",
         )
-        self.k_l1 = Channel(
+        self.k_l1 = RingBuffer(
             MemLoc.L1,
-            (TILE_N, LOGICAL_D),
             dtypes.fp4x2_e2m1,
+            make_layout((TILE_N, LOGICAL_D)),
             depth=2,
             data_format="nz",
         )
         self.q_scale_l1 = Buffer(
             MemLoc.L1,
-            (TILE_M, 4),
             dtypes.float8_e8m0,
-            data_format="zn",
+            make_layout((4, TILE_M)),
+            data_format="nz",
         )
-        self.k_scale_l1 = Channel(
+        self.k_scale_l1 = RingBuffer(
             MemLoc.L1,
-            (4, TILE_N),
             dtypes.float8_e8m0,
+            make_layout((4, TILE_N)),
             depth=2,
             data_format="nz",
         )
-        self.l0a = Channel(MemLoc.L0A, (TILE_M, LOGICAL_D), dtypes.fp4x2_e2m1, depth=1)
-        self.l0b = Channel(
+        self.l0a = RingBuffer(
+            MemLoc.L0A, dtypes.fp4x2_e2m1, make_layout((TILE_M, LOGICAL_D)), depth=1
+        )
+        self.l0b = RingBuffer(
             MemLoc.L0B,
-            (TILE_N, LOGICAL_D),
             dtypes.fp4x2_e2m1,
+            make_layout((TILE_N, LOGICAL_D)),
             depth=2,
             data_format="nz",
         )
         # 单槽 32 * 512 * 4 = 65536 字节；两槽交替供 MAC 与 FIXP 使用。
-        self.l0c = Channel(MemLoc.L0C, (TILE_M, TILE_N), dtypes.float32, depth=2)
-        self.nd2nz_fp4 = make_copy_engine(
-            format_transform="nd2nz",
+        self.l0c = RingBuffer(
+            MemLoc.L0C, dtypes.float32, make_layout((TILE_M, TILE_N)), depth=2
         )
-        self.scale_a = make_copy_engine(
-            format_transform="mx_scale_and",
-        )
-        self.scale_b = make_copy_engine(
-            format_transform="mx_scale_bdn",
-        )
-        self.fixpipe = make_copy_engine()
+        self.scale_a = None
+        self.scale_b = None
 
     def load_query(self, query, query_scale):
-        mem_copy(self.q_l1.produce(), query, engine=self.nd2nz_fp4)
-        mem_copy(self.q_scale_l1, query_scale, engine=self.scale_a)
-        mem_copy(self.l0a.produce(), self.q_l1.consume(), mx_scale=self.q_scale_l1)
+        mem_copy(self.q_l1.next_write(), query)
+        mem_copy(
+            self.q_scale_l1.permute(1, 0),
+            query_scale.flatten(1, 2),
+            options=self.scale_a,
+        )
+        mem_copy(
+            self.l0a.next_write(),
+            self.q_l1.next_read(),
+            options=copy_options(mx_scale=self.q_scale_l1.permute(1, 0)),
+        )
 
     def compute_qk(self, key_tile, key_scale_tile, qk_handoff, slot):
-        mem_copy(self.k_l1.produce(), key_tile, engine=self.nd2nz_fp4)
-        mem_copy(self.k_scale_l1.produce(), key_scale_tile, engine=self.scale_b)
+        mem_copy(self.k_l1.next_write(), key_tile)
         mem_copy(
-            self.l0b.produce(), self.k_l1.consume(), mx_scale=self.k_scale_l1.consume()
+            self.k_scale_l1.next_write(),
+            key_scale_tile.flatten(1, 2).permute(1, 0),
+            options=self.scale_b,
         )
-        l0c = self.l0c.produce()
-        dsl_matmul(l0c, self.l0a.consume(), self.l0b.consume(), init=True, unit_flag=0)
-        l0c_read = self.l0c.consume()
+        mem_copy(
+            self.l0b.next_write(),
+            self.k_l1.next_read(),
+            options=copy_options(mx_scale=self.k_scale_l1.next_read()),
+        )
+        l0c = self.l0c.next_write()
+        dsl_matmul(
+            l0c,
+            self.l0a.next_read(),
+            self.l0b.next_read(),
+            init=True,
+            mx_mode=True,
+            unit_flag=0,
+        )
+        l0c_read = self.l0c.next_read()
         cube_sync_intra_wait(PIPE.FIXPIPE, 4 + slot)
         cube_sync_intra_wait(PIPE.FIXPIPE, 20 + slot)
         destination = tile_view(qk_handoff, (TILE_M, TILE_N // 2), (slot, 0))
         mem_copy(
             destination,
             tile_view(l0c_read, (TILE_M, TILE_N // 2), (0, 0)),
-            engine=self.fixpipe,
-            dst_subblock=0,
-            unit_flag=0,
+            options=copy_options(dst_subblock=0, unit_flag=0),
         )
         mem_copy(
             destination,
             tile_view(l0c_read, (TILE_M, TILE_N // 2), (0, 1)),
-            engine=self.fixpipe,
-            dst_subblock=1,
-            unit_flag=0,
+            options=copy_options(dst_subblock=1, unit_flag=0),
         )
         cube_sync_intra_arrive(PIPE.FIXPIPE, 14 + slot)
         cube_sync_intra_arrive(PIPE.FIXPIPE, 30 + slot)
@@ -874,17 +919,23 @@ class QsliVector0:
         self.packed_buffers = [
             Buffer(
                 MemLoc.UB,
-                (CANDIDATE_BLOCKS_PER_AIV, PACKED_BLOCK_BYTES),
                 dtypes.uint8,
+                make_layout((CANDIDATE_BLOCKS_PER_AIV, PACKED_BLOCK_BYTES)),
             )
             for _ in range(V0_BUFFER_COUNT)
         ]
-        self.candidate_ub = Buffer(MemLoc.UB, (1, CANDIDATE_CAPACITY), dtypes.int32)
-        self.pair_swaps = Buffer(MemLoc.UB, (1, CANDIDATE_CAPACITY // 2), dtypes.uint32)
-        self.physical_blocks = Buffer(MemLoc.UB, (1, CANDIDATE_CAPACITY), dtypes.uint32)
+        self.candidate_ub = Buffer(
+            MemLoc.UB, dtypes.int32, make_layout((1, CANDIDATE_CAPACITY))
+        )
+        self.pair_swaps = Buffer(
+            MemLoc.UB, dtypes.uint32, make_layout((1, CANDIDATE_CAPACITY // 2))
+        )
+        self.physical_blocks = Buffer(
+            MemLoc.UB, dtypes.uint32, make_layout((1, CANDIDATE_CAPACITY))
+        )
         self.pa_table_capacity = PA_TABLE_CACHE_ENTRIES  # UB cache capacity; larger tables use the scalar path.
         self.page_table_ub = Buffer(
-            MemLoc.UB, (1, self.pa_table_capacity), dtypes.int32
+            MemLoc.UB, dtypes.int32, make_layout((1, self.pa_table_capacity))
         )
 
     @jit
@@ -894,8 +945,9 @@ class QsliVector0:
                 self.page_table_ub[0:1, 0 : table.shape[1]],
                 table[batch : batch + 1, 0 : table.shape[1]],
             )
-            vec_sync_notify(PIPE.MTE2, PIPE.V, 0)
-            vec_sync_wait(PIPE.MTE2, PIPE.V, 0)
+            # Complete the page-table DMA before issuing address generation for this batch.
+            vec_sync_notify(PIPE.MTE2, PIPE.S, 7)
+            vec_sync_wait(PIPE.MTE2, PIPE.S, 7)
 
     @jit
     def prepare_addresses(
@@ -1004,7 +1056,6 @@ class QsliVector0:
                     rr.vmuls(offset, PACKED_BLOCK_BYTES, mask=mask), dtypes.uint32
                 )
                 low = rr.vadd(low, offset_bytes, mask=mask)
-                _high = zero
                 even_low = rr.vgather_reg(low, even_lane)
                 odd_low = rr.vgather_reg(low, odd_lane)
                 low_gt = rr.vselect(
@@ -1311,7 +1362,7 @@ class QsliVector0:
             + dtypes.int64(candidate_tile) % STAGING_DEPTH
         ) * TILE_N + dtypes.int64(half) * (TILE_N // 2)
         first_candidate = dtypes.int64(candidate_tile) * CANDIDATE_BLOCKS_PER_AIV
-        _valid_blocks = dtypes.int64(candidate_block_length)
+        dtypes.int64(candidate_block_length)
         if slot == 0:
             vec_sync_wait(PIPE.MTE3, PIPE.MTE2, 2)
         else:
@@ -1324,7 +1375,7 @@ class QsliVector0:
         else:
             for pair in range(CANDIDATE_BLOCKS_PER_AIV // 2):
                 packed_pair = self.physical_blocks.reinterpret(
-                    dtypes.uint64, (1, CANDIDATE_CAPACITY // 2)
+                    dtypes.uint64, make_layout((1, CANDIDATE_CAPACITY // 2))
                 )[0, first_candidate // 2 + pair]
                 first = dtypes.int64(dtypes.uint32(packed_pair))
                 second = dtypes.int64(packed_pair // 4294967296)
@@ -1360,7 +1411,7 @@ class QsliVector0:
             + dtypes.int64(candidate_tile) % STAGING_DEPTH
         ) * TILE_N + dtypes.int64(half) * (TILE_N // 2)
         first_candidate = dtypes.int64(candidate_tile) * CANDIDATE_BLOCKS_PER_AIV
-        _valid_blocks = dtypes.int64(candidate_block_length)
+        dtypes.int64(candidate_block_length)
         if slot == 0:
             vec_sync_wait(PIPE.MTE3, PIPE.MTE2, 2)
         else:
@@ -1369,16 +1420,16 @@ class QsliVector0:
             for block_idx in range(CANDIDATE_BLOCKS_PER_AIV):
                 pos = first_candidate + block_idx
                 address = self.physical_blocks.reinterpret(
-                    dtypes.int64, (1, CANDIDATE_CAPACITY // 2)
+                    dtypes.int64, make_layout((1, CANDIDATE_CAPACITY // 2))
                 )[0, pos]
                 _copy_pa_row(packed_ub, block_idx, key, self.key_address, address)
         else:
             for pair in range(CANDIDATE_BLOCKS_PER_AIV // 2):
                 first = self.physical_blocks.reinterpret(
-                    dtypes.int64, (1, CANDIDATE_CAPACITY // 2)
+                    dtypes.int64, make_layout((1, CANDIDATE_CAPACITY // 2))
                 )[0, first_candidate + pair * 2]
                 second = self.physical_blocks.reinterpret(
-                    dtypes.int64, (1, CANDIDATE_CAPACITY // 2)
+                    dtypes.int64, make_layout((1, CANDIDATE_CAPACITY // 2))
                 )[0, first_candidate + pair * 2 + 1]
                 _copy_pa_pair(packed_ub, pair, key, self.key_address, first, second)
         vec_sync_notify(PIPE.MTE2, PIPE.MTE3, 2)
@@ -1458,11 +1509,13 @@ class QsliVector1:
 
     def __init__(self, tokens):
         self.tokens = int(tokens)
-        self.weight_ub = Buffer(MemLoc.UB, (1, N1), dtypes.float32)
-        self.weight_bf16 = Buffer(MemLoc.UB, (N1,), dtypes.bfloat16)
-        self.key_ub = Buffer(MemLoc.UB, (1, TOPK_TRUNK_LEN), dtypes.uint16)
-        self.valid_counts = Buffer(MemLoc.UB, (CANDIDATE_CAPACITY,), dtypes.int32)
-        self.valid_ub = Buffer(MemLoc.UB, (TILE_N,), dtypes.uint16)
+        self.weight_ub = Buffer(MemLoc.UB, dtypes.float32, make_layout((1, N1)))
+        self.weight_bf16 = Buffer(MemLoc.UB, dtypes.bfloat16, make_layout((N1,)))
+        self.key_ub = Buffer(MemLoc.UB, dtypes.uint16, make_layout((1, TOPK_TRUNK_LEN)))
+        self.valid_counts = Buffer(
+            MemLoc.UB, dtypes.int32, make_layout((CANDIDATE_CAPACITY,))
+        )
+        self.valid_ub = Buffer(MemLoc.UB, dtypes.uint16, make_layout((TILE_N,)))
 
     @jit
     def load_weights(self, weights, task_query_row):
@@ -1669,7 +1722,7 @@ class QsliVector1:
         vec_sync_intra_wait(PIPE.MTE2, 7)
         if subblock_idx == dtypes.int64(0):
             mem_copy(
-                reinterpret(self.key_ub, shape=(1, self.tokens)),
+                reinterpret(self.key_ub, layout=make_layout((1, self.tokens))),
                 tile_view(key_workspace, (1, self.tokens), (worker_idx, 0)),
             )
             vec_sync_notify(PIPE.MTE2, PIPE.V, 0)
@@ -1682,19 +1735,21 @@ class QsliPositionMapper:
     def __init__(self, topk, candidate_capacity):
         self.topk = int(topk)
         self.candidate_capacity = int(candidate_capacity)
-        self.count_ub = Buffer(MemLoc.UB, (8,), dtypes.int32)
+        self.count_ub = Buffer(MemLoc.UB, dtypes.int32, make_layout((8,)))
         # Half-vector loads may fetch a full register. Reserve private padding
         # so the final AIV1 load does not read an adjacent UB allocation.
         self.candidate_ub = Buffer(
             MemLoc.UB,
-            (self.candidate_capacity,),
             dtypes.int32,
-            capacity=(ceil_div(self.candidate_capacity, 64) * 64 + 64,),
+            make_layout((self.candidate_capacity,)),
+            physical_layout=make_layout(
+                (ceil_div(self.candidate_capacity, 64) * 64 + 64,)
+            ),
         )
         self.output_ub = Buffer(
             MemLoc.UB,
-            (1, self.topk),
             dtypes.int32,
+            make_layout((1, self.topk)),
         )
 
     @jit
@@ -1910,18 +1965,10 @@ class QsliPositionMapper:
 class QsliOutputWriter:
     """Initialize public rows inside the fused kernel."""
 
-    def __init__(self, public_topk):
+    def __init__(self, public_topk, index_ub, value_ub):
         self.public_topk = int(public_topk)
-        self.index_ub = Buffer(
-            MemLoc.UB,
-            (1, self.public_topk),
-            dtypes.int32,
-        )
-        self.value_ub = Buffer(
-            MemLoc.UB,
-            (1, self.public_topk),
-            dtypes.uint16,
-        )
+        self.index_ub = index_ub
+        self.value_ub = value_ub
 
     @jit
     def initialize(self, sparse_indices, sparse_value_bits, query_row):
@@ -1988,13 +2035,19 @@ class QsliFusedKernel:
         self.has_output_offset = bool(has_output_offset)
         # Explicit per-slot credits protect both BF16 destinations. The current
         # Channel split-N path does not support FP32-to-BF16 narrowing.
-        self.qk_handoff = Buffer(MemLoc.UB, (TILE_M * 2, TILE_N // 2), dtypes.bfloat16)
+        self.qk_handoff = Buffer(
+            MemLoc.UB, dtypes.bfloat16, make_layout((TILE_M * 2, TILE_N // 2))
+        )
         self.cube = QsliCube()
         self.vector0 = QsliVector0(get_subblock_id(), pa_block_size)
         self.vector1 = QsliVector1(tokens)
-        self.output_writer = QsliOutputWriter(self.topk_count)
         self.topk_workspace = QsliLocalTopKWorkspace(TOPK_TRUNK_LEN, self.topk_count)
         self.topk = QsliLocalTopKSelector(self.topk_count, self.topk_workspace)
+        self.output_writer = QsliOutputWriter(
+            self.topk_count,
+            self.topk.output_idx_stage,
+            self.topk.output_value_bits_stage,
+        )
         self.position_mapper = QsliPositionMapper(self.topk_count, candidate_capacity)
 
     @jit
@@ -2468,16 +2521,16 @@ def _build_compiled_fused_runner(
             dtypes.uint16, dtypes.int64(sparse_value_address), MemLoc.GM
         )
         sparse_indices = make_tensor(
-            index_pointer, make_layout((64, topk), stride=(topk, 1))
+            index_pointer, make_layout((worker_count * 2, topk), stride=(topk, 1))
         )
         sparse_value_bits = make_tensor(
-            value_pointer, make_layout((64, topk), stride=(topk, 1))
+            value_pointer, make_layout((worker_count * 2, topk), stride=(topk, 1))
         )
         merge_indices = make_tensor(
-            index_pointer, make_layout((64, topk), stride=(topk, 1))
+            index_pointer, make_layout((worker_count * 2, topk), stride=(topk, 1))
         )
         merge_bits = make_tensor(
-            value_pointer, make_layout((64, topk), stride=(topk, 1))
+            value_pointer, make_layout((worker_count * 2, topk), stride=(topk, 1))
         )
         QsliFusedKernel(
             tokens,
@@ -2529,7 +2582,7 @@ def _build_compiled_fused_runner(
         )
         if ld_enabled:
             global_sync_all()
-            channel_rewind(reset_sync_id=True)
+            onchip_rewind(reset_sync_id=True)
             LdMergeStage(topk, splits)(
                 merge_indices,
                 merge_bits,
@@ -2626,7 +2679,13 @@ def _build_compiled_fused_runner(
     key_stride_dim = cannbotdsl.Dim("K_S0")
     fake = cannbotdsl.TensorSpec
     dummy_spec = fake((query_rows_dim, N2), dtypes.int32)
-    cu_spec = fake((batch_dim + 1,), dtypes.int32) if has_cu else dummy_spec
+    # With only cu present, B has no direct slot from which DSL can bind it.
+    cu_shape = (
+        (batch_dim + 1,)
+        if has_seqused_q or has_seqused_k or has_block_table
+        else (cannbotdsl.Dim("B_PLUS_1"),)
+    )
+    cu_spec = fake(cu_shape, dtypes.int32) if has_cu else dummy_spec
     seqused_q_spec = fake((batch_dim,), dtypes.int32) if has_seqused_q else dummy_spec
     block_table_spec = (
         fake((batch_dim, block_table_width_dim), dtypes.int32)
@@ -2992,15 +3051,19 @@ def quant_sparse_lightning_indexer(
         raise ValueError("Metadata must be on the same device as q")
     metadata = metadata.view(METADATA_ROWS, METADATA_FIELDS)
     tokens = full_tokens
-    worker_count = MAX_CUBE_WORKERS
+    worker_count = int(torch.npu.get_device_properties(q.device).cube_core_num)
+    if not 1 <= worker_count <= LD_RECORD_START:
+        raise RuntimeError(
+            f"Unsupported Cube core count {worker_count}; LI metadata supports 1..{LD_RECORD_START}"
+        )
 
     sparse_indices = torch.empty(
-        (64, N2, int(topk)),
+        (worker_count * 2, N2, int(topk)),
         dtype=torch.int32,
         device=q.device,
     )
     sparse_values = torch.empty(
-        (64, N2, int(topk)),
+        (worker_count * 2, N2, int(topk)),
         dtype=torch.bfloat16,
         device=w.device,
     )
@@ -3084,7 +3147,7 @@ def quant_sparse_lightning_indexer(
         final_sparse_indices.data_ptr(),
         final_sparse_values.view(torch.uint16).data_ptr(),
         int(return_value),
-        min(64, query_rows),
+        min(worker_count * 2, query_rows),
         0 if output_idx_offset is None else output_idx_offset.data_ptr(),
         int(_batch_consistency_enabled()),
     )
@@ -3100,7 +3163,6 @@ def quant_sparse_lightning_indexer(
 @export("qsli")
 def export_qsli():
     """Export static profiles with dynamic tensor axes, without NPU execution."""
-    from itertools import product
     import json
 
     defaults = {
@@ -3125,13 +3187,21 @@ def export_qsli():
             pa_block_size=page,
             has_output_offset=offset,
             layout_k=layout,
+            has_cu=has_cu,
+            has_seqused_q=has_seqused_q,
+            has_seqused_k=has_seqused_k,
+            has_block_table=has_block_table,
         )
-        for mask, ratio, (layout, page), offset in product(
-            (0, 3),
-            (1, 2),
-            (("PA_BBND", 64), ("PA_BBND", 128), ("TND", 0)),
-            (False, True),
-        )
+        for mask in (0, 3)
+        for ratio in (1, 2)
+        for layout in ("PA_BBND", "TND")
+        for page in ((64, 128) if layout == "PA_BBND" else (0,))
+        for offset in (False, True)
+        for has_cu in ((False, True) if layout == "PA_BBND" else (True,))
+        for has_seqused_q in (False, True)
+        for has_seqused_k in (False, True)
+        # TND uses this runner position for its mandatory cu_seqlens_k.
+        for has_block_table in ((False, True) if layout == "PA_BBND" else (True,))
     ]
     profile_path = os.environ.get("CANNBOTDSL_DS41_PROFILES")
     if profile_path:
@@ -3179,12 +3249,14 @@ class QsliTndGather(QsliVector0):
         self.packed_buffers = [
             Buffer(
                 MemLoc.UB,
-                (CANDIDATE_BLOCKS_PER_AIV, PACKED_BLOCK_BYTES),
                 dtypes.uint8,
+                make_layout((CANDIDATE_BLOCKS_PER_AIV, PACKED_BLOCK_BYTES)),
             )
             for _ in range(V0_BUFFER_COUNT)
         ]
-        self.pair_swaps = Buffer(MemLoc.UB, (1, CANDIDATE_CAPACITY // 2), dtypes.uint32)
+        self.pair_swaps = Buffer(
+            MemLoc.UB, dtypes.uint32, make_layout((1, CANDIDATE_CAPACITY // 2))
+        )
 
     @jit
     def prepare_identity(self):
@@ -3217,23 +3289,18 @@ class QsliTndGather(QsliVector0):
             block_idx : block_idx + 1, 512:PACKED_BLOCK_BYTES
         ].view(8, 4)
         if count == 8:
-            if key.stride[0] == PACKED_D:
-                mem_copy(key_target, key_source)
-            else:
-                mem_copy(key_target, key_source, engine=make_copy_engine(kind="nddma"))
-            if key_scale.stride[0] == 4:
-                mem_copy(scale_target, scale_source)
-            else:
-                mem_copy(
-                    scale_target, scale_source, engine=make_copy_engine(kind="nddma")
-                )
+            mem_copy(key_target, key_source)
+            mem_copy(scale_target, scale_source)
         else:
-            engine = make_copy_engine(kind="nddma", padding_mode="nearest")
             mem_copy(
-                key_target, key_source, engine=engine, right_padding=(8 - count, 0)
+                key_target,
+                pad(key_source, (0, 0, 0, 8 - count), mode="replicate"),
+                options=copy_options(engine="nddma"),
             )
             mem_copy(
-                scale_target, scale_source, engine=engine, right_padding=(8 - count, 0)
+                scale_target,
+                pad(scale_source, (0, 0, 0, 8 - count), mode="replicate"),
+                options=copy_options(engine="nddma"),
             )
 
     @jit
@@ -3361,13 +3428,19 @@ class QsliTndFusedKernel:
         self.has_residual = self.mask_mode == 3 and self.cmp_ratio != 1
         self.has_cu_k = bool(has_cu_k)
         self.has_output_offset = bool(has_output_offset)
-        self.qk_handoff = Buffer(MemLoc.UB, (TILE_M * 2, TILE_N // 2), dtypes.bfloat16)
+        self.qk_handoff = Buffer(
+            MemLoc.UB, dtypes.bfloat16, make_layout((TILE_M * 2, TILE_N // 2))
+        )
         self.cube = QsliCube()
         self.vector0 = QsliTndGather(get_subblock_id())
         self.vector1 = QsliVector1(tokens)
-        self.output_writer = QsliOutputWriter(self.topk_count)
         self.topk_workspace = QsliLocalTopKWorkspace(TOPK_TRUNK_LEN, self.topk_count)
         self.topk = QsliLocalTopKSelector(self.topk_count, self.topk_workspace)
+        self.output_writer = QsliOutputWriter(
+            self.topk_count,
+            self.topk.output_idx_stage,
+            self.topk.output_value_bits_stage,
+        )
         self.position_mapper = QsliPositionMapper(self.topk_count, candidate_capacity)
 
     @jit
@@ -3821,16 +3894,16 @@ def _build_tnd_compiled_fused_runner(
             dtypes.uint16, dtypes.int64(sparse_value_address), MemLoc.GM
         )
         sparse_indices = make_tensor(
-            index_pointer, make_layout((64, topk), stride=(topk, 1))
+            index_pointer, make_layout((worker_count * 2, topk), stride=(topk, 1))
         )
         sparse_value_bits = make_tensor(
-            value_pointer, make_layout((64, topk), stride=(topk, 1))
+            value_pointer, make_layout((worker_count * 2, topk), stride=(topk, 1))
         )
         merge_indices = make_tensor(
-            index_pointer, make_layout((64, topk), stride=(topk, 1))
+            index_pointer, make_layout((worker_count * 2, topk), stride=(topk, 1))
         )
         merge_bits = make_tensor(
-            value_pointer, make_layout((64, topk), stride=(topk, 1))
+            value_pointer, make_layout((worker_count * 2, topk), stride=(topk, 1))
         )
         QsliTndFusedKernel(
             tokens,
@@ -3883,7 +3956,7 @@ def _build_tnd_compiled_fused_runner(
         )
         if ld_enabled:
             global_sync_all()
-            channel_rewind(reset_sync_id=True)
+            onchip_rewind(reset_sync_id=True)
             LdMergeStage(topk, splits)(
                 merge_indices,
                 merge_bits,
@@ -4245,15 +4318,19 @@ def _run_tnd(
         )
     metadata = metadata.view(METADATA_ROWS, METADATA_FIELDS)
     tokens = full_tokens
-    worker_count = MAX_CUBE_WORKERS
+    worker_count = int(torch.npu.get_device_properties(q.device).cube_core_num)
+    if not 1 <= worker_count <= LD_RECORD_START:
+        raise RuntimeError(
+            f"Unsupported Cube core count {worker_count}; LI metadata supports 1..{LD_RECORD_START}"
+        )
 
     sparse_indices = torch.empty(
-        (64, N2, int(topk)),
+        (worker_count * 2, N2, int(topk)),
         dtype=torch.int32,
         device=q.device,
     )
     sparse_values = torch.empty(
-        (64, N2, int(topk)),
+        (worker_count * 2, N2, int(topk)),
         dtype=torch.bfloat16,
         device=w.device,
     )
@@ -4339,7 +4416,7 @@ def _run_tnd(
         final_sparse_indices.data_ptr(),
         final_sparse_values.view(torch.uint16).data_ptr(),
         int(return_value),
-        min(64, query_rows),
+        min(worker_count * 2, query_rows),
         0 if output_idx_offset is None else output_idx_offset.data_ptr(),
     )
     sparse_indices, sparse_values = final_sparse_indices, final_sparse_values

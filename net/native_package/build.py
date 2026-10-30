@@ -318,12 +318,12 @@ def build_aicpu_metadata(
             "mqsmla_metadata_kernel.so",
         ),
         "qli": (
-            "quant_lightning_indexer_metadata_dsl",
+            "quant_lightning_indexer_metadata",
             "metadata_kernel",
             "metadata_kernel.so",
         ),
         "qsli": (
-            "quant_sparse_lightning_indexer_metadata_dsl",
+            "quant_sparse_lightning_indexer_metadata",
             "metadata_kernel",
             "qsli_metadata_kernel.so",
         ),

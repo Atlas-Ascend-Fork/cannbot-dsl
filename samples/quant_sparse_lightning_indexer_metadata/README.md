@@ -1,4 +1,4 @@
-# quant_sparse_lightning_indexer_metadata_dsl
+# quant_sparse_lightning_indexer_metadata
 
 ## 产品支持情况
 
@@ -6,11 +6,11 @@
 
 ## 功能说明
 
-`quant_sparse_lightning_indexer_metadata` 是 [QSLI](../quant_sparse_lightning_indexer_dsl/README.md) 配套的独立 AICPU 调度算子。它根据每个 Query 的候选长度、序列长度和静态配置，生成 LI 计算范围及 LD 跨核 TopK 归并关系，不读取候选块索引或 Q/K 特征，不计算分数与 TopK。
+`quant_sparse_lightning_indexer_metadata` 是 [QSLI](../quant_sparse_lightning_indexer/README.md) 配套的独立 AICPU 调度算子。它根据每个 Query 的候选长度、序列长度和静态配置，生成 LI 计算范围及 LD 跨核 TopK 归并关系，不读取候选块索引或 Q/K 特征，不计算分数与 TopK。
 
 每个 Query 独立调度。根据 mask 和压缩参数判断 Query 是否存在可见 Key 后，将有效候选按每 64 个块划分为一个 tile，即每 tile 最多 `64 × 8 = 512` 个候选 token。LI 记录每核在 `(batch, query_row, candidate_tile)` 坐标空间中的起止范围；同一 Query 的候选 tile 被拆到多个核时，LD 记录分片数、临时结果位置和输出行，供主算子归并局部 TopK。工作量来自候选有效前缀，而非完整 S2 扫描。
 
-候选长度为零或 Query 无可见 Key 时保留必要的输出初始化调度。实现位于 [quant_sparse_lightning_indexer_metadata_dsl.py](quant_sparse_lightning_indexer_metadata_dsl.py)。
+候选长度为零或 Query 无可见 Key 时保留必要的输出初始化调度。实现位于 [quant_sparse_lightning_indexer_metadata.py](quant_sparse_lightning_indexer_metadata.py)。
 
 ## 函数原型
 
@@ -26,7 +26,7 @@ def quant_sparse_lightning_indexer_metadata(
     ...
 ```
 
-模块路径为 `quant_sparse_lightning_indexer_metadata_dsl.quant_sparse_lightning_indexer_metadata_dsl`。
+模块路径为 `quant_sparse_lightning_indexer_metadata.quant_sparse_lightning_indexer_metadata`。
 
 ## 参数说明
 
@@ -75,7 +75,7 @@ def quant_sparse_lightning_indexer_metadata(
 import torch
 import torch_npu
 
-from quant_sparse_lightning_indexer_metadata_dsl.quant_sparse_lightning_indexer_metadata_dsl import (
+from quant_sparse_lightning_indexer_metadata.quant_sparse_lightning_indexer_metadata import (
     quant_sparse_lightning_indexer_metadata,
 )
 
@@ -96,14 +96,14 @@ torch.npu.synchronize()
 assert metadata.shape == (1024,) and metadata.dtype == torch.int32
 ```
 
-主算子接收 `quant_sparse_lightning_indexer(..., metadata=metadata)`，完整调用见 [QSLI 快速开始](../quant_sparse_lightning_indexer_dsl/README.md#快速开始)。
+主算子接收 `quant_sparse_lightning_indexer(..., metadata=metadata)`，完整调用见 [QSLI 快速开始](../quant_sparse_lightning_indexer/README.md#快速开始)。
 
 ## 精度测试
 
 在仓库根目录执行独立 metadata 测试，不加载 QSLI 主计算算子：
 
 ```bash
-python -m pytest -q test/quant_sparse_lightning_indexer_metadata_dsl/test_quant_sparse_lightning_indexer_metadata_dsl.py
+python -m pytest -q test/quant_sparse_lightning_indexer_metadata/test_quant_sparse_lightning_indexer_metadata.py
 ```
 
 共 6 项测试：1 项 CPU 参考校验、4 项 NPU 调度边界、1 项 NPU 典型调度用例。覆盖 PA/TND、变长、causal、跨核 LD 和零工作量；独立检查逻辑候选 tile 无遗漏或重复、LD 分片数与 Query 行覆盖、工作区不重叠和保留区清零。典型配置为 B=12、S1=6、Nq/Nk=32/1、D=128、S2=128K、TopK=512、候选块数量/大小=2048/8、mask_mode=3、cmp_ratio=2。典型用例标记 `slow`，默认执行；最终 TopK 数值由主算子测试验证。

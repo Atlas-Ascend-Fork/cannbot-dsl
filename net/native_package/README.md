@@ -7,8 +7,8 @@
 ```toml
 [operators]
 mqsmla = ["mixed_quant_sparse_flash_mla.py", "mixed_quant_sparse_flash_mla_metadata.py"]
-qli = ["quant_lightning_indexer_dsl.py", "quant_lightning_indexer_metadata_dsl.py"]
-qsli = ["quant_sparse_lightning_indexer_dsl.py", "quant_sparse_lightning_indexer_metadata_dsl.py"]
+qli = ["quant_lightning_indexer.py", "quant_lightning_indexer_metadata.py"]
+qsli = ["quant_sparse_lightning_indexer.py", "quant_sparse_lightning_indexer_metadata.py"]
 
 [groups]
 ds41 = ["mqsmla", "qli", "qsli"]

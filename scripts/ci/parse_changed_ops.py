@@ -137,6 +137,15 @@ def is_skippable(file_path):
 def normalize_line(line):
     """Strip git diff --name-status prefixes such as 'M\\tfile'."""
     line = line.strip()
+    status, *paths = line.split("\t")
+    if paths and status == "D":
+        return ""
+    if (
+        paths
+        and status[:1] in ("R", "C")
+        and (len(status) == 1 or status[1:].isdigit())
+    ):
+        return paths[-1]
     for prefix in _STATUS_PREFIXES:
         if line.startswith(prefix):
             return line.removeprefix(prefix)
@@ -248,6 +257,9 @@ def collect_related_ops(routing, changed_list_path):
                 logger.info("ignored metadata file: %s", line)
                 continue
             path = Path(line)
+            if not path.exists():
+                logger.info("deleted file, skip: %s", line)
+                continue
             if path.parent == Path("test"):
                 related.append("all")
                 continue

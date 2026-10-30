@@ -6,24 +6,22 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 
-"""QLI AICPU 分核：固定 int32[1024] 的 LI/LD 边界 ABI。
+"""QSLI AICPU 分核：固定 int32[1024] 的 LI/LD 边界 ABI。
 
 LI: 36 records x 8 fields: enable, start B/M/S2, end B/M/S2,
 first LD workspace index. LD: 72 records x 8 fields: enable, B/M,
 workspace index/count, M start/count, reserved. Remaining words are zero.
-M is the operator's query tile index; S2 is a 256-token tile index.
-All query groups schedule indivisible 256-token blocks and write those
-indices directly. Odd lengths use a final tail.
+M is the operator's query tile index; S2 is a 512-token tile index.
 """
 
-__all__ = ["quant_lightning_indexer_metadata"]
+__all__ = ["quant_sparse_lightning_indexer_metadata"]
 
 from functools import lru_cache
 import tempfile
 import torch
 from cannbotdsl.aicpu import (
-    GmIn,
-    GmOut,
+    gm_in as GmIn,
+    gm_out as GmOut,
     I32,
     I64,
     U32,
@@ -32,13 +30,16 @@ from cannbotdsl.aicpu import (
 )
 
 
-# LI/LD 固定输出布局；第 36 行为 LD/FD 归并记录起始位置。
+# metadata 为 int32[1024]；每条分核记录包含 8 个字段。
 METADATA_ELEMENTS = 1024
 METADATA_FIELDS = 8
-LD_RECORD_START = 36
-LI_WORKSPACE_OFFSET_FIELD = 7
-GROUP_QUERY_OFFSET_FIELD = 7
-S2_TILE_TOKENS = 256
+LD_RECORD_START = 36  # FD/LD 在固定 ABI 中的起始行，不能随实际核数改变。
+LI_WORKSPACE_OFFSET_FIELD = 7  # LI 记录第 7 字段：本行首个 LD 工作区位置。
+SCHEDULER_FIELDS = 8
+SCHEDULER_QUERY_OFFSET_FIELD = 7  # 临时调度记录第 7 字段：组内 query 偏移。
+MAX_MERGE_PARTS = 8
+TOPK_TRUNK_LEN = 16384
+S2_TILE_TOKENS = 512  # 与主算子的 TILE_N 一致，metadata 边界以此为单位。
 
 
 class Args:
@@ -70,97 +71,110 @@ class Args:
     has_offset: U32
 
 
-def _group_field(args, g, total_q, field):
-    if g >= args.scratch[args.batch]:
-        if field == 6:
-            return args.batch
-        return 0
-    # Prefix boundaries map a compact query tile index to its batch.
-    lo = 0
-    hi = args.batch
-    while lo + 1 < hi:
-        mid = (lo + hi) // 2
-        if args.scratch[mid] <= g:
-            lo = mid
-        else:
-            hi = mid
-    batch_idx = lo
-    qoff = (g - args.scratch[batch_idx]) * args.query_rows
-    begin = 0
-    end = total_q
-    if args.has_cu != 0:
-        begin = args.cu[batch_idx]
-        end = args.cu[batch_idx + 1]
-    used = end - begin
-    if args.has_q != 0:
-        used = args.used_q[batch_idx]
-    span = min(args.query_rows, max(0, end - begin - qoff))
-    active = min(span, max(0, used - qoff))
-    if field == 6:
-        return batch_idx
-    if field == GROUP_QUERY_OFFSET_FIELD:
-        return qoff
-    if field == 2:
-        return active
-    if field == 9:
-        return 6 * ((active * args.heads + 15) // 16) + 20
-    actual = args.capacity
-    if args.has_k != 0:
-        actual = args.used_k[batch_idx]
-    rem = 0
-    if args.has_residual != 0:
-        rem = args.residual[batch_idx]
-    visible = actual
-    if args.mask == 3:
-        visible = min(
-            actual,
-            max(0, (actual * args.ratio + rem - used + qoff + active) // args.ratio),
-        )
-    if active == 0:
-        visible = 0
-    return (visible + S2_TILE_TOKENS - 1) // S2_TILE_TOKENS
-
-
 @aicpu_kernel
 def metadata_kernel(args: Args):
     total_q = args.total_q
     if args.has_cu != 0:
         total_q = args.cu[args.batch]
-    elif total_q < 0 and args.has_q != 0:
-        total_q = args.used_q[0]
-    # ASC GetS1SeqSize: seqused_q takes precedence over the TND span.
-    # Only B+1 prefix entries are needed; workspace never depends on GM values.
-    groups = 0
-    args.scratch[0] = 0
-    for batch_idx in range(args.batch):
-        length = total_q
-        if args.has_cu != 0:
-            length = args.cu[batch_idx + 1] - args.cu[batch_idx]
-        if args.has_q != 0:
-            length = args.used_q[batch_idx]
-        groups += (length + args.query_rows - 1) // args.query_rows
-        args.scratch[batch_idx + 1] = groups
+    groups = args.groups
+    if args.sparse != 0:
+        groups = total_q
     workers = args.workers
+    # 调度开销按有效 M 轴长度计算，尾组只计入实际 query 行。
     for i in range(METADATA_ELEMENTS):
         args.output[i] = 0
+    # Variable-size scheduler state belongs in GM, not the AICPU local arena.
+    for i in range(0, groups * (12 + 3 * args.splits)):
+        args.scratch[i] = 0
     total_cost = 0
-    for g in range(groups):
-        n = _group_field(args, g, total_q, 8)
-        total_cost += n * _group_field(args, g, total_q, 9)
+    batch_idx = 0
+    for g in range(0, groups):
+        qoff = 0
+        begin = 0
+        end = total_q
+        group_size = args.query_rows
+        if args.sparse != 0:
+            group_size = 1
+            if args.has_cu != 0:
+                while batch_idx + 1 < args.batch and g >= args.cu[batch_idx + 1]:
+                    batch_idx += 1
+                begin = args.cu[batch_idx]
+                end = args.cu[batch_idx + 1]
+            qoff = g - begin
+        else:
+            batch_idx = g // args.max_tasks
+            qoff = (g % args.max_tasks) * args.query_rows
+            if args.has_cu != 0:
+                begin = args.cu[batch_idx]
+                end = args.cu[batch_idx + 1]
+        used = end - begin
+        if args.has_q != 0:
+            used = args.used_q[batch_idx]
+        span = min(group_size, max(0, end - begin - qoff))
+        active = min(span, max(0, used - qoff))
+        actual = args.capacity
+        if args.has_k != 0:
+            actual = args.used_k[batch_idx]
+        rem = 0
+        if args.has_residual != 0:
+            rem = args.residual[batch_idx]
+        visible = actual
+        if args.mask == 3:
+            visible = min(
+                actual,
+                max(
+                    0, (actual * args.ratio + rem - used + qoff + active) // args.ratio
+                ),
+            )
+        if active == 0:
+            visible = 0
+        length = visible
+        if args.sparse != 0:
+            length = args.candidate_length[g] * 8
+            if visible == 0:
+                length = 0
+        n = (length + S2_TILE_TOKENS - 1) // S2_TILE_TOKENS
+        args.scratch[0 + (g)] = n
+        args.scratch[groups + (g)] = 4 * (6 * ((active * args.heads + 15) // 16) + 20)
+        tail = length % S2_TILE_TOKENS
+        args.scratch[2 * groups + (g)] = args.scratch[groups + (g)]
+        if tail != 0:
+            args.scratch[2 * groups + (g)] = ((tail + 127) // 128) * 6 * (
+                (active * args.heads + 15) // 16
+            ) + 10 * ((tail + 63) // 64)
+        if n > 0:
+            row_cost = (n - 1) * args.scratch[groups + (g)] + args.scratch[
+                2 * groups + (g)
+            ]
+            total_cost += row_cost
+        row = begin + qoff
+        field1 = span
+        if args.sparse != 0:
+            row = batch_idx
+            field1 = qoff
+        args.scratch[3 * groups + (g * 8)] = row
+        args.scratch[3 * groups + (g * 8 + 1)] = field1
+        args.scratch[3 * groups + (g * 8 + 2)] = active
+        args.scratch[3 * groups + (g * 8 + 3)] = used
+        args.scratch[3 * groups + (g * 8 + 4)] = actual
+        args.scratch[3 * groups + (g * 8 + 5)] = rem
+        args.scratch[3 * groups + (g * 8 + 6)] = batch_idx
+        args.scratch[
+            3 * groups + (g * SCHEDULER_FIELDS + SCHEDULER_QUERY_OFFSET_FIELD)
+        ] = qoff
     # ASC AssignByBatch -> AssignByRow -> AssignByBlock -> ForceAssign.
     # The cursor is a lexicographic (B, M, S2) boundary. No per-query split cap.
-    first_group = zeros(I64, workers)  # noqa: F821 - AICPU compiler intrinsic.
-    last_group = zeros(I64, workers)  # noqa: F821 - AICPU compiler intrinsic.
-    first_tile = zeros(I64, workers)  # noqa: F821 - AICPU compiler intrinsic.
-    last_tile = zeros(I64, workers)  # noqa: F821 - AICPU compiler intrinsic.
+    first_group = zeros(I64, workers)
+    last_group = zeros(I64, workers)
+    first_tile = zeros(I64, workers)
+    last_tile = zeros(I64, workers)
     max_row_cost = 0
     for g in range(groups):
-        n = _group_field(args, g, total_q, 8)
+        n = args.scratch[g]
         if n > 0:
             max_row_cost = max(
                 max_row_cost,
-                (n - 1) * _group_field(args, g, total_q, 9)
-                + _group_field(args, g, total_q, 9),
+                (n - 1) * args.scratch[groups + g] + args.scratch[2 * groups + g],
             )
     g = 0
     at = 0
@@ -178,22 +192,22 @@ def metadata_kernel(args: Args):
         blocks = 0
         # Assign remaining complete batches with ASC half-last-block tolerance.
         while g < groups:
-            batch_idx = _group_field(args, g, total_q, 6)
+            batch_idx = args.scratch[3 * groups + g * 8 + 6]
             end = g
             batch_cost = 0
             batch_blocks = 0
             batch_last = 0
-            while end < groups and _group_field(args, end, total_q, 6) == batch_idx:
-                n = _group_field(args, end, total_q, 8)
+            while end < groups and args.scratch[3 * groups + end * 8 + 6] == batch_idx:
+                n = args.scratch[end]
                 start = 0
                 if end == g:
                     start = at
                 if n > start:
-                    batch_cost += (n - start - 1) * _group_field(
-                        args, end, total_q, 9
-                    ) + _group_field(args, end, total_q, 9)
+                    batch_cost += (n - start - 1) * args.scratch[
+                        groups + end
+                    ] + args.scratch[2 * groups + end]
                     batch_blocks += n - start
-                    batch_last = _group_field(args, end, total_q, 9)
+                    batch_last = args.scratch[2 * groups + end]
                 end += 1
             if batch_cost != 0 and used + batch_cost > limit + batch_last // 2:
                 break
@@ -203,13 +217,13 @@ def metadata_kernel(args: Args):
             at = 0
         # Assign complete M rows.
         while g < groups:
-            n = _group_field(args, g, total_q, 8)
+            n = args.scratch[g]
             row_cost = 0
             if n > at:
-                row_cost = (n - at - 1) * _group_field(
-                    args, g, total_q, 9
-                ) + _group_field(args, g, total_q, 9)
-            if used + row_cost > limit + _group_field(args, g, total_q, 9) // 2:
+                row_cost = (n - at - 1) * args.scratch[groups + g] + args.scratch[
+                    2 * groups + g
+                ]
+            if used + row_cost > limit + args.scratch[2 * groups + g] // 2:
                 break
             used += row_cost
             blocks += n - at
@@ -217,20 +231,20 @@ def metadata_kernel(args: Args):
             at = 0
         # Assign S2 blocks only when LD is enabled.
         if args.ld != 0 and g < groups:
-            n = _group_field(args, g, total_q, 8)
+            n = args.scratch[g]
             while at < n:
-                cost = _group_field(args, g, total_q, 9)
+                cost = args.scratch[groups + g]
                 if at == n - 1:
-                    cost = _group_field(args, g, total_q, 9)
+                    cost = args.scratch[2 * groups + g]
                 if used + cost > limit + cost // 2:
                     break
                 used += cost
                 blocks += 1
                 at += 1
             if blocks == 0 and at < n:
-                cost = _group_field(args, g, total_q, 9)
+                cost = args.scratch[groups + g]
                 if at == n - 1:
-                    cost = _group_field(args, g, total_q, 9)
+                    cost = args.scratch[2 * groups + g]
                 used += cost
                 at += 1
             if at >= n:
@@ -252,15 +266,19 @@ def metadata_kernel(args: Args):
         start = first_group[c]
         end = last_group[c]
         if start < groups:
-            args.output[c * 8 + 1] = _group_field(args, start, total_q, 6)
-            m = _group_field(args, start, total_q, GROUP_QUERY_OFFSET_FIELD)
+            args.output[c * 8 + 1] = args.scratch[3 * groups + start * 8 + 6]
+            m = args.scratch[
+                3 * groups + start * SCHEDULER_FIELDS + SCHEDULER_QUERY_OFFSET_FIELD
+            ]
             if args.sparse == 0:
                 m = m // args.query_rows
             args.output[c * 8 + 2] = m
             args.output[c * 8 + 3] = first_tile[c]
         if end < groups:
-            args.output[c * 8 + 4] = _group_field(args, end, total_q, 6)
-            m = _group_field(args, end, total_q, GROUP_QUERY_OFFSET_FIELD)
+            args.output[c * 8 + 4] = args.scratch[3 * groups + end * 8 + 6]
+            m = args.scratch[
+                3 * groups + end * SCHEDULER_FIELDS + SCHEDULER_QUERY_OFFSET_FIELD
+            ]
             if args.sparse == 0:
                 m = m // args.query_rows
             args.output[c * 8 + 5] = m
@@ -268,10 +286,10 @@ def metadata_kernel(args: Args):
         else:
             args.output[c * 8 + 4] = args.batch
     # Record only cross-core rows. Compact workspace slots follow ASC FD order.
-    fd_group = zeros(I64, workers)  # noqa: F821 - AICPU compiler intrinsic.
-    fd_parts = zeros(I64, workers)  # noqa: F821 - AICPU compiler intrinsic.
-    fd_base = zeros(I64, workers)  # noqa: F821 - AICPU compiler intrinsic.
-    fd_rows = zeros(I64, workers)  # noqa: F821 - AICPU compiler intrinsic.
+    fd_group = zeros(I64, workers)
+    fd_parts = zeros(I64, workers)
+    fd_base = zeros(I64, workers)
+    fd_rows = zeros(I64, workers)
     fd_num = 0
     workspace = 0
     total_fd_load = 0
@@ -289,7 +307,7 @@ def metadata_kernel(args: Args):
             fd_group[fd_num] = group
             fd_parts[fd_num] = parts
             fd_base[fd_num] = workspace
-            fd_rows[fd_num] = _group_field(args, group, total_q, 2)
+            fd_rows[fd_num] = args.scratch[3 * groups + group * 8 + 2]
             total_fd_load += parts * fd_rows[fd_num]
             workspace += parts
             fd_num += 1
@@ -326,13 +344,15 @@ def metadata_kernel(args: Args):
             count = (fd_rows[f] + row_chunk - 1) // row_chunk
             count = min(count, spare + 1)
         group = fd_group[f]
-        m = _group_field(args, group, total_q, GROUP_QUERY_OFFSET_FIELD)
+        m = args.scratch[
+            3 * groups + group * SCHEDULER_FIELDS + SCHEDULER_QUERY_OFFSET_FIELD
+        ]
         if args.sparse == 0:
             m = m // args.query_rows
         for v in range(count):
             dst = LD_RECORD_START * METADATA_FIELDS + vector * METADATA_FIELDS
             args.output[dst] = 1
-            args.output[dst + 1] = _group_field(args, group, total_q, 6)
+            args.output[dst + 1] = args.scratch[3 * groups + group * 8 + 6]
             args.output[dst + 2] = m
             args.output[dst + 3] = fd_base[f]
             args.output[dst + 4] = fd_parts[f]
@@ -352,7 +372,7 @@ def compiled_metadata():
     from pathlib import Path
     from cannbotdsl.aicpu.toolchain import CompiledAicpuKernel, compile_aicpu_kernel
 
-    binary = Path(__file__).parent / "_aicpu" / "metadata_kernel.so"
+    binary = Path(__file__).parent / "_aicpu" / "qsli_metadata_kernel.so"
     if binary.is_file():
         return None, CompiledAicpuKernel(
             str(binary),
@@ -360,7 +380,7 @@ def compiled_metadata():
             name="metadata_kernel",
             launch_mode="interface",
         )
-    directory = tempfile.TemporaryDirectory(prefix="qli_metadata_aicpu_")
+    directory = tempfile.TemporaryDirectory(prefix="qsli_metadata_aicpu_")
     return directory, compile_aicpu_kernel(
         metadata_kernel, workdir=directory.name, launch_mode="interface"
     )
@@ -369,7 +389,7 @@ def compiled_metadata():
 def choose_splits(topk):
     # UB capacity for one streaming merge pass, not a limit on LD partitions.
     # AICPU computes the actual partition count and per-core ownership.
-    return max(1, min(8, 16384 // topk))
+    return max(1, min(MAX_MERGE_PARTS, TOPK_TRUNK_LEN // topk))
 
 
 def build_metadata(
@@ -392,9 +412,15 @@ def build_metadata(
     output_idx_offset=None,
 ):
     groups = q.shape[0] if sparse else batch * max_tasks
-    workers = 32
+    workers = int(torch.npu.get_device_properties(q.device).cube_core_num)
+    if not 1 <= workers <= LD_RECORD_START:
+        raise RuntimeError(
+            f"Unsupported Cube core count {workers}; LI metadata supports 1..{LD_RECORD_START}"
+        )
     output = torch.empty((METADATA_ELEMENTS,), dtype=torch.int32, device=q.device)
-    scratch = torch.empty((batch + 1,), dtype=torch.int64, device=q.device)
+    scratch = torch.empty(
+        (groups * (12 + 3 * splits),), dtype=torch.int64, device=q.device
+    )
     _, compiled = compiled_metadata()
     tensors = dict(
         cu=cu,
@@ -453,6 +479,7 @@ def metadata_geometry(
     cmp_ratio,
     layout_q,
     layout_k,
+    total_query_rows,
 ):
     from types import SimpleNamespace
 
@@ -494,23 +521,20 @@ def metadata_geometry(
         raise ValueError("Sequence length tensors must have B elements")
     if cu_seqlens_q is None and batch != 1:
         raise ValueError("TND metadata requires cu_seqlens_q for multiple batches")
-    # Sequence values are consumed by AICPU, including during graph replay.
+    # Packed query capacity comes from candidate lengths, not sequence values.
+    # AICPU reads cu/used_q/used_k on every invocation, including graph replay.
     max_q = int(max_seqlen_q)
     max_k = int(max_seqlen_k)
     if max_q == 0 or max_q < -1 or max_k < -1:
         raise ValueError("Invalid maximum sequence length")
-    if max_q == -1 and cu_seqlens_q is None and seqused_q is None:
-        raise ValueError("Max_seqlen_q or query sequence lengths are required")
     if max_k == -1 and seqused_k is None:
         raise ValueError("PA metadata requires max_seqlen_k or seqused_k")
-
-    geometry = SimpleNamespace(
-        shape=(batch * max_q if max_q >= 0 else -1, num_heads_q), device=device
-    )
+    geometry = SimpleNamespace(shape=(total_query_rows, num_heads_q), device=device)
     return geometry, batch, max_q, max_k
 
 
-def quant_lightning_indexer_metadata(
+def quant_sparse_lightning_indexer_metadata(
+    candidate_block_length,
     cu_seqlens_q=None,
     cu_seqlens_k=None,
     seqused_q=None,
@@ -524,42 +548,58 @@ def quant_lightning_indexer_metadata(
     num_heads_k,
     head_dim,
     topk,
+    quant_mode,
+    candidate_block_size,
     mask_mode=0,
     cmp_ratio=1,
     layout_q="TND",
     layout_k="TND",
-    candidate_topk_blocks=-1,
-    candidate_block_size=-1,
 ):
-    """Build flat AICPU metadata without requiring Q/K data tensors."""
-    if (num_heads_q, num_heads_k, head_dim) != (32, 1, 128):
-        raise ValueError("QLI metadata requires N1=32, N2=1 and logical D=128")
-    if candidate_topk_blocks == -1:
-        if candidate_block_size != -1:
-            raise ValueError("Disabled candidate requires block size -1")
-    elif candidate_topk_blocks <= 0 or candidate_block_size != 8:
-        raise ValueError("Candidate requires positive capacity and block size 8")
     if layout_k == "TND":
-        return _tnd_metadata(
+        if batch_size is not None:
+            raise ValueError(
+                "TND metadata infers batch from cu arrays; batch_size must be None"
+            )
+        if (num_heads_q, num_heads_k, head_dim, quant_mode, candidate_block_size) != (
+            32,
+            1,
+            128,
+            1,
+            8,
+        ):
+            raise ValueError(
+                "TND QSLI requires Nq=32, Nk=1, D=128, quant_mode=1, block size=8"
+            )
+        if layout_q != "TND" or int(max_seqlen_q) < -1 or int(max_seqlen_k) < -1:
+            raise ValueError("Invalid TND layout or maximum sequence length")
+        batch, effective_k = _tnd_geometry(
+            candidate_block_length,
             cu_seqlens_q,
             cu_seqlens_k,
             seqused_q,
             seqused_k,
             cmp_residual_k,
-            batch_size=batch_size,
-            max_seqlen_q=max_seqlen_q,
-            max_seqlen_k=max_seqlen_k,
-            num_heads_q=num_heads_q,
-            num_heads_k=num_heads_k,
-            head_dim=head_dim,
             topk=topk,
             mask_mode=mask_mode,
             cmp_ratio=cmp_ratio,
-            layout_q=layout_q,
-            candidate_topk_blocks=candidate_topk_blocks,
-            candidate_block_size=candidate_block_size,
         )
-    q, batch, max_q, capacity = metadata_geometry(
+        return _build_tnd_metadata(
+            candidate_block_length,
+            cu_seqlens_q,
+            seqused_q,
+            effective_k,
+            cmp_residual_k,
+            batch=batch,
+            topk=topk,
+            mask_mode=mask_mode,
+            cmp_ratio=cmp_ratio,
+        )
+
+    if quant_mode != 1 or candidate_block_size != 8:
+        raise ValueError("QSLI MX4 requires quant_mode=1, candidate block size8")
+    if num_heads_q != 32:
+        raise ValueError("QSLI currently supports 32 query heads")
+    q, batch, _, capacity = metadata_geometry(
         cu_seqlens_q,
         seqused_q,
         seqused_k,
@@ -575,133 +615,106 @@ def quant_lightning_indexer_metadata(
         cmp_ratio=cmp_ratio,
         layout_q=layout_q,
         layout_k=layout_k,
+        total_query_rows=candidate_block_length.numel(),
     )
-    rows = min(6, 256 // num_heads_q)
-    tasks = (max_q + rows - 1) // rows if max_q >= 0 else -1
+    if (
+        candidate_block_length.dtype != torch.int32
+        or candidate_block_length.ndim not in (1, 2)
+    ):
+        raise ValueError("Candidate_block_length must be int32 [T] or [T,1]")
+    if candidate_block_length.ndim == 2 and candidate_block_length.shape[1] != 1:
+        raise ValueError("Candidate_block_length must have one KV head")
+    if candidate_block_length.device != q.device:
+        raise ValueError("Candidate lengths and sequence lengths must share a device")
     return build_metadata(
         q,
         cu_seqlens_q,
         seqused_q,
         seqused_k,
         cmp_residual_k,
-        None,
+        candidate_block_length.reshape(-1, 1),
         batch=batch,
-        max_tasks=tasks,
+        max_tasks=1,
         capacity=capacity,
         splits=choose_splits(topk),
         mask=mask_mode,
         ratio=cmp_ratio,
-        query_rows=rows,
+        sparse=True,
     )
 
 
-def _tnd_metadata(
+def _sequence(tensor, name, device, count=None):
+    if tensor is None or tensor.dtype != torch.int32 or tensor.ndim != 1:
+        raise ValueError(f"{name} must be a one-dimensional int32 tensor")
+    if tensor.device != device or device.type != "npu" or not tensor.is_contiguous():
+        raise ValueError(f"{name} must be contiguous on the input NPU device")
+    if count is not None and tensor.numel() != count:
+        raise ValueError(f"{name} must have {count} entries")
+
+
+def _tnd_geometry(
+    lengths, cu_q, cu_k, used_q, used_k, residual, *, topk, mask_mode, cmp_ratio
+):
+    if (
+        lengths.ndim != 2
+        or lengths.shape[1] != 1
+        or lengths.shape[0] <= 0
+        or lengths.dtype != torch.int32
+        or lengths.device.type != "npu"
+        or not lengths.is_contiguous()
+    ):
+        raise ValueError(
+            "Candidate_block_length must be contiguous NPU int32 (T1,1), T1>0"
+        )
+    device = lengths.device
+    _sequence(cu_q, "cu_seqlens_q", device)
+    if cu_q.numel() < 2:
+        raise ValueError("Cu_seqlens_q must contain at least two boundaries")
+    batch = cu_q.numel() - 1
+    _sequence(cu_k, "cu_seqlens_k", device, batch + 1)
+    for name, tensor in (("seqused_q", used_q), ("seqused_k", used_k)):
+        if tensor is not None:
+            _sequence(tensor, name, device, batch)
+    if int(topk) <= 0 or int(mask_mode) not in (0, 3) or not 1 <= int(cmp_ratio) <= 128:
+        raise ValueError("Invalid topk, mask_mode or cmp_ratio")
+    if int(mask_mode) == 3 and int(cmp_ratio) != 1:
+        _sequence(residual, "cmp_residual_k", device, batch)
+    elif residual is not None:
+        raise ValueError("Cmp_residual_k requires mask_mode=3 and cmp_ratio!=1")
+    # Boundary values remain a device-side input contract; no CPU read/sync.
+    effective_k = used_k if used_k is not None else cu_k[1:] - cu_k[:-1]
+    return batch, effective_k
+
+
+def _build_tnd_metadata(
+    lengths,
     cu_q,
-    cu_k,
     used_q,
-    used_k,
+    effective_k,
     residual,
     *,
-    batch_size,
-    max_seqlen_q,
-    max_seqlen_k,
-    num_heads_q,
-    num_heads_k,
-    head_dim,
+    batch,
     topk,
     mask_mode,
     cmp_ratio,
-    layout_q,
-    candidate_topk_blocks,
-    candidate_block_size,
+    output_idx_offset=None,
 ):
-    if (num_heads_q, num_heads_k, head_dim) != (32, 1, 128):
-        raise ValueError("TND QLI requires Nq=32, Nk=1 and logical D=128")
-    if batch_size is not None:
-        raise ValueError("TND metadata requires batch_size=None")
-    if layout_q != "TND" or max_seqlen_q < -1 or max_seqlen_k < -1:
-        raise ValueError("Invalid layout or sequence maximum")
-    if topk <= 0 or mask_mode not in (0, 3) or not 1 <= cmp_ratio <= 128:
-        raise ValueError("Invalid topk, mask_mode or cmp_ratio")
-    if candidate_topk_blocks == -1:
-        if candidate_block_size != -1:
-            raise ValueError("Disabled candidate requires block size -1")
-    elif candidate_topk_blocks <= 0 or candidate_block_size != 8:
-        raise ValueError("Candidate requires positive capacity and block size 8")
-    tensors = [
-        tensor
-        for tensor in (cu_q, cu_k, used_q, used_k, residual)
-        if tensor is not None
-    ]
-    device = (
-        tensors[0].device
-        if tensors
-        else torch.device("npu", torch.npu.current_device())
-    )
-    if device.type != "npu":
-        raise ValueError("Sequence inputs must be on NPU")
-    for tensor in tensors:
-        if (
-            tensor.device != device
-            or tensor.dtype != torch.int32
-            or tensor.ndim != 1
-            or not tensor.is_contiguous()
-        ):
-            raise ValueError(
-                "Sequence inputs must be contiguous int32 vectors on one NPU"
-            )
-    batch = cu_q.numel() - 1 if cu_q is not None else 1
-    if batch <= 0 or (cu_k is not None and cu_k.numel() != batch + 1):
-        raise ValueError("Cu_q and cu_k must describe the same positive batch count")
-    if any(
-        tensor is not None and tensor.numel() != batch
-        for tensor in (used_q, used_k, residual)
-    ):
-        raise ValueError("Sequence lengths must have B elements")
-    if (mask_mode == 3 and cmp_ratio != 1) != (residual is not None):
-        raise ValueError("Cmp_residual_k is required only for causal compressed K")
-    if cu_k is None and batch != 1:
-        raise ValueError("Multiple TND batches require cu_seqlens_k")
-    effective_k = used_k
-    if effective_k is None:
-        if cu_k is not None:
-            effective_k = cu_k[1:] - cu_k[:-1]
-        elif max_seqlen_k >= 0:
-            effective_k = torch.full(
-                (batch,), max_seqlen_k, dtype=torch.int32, device=device
-            )
-        else:
-            raise ValueError("K boundaries, used lengths or max_seqlen_k are required")
-    query, batch, max_query, capacity = metadata_geometry(
-        cu_q,
-        used_q,
-        effective_k,
-        residual,
-        batch_size=None,
-        max_seqlen_q=max_seqlen_q,
-        max_seqlen_k=0,
-        num_heads_q=num_heads_q,
-        num_heads_k=num_heads_k,
-        head_dim=head_dim,
-        topk=topk,
-        mask_mode=mask_mode,
-        cmp_ratio=cmp_ratio,
-        layout_q=layout_q,
-        layout_k="PA_BBND",
-    )
-    tasks = (max_query + 5) // 6 if max_query >= 0 else -1
+    from types import SimpleNamespace
+
+    geometry = SimpleNamespace(shape=(lengths.shape[0], 32), device=lengths.device)
     return build_metadata(
-        query,
+        geometry,
         cu_q,
         used_q,
         effective_k,
         residual,
-        None,
+        lengths,
         batch=batch,
-        max_tasks=tasks,
-        capacity=capacity,
-        splits=choose_splits(topk),
-        mask=mask_mode,
-        ratio=cmp_ratio,
-        query_rows=6,
+        max_tasks=1,
+        capacity=0,
+        splits=choose_splits(int(topk)),
+        mask=int(mask_mode),
+        ratio=int(cmp_ratio),
+        sparse=True,
+        output_idx_offset=output_idx_offset,
     )

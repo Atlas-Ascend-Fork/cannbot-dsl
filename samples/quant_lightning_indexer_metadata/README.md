@@ -1,4 +1,4 @@
-# quant_lightning_indexer_metadata_dsl
+# quant_lightning_indexer_metadata
 
 ## 产品支持情况
 
@@ -6,11 +6,11 @@
 
 ## 功能说明
 
-`quant_lightning_indexer_metadata` 是 [QLI](../quant_lightning_indexer_dsl/README.md) 配套的独立 AICPU 调度算子。它根据有效序列长度、mask、压缩比例和 TopK 生成 LI 计算范围及 LD 跨核归并信息，不读取 Q/K 特征，不计算分数或 TopK。
+`quant_lightning_indexer_metadata` 是 [QLI](../quant_lightning_indexer/README.md) 配套的独立 AICPU 调度算子。它根据有效序列长度、mask、压缩比例和 TopK 生成 LI 计算范围及 LD 跨核归并信息，不读取 Q/K 特征，不计算分数或 TopK。
 
 Query 按最多 6 行分组，Key 按 256-token tile 划分。causal 场景根据有效长度、`cmp_ratio` 和 `cmp_residual_k` 推导右下对齐的可见范围，再估算各 Query group 的计算量。LI 记录每核在 `(batch, query_group, s2_tile)` 坐标空间中的连续起止范围；同一 Query group 被拆到多个核时，LD 记录分片数、临时结果位置和输出行范围，供主算子归并局部 TopK。
 
-零工作量保留必要的输出初始化调度。实现位于 [quant_lightning_indexer_metadata_dsl.py](quant_lightning_indexer_metadata_dsl.py)。
+零工作量保留必要的输出初始化调度。实现位于 [quant_lightning_indexer_metadata.py](quant_lightning_indexer_metadata.py)。
 
 ## 函数原型
 
@@ -26,7 +26,7 @@ def quant_lightning_indexer_metadata(
     ...
 ```
 
-模块路径为 `quant_lightning_indexer_metadata_dsl.quant_lightning_indexer_metadata_dsl`。
+模块路径为 `quant_lightning_indexer_metadata.quant_lightning_indexer_metadata`。
 
 ## 参数说明
 
@@ -74,7 +74,7 @@ def quant_lightning_indexer_metadata(
 import torch
 import torch_npu
 
-from quant_lightning_indexer_metadata_dsl.quant_lightning_indexer_metadata_dsl import (
+from quant_lightning_indexer_metadata.quant_lightning_indexer_metadata import (
     quant_lightning_indexer_metadata,
 )
 
@@ -93,14 +93,14 @@ torch.npu.synchronize()
 assert metadata.shape == (1024,) and metadata.dtype == torch.int32
 ```
 
-主算子接收 `quant_lightning_indexer(..., metadata=metadata)`，完整调用见 [QLI 快速开始](../quant_lightning_indexer_dsl/README.md#快速开始)。
+主算子接收 `quant_lightning_indexer(..., metadata=metadata)`，完整调用见 [QLI 快速开始](../quant_lightning_indexer/README.md#快速开始)。
 
 ## 精度测试
 
 在仓库根目录执行独立 metadata 测试，不加载 QLI 主计算算子：
 
 ```bash
-python -m pytest -q test/quant_lightning_indexer_metadata_dsl/test_quant_lightning_indexer_metadata_dsl.py
+python -m pytest -q test/quant_lightning_indexer_metadata/test_quant_lightning_indexer_metadata.py
 ```
 
 共 7 项测试：1 项 CPU 参考校验、4 项 NPU 调度边界、2 项 NPU 典型调度用例。覆盖 PA/TND、变长尾部、causal、跨核 LD 和零工作量；独立枚举任务，检查每个 S2 tile 恰好出现一次、LD 分片数与 Query 行覆盖、工作区不重叠及保留区清零。典型配置为 B=12、S1=6、Nq/Nk=32/1、D=128、S2=64K/128K、TopK=512、mask_mode=3、cmp_ratio=2。典型用例标记 `slow`，默认执行；最终 TopK 数值由主算子测试验证。
