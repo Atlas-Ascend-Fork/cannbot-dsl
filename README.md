@@ -4,31 +4,20 @@
 
 [📖 概述](docs/zh/guide/overview.md) · [💻 软硬件配套](docs/zh/guide/hardware-model.md) · [⚡️ 快速上手](docs/zh/install/source-build.md) · [📦 算子列表](samples/) · [📚 文档导航](docs/zh/api/index.md) · [📂 目录结构](docs/zh/guide/repository.md) · [🔥 更新日志](CHANGELOG.md) · [📜 许可证](LICENSE)
 
-<!-- TODO(发布后)：补顶部徽章行（许可证 / 文档站 / CANN 版本 / 所属 SIG）。 -->
-<!-- TODO(发布后)：补语言切换入口（中文 | English）。本次仅提供中文。 -->
 
 ---
 
 ## 🔥 最新动态
 
+> **2026-10-30**
+>
+> - **📦 发布 CANNBot-DSL 0.8.0 wheel 包**：`master` 分支配套 `cannbot-dsl==0.8.0`，可直接通过 pip 安装。
+>
 > **2026-09-30**
 >
 > - **✅ 支持 DeepSeek V4.1**：本仓算子集已覆盖相关算子，包括 [`indexer_prologue_qw`](samples/indexer_prologue_qw)、[`indexer_prologue_k`](samples/indexer_prologue_k)、[`attn_prologue`](samples/attn_prologue)、[`attn_epilogue`](samples/attn_epilogue)、[`quant_lightning_indexer`](samples/quant_lightning_indexer)、[`quant_sparse_lightning_indexer`](samples/quant_sparse_lightning_indexer)、[`mixed_quant_sparse_flash_mla`](samples/mixed_quant_sparse_flash_mla)。
 >
 > - **🚀 新增 17 个算子样例，并更新既有算子适配最新 CANNBot-DSL**。其中，[Sparse Flash Attention](samples/sparse_flash_attention) 在典型场景下**最高加速比达到 1.63 倍**；[Qwen Sparse Attention](samples/qwen_sparse_attn) 在长 KV decode 场景下**平均加速比达到 1.23 倍**。更多性能数据与测试口径请参见对应样例 README，其余算子的详细信息请参见下方的算子列表。
->
-> - **🛠 支持样例运行与自定义算子的调试开发**：CANNBot-DSL 0.7.0 版本发布，可直接通过 `python -m pip install cannbot-dsl` 安装；本仓样例可直接运行，自定义算子可通过 `net/native_package` 编译打包为 Native 算子包。使用说明见[快速上手](docs/zh/install/source-build.md)，打包方式见 [Native 打包说明](net/native_package/README.md)，接口与调试能力见 [API 文档](docs/zh/api/index.md)。
-
-<!-- TODO(算子全量合入后)：本节只保留当前这批重大更新，跟随后续合入滚动替换，
-     顶部那行日期（现为 2026-09-30）需一并更新为最新一批的合入日期。
-     历史沿革由 CHANGELOG.md 承载，但其首节目前只记到 2026-09-30，且只收录了
-     attn_prologue、attn_epilogue、batch_matmul、matmul_streamk、quant_batch_matmul_mxa8w4 五条；
-     engram_gate、indexer_prologue_k、flash_mla_with_kvcache、quant_block_sparse_attn、
-     flash_attn 的 metadata 变长序列支持、既有算子适配 0.7.0 的迁移，
-     以及 flash_kda_metadata / fused_recurrent_kda_snapshot 两个样例的撤并，均未收录，需补齐。 -->
-
-<!-- TODO(发布前)：第二条的「17 个」按 2026-09-29 与 2026-09-30 两批合入的新增算子计，
-     metadata 算子计入其主算子（含 flash_attn_metadata）；「更新适配」的具体范围也需一并核实。 -->
 
 ## 📌 概述
 
@@ -46,49 +35,36 @@ CANNBot 是 [CANN](https://hiascend.com/software/cann) 社区的 Infra 智能体
 | CPU 架构 | x86_64 / aarch64 |
 | 操作系统 | CANN 支持的 Linux 发行版，见[硬件兼容性查询](https://www.hiascend.com/hardware/compatibility) |
 | Python | 3.10、3.11、3.12 |
-| CANN | 建议 9.2.0-beta.2，见 [CANN 安装部署](https://www.hiascend.com/cann/download) |
-| CANNBot-DSL | 0.7.0 |
+| CANN | 9.2.1，见 [CANN 安装部署](https://www.hiascend.com/zh/cann/download?versionId=813&ids=d806%2Ch0501%2Ch0601%2Ch0703&currentTab=0) |
+| CANNBot-DSL | 0.8.0 |
 | torch | 2.7.1 / 2.9.0 / 2.10.0 / 2.11.0 / 2.12.0 |
 
-> 上表口径截至 2026-09-30。CANN 版本以 [CANN 安装部署](https://www.hiascend.com/cann/download)为准。
+> 上表口径截至 2026-10-29。CANN 软件包请以 [CANN 安装部署](https://www.hiascend.com/zh/cann/download?versionId=813&ids=d806%2Ch0501%2Ch0601%2Ch0703&currentTab=0)页面提供的产品和架构匹配版本为准。
 
-<!-- TODO(发布后)：`cannbot-dsl` 0.7.0 上架 pip 源后，复核本表版本号与「快速上手」中的安装命令。 -->
 
 ## ⚡️ 快速上手
 
 ### 1. 安装 CANN
 
-版本要求见[软硬件配套说明](#软硬件配套说明)。CANN 软件包为 Linux 版本，分 `x86_64` 与 `aarch64` 两种架构，下文以 `x86_64`、CANN 9.2.0-beta.2 为例。
-
-软件包可从 [CANN 安装部署](https://www.hiascend.com/cann/download)页面获取，也可直接从镜像 `wget` 下载（`aarch64` 机器把下面 URL 中的 `x86_64` 换成 `aarch64`）：
-
-```bash
-CANN_BASE=https://ascend.devcloud.huaweicloud.com/artifactory/cann-run/software/9.2.0-beta.2/x86_64
-
-wget ${CANN_BASE}/Ascend-cann-toolkit_9.2.0-beta.2_linux-x86_64.run
-wget ${CANN_BASE}/Ascend-cann-950-ops_9.2.0-beta.2_linux-x86_64.run
-```
+版本要求见[软硬件配套说明](docs/zh/guide/hardware-model.md)。CANN 软件包为 Linux 版本，分 `x86_64` 与 `aarch64` 两种架构。请从 [CANN 安装部署](https://www.hiascend.com/zh/cann/download?versionId=813&ids=d806%2Ch0501%2Ch0601%2Ch0703&currentTab=0)页面选择 CANN 9.2.1 以及与目标产品、操作系统架构匹配的 Toolkit 和算子包。
 
 `${install_path}` 为安装路径，默认 `/usr/local/Ascend`：
 
 ```bash
-bash ./Ascend-cann-toolkit_9.2.0-beta.2_linux-x86_64.run --install --force --install-path=${install_path}
-bash ./Ascend-cann-950-ops_9.2.0-beta.2_linux-x86_64.run --install --force --install-path=${install_path}
+bash ./Ascend-cann_9.2.1_linux-x86_64.run --install --force --install-path=${install_path}
+bash ./Ascend-cann-950-ops_9.2.1_linux-x86_64.run --install --force --install-path=${install_path}
 
 source ${install_path}/ascend-toolkit/set_env.sh
 ```
 
-复现 DeepSeek V4.1 相关算子建议使用 CANN `9.2.0~weekly.20260909.01`，包目录见 [cann-run-mirror/software/legacy/20260909000323409](https://ascend.devcloud.huaweicloud.com/artifactory/cann-run-mirror/software/legacy/20260909000323409)。
-
 ### 2. 安装 CANNBot-DSL
 
-CANNBot-DSL 以 whl 包发布，编译器后端已包含在包内，安装后即可使用，无需再从源码构建。发行包名为 `cannbot-dsl`，导入名为 `cannbotdsl`：
+CANNBot-DSL 0.8.0 已发布到 pip 源。发行包名为 `cannbot-dsl`，导入名为 `cannbotdsl`：
 
 ```bash
-python -m pip install cannbot-dsl
+python -m pip install cannbot-dsl==0.8.0
 ```
 
-<!-- TODO(发布后)：`cannbot-dsl` 0.7.0 上架后复核本节命令与配套版本号（上架前公网仅 0.0.3 Alpha）。 -->
 
 安装完成后验证版本：
 
@@ -98,63 +74,49 @@ python -c 'import cannbotdsl; print(cannbotdsl.__version__)'
 
 ### 3. 运行一个算子
 
-以 `sparse_flash_attention` 为例，BSND、BF16，每个 Query token 选取 TOPK 个逻辑 KV token：
+以 `flash_kda` 为例。该样例依赖 CANNBot-DSL 0.8.0，先生成 metadata，再执行 FlashKDA：
 
 ```python
 import math
+
 import torch
 import torch_npu
 
-from sparse_flash_attention import sparse_flash_attention
+from flash_kda.flash_kda import flash_kda
+from flash_kda.flash_kda_metadata import flash_kda_metadata
 
-B, S1, S2, N1, N2 = 1, 2, 16, 8, 1
-D, DR, TOPK = 512, 64, 8
+B, NQK, NV, S, D = 1, 3, 3, 8192, 128
+q = torch.randn(B, NQK, S, D, device="npu", dtype=torch.bfloat16)
+k = torch.randn_like(q)
+v = torch.randn(B, NV, S, D, device="npu", dtype=torch.bfloat16)
+g = torch.randn_like(v)
+beta = torch.randn(B, NV, S, device="npu", dtype=torch.bfloat16)
+initial_state = torch.zeros(B, NV, D, D, device="npu", dtype=torch.float32)
+A_log = torch.randn(NV, device="npu", dtype=torch.float32)
+dt_bias = torch.randn(NV, D, device="npu", dtype=torch.float32)
 
-query = torch.randn(B, S1, N1, D, dtype=torch.bfloat16).npu()
-query_rope = torch.randn(B, S1, N1, DR, dtype=torch.bfloat16).npu()
-key = torch.randn(B, S2, N2, D, dtype=torch.bfloat16).npu()
-key_rope = torch.randn(B, S2, N2, DR, dtype=torch.bfloat16).npu()
-
-sparse_indices = torch.tensor(
-    [[[[0, 2, 4, 6, 8, 10, 12, 14]],
-      [[1, 3, 5, 7, 9, 11, 13, 15]]]],
-    dtype=torch.int32,
-).npu()
-
-output, softmax_max, softmax_sum = sparse_flash_attention(
-    query=query,
-    key=key,
-    value=key,                 # MLA-absorb；当前 kernel 使用 key 参与 PV
-    sparse_indices=sparse_indices,
-    query_rope=query_rope,
-    key_rope=key_rope,
-    scale_value=1.0 / math.sqrt(D + DR),
-    sparse_block_size=1,
-    layout_query="BSND",
-    layout_kv="BSND",
-    sparse_mode=0,
-    attention_mode=2,
-    return_softmax_lse=True,
+metadata = flash_kda_metadata(q, v, initial_state, "BNSD")
+out, final_state = flash_kda(
+    q, k, v, g, beta, 1 / math.sqrt(D), initial_state,
+    A_log, dt_bias, -5.0, "BNSD", metadata,
 )
 
-print("output", tuple(output.shape))
-print("softmax_max", tuple(softmax_max.shape))
-print("softmax_sum", tuple(softmax_sum.shape))
+print("out", tuple(out.shape))
+print("final_state", tuple(final_state.shape))
 ```
 
-样例以目录为单位组织，运行前请切换到该样例所在目录，或把样例目录加入 `PYTHONPATH`：
+样例以目录为单位组织，运行前请在仓库根目录将 `samples` 加入 `PYTHONPATH`：
 
 ```bash
-cd samples/sparse_flash_attention
+export PYTHONPATH="$PWD/samples:$PYTHONPATH"
 python3 your_script.py
 ```
 
 运行成功时打印：
 
 ```text
-output (1, 2, 8, 512)
-softmax_max (1, 1, 2, 8)
-softmax_sum (1, 1, 2, 8)
+out (1, 3, 8192, 128)
+final_state (1, 3, 128, 128)
 ```
 
 各算子的接口参数、数据类型约束与返回值说明，见[算子列表](#算子列表)中对应样例的 README。
@@ -162,10 +124,9 @@ softmax_sum (1, 1, 2, 8)
 ### 4. 运行精度测试
 
 ```bash
-python3 -m pytest test/sparse_flash_attention/test_sparse_flash_attention.py -v
+python3 -m pytest test/flash_kda/test_flash_kda.py -v
 ```
 
-<!-- TODO(算子全量合入后)：补充「一次跑全部样例测试」的命令与耗时说明。 -->
 
 ## 📦 算子列表
 

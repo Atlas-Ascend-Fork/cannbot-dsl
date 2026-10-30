@@ -112,7 +112,7 @@ OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 python -m pytest -q test/flash_kda/test_flas
 
 ## 性能测试
 
-测量环境：Ascend 950 PR，cannbotdsl 0.8.0、PyTorch 2.10.0、CANN 9.2.0，32 个 AIC。
+测量环境：Ascend 950 PR，cannbotdsl 0.8.0、PyTorch 2.10.0、CANN 9.2.1，32 个 AIC。
 
 `B=1`、`Nqk=Nv=96`、`S=16384`、`Dk=Dv=128`，BF16 输入、FP32 状态，`template="auto"`。
 

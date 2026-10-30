@@ -25,7 +25,7 @@ const guideSidebar = [
   { text: '源码构建', link: '/zh/install/source-build' },
   { text: '编程模型', link: '/zh/guide/overview' },
   { text: '仓库结构', link: '/zh/guide/repository' },
-  { text: '样例导航', link: 'https://gitcode.com/cann/cannbot-dsl/blob/master/samples/README.md' }
+  { text: '样例导航', link: '/samples/' }
 ]
 
 const programmingModelSidebar = [
