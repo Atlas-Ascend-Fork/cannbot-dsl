@@ -50,14 +50,15 @@ except ImportError:  # CPU-only tests import this module without an NPU stack.
 
 from cannbotdsl import (
     Buffer,
-    Channel,
-    ChannelKind,
     Dim,
     MemLoc,
+    RingBuffer,
     Tensor,
     TensorSpec,
     compile as dsl_compile,
     const_expr,
+    convert,
+    copy_options,
     dtypes,
     host,
     get_block_idx,
@@ -66,8 +67,7 @@ from cannbotdsl import (
     get_subblock_id,
     jit,
     kernel,
-    cv_valid_extent,
-    make_copy_engine as _dsl_make_copy_engine,
+    make_layout,
     matmul,
     mem_copy,
     range_constexpr,
@@ -90,7 +90,6 @@ from cannbotdsl.ops.reg import (
     veq,
     vgather,
     vgather_reg,
-    vges,
     vgts,
     vload,
     vlts,
@@ -120,11 +119,7 @@ from cannbotdsl.ops.sync import (
     vec_sync_all,
     vec_sync_block_wait,
 )
-from cannbotdsl.tensor import (
-    make_tiler,
-    reinterpret,
-    tile_slice,
-)
+from cannbotdsl.tensor import reinterpret, tile_slice
 
 Float8E4M3FN = dtypes.float8_e4m3fn
 Float8E8M0 = dtypes.float8_e8m0
@@ -134,26 +129,26 @@ def tile_view(tensor, tiler, coord):
     return tile_slice(tensor, tiler, coord)
 
 
-def make_bounded_tiler(shape, capacity=None, alignment=None):
-    del capacity
-    return make_tiler(shape, alignment=alignment)
+def local_slice(tensor, shape, stride=None, offset=0):
+    return reinterpret(tensor, layout=make_layout(shape, stride=stride), offset=offset)
 
 
-def local_slice(tensor, tiler, stride=None, offset=0):
-    return reinterpret(tensor, shape=tiler, stride=stride, offset=offset)
+def _mx_scale_view(tensor):
+    """Carry the native MX ScaleA layout into an L0 scale operand.
 
-
-def make_copy_engine(*args, **kwargs):
-    kwargs.pop("dtype", None)
-    kwargs.pop("pad_value", None)
-    return _dsl_make_copy_engine(*args, **kwargs)
+    The ring is an ``nz`` ``(scale, M)`` pool; the ``(M, scale)`` view is
+    obtained by transposing each selected slot.
+    """
+    return tensor.permute(1, 0)
 
 
 try:
     from device_properties import get_device_properties
 except ImportError:  # packaged net/ops wheel has no samples/ on sys.path
+
     def get_device_properties():
         return torch.npu.get_device_properties(0)
+
 
 I32 = dtypes.int32
 # ``get_block_idx`` and ``get_block_num`` are int64, and a dynamic range wants
@@ -190,7 +185,7 @@ LUT_SHIFT = 20
 LUT_LEN = 1088
 
 
-# Channel depths, overridable while tuning so a sweep is one env var per run.
+# Ring depths, overridable while tuning so a sweep is one env var per run.
 # Read at trace time, so every one of these is a compile-time constant.
 def _depth(name: str, default: int) -> int:
     return int(os.environ.get(f"IPQW_{name}_DEPTH", default))
@@ -354,9 +349,7 @@ def resolve_cube_cores(cube_cores: int | None = None) -> int:
     """
     if cube_cores is None:
         forced = os.environ.get("IPQW_CUBE_CORES")
-        cube_cores = (
-            int(forced) if forced else get_device_properties().cube_core_num
-        )
+        cube_cores = int(forced) if forced else get_device_properties().cube_core_num
     cube_cores = int(cube_cores)
     if cube_cores <= 0:
         raise ValueError(f"cube_cores must be positive, got {cube_cores}")
@@ -371,6 +364,7 @@ def scale_l1_len(k: int) -> int:
 # ---------------------------------------------------------------------------
 # E2M1 rounding table
 # ---------------------------------------------------------------------------
+
 
 # Build the FP4 rounding table. The index is bits of the scaled absolute value;
 # the stored code is a 3-bit magnitude. The sign is merged later, and two
@@ -394,13 +388,14 @@ def build_e2m1_lut() -> torch.Tensor:
                 continue
             value = 2.0 ** (exponent - E8M0_BIAS) * (1.0 + mantissa / 8.0)
             codes[index] = sum(1 for m in midpoints if value >= m)
-    codes[133 * 8:] = 7
+    codes[133 * 8 :] = 7
     return codes
 
 
 # ---------------------------------------------------------------------------
 # Host tiling
 # ---------------------------------------------------------------------------
+
 
 # Host-side plan: template, on-chip buffer sizes, and the work each core owns.
 # T = batch * seq. Default base_m is 128. Q is split by head; W is split on K.
@@ -437,18 +432,12 @@ class Plan:
         self.dr = dr
         self.cube_cores = resolve_cube_cores(cube_cores)
 
-        # Sizing the tile to T is what used to make T compile-time below one
-        # tile per core: ``base_m`` is the height of every L1/L0/UB buffer, so a
-        # T-dependent value here fragments the small-T range into one binary per
-        # T.  A dynamic plan pins it and lets the short tile be short -- which
-        # costs nothing measurable, because the vector epilogue is already cut
-        # to the live rows (``vec.epilogue(cv_ub, rows)``) and the wasted mmad
-        # rows land in a cube that is only ~22% busy down here.
-        self.base_m = (
-            BASE_M
-            if (self.t_dyn or t >= BASE_M)
-            else max(16, ceil_div(t, 16) * 16)
-        )
+        # Below BASE_M, each 16-row bucket keeps its own rounded buffer height.
+        # Pinning every dynamic bucket to BASE_M makes a 72-row ND2NZ fill into
+        # a 128-row destination wrap the source inside each fractal.  The live
+        # T still comes from t_live, and T >= BASE_M keeps the single 128-row
+        # template.
+        self.base_m = BASE_M if t >= BASE_M else max(16, ceil_div(t, 16) * 16)
         self.rows_vec = self.base_m // 2
         self.n_tiles = ceil_div(t, self.base_m)
         self._plan_head_split()
@@ -530,8 +519,6 @@ class Plan:
                 )
         self.bytes_used = {"L1": l1, "L0A": l0a, "L0B": l0b, "L0C": l0c, "UB": ub}
 
-
-
     # Template choice: when ceil(T/128) < 25, split 32 heads into 16 groups of
     # 2. That also splits the W reduction of dim=5120 into 16 K slices, which
     # is why this template is called split-K. Otherwise use split-T.
@@ -610,8 +597,7 @@ class Plan:
 
         if self.n_heads % forced:
             raise ValueError(
-                f"head block count {forced} does not divide n_heads="
-                f"{self.n_heads}"
+                f"head block count {forced} does not divide n_heads={self.n_heads}"
             )
         self.n_head_blocks = forced
         self.heads_per_block = self.n_heads // self.n_head_blocks
@@ -638,16 +624,16 @@ class Plan:
     # ``workspace_rows`` -- are all derived from the live row count at runtime.  So this
     # tuple *is* the specialisation key: two T that agree on it share a binary.
     SHAPE_KEY = (
-        "base_m",         # height of every L1/L0/UB tile
-        "rows_vec",       # vector-side tile height
+        "base_m",  # height of every L1/L0/UB tile
+        "rows_vec",  # vector-side tile height
         "n_head_blocks",  # head loop trip count, k_block, band UB width
         "heads_per_block",
-        "rows_red",       # band UB height
-        "red_regs",       # register unroll in the band sum
+        "rows_red",  # band UB height
+        "red_regs",  # register unroll in the band sum
         # ``used_cores`` is deliberately absent: the grid is a symbolic
         # expression over the padded row count now, not a constant, so it is
         # neither a specialisation dimension nor a route for the core count.
-        "w_workspace",           # whether the workspace path is compiled in at all
+        "w_workspace",  # whether the workspace path is compiled in at all
         "w_separate",
         "w_leader_only",
         "w_interleaved",
@@ -669,10 +655,9 @@ class Plan:
 
         Two things have to hold, and neither is about which template this is.
 
-        ``base_m`` must be the pinned tile height, because it is a buffer shape
-        rather than a count -- a plan that sized it to T could not serve any
-        other T.  ``__init__`` pins it under ``t_dyn``, so this is a guard on
-        that, not a restriction on the caller.
+        ``base_m`` must be one of the small 16-row-aligned bucket heights or
+        BASE_M, because it is a buffer shape rather than a count.  A bucket
+        serves every T in its range, so sizing it to one exact T is invalid.
 
         ``reduce_at`` must be "tail".  The "early" rendezvous sits inside the
         work loop and is only sound while every launched core runs that loop
@@ -680,8 +665,10 @@ class Plan:
         now a runtime value, so it cannot be decided here.
         """
         problems = []
-        if self.base_m != BASE_M:
-            problems.append(f"base_m={self.base_m} is sized to T (want {BASE_M})")
+        if self.base_m > BASE_M or self.base_m % NZ_M_FRAC != 0:
+            problems.append(
+                f"base_m={self.base_m} is not a 16-row bucket height <= {BASE_M}"
+            )
         if self.w_workspace and self.reduce_at != "tail":
             problems.append(
                 f"reduce_at={self.reduce_at!r} needs one work item per core, "
@@ -754,10 +741,7 @@ class Plan:
         # wherever w_workspace is on, but it is cheap to keep honest.
         self.reduce_at = (
             W_REDUCE_AT
-            if (
-                not self.t_dyn
-                and self.n_tiles * self.n_head_blocks == self.used_cores
-            )
+            if (not self.t_dyn and self.n_tiles * self.n_head_blocks == self.used_cores)
             else "tail"
         )
 
@@ -784,9 +768,13 @@ class Plan:
 
     def _pick_base_k_w(self) -> int:
         """L0 K step for the W path: as large as L0A allows next to the Q path."""
-        q_l0a = D_L0AB_Q * self.base_m * (
-            int(os.environ.get("IPQW_BASE_K_Q", 0))
-            or min(128, ceil_div(self.q_lora, MX_K_ALIGN) * MX_K_ALIGN)
+        q_l0a = (
+            D_L0AB_Q
+            * self.base_m
+            * (
+                int(os.environ.get("IPQW_BASE_K_Q", 0))
+                or min(128, ceil_div(self.q_lora, MX_K_ALIGN) * MX_K_ALIGN)
+            )
         )
         budget = L0AB_BYTES - q_l0a
         best = 16
@@ -917,6 +905,7 @@ class Plan:
         self.enc_regs = ceil_div(self.rows_vec * self.groups, VL)
         self.amax_len = self.enc_regs * VL
 
+
 # The plan the public entry will use, sharing the cache with _plan_for.
 # Use this to read base_m and the other live parameters. A freshly built
 # static Plan can disagree with the binary that will actually run.
@@ -946,6 +935,7 @@ def plan(t: int, geo: Geometry) -> Plan:
 # ---------------------------------------------------------------------------
 # Cross-core rendezvous for the W reduction
 # ---------------------------------------------------------------------------
+
 
 # Cross-core barrier before the W reduction. Every AIC must have stored its
 # partials to GM before any AIV reads them, so a later call cannot see leftovers.
@@ -1011,6 +1001,7 @@ def w_barrier():
 # Cube modules
 # ---------------------------------------------------------------------------
 
+
 # Q GEMM: one token tile and one head, qr @ wqb_head.T.
 # qr and its scale stay in L1. wqb streams in by K window. The FP32
 # accumulator lives in L0C.
@@ -1019,60 +1010,59 @@ class CubeQ:
 
     def __init__(self, p: Plan):
         self.p = p
-        self.qr_l1 = Channel(
-            MemLoc.L1, (p.base_m, p.qr_k_l1), Float8E4M3FN, depth=1, data_format="nz"
+        self.qr_l1 = RingBuffer(
+            MemLoc.L1, Float8E4M3FN, make_layout((p.base_m, p.qr_k_l1)), depth=1
         )
-        self.scale_qr_l1 = Channel(
-            MemLoc.L1, (p.base_m, p.scale_k_len_q), Float8E8M0, depth=1, data_format="zn"
+        self.scale_qr_l1 = RingBuffer(
+            MemLoc.L1,
+            Float8E8M0,
+            make_layout((p.scale_k_len_q, p.base_m)),
+            depth=1,
         )
         # ``wqb`` is handed over already in FRACTAL_NZ.  The GM-to-L1 identity
         # copy is a raw byte move and insists both sides share a dtype, and the
         # one-byte elements FRACTAL_NZ can describe are only the integers -- so
-        # the staging channel is declared uint8 for the fill and read back
+        # the staging ring is declared uint8 for the fill and read back
         # through an fp8 alias.
         #
-        # One depth-1 channel per K window rather than one channel of that
+        # One depth-1 ring per K window rather than one ring of that
         # depth, because the fp8 view has to be taken on the slot (see
         # gemm_head) and a slot only has a statically known byte origin when
-        # its channel is depth 1.
+        # its ring is depth 1.
         self.wqb_l1 = [
-            Channel(
+            RingBuffer(
                 MemLoc.L1,
-                (p.base_n_q, p.k_l1_q),
                 U8,
+                make_layout((p.base_n_q, p.k_l1_q)),
                 depth=1,
-                data_format="nz",
             )
             for _ in range(p.n_buf_wqb)  # == k_l1_tiles_q
         ]
-        # No alias on the scales, so one rotating channel is fine here.
-        self.scale_wqb_l1 = Channel(
+        # No alias on the scales, so one rotating ring is fine here.
+        self.scale_wqb_l1 = RingBuffer(
             MemLoc.L1,
-            (p.scale_k_l1_len_q, p.base_n_q),
             Float8E8M0,
+            make_layout((p.scale_k_l1_len_q, p.base_n_q)),
             depth=p.n_buf_wqb,
-            data_format="nz",
         )
-        self.l0a = Channel(MemLoc.L0A, (p.base_m, p.base_k_q), Float8E4M3FN, depth=D_L0AB_Q)
-        self.l0b = Channel(MemLoc.L0B, (p.base_n_q, p.base_k_q), Float8E4M3FN, depth=D_L0B_Q)
-        self.l0c = Channel(MemLoc.L0C, (p.base_m, p.base_n_q), F32, depth=D_L0C_Q)
-
-        self.eng_nd2nz = make_copy_engine(
-            format_transform="nd2nz", dtype=Float8E4M3FN, pad_value=0.0
+        self.l0a = RingBuffer(
+            MemLoc.L0A,
+            Float8E4M3FN,
+            make_layout((p.base_m, p.base_k_q)),
+            depth=D_L0AB_Q,
         )
-        # ``wqb`` arrives in FRACTAL_NZ, so its L1 fill is a plain burst copy.
-        # The ND route had to gather base_n_q separate q_lora-strided rows per
-        # window; the NZ route reads whole (16, 32) fractals back to back,
-        # which is what makes this the cheapest 5.24 MB on the chip.
-        self.eng_nz = make_copy_engine(format_transform="identity", dtype=U8)
-        self.eng_scale_a = make_copy_engine(
-            format_transform="mx_scale_and", dtype=Float8E8M0, pad_value=0.0
+        self.l0b = RingBuffer(
+            MemLoc.L0B,
+            Float8E4M3FN,
+            make_layout((p.base_n_q, p.base_k_q)),
+            depth=D_L0B_Q,
         )
-        self.eng_scale_b = make_copy_engine(
-            format_transform="mx_scale_bdn", dtype=Float8E8M0, pad_value=0.0
+        self.l0c = RingBuffer(
+            MemLoc.L0C,
+            F32,
+            make_layout((p.base_m, p.base_n_q)),
+            depth=D_L0C_Q,
         )
-        # Hardware sends each balanced M partition to its corresponding AIV.
-        self.eng_c2v = make_copy_engine(split_axis=0)
 
     # Copy qr and its scale for token tile into L1. Every head of this task
     # reuses them. A short last tile copies only the live rows; stores are
@@ -1091,27 +1081,27 @@ class CubeQ:
         height -- see ``rows_view``.
         """
         p = self.p
+        qr_src = tile_view(qr_gm, (p.base_m, p.qr_k_l1), (tile, 0))
+        scale_src = tile_view(
+            descale_qr_gm,
+            (p.base_m, p.scale_k_len_q // MX_PAIR, MX_PAIR),
+            (tile, 0, 0),
+        ).flatten(start_dim=1)
         mem_copy(
-            self.qr_l1.produce(),
-            tile_view(qr_gm, (p.base_m, p.qr_k_l1), (tile, 0)),
-            engine=self.eng_nd2nz,
-            l2_cache_ctl=p.l2_q,
+            self.qr_l1.next_write(),
+            qr_src,
+            options=copy_options(l2_cache_ctl=p.l2_q),
         )
         mem_copy(
-            self.scale_qr_l1.produce(),
-            tile_view(
-                descale_qr_gm,
-                (p.base_m, p.scale_k_len_q // MX_PAIR, MX_PAIR),
-                (tile, 0, 0),
-            ),
-            engine=self.eng_scale_a,
-            l2_cache_ctl=p.l2_q,
+            _mx_scale_view(self.scale_qr_l1.next_write()),
+            scale_src,
+            options=copy_options(l2_cache_ctl=p.l2_q),
         )
 
     @jit
     def wait_qr(self):
         """The staged ``qr`` tile and its scales, as one transaction pair."""
-        return self.qr_l1.consume(), self.scale_qr_l1.consume()
+        return self.qr_l1.next_read(), _mx_scale_view(self.scale_qr_l1.next_read())
 
     # Physical layout of a short tail. rows_l1 rounds the live row count up
     # to 16. Later L1 reads must use that same row pitch. Treating the tail
@@ -1132,35 +1122,17 @@ class CubeQ:
         The layout pass infers exactly this height on its own, but only while
         one unconditional fill reaches the reads.  The prefetch adds a second
         fill site behind a runtime ``if``, the two runtime extents join to the
-        declared height, and an explicit view is rejected on an implicit channel
-        ("cannot project typed Channel reaching shape through explicit tile_view
-        read") -- hence the manual transaction, which hands back a plain slot
-        this can slice.  Measured: with the fill unconditional the inference is
-        right at every T; with the prefetch on it is wrong at every T that is
-        not a multiple of 128.
+        declared height, and an explicit view is rejected on an implicit ring
+        read -- hence the manual transaction, which hands back a plain slot this
+        can slice.  Measured: with the fill unconditional the inference is right
+        at every T; with the prefetch on it is wrong at every T that is not a
+        multiple of 128.
 
         The scales are cut to the same height for their row step only.  Their
-        fill is ``mx_scale_and``, which does not pack to the tail, so their row
-        stride is the declared one either way.
+        scale-layout fill does not pack to the tail, so their row stride is the
+        declared one either way.
         """
-        p = self.p
-        qr = local_slice(
-            qr_slot,
-            make_bounded_tiler(
-                (rows_l1, p.qr_k_l1), (p.base_m, p.qr_k_l1), (NZ_M_FRAC, 1)
-            ),
-            stride=(p.qr_k_l1, 1),
-        )
-        scale = local_slice(
-            scale_slot,
-            make_bounded_tiler(
-                (rows_l1, p.scale_k_len_q),
-                (p.base_m, p.scale_k_len_q),
-                (NZ_M_FRAC, 1),
-            ),
-            stride=(p.scale_k_len_q, 1),
-        )
-        return qr, scale
+        return qr_slot, scale_slot
 
     @jit
     def _fill_wqb(self, wqb_gm, descale_wqb_gm, head, kw, buf):
@@ -1171,16 +1143,17 @@ class CubeQ:
         # in gemm_head.  Both halves are written out by hand so the fill and
         # the read name the same depth-1 buffer.
         mem_copy(
-            self.wqb_l1[buf].produce(),
+            self.wqb_l1[buf].next_write(),
             tile_view(wqb_gm, (p.base_n_q, p.k_l1_q), (head, kw)),
-            engine=self.eng_nz,
-            l2_cache_ctl=p.l2_q,
+            options=copy_options(l2_cache_ctl=p.l2_q),
+        )
+        scale_src = tile_view(
+            descale_wqb_gm, (p.base_n_q, groups, MX_PAIR), (head, kw, 0)
         )
         mem_copy(
-            self.scale_wqb_l1.produce(),
-            tile_view(descale_wqb_gm, (p.base_n_q, groups, MX_PAIR), (head, kw, 0)),
-            engine=self.eng_scale_b,
-            l2_cache_ctl=p.l2_q,
+            self.scale_wqb_l1.next_write(),
+            scale_src.flatten(start_dim=1).permute(1, 0),
+            options=copy_options(l2_cache_ctl=p.l2_q),
         )
 
     # Reduce the whole q_lora K of one head into one L0C slot.
@@ -1196,7 +1169,7 @@ class CubeQ:
         """
         p = self.p
         # Select once per head: every K step accumulates into this same slot.
-        l0c = self.l0c.produce()
+        l0c = self.l0c.next_write()
         self._fill_wqb(wqb_gm, descale_wqb_gm, head, 0, 0)
         # Unrolled: keeps ``init`` a compile-time bool, so the hottest loop in
         # the kernel has no scf.if around its mmad.
@@ -1206,41 +1179,49 @@ class CubeQ:
                     wqb_gm, descale_wqb_gm, head, kw + 1, (kw + 1) % p.n_buf_wqb
                 )
             buf = kw % p.n_buf_wqb
-            wqb_ready = reinterpret(
-                self.wqb_l1[buf].consume(), dtype=Float8E4M3FN
-            )
-            scale_ready = self.scale_wqb_l1.consume()
+            wqb_ready = reinterpret(self.wqb_l1[buf].next_read(), dtype=Float8E4M3FN)
+            scale_ready = self.scale_wqb_l1.next_read()
             for kk in range_constexpr(p.step_k_q):
                 k_l0 = kw * p.step_k_q + kk
+                a_rows = self.l0a.next_write()
                 mem_copy(
-                    self.l0a.produce(),
+                    a_rows,
                     tile_view(qr_rows, (p.base_m, p.base_k_q), (0, k_l0)),
-                    mx_scale=tile_view(
-                        scale_rows, (p.base_m, p.scale_k_l0_len), (0, k_l0)
+                    options=copy_options(
+                        mx_scale=tile_view(
+                            scale_rows, (p.base_m, p.scale_k_l0_len), (0, k_l0)
+                        )
                     ),
                 )
                 mem_copy(
-                    self.l0b.produce(),
+                    self.l0b.next_write(),
                     tile_view(wqb_ready, (p.base_n_q, p.base_k_q), (0, kk)),
-                    mx_scale=tile_view(
-                        scale_ready, (p.scale_k_l0_len, p.base_n_q), (kk, 0)
+                    options=copy_options(
+                        mx_scale=tile_view(
+                            scale_ready, (p.scale_k_l0_len, p.base_n_q), (kk, 0)
+                        )
                     ),
                 )
-                # matmul takes M from this operand view, not its last fill.
-                a_rows = local_slice(
-                    self.l0a.consume(), (qr_rows.shape[0], p.base_k_q)
-                )
+                # matmul reads the declared L0 slot; later stores clip the tail.
+                self.l0a.next_read()
                 if const_expr(UNIT_FLAG):
                     last_k = k_l0 == p.k_l0_tiles_q - 1
                     matmul(
                         l0c,
                         a_rows,
-                        self.l0b.consume(),
+                        self.l0b.next_read(),
                         init=(k_l0 == 0),
                         unit_flag=3 if last_k else 2,
+                        mx_mode=True,
                     )
                 else:
-                    matmul(l0c, a_rows, self.l0b.consume(), init=(k_l0 == 0))
+                    matmul(
+                        l0c,
+                        a_rows,
+                        self.l0b.next_read(),
+                        init=(k_l0 == 0),
+                        mx_mode=True,
+                    )
 
     # Hand the Q accumulator from L0C straight to the vector UB. No GM hop.
     # rows is the live output height. rows_l1 is the accumulator layout.
@@ -1248,12 +1229,17 @@ class CubeQ:
     @jit
     def drain_to_vec(self, cv_ub, rows, rows_l1):
         # The accumulator is packed with the M used by matmul on this tile.
-        c_rows = local_slice(self.l0c.consume(), (rows_l1, self.p.d))
+        # Partition the live M so the two AIVs split the same rows the vector
+        # epilogue processes; the L0 allocation's padded height is not a split
+        # boundary. ``rows_l1`` remains the accumulator layout height.
+        c_rows = local_slice(self.l0c.next_read(), (rows, self.p.d))
+        part_rows = c_rows.partition(dim=0, part_id=0).shape[0]
         mem_copy(
-            cv_ub.produce(), c_rows, engine=self.eng_c2v,
-            actual=(rows, self.p.d), unit_flag=3 if UNIT_FLAG else 0,
+            cv_ub.next_write()[0:part_rows, 0 : self.p.d],
+            c_rows.partition(dim=0),
+            options=copy_options(unit_flag=3 if UNIT_FLAG else 0),
         )
-        return cv_ub.consume()
+        return cv_ub.next_read()
 
 
 # W GEMM: x @ weight_w.T, with softmax_scale applied on the store.
@@ -1265,21 +1251,27 @@ class CubeW:
     def __init__(self, p: Plan):
         self.p = p
         bf16 = dtypes.bfloat16
-        self.x_l1 = Channel(
-            MemLoc.L1, (p.base_m, p.k_l1_w), bf16, depth=D_X, data_format="nz"
+        self.x_l1 = RingBuffer(
+            MemLoc.L1,
+            bf16,
+            make_layout((p.base_m, p.k_l1_w)),
+            depth=D_X,
         )
-        self.ww_l1 = Channel(
-            MemLoc.L1, (p.base_n_w, p.k_l1_w), bf16, depth=D_X, data_format="nz"
+        self.ww_l1 = RingBuffer(
+            MemLoc.L1,
+            bf16,
+            make_layout((p.base_n_w, p.k_l1_w)),
+            depth=D_X,
         )
-        self.l0a = Channel(MemLoc.L0A, (p.base_m, p.base_k_w), bf16, depth=D_L0AB_W)
-        self.l0b = Channel(MemLoc.L0B, (p.base_n_w, p.base_k_w), bf16, depth=D_L0AB_W)
-        self.l0c = Channel(MemLoc.L0C, (p.base_m, p.base_n_w), F32, depth=2)
-        self.eng_nd2nz = make_copy_engine(
-            format_transform="nd2nz", dtype=bf16, pad_value=0.0
+        self.l0a = RingBuffer(
+            MemLoc.L0A, bf16, make_layout((p.base_m, p.base_k_w)), depth=D_L0AB_W
         )
-        # ``ww`` arrives in FRACTAL_NZ; ``x`` is an activation and stays ND.
-        self.eng_nz = make_copy_engine(format_transform="identity", dtype=bf16)
-        self.eng_fp = make_copy_engine(dtype=F32)
+        self.l0b = RingBuffer(
+            MemLoc.L0B, bf16, make_layout((p.base_n_w, p.base_k_w)), depth=D_L0AB_W
+        )
+        self.l0c = RingBuffer(
+            MemLoc.L0C, F32, make_layout((p.base_m, p.base_n_w)), depth=2
+        )
 
     # View of x that matches the L1 copy. A short tail uses rows_l1 as the
     # row pitch so later column blocks are not read from the wrong offset.
@@ -1296,19 +1288,17 @@ class CubeW:
         upper half of the head axis and why ``x`` used to be handed over grown
         to whole tiles in GM.
 
-        The height cannot be the channel's declared shape, because only the last
-        tile is short, and it cannot be inferred either: a manual produce/consume
+        The height cannot be the ring's declared shape, because only the last
+        tile is short, and it cannot be inferred either: a manual write/read
         slot is a fresh root, so the fill's row count never reaches the read.
-        (The ``qr`` staging is an implicit channel, where the layout pass does
+        (The ``qr`` staging is an implicit ring, where the layout pass does
         propagate it; see ``CubeQ.load_qr``.)  So it is passed in, and this is
-        the same ``local_slice`` a dynamic-shape Channel would apply itself.
+        the same ``local_slice`` a dynamic-shape RingBuffer would apply itself.
         """
         p = self.p
         return local_slice(
             slot,
-            make_bounded_tiler(
-                (rows_l1, p.k_l1_w), (p.base_m, p.k_l1_w), (NZ_M_FRAC, 1)
-            ),
+            (rows_l1, p.k_l1_w),
             stride=(p.k_l1_w, 1),
         )
 
@@ -1327,9 +1317,7 @@ class CubeW:
         p = self.p
         return local_slice(
             slot,
-            make_bounded_tiler(
-                (rows_l1, p.base_n_w), (p.base_m, p.base_n_w), (NZ_M_FRAC, 1)
-            ),
+            (rows_l1, p.base_n_w),
             stride=(p.base_n_w, 1),
         )
 
@@ -1341,7 +1329,7 @@ class CubeW:
         MTE2 underneath the Q path's cube work.  ``local_head`` is 0 ..
         heads_per_block-1 on this core; ``h_block`` selects which slice of
         ``ww`` / ``w`` this core owns.  ``local_head`` is a runtime index,
-        hence the manual L0C transaction: with an implicit channel the
+        hence the manual L0C transaction: with an implicit ring the
         ``scf.if`` around the ``init`` matmul reads as a second writer.
         """
         p = self.p
@@ -1351,25 +1339,36 @@ class CubeW:
         for j in range_constexpr(p.w_per_head):
             if const_expr(j + 1 < p.w_per_head):
                 self._fill_window(
-                    self.x_gm, self.ww_gm, tile, h_block, local_head * p.w_per_head + j + 1
+                    self.x_gm,
+                    self.ww_gm,
+                    tile,
+                    h_block,
+                    local_head * p.w_per_head + j + 1,
                 )
-            x_ready = self.x_l1.consume()
-            ww_ready = self.ww_l1.consume()
+            x_ready = self.x_l1.next_read()
+            ww_ready = self.ww_l1.next_read()
             x_rows = self.x_rows(x_ready, rows_l1)
             for kk in range_constexpr(p.step_k_w):
-                mem_copy(self.l0a.produce(), tile_view(x_rows, (p.base_m, p.base_k_w), (0, kk)))
-                mem_copy(self.l0b.produce(), tile_view(ww_ready, (p.base_n_w, p.base_k_w), (0, kk)))
-                a_rows = local_slice(self.l0a.consume(), (rows_l1, p.base_k_w))
+                a_rows = self.l0a.next_write()
+                mem_copy(
+                    a_rows,
+                    tile_view(x_rows, (p.base_m, p.base_k_w), (0, kk)),
+                )
+                mem_copy(
+                    self.l0b.next_write(),
+                    tile_view(ww_ready, (p.base_n_w, p.base_k_w), (0, kk)),
+                )
+                self.l0a.next_read()
                 first = kk == 0 and j == 0
                 if const_expr(PROBE == "no_runtime_init"):
-                    matmul(l0c_slot, a_rows, self.l0b.consume(), init=False)
+                    matmul(l0c_slot, a_rows, self.l0b.next_read(), init=False)
                 elif const_expr(PROBE == "no_w_mmad"):
                     pass
                 else:
                     matmul(
                         l0c_slot,
                         a_rows,
-                        self.l0b.consume(),
+                        self.l0b.next_read(),
                         init=(local_head == 0) if const_expr(first) else False,
                     )
 
@@ -1383,16 +1382,14 @@ class CubeW:
         """
         p = self.p
         mem_copy(
-            self.x_l1.produce(),
+            self.x_l1.next_write(),
             tile_view(x_gm, (p.base_m, p.k_l1_w), (tile, k_base + kw)),
-            engine=self.eng_nd2nz,
-            l2_cache_ctl=L2_W,
+            options=copy_options(l2_cache_ctl=L2_W),
         )
         mem_copy(
-            self.ww_l1.produce(),
+            self.ww_l1.next_write(),
             tile_view(ww_gm, (p.base_n_w, p.k_l1_w), (0, k_base + kw)),
-            engine=self.eng_nz,
-            l2_cache_ctl=L2_W,
+            options=copy_options(l2_cache_ctl=L2_W),
         )
 
     @jit
@@ -1409,18 +1406,25 @@ class CubeW:
         """Retire the oldest staged window pair into ``l0c_slot``."""
         p = self.p
         for j in range_constexpr(p.w_per_head):
-            x_ready = self.x_l1.consume()
-            ww_ready = self.ww_l1.consume()
+            x_ready = self.x_l1.next_read()
+            ww_ready = self.ww_l1.next_read()
             x_rows = self.x_rows(x_ready, rows_l1)
             for kk in range_constexpr(p.step_k_w):
-                mem_copy(self.l0a.produce(), tile_view(x_rows, (p.base_m, p.base_k_w), (0, kk)))
-                mem_copy(self.l0b.produce(), tile_view(ww_ready, (p.base_n_w, p.base_k_w), (0, kk)))
-                a_rows = local_slice(self.l0a.consume(), (rows_l1, p.base_k_w))
+                a_rows = self.l0a.next_write()
+                mem_copy(
+                    a_rows,
+                    tile_view(x_rows, (p.base_m, p.base_k_w), (0, kk)),
+                )
+                mem_copy(
+                    self.l0b.next_write(),
+                    tile_view(ww_ready, (p.base_n_w, p.base_k_w), (0, kk)),
+                )
+                self.l0a.next_read()
                 first = kk == 0 and j == 0
                 matmul(
                     l0c_slot,
                     a_rows,
-                    self.l0b.consume(),
+                    self.l0b.next_read(),
                     init=(local_head == 0) if const_expr(first) else False,
                 )
 
@@ -1434,15 +1438,22 @@ class CubeW:
         for kw in range_constexpr(p.k_l1_tiles_w):
             if const_expr(kw + 1 < p.k_l1_tiles_w):
                 self._fill_window(self.x_gm, self.ww_gm, tile, k_base, kw + 1)
-            x_ready = self.x_l1.consume()
-            ww_ready = self.ww_l1.consume()
+            x_ready = self.x_l1.next_read()
+            ww_ready = self.ww_l1.next_read()
             x_rows = self.x_rows(x_ready, rows_l1)
             for kk in range_constexpr(p.step_k_w):
-                mem_copy(self.l0a.produce(), tile_view(x_rows, (p.base_m, p.base_k_w), (0, kk)))
-                mem_copy(self.l0b.produce(), tile_view(ww_ready, (p.base_n_w, p.base_k_w), (0, kk)))
-                a_rows = local_slice(self.l0a.consume(), (rows_l1, p.base_k_w))
+                a_rows = self.l0a.next_write()
+                mem_copy(
+                    a_rows,
+                    tile_view(x_rows, (p.base_m, p.base_k_w), (0, kk)),
+                )
+                mem_copy(
+                    self.l0b.next_write(),
+                    tile_view(ww_ready, (p.base_n_w, p.base_k_w), (0, kk)),
+                )
+                self.l0a.next_read()
                 first = kw == 0 and kk == 0
-                matmul(l0c_slot, a_rows, self.l0b.consume(), init=const_expr(first))
+                matmul(l0c_slot, a_rows, self.l0b.next_read(), init=const_expr(first))
 
     @jit
     def store(self, tile, rows_l1):
@@ -1450,12 +1461,11 @@ class CubeW:
         # softmax_scale folded into the fixpipe DEQSCALE register: the W path
         # never touches the vector unit.
         p = self.p
+        c_rows = self.c_rows(self.l0c.next_read(), rows_l1)
         mem_copy(
             tile_view(self.w_gm, (p.base_m, p.base_n_w), (tile, 0)),
-            self.c_rows(self.l0c.consume(), rows_l1),
-            engine=self.eng_fp,
-            deq_scale=self.softmax_scale,
-            l2_cache_ctl=L2_W,
+            convert(c_rows, c_rows.dtype, scale=self.softmax_scale),
+            options=copy_options(l2_cache_ctl=L2_W),
         )
 
     # Each K slice writes its W partial into a workspace region only it owns.
@@ -1477,20 +1487,20 @@ class CubeW:
         view is cut to the live rows of ``w``.
         """
         p = self.p
+        c_rows = self.c_rows(self.l0c.next_read(), rows_l1)
         mem_copy(
             tile_view(
                 self.workspace_gm, (p.base_m, p.base_n_w), (h_block * n_tiles + tile, 0)
             ),
-            self.c_rows(self.l0c.consume(), rows_l1),
-            engine=self.eng_fp,
-            deq_scale=self.softmax_scale,
-            l2_cache_ctl=L2_W,
+            convert(c_rows, c_rows.dtype, scale=self.softmax_scale),
+            options=copy_options(l2_cache_ctl=L2_W),
         )
 
 
 # ---------------------------------------------------------------------------
 # Vector module
 # ---------------------------------------------------------------------------
+
 
 # Vector epilogue. Q gets RoPE, MXFP4 quantisation in groups of 32, and
 # packed FP4 stores. The same unit also sums W partials in the split-K
@@ -1508,15 +1518,14 @@ class VectorQ:
         # pass 2 writes at would land in the padding.  Declare it in the shape
         # pass 2 actually writes (one 64-byte register per row) and let ``store``
         # re-view it as (rows, groups) with an explicit packed stride.
-        self.q_ub = Buffer(MemLoc.UB, (rows, p.d // 2), U8)
-        self.dsc_ub = Buffer(MemLoc.UB, (p.enc_regs, VL), U8)
+        self.q_ub = Buffer(MemLoc.UB, U8, make_layout((rows, p.d // 2)))
+        self.dsc_ub = Buffer(MemLoc.UB, U8, make_layout((p.enc_regs, VL)))
         # Auto-buffer-sync orders MTE2 DMA against VF reads on Buffers.
-        self.amax_ub = Buffer(MemLoc.UB, (p.amax_len,), F32)
-        self.off_ub = Buffer(MemLoc.UB, (p.amax_len,), I32)
-        self.lut_ub = Buffer(MemLoc.UB, (LUT_LEN,), I32)
-        self.cos_ub = Buffer(MemLoc.UB, (rows, max(p.dr, 1)), F32)
-        self.sin_ub = Buffer(MemLoc.UB, (rows, max(p.dr, 1)), F32)
-        self.eng_split = make_copy_engine(split_axis=0)
+        self.amax_ub = Buffer(MemLoc.UB, F32, make_layout((p.amax_len,)))
+        self.off_ub = Buffer(MemLoc.UB, I32, make_layout((p.amax_len,)))
+        self.lut_ub = Buffer(MemLoc.UB, I32, make_layout((LUT_LEN,)))
+        self.cos_ub = Buffer(MemLoc.UB, F32, make_layout((rows, max(p.dr, 1))))
+        self.sin_ub = Buffer(MemLoc.UB, F32, make_layout((rows, max(p.dr, 1))))
         # W reduction staging.  ``band_ub`` holds every partial of one band so
         # the sum is whole-register adds; partial ``i`` starts exactly
         # ``red_regs`` registers in, because a band's innermost extent
@@ -1526,9 +1535,9 @@ class VectorQ:
         # coarse but runs at most twice per band.
         if p.w_workspace:
             self.band_ub = Buffer(
-                MemLoc.UB, (p.n_head_blocks * p.rows_red, p.n_heads), F32
+                MemLoc.UB, F32, make_layout((p.n_head_blocks * p.rows_red, p.n_heads))
             )
-            self.wsum_ub = Buffer(MemLoc.UB, (p.rows_red, p.n_heads), F32)
+            self.wsum_ub = Buffer(MemLoc.UB, F32, make_layout((p.rows_red, p.n_heads)))
 
     # Hand W bands out across every AIV. Each band is summed and stored by
     # one AIV, so the writes do not collide.
@@ -1585,13 +1594,14 @@ class VectorQ:
         """Per-T-tile prologue: DMA the LUT and the cos/sin tables into UB."""
         mem_copy(self.lut_ub, tile_view(lut_gm, (LUT_LEN,), (0,)))
         if const_expr(self.p.dr > 0):
+            part = get_subblock_id()
             mem_copy(
-                self.cos_ub, cos_tile, engine=self.eng_split,
-                part_id=get_subblock_id(),
+                self.cos_ub,
+                cos_tile.partition(dim=0, part_id=part),
             )
             mem_copy(
-                self.sin_ub, sin_tile, engine=self.eng_split,
-                part_id=get_subblock_id(),
+                self.sin_ub,
+                sin_tile.partition(dim=0, part_id=part),
             )
         return self.lut_ub, self.cos_ub, self.sin_ub
 
@@ -1614,17 +1624,15 @@ class VectorQ:
     def store(self, q_tile, dsc_tile, rows):
         """Write back exactly ``rows`` rows, so a short T tail cannot overrun GM."""
         p = self.p
+        part = get_subblock_id()
         mem_copy(
-            q_tile,
+            q_tile.partition(dim=0, part_id=part),
             local_slice(self.q_ub, (rows, p.d // 2), stride=(p.d // 2, 1)),
-            engine=self.eng_split, part_id=get_subblock_id(),
         )
         mem_copy(
-            dsc_tile,
+            dsc_tile.partition(dim=0, part_id=part),
             local_slice(self.dsc_ub, (rows, p.groups), stride=(p.groups, 1)),
-            engine=self.eng_split, part_id=get_subblock_id(),
         )
-
 
     @jit
     def _rope_amax(self, cv_ub, rows, cos_ub, sin_ub):
@@ -1635,20 +1643,23 @@ class VectorQ:
             m_lo = create_mask("h", 32)
             lane = varange(0, I32)
             one_i = vdups(1, I32, mask=m32)
-            pair_idx = vreinterpret(
-                vbitwise_xor(lane, one_i, mask=m32), U32
-            )
+            pair_idx = vreinterpret(vbitwise_xor(lane, one_i, mask=m32), U32)
             group_idx = vreinterpret(
                 vbitwise_and(
                     vadds(lane, VL // 2, mask=m32),
                     vdups(VL - 1, I32, mask=m32),
                     mask=m32,
-                ), U32
+                ),
+                U32,
             )
             rope_sgn = vselect(
                 vdups(1.0, F32, mask=m32),
                 vdups(-1.0, F32, mask=m32),
-                cond_mask=vne(vbitwise_and(lane, one_i, mask=m32), vdups(0, I32, mask=m32), mask=m32),
+                cond_mask=vne(
+                    vbitwise_and(lane, one_i, mask=m32),
+                    vdups(0, I32, mask=m32),
+                    mask=m32,
+                ),
             )
             for r in range(rows):
                 base = r * p.d
@@ -1751,20 +1762,24 @@ class VectorQ:
                     # the descaled fp32 bucket, while the discarded LUT bits
                     # distinguish the exact midpoint from values just above it.
                     tie_lower = vselect(
-                        one_i, zero_i,
+                        one_i,
+                        zero_i,
                         cond_mask=veq(idx, vdups(1000, I32, mask=m32), mask=m32),
                     )
                     for midpoint_idx in (1018, 1026, 1034):
                         tie_lower = vselect(
-                            one_i, tie_lower,
+                            one_i,
+                            tie_lower,
                             cond_mask=veq(
                                 idx, vdups(midpoint_idx, I32, mask=m32), mask=m32
                             ),
                         )
                     tie_code = vselect(
-                        vsub(code, one_i, mask=m32), code,
+                        vsub(code, one_i, mask=m32),
+                        code,
                         cond_mask=veq(
-                            vbitwise_and(mag, lut_remainder_mask, mask=m32), zero_i,
+                            vbitwise_and(mag, lut_remainder_mask, mask=m32),
+                            zero_i,
                             mask=m32,
                         ),
                     )
@@ -1793,6 +1808,7 @@ class VectorQ:
 # ---------------------------------------------------------------------------
 # Fused kernel
 # ---------------------------------------------------------------------------
+
 
 class _Launch:
     """Invariant GM handles for one launch. Per-tile values stay in arguments."""
@@ -1824,7 +1840,7 @@ def _w_prefix(gm, work):
     rows_full = tile_view(gm.w, (p.base_m, p.n_heads), (tile, 0)).shape[0]
     rows_l1 = ceil_div(rows_full, NZ_M_FRAC) * NZ_M_FRAC
     if const_expr(not (PROBE == "no_w" and p.w_separate)):
-        w_slot = cube_w.l0c.produce()
+        w_slot = cube_w.l0c.next_write()
     else:
         w_slot = None
     if const_expr(p.w_separate) and const_expr(PROBE != "no_w"):
@@ -1838,7 +1854,9 @@ def _w_prefix(gm, work):
         else:
             cube_w.store(tile, rows_l1)
         w_slot = None
-        if const_expr(p.w_workspace and p.reduce_at == "early" and PROBE != "no_reduce"):
+        if const_expr(
+            p.w_workspace and p.reduce_at == "early" and PROBE != "no_reduce"
+        ):
             if const_expr(PROBE != "no_sync"):
                 w_barrier()
             gm.vec.reduce_all(gm.workspace, gm.w, gm.n_bands, gm.n_bands_workspace)
@@ -1858,11 +1876,14 @@ def _q_heads(gm, work, lut_ub, cos_ub, w_slot):
     h_block = work % p.n_head_blocks
     rows_full = tile_view(gm.w, (p.base_m, p.n_heads), (tile, 0)).shape[0]
     rows_l1 = ceil_div(rows_full, NZ_M_FRAC) * NZ_M_FRAC
-    rows = cv_valid_extent(
-        tile_view(gm.descale_q, (p.base_m, p.groups), (tile, 0)),
-        axis=0,
-        part_id=gm.subblock,
-    )
+    # The vector epilogue, the L0C drain and the GM store must all walk the
+    # same AIV row partition.  Read that split off the store's own partition
+    # view instead of re-deriving it from the live tile extent: the two agree
+    # on a full tile, but a short tail is where splitting the declared height
+    # and splitting the clipped height diverge.
+    q_tile = tile_view(gm.q, (p.base_m, p.d // 2), (tile, 0))
+    rows = q_tile.partition(dim=0, part_id=gm.subblock).shape[0]
+    drain_rows = q_tile.partition(dim=0, part_id=0).shape[0] * 2
     sin_ub = gm.sin_ub
     qr_ready, dqr_ready = cube_q.wait_qr()
     qr_rows, dqr_rows = cube_q.rows_view(qr_ready, dqr_ready, rows_l1)
@@ -1877,7 +1898,7 @@ def _q_heads(gm, work, lut_ub, cos_ub, w_slot):
             if local_head + 1 < p.heads_per_block:
                 cube_w.fill(tile, local_head + 1, 0)
             cube_w.drain(local_head, w_slot, rows_l1)
-        cv_ready = cube_q.drain_to_vec(gm.cv_ub, rows_full, rows_l1)
+        cv_ready = cube_q.drain_to_vec(gm.cv_ub, drain_rows, rows_l1)
         vec.epilogue(cv_ready, rows, lut_ub, cos_ub, sin_ub)
         vec.store(
             tile_view(gm.q, (p.base_m, p.d // 2), (tile, head)),
@@ -1888,7 +1909,7 @@ def _q_heads(gm, work, lut_ub, cos_ub, w_slot):
     if const_expr(PROBE != "no_w" and not p.w_separate):
         cube_w.store(tile, rows_l1)
     elif const_expr(PROBE == "no_w" and not p.w_separate):
-        cube_w.l0c.consume()
+        cube_w.l0c.next_read()
 
 
 @jit
@@ -1896,7 +1917,15 @@ def _arm(p, direct, views, t_live):
     """Stash the launch tensors. Called from the kernel so the entry stays short."""
     x, wqb, weight_w, workspace = direct
     (
-        qr, q, descale_q, descale_qr, descale_wqb, lut, rope_sin, rope_cos, w,
+        qr,
+        q,
+        descale_q,
+        descale_qr,
+        descale_wqb,
+        lut,
+        rope_sin,
+        rope_cos,
+        w,
         softmax_scale,
     ) = views
     cube_w = CubeW(p)
@@ -1910,9 +1939,7 @@ def _arm(p, direct, views, t_live):
     gm.cube_q = CubeQ(p)
     gm.cube_w = cube_w
     gm.vec = VectorQ(p)
-    gm.cv_ub = Channel(
-        MemLoc.UB, (p.rows_vec, p.d), F32, depth=D_CV, kind=ChannelKind.CrossCore,
-    )
+    gm.cv_ub = RingBuffer(MemLoc.UB, F32, make_layout((p.rows_vec, p.d)), depth=D_CV)
     gm.subblock = get_subblock_id()
     gm.qr = qr
     gm.q = q
@@ -1986,24 +2013,46 @@ class IndexerPrologueQwKernel:
         gm = _arm(
             self.p,
             (x, wqb, weight_w, workspace),
-            (qr, q, descale_q, descale_qr, descale_wqb, lut, rope_sin, rope_cos, w, softmax_scale),
+            (
+                qr,
+                q,
+                descale_q,
+                descale_qr,
+                descale_wqb,
+                lut,
+                rope_sin,
+                rope_cos,
+                w,
+                softmax_scale,
+            ),
             t_live,
         )
         for work in range(gm.first_work, gm.n_work, get_block_num()):
             _one_tile(gm, work)
-        if const_expr(self.p.w_workspace and self.p.reduce_at == "tail" and PROBE != "no_reduce"):
+        if const_expr(
+            self.p.w_workspace and self.p.reduce_at == "tail" and PROBE != "no_reduce"
+        ):
             if const_expr(PROBE != "no_sync"):
                 w_barrier()
             gm.vec.reduce_all(workspace, gm.w, gm.n_bands, gm.n_bands_workspace)
-
 
 
 # Compile and launch wrapper around one Plan. Callers use indexer_prologue_qw().
 class IndexerPrologueQw:
     """Host wrapper: validates, plans tiles, launches the fused kernel."""
 
-    def __init__(self, t, dim, q_lora, n_heads, d, dr, cube_cores=None,
-                 t_dyn=False, tile_plan=None):
+    def __init__(
+        self,
+        t,
+        dim,
+        q_lora,
+        n_heads,
+        d,
+        dr,
+        cube_cores=None,
+        t_dyn=False,
+        tile_plan=None,
+    ):
         # ``tile_plan`` lets ``_plan_for`` hand over the plan it already built to read
         # the shape key off, instead of building an identical second one.
         self.p = tile_plan or Plan(t, dim, q_lora, n_heads, d, dr, cube_cores, t_dyn)
@@ -2049,9 +2098,21 @@ class IndexerPrologueQw:
         IndexerPrologueQwKernel(
             p.t, p.dim, p.q_lora, p.n_heads, p.d, p.dr, p.cube_cores, p.t_dyn
         )[grid](
-            x_gm, qr_gm, wqb_gm, ww_gm, descale_qr_gm, descale_wqb_gm,
-            rope_sin_gm, rope_cos_gm, lut_gm, q_gm, descale_q_gm, w_gm,
-            workspace_gm, t_live, softmax_scale,
+            x_gm,
+            qr_gm,
+            wqb_gm,
+            ww_gm,
+            descale_qr_gm,
+            descale_wqb_gm,
+            rope_sin_gm,
+            rope_cos_gm,
+            lut_gm,
+            q_gm,
+            descale_q_gm,
+            w_gm,
+            workspace_gm,
+            t_live,
+            softmax_scale,
         )
 
 
@@ -2072,9 +2133,30 @@ FRACTAL_NZ = 29
 # the verification shape module so that ``net/ops`` stays importable on its own;
 # ``net/verification/test/indexer_prologue_qw_shapes.py`` generates it.
 DEPLOYMENT_T = (
-    1, 4, 6, 8, 12, 16, 24, 32, 48, 72, 96, 192,
-    1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144,
+    1,
+    4,
+    6,
+    8,
+    12,
+    16,
+    24,
+    32,
+    48,
+    72,
+    96,
+    192,
+    1024,
+    2048,
+    4096,
+    8192,
+    16384,
+    32768,
+    65536,
+    131072,
+    262144,
 )
+
+
 def _export_t_values() -> tuple[int, ...]:
     raw = os.environ.get("IPQW_EXPORT_T", "")
     if not raw:
@@ -2110,10 +2192,12 @@ _PLAN_CACHE: dict[tuple, "IndexerPrologueQw"] = {}
 def plan_buckets(geo, t_max=None):
     """Enumerate compile templates for dynamic T. Each item is (plan, t_lo, t_hi).
 
-    The plan depends on the number of 128-row tiles. Tiles are walked and
-    collapsed by shape_key. The default is two buckets: split-K on [1, 3072]
-    and split-T on [3073, 262144]. After tuning flags change, trust the
-    enumeration. Each range is the envelope of T that share one key.
+    The plan depends on the number of tiles.  Below BASE_M, each 16-row
+    rounded height gets its own bucket so a short ND2NZ fill matches its
+    destination M; larger ranges are walked and collapsed by shape_key.  By
+    default this is split-K on [1, 3072] and split-T on [3073, 262144], plus
+    the small-height split-K buckets.  Each range is the envelope of T sharing
+    one key.
     """
     dim = geo.dim
     q_lora = geo.q_lora
@@ -2122,6 +2206,13 @@ def plan_buckets(geo, t_max=None):
     dr = geo.dr
     cube_cores = resolve_cube_cores(geo.cube_cores)
     t_max = t_max or T_MAX
+    out = []
+    # Short tiles need their own rounded buffer height; see Plan.base_m.
+    for upper in range(NZ_M_FRAC, BASE_M, NZ_M_FRAC):
+        if upper - NZ_M_FRAC + 1 > t_max:
+            break
+        tile_plan = Plan(upper, dim, q_lora, n_heads, d, dr, cube_cores, t_dyn=True)
+        out.append((tile_plan, upper - NZ_M_FRAC + 1, min(upper, t_max)))
     seen: dict[tuple, list] = {}
     for tiles in range(1, ceil_div(t_max, BASE_M) + 1):
         tile_plan = Plan(
@@ -2130,9 +2221,10 @@ def plan_buckets(geo, t_max=None):
         entry = seen.setdefault(tile_plan.shape_key(), [tile_plan, tiles, tiles])
         entry[1] = min(entry[1], tiles)
         entry[2] = max(entry[2], tiles)
-    out = []
     for tile_plan, lo, hi in seen.values():
-        out.append((tile_plan, (lo - 1) * BASE_M + 1, min(hi * BASE_M, t_max)))
+        t_lo = (lo - 1) * BASE_M + 1 if lo > 1 else BASE_M - NZ_M_FRAC + 1
+        if t_lo <= t_max:
+            out.append((tile_plan, t_lo, min(hi * BASE_M, t_max)))
     out.sort(key=lambda item: item[1])
     return out
 
@@ -2231,8 +2323,8 @@ def _bucket_dims(index, tile_plan, t_lo, t_hi):
     workspace_rows = (
         Dim(
             f"WS{index}",
-            min=tile_plan.n_head_blocks * tiles_lo * BASE_M + 1,
-            max=tile_plan.n_head_blocks * tiles_hi * BASE_M + MAX_CORES,
+            min=tile_plan.n_head_blocks * tiles_lo * tile_plan.base_m + 1,
+            max=tile_plan.n_head_blocks * tiles_hi * tile_plan.base_m + MAX_CORES,
         )
         if tile_plan.w_workspace
         else Dim(f"WS{index}", min=1, max=MAX_CORES)
@@ -2382,7 +2474,9 @@ def _check_nz(tensor, name):
 
 def _check_byte(tensor, name):
     if tensor.element_size() != 1:
-        raise ValueError(f"{name} must be a one-byte fp8/e8m0 dtype, got {tensor.dtype}")
+        raise ValueError(
+            f"{name} must be a one-byte fp8/e8m0 dtype, got {tensor.dtype}"
+        )
 
 
 def _check_prologue(bound):
@@ -2406,9 +2500,7 @@ def _check_prologue(bound):
         )
     d = wqb.shape[0] // n_heads
     if rope_sin.shape[0] != t:
-        raise ValueError(
-            f"RoPE tables have {rope_sin.shape[0]} rows, expected T={t}"
-        )
+        raise ValueError(f"RoPE tables have {rope_sin.shape[0]} rows, expected T={t}")
     dr = rope_sin.shape[-1]
     frozen = (FROZEN_DIM, FROZEN_Q_LORA, FROZEN_N_HEADS, FROZEN_D, FROZEN_DR)
     got = (dim, q_lora, n_heads, d, dr)
@@ -2426,7 +2518,6 @@ def _check_prologue(bound):
     bound["d"] = d
     bound["dr"] = dr
     return bound
-
 
 
 def _launch_prologue(bound):
@@ -2482,7 +2573,11 @@ def _launch_prologue(bound):
     _check_workspace(op, t, partial_rows)
 
     return _pack_and_run(
-        bound, op, geo, workspace, (qr_in, dqr_in, q_flat, dsc_flat, w_out, lut),
+        bound,
+        op,
+        geo,
+        workspace,
+        (qr_in, dqr_in, q_flat, dsc_flat, w_out, lut),
     )
 
 
@@ -2553,15 +2648,20 @@ def indexer_prologue_qw(*tensors, **options):
     ``(T, N, D/2)``; ``descale_q`` is e8m0; ``w`` is fp32.
     """
     names = (
-        "x", "qr", "wqb", "ww", "descale_qr", "descale_wqb", "rope_sin", "rope_cos",
+        "x",
+        "qr",
+        "wqb",
+        "ww",
+        "descale_qr",
+        "descale_wqb",
+        "rope_sin",
+        "rope_cos",
     )
     if len(tensors) > len(names):
         raise TypeError("indexer_prologue_qw takes the eight input tensors")
     bound = dict(zip(names, tensors))
     bound.update(options)
     return _launch_prologue(_check_prologue(bound))
-
-
 
 
 @export("indexer_prologue_qw")
@@ -2576,7 +2676,11 @@ def export_indexer_prologue_qw():
     """
     # Frozen geometry: hidden dim, q_lora, head count, head dim, RoPE length.
     geo = Geometry(
-        FROZEN_DIM, FROZEN_Q_LORA, FROZEN_N_HEADS, FROZEN_D, FROZEN_DR,
+        FROZEN_DIM,
+        FROZEN_Q_LORA,
+        FROZEN_N_HEADS,
+        FROZEN_D,
+        FROZEN_DR,
         resolve_cube_cores(),
     )
     buckets = plan_buckets(geo)
@@ -2587,8 +2691,15 @@ def export_indexer_prologue_qw():
         if tile_plan.shape_key() not in wanted:
             continue
         op = IndexerPrologueQw(
-            tile_plan.t, geo.dim, geo.q_lora, geo.n_heads, geo.d, geo.dr,
-            geo.cube_cores, t_dyn=True, tile_plan=tile_plan,
+            tile_plan.t,
+            geo.dim,
+            geo.q_lora,
+            geo.n_heads,
+            geo.d,
+            geo.dr,
+            geo.cube_cores,
+            t_dyn=True,
+            tile_plan=tile_plan,
         )
         fn = dsl_compile(
             op.run,

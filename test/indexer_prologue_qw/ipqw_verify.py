@@ -41,9 +41,7 @@ FP32_MANTISSA_MASK = 0x7FFFFF
 # OCP MXFP4 E2M1 positive codebook. Index is the 3-bit magnitude field.
 E2M1_POS = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 # Halfway between consecutive E2M1 magnitudes: where rounding flips.
-E2M1_MIDPOINTS = tuple(
-    (low + high) / 2 for low, high in zip(E2M1_POS, E2M1_POS[1:])
-)
+E2M1_MIDPOINTS = tuple((low + high) / 2 for low, high in zip(E2M1_POS, E2M1_POS[1:]))
 
 
 def ceil_div(value: int, divisor: int) -> int:
@@ -83,7 +81,9 @@ def rotate_interleave(x: torch.Tensor) -> torch.Tensor:
     return torch.stack((-pair[..., 1], pair[..., 0]), dim=-1).reshape_as(x)
 
 
-def apply_rope_inplace(q: torch.Tensor, rope_sin: torch.Tensor, rope_cos: torch.Tensor) -> torch.Tensor:
+def apply_rope_inplace(
+    q: torch.Tensor, rope_sin: torch.Tensor, rope_cos: torch.Tensor
+) -> torch.Tensor:
     """Inplace RoPE on the last Dr columns of D. q is (T, N, D)."""
     dr = int(rope_sin.shape[-1])
     if dr == 0:
@@ -108,8 +108,12 @@ def mx_matmul_fp32(
     """Dequantised fp32 matmul of the two MX operands."""
     m, k = lhs.shape
     n = rhs.shape[0]
-    scale_a = _decode_e8m0_scale(scale_lhs, m, k).repeat_interleave(MX_GROUP_SIZE, dim=1)[:, :k]
-    scale_b = _decode_e8m0_scale(scale_rhs, n, k).repeat_interleave(MX_GROUP_SIZE, dim=1)[:, :k]
+    scale_a = _decode_e8m0_scale(scale_lhs, m, k).repeat_interleave(
+        MX_GROUP_SIZE, dim=1
+    )[:, :k]
+    scale_b = _decode_e8m0_scale(scale_rhs, n, k).repeat_interleave(
+        MX_GROUP_SIZE, dim=1
+    )[:, :k]
     return (lhs.float() * scale_a) @ (rhs.float() * scale_b).T
 
 
@@ -123,9 +127,11 @@ def fp32_to_e2m1_nibble(values: torch.Tensor) -> torch.Tensor:
     tied = dist == min_dist
     arange = torch.arange(8, device=values.device, dtype=torch.int64)
     nearest = torch.where(tied, arange, torch.full_like(arange, 8)).min(dim=-1).values
-    even = torch.where(
-        tied & ((arange & 1) == 0), arange, torch.full_like(arange, 8)
-    ).min(dim=-1).values
+    even = (
+        torch.where(tied & ((arange & 1) == 0), arange, torch.full_like(arange, 8))
+        .min(dim=-1)
+        .values
+    )
     idx = torch.where(tied.sum(dim=-1) > 1, even, nearest)
     nibble = idx.to(torch.uint8)
     nibble = torch.where(sign, nibble | 0x08, nibble)
@@ -145,7 +151,9 @@ def unpack_e2m1_nibbles(packed: torch.Tensor) -> torch.Tensor:
     """Unpack (..., D/2) bytes into (..., D) nibbles."""
     low = packed & 0x0F
     high = (packed.to(torch.int16) >> 4).to(torch.uint8)
-    return torch.stack((low, high), dim=-1).reshape(*packed.shape[:-1], packed.shape[-1] * 2)
+    return torch.stack((low, high), dim=-1).reshape(
+        *packed.shape[:-1], packed.shape[-1] * 2
+    )
 
 
 def e2m1_nibble_to_fp32(nibbles: torch.Tensor) -> torch.Tensor:
@@ -179,13 +187,17 @@ def mx_quant_along_last(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     e8m0 = _fp32_scale_to_e8m0(raw_scale)
     decoded = torch.pow(2.0, e8m0.to(torch.float32) - E8M0_BIAS)
     q_fp32 = grouped / decoded.unsqueeze(-1)
-    nibbles = fp32_to_e2m1_nibble(q_fp32.reshape(t, n, n_groups * MX_GROUP_SIZE)[..., :d])
+    nibbles = fp32_to_e2m1_nibble(
+        q_fp32.reshape(t, n, n_groups * MX_GROUP_SIZE)[..., :d]
+    )
     q = pack_e2m1_nibbles(nibbles)
 
     pair_groups = paired_scale_groups(d)
     pair_elems = pair_groups * MX_SCALE_PAIR
     if n_groups < pair_elems:
-        e8m0 = torch.nn.functional.pad(e8m0, (0, pair_elems - n_groups), value=E8M0_BIAS)
+        e8m0 = torch.nn.functional.pad(
+            e8m0, (0, pair_elems - n_groups), value=E8M0_BIAS
+        )
     descale = e8m0.reshape(t, n, pair_groups, MX_SCALE_PAIR).contiguous()
     return q, descale
 
@@ -339,7 +351,7 @@ def descale_accum_ambiguous(
     if index.numel() == 0:
         return torch.zeros_like(candidates)
 
-    t, n = want.q_fp32.shape[0], want.q_fp32.shape[1]
+    _t, _n = want.q_fp32.shape[0], want.q_fp32.shape[1]
     d = want.q_fp32.shape[2]
     dr = int(inputs.rope_sin.shape[-1])
     groups_per_head = got.shape[2] * got.shape[3]
@@ -352,7 +364,7 @@ def descale_accum_ambiguous(
             continue
         span = d // groups_per_head
         lo = flat_group * span
-        group = want.q_fp32[row, head, lo:lo + span].abs()
+        group = want.q_fp32[row, head, lo : lo + span].abs()
         amax = float(group.max())
         if amax == 0.0:
             continue
@@ -360,7 +372,9 @@ def descale_accum_ambiguous(
         window = _element_uncertainty(inputs, want, (row, head, col), (d, dr))
         # scale = 2**ceil(log2(amax / 6)). The boundary between the two
         # candidate exponents is six times the smaller decoded scale.
-        lower_code = min(int(got[tuple(position)]), int(want.descale_q[tuple(position)]))
+        lower_code = min(
+            int(got[tuple(position)]), int(want.descale_q[tuple(position)])
+        )
         boundary = FP4_E2M1_MAX * 2.0 ** (lower_code - E8M0_BIAS)
         ambiguous[tuple(position)] = abs(amax - boundary) <= window
     return ambiguous
@@ -412,9 +426,13 @@ def q_mismatches(
 
     scale = torch.pow(2.0, want.descale_q.reshape(t, n, -1).float() - E8M0_BIAS)
     quotient = (
-        want.q_fp32.reshape(t, n, scale.shape[-1], MX_GROUP_SIZE)
-        / scale.unsqueeze(-1)
-    ).abs().reshape(t, n, half_d * 2)
+        (
+            want.q_fp32.reshape(t, n, scale.shape[-1], MX_GROUP_SIZE)
+            / scale.unsqueeze(-1)
+        )
+        .abs()
+        .reshape(t, n, half_d * 2)
+    )
     eps = torch.finfo(torch.float32).eps
     at_midpoint = torch.zeros_like(quotient, dtype=torch.bool)
     for midpoint in E2M1_MIDPOINTS:
@@ -425,16 +443,14 @@ def q_mismatches(
         & ((want_nibbles & 0x7) == 0)
         & (quotient < E2M1_MIDPOINTS[0])
     )
-    excused = (
-        ~nibble_differs
-        | (one_step & same_sign & at_midpoint)
-        | signed_zero
-    )
+    excused = ~nibble_differs | (one_step & same_sign & at_midpoint) | signed_zero
     # Both nibbles of a byte have to be accounted for to excuse the byte.
     return differs & ~(excused[..., 0::2] & excused[..., 1::2])
 
 
-def _make_paired_scale(outer_size: int, k: int, generator: torch.Generator) -> torch.Tensor:
+def _make_paired_scale(
+    outer_size: int, k: int, generator: torch.Generator
+) -> torch.Tensor:
     scale_k_len = paired_scale_groups(k) * MX_SCALE_PAIR
     exponents = torch.randint(
         -2,
@@ -472,16 +488,22 @@ def make_inputs(
         raise ValueError(f"D must be even for FP4 packing, got {d}")
     gen = torch.Generator(device="cpu").manual_seed(seed)
     qr = (torch.randn((t, q_lora), generator=gen) * 0.5).to(torch.float8_e4m3fn)
-    wqb = (torch.randn((n_heads * d, q_lora), generator=gen) * 0.5).to(torch.float8_e4m3fn)
+    wqb = (torch.randn((n_heads * d, q_lora), generator=gen) * 0.5).to(
+        torch.float8_e4m3fn
+    )
     x = torch.randn((t, dim), generator=gen, dtype=torch.float32).to(torch.bfloat16)
-    ww = torch.randn((n_heads, dim), generator=gen, dtype=torch.float32).to(torch.bfloat16)
+    ww = torch.randn((n_heads, dim), generator=gen, dtype=torch.float32).to(
+        torch.bfloat16
+    )
     if rope_identity:
         rope_cos = torch.ones((t, dr), dtype=torch.float32)
         rope_sin = torch.zeros((t, dr), dtype=torch.float32)
     else:
         # RoPE uses adjacent (even, odd) pairs, so both lanes in a pair share
         # one angle/frequency.
-        theta = torch.rand((t, dr // 2), generator=gen, dtype=torch.float32) * (2 * math.pi)
+        theta = torch.rand((t, dr // 2), generator=gen, dtype=torch.float32) * (
+            2 * math.pi
+        )
         theta = theta.repeat_interleave(2, dim=-1)
         rope_cos = torch.cos(theta)
         rope_sin = torch.sin(theta)
@@ -498,7 +520,9 @@ def make_inputs(
     )
 
 
-def indexer_prologue_qw_golden(inputs: IndexerPrologueQwInputs) -> IndexerPrologueQwOutputs:
+def indexer_prologue_qw_golden(
+    inputs: IndexerPrologueQwInputs,
+) -> IndexerPrologueQwOutputs:
     t = inputs.qr.shape[0]
     n_d = inputs.wqb.shape[0]
     # Infer N, D from q output contract: wqb is (N*D, q_lora), ww is (N, dim).
@@ -584,9 +608,7 @@ def cases(phase: str) -> tuple[tuple[int, int, int], ...]:
         batches, seqs = PREFILL_BATCH, PREFILL_SEQ
     else:
         raise ValueError(f"phase must be 'decode' or 'prefill', got {phase!r}")
-    return tuple(
-        sorted((b * s, b, s) for b in batches for s in seqs)
-    )
+    return tuple(sorted((b * s, b, s) for b in batches for s in seqs))
 
 
 def t_values(phase: str) -> tuple[int, ...]:
@@ -608,7 +630,14 @@ def device_inputs(inputs):
 
     result = {}
     for name in (
-        "x", "qr", "wqb", "ww", "descale_qr", "descale_wqb", "rope_sin", "rope_cos",
+        "x",
+        "qr",
+        "wqb",
+        "ww",
+        "descale_qr",
+        "descale_wqb",
+        "rope_sin",
+        "rope_cos",
     ):
         result[name] = getattr(inputs, name).npu()
     for name in ("wqb", "ww"):
@@ -631,15 +660,43 @@ def compare(got, want, inputs):
     if bad_scales.any():
         bad_scales &= ~descale_accum_ambiguous(scales, want, inputs, bad_scales)
     if bad_scales.any():
-        raise AssertionError(f"{int(bad_scales.sum())} unexplained scale bytes")
+        raw_bad = scales != want.descale_q
+        row_counts = raw_bad.reshape(raw_bad.shape[0], -1).sum(1).tolist()
+        groups = raw_bad.sum(dim=(0, 1)).tolist()
+        head_totals = raw_bad.sum(dim=(0, 2, 3))
+        pos = torch.nonzero(raw_bad)[:3].tolist()
+        vals = [(int(scales[tuple(p)]), int(want.descale_q[tuple(p)])) for p in pos]
+        diff = scales.to(torch.int16) - want.descale_q.to(torch.int16)
+        uniq, counts = torch.unique(diff, return_counts=True)
+        hist = sorted(zip(uniq.tolist(), counts.tolist()), key=lambda kv: -kv[1])[:5]
+        decoded = torch.pow(2.0, scales.reshape(*q.shape[:2], -1).float() - E8M0_BIAS)
+        quotient = want.q_fp32 / decoded.repeat_interleave(MX_GROUP_SIZE, dim=-1)
+        q_at_got = pack_e2m1_nibbles(fp32_to_e2m1_nibble(quotient))
+        flat_got = scales.flatten(start_dim=2)
+        flat_want = want.descale_q.flatten(start_dim=2)
+        probes = {
+            "swap": int((scales != want.descale_q.permute(0, 1, 3, 2)).sum()),
+            "head+1": int((scales[:, :-1] != want.descale_q[:, 1:]).sum()),
+            "head-1": int((scales[:, 1:] != want.descale_q[:, :-1]).sum()),
+            "grp+1": int((flat_got[..., :-1] != flat_want[..., 1:]).sum()),
+            "grp-1": int((flat_got[..., 1:] != flat_want[..., :-1]).sum()),
+        }
+        raise AssertionError(
+            f"IPQW-DEBUG rows={row_counts} g={groups} "
+            f"hb=[{int(head_totals.min())},{int(head_totals.max())}] "
+            f"pos={pos} vals={vals} hist={hist} "
+            f"qbad={int((q != want.q).sum())} qgot={int((q != q_at_got).sum())} "
+            f"probe={probes}"
+        )
     if raw_scales:
         # An accepted scale boundary changes all 32 codes in that group.
         # Requantize the independent CPU values at that validated scale;
         # never exempt the group's Q bytes from comparison.
         decoded = torch.pow(2.0, scales.reshape(*q.shape[:2], -1).float() - 127)
         quotient = want.q_fp32 / decoded.repeat_interleave(32, dim=-1)
-        want = replace(want, descale_q=scales,
-                       q=pack_e2m1_nibbles(fp32_to_e2m1_nibble(quotient)))
+        want = replace(
+            want, descale_q=scales, q=pack_e2m1_nibbles(fp32_to_e2m1_nibble(quotient))
+        )
     bad_q = q_mismatches(q, want)
     if bad_q.any():
         bad_q &= ~q_accum_ambiguous(q, want, inputs, bad_q)
@@ -663,14 +720,22 @@ def check_shape(t, *, chunk_rows=1024, seed=0):
         stop = min(t, start + chunk_rows)
         subset = select_rows(inputs, slice(start, stop))
         metrics = compare(
-            tuple(x[start:stop] for x in got), indexer_prologue_qw_golden(subset), subset,
+            tuple(x[start:stop] for x in got),
+            indexer_prologue_qw_golden(subset),
+            subset,
         )
         raw_q += metrics[0]
         raw_scales += metrics[1]
         max_w = max(max_w, metrics[2])
-    return dict(T=t, rows_checked=t, seed=seed, passed=True,
-                q_boundary_bytes=raw_q, scale_boundary_bytes=raw_scales,
-                w_max_abs_error=max_w)
+    return dict(
+        T=t,
+        rows_checked=t,
+        seed=seed,
+        passed=True,
+        q_boundary_bytes=raw_q,
+        scale_boundary_bytes=raw_scales,
+        w_max_abs_error=max_w,
+    )
 
 
 def benchmark(t, *, repeats=100, rounds=10):
@@ -698,9 +763,16 @@ def benchmark(t, *, repeats=100, rounds=10):
     # Keep graph outputs alive through the timed replays.
     if outputs[-1][0].shape[0] != t:
         raise AssertionError(outputs[-1][0].shape)
-    return dict(T=t, method="NPU graph event time per call", repeats=repeats,
-                rounds=rounds, min_us=min(samples), median_us=statistics.median(samples),
-                max_us=max(samples), samples_us=samples)
+    return dict(
+        T=t,
+        method="NPU graph event time per call",
+        repeats=repeats,
+        rounds=rounds,
+        min_us=min(samples),
+        median_us=statistics.median(samples),
+        max_us=max(samples),
+        samples_us=samples,
+    )
 
 
 def main():
@@ -709,10 +781,16 @@ def main():
     parser.add_argument("--chunk-rows", type=int, default=1024)
     parser.add_argument("--threads", type=int, default=8)
     parser.add_argument("--perf-only", action="store_true")
-    parser.add_argument("--output", type=Path, default=Path("indexer_prologue_qw_validation.json"))
+    parser.add_argument(
+        "--output", type=Path, default=Path("indexer_prologue_qw_validation.json")
+    )
     args = parser.parse_args()
     import torch_npu
-    from indexer_prologue_qw.indexer_prologue_qw import Geometry, plan_buckets, resolve_cube_cores
+    from indexer_prologue_qw.indexer_prologue_qw import (
+        Geometry,
+        plan_buckets,
+        resolve_cube_cores,
+    )
 
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     torch.set_num_threads(args.threads)
@@ -721,13 +799,20 @@ def main():
     templates = []
     for tile_plan, lo, hi in plan_buckets(Geometry(**GEOMETRY)):
         templates.append(dict(T_min=lo, T_max=hi, head_blocks=tile_plan.n_head_blocks))
-    report = dict(device=str(torch.npu.get_device_properties(0)),
-                  torch_version=torch.__version__, torch_npu_version=torch_npu.__version__,
-                  templates=templates,
-                  cube_cores=resolve_cube_cores(),
-                  cases=[dict(phase=phase, batch=b, seq=s, T=t)
-                         for phase in ("decode", "prefill") for t, b, s in cases(phase)],
-                  precision=[], performance=[])
+    report = dict(
+        device=str(torch.npu.get_device_properties(0)),
+        torch_version=torch.__version__,
+        torch_npu_version=torch_npu.__version__,
+        templates=templates,
+        cube_cores=resolve_cube_cores(),
+        cases=[
+            dict(phase=phase, batch=b, seq=s, T=t)
+            for phase in ("decode", "prefill")
+            for t, b, s in cases(phase)
+        ],
+        precision=[],
+        performance=[],
+    )
     args.output.parent.mkdir(parents=True, exist_ok=True)
 
     def save():
@@ -754,4 +839,5 @@ if __name__ == "__main__":
         main()
     finally:
         from device_properties import cleanup_current_device_properties
+
         cleanup_current_device_properties()
