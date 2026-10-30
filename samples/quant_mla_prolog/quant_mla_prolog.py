@@ -1041,11 +1041,20 @@ class _WkbProjection:
                             plan=load_engine,
                             l2_cache_ctl=WKB_WEIGHT_L2_CACHE_CTL,
                         )
-                        _copy(a_l0.next_write(), a_l1.next_read())
+                        _copy(
+                            _view(
+                                a_l0.next_write(),
+                                shape=(output_tile.shape[0], WKB_C2V_REDUCTION),
+                            ),
+                            a_l1.next_read(),
+                        )
                         _copy(b_l0.next_write(), b_l1.next_read(), transpose=True)
                         matmul(
                             acc_slot,
-                            a_l0.next_read(),
+                            _view(
+                                a_l0.next_read(),
+                                shape=(output_tile.shape[0], WKB_C2V_REDUCTION),
+                            ),
                             b_l0.next_read(),
                             init=k_tile == 0,
                         )
@@ -1165,7 +1174,13 @@ class _WkbProjection:
                             ),
                             plan=load_engine,
                         )
-                        _copy(a_l0.next_write(), a_l1.next_read())
+                        _copy(
+                            _view(
+                                a_l0.next_write(),
+                                shape=(output_tile.shape[0], WKB_C2V_REDUCTION),
+                            ),
+                            a_l1.next_read(),
+                        )
                         _copy(
                             b_l0.next_write(),
                             tile_slice(
@@ -1177,7 +1192,10 @@ class _WkbProjection:
                         )
                         matmul(
                             acc_slot,
-                            a_l0.next_read(),
+                            _view(
+                                a_l0.next_read(),
+                                shape=(output_tile.shape[0], WKB_C2V_REDUCTION),
+                            ),
                             b_l0.next_read(),
                             init=k_tile == 0,
                         )
@@ -1263,9 +1281,23 @@ class _WkbProjection:
                     plan=load_engine,
                     l2_cache_ctl=WKB_WEIGHT_L2_CACHE_CTL,
                 )
-                _copy(a_l0.next_write(), a_l1.next_read())
+                _copy(
+                    _view(
+                        a_l0.next_write(),
+                        shape=(output_tile.shape[0], WKB_C2V_REDUCTION),
+                    ),
+                    a_l1.next_read(),
+                )
                 _copy(b_l0.next_write(), b_l1.next_read(), transpose=True)
-                matmul(acc_slot, a_l0.next_read(), b_l0.next_read(), init=k_tile == 0)
+                matmul(
+                    acc_slot,
+                    _view(
+                        a_l0.next_read(),
+                        shape=(output_tile.shape[0], WKB_C2V_REDUCTION),
+                    ),
+                    b_l0.next_read(),
+                    init=k_tile == 0,
+                )
             c_l0.next_read()
             _copy(c_to_v.next_write(), acc, plan=split_engine)
             values = c_to_v.next_read()
