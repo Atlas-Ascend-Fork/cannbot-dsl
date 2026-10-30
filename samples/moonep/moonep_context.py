@@ -77,34 +77,23 @@ def reduce_stg_off(epn: int, w_elems: int, num_groups: int = 1, slots: int = 1) 
     return prefetch_weight_off() + slots * num_groups * 2 * epn * w_elems * 2
 
 
+def grad_slot_off(epn: int, w_elems: int, num_groups: int = 1, slots: int = 1) -> int:
+    """pull 协议梯度槽区基址（紧随权重发布区）。"""
+    return reduce_stg_off(epn, w_elems, num_groups, slots)
+
+
 def reduce_region_end(
     world_size: int,
     epn: int,
     w_elems: int,
     num_groups: int = 1,
     slots: int = 1,
-    staging_bytes_per_elem: int = 4,
+    grad_bytes_per_elem: int = 2,
 ) -> int:
-    """Symmetric heap upper bound (for capacity self-check).
-
-    staging 组间复用：与 num_groups 无关（组间串行共享同一块）。
-
-    布局顺序（A1 修订）：窗口池 | flags 区（固定宽 R×epn int32，32B 对齐）|
-    staging 段（按 dtype 收缩）| 尾。flags 必须放在 staging **之前**：若紧随
-    fp32 口径的 staging 之后，同进程先 fp32 后 bf16 调用会让 bf16 的 flags
-    落在上次 fp32 staging 的残留数据上——浮点位型当 int32 读出远大于 epoch，
-    busy_wait 提前放行、归并读到半新半旧数据。
-
-    staging_bytes_per_elem：staging 段元素宽度。缺省 4（fp32）；grad 视图为
-    bf16 时传 2——reduce_grad 的 SymBuffer 已随 dtype 收缩，容量公式同步后
-    堆申请省 R×epn×W×2 字节。所有 rank 须传同一值。
-    """
-    flags_off = reduce_stg_off(epn, w_elems, num_groups, slots)
-    stg_off = (flags_off + world_size * epn * 4 + 31) & ~31  # 32B 对齐
+    """pull 协议的堆上界（含梯度槽区）。"""
+    slot_off = grad_slot_off(epn, w_elems, num_groups, slots)
     return (
-        stg_off
-        + world_size * epn * w_elems * staging_bytes_per_elem
-        + LAYOUT_TAIL_BYTES
+        slot_off + num_groups * epn * w_elems * grad_bytes_per_elem + LAYOUT_TAIL_BYTES
     )
 
 
@@ -240,6 +229,12 @@ class MoonepContext:
         # reduce 重复调用免清单重建（清单由设备侧 kernel 从 etc 生成）；新 etc
         # （新 plan）自动重建。（内部状态，外部只读，勿改）
         self.reduce_manifest = None
+        # pull per-peer 清单缓存：(etc 身份, gm_rm, max_rcnt)——peer=block idx。
+        self.pull_manifest = None
+        # pull 直累 scratch 常驻缓存：((R, W, dtype), gm_scratch [R, W])。
+        self.pull_scratch = None
+        # 槽视图已用的 slots 值（一致性守卫——create_grad_slot_view 写入）。
+        self.pull_slots_used = None
         # plan 中间 workspace 缓存：((S,K,E,R), (dem/topk_all/rem/order))。
         # A/B kernel 对四表全量覆写，同 shape 重复调用免分配。（内部状态，勿改）
         self.plan_workspace = None

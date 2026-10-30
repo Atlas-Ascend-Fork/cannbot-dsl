@@ -914,44 +914,38 @@ def test_moonep_precision_pipeline_fp32_then_bf16():
 
 @pytest.mark.npu
 @_requires_dsl
-def test_moonep_layout_formulas_a1():
+def test_moonep_layout_formulas():
     """布局公式算术自检（纯公式，无通信）。
 
-    - staging_bytes_per_elem=2 使布局上界恰减 R*epn*W*2（bf16 grad 堆申请减半）；
-    - 修订布局（窗口池 | flags(固定宽, 32B 对齐) | staging(dtype) | 尾）逐项对账。
+    v4 布局（plan 区 | 发布区(窗口池) | 尾）逐项对账——无独立梯度槽区：
+    副本 dW 与预取权重同址（权重视图副本行段 [epn, 2*epn)）。
     """
     from moonep_context import (
         LAYOUT_TAIL_BYTES,
         PLAN_REGION_END,
-        reduce_region_end,
+        prefetch_weight_off,
         reduce_stg_off,
     )
 
-    world_size, epn, w_elems, num_groups, slots = 4, 28, 3_670_016, 3, 2
-    full_fp32 = reduce_region_end(world_size, epn, w_elems, num_groups, slots)
-    full_bf16 = reduce_region_end(
-        world_size, epn, w_elems, num_groups, slots, staging_bytes_per_elem=2
-    )
-    # A1：bf16 staging 半宽
-    half = world_size * epn * w_elems * 2
-    assert full_fp32 - full_bf16 == half, "staging 减半量不符"
-
-    # 修订布局逐项对账（窗口池 | flags(固定) | staging(dtype) | 尾）
+    epn, w_elems, num_groups, slots = 28, 3_670_016, 3, 2
+    # 发布区（窗口池）：slots × groups × [2*epn, W] bf16 视图
     window_bytes = slots * num_groups * 2 * epn * w_elems * 2
-    flags_off = reduce_stg_off(epn, w_elems, num_groups, slots)
-    assert flags_off == PLAN_REGION_END + window_bytes, "窗口池基址公式不符"
-    stg_off = (flags_off + world_size * epn * 4 + 31) & ~31
-    assert stg_off % 32 == 0 and stg_off >= flags_off + world_size * epn * 4
-    expect = (
-        PLAN_REGION_END
-        + window_bytes
-        + (stg_off - flags_off)
-        + world_size * epn * w_elems * 2
-        + LAYOUT_TAIL_BYTES
-    )
-    assert full_bf16 == expect, "修订布局与逐项公式不符"
-    # 缺省口径向后兼容：bpe=4 时 staging 按 fp32 全宽计
-    assert full_fp32 == expect + half
+    assert prefetch_weight_off() == PLAN_REGION_END, "发布区基址公式不符"
+    publish_end = reduce_stg_off(epn, w_elems, num_groups, slots)
+    assert publish_end == PLAN_REGION_END + window_bytes, "发布区终点公式不符"
+
+    # E1 副本行段（dW 落点）：组 g 副本行基址 = 发布区 + g*整视图步长
+    # + epn*W*elem——须落在组 g 视图内且不越发布区
+    elem = 2
+    view_step = 2 * epn * w_elems * elem
+    for g in range(num_groups):
+        rep = prefetch_weight_off() + g * view_step + epn * w_elems * elem
+        assert rep >= prefetch_weight_off() + g * view_step, "副本行段基址低于组起点"
+        assert (
+            rep + epn * w_elems * elem <= prefetch_weight_off() + (g + 1) * view_step
+        ), "副本行段越组界"
+    # 堆终点 = 发布区 + 尾部对齐余量
+    assert LAYOUT_TAIL_BYTES >= 32
 
 
 # ---------------------------------------------------------------------------

@@ -134,7 +134,7 @@ reduce_grad(context, experts_to_copy, grad_view, epn)
 | `experts_to_copy` | `[R, epn]` | `torch.int32` | `moonep_plan` 的预取/归并清单；每行至多一个远程 home rank |
 | `real_weights` | `[epn, H*H']` | `torch.bfloat16` | 真实本地专家权重（普通张量，home 直推的数据源；多组用 list） |
 | `local_weights` | `[2*epn, H*H']` | `torch.bfloat16` | 对称区权重视图（`create_weight_view` 创建）：前 `epn` 行本地专家（调用前就位），后 `epn` 行预取槽（本函数填充） |
-| `grad_view` | `[2*epn, H*H']` | `torch.float32` | 梯度视图：前 `epn` 行真实专家，后 `epn` 行副本槽 |
+| `grad_view` | `[epn, H*H']` | `torch.bfloat16` / `torch.float32` | 本地 home 梯度（FFN 反向预写种子；归并后为全量）。副本 dW 由 FFN 反向直写 `local_weights` 视图的副本行段 `[epn, 2*epn)`，本函数 owner 远端读对端副本行归并 |
 | `epn` | 标量 | int | 每 rank 本地专家数（行宽由张量 shape 自取） |
 
 两接口均原地生效、无返回值（`async_finish=False` 缺省形态）；gate / up / down 三个
@@ -143,13 +143,16 @@ projection 各调一次（或传 list 共享清单）。每次调用末尾含一
 prefetch 的 peer 按 round-robin 分给 `min(R-1, resident_blocks())` 个 block
 （块数受本机 AIV 数约束），每个 peer 的 put/flush 只由一个 block 发起；清单在
 kernel 内用 64-lane 向量比较生成（UB 内，不落 GM），末尾完成 barrier 独立 launch。
-reduce 发送侧按一卡一源选择唯一 home block；接收侧保留同一 home 行的多 sender 归并。
+reduce 为 pull 协议：owner 用 64-lane 向量扫描清单（kernel 内，不落 GM）
+远端读各 peer 的副本 dW，kernel 内原子加归并进 home 行（任意 sender 数正确）。
+时序约束：FFN 反向写副本 dW 须晚于本层对权重最后一次读；reduce 须先于下一层
+prefetch（单槽串行；`--slots 2` 双槽两层流水安全）。
 **侧流并发（`async_finish=True`）**：两接口均可传 `async_finish=True`——跳过末尾屏障
 及其 host 同步（reduce 的组间 barrier 同时改为只发射 kernel），**返回发起流
 上的 NPU 事件**；调用方 `wait_event` 汇合，跨 rank 的槽位/staging 复用安全由
 调用方在合适位置（如下一轮迭代的 barrier）负责，plan 延迟溢出检查顺延到下一
 个我方算子尾部。适配侧流重叠调度（prefetch∥共享专家计算、reduce∥下层反向）。
-`reduce_grad` 语义：`grad_view[e_local] += Σ 副本梯度`，随后副本槽清零。
+`reduce_grad` 语义：`grad_view[e_local] += Σ 副本 dW`（原子加，含 host 侧零同步——清单在 kernel 内生成）。
 对称堆容量在 `create_moonep_context` 与 `create_weight_view` 处前置校验，
 不足即报所需/现有容量。对称窗权重视图进 grouped_matmul 前先
 `materialize_weights(view)` 落地普通显存（GMM host 路径限制）。
