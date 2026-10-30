@@ -1,0 +1,58 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1032" height="348" viewBox="0 0 1032 348" role="img" aria-labelledby="mx-flow-title mx-flow-desc" font-family="FZLanTingHei-R-GBK, 方正兰亭黑_GBK, sans-serif">
+  <title id="mx-flow-title">MX矩阵基础计算流程图</title>
+  <desc id="mx-flow-desc">A、ScaleA、B、ScaleB、Bias与随路量化数据从GM经L1进入各自Buffer；MX矩阵乘加输出L0C，经结果搬运回到GM。MX系数加载由数据搬运的mx_scale选项表达，所有图形和文本均可编辑。</desc>
+  <defs>
+    <marker id="mx-flow-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse"><path d="M0 0L7 3L0 6Z" fill="#171717"/></marker>
+    <marker id="mx-flow-blue-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse"><path d="M0 0L7 3L0 6Z" fill="#5277ff"/></marker>
+    <g id="mx-flow-l1"><rect width="80" height="28" fill="#e9edff" stroke="#5277ff" stroke-width="0.8"/><text x="40" y="18" fill="#101843" font-size="12" text-anchor="middle">L1 Buffer</text></g>
+  </defs>
+  <rect width="1032" height="348" fill="#fff"/>
+  <g fill="#fff" stroke="#111843" stroke-width="0.7">
+    <rect x="141" y="2" width="793" height="314" rx="8"/><rect x="131" y="15" width="793" height="314" rx="8"/><rect x="86" y="29" width="813" height="313" rx="8"/>
+  </g>
+  <rect x="94" y="37" width="800" height="297" fill="#eef0f3"/>
+  <g fill="#bfd2fe"><rect x="1" y="1" width="80" height="346"/><rect x="951" y="1" width="81" height="346"/></g>
+  <g fill="#5277ff"><rect x="10" y="15" width="63" height="312"/><rect x="960" y="15" width="63" height="312"/></g>
+  <g font-family="FZLanTingHei-R-GBK, 方正兰亭黑_GBK, sans-serif" font-size="12" text-anchor="middle">
+    <text x="41" y="178" fill="#fff">GM</text><text x="991" y="178" fill="#fff">GM</text>
+    <use href="#mx-flow-l1" x="182" y="46"/><use href="#mx-flow-l1" x="182" y="89"/><use href="#mx-flow-l1" x="182" y="127"/>
+    <use href="#mx-flow-l1" x="182" y="165"/><use href="#mx-flow-l1" x="182" y="218"/><use href="#mx-flow-l1" x="182" y="265"/>
+    <g fill="#e9edff" stroke="#5277ff" stroke-width="0.8">
+      <rect x="418" y="46" width="111" height="38"/><rect x="418" y="90" width="111" height="25" stroke-dasharray="3 4"/>
+      <rect x="418" y="127" width="111" height="38"/><rect x="418" y="176" width="111" height="26" stroke-dasharray="3 4"/>
+      <rect x="418" y="218" width="111" height="26"/><rect x="418" y="269" width="111" height="27"/>
+      <rect x="682" y="136" width="100" height="74"/>
+    </g>
+    <g fill="#101843">
+      <text x="474" y="70">L0A Buffer</text><text x="474" y="107">L0A_MX Buffer</text>
+      <text x="474" y="151">L0B Buffer</text><text x="474" y="194">L0B_MX Buffer</text>
+      <text x="474" y="236">BT Buffer</text><text x="474" y="287">FP Buffer</text><text x="732" y="178">L0C Buffer</text>
+    </g>
+    <g fill="none" stroke="#17b7a6" stroke-width="0.7"><ellipse cx="619" cy="173" rx="32" ry="35"/><ellipse cx="852" cy="173" rx="29" ry="22"/></g>
+    <g fill="#101843" font-size="10">
+      <text x="619" y="167">matmul</text><text x="619" y="183" font-size="9">mx_mode=True</text><text x="852" y="177">mem_copy</text>
+    </g>
+    <g fill="#101843" font-size="10" text-anchor="start">
+      <text x="89" y="52">mem_copy</text><text x="89" y="96">mem_copy</text><text x="89" y="135">mem_copy</text>
+      <text x="89" y="173">mem_copy</text><text x="89" y="226">mem_copy</text><text x="89" y="273">mem_copy</text>
+      <text x="303" y="53">mem_copy</text><text x="276" y="96">mem_copy + mx_scale</text>
+      <text x="303" y="135">mem_copy</text><text x="276" y="173">mem_copy + mx_scale</text>
+      <text x="303" y="226">mem_copy</text><text x="270" y="274">convert(..., scale=...)</text>
+      <text x="89" y="317">根据场景选择相应接口</text>
+    </g>
+  </g>
+  <g fill="none" stroke-width="0.8">
+    <g stroke="#5277ff" marker-end="url(#mx-flow-blue-arrow)">
+      <path d="M81 60H181"/><path d="M81 103H181"/><path d="M81 141H181"/>
+      <path d="M81 179H181"/><path d="M81 232H181"/><path d="M81 279H181"/>
+    </g>
+    <g stroke="#171717" marker-end="url(#mx-flow-arrow)">
+      <path d="M262 60H417"/><path d="M262 103H417"/><path d="M262 141H417"/>
+      <path d="M262 179H417"/><path d="M262 232H417"/><path d="M262 282H417"/>
+      <path d="M529 65L587 166"/><path d="M529 103L588 169"/><path d="M529 146L587 172"/>
+      <path d="M529 189L587 176"/><path d="M529 232L588 179"/>
+      <path d="M651 173H681"/><path d="M782 173H822"/><path d="M881 173H951"/>
+      <path d="M529 282H852V195"/>
+    </g>
+  </g>
+</svg>

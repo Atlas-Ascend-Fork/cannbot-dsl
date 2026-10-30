@@ -1,0 +1,67 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="528" viewBox="0 0 1120 528" role="img" aria-labelledby="mx-b-title mx-b-desc">
+  <title id="mx-b-title">scaleB矩阵在不同位置上的排布格式</title>
+  <desc id="mx-b-desc">左侧给出scaleB不转置和转置时的GM配对存储，分别通过ND2NZ.b16和DN2NZ.b16转换为右侧的Nn分形。分形为2×16，两个量化系数占2 Byte。全部标签、网格、箭头与背景带均可编辑。</desc>
+  <defs>
+    <marker id="mx-b-arrow" markerWidth="5" markerHeight="5" refX="4.5" refY="2.5" orient="auto" markerUnits="userSpaceOnUse"><path d="M0 0L5 2.5L0 5Z" fill="#222"/></marker>
+    <marker id="mx-b-small" markerWidth="4" markerHeight="4" refX="3.5" refY="2" orient="auto" markerUnits="userSpaceOnUse"><path d="M0 0L4 2L0 4Z" fill="#333"/></marker>
+    <g id="mx-b-row" fill="none" stroke="#333" stroke-width="0.8" marker-end="url(#mx-b-small)"><path d="M5 0H25"/><path d="M32 0H52"/><path d="M59 0H79"/><path d="M121 0H141"/></g>
+    <g id="mx-b-column" fill="none"><path d="M10 14L4 130" stroke="#f2b8b8" stroke-width="8" opacity="0.8"/><path d="M0 14H19L0 130H19" stroke="#333" stroke-width="0.8" marker-mid="url(#mx-b-small)" marker-end="url(#mx-b-small)"/></g>
+    <g id="mx-b-n" fill="none" stroke="#222" stroke-width="0.8"><path d="M4 3V35L38 3V35" marker-mid="url(#mx-b-small)" marker-end="url(#mx-b-small)"/></g>
+    <g id="mx-b-mini" fill="none" stroke="#222" stroke-width="0.65">
+      <path d="M2 3V16L37 3V16L2 21V34L37 21V34L2 39V52L37 39V52L2 57V70L37 57V70L2 75V88L37 75V88L2 93V106L37 93V106L2 111V124L37 111V124L2 129V142L37 129V142" marker-mid="url(#mx-b-small)" marker-end="url(#mx-b-small)"/>
+    </g>
+  </defs>
+  <rect width="1120" height="528" fill="#fff"/>
+  <g font-family="FZLanTingHei-R-GBK, 方正兰亭黑_GBK, sans-serif" font-size="13" fill="#071429">
+    <g stroke="#777" stroke-width="0.8" fill="#fff"><rect x="209.5" y="48.5" width="294" height="52" rx="11"/><rect x="532.5" y="48.5" width="542" height="52" rx="11"/></g>
+    <g fill="#409fe2"><rect x="212" y="51" width="289" height="47" rx="9"/><rect x="535" y="51" width="537" height="47" rx="9"/></g>
+    <g fill="#1b1b1b"><rect x="348" y="55" width="75" height="38" rx="7"/><rect x="819" y="55" width="139" height="38" rx="7"/></g>
+    <g fill="#fff" text-anchor="middle" font-size="15"><text x="322" y="81">GM</text><text x="386" y="81">ND</text><text x="705" y="81">GM/L1/UB</text><text x="888" y="81">Nn</text></g>
+    <path d="M517 51V493" fill="none" stroke="#222" stroke-width="0.8" stroke-dasharray="6 4"/>
+    <g fill="#ededed"><rect x="48" y="204" width="188" height="38" rx="7"/><rect x="49" y="394" width="193" height="38" rx="7"/><rect x="783" y="261" width="87" height="39" rx="7"/></g>
+    <text x="56" y="229" font-size="15">scaleB不转置: [K/64,N,2]</text><text x="57" y="419" font-size="15">scaleB转置: [N,K/64,2]</text>
+    <text x="827" y="285" text-anchor="middle" font-size="15">等效成</text>
+    <g transform="translate(283 149)">
+      <rect width="151" height="144" rx="2" fill="#fff" stroke="#222" stroke-width="0.8"/>
+      <path d="M30 0V144M60 0V144M90 0V144M129 0V144" fill="none" stroke="#444" stroke-width="0.6"/>
+      <use href="#mx-b-column" x="6"/><use href="#mx-b-column" x="36"/><use href="#mx-b-column" x="66"/><use href="#mx-b-column" x="134"/>
+      <text x="105" y="72" text-anchor="middle">...</text>
+    </g>
+    <g transform="translate(287 341)">
+      <rect width="147" height="144" rx="2" fill="#fff" stroke="#222" stroke-width="0.8"/>
+      <path d="M5 13H142L5 34H142L5 55H142M5 94H142L5 115H142L5 136H142" fill="none" stroke="#f2b8b8" stroke-width="8" opacity="0.65"/>
+      <use href="#mx-b-row" y="13"/><use href="#mx-b-row" y="34"/><use href="#mx-b-row" y="55"/><use href="#mx-b-row" y="94"/><use href="#mx-b-row" y="115"/><use href="#mx-b-row" y="136"/>
+      <text x="74" y="77" text-anchor="middle">⋮</text><text x="104" y="16">...</text><text x="104" y="37">...</text><text x="104" y="58">...</text>
+    </g>
+    <g stroke="#222" stroke-width="0.8" fill="none">
+      <path d="M283 126V134M433 126V134M283 130H433M283 140V148M313 140V148M343 140V148M373 140V148M414 140V148M433 140V148M283 144H373M414 144H433"/>
+      <path d="M287 315V323M434 315V323M287 319H434M287 332V340M314 332V340M341 332V340M369 332V340M413 332V340M434 332V340M287 336H369M413 336H434"/>
+      <path d="M441 205L505 242" marker-end="url(#mx-b-arrow)"/>
+      <path d="M441 381L506 332" marker-end="url(#mx-b-arrow)"/>
+    </g>
+    <g text-anchor="middle"><text x="359" y="125">K/32</text><text x="299" y="141">2</text><text x="329" y="141">2</text><text x="359" y="141">2</text><text x="424" y="141">2</text><text x="256" y="228">N</text>
+      <text x="361" y="314">K/32</text><text x="301" y="333">2</text><text x="328" y="333">2</text><text x="355" y="333">2</text><text x="424" y="333">2</text><text x="256" y="427">N</text></g>
+    <text transform="translate(444 200) rotate(31)" font-weight="600">ND2NZ.b16</text><text transform="translate(451 375) rotate(-31)" font-weight="600">DN2NZ.b16</text>
+    <rect x="563" y="208" width="207" height="206" fill="none" stroke="#4d4d4d" stroke-width="2" stroke-dasharray="5 5"/>
+    <g transform="translate(592 243)">
+      <rect width="150" height="144" rx="2" fill="#fff" stroke="#222" stroke-width="0.8"/>
+      <path d="M1 40H149M1 74H149M1 108H149" fill="none" stroke="#333" stroke-width="0.7"/>
+      <use href="#mx-b-n"/><use href="#mx-b-n" x="105"/><use href="#mx-b-n" y="108"/><use href="#mx-b-n" x="105" y="108"/>
+      <text x="75" y="23" text-anchor="middle">...</text><text x="40" y="56" text-anchor="middle">...</text><text x="125" y="56" text-anchor="middle">...</text>
+      <text x="40" y="90" text-anchor="middle">...</text><text x="125" y="90" text-anchor="middle">...</text>
+    </g>
+    <path d="M594 245H610V281H594Z" fill="none" stroke="#f02222" stroke-dasharray="5 5"/>
+    <g fill="none" stroke="#222" stroke-width="0.8"><path d="M593 230V241M610 230V241M593 235H610M581 244H590M581 282H590M585 244V282"/>
+      <path d="M804 309H825V301L847 317L825 333V325H804Z" fill="#fff"/>
+    </g>
+    <g text-anchor="middle"><text x="666" y="228">K/32</text><text x="609" y="228">2 Byte</text><text x="570" y="269">16</text><text x="568" y="320">N</text></g>
+    <g transform="translate(906 243)">
+      <rect width="168" height="145" rx="2" fill="#fff" stroke="#222" stroke-width="0.8"/>
+      <path d="M20 6L14 138M60 6L54 138M100 6L94 138M140 6L134 138" stroke="#f2b8b8" stroke-width="8" opacity="0.6" fill="none"/>
+      <path d="M40 1V144M80 1V144M120 1V144M160 1V144" fill="none" stroke="#333" stroke-width="0.6"/>
+      <use href="#mx-b-mini"/><use href="#mx-b-mini" x="40"/><use href="#mx-b-mini" x="80"/><use href="#mx-b-mini" x="120"/>
+    </g>
+    <g stroke="#222" fill="none" stroke-width="0.8"><path d="M923 209V217M962 209V217M923 213H962M893 244H902M893 260H902M897 244V260"/></g>
+    <g text-anchor="middle"><text x="988" y="231">N</text><text x="943" y="208">16</text><text x="888" y="257" text-anchor="end">2 Byte</text><text x="890" y="320">K/32</text></g>
+  </g>
+</svg>

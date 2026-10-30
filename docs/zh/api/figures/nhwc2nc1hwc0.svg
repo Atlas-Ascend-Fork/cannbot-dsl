@@ -1,51 +1,62 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="843" height="356" viewBox="0 0 843 356" role="img" aria-labelledby="nhwc2nc1hwc0-title nhwc2nc1hwc0-desc">
-  <title id="nhwc2nc1hwc0-title">nhwc2nc1hwc0示意图</title>
-  <desc id="nhwc2nc1hwc0-desc">Editable vector diagram reconstructed from the preserved nhwc2nc1hwc0.png; text uses FZLanTingHei-R-GBK.</desc>
-  <defs>
-    <marker id="nhwc2nc1hwc0-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
-      <path d="M0 0L7 3L0 6Z" fill="#696d75" />
-    </marker>
-    <marker id="nhwc2nc1hwc0-ink-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
-      <path d="M0 0L7 3L0 6Z" fill="#101843" />
-    </marker>
-    <marker id="nhwc2nc1hwc0-blue-arrow" markerWidth="7" markerHeight="6" refX="6.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
-      <path d="M0 0L7 3L0 6Z" fill="#5277ff" />
-    </marker>
-  </defs>
-  <rect x="0" y="0" width="843" height="356" fill="#fff" stroke="none" stroke-width="1" rx="0" />
-  <g>
-    <rect x="41" y="234" width="134" height="90" fill="none" stroke="#171717" stroke-width="2" rx="0" />
-    <path d="M41 234 l188 -183 h134 v90 l-188 183 M175 234 l188 -183 M229 141 l-188 183" stroke="#171717" stroke-width="2" fill="none" />
-    <line x1="41" y1="337" x2="175" y2="337" stroke="#696d75" stroke-width="1.2" />
-    <line x1="41" y1="333" x2="41" y2="341" stroke="#696d75" stroke-width="1.2" />
-    <line x1="175" y1="333" x2="175" y2="341" stroke="#696d75" stroke-width="1.2" />
-    <rect x="95.664" y="327" width="24.672" height="20" fill="#fff" stroke="none" stroke-width="1" rx="0" />
-    <rect x="521" y="234" width="134" height="90" fill="none" stroke="#171717" stroke-width="2" rx="0" />
-    <path d="M521 234 l46 -45 h134 v90 l-46 45 M655 234 l46 -45 M567 279 l-46 45" stroke="#171717" stroke-width="2" fill="none" />
-    <rect x="568" y="187" width="134" height="90" fill="none" stroke="#171717" stroke-width="2" rx="0" />
-    <path d="M568 187 l46 -45 h134 v90 l-46 45 M702 187 l46 -45 M614 232 l-46 45" stroke="#171717" stroke-width="2" fill="none" />
-    <rect x="615" y="142" width="134" height="90" fill="none" stroke="#171717" stroke-width="2" rx="0" />
-    <path d="M615 142 l46 -45 h134 v90 l-46 45 M749 142 l46 -45 M661 187 l-46 45" stroke="#171717" stroke-width="2" fill="none" />
-    <rect x="663" y="96" width="134" height="90" fill="none" stroke="#171717" stroke-width="2" rx="0" />
-    <path d="M663 96 l46 -45 h134 v90 l-46 45 M797 96 l46 -45 M709 141 l-46 45" stroke="#171717" stroke-width="2" fill="none" />
-    <line x1="521" y1="337" x2="655" y2="337" stroke="#696d75" stroke-width="1.2" />
-    <line x1="521" y1="333" x2="521" y2="341" stroke="#696d75" stroke-width="1.2" />
-    <line x1="655" y1="333" x2="655" y2="341" stroke="#696d75" stroke-width="1.2" />
-    <rect x="575.664" y="327" width="24.672" height="20" fill="#fff" stroke="none" stroke-width="1" rx="0" />
-    <path d="M398 178H469V164L491 187L469 212V197H398Z" stroke="#101843" stroke-width="1" fill="none" />
+<svg xmlns="http://www.w3.org/2000/svg" width="843" height="356" viewBox="0 0 843 356" role="img" aria-labelledby="nhwc2nc1hwc0-title nhwc2nc1hwc0-desc" font-family="FZLanTingHei-R-GBK, 方正兰亭黑_GBK, sans-serif" font-size="14">
+  <title id="nhwc2nc1hwc0-title">NHWC到NC1HWC0的C维度切分</title>
+  <desc id="nhwc2nc1hwc0-desc">图示单个N批次。NHWC沿C方向切分为C1个通道组，每组宽度为C0，H与W保持不变。四个示意通道组由远到近绘制，白色前表面遮挡隐藏棱线。文字、尺寸线、轮廓和转换箭头均可编辑。</desc>
+  <rect width="843" height="356" fill="#fff"/>
+
+  <g id="nhwc-source" stroke="#202020" stroke-width="1.8" stroke-linejoin="miter">
+    <rect x="228" y="50" width="134" height="92" fill="none"/>
+    <path d="M41 233L228 50M175 233L362 50M175 325L362 142M41 325L228 142" fill="none"/>
+    <rect id="nhwc-front-face" x="41" y="233" width="134" height="92" fill="#fff"/>
   </g>
-  <g fill="#171717" font-family="FZLanTingHei-R-GBK, 方正兰亭黑_GBK, sans-serif" font-size="12" font-weight="400">
-    <text x="202" y="21" font-size="14.00" text-anchor="middle" fill="#171717">NHWC</text>
-    <text x="108" y="341" font-size="14.00" text-anchor="middle" fill="#171717">W</text>
-    <text x="20" y="285" font-size="14.00" text-anchor="middle" fill="#171717">H</text>
-    <text x="130" y="136" font-size="14.00" text-anchor="middle" fill="#171717" transform="rotate(-45 130 136)">C</text>
-    <text x="713" y="21" font-size="14.00" text-anchor="middle" fill="#171717">NC1HWC0</text>
-    <text x="588" y="341" font-size="14.00" text-anchor="middle" fill="#171717">W</text>
-    <text x="501" y="285" font-size="14.00" text-anchor="middle" fill="#171717">H</text>
-    <text x="545" y="208" font-size="14.00" text-anchor="middle" fill="#171717" transform="rotate(-45 545 208)">C0</text>
-    <text x="591" y="161" font-size="14.00" text-anchor="middle" fill="#171717" transform="rotate(-45 591 161)">C0</text>
-    <text x="685" y="69" font-size="14.00" text-anchor="middle" fill="#171717" transform="rotate(-45 685 69)">C0</text>
-    <text x="586" y="118" font-size="14.00" text-anchor="middle" fill="#171717" transform="rotate(-45 586 118)">C1</text>
-    <text x="445" y="154" font-size="14.00" text-anchor="middle" fill="#171717">C维度切分</text>
+
+  <g id="nc1hwc0-target" stroke="#202020" stroke-width="1.8" stroke-linejoin="miter">
+    <rect x="708" y="51" width="134" height="91" fill="none"/>
+    <g id="nc1hwc0-channel-3">
+      <path d="M662 96L708 51M796 96L842 51M796 187L842 142M662 187L708 142" fill="none"/>
+      <rect x="662" y="96" width="134" height="91" fill="#fff"/>
+    </g>
+    <g id="nc1hwc0-channel-2">
+      <path d="M615 142L662 96M749 142L796 96M749 233L796 187M615 233L662 187" fill="none"/>
+      <rect x="615" y="142" width="134" height="91" fill="#fff"/>
+    </g>
+    <g id="nc1hwc0-channel-1">
+      <path d="M568 188L615 142M702 188L749 142M702 279L749 233M568 279L615 233" fill="none"/>
+      <rect x="568" y="188" width="134" height="91" fill="#fff"/>
+    </g>
+    <g id="nc1hwc0-channel-0">
+      <path d="M521 234L568 188M655 234L702 188M655 325L702 279M521 325L568 279" fill="none"/>
+      <rect id="nc1hwc0-front-face" x="521" y="234" width="134" height="91" fill="#fff"/>
+    </g>
+  </g>
+
+  <g id="nhwc-dimensions" fill="none" stroke="#444" stroke-width="1.6">
+    <path d="M16 234H26M21 234V266M21 294V325M16 325H26"/>
+    <path d="M41 332V342M41 337H90M126 337H175M175 332V342"/>
+    <path d="M31 221L40 230M35.5 225.5L120 141M138 123L219 42M214.5 37.5L223.5 46.5"/>
+  </g>
+
+  <g id="nc1hwc0-dimensions" fill="none" stroke="#444" stroke-width="1.6">
+    <path d="M496 234H506M501 234V266M501 294V325M496 325H506"/>
+    <path d="M521 332V342M521 337H570M606 337H655M655 332V342"/>
+    <path d="M509.5 220.5L518.5 229.5M556.5 174.5L565.5 183.5M603.5 128.5L612.5 137.5M650.5 82.5L659.5 91.5M697.5 37.5L706.5 46.5"/>
+    <path d="M514 225L528 211M546 193L561 179M561 179L575 165M593 147L608 133M608 133L620 121M643 99L655 87M655 87L669 73M687 55L702 42"/>
+  </g>
+
+  <path id="nhwc-channel-split-arrow" d="M397.5 178.5H469.5V164L491.5 188.5L469.5 212.5V198.5H397.5Z" fill="#fff" stroke="#101843" stroke-width="0.8"/>
+
+  <g id="nhwc-labels" fill="#071429" text-anchor="middle" font-weight="400">
+    <text x="202" y="19">NHWC</text>
+    <text x="682" y="19">NC1HWC0</text>
+    <text x="108" y="342">W</text>
+    <text x="21" y="284">H</text>
+    <text x="130" y="137" transform="rotate(-45 130 137)">C</text>
+    <text x="588" y="342">W</text>
+    <text x="501" y="284">H</text>
+    <text x="539" y="205" transform="rotate(-45 539 205)">C0</text>
+    <text x="586" y="159" transform="rotate(-45 586 159)">C0</text>
+    <text x="634" y="113" transform="rotate(-45 634 113)">...</text>
+    <text x="680" y="67" transform="rotate(-45 680 67)">C0</text>
+    <text x="586" y="118" transform="rotate(-45 586 118)">C1</text>
+    <text x="445" y="155" font-size="13">C维度切分</text>
   </g>
 </svg>

@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="842" height="357" viewBox="0 0 842 357" role="img" aria-labelledby="mx-demo-title mx-demo-desc">
+  <title id="mx-demo-title">MX矩阵乘示意图</title>
+  <desc id="mx-demo-desc">scaleA与A、scaleB与B分别广播相乘后做矩阵乘法，再加上广播的Bias得到C。下方展示K方向每32个元素共享量化系数。所有标签、矩阵和箭头均为可编辑矢量元素。</desc>
+  <rect width="842" height="357" fill="#fff"/>
+  <g stroke="#161616" stroke-width="1" fill="#5bd37c">
+    <rect x="33.5" y="54.5" width="49" height="85" rx="3"/>
+    <rect x="132.5" y="54.5" width="99" height="86" rx="4" fill="#1fc347"/>
+    <rect x="315.5" y="71.5" width="89" height="50" rx="3"/>
+    <rect x="455.5" y="46.5" width="89" height="102" rx="3" fill="#1fc347"/>
+    <rect x="603.5" y="53.5" width="89" height="85" rx="2" fill="#fff"/>
+    <path d="M604 54H692V117H604Z" fill="#94dca9" stroke="none"/>
+    <path d="M604 74.5H692M604 95.5H692M604 116.5H692"/>
+    <rect x="747.5" y="54.5" width="89" height="85" rx="3" fill="#1fc347"/>
+    <rect x="7.5" y="175.5" width="416" height="162" rx="2" fill="#fff"/>
+    <rect x="29.5" y="242.5" width="99" height="84" rx="3"/>
+    <rect x="315.5" y="226.5" width="89" height="101" rx="3"/>
+  </g>
+  <g fill="none" stroke="#161616" stroke-width="2">
+    <path d="M30 20H10V156H30M220 20H240V156H220M298 20H278V156H298M533 20H553V156H533"/>
+    <circle cx="99" cy="97" r="13" stroke-width="1"/><path d="M91 89L107 105M107 89L91 105" stroke-width="8"/>
+    <circle cx="424" cy="97" r="13" stroke-width="1"/><path d="M416 89L432 105M432 89L416 105" stroke-width="8"/>
+    <path d="M252 90L266 104M266 90L252 104" stroke-width="7"/>
+    <path d="M560 97H584M572 85V109M703 92H724M703 101H724" stroke-width="6"/>
+    <path d="M29 229V237M62 229V237M29 233H62M307 227V259M303 227H311M303 259H311" stroke-width="1"/>
+  </g>
+  <path d="M50 161H66V181H75L58 202L41 181H50ZM350 161H366V181H375L358 202L341 181H350Z" fill="#202020"/>
+  <g fill="#081728" font-family="FZLanTingHei-R-GBK, 方正兰亭黑_GBK, sans-serif" font-size="12" text-anchor="middle">
+    <text x="56" y="47">K/32</text><text x="23" y="102">M</text><text x="122" y="102">M</text><text x="180" y="47">K</text>
+    <text x="360" y="49">N</text><text x="299" y="104">K/32</text><text x="449" y="103">K</text><text x="499" y="37">N</text>
+    <text x="649" y="47">N</text><text x="594" y="102">M</text><text x="738" y="103">M</text><text x="791" y="47">N</text>
+    <text x="649" y="69">bias</text><text x="649" y="90">bias</text><text x="649" y="111">bias</text><text x="649" y="130">...</text>
+    <text x="220" y="199" font-size="14">K方向共享量化因子，等效图</text>
+    <text x="46" y="225">32个</text><text x="78" y="236">K</text><text x="19" y="290">M</text>
+    <text x="359" y="222">N</text><text x="298" y="286">K</text><text x="286" y="244">32个</text><text x="286" y="261">4</text>
+  </g>
+  <g fill="#fff" font-family="FZLanTingHei-R-GBK, 方正兰亭黑_GBK, sans-serif" font-size="12" text-anchor="middle">
+    <text x="58" y="73">0 1 2 ...</text><text x="58" y="102">scaleA</text><text x="181" y="102">A</text>
+    <text x="327" y="85">4</text><text x="327" y="96">5</text><text x="327" y="107">6</text><text x="327" y="118">...</text>
+    <text x="359" y="102">scaleB</text><text x="499" y="102">B</text><text x="791" y="102">C</text>
+    <text x="78" y="254">000</text><text x="78" y="272">...111...222...</text><text x="78" y="289">scaleA</text>
+    <text x="326" y="237">4</text><text x="326" y="250">4</text><text x="326" y="263">4</text><text x="326" y="276">...</text>
+    <text x="326" y="289">5</text><text x="326" y="302">5</text><text x="326" y="315">5</text><text x="326" y="325">...</text>
+    <text x="359" y="280">scaleB</text>
+  </g>
+</svg>

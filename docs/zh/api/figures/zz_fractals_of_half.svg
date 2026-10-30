@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="522" height="507" viewBox="0 0 522 507" role="img" aria-labelledby="zz-half-title zz-half-desc" font-family="FZLanTingHei-R-GBK, 方正兰亭黑_GBK, sans-serif">
+  <title id="zz-half-title">Zz格式示意图，以float16矩阵为例</title>
+  <desc id="zz-half-desc">32×32矩阵划分为四个16×16分形。分形内部按行主序读取，分形之间也按行主序读取。箭头依次经过左上、右上、左下、右下分形，坐标和尺寸标注均为可编辑文字。</desc>
+  <defs>
+    <marker id="zz-half-arrow" markerWidth="6" markerHeight="6" refX="5.5" refY="3" orient="auto" markerUnits="userSpaceOnUse"><path d="M0 0L6 3L0 6Z" fill="#252525"/></marker>
+  </defs>
+  <rect width="522" height="507" fill="#fff"/>
+  <g id="zz-half-axes" fill="none" stroke="#252525" stroke-width="0.8" marker-end="url(#zz-half-arrow)">
+    <path d="M84 29H465"/>
+    <path d="M62 47V400"/>
+  </g>
+  <g id="zz-half-intra-fractal" fill="none" stroke="#252525" stroke-width="0.8" marker-end="url(#zz-half-arrow)">
+    <path d="M84 45H217"/><path d="M217 45L88 178"/><path d="M88 178H217"/>
+    <path d="M282 45H415"/><path d="M415 45L286 178"/><path d="M286 178H415"/>
+    <path d="M84 241H217"/><path d="M217 241L88 374"/><path d="M88 374H217"/>
+    <path d="M282 241H415"/><path d="M415 241L286 374"/><path d="M286 374H415"/>
+  </g>
+  <g id="zz-half-inter-fractal" fill="none" stroke="#252525" stroke-width="0.8" marker-end="url(#zz-half-arrow)">
+    <path d="M217 178L282 45"/>
+    <path d="M415 178L84 241"/>
+    <path d="M217 374L282 241"/>
+  </g>
+  <g id="zz-half-dimensions" fill="none" stroke="#252525" stroke-width="1.5">
+    <path d="M464 241H480M472 241V273M472 342V374M464 374H480"/>
+    <path d="M431 303H515"/>
+    <path d="M288 405V421M288 413H329M388 413H420M420 405V421"/>
+  </g>
+  <rect x="168" y="438" width="163" height="69" rx="9" fill="#ededed"/>
+  <g id="zz-half-labels" fill="#1d1d2b" font-size="22" font-weight="600">
+    <text x="226" y="26" text-anchor="middle">Col</text>
+    <text x="88" y="26" text-anchor="middle">0</text>
+    <text x="405" y="26" text-anchor="middle">31</text>
+    <text x="24" y="191" text-anchor="middle">Row</text>
+    <text x="51" y="59" text-anchor="middle">0</text>
+    <text x="49" y="351" text-anchor="middle">31</text>
+    <text x="75" y="67">(0,0)</text><text x="208" y="67">(0,15)</text>
+    <text x="279" y="67">(0,16)</text><text x="413" y="67">(0,31)</text>
+    <text x="70" y="199">(15,0)</text><text x="199" y="199">(15,15)</text>
+    <text x="278" y="199">(15,16)</text><text x="411" y="199">(15,31)</text>
+    <text x="70" y="235">(16,0)</text><text x="199" y="235">(16,15)</text>
+    <text x="278" y="235">(16,16)</text><text x="411" y="235">(16,31)</text>
+    <text x="69" y="393">(31,0)</text><text x="199" y="393">(31,15)</text>
+    <text x="278" y="393">(31,16)</text><text x="411" y="393">(31,31)</text>
+    <text x="473" y="292" text-anchor="middle" font-weight="400">32</text>
+    <text x="474" y="323" text-anchor="middle" font-size="20" font-weight="400" font-style="italic">sizeof(T)</text>
+    <text x="356" y="421" text-anchor="middle">16</text>
+    <text x="249.5" y="479" text-anchor="middle" font-size="16" font-weight="400">矩阵A</text>
+  </g>
+</svg>

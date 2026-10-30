@@ -48,6 +48,39 @@
 - 场景：通常存在于Global Memory（GM）中。若此输入要作为矩阵计算的输入，需要转换成Nz格式。
 - 转换示例：可以使用[`mem_copy`](../../data-movement/mem-copy.md)的DN2Nz随路转换将其转换为Nz格式以适配Cube单元。
 
+## Zz格式
+
+Zz格式也称为`FRACTAL_Zz`。
+
+- **定义：** 大Z外部row major（行主序）+ 小z内部row major（行主序），见下图。
+
+  **Zz格式（以`dtypes.float16`类型为例）**
+
+  ![Zz格式示意图](../../figures/zz_fractals_of_half.svg)
+
+- **物理位置：** 在采用Zz左矩阵布局的计算场景中，通常位于L0A Buffer，作为左矩阵。950产品的输入矩阵及量化系数适用情况见本节末说明。
+- **设计原理：**
+  - **行读取需求：** 在A×B中，A矩阵需要按行读取。
+  - **内存一致性：** Zz格式在分形内部按行存储，同一行的相邻元素在物理地址上连续，便于计算单元连续读取，无需在分形内跨步访问。
+- **格式转换过程：** 对Tensor的最低两维进行填充（pad）、拆分（reshape）和转置（transpose）。`(M, K)`大小的矩阵被分为`M1 × K1`个分形，按照row major（行主序）排布，形状如Z字形；每个分形内部有`M0 × K0`个元素，也按row major排布，因此称为Zz格式。其中`(M0, K0)`表示一个分形的大小。对普通输入矩阵，M0=16，分形大小为16×K0，占用512字节。
+
+通过公式表达转换过程如下：
+
+```text
+(…, B, M, K)
+  → pad       → (…, B, M1 × M0, K1 × K0)
+  → reshape   → (…, B, M1, M0, K1, K0)
+  → transpose → (…, B, M1, K1, M0, K0)
+```
+
+- **分形大小约束：** 对普通输入矩阵，M0=16，K0由元素位宽决定。若元素位宽为b bits，则`K0 = 256 / b`：
+  - 32-bit（`dtypes.float32`/`dtypes.int32`）：K0=8，分形为16×8。
+  - 16-bit（`dtypes.float16`）：K0=16，分形为16×16。
+  - 8-bit（`dtypes.int8`）：K0=32，分形为16×32。
+  - 4-bit：K0=64，分形为16×64。
+
+> **950适用说明：** 上图和512字节分形规则说明的是普通输入矩阵的Zz排布。当前DSL支持的950系列中，左输入矩阵A在L0A Buffer中使用Nz；左量化系数矩阵ScaleA使用Zz，但其分形为16×2个`dtypes.float8_e8m0`元素，占32字节，不能套用普通输入矩阵的512字节规则。ScaleA的排布及搬运要求见[辅助矩阵分形格式详解](./aux-fractal-formats.md#mx-scalea系数矩阵分形介绍)。
+
 ## Zn格式（FRACTAL_Zn）
 
 - **定义：** 大Z外部row major（行主序）+ 小n内部column major（列主序），见下图。

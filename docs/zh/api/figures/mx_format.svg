@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="522" height="271" viewBox="0 0 522 271" role="img" aria-labelledby="mx-format-title mx-format-desc">
+  <title id="mx-format-title">MX格式组成示意图</title>
+  <desc id="mx-format-desc">共享量化系数X占w位，k个私有元素各占d位，由符号、指数和尾数字段组成。文字与图形均可独立编辑。</desc>
+  <defs>
+    <pattern id="mx-format-hatch" width="7" height="7" patternUnits="userSpaceOnUse"><path d="M-1 1L1-1M0 7L7 0M6 8L8 6" stroke="#dedede" stroke-width="0.5"/></pattern>
+  </defs>
+  <rect width="522" height="271" fill="#fff"/>
+  <g fill="none" stroke="#151515" stroke-width="0.8">
+    <rect x="32.5" y="116.5" width="139" height="63" rx="2" fill="url(#mx-format-hatch)"/>
+    <rect x="223.5" y="59.5" width="208" height="52" rx="2"/>
+    <path d="M249.5 60V111M310.5 60V111"/>
+    <rect x="223.5" y="190.5" width="208" height="52" rx="2"/>
+    <path d="M249.5 191V242M310.5 191V242"/>
+    <path d="M432 85Q440 85 440 94V135Q440 147 453 147Q440 147 440 159V208Q440 217 432 217"/>
+  </g>
+  <g fill="#071429" font-family="FZLanTingHei-R-GBK, 方正兰亭黑_GBK, sans-serif" font-size="16" text-anchor="middle">
+    <text x="102" y="107"><tspan font-style="italic">w</tspan> bits</text>
+    <text x="102" y="138" font-style="italic">X</text>
+    <text x="102" y="157" fill="#004080">(shared</text><text x="102" y="178" fill="#004080">scale)</text>
+    <text x="328" y="50"><tspan font-style="italic">d</tspan> bits</text>
+    <g font-style="italic">
+      <text x="207" y="80">P</text><text x="207" y="103">1</text>
+      <text x="237" y="80">S</text><text x="237" y="103">1</text>
+      <text x="280" y="92">E1</text><text x="374" y="92">M1</text>
+      <text x="207" y="212">P</text><text x="207" y="235">k</text>
+      <text x="237" y="212">S</text><text x="237" y="235">k</text>
+      <text x="280" y="224">Ek</text><text x="374" y="224">Mk</text>
+      <text x="327" y="132">·</text><text x="327" y="155">·</text><text x="327" y="178">·</text>
+    </g>
+    <text x="471" y="154">k</text>
+  </g>
+</svg>

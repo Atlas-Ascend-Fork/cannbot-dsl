@@ -6,7 +6,7 @@
 ## 功能说明
 
 在 Kernel 中将 `src` 描述的数据搬运到 `dst` 指定的存储区域，默认覆盖写入，启用原子累加时与目标原值相加。
-Tensor 的布局及 `transpose`、`pad`、`convert`、`relu` 等视图或数据变换接口描述数据的访问方式和变换，[copy_options](./copy-options.md) 提供搬运控制选项，`mem_copy` 执行实际搬运并返回目标 Tensor 视图。
+Tensor 的布局及 `transpose`、`pad`、`convert`、`relu` 等视图或数据变换接口描述数据的访问方式和变换，[copy_options](./copy-options.md) 提供搬运控制选项，`mem_copy` 执行实际搬运，不返回目标 Tensor 视图。
 与只创建视图的操作不同，本接口会读写存储；创建源视图时不复制数据，源数据在搬运执行时读取。
 
 ## 函数原型
@@ -16,7 +16,7 @@ mem_copy(
     dst: Tensor | Storage | tuple[Tensor, ...] | list[Tensor],
     src: Tensor | Storage | tuple[Tensor, ...] | list[Tensor],
     options: CopyOptions | None = None,
-) -> Tensor | tuple[Tensor, ...]
+) -> None
 ```
 
 调用入口为 `cannbotdsl.mem_copy`。`options` 可按位置传入，也可写成 `options=...`。原型保留源码类型注解；其中裸 `Storage` 作为源的用法当前不支持，须先取得 Tensor 视图，详见参数说明。
@@ -26,7 +26,7 @@ mem_copy(
 | 参数 | 输入/输出 | 说明 |
 | --- | --- | --- |
 | `dst` | 输入/输出 | 搬运目标。单目标接受 [Tensor](../data-structures/tensor/overview.md) 或 [Storage](../data-structures/storage/storage/overview.md)：Tensor 保持已声明的地址映射，Storage 按其布局策略和本次源数据范围生成目标视图，已有容量须足够容纳结果，不会自动扩容。非空 tuple/list 用于多目标搬运，元素须为 Tensor，规则见下文。默认仅写入目标；启用 `options` 中的 `atomic_add` 时还会读取目标原值。 |
-| `src` | 输入 | 搬运源。接受 Tensor，或用于多源搬运的非空 Tensor tuple/list；裸 Storage 不可直接传入，应使用先前搬运返回的 Tensor，或调用 `Storage.view()` 取得明确的源视图。单目标调用要求源、目标视图的逻辑维数一致，不会按元素总数自动展平或重塑；需要改变维数时应先显式构造视图。普通逻辑搬运的范围由源视图决定，目标须覆盖该范围；源可通过受支持的视图或变换接口描述转置、填充、拼接等行为。L1→UB 的物理搬运规则见下表。 |
+| `src` | 输入 | 搬运源。接受 Tensor，或用于多源搬运的非空 Tensor tuple/list；裸 Storage 不可直接传入，应使用已有的 Tensor，或调用 `Storage.view()` 取得明确的源视图。单目标调用要求源、目标视图的逻辑维数一致，不会按元素总数自动展平或重塑；需要改变维数时应先显式构造视图。普通逻辑搬运的范围由源视图决定，目标须覆盖该范围；源可通过受支持的视图或变换接口描述转置、填充、拼接等行为。L1→UB 的物理搬运规则见下表。 |
 | `options` | 输入 | 可选的 [CopyOptions](copy-options-type.md) 对象，由 [copy_options](./copy-options.md) 创建；默认 `None`，使用默认控制项。GM→UB 默认使用普通 DMA，不会自动选择 NDDMA；需要 NDDMA 时显式传入 `copy_options(engine="nddma")`。选项含义、取值及适用方向统一见 [copy_options 参数说明](./copy-options.md#参数说明)，不直接向 `mem_copy` 传入 `engine`、`atomic_add`、`mx_scale` 等旧参数。 |
 
 源、目标的存储位置决定可使用的搬运方向。下表说明各方向的主要行为及对应操作数要求，不表示任意数据类型、布局和变换均可组合。GM、UB、NZ、ZN 等术语见[术语表](../../guide/glossary.md)。
@@ -54,13 +54,13 @@ mem_copy(
 
 - 多于一个目标时，源须为单个 ND GM Tensor；目标须全部为 UB 或全部为 L1，且数据类型、逻辑布局和物理布局一致。目标支持 ND，L1 目标还支持 NZ；源与目标数据类型一致，元素按整字节存储，ND→NZ 时限于 8、16、32 位元素。
 - 目标个数和顺序须在编译期确定。目标起始地址按列表顺序等间隔排列；调用者须保证第三个及之后的目标延续前两个目标确定的地址间隔。
-- 仅支持默认搬运控制和 `l2_cache_ctl`，不组合填充、分区、原子累加或缩放。仅含一个 Tensor 的目标序列使用普通单目标规则，但返回值仍为单元素 tuple。
+- 仅支持默认搬运控制和 `l2_cache_ctl`，不组合填充、分区、原子累加或缩放。仅含一个 Tensor 的目标序列使用普通单目标规则。
 
 ## 返回值说明
 
-- 单个目标返回本次写入对应的 Tensor 视图，不返回 `None`。
-- 目标为 tuple/list 时，返回相同顺序的 Tensor tuple；即使输入为 list 或仅含一个元素，也返回 tuple。
-- 返回视图与目标共享存储，并携带本次写入的数据范围和布局信息，不另外分配一份数据副本。忽略返回值不会取消搬运，但也不会将这些视图信息自动更新到已有 Tensor 或 `Storage.view()` 的默认视图中。后续需要使用本次结果范围时，应保留并传递返回视图。
+无返回值，Python调用返回`None`。数据直接写入`dst`指定的存储，不另外分配一份数据副本。
+
+后续读取或计算应使用事先构造的目标Tensor视图；需要从Storage取得操作数时，应显式调用`Storage.view()`绑定所需的数据范围和布局。不要将`mem_copy(...)`的返回值作为后续接口的Tensor入参。
 
 ## 约束说明
 
@@ -68,7 +68,7 @@ mem_copy(
 - 多源拼接与多目标广播不能在同一调用中组合。需要“多源到多目标”时，应拆成分别满足上述规则的调用。
 - 读写同一片上缓冲区时，必须保证写入完成后再读取，读取完成后再覆盖。使用 RingBuffer 时，通过同一缓冲区的 `next_write()`、`next_read()` 选择相应槽位并建立读写依赖；槽位选择本身不搬运数据。绕过缓冲区管理的跨流水或跨核访问须自行建立同步，不能只依赖 Python 语句顺序。
 - 创建视图不会冻结其中的数据。源数据及缩放因子须在搬运读取完成前保持有效，不能提前覆盖；原子累加前须初始化目标，且不得与同一区域的未同步普通写入并发。
-- 返回目标视图不等于 Host 已等待设备执行完成。Host 读取 NPU 结果前须等待设备执行完成，例如调用 `torch.npu.synchronize()`。
+- 调用本接口不等于 Host 已等待设备执行完成。Host 读取 NPU 结果前须等待设备执行完成，例如调用 `torch.npu.synchronize()`。
 
 ## 调用示例
 

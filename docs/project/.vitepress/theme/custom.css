@@ -1,4 +1,6 @@
 :root {
+  --vp-layout-max-width: 1680px;
+  --vp-sidebar-width: 320px;
   --vp-c-brand-1: #315ad8;
   --vp-c-brand-2: #2749bb;
   --vp-c-brand-3: #203d9b;
@@ -190,8 +192,45 @@
 }
 
 .vp-doc table {
-  display: table;
+  display: block;
   width: 100%;
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+/* 文档正文使用侧边导航和页内目录之间的可用宽度。 */
+.VPDoc.has-aside .content-container {
+  max-width: none !important;
+  width: auto !important;
+  margin: 0 !important;
+}
+
+.vp-doc mjx-container[display='true'] {
+  max-width: 100%;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+
+@media (min-width: 2560px) {
+  :root {
+    --vp-layout-max-width: 2520px;
+  }
+}
+
+/* 中等屏幕改用折叠菜单，避免较长的中文导航撑出页面。 */
+@media (min-width: 768px) and (max-width: 1279px) {
+  .VPNav .VPNavBar .VPNavBarMenu,
+  .VPNav .VPNavBar .VPNavBarExtra {
+    display: none;
+  }
+
+  .VPNav .VPNavBar .VPNavBarHamburger {
+    display: flex;
+  }
+
+  .VPNav .VPNavScreen {
+    display: block;
+  }
 }
 
 @media (max-width: 959px) {

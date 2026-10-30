@@ -27,5 +27,3 @@ GM 等 workspace 上的同步可以使用本章节开放的同步接口。
 | [`vec_sync_block_wait`](./vec-sync-block-wait.md) | AIV | 消费者，负责阻塞等待通知到达 | 模式 0、模式 1、模式 2 |
 | [`vec_sync_intra_arrive`](./vec-sync-intra-arrive.md) | AIV | 生产者，负责向 AIC 发送通知 | 模式 4 |
 | [`vec_sync_intra_wait`](./vec-sync-intra-wait.md) | AIV | 消费者，负责阻塞等待 AIC 的通知到达 | 模式 4 |
-
-<p class="doc-footnote">本分类下接口的功能描述与术语参考 Ascend C 的 C API 文档。</p>

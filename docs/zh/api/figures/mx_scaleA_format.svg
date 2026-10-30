@@ -1,0 +1,70 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="557" viewBox="0 0 1120 557" role="img" aria-labelledby="mx-a-title mx-a-desc">
+  <title id="mx-a-title">scaleA矩阵在不同位置上的排布格式</title>
+  <desc id="mx-a-desc">左侧给出scaleA不转置和转置时的GM配对存储，分别通过DN2NZ.b16和ND2NZ.b16转换为右侧的Zz分形。分形为16×2，两个量化系数占2 Byte。全部标签、网格、箭头与背景带均可编辑。</desc>
+  <defs>
+    <marker id="mx-a-arrow" markerWidth="5" markerHeight="5" refX="4.5" refY="2.5" orient="auto" markerUnits="userSpaceOnUse"><path d="M0 0L5 2.5L0 5Z" fill="#222"/></marker>
+    <marker id="mx-a-small" markerWidth="4" markerHeight="4" refX="3.5" refY="2" orient="auto" markerUnits="userSpaceOnUse"><path d="M0 0L4 2L0 4Z" fill="#333"/></marker>
+    <g id="mx-a-row" fill="none" stroke="#333" stroke-width="0.8" marker-end="url(#mx-a-small)"><path d="M5 0H25"/><path d="M32 0H52"/><path d="M59 0H79"/><path d="M123 0H143"/></g>
+    <g id="mx-a-column" fill="none"><path d="M10 14L4 130" stroke="#f2b8b8" stroke-width="8" opacity="0.8"/><path d="M0 14H19L0 130H19" stroke="#333" stroke-width="0.8" marker-mid="url(#mx-a-small)" marker-end="url(#mx-a-small)"/></g>
+    <g id="mx-a-z" fill="none" stroke="#222" stroke-width="0.8"><path d="M5 3V43L50 3V43" marker-mid="url(#mx-a-small)" marker-end="url(#mx-a-small)"/></g>
+    <g id="mx-a-mini" fill="none" stroke="#222" stroke-width="0.65">
+      <path d="M2 3H14L2 43H14" marker-mid="url(#mx-a-small)" marker-end="url(#mx-a-small)"/>
+      <path d="M2 51H14L2 91H14" marker-mid="url(#mx-a-small)" marker-end="url(#mx-a-small)"/>
+      <path d="M2 99H14L2 139H14" marker-mid="url(#mx-a-small)" marker-end="url(#mx-a-small)"/>
+    </g>
+  </defs>
+  <rect width="1120" height="557" fill="#fff"/>
+  <g font-family="FZLanTingHei-R-GBK, 方正兰亭黑_GBK, sans-serif" font-size="13" fill="#071429">
+    <g stroke="#777" stroke-width="0.8"><rect x="214.5" y="43.5" width="306" height="54" rx="11" fill="#fff"/><rect x="546.5" y="43.5" width="494" height="54" fill="#fff"/></g>
+    <g fill="#409fe2"><rect x="217" y="46" width="301" height="49" rx="9"/><rect x="549" y="46" width="489" height="49" rx="9"/></g>
+    <g fill="#1b1b1b"><rect x="359" y="51" width="78" height="39" rx="8"/><rect x="808" y="51" width="127" height="39" rx="8"/></g>
+    <g fill="#fff" text-anchor="middle" font-size="15"><text x="332" y="77">GM</text><text x="398" y="77">ND</text><text x="712" y="77">GM/L1/UB</text><text x="872" y="77">Zz</text></g>
+    <path d="M533.5 45V509" fill="none" stroke="#222" stroke-width="0.8" stroke-dasharray="6 4"/>
+    <g fill="#ededed"><rect x="38" y="194" width="209" height="39" rx="7"/><rect x="42" y="413" width="204" height="39" rx="7"/><rect x="785" y="245" width="87" height="39" rx="7"/></g>
+    <text x="49" y="219" font-size="15">scaleA不转置: [M, K/64,2]</text><text x="51" y="438" font-size="15">scaleA转置: [K/64,M,2]</text>
+    <text x="829" y="269" text-anchor="middle" font-size="15">等效成</text>
+    <g transform="translate(283 143)">
+      <rect width="152" height="144" rx="2" fill="#fff" stroke="#222" stroke-width="0.8"/>
+      <path d="M5 10H146L5 30H146L5 50H146M5 93H146L5 115H146L5 136H146" fill="none" stroke="#f2b8b8" stroke-width="8" opacity="0.65"/>
+      <use href="#mx-a-row" y="10"/><use href="#mx-a-row" y="30"/><use href="#mx-a-row" y="50"/><use href="#mx-a-row" y="93"/><use href="#mx-a-row" y="115"/><use href="#mx-a-row" y="136"/>
+      <text x="76" y="75" text-anchor="middle">⋮</text><text x="104" y="11">...</text><text x="104" y="33">...</text><text x="104" y="53">...</text>
+    </g>
+    <g transform="translate(288 359)">
+      <rect width="152" height="145" rx="2" fill="#fff" stroke="#222" stroke-width="0.8"/>
+      <path d="M30 0V145M60 0V145M90 0V145M130 0V145" stroke="#444" stroke-width="0.6" fill="none"/>
+      <use href="#mx-a-column" x="5"/><use href="#mx-a-column" x="35"/><use href="#mx-a-column" x="65"/><use href="#mx-a-column" x="135"/>
+      <text x="106" y="72" text-anchor="middle">...</text>
+    </g>
+    <g stroke="#222" stroke-width="0.8" fill="none">
+      <path d="M283 117V124M434 117V124M283 121H434M283 133V141M310 133V141M337 133V141M363 133V141M411 133V141M434 133V141M283 137H363M411 137H434"/>
+      <path d="M288 334V342M439 334V342M288 338H439M288 350V358M318 350V358M348 350V358M378 350V358M418 350V358M439 350V358M288 354H378M418 354H439"/>
+      <path d="M445 195L526 242" marker-end="url(#mx-a-arrow)"/>
+      <path d="M441 435L529 347" marker-end="url(#mx-a-arrow)"/>
+    </g>
+    <g text-anchor="middle"><text x="359" y="117">K/32</text><text x="297" y="134">2</text><text x="324" y="134">2</text><text x="351" y="134">2</text><text x="424" y="134">2</text><text x="257" y="219">M</text>
+      <text x="364" y="329">K/32</text><text x="303" y="351">2</text><text x="333" y="351">2</text><text x="363" y="351">2</text><text x="429" y="351">2</text><text x="257" y="438">M</text></g>
+    <text transform="translate(455 190) rotate(31)" font-weight="600">DN2NZ.b16</text><text transform="translate(458 408) rotate(-31)" font-weight="600">ND2NZ.b16</text>
+    <rect x="566" y="181" width="214" height="213" fill="none" stroke="#4d4d4d" stroke-width="2" stroke-dasharray="5 5"/>
+    <g transform="translate(610 244)">
+      <rect width="159" height="145" rx="2" fill="#fff" stroke="#222" stroke-width="0.8"/>
+      <path d="M78 1V144" fill="none" stroke="#333" stroke-width="0.7"/>
+      <use href="#mx-a-z"/><use href="#mx-a-z" x="104"/><use href="#mx-a-z" y="48"/><use href="#mx-a-z" x="104" y="48"/><use href="#mx-a-z" y="96"/><use href="#mx-a-z" x="104" y="96"/>
+      <g fill="#fff" stroke="none"><rect x="56" y="3" width="49" height="138"/></g>
+      <text x="80" y="29" text-anchor="middle">⋮</text><text x="80" y="77" text-anchor="middle">⋮</text><text x="80" y="125" text-anchor="middle">⋮</text>
+    </g>
+    <path d="M615 246H634V287H615Z" fill="none" stroke="#f02222" stroke-dasharray="5 5"/>
+    <g stroke="#222" fill="none" stroke-width="0.8"><path d="M616 207V215M664 207V215M616 211H664M615 230V242M634 230V242M615 235H634M600 244H608M600 287H608M604 244V287"/>
+      <path d="M807 297H829V289L851 305L829 321V313H807Z" fill="#fff"/>
+    </g>
+    <g text-anchor="middle"><text x="691" y="195">K/32</text><text x="640" y="201">16</text><text x="625" y="229">2 Byte</text><text x="587" y="275">16</text><text x="591" y="386">M</text></g>
+    <g transform="translate(908 244)">
+      <rect width="152" height="145" rx="2" fill="#fff" stroke="#222" stroke-width="0.8"/>
+      <path d="M3 22H149L3 70H149L3 118H149" stroke="#f2b8b8" stroke-width="8" opacity="0.6" fill="none"/>
+      <path d="M16 1V144M32 1V144M48 1V144M118 1V144M134 1V144M1 48H151M1 96H151" fill="none" stroke="#333" stroke-width="0.7"/>
+      <use href="#mx-a-mini"/><use href="#mx-a-mini" x="16"/><use href="#mx-a-mini" x="32"/><use href="#mx-a-mini" x="118"/><use href="#mx-a-mini" x="134"/>
+      <text x="83" y="29" text-anchor="middle">...</text><text x="83" y="77" text-anchor="middle">...</text><text x="83" y="125" text-anchor="middle">...</text>
+    </g>
+    <path d="M908 233V242M924 233V242M908 237H924" fill="none" stroke="#222" stroke-width="0.8"/>
+    <g text-anchor="middle"><text x="986" y="217">K/32</text><text x="921" y="230">2 Byte</text><text x="885" y="272">16</text><text x="880" y="322">M</text></g>
+  </g>
+</svg>

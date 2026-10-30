@@ -18,5 +18,5 @@
 | [get_squeeze_status](./get-squeeze-status.md) | 获取squeeze有效数据长度。 |
 | [is_aic](./is-aic.md) | 判断当前编译通道是否为Cube（AIC）。 |
 | [is_aiv](./is-aiv.md) | 判断当前编译通道是否为Vector（AIV）。 |
-| [get_ctrl](./get-ctrl.md) | 读取CTRL控制寄存器。 |
-| [set_ctrl](./set-ctrl.md) | 设置CTRL控制寄存器。 |
+| [get_ctrl](./spr/get-ctrl.md) | 读取CTRL控制寄存器。 |
+| [set_ctrl](./spr/set-ctrl.md) | 设置CTRL控制寄存器。 |

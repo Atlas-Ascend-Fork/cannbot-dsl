@@ -513,68 +513,99 @@ const apiSidebar = [
             "link": "/zh/api/compute/matrix",
             "items": [
               {
-                "text": "enable_fp8",
-                "link": "/zh/api/compute/matrix/enable-fp8"
+                "text": "概述",
+                "items": [
+                  {
+                    "text": "矩阵计算单元",
+                    "link": "/zh/api/compute/matrix/unit"
+                  },
+                  {
+                    "text": "普通矩阵计算流程",
+                    "link": "/zh/api/compute/matrix/flow"
+                  }
+                ],
+                "collapsed": true
               },
               {
-                "text": "enable_hf32",
-                "link": "/zh/api/compute/matrix/enable-hf32"
+                "text": "矩阵计算分形介绍",
+                "items": [
+                  {
+                    "text": "背景与核心概念",
+                    "link": "/zh/api/compute/matrix/fractal-intro"
+                  },
+                  {
+                    "text": "关键分形格式详解",
+                    "link": "/zh/api/compute/matrix/fractal-formats"
+                  },
+                  {
+                    "text": "辅助矩阵分形格式详解",
+                    "link": "/zh/api/compute/matrix/aux-fractal-formats"
+                  }
+                ],
+                "collapsed": true
               },
               {
-                "text": "enable_hif8",
-                "link": "/zh/api/compute/matrix/enable-hif8"
+                "text": "Mmad计算",
+                "items": [
+                  {
+                    "text": "matmul（普通模式）",
+                    "link": "/zh/api/compute/matrix/matmul"
+                  },
+                  {
+                    "text": "matmul（MX模式）",
+                    "link": "/zh/api/compute/matrix/matmul-mx"
+                  }
+                ],
+                "collapsed": true
               },
               {
-                "text": "普通矩阵计算流程",
-                "link": "/zh/api/compute/matrix/flow"
+                "text": "Mmad计算关键特性说明",
+                "link": "/zh/api/compute/matrix/key-features",
+                "items": [
+                  {
+                    "text": "GEMV",
+                    "link": "/zh/api/compute/matrix/key-features-gemv"
+                  },
+                  {
+                    "text": "HF32",
+                    "link": "/zh/api/compute/matrix/key-features-hf32"
+                  },
+                  {
+                    "text": "UnitFlag",
+                    "link": "/zh/api/compute/matrix/key-features-unit-flag"
+                  }
+                ],
+                "collapsed": true
               },
               {
-                "text": "关键分形格式详解",
-                "link": "/zh/api/compute/matrix/fractal-formats"
-              },
-              {
-                "text": "背景与核心概念",
-                "link": "/zh/api/compute/matrix/fractal-intro"
-              },
-              {
-                "text": "GEMV",
-                "link": "/zh/api/compute/matrix/key-features-gemv"
-              },
-              {
-                "text": "HF32",
-                "link": "/zh/api/compute/matrix/key-features-hf32"
-              },
-              {
-                "text": "UnitFlag",
-                "link": "/zh/api/compute/matrix/key-features-unit-flag"
-              },
-              {
-                "text": "关键特性说明",
-                "link": "/zh/api/compute/matrix/key-features"
-              },
-              {
-                "text": "matmul",
-                "link": "/zh/api/compute/matrix/matmul"
-              },
-              {
-                "text": "矩阵计算",
-                "link": "/zh/api/compute/matrix/overview"
-              },
-              {
-                "text": "set_fp32_mode",
-                "link": "/zh/api/compute/matrix/set-fp32-mode"
-              },
-              {
-                "text": "set_hf32_round_mode",
-                "link": "/zh/api/compute/matrix/set-hf32-round-mode"
-              },
-              {
-                "text": "set_mmad_direction",
-                "link": "/zh/api/compute/matrix/set-mmad-direction"
-              },
-              {
-                "text": "矩阵计算单元",
-                "link": "/zh/api/compute/matrix/unit"
+                "text": "Mmad计算辅助配置接口",
+                "items": [
+                  {
+                    "text": "set_fp32_mode",
+                    "link": "/zh/api/compute/matrix/set-fp32-mode"
+                  },
+                  {
+                    "text": "enable_fp8",
+                    "link": "/zh/api/compute/matrix/enable-fp8"
+                  },
+                  {
+                    "text": "enable_hf32",
+                    "link": "/zh/api/compute/matrix/enable-hf32"
+                  },
+                  {
+                    "text": "enable_hif8",
+                    "link": "/zh/api/compute/matrix/enable-hif8"
+                  },
+                  {
+                    "text": "set_hf32_round_mode",
+                    "link": "/zh/api/compute/matrix/set-hf32-round-mode"
+                  },
+                  {
+                    "text": "set_mmad_direction",
+                    "link": "/zh/api/compute/matrix/set-mmad-direction"
+                  }
+                ],
+                "collapsed": true
               }
             ],
             "collapsed": true
@@ -1291,7 +1322,6 @@ const apiSidebar = [
             "items": [
               {
                 "text": "特殊寄存器",
-                "link": "/zh/api/execution/device/spr",
                 "items": [
                   {
                     "text": "get_ctrl",
@@ -1315,10 +1345,6 @@ const apiSidebar = [
               {
                 "text": "get_core_id",
                 "link": "/zh/api/execution/device/get-core-id"
-              },
-              {
-                "text": "get_ctrl",
-                "link": "/zh/api/execution/device/get-ctrl"
               },
               {
                 "text": "get_squeeze_status",
@@ -1351,10 +1377,6 @@ const apiSidebar = [
               {
                 "text": "is_aiv",
                 "link": "/zh/api/execution/device/is-aiv"
-              },
-              {
-                "text": "set_ctrl",
-                "link": "/zh/api/execution/device/set-ctrl"
               }
             ],
             "collapsed": true
@@ -1699,6 +1721,8 @@ const normalizeApiSidebar = (sidebar: any[]) => {
   const orderForReading = (item: any): any => {
     if (!Array.isArray(item.items)) return item
     const children = item.items.map(orderForReading)
+    // Matrix pages follow ASC's concepts, computation, features, then configuration order.
+    if (item.link === '/zh/api/compute/matrix') return { ...item, items: children }
     return {
       ...item,
       items: children
