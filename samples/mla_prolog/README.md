@@ -13,7 +13,7 @@
 | (Dn,Dr) | (128,64)、(192,64)、(256,0) |
 | 权重 | 三路投影权重统一 ND 或统一真实 NZ；wkb 为 ND |
 | 输出模式 | 0/1/2/3；mode1 仅 PA_BSND，其余支持 PA_BSND/PA_NZ |
-| Cache | `16 ≤ block_size ≤ 1024`，16 对齐；从 `kv_cache.shape[1]` 获取。负 index 跳过写入，重复有效 index 非法 |
+| Cache | `16 ≤ block_size ≤ 1024`，16 对齐；从 `kv_cache.shape[1]` 获取。负 index 跳过写入；调用方保证非负 index 不越界且不重复 |
 | 空输入 | T=0 无主 Kernel 启动；返回固定三个 Tensor 槽位 |
 | 核资源 | 按当前 stream 的可用 MIX 资源选择 `min(AIC数, AIV数 // 2)`；四种输出模式均不额外限制为32/36核，mode3不按 `T*N` 限制启动核数 |
 
@@ -68,8 +68,8 @@ def mla_prolog(
 | `norm_weight_qa` | `(q_lora,)` | `torch.float32` | ND，QA RMSNorm gamma |
 | `norm_weight_kva` | `(512,)` | `torch.float32` | ND，Ckv RMSNorm gamma |
 | **`kv_cache`（原地输入输出）** | mode 0/2/3：`(block_number,block_size,1,512+Dr)`；mode 1：`(block_number,block_size,1,512+2*Dr+16)` | mode 0：`torch.bfloat16`；mode 1/2：`torch.float8_e4m3fn`；mode 3：`torch.uint8`承载HiF8字节 | `block_size` 为 16～1024 内的 16 的倍数。外部Tensor为ND载体，内部按 `cache_mode` 的PA_BSND/PA_NZ地址映射；mode 1仅PA_BSND |
-| `cache_index` | `(T,)` | `torch.int64` | ND，token写入的线性Cache槽位；负值跳过写入 |
-| `quant_scale_kv` | `(1,)` | `torch.float32` | ND，mode 2/3必填且有限正数；mode 0/1必须为 `None` |
+| `cache_index` | `(T,)` | `torch.int64` | ND，token写入的线性Cache槽位；负值跳过写入；仅校验元信息，数值合法性由调用方保证 |
+| `quant_scale_kv` | `(1,)` | `torch.float32` | ND，mode 2/3必填且有限、≥0；mode 0/1必须为 `None` |
 | `rope_sin` | `(T,Dr)` | `torch.bfloat16` | ND，启用RoPE时必填 |
 | `rope_cos` | `(T,Dr)` | `torch.bfloat16` | ND，与sin成对提供 |
 
@@ -86,14 +86,16 @@ def mla_prolog(
 | `norm_eps` | 浮点属性，内核类型FP32；须有限且严格大于0，拒绝bool | `1e-5` | QA和Ckv两路RMSNorm共用epsilon |
 | `qkv_quant_mode` | `mlaprolog.QkvQuantMode` | `NO_QUANT` | 最终Q及Cache的量化模式 |
 | `cache_mode` | `mlaprolog.CacheMode` | `PA_BSND` | Cache内部地址映射 |
-| `qr_scale` | 转FP32后有限，允许负数和0，拒绝bool | `1.0` | QA RMSNorm后、WQB前缩放CQ；同时影响Q-Nope、Q-RoPE和qr |
-| `kvr_scale` | 转FP32后有限，允许负数和0，拒绝bool | `1.0` | Ckv RMSNorm后缩放Ckv，**不缩放KR** |
+| `qr_scale` | 转FP32后有限，允许正数、0和负数，拒绝bool | `1.0` | QA RMSNorm后、WQB前直接乘传入值；同时影响Q-Nope、Q-RoPE和qr |
+| `kvr_scale` | 转FP32后有限，允许正数、0和负数，拒绝bool | `1.0` | Ckv RMSNorm后直接乘传入值，**不缩放KR** |
 | `rope_mode` | `mlaprolog.RopeMode` | `INTERLEAVE_HALF` | RoPE变换方式 |
 | `return_qr` | 严格bool | `False` | 是否写出QA归一化并缩放后的qr，不改变主Q路径 |
 
 公开 Python 入口在进入 Torch dispatcher 前拒绝三个浮点属性的 bool 和非数值类型。
 `norm_eps` 通过 Python 数值属性传入，例如 `norm_eps=1e-5`，不是 Tensor 参数；内核接收 FP32 标量。
 省略时使用 `1e-5`。Host 拒绝非有限值，以及超出 FP32 有限范围或转换为 FP32 后变为0的值，确保内核实际接收的 epsilon 有限且严格大于0。
+
+`qr_scale`、`kvr_scale` 不传时均为 `1.0`，显式传入 `0` 或负数也是合法输入；不检查正负范围，不设置接近 `1.0` 时跳过缩放的阈值，计算使用传入值的 FP32 表示。类型、有限性检查与 `norm_eps` 的严格正值约束分别保留。
 
 | 枚举成员 | 内部编码 | 语义 |
 | --- | ---: | --- |
@@ -125,16 +127,18 @@ def mla_prolog(
 mode 1每个token的payload按 `[KV FP8字节, KR BF16字节, 4个FP32 descale字节]` 拼接：
 `Dr=64` 为656字节，`Dr=0` 为528字节。虽然载体dtype为E4M3FN，KR和descale部分不能按FP8数值解释。
 mode 2/3的 `quant_scale_kv` 是**量化乘子**：`payload=Quantize(value*quant_scale_kv)`，
-读取时 `value=Decode(payload)/quant_scale_kv`，KV与KR共用此乘子；它不是Q输出的descale。
+KV与KR共用此乘子；它不是Q输出的descale。仅当乘子大于0时，读取可用 `Decode(payload)/quant_scale_kv`。
+乘子为0时，有限KV/KR的命中槽位写入数值零；原值不可恢复，测试直接检查解码后的零值，禁止除以0。
+`q`、`descale_q` 和 `qr` 不受此Cache乘子影响；未命中槽位及Cache存储身份保持不变。
 HiF8的uint8仅承载编码，不表示UINT8数值量化。
 
 ### 计算与调用约束
 
 - QA：`cq=RMSNorm(x@wqa.T)*qr_scale`，再经WQB投影；Q-Nope经WKB吸收，Q-Rope按RoPE模式处理，拼接后按输出模式量化。
 - KVA：将 `x@wkva.T` 拆为Ckv和KR；仅Ckv执行RMSNorm及 `kvr_scale`，KR执行可选RoPE；之后量化并写Cache。
-- `cache_index>=0` 的项必须小于 `block_number*block_size` 且互不重复；所有INT64负值均跳过Cache写入，允许重复负值。跳过写入的token仍参与Q、qr及Q动态量化计算。
+- `cache_index>=0` 的项必须小于 `block_number*block_size` 且互不重复；所有INT64负值均跳过Cache写入，允许重复负值。跳过写入的token仍参与Q、qr及Q动态量化计算。**所有执行方式均不回读或校验 `cache_index` 数值，调用方必须保证上述范围和唯一性；非法非负索引不保证抛出异常，可能导致越界访问或写冲突。** 不要求 `T ≤ block_number*block_size`，未写入的token可使用负索引。
 - **T=0仍执行接口校验，在Host返回，不分配Kernel workspace、不启动DSL Kernel**；q为 `(0,N,512+Dr)`；mode 2的descale_q为 `(0,N,1)`，mode 0/1/3为 `(0,)`；qr按 `return_qr` 为 `(0,q_lora)` 或 `(0,)`。Cache的地址、storage identity、Shape、dtype及全部原始字节不变。
-- 元信息和属性错误在调用层报错；Eager额外回读index/scale值进行预检。图捕获与replay不做值回读，必须在图外保证合法性，详见后续图模式示例。
+- 元信息和属性错误在调用层报错；`cache_index` 仍检查 `(T,)`、INT64、ND及设备一致性。Eager仅额外回读 `quant_scale_kv`，检查有限且非负；图捕获与replay不做值回读，调用方必须在图外保证合法性。
 - 不通过Cache clone、copy-back、TensorMove或隐式Format转换修复不合法输入；公开输出不支持自动求导。
 
 ## 计算公式
@@ -434,7 +438,7 @@ $$
 
 | 执行方式 | 调用入口 | 当前配置 |
 | --- | --- | --- |
-| Eager | `mlaprolog.mla_prolog` | 检查元信息及设备值，有 D2H 同步成本 |
+| Eager | `mlaprolog.mla_prolog` | 检查元信息和属性；仅 mode 2/3 的 `quant_scale_kv` 值检查有 D2H 同步成本 |
 | Native require 部署 | `mlaprolog.mla_prolog` | 设置 `CANNBOTDSL_NATIVE_BINARY_MODE=require`，缺少编译变体应报错，不允许 JIT 回退；可配合Eager或图模式使用 |
 | ACLGraph | 捕获预检后的 `mlaprolog.mla_prolog` | 自动选择异步图入口；源码和已安装 Native require 均可使用 |
 | NPUGraph-EX | `torch.compile(mlaprolog.mla_prolog, backend="npugraph_ex", ...)` | 内部自动选择可入图的原地算子；设备值须在捕获/回放外预检 |
@@ -443,8 +447,8 @@ $$
 `Tensor(a!) kv_cache` 声明原地更新。公开 Python 接口使用 `CacheMode`、
 `QkvQuantMode`、`RopeMode`，不是裸整数或字符串。
 
-**公开 `mla_prolog` 在图外预检，手工捕获内自动走异步图入口。**
-`index/quant_scale_kv` 的设备值检查包含 CPU 回读，不能放进捕获；低层带校验的
+**公开 `mla_prolog` 在手工捕获内自动走异步图入口。`cache_index` 数值始终由调用方保证合法，算子不回读、不检查越界或重复。**
+Eager 的 `quant_scale_kv` 值检查包含 CPU 回读，不能放进捕获；低层带校验的
 `torch.ops.cannbot_dsl_mla_prolog.mla_prolog` 仍拒绝直接捕获，整网应使用公开 Python 入口。
 Fake 注册只描述输出，不提供自动求导。EX 内部注册使用相同参数、固定三个输出及
 `Tensor(a!) kv_cache`，不引入自定义 clone/copy-back。图模式调用方必须在捕获前
@@ -507,8 +511,9 @@ assert q.shape == (T, N, 512 + Dr)
 assert descale_q.shape == qr.shape == (0,)
 ```
 
-Cache 是原地输入输出，不另返回 Cache。Eager 检查 scale 有限且大于零、有效 index
-不越界且不重复；所有负 index 跳过 Cache 写入。错误在主 Kernel 启动前抛出。
+Cache 是原地输入输出，不另返回 Cache。Eager 检查 `quant_scale_kv` 有限且大于等于零，
+错误在主 Kernel 启动前抛出。`cache_index` 不进行数值检查，调用方保证非负索引不越界且不重复；
+所有负 index 跳过 Cache 写入。`qr_scale`、`kvr_scale` 允许正数、负数和零。
 
 ### Native require 部署（调用函数不变）
 
@@ -555,7 +560,7 @@ ACLGraph 和 NPUGraph-EX 复用后续示例，仍须图外预检。
 ### ACLGraph 捕获和回放
 
 ```python
-# 图外调用：完整预检并编译/准备，也会更新命中 Cache。
+# 调用方先保证 index 合法；图外调用校验元信息及 quant_scale_kv 并编译/准备，也会写 Cache。
 prepared = mlaprolog.mla_prolog(**inputs, **attrs)
 torch.npu.synchronize()
 graph = torch.npu.NPUGraph()
@@ -577,7 +582,7 @@ q, descale_q, qr = graph_outputs
 ### NPUGraph-EX 调用
 
 ```python
-# 首次 Eager 调用在图外预检并准备编译产物；会更新命中 Cache。
+# 调用方先保证 index 合法；首次 Eager 校验元信息及 quant_scale_kv 并准备编译，会写 Cache。
 mlaprolog.mla_prolog(**inputs, **attrs)
 torch.npu.synchronize()
 compiled = torch.compile(

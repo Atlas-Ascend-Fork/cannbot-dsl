@@ -1144,9 +1144,6 @@ VECTOR_KV_LORA = 512
 VECTOR_KVR_MAX = 576
 
 
-SCALE_EPS = 2.0 ** (-23)
-
-
 GROUPS = 4
 
 
@@ -1351,8 +1348,6 @@ class QaRmsNorm:
         row_tiler = make_tiler((1, q_lora), alignment=(1, VECTOR_SEG))
         gamma_tiler = make_tiler((1, q_lora), alignment=(1, VECTOR_SEG))
         inv_q_lora = 1.0 / dtypes.float32(q_lora)
-        qr_enabled = qr_scale - 1.0 >= SCALE_EPS or 1.0 - qr_scale >= SCALE_EPS
-        qr_value = qr_scale if qr_enabled else 1.0
         mem_copy(self.gamma.next_write(), tile_slice(gamma_gm, gamma_tiler, (0, 0)))
         gamma_read = self.gamma.next_read()
         for token in cannbotdsl.range(start, rows, stride):
@@ -1385,7 +1380,7 @@ class QaRmsNorm:
                     normalized = vmul(
                         normalized, vload(gamma_read, segment), mask=full_mask()
                     )
-                    normalized = vmuls(normalized, qr_value, mask=full_mask())
+                    normalized = vmuls(normalized, qr_scale, mask=full_mask())
                     vstore(out_write, segment, normalized, full_mask())
                 vmem_bar(mode="vst_vld")
             mem_copy(
@@ -1400,8 +1395,6 @@ class QaRmsNorm:
         row_tiler = make_tiler((1, q_lora), alignment=(1, VECTOR_SEG))
         gamma_tiler = make_tiler((1, q_lora), alignment=(1, VECTOR_SEG))
         inv_q_lora = 1.0 / dtypes.float32(q_lora)
-        qr_enabled = qr_scale - 1.0 >= SCALE_EPS or 1.0 - qr_scale >= SCALE_EPS
-        qr_value = qr_scale if qr_enabled else 1.0
         mem_copy(self.gamma.next_write(), tile_slice(gamma_gm, gamma_tiler, (0, 0)))
         gamma_read = self.gamma.next_read()
         for token in cannbotdsl.range(start, rows, stride):
@@ -1434,7 +1427,7 @@ class QaRmsNorm:
                     normalized = vmul(
                         normalized, vload(gamma_read, segment), mask=full_mask()
                     )
-                    normalized = vmuls(normalized, qr_value, mask=full_mask())
+                    normalized = vmuls(normalized, qr_scale, mask=full_mask())
                     vstore_pack(
                         out_write,
                         segment,
@@ -1460,8 +1453,6 @@ class QaRmsNorm:
         row_tiler = make_tiler((1, q_lora), alignment=(1, VECTOR_SEG))
         gamma_tiler = make_tiler((1, q_lora), alignment=(1, VECTOR_SEG))
         inv_q_lora = 1.0 / dtypes.float32(q_lora)
-        qr_enabled = qr_scale - 1.0 >= SCALE_EPS or 1.0 - qr_scale >= SCALE_EPS
-        qr_value = qr_scale if qr_enabled else 1.0
         mem_copy(self.gamma.next_write(), tile_slice(gamma_gm, gamma_tiler, (0, 0)))
         gamma_read = self.gamma.next_read()
         for token in cannbotdsl.range(start, rows, stride):
@@ -1495,7 +1486,7 @@ class QaRmsNorm:
                     normalized = vmul(
                         normalized, vload(gamma_read, segment), mask=full_mask()
                     )
-                    normalized = vmuls(normalized, qr_value, mask=full_mask())
+                    normalized = vmuls(normalized, qr_scale, mask=full_mask())
                     vstore(out_write, segment, normalized, full_mask())
                     vstore_pack(
                         bf16_write,
@@ -1536,8 +1527,6 @@ class QaRmsNorm:
         row_tiler = make_tiler((1, q_lora), alignment=(1, VECTOR_SEG))
         gamma_tiler = make_tiler((1, q_lora), alignment=(1, VECTOR_SEG))
         inv_q_lora = 1.0 / dtypes.float32(q_lora)
-        qr_enabled = qr_scale - 1.0 >= SCALE_EPS or 1.0 - qr_scale >= SCALE_EPS
-        qr_value = qr_scale if qr_enabled else 1.0
         mem_copy(self.gamma.next_write(), tile_slice(gamma_gm, gamma_tiler, (0, 0)))
         gamma_read = self.gamma.next_read()
         for token in cannbotdsl.range(start, rows, stride):
@@ -1570,7 +1559,7 @@ class QaRmsNorm:
                     normalized = vmul(
                         normalized, vload(gamma_read, segment), mask=full_mask()
                     )
-                    normalized = vmuls(normalized, qr_value, mask=full_mask())
+                    normalized = vmuls(normalized, qr_scale, mask=full_mask())
                     vstore_pack(
                         out_write,
                         segment,
@@ -1723,7 +1712,7 @@ class KvChain:
         gamma_read,
         kr_read,
         kr_offset,
-        kvr_value,
+        kvr_scale,
         rope_dim,
     ):
         with vf(mode="simd"):
@@ -1737,7 +1726,7 @@ class KvChain:
                     vload(gamma_read, segment * VECTOR_SEG),
                     mask=full_mask(),
                 )
-                normalized = vmuls(normalized, kvr_value, mask=full_mask())
+                normalized = vmuls(normalized, kvr_scale, mask=full_mask())
                 vstore_pack(
                     payload_write,
                     segment * VECTOR_SEG,
@@ -1773,7 +1762,7 @@ class KvChain:
         gamma_read,
         kr_read,
         kr_offset,
-        kvr_value,
+        kvr_scale,
         rope_dim,
     ):
         kr_view = payload_write.reinterpret(
@@ -1805,7 +1794,7 @@ class KvChain:
                         vload(gamma_read, g * GROUP_SIZE + s * VECTOR_SEG),
                         mask=full_mask(),
                     )
-                    normalized = vmuls(normalized, kvr_value, mask=full_mask())
+                    normalized = vmuls(normalized, kvr_scale, mask=full_mask())
                     g_amax = vmax(
                         g_amax,
                         vreduce_max(
@@ -1839,7 +1828,7 @@ class KvChain:
                         vload(gamma_read, g * GROUP_SIZE + s * VECTOR_SEG),
                         mask=full_mask(),
                     )
-                    normalized = vmuls(normalized, kvr_value, mask=full_mask())
+                    normalized = vmuls(normalized, kvr_scale, mask=full_mask())
                     quantized = vdiv(
                         normalized, g_descale, mask=full_mask(), precision_mode=True
                     )
@@ -1880,7 +1869,7 @@ class KvChain:
         gamma_read,
         kr_read,
         kr_offset,
-        kvr_value,
+        kvr_scale,
         rope_dim,
         scale_read,
     ):
@@ -1895,7 +1884,7 @@ class KvChain:
                     vload(gamma_read, segment * VECTOR_SEG),
                     mask=full_mask(),
                 )
-                normalized = vmuls(normalized, kvr_value, mask=full_mask())
+                normalized = vmuls(normalized, kvr_scale, mask=full_mask())
                 scaled = vmul(normalized, scale_vec, mask=full_mask())
                 scaled = vmaxs(scaled, -FP8_MAX, mask=full_mask())
                 scaled = vmins(scaled, FP8_MAX, mask=full_mask())
@@ -1938,7 +1927,7 @@ class KvChain:
         gamma_read,
         kr_read,
         kr_offset,
-        kvr_value,
+        kvr_scale,
         rope_dim,
         scale_read,
     ):
@@ -1953,7 +1942,7 @@ class KvChain:
                     vload(gamma_read, segment * VECTOR_SEG),
                     mask=full_mask(),
                 )
-                normalized = vmuls(normalized, kvr_value, mask=full_mask())
+                normalized = vmuls(normalized, kvr_scale, mask=full_mask())
                 scaled = vmul(normalized, scale_vec, mask=full_mask())
                 scaled = vmaxs(scaled, -HIF8_MAX, mask=full_mask())
                 scaled = vmins(scaled, HIF8_MAX, mask=full_mask())
@@ -2010,8 +1999,6 @@ class KvChain:
     ):
         row_tiler = make_tiler((1, kvr), alignment=(1, VECTOR_SEG))
         rope_dim = kvr - VECTOR_KV_LORA
-        kvr_enabled = kvr_scale - 1.0 >= SCALE_EPS or 1.0 - kvr_scale >= SCALE_EPS
-        kvr_value = kvr_scale if kvr_enabled else 1.0
         is_hif8_quant = scale_gm is not None and cache.dtype == dtypes.uint8
         is_fp8_tensor_quant = scale_gm is not None and (not is_hif8_quant)
         is_fp8_group_quant = scale_gm is None and cache.dtype == dtypes.float8_e4m3fn
@@ -2037,7 +2024,7 @@ class KvChain:
                     gamma_read,
                     row_read,
                     VECTOR_KV_LORA,
-                    kvr_value,
+                    kvr_scale,
                     rope_dim,
                     scale_read,
                 )
@@ -2053,7 +2040,7 @@ class KvChain:
                     gamma_read,
                     row_read,
                     VECTOR_KV_LORA,
-                    kvr_value,
+                    kvr_scale,
                     rope_dim,
                     scale_read,
                 )
@@ -2069,7 +2056,7 @@ class KvChain:
                     gamma_read,
                     row_read,
                     VECTOR_KV_LORA,
-                    kvr_value,
+                    kvr_scale,
                     rope_dim,
                 )
                 payload_read = self.payload_q.next_read()
@@ -2084,7 +2071,7 @@ class KvChain:
                     gamma_read,
                     row_read,
                     VECTOR_KV_LORA,
-                    kvr_value,
+                    kvr_scale,
                     rope_dim,
                 )
                 payload_read = self.payload.next_read()
@@ -2113,8 +2100,6 @@ class KvChain:
     ):
         row_tiler = make_tiler((1, kvr), alignment=(1, VECTOR_SEG))
         rope_dim = kvr - VECTOR_KV_LORA
-        kvr_enabled = kvr_scale - 1.0 >= SCALE_EPS or 1.0 - kvr_scale >= SCALE_EPS
-        kvr_value = kvr_scale if kvr_enabled else 1.0
         is_hif8_quant = scale_gm is not None and cache.dtype == dtypes.uint8
         is_fp8_tensor_quant = scale_gm is not None and (not is_hif8_quant)
         is_fp8_group_quant = scale_gm is None and cache.dtype == dtypes.float8_e4m3fn
@@ -2143,7 +2128,7 @@ class KvChain:
                     gamma_read,
                     self.rope.out,
                     0,
-                    kvr_value,
+                    kvr_scale,
                     rope_dim,
                     scale_read,
                 )
@@ -2159,7 +2144,7 @@ class KvChain:
                     gamma_read,
                     self.rope.out,
                     0,
-                    kvr_value,
+                    kvr_scale,
                     rope_dim,
                     scale_read,
                 )
@@ -2175,7 +2160,7 @@ class KvChain:
                     gamma_read,
                     self.rope.out,
                     0,
-                    kvr_value,
+                    kvr_scale,
                     rope_dim,
                 )
                 payload_read = self.payload_q.next_read()
@@ -2190,7 +2175,7 @@ class KvChain:
                     gamma_read,
                     self.rope.out,
                     0,
-                    kvr_value,
+                    kvr_scale,
                     rope_dim,
                 )
                 payload_read = self.payload.next_read()
@@ -4901,8 +4886,6 @@ class GlobalSplitFront:
         scalar = Buffer(MemLoc.UB, dtypes.float32, make_layout((1, 16)))
         mem_copy(gamma_channel.next_write(), tile_slice(gamma, row_tiler, (0, 0)))
         gamma_read = gamma_channel.next_read()
-        qr_enabled = scale - 1.0 >= SCALE_EPS or 1.0 - scale >= SCALE_EPS
-        qr_value = scale if qr_enabled else 1.0
         for token in cannbotdsl.range(block * 2 + subblock, tokens, blocks * 2):
             mem_copy(left_channel.next_write(), tile_slice(raw, row_tiler, (token, 0)))
             mem_copy(
@@ -4970,7 +4953,7 @@ class GlobalSplitFront:
                     normalized = vmul(
                         normalized, vload(gamma_read, offset), mask=full_mask()
                     )
-                    normalized = vmuls(normalized, qr_value, mask=full_mask())
+                    normalized = vmuls(normalized, scale, mask=full_mask())
                     packed = vcast(
                         normalized,
                         dtypes.bfloat16,
@@ -5984,11 +5967,11 @@ def _launch(
     return (q_root[: meta.tokens], descale, qr)
 
 
-def _validate_device_values(cache_index, quant_scale_kv, cache_capacity):
-    """Eager value checks synchronize small inputs to CPU before any Cache write.
+def _validate_quant_scale_value(quant_scale_kv):
+    """Check the optional quantization scale in Eager before any Cache write.
 
-    Checked dispatch is not capturable. Public graph/Native callers validate
-    values before capture and preserve that contract on every replay.
+    This check reads the scale back to CPU. Graph callers guarantee its value
+    outside capture/replay. Cache index values are always caller-validated.
     """
     if torch.npu.is_current_stream_capturing():
         raise RuntimeError(
@@ -5997,18 +5980,8 @@ def _validate_device_values(cache_index, quant_scale_kv, cache_capacity):
         )
     if quant_scale_kv is not None:
         scale = quant_scale_kv.detach().cpu().item()
-        if not math.isfinite(scale) or scale <= 0:
-            raise ValueError("quant_scale_kv must be finite and positive")
-    indices = cache_index.detach().cpu().tolist()
-    valid_indices = set()
-    for index in indices:
-        if index < 0:
-            continue
-        if index >= cache_capacity:
-            raise ValueError("cache_index exceeds Cache capacity")
-        if index in valid_indices:
-            raise ValueError("cache_index contains duplicate valid indices")
-        valid_indices.add(index)
+        if not math.isfinite(scale) or scale < 0:
+            raise ValueError("quant_scale_kv must be finite and non-negative")
 
 
 # Direct Python entry: fixed (q, descale_q, qr) slots; kv_cache is mutated in place.
@@ -6264,7 +6237,7 @@ def mla_prolog_npu(
     rope_mode: int = 1,
     return_qr: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Checked Eager dispatch; device-value readback precedes the DSL launch."""
+    """Eager dispatch checks quantization scale; index values are caller-owned."""
     _validate_schema_modes(qkv_quant_mode, cache_mode, rope_mode)
     _validate(
         x,
@@ -6287,9 +6260,7 @@ def mla_prolog_npu(
         rope_mode,
         return_qr,
     )
-    _validate_device_values(
-        cache_index, quant_scale_kv, kv_cache.shape[0] * kv_cache.shape[1]
-    )
+    _validate_quant_scale_value(quant_scale_kv)
     return mla_prolog_native(
         x,
         wqa,
@@ -6469,9 +6440,10 @@ def mla_prolog(
 
     The schema serializes the three enums as integers. Cache mutation is
     declared by Tensor(a!); this entry does not clone or return Cache.
-    Eager value checks synchronize index/scale to CPU. Manual capture and
-    torch.compile use asynchronous graph dispatch; the caller must validate
-    device values outside capture/replay. No validation result is cached.
+    Cache index values are not read back or checked; callers guarantee valid
+    indices in every execution mode. Eager checks quant_scale_kv on CPU.
+    Manual capture and torch.compile use asynchronous graph dispatch; callers
+    guarantee scale validity outside capture/replay. No result is cached.
     """
     _validate_mode_enums(qkv_quant_mode, cache_mode, rope_mode)
     if type(return_qr) is not bool:

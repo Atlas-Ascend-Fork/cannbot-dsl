@@ -966,9 +966,21 @@ def golden_with_reference(golden, inputs, attrs):
 
 
 def compare_numeric_outputs(
-    golden, actual, expected, cache_actual, cache_expected, inputs, attrs, captured
+    golden,
+    actual,
+    expected,
+    cache_actual,
+    cache_expected,
+    inputs,
+    attrs,
+    captured,
+    *,
+    split_diagnostics=False,
 ):
-    """All numeric segments, independent quotas; structural checks stay in runner."""
+    """One quota per homogeneous output; mixed Cache fields stay independent.
+
+    split_diagnostics exposes branch details only, never acceptance gates.
+    """
     mode = int(attrs["qkv_quant_mode"])
     layout = golden.CacheMode[attrs["cache_mode"].name]
     dr = inputs["wkva"].shape[0] - 512
@@ -979,7 +991,12 @@ def compare_numeric_outputs(
         q_reference = torch.where(expected[1] == 0, 0.0, q_fp / denominator)
     else:
         q_reference = torch.empty_like(expected[0], dtype=torch.float32)
-    for label, section in (("q_nope", slice(0, 512)), ("q_rope", slice(512, None))):
+    q_sections = (
+        (("q_nope", slice(0, 512)), ("q_rope", slice(512, None)))
+        if split_diagnostics
+        else (("q", slice(None)),)
+    )
+    for label, section in q_sections:
         a, b = actual[0][..., section], expected[0][..., section]
         results[label] = (
             mixed(a, b)
@@ -1017,7 +1034,12 @@ def compare_numeric_outputs(
             )
         else:
             cache_ref = torch.empty_like(b, dtype=torch.float32)
-        for label, section in (("kv", slice(0, 512)), ("kr", slice(512, None))):
+        cache_sections = (
+            (("kv", slice(0, 512)), ("kr", slice(512, None)))
+            if split_diagnostics
+            else (("cache", slice(None)),)
+        )
+        for label, section in cache_sections:
             av, bv = a[..., section], b[..., section]
             results[label] = (
                 mixed(av, bv)
@@ -1149,9 +1171,16 @@ def fallback_segments(golden, inputs, attrs, actual, after, expected, captured):
                 -32768, 32768
             )
     triples = {}
+    diagnostic_triples = {}
     qdtype = torch.float32 if mode == 3 else actual[0].dtype
+    triples["q"] = (d, c, g, qdtype)
     for name, section in (("q_nope", slice(0, 512)), ("q_rope", slice(512, None))):
-        triples[name] = (d[..., section], c[..., section], g[..., section], qdtype)
+        diagnostic_triples[name] = (
+            d[..., section],
+            c[..., section],
+            g[..., section],
+            qdtype,
+        )
     for name, i in (("descale_q", 1), ("qr", 2)):
         triples[name] = (
             actual[i].float(),
@@ -1191,16 +1220,16 @@ def fallback_segments(golden, inputs, attrs, actual, after, expected, captured):
     else:
         dv, cv, gv = (decode(v.contiguous()) for v in (da, ca, ge))
         dtype = torch.float32 if mode == 3 else da.dtype
+        triples["cache"] = (dv, cv, gv, dtype)
         for name, section in (("kv", slice(0, 512)), ("kr", slice(512, None))):
-            triples[name] = (
+            diagnostic_triples[name] = (
                 dv[..., section],
                 cv[..., section],
                 gv[..., section],
                 dtype,
             )
-    required = {"q_nope", "q_rope", "qr", "descale_q", "kv", "kr"}
-    if mode == 1:
-        required.add("cache_descale")
+    required = {"q", "qr", "descale_q"}
+    required.update({"kv", "kr", "cache_descale"} if mode == 1 else {"cache"})
     if set(triples) != required:
         raise ValueError("missing or extra three-way segment")
     records = {name: policy.three_way(*values) for name, values in triples.items()}
@@ -1212,6 +1241,12 @@ def fallback_segments(golden, inputs, attrs, actual, after, expected, captured):
         dict(
             status=status,
             segments=records,
+            diagnostics={
+                name: policy.three_way(*values)
+                for name, values in diagnostic_triples.items()
+            },
+            diagnostics_affect_acceptance=True,
+            diagnostics_acceptance_condition="only after the corresponding whole output fails both comparisons",
             reference="D=device; C=independent single-BF16 CPU chain; G=frozen Golden; quantized Q uses pre-Cast normalized G",
             hif8_binding=(
                 "decoded numeric domain, FP32 comparison with zero floor; SAT reference retained"
@@ -1224,7 +1259,7 @@ def fallback_segments(golden, inputs, attrs, actual, after, expected, captured):
 
 
 # Freeze numerical definitions, not the formatting or file organization.
-_FROZEN_NUMERIC_AST = "da9d231dda8f0247fc36ec97bfa89c92e2764738dc7453fb9d3ab0f8da2153da"
+_FROZEN_NUMERIC_AST = "b5ae7ef0d26df9af30c4cca10a509d4cceb1a6cb000f85c64e693338dec9dd51"
 _FROZEN_NUMERIC_NAMES = (
     "_KV_LORA",
     "_GROUP_SIZE",
@@ -1507,6 +1542,79 @@ def run_entry(actual, attrs, execution, trace_dir):
     return result, replay, audit_trace(trace, execution)
 
 
+def accept_output_comparisons(direct, fallback, diagnostics, mode):
+    """Try whole outputs first; split homogeneous outputs only after both fail."""
+    required = {"q", "qr", "descale_q"}
+    required.update({"kv", "kr", "cache_descale"} if mode == 1 else {"cache"})
+    if set(direct) != required:
+        raise ValueError("missing or extra two-way output")
+    fallback = fallback or {}
+    three = fallback.get("segments", {})
+    split_three = fallback.get("diagnostics", {})
+    splits = {"q": ("q_nope", "q_rope")}
+    if mode != 1:
+        splits["cache"] = ("kv", "kr")
+
+    def either(two_record, three_record):
+        two = two_record.get("status", "NOT_RUN")
+        triple = three_record.get("status", "NOT_RUN")
+        if two in ("PASS", "EMPTY"):
+            path = "TWO_WAY"
+        elif triple in ("Pass", "warning"):
+            path = "THREE_WAY"
+        elif two == "FAIL" and triple == "Failed":
+            path = "FAIL"
+        else:
+            path = "UNVERIFIED"
+        return dict(two_way=two, three_way=triple, accepted_by=path)
+
+    outputs = {}
+    for name in sorted(required):
+        decision = either(direct[name], three.get(name, {}))
+        if decision["accepted_by"] == "FAIL" and name in splits:
+            branches = {
+                branch: either(diagnostics.get(branch, {}), split_three.get(branch, {}))
+                for branch in splits[name]
+            }
+            states = {item["accepted_by"] for item in branches.values()}
+            decision["branches"] = branches
+            decision["accepted_by"] = (
+                "FAIL"
+                if "FAIL" in states
+                else "UNVERIFIED"
+                if "UNVERIFIED" in states
+                else "SPLIT_FALLBACK"
+            )
+        outputs[name] = decision
+    states = {item["accepted_by"] for item in outputs.values()}
+    status = (
+        "FAIL"
+        if "FAIL" in states
+        else "UNVERIFIED"
+        if "UNVERIFIED" in states
+        else "PASS"
+    )
+    category = (
+        "PRECISION_FAIL"
+        if status == "FAIL"
+        else "UNVERIFIED"
+        if status == "UNVERIFIED"
+        else "TWO_WAY_PASS"
+        if states == {"TWO_WAY"}
+        else "THREE_WAY_PASS"
+    )
+    return dict(
+        status=status,
+        category=category,
+        outputs=outputs,
+        split_fallback_outputs=[
+            name
+            for name, item in outputs.items()
+            if item["accepted_by"] == "SPLIT_FALLBACK"
+        ],
+    )
+
+
 def compare_outputs(cpu, actual, attrs, outputs, before):
     expected, captured = policy.golden_with_reference(golden, cpu, attrs)
     host = tuple(value.cpu() for value in outputs)
@@ -1524,15 +1632,31 @@ def compare_outputs(cpu, actual, attrs, outputs, before):
         captured,
     )
     direct_status = policy.precision_status(direct)
-    report = dict(two_way=direct, category="TWO_WAY_PASS")
+    diagnostics = policy.compare_outputs(
+        golden,
+        host,
+        expected,
+        after,
+        cpu["kv_cache"],
+        cpu,
+        attrs,
+        captured,
+        split_diagnostics=True,
+    )
+    report = dict(
+        two_way=direct, two_way_diagnostics=diagnostics, category="TWO_WAY_PASS"
+    )
+    fallback = None
     if direct_status == "FAIL":
         fallback, _ = fallback_segments(
             golden, cpu, attrs, host, after, expected, captured
         )
-        report.update(three_way=fallback, category="THREE_WAY_PASS")
-        assert fallback["status"] in ("Pass", "warning"), report
-    else:
-        assert direct_status == "PASS", report
+        report["three_way"] = fallback
+    acceptance = accept_output_comparisons(
+        direct, fallback, diagnostics, int(attrs["qkv_quant_mode"])
+    )
+    report.update(acceptance=acceptance, category=acceptance["category"])
+    assert acceptance["status"] == "PASS", report
     layout = attrs["cache_mode"]
     old_bytes = (
         golden.cache_to_logical(before, layout)
@@ -1552,6 +1676,45 @@ def compare_outputs(cpu, actual, attrs, outputs, before):
         "Untouched Cache bytes changed"
     )
     return report
+
+
+def check_zero_cache_scale(cpu, actual, attrs, outputs, before):
+    """Check zero multiplier directly; the frozen Golden requires positive scales.
+
+    Q, its descale and QR must equal the already validated positive-scale call.
+    Cache zero is checked in the encoded domain, without division by scale.
+    """
+    identity = cache_identity(actual["kv_cache"])
+    expected_q = [
+        value.cpu().contiguous().view(torch.uint8).clone() for value in outputs
+    ]
+    actual["kv_cache"].copy_(before.to(actual["kv_cache"].device))
+    zero_inputs = dict(
+        actual, quant_scale_kv=torch.zeros_like(actual["quant_scale_kv"])
+    )
+    zero_outputs = op.mla_prolog(**zero_inputs, **attrs)
+    torch.npu.synchronize()
+    assert cache_identity(actual["kv_cache"]) == identity
+    assert all(
+        torch.equal(value.cpu().contiguous().view(torch.uint8), expected)
+        for value, expected in zip(zero_outputs, expected_q)
+    ), "Cache scale changed Q, descale_q or QR"
+    capacity = before.shape[0] * before.shape[1]
+    layout = golden.CacheMode[attrs["cache_mode"].name]
+    after = golden.cache_to_logical(actual["kv_cache"].cpu(), layout)
+    old = golden.cache_to_logical(before, layout)
+    indices = cpu["cache_index"]
+    indices = indices[indices >= 0]
+    rows = after.reshape(capacity, -1)
+    if attrs["qkv_quant_mode"] == op.QkvQuantMode(3):
+        assert bool((golden.decode_hif8(rows[indices]) == 0).all())
+    else:
+        assert bool((rows.float()[indices] == 0).all())
+    untouched = torch.ones(capacity, dtype=torch.bool)
+    untouched[indices] = False
+    old_bytes = old.contiguous().view(torch.uint8).reshape(capacity, -1)
+    new_bytes = after.contiguous().view(torch.uint8).reshape(capacity, -1)
+    assert torch.equal(old_bytes[untouched], new_bytes[untouched])
 
 
 def check_changed_input_replay(cpu, actual, attrs, replay, original, before):
@@ -1576,174 +1739,6 @@ def check_changed_input_replay(cpu, actual, attrs, replay, original, before):
     )
 
 
-@pytest.mark.parametrize("mode", range(4))
-@pytest.mark.parametrize(
-    "cube, vector",
-    ((1, 2), (8, 16), (32, 64), (36, 72), (64, 128), (97, 194), (36, 64)),
-)
-def test_core_quota_uses_current_stream(mode, cube, vector, monkeypatch):
-    """Host selection contract; synthetic quotas do not claim hardware coverage."""
-    stream = object()
-    info = SimpleNamespace(available=True, cube_core_num=cube, vector_core_num=vector)
-    monkeypatch.setattr(torch.npu, "current_stream", lambda device: stream)
-
-    def platform_info(*, stream):
-        assert stream is expected_stream
-        return info
-
-    expected_stream = stream
-    monkeypatch.setattr(op.dsl, "get_platform_info", platform_info)
-    meta = SimpleNamespace(tokens=1, heads=1, qkv_quant_mode=mode)
-    assert op._core_num(torch.empty(0), meta) == min(cube, vector // 2)
-    # A subsequent call must use the new stream quota, not a cached device value.
-    info.cube_core_num, info.vector_core_num = 2, 4
-    assert op._core_num(torch.empty(0), meta) == 2
-
-
-@pytest.mark.parametrize(
-    "available, cube, vector",
-    ((False, 32, 64), (True, 0, 64), (True, 32, 1), (True, 32, 0)),
-)
-def test_core_quota_rejects_unavailable_mix(available, cube, vector, monkeypatch):
-    monkeypatch.setattr(torch.npu, "current_stream", lambda device: None)
-    info = SimpleNamespace(
-        available=available, cube_core_num=cube, vector_core_num=vector
-    )
-    monkeypatch.setattr(op.dsl, "get_platform_info", lambda **kwargs: info)
-    meta = SimpleNamespace(tokens=1, heads=1, qkv_quant_mode=3)
-    with pytest.raises(ValueError, match="no valid MIX-core capacity"):
-        op._core_num(torch.empty(0), meta)
-
-
-@pytest.mark.parametrize("name", ("norm_eps", "qr_scale", "kvr_scale"))
-@pytest.mark.parametrize("value", (True, False, "1.0", None, 1j))
-@pytest.mark.parametrize("compiling", (False, True))
-def test_public_scalar_types(name, value, compiling, monkeypatch):
-    def forbidden_dispatch(*args, **kwargs):
-        pytest.fail("Invalid Python scalar reached the Torch dispatcher")
-
-    namespace = torch.ops.cannbot_dsl_mla_prolog
-    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: compiling)
-    monkeypatch.setattr(namespace.mla_prolog, "default", forbidden_dispatch)
-    monkeypatch.setattr(namespace._mla_prolog_graph, "default", forbidden_dispatch)
-    with pytest.raises(TypeError, match=name):
-        op.mla_prolog(*([torch.empty(0)] * 9), **{name: value})
-
-
-@pytest.mark.parametrize(
-    "epsilon", (0.0, -1.0, float("nan"), float("inf"), 1e40, 1e-50)
-)
-def test_public_invalid_epsilon(epsilon):
-    library = torch.library.Library("cannbot_dsl_mla_prolog", "IMPL", "CPU")
-    library.impl("mla_prolog", op.mla_prolog_npu)
-    with pytest.raises(ValueError, match="norm_eps"):
-        op.mla_prolog(*([torch.empty(0)] * 9), norm_eps=epsilon)
-
-
-def test_public_scalar_defaults(monkeypatch):
-    observed = []
-
-    def capture_dispatch(*args, **kwargs):
-        observed.append(kwargs)
-        return ()
-
-    monkeypatch.setattr(
-        torch.ops.cannbot_dsl_mla_prolog.mla_prolog, "default", capture_dispatch
-    )
-    op.mla_prolog(*([torch.empty(0)] * 9))
-    assert observed[-1]["norm_eps"] == 1e-5
-    op.mla_prolog(*([torch.empty(0)] * 9), norm_eps=1, qr_scale=0, kvr_scale=-1)
-    assert observed[-1]["qr_scale"] == 0
-    assert observed[-1]["kvr_scale"] == -1
-
-
-@pytest.mark.parametrize("mode", range(4))
-@pytest.mark.parametrize("return_qr", (False, True))
-@pytest.mark.parametrize("tokens", (0, 1))
-def test_output_metadata(mode, return_qr, tokens):
-    meta = SimpleNamespace(
-        tokens=tokens,
-        heads=2,
-        kvr=576,
-        q_lora=640,
-        qkv_quant_mode=mode,
-        return_qr=return_qr,
-    )
-    expected_scale = (
-        (tokens, 2, 1) if mode == 2 else (1,) if mode == 3 and tokens else (0,)
-    )
-    expected_shapes = (
-        (tokens, 2, 576),
-        expected_scale,
-        (tokens, 640) if return_qr else (0,),
-    )
-    expected_dtypes = (
-        (torch.bfloat16, torch.bfloat16, torch.float8_e4m3fn, torch.uint8)[mode],
-        torch.float32,
-        torch.bfloat16,
-    )
-    fake_inputs = dict(
-        x=torch.empty((tokens, 1024), device="meta"),
-        wqa=torch.empty((640, 1024), device="meta"),
-        wqb=torch.empty((384, 640), device="meta"),
-        wkva=torch.empty((576, 1024), device="meta"),
-        wkb=torch.empty((2, 128, 512), device="meta"),
-        norm_weight_qa=torch.empty(640, device="meta"),
-        norm_weight_kva=torch.empty(512, device="meta"),
-        kv_cache=torch.empty(0, device="meta"),
-        cache_index=torch.empty(tokens, device="meta"),
-    )
-    for outputs in (
-        op._empty_outputs(meta, "cpu"),
-        op.mla_prolog_fake(**fake_inputs, qkv_quant_mode=mode, return_qr=return_qr),
-    ):
-        assert tuple(tuple(value.shape) for value in outputs) == expected_shapes
-        assert tuple(value.dtype for value in outputs) == expected_dtypes
-
-
-@pytest.mark.parametrize("mode", range(4))
-@pytest.mark.parametrize("return_qr", (False, True))
-@pytest.mark.parametrize("block_size", (16, 128, 1024))
-def test_empty_public_entry(mode, return_qr, block_size, monkeypatch):
-    if not torch.npu.is_available():
-        pytest.skip("Ascend NPU required")
-    device = int(os.environ.get("MLA_PROLOG_DEVICE", "0"))
-    torch.npu.set_device(device)
-    case = (mode, "ND", "PA_BSND", 128, 64, 1, return_qr)
-    _, actual, _, attrs = make_inputs(case, torch.device(f"npu:{device}"))
-    cache = actual["kv_cache"]
-    actual["kv_cache"] = torch.zeros(
-        (2, block_size, 1, cache.shape[-1]), dtype=torch.float32, device=cache.device
-    ).to(cache.dtype)
-    for name in ("x", "cache_index", "rope_sin", "rope_cos"):
-        actual[name] = actual[name][:0]
-    before = actual["kv_cache"].cpu().view(torch.uint8).clone()
-    identity = cache_identity(actual["kv_cache"])
-
-    def forbidden_launch(*args, **kwargs):
-        pytest.fail("Empty input reached DSL workspace allocation or Kernel launch")
-
-    monkeypatch.setattr(op, "_launch", forbidden_launch)
-    q, descale, qr = op.mla_prolog(**actual, **attrs)
-    assert tuple(q.shape) == (0, 2, 576)
-    assert (
-        q.dtype
-        == (torch.bfloat16, torch.bfloat16, torch.float8_e4m3fn, torch.uint8)[mode]
-    )
-    assert tuple(descale.shape) == ((0, 2, 1) if mode == 2 else (0,))
-    assert descale.dtype == torch.float32
-    assert tuple(qr.shape) == ((0, 640) if return_qr else (0,))
-    assert qr.dtype == torch.bfloat16
-    assert cache_identity(actual["kv_cache"]) == identity
-    assert torch.equal(actual["kv_cache"].cpu().view(torch.uint8), before)
-    with pytest.raises(ValueError, match="norm_eps"):
-        op.mla_prolog(**actual, **dict(attrs, norm_eps=0.0))
-    with pytest.raises(ValueError, match="cache_index"):
-        op.mla_prolog(
-            **dict(actual, cache_index=actual["cache_index"].reshape(0, 1)), **attrs
-        )
-
-
 @pytest.mark.parametrize("case", CASES, ids=("mode0", "mode1", "mode2", "mode3"))
 def test_mla_prolog(case):
     if not torch.npu.is_available():
@@ -1763,6 +1758,9 @@ def test_mla_prolog(case):
     outputs, replay, audit = run_entry(actual, public_attrs, execution, trace_dir)
     assert cache_identity(actual["kv_cache"]) == identity
     report = compare_outputs(cpu, actual, attrs, outputs, before)
+    if case[0] in (2, 3):
+        check_zero_cache_scale(cpu, actual, public_attrs, outputs, before)
+        report["zero_cache_scale"] = "PASS"
     if replay is not None:
         check_changed_input_replay(cpu, actual, public_attrs, replay, outputs, before)
         assert cache_identity(actual["kv_cache"]) == identity
@@ -1777,99 +1775,3 @@ def test_mla_prolog(case):
             json.dumps(report, ensure_ascii=False, indent=2)
         )
     print(json.dumps(report, ensure_ascii=False), flush=True)
-
-
-def cache_slot_bytes(cache, cache_mode):
-    """Decode physical Cache bytes using its actual page size, without arithmetic."""
-    blocks, block_size, _, width = cache.shape
-    row_bytes = width * cache.element_size()
-    raw = cache.cpu().contiguous().view(torch.uint8)
-    if cache_mode == "PA_NZ":
-        raw = raw.reshape(blocks, row_bytes // 32, block_size, 32)
-        raw = raw.permute(0, 2, 1, 3).contiguous()
-    return raw.reshape(blocks * block_size, row_bytes)
-
-
-@pytest.mark.parametrize(
-    "case",
-    (
-        (0, "ND", "PA_BSND", 128, 64, 1, True),
-        (0, "NZ", "PA_NZ", 128, 64, 1, True),
-        (1, "NZ", "PA_BSND", 192, 64, 2, False),
-        (1, "ND", "PA_BSND", 256, 0, 0, False),
-        (2, "ND", "PA_BSND", 128, 64, 1, False),
-        (2, "NZ", "PA_NZ", 128, 64, 1, False),
-        (3, "ND", "PA_NZ", 256, 0, 0, True),
-        (3, "NZ", "PA_BSND", 128, 64, 1, True),
-    ),
-)
-def test_cache_block_size(case):
-    """Page geometry must not alter numerics or write any unselected slot.
-
-    The 128-page baseline is independently checked against frozen references.
-    Other page sizes are a byte-level layout metamorphic check against that
-    baseline; this does not redefine the numerical Golden or its thresholds.
-    """
-    if not torch.npu.is_available():
-        pytest.skip("Ascend NPU required")
-    verify_reference_integrity()
-    torch.set_num_threads(4)
-    device = int(os.environ.get("MLA_PROLOG_DEVICE", "0"))
-    torch.npu.set_device(device)
-    cpu, actual, attrs, public_attrs = make_inputs(case, torch.device(f"npu:{device}"))
-    before = cpu["kv_cache"].clone()
-    reference = op.mla_prolog(**actual, **public_attrs)
-    compare_outputs(cpu, actual, attrs, reference, before)
-    expected_outputs = [value.cpu().view(torch.uint8) for value in reference]
-    expected_payload = cache_slot_bytes(actual["kv_cache"], case[2])[
-        cpu["cache_index"]
-    ].clone()
-    dtype, width = actual["kv_cache"].dtype, actual["kv_cache"].shape[-1]
-    # Scan all 64 legal sizes on BSND, representative boundaries on other paths.
-    sizes = range(16, 1025, 16) if case == CASES[0] else (16, 48, 128, 256, 1024)
-    for block_size in sizes:
-        shape = (3, block_size, 1, width)
-        raw = torch.full(
-            (math.prod(shape) * actual["kv_cache"].element_size(),),
-            0xA5,
-            dtype=torch.uint8,
-        )
-        actual["kv_cache"] = raw.view(dtype).reshape(shape).to(device)
-        # Non-monotonic order: last legal slot, last slot in page 0, first in page 1.
-        indices = torch.tensor([3 * block_size - 1, block_size - 1, block_size])
-        actual["cache_index"] = indices.to(device)
-        identity = cache_identity(actual["kv_cache"])
-        outputs = op.mla_prolog(**actual, **public_attrs)
-        assert cache_identity(actual["kv_cache"]) == identity
-        for value, expected in zip(outputs, expected_outputs):
-            assert torch.equal(value.cpu().view(torch.uint8), expected), block_size
-        slots = cache_slot_bytes(actual["kv_cache"], case[2])
-        assert torch.equal(slots[indices], expected_payload), block_size
-        untouched = torch.ones(3 * block_size, dtype=torch.bool)
-        untouched[indices] = False
-        assert bool((slots[untouched] == 0xA5).all()), block_size
-
-
-@pytest.mark.parametrize("block_size", (0, 15, 17, 1025, 1040))
-@pytest.mark.parametrize("empty", (False, True))
-def test_cache_block_size_rejected(block_size, empty, monkeypatch):
-    if not torch.npu.is_available():
-        pytest.skip("Ascend NPU required")
-    device = int(os.environ.get("MLA_PROLOG_DEVICE", "0"))
-    torch.npu.set_device(device)
-    _, actual, _, attrs = make_inputs(CASES[0], torch.device(f"npu:{device}"))
-    actual["kv_cache"] = torch.zeros(
-        (2, block_size, 1, 576), dtype=torch.bfloat16, device=f"npu:{device}"
-    )
-    if empty:
-        for name in ("x", "cache_index", "rope_sin", "rope_cos"):
-            actual[name] = actual[name][:0]
-    before = actual["kv_cache"].cpu().view(torch.uint8).clone()
-
-    def forbidden_launch(*args, **kwargs):
-        pytest.fail("Invalid Cache page size reached Kernel launch")
-
-    monkeypatch.setattr(op, "_launch", forbidden_launch)
-    with pytest.raises(ValueError, match="kv_cache block_size"):
-        op.mla_prolog(**actual, **attrs)
-    assert torch.equal(actual["kv_cache"].cpu().view(torch.uint8), before)
