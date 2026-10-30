@@ -1,575 +1,433 @@
-# Quant MLA Prolog AW1 BF16 / MXFP8
+# quant_mla_prolog
 
-## 当前框架适配：gcbe9dba
+## 支持规格
 
-当前适配目标为 CANNBot-DSL + OpKit。
-本次核验现有 K3 group 的源码兼容性；MegaMoE 不纳入本轮。
-已兼容新包的算子不修改源码，测试结果以完成后的日志为准。
-沿用 `simd` 向量 API、单 MixKernel 与现有 Torch 图注册。
-2026-09-24 本算子自身测试在新包上完成 `57 passed`，包括 C0/C1 的四条网络 case；
-同轮 `commit_recurrent_kda_replayssm` 测试完成 `113 passed`。其余 K3 的整组验证
-按要求停止，不能据此声明全组已通过。
-本轮不重新编包，下面 Native/入图/性能数据均注明历史框架版本，不能视为 gcbe9dba 的实测结果。
+| 参数 | 范围 |
+| --- | --- |
+| CANNBot-DSL | 0.8.0 |
+| CANN | 9.2.1 |
+| dim | 1024～8192，256 对齐 |
+| q_lora | 640、1024、1536、2048 |
+| kv_lora | 512 |
+| N | 1～128 |
+| (Dn,Dr) | (128,64)、(192,64)、(256,0) |
+| 输入量化 | MXFP8 E4M3FN + E8M0 descale，或 HiF8 + FP32 descale |
+| 权重 | 三路投影权重统一 ND 或统一真实 NZ；wkb 为 ND BF16 |
+| 输出模式 | 0/1/2/3；mode 1 仅 PA_BSND，其余支持 PA_BSND/PA_NZ |
+| Cache | block_number>0；block_size=16～1024，16 对齐；负 index 跳过写入；调用方保证非负 index 在容量内且唯一 |
+| 空输入 | T=0 无 Kernel 启动；返回固定四个 Tensor 槽位 |
 
-## 历史验证：gff410b6
+## 算子接口
 
-当前目标为 CANNBot-DSL + OpKit。
-新框架的寄存器向量区间使用 `vf(mode="simd")`，不再接受 `raw/raw_reg`。
-本次补齐输入补齐路径 `_MlaInputPadUnit.pad` 的残留 `raw`；全部 7 处 VF 区间
-统一使用 `simd`。量化公式、单 MixKernel、动态 T/core/cache 策略及 Torch/图注册
-保持原有语义。
-
-2026-09-24 在该新包上重新执行：
-
-```bash
-python -m pytest -q test/quant_mla_prolog/test_quant_mla_prolog.py -k "not bf16"
-```
-
-结果：`49 passed, 8 deselected`。四条 C1 网络 case（T=8/32/64/128）的精度与
-固定工作区污染恢复测试通过。重新导出的 Native wheel 在 `require` 模式完成
-以下验收，全部命中包内二进制：
-
-- 四条网络 case × 1～32 AIC × eager/ACLGraph/npugraph_ex × 10 次，共 3,840 次检查通过；AIC:AIV=1:2。
-- `blocks=261/804/6657` 在 7/32 AIC 的三种模式通过，cache 页数不作为精确 Native 模板键。
-- 原始网络脚本仅移除 FA 的 Prolog 片段，eager、ACLGraph、npugraph_ex 均通过；更换输入和 cache slot 后，回放结果与 eager 严格一致。
-- 三份故障 PT 各 200 轮固定工作区污染恢复无 NaN/Inf；按既定网络相对 L2/余弦标准通过。rank18 的严格逐元素 Q 诊断仍有 0.110994% 超差，反量化相对 L2 为 0.289306%，与旧基线一致，非 CPU 逐位一致。
-- 本轮选取的 15 项 Native 验证全部通过，不代表完整 nightly、C0、大 T 或含 FA 整网的重新验收。
-
-msprof 单 MixKernel 耗时：32 AIC / 64 AIV，C1，npugraph_ex，预热后各采样
-20 次。以下是设备 kernel 耗时，不是冷启动或 Python 端到端耗时。
-
-| B，S=8 | T | 平均耗时（μs） | 中位数（μs） |
-| --- | --- | --- | --- |
-| 1 | 8 | 34.966 | 34.870 |
-| 4 | 32 | 41.806 | 41.778 |
-| 8 | 64 | 50.687 | 50.642 |
-| 16 | 128 | 66.962 | 66.987 |
-
-采样区间无整块 KV cache TensorMove。默认图后端仍有 index ForeachCopy，
-T64/128 仍有输入 x 的 TensorMove，不能描述为整张图完全无拷贝。
-切换框架后需要重新导出 Native 二进制；新 wheel 内仍为五个 T 区间 × C0/C1
-共十个变体，实际 T、core 数和 cache 页数保持运行时传入。
-
-## 历史验证：g1120db9
-
-
-> **上一轮适配框架**：CANNBot-DSL 与 OpKit。
-> 下文标注 `92af3529` 的结果属于旧框架的历史验证，不代表新框架的验收结果。
-> Native collector 使用 `cannbotdsl.aot.export`；旧的注册接口不适用于
-> 该拆包版本。实现使用 CANNBot-DSL 的 `Channel.produce()/consume()`、公开
-> `channel_rewind`、固定 FFTS flag 与 `tile_slice`，不依赖私有内部接口。
-> 切换框架后须重新导出 Native 二进制，不能把旧框架 wheel 的命中或精度结果沿用到新包。
-
-本轮提交前执行 `pytest -q test/quant_mla_prolog/test_quant_mla_prolog.py -k "not bf16"`：
-`49 passed, 8 deselected`，未重跑 BF16 用例。
-
-本轮新框架的源码 JIT 验证：C1 的 T=8/32/64/128 共四条网络 case 全部通过，
-Q 相对 L2 分别为 0.113425% / 0.158928% / 0.137906% / 0.141803%，
-KV 相对 L2 均为 0，与旧框架基线的误差指标一致。
-
-新导出 wheel 的 C1 独立验证（2026-09-24）：四条网络 case 分别覆盖 1～32
-个 AIC、AIC:AIV=1:2、eager/ACLGraph/npugraph_ex 三种模式各 10 次，
-共 3,840 次检查通过。原始网络脚本的 Prolog-only 片段在三种模式下通过；
-三份故障 PT 各 200 轮固定工作区污染恢复未出现 NaN/Inf。本轮选取的
-12 项 Native require 验证全部通过，不代表完整 nightly、C0 或大 T 的重验。
-PT 对照采用既定网络相对 L2/余弦标准；rank18 的 Q 严格逐元素诊断有
-0.110994% 超差、反量化相对 L2 为 0.289306%，与旧基线一致，非 CPU 逐位一致。
-
-新框架 msprof 单 MixKernel 耗时（32 AIC / 64 AIV，C1，npugraph_ex，
-预热后每条采样 20 次，单位 μs）：
-
-| B，S=8 | T | 平均耗时 | 中位数 |
-| --- | --- | --- | --- |
-| 1 | 8 | 35.770 | 35.709 |
-| 4 | 32 | 42.188 | 42.149 |
-| 8 | 64 | 51.415 | 51.507 |
-| 16 | 128 | 67.843 | 67.880 |
-
-这些数值是 kernel 耗时，不含 Python 端到端开销。采样区间无整块 KV cache
-TensorMove；默认图后端保留 index 的 ForeachCopy，T64/128 还保留输入
-x 的 TensorMove，不能将其描述为整张图完全无拷贝。
-
-基于 CANNBot-DSL 实现的 AW1 MLA Prolog，支持 BF16 非量化输出（C0）和
-MXFP8 全量化输出（C1），支持由当前设备与流配额选择 1～32 个 AIC。两个模式都在一次
-MixKernel launch 中完成 WQA/WKVA 投影、QA/KVA RMSNorm、WQB/WKB 投影、
-Q 合并和 PA_NZ KV cache 原位更新；C1 额外完成 Q/KV 输出量化。
-
-C0/C1 接收任意正整数 T，不要求 8 的倍数。Decode 使用 8/32/64/128 行
-切分区间；T>128 使用运行时 M128 分块的 prefill 路径。尾块在同一个 MixKernel
-内处理，公开输出 shape 始终为实际 T，每次调用只发射一个 MixKernel。
-
-Q 与 KV cache 都使用合并后的 576 维布局：前 512 维为 NoPE，后 64 维为
-RoPE 通道。当前算子不接收 sin/cos，不执行旋转位置编码；这里只合并投影得到的
-64 维通道，不能把该操作视为已完成 RoPE。
-
-## 跨核依赖与精度看护
-
-QB 按 N128 tile 轮转分配，WKB 按完整 head 分配。一个 head 的 NoPE128
-可能来自其他 AIC 的 QB tile，因此本核 `cube_sync_all()` 不能代替跨 AIC
-生产完成通知。在 QB 的 FIXPIPE 写回之后，所有实际启动的 AIC 都执行
-`cube_sync_block_arrive(PIPE.FIXPIPE, 1, mode=0)` 和相应等待，再进入 WKB。
-无 QB 任务的核也参与该屏障；flag 1 的前阶段握手已结束后才复用。
-
-WKB 写完一个 head 后先完成本核 FIXPIPE→MTE2 交接，再通知 AIV 量化；
-1～7 核使用完成所有自有 head 后的一次通知，避免耗尽硬件同步 flag。
-Q/scale 的 MTE3 写回及最终 AIC/AIV 汇合保持不变。修复不改变量化公式、
-cache 地址或图注册，每次调用仍为一个 MixKernel。
-
-四个 C1 网络 case 的单元测试除完整 golden 比较外，增加固定工作区污染恢复：
-先用 NaN 输入污染中间结果，紧接着执行有限输入，每个 case 重复三轮。
-恢复后 Q、descale_q、完整 cache 必须逐位等于清洁参考，且 Q、scale、
-q_head 与 q_latent_h 必须有限。NaN 输入仅用于测试；生产 kernel 不包含
-延迟、工作区 hook、NaN 清零或放宽精度阈值的逻辑。
-
-人工延迟 QB 生产核、真实 PT 压力、Native require 及三种入图模式属于独立
-验证，不在普通单元测试中枚举 Native 编译配置。自然回放未复现异常不等于
-证明不存在竞态，修复还需结合生成代码的生产/消费顺序和受控延迟对照验收。
-
-## API
+`quant_mla_prolog` 接收量化激活、量化投影权重及 descale，支持非量化或量化的 Q/Cache 输出。
+以下为公开 Python 接口，枚举通过同一个 `qmlaprolog` 模块访问。
 
 ```python
-outputs = quant_mla_prolog(
-    x, wqa, wqb, wkva, wkb,
-    descale_x, descale_wqa, descale_wqb, descale_wkva,
-    norm_weight_qa, norm_weight_kva,
-    kv_cache, cache_index, qscale_kv,
-    norm_eps=1.0e-6,
-    quant_mode_aw=1,
-    quant_mode_c=1,
-)
+import quant_mla_prolog as qmlaprolog
+
+
+def quant_mla_prolog(
+    x,
+    wqa,
+    wqb,
+    wkva,
+    wkb,
+    descale_x,
+    descale_wqa,
+    descale_wqb,
+    descale_wkva,
+    norm_weight_qa,
+    norm_weight_kva,
+    kv_cache,
+    cache_index,
+    quant_scale_kv=None,
+    rope_sin=None,
+    rope_cos=None,
+    *,
+    norm_eps=1e-5,
+    w_qr_quant_mode,
+    qkv_quant_mode,
+    cache_mode,
+    qr_scale=1.0,
+    kvr_scale=1.0,
+    rope_mode=qmlaprolog.RopeMode.INTERLEAVE_HALF,
+    return_qr=False,
+):
+    ...  # 固定返回 (q, descale_q, qr, descale_qr)，原地更新 kv_cache。
 ```
 
-公开模块只导出 `quant_mla_prolog`。返回值为有序字典：
+### 输入Tensor
 
-- `quant_mode_c=0`：`{"q", "kv_cache_out"}`
-- `quant_mode_c=1`：`{"q", "kv_cache_out", "descale_q"}`
+`T>=0`；其他维度范围见“支持规格”。所有输入位于同一 NPU，满足连续性要求。
+HiF8 使用 uint8/int8 原始编码载体，不表示整数数值量化。
 
-`kv_cache` 是 in/out（输入输出）；`kv_cache_out is kv_cache`，数据指针和底层 storage 均不变。
+| 参数 | Torch逻辑Shape | Torch dtype | Format与用途 |
+| --- | --- | --- | --- |
+| `x` | `(T,dim)` | MXFP8：E4M3FN；HiF8：uint8/int8 载体 | ND，输入隐状态 |
+| `wqa` | `(q_lora,dim)` | 与输入量化模式对应 | ND 或真实 FRACTAL_NZ，QA 投影 |
+| `wqb` | `(N*(Dn+Dr),q_lora)` | 与输入量化模式对应 | ND 或真实 FRACTAL_NZ，Q 上投影 |
+| `wkva` | `(512+Dr,dim)` | 与输入量化模式对应 | ND 或真实 FRACTAL_NZ，KVA 投影 |
+| `wkb` | `(N,Dn,512)` | BF16 | ND，将 Q-Nope 吸收到 512 维 latent 空间 |
+| `descale_x` | MXFP8：`(T,dim/32)`；HiF8：`(1,)` | E8M0 / FP32 | ND，激活反量化乘子 |
+| `descale_wqa` | 见下方权重 descale 规则，`O=q_lora,K=dim` | E8M0 / FP32 | ND 载体，QA 权重反量化乘子 |
+| `descale_wqb` | 同规则，`O=N*(Dn+Dr),K=q_lora` | E8M0 / FP32 | ND 载体，QB 权重反量化乘子 |
+| `descale_wkva` | 同规则，`O=512+Dr,K=dim` | E8M0 / FP32 | ND 载体，KVA 权重反量化乘子 |
+| `norm_weight_qa` | `(q_lora,)` | FP32 | ND，QA RMSNorm gamma |
+| `norm_weight_kva` | `(512,)` | FP32 | ND，KV RMSNorm gamma |
+| **`kv_cache`（原地输入输出）** | mode 0/2/3：`(block_number,block_size,1,512+Dr)`；mode 1：`(block_number,block_size,1,512+2*Dr+16)` | mode 0：BF16；mode 1/2：E4M3FN；mode 3：uint8/int8 载体 | ND 载体，内部按 PA_BSND/PA_NZ 寻址；mode 1 仅 PA_BSND |
+| `cache_index` | `(T,)` | INT64 | ND，token 写入的线性 Cache 槽位；数值合法性由调用方保证 |
+| `quant_scale_kv` | `(1,)` | FP32 | ND，mode 2/3 必填，有限且 ≥0，不支持负数；其余必须为 `None` |
+| `rope_sin` / `rope_cos` | `(T,Dr)` | BF16 | ND，启用 RoPE 时必填，成对提供 |
 
-### 参数表
+**三路权重必须统一 ND（format 2）或统一真实 NZ（format 29）。**
+真实 NZ 的 Torch 逻辑 Shape 仍是上表二维 Shape；每个 `(O,K)` 权重的物理分块为
+`(O/32,K/16,16,32)`。普通 ND reshape 成四维不合法。
 
-| 分组 | 名称 | 类型 | Shape | 默认值 | Format | 说明 |
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| INPUT | `x` | FP8_E4M3 | `(T, dim)` | N/A | ND | 必填 |
-| INPUT | `wqa` | FP8_E4M3 | `(q_lora/32, dim, 32)` | N/A | NZ | 必填 |
-| INPUT | `wqb` | FP8_E4M3 | `(N*D/32, q_lora, 32)` | N/A | NZ | 必填 |
-| INPUT | `wkva` | FP8_E4M3 | `((kv_lora+Dr)/32, dim, 32)` | N/A | NZ | 必填 |
-| INPUT | `wkb` | BF16 | `(N, Dn, kv_lora)` | N/A | ND | 必填 |
-| INPUT | `descale_x` | FP8_E8M0 | `(T, ceil(dim/64), 2)` | N/A | ND | 必填 |
-| INPUT | `descale_wqa` | FP8_E8M0 | `(q_lora, ceil(dim/64), 2)` | N/A | NZ | 必填 |
-| INPUT | `descale_wqb` | FP8_E8M0 | `(N*D, ceil(q_lora/64), 2)` | N/A | NZ | 必填 |
-| INPUT | `descale_wkva` | FP8_E8M0 | `(kv_lora+Dr, ceil(dim/64), 2)` | N/A | NZ | 必填 |
-| INPUT | `norm_weight_qa` | FP32 | `(q_lora,)` | N/A | ND | 必填 |
-| INPUT | `norm_weight_kva` | FP32 | `(kv_lora,)` | N/A | ND | 必填 |
-| INPUT | `kv_cache` | BF16 / FP8_E4M3 | `(block_number, block_size, 1, kv_lora+Dr)` | N/A | PA_NZ | 原位更新 |
-| INPUT | `cache_index` | INT64 | `(T,)` | N/A | ND | cache slot |
-| INPUT 可选 | `qscale_kv` | FP32（接口表 DT_BF32） | `(1,)` | `None` | ND | `quant_mode_c=1` 时必填 |
-| ATTR | `norm_eps` | FLOAT | 标量 | 无默认值 | N/A | 有限正数 |
-| ATTR | `quant_mode_aw` | INT | `1` | `1` | N/A | QA/QB/KVA 全量 MXFP8 |
-| ATTR | `quant_mode_c` | INT | `0/1` | `0` | N/A | 0：不量化；1：Q per-token-head FP8，KV per-tensor FP8 |
-| OUTPUT | `q` | BF16 / FP8_E4M3 | `(T, N, kv_lora+Dr)` | N/A | ND | NoPE 512 + RoPE 64 |
-| OUTPUT | `kv_cache_out` | BF16 / FP8_E4M3 | 同 `kv_cache` | N/A | PA_NZ | 输入 cache 的原地输出 |
-| OUTPUT 可选 | `descale_q` | FP32 | `(T, N)` | N/A | ND | 仅 `quant_mode_c=1` |
+MXFP8 权重 descale 的 ND Shape 为 `(O,K/64,2)`，对应 NZ 权重时为
+`(O/16,K/64,16,2)`；两者的 descale Tensor 自身均为 ND。
+HiF8 权重 descale 为 `(1,O)` FP32，不随权重 ND/NZ 改变。
 
-固定优化规格：
+权重 FRACTAL_NZ 与 Cache PA_NZ 不可互相替代。Cache PA_NZ 按
+`[block_number,D/C0,block_size,C0]` 存放，`C0=32/element_size`，公开 Tensor 仍为 BSND 外形。
 
-```text
-dim=7168, q_lora=1536, kv_lora=512
-N=96, D=192, Dn=128, Dr=64
-block_size=128, profiled_block_dim=32
-supported_aic_core_counts=1..32（运行时有效核数）
-supported_t_c0_c1=任意正整数（受设备可用内存限制）
-```
+### 属性与枚举
 
-`block_number` 与 BF16 接口定义一致：它严格取自 `kv_cache.shape[0]`，表示调用方
-已经分配的 PA page 总数，包含历史上下文驻留页，不能从本次调用的 `T` 或
-`ceil(T/128)` 推导。`block_size` 固定为 128，并要求
-`block_number * 128 >= T`；Native 的 T 与 `block_number` 为动态维，有效 AIC 核数为运行时标量。
+| 属性 | 类型与合法值 | 默认值 | 含义 |
+| --- | --- | --- | --- |
+| `norm_eps` | 转 FP32 后有限且严格大于 0，拒绝 bool | `1e-5` | QA/KV 两路 RMSNorm 共用 epsilon |
+| `w_qr_quant_mode` | `qmlaprolog.WQrQuantMode` 或合法整数编码 | 必填 | 输入、投影权重和 QR 的量化模式 |
+| `qkv_quant_mode` | `qmlaprolog.QkvQuantMode` 或合法整数编码 | 必填 | 最终 Q/Cache 量化模式 |
+| `cache_mode` | `qmlaprolog.CacheMode` 或合法整数编码 | 必填 | Cache 物理地址映射 |
+| `qr_scale` | 转 FP32 后有限，允许 0 和负数，拒绝 bool | `1.0` | QA RMSNorm 后、QR 量化前缩放 |
+| `kvr_scale` | 转 FP32 后有限，允许 0 和负数，拒绝 bool | `1.0` | KV RMSNorm 后缩放，**不缩放 KR** |
+| `rope_mode` | `qmlaprolog.RopeMode` 或合法整数编码 | `INTERLEAVE_HALF` | RoPE 变换方式 |
+| `return_qr` | 严格 bool | `False` | 是否写出 QR 及其 descale，不改变主 Q 路径 |
 
-公开 E8M0 scale 使用 rank-3 逻辑描述；权重 scale 的底层字节保留 NZ 排列。
-`kv_cache` 的公开 shape 是逻辑 shape，连续字节按 PA_NZ 排列，接口通过零拷贝 view
-交给 kernel。
+三个浮点属性在 Torch 分派前检查，均拒绝 bool、NaN、Inf 及 FP32 溢出；仅 `norm_eps` 额外拒绝 0、负数及 FP32 下溢为 0 的值。
+`qr_scale/kvr_scale` 不传使用 1.0，显式传入按该值相乘：1 不改变结果，0 将对应有限值置零，负数改变符号。
 
-## 外部调用示例
+| 枚举成员 | 内部编码 | 语义 |
+| --- | ---: | --- |
+| `WQrQuantMode.MXFP8` | 1 | E4M3FN 数据，K 轴每 32 值共享 E8M0 descale |
+| `WQrQuantMode.HIF8` | 2 | HiF8 数据；激活 per-tensor、权重 per-channel FP32 descale |
+| `QkvQuantMode.NO_QUANT` | 0 | Q、KV、KR 均为 BF16 |
+| `QkvQuantMode.KV_FP8_PER_TOKEN_GROUP` | 1 | Q 为 BF16；KV 按 token/group 动态量化，KR 为 BF16 |
+| `QkvQuantMode.Q_KV_FP8` | 2 | Q 按 token/head 动态量化；KV/KR 共用输入量化乘子 |
+| `QkvQuantMode.Q_KV_HIF8` | 3 | Q 全局 per-tensor 动态量化；KV/KR 共用输入量化乘子 |
+| `CacheMode.PA_BSND` / `PA_NZ` | 0 / 1 | 两种 Cache 物理地址映射 |
+| `RopeMode.NONE` | 0 | 不旋转，Dr=64 时位置编码部分直通 |
+| `RopeMode.INTERLEAVE_HALF` | 1 | 交错偶/奇通道取对，输出前后半区 |
+| `RopeMode.HALF` | 2 | 前后半区取对，输出前后半区 |
 
-下面示例与公开 API 一致，先展示 `quant_mode_c=1` 的完整调用。示例中的单位
-E8M0 scale 和随机权重只用于说明接口；整网应直接传入模型量化阶段生成的
-E4M3 权重与 E8M0 scale。
+合法 `(qkv_quant_mode,w_qr_quant_mode)` 为 `(0,1)`、`(0,2)`、`(1,1)`、`(2,1)`、`(3,2)`。
+枚举参数也接受对应合法整数，不接受字符串或 bool。`Dr=0` 必须显式指定 `RopeMode.NONE`。
+禁用 RoPE 时 sin/cos 可同时为 `None`；传入时仍须成对满足 Shape/dtype，但不参与计算。
+
+### 输出与Cache原地更新
+
+返回值始终为四个 Tensor，不返回独立 Cache Tensor：
+
+| 输出/更新项 | Shape | Torch dtype | 语义 |
+| --- | --- | --- | --- |
+| `q`，槽位0 | `(T,N,512+Dr)` | mode 0/1：BF16；mode 2：E4M3FN；mode 3：uint8 | `[Q-Nope(512),Q-RoPE(Dr)]` |
+| `descale_q`，槽位1 | mode 2：`(T,N,1)`；T>0 且 mode 3：`(1,)`；其余：`(0,)` | FP32 | Q 反量化乘子 |
+| `qr`，槽位2 | true：`(T,q_lora)`；false：`(0,)` | MXFP8：E4M3FN；HiF8：uint8 | QA RMSNorm、缩放后的量化结果 |
+| `descale_qr`，槽位3 | QR 启用时 MXFP8：`(T,q_lora/32)`；HiF8：T>0 为 `(1,)`，T=0 为 `(0,)`；QR 禁用时 `(0,)` | MXFP8：E8M0；HiF8：FP32 | QR 反量化乘子 |
+| `kv_cache`，输入原地更新 | 与输入完全一致 | 与输入完全一致 | 命中位置更新；未命中字节、data pointer、storage identity 不变 |
+
+mode 1 的 payload 为 `[KV FP8字节, KR BF16字节, 4个FP32 descale字节]`，
+Dr=64 为 656 字节，Dr=0 为 528 字节；KR 和 descale 部分不能按 FP8 数值解释。
+mode 2/3 的 `quant_scale_kv` 是量化乘子：`payload=Quantize(value*quant_scale_kv)`，
+系数 >0 时可用 `value=Decode(payload)/quant_scale_kv` 反量化；系数为 0 时，有限输入量化为零，无法恢复原值，测试直接比较量化输出。Q/QR 的 descale 是输出反量化乘子。
+
+### 计算与调用约束
+
+- QA/KVA/WQB 使用量化投影、FP32 累加及 FP32 输出。QR 内部量化始终参与 WQB；`return_qr` 仅控制公开输出。
+- Q-Nope 在 WKB 前转 BF16，WKB FP32 累加后输出 BF16；RoPE FP32 计算后转 BF16。KV 归一化与 `kvr_scale` 不作用于 KR。
+- 调用方须保证非负 `cache_index` 小于 `block_number*block_size` 且唯一，算子仅检查其 shape、dtype、device 和布局，不回读或校验索引数值。所有负 INT64 值仅跳过 Cache 写入，token 仍参与 Q/QR 和全局量化统计。
+- **T=0 仍校验接口元信息，在 Host 返回**；有效输出保留零长度维度，全局 HiF8 descale 为 `(0,)`。不回读设备值、不查询 Stream、不分配 Kernel workspace、不编译或启动 Kernel，Cache 不变。
+- 非空调用必须成功查询当前 Stream 核数配额；接口缺失、失败、非法值明确报错，零配额拒绝启动，不回退整卡核数。
+- Eager、Native 和图执行只校验元信息，不回读设备内容。索引数值合法性由调用方保证；非空输入启用 `quant_scale_kv` 时，调用方须先调用 `quant_mla_prolog_precheck` 检查其值，更新 scale 后须重新预检。更新输入后须建立流依赖。公开执行不以 Torch 小算子补算、Cache clone/copy-back 或隐式格式转换修复输入；不支持自动求导或功能化 Cache。
+
+## 计算公式
+
+以下描述数学依赖和量化轴，不以实数等价替代实际 Cast、累加顺序和特殊值规则。
+令 `Lq=q_lora`、`Lkv=512`，`Dn` 是 WKB 的归约维，`N` 是 head 数。
+权重公开 Shape 按 `(输出维, 输入维)` 排列，WKB 为 `(N,Dn,512)`。
+
+### 1. 量化投影与 RMSNorm
+
+记投影为 $P(A,W;s_A,s_W)$。MXFP8 按 K 轴每 32 个值共享 E8M0 descale：
+
+$$
+P_{t,o}=\sum_g s_A[t,g]s_W[o,g]
+  \sum_{k=32g}^{32g+31}\operatorname{decode}_{E4M3}(A_{t,k})
+                              \operatorname{decode}_{E4M3}(W_{o,k}).
+$$
+
+这一路使用原生 MX 随路 scale。HiF8 则先对解码值完成 FP32 累加，再依次乘
+权重 descale 和激活 descale，不是 MX 分组随路量化：
+
+$$
+C_0=\operatorname{MatMul}_{FP32}(\operatorname{decode}_{HiF8}(A),
+                                   \operatorname{decode}_{HiF8}(W)^T),\quad
+C_1=\operatorname{FP32}(C_0s_W),\quad P=\operatorname{FP32}(C_1s_A).
+$$
+
+归一化沿每行完整特征维进行，Gamma 在 FP32 域相乘：
+
+$$
+\operatorname{RMSNorm}(v,\gamma)_j=
+ \frac{v_j\gamma_j}{\sqrt{\frac{1}{d}\sum_{i=0}^{d-1}v_i^2+\texttt{norm\_eps}}}.
+$$
+
+### 2. Q 与 QR 路径
+
+$$
+A=P(x,WQA),\quad R=\operatorname{RMSNorm}(A,\gamma_{QA})\cdot\texttt{qr\_scale},
+\qquad (QR,s_{QR})=\operatorname{DynamicQuant}(R),
+$$
+$$
+U=\operatorname{reshape}_{T,N,Dn+Dr}(P(QR,WQB;s_{QR},s_{WQB})),
+$$
+$$
+Q_{NoPE}[t,n,:]=\operatorname{BF16}\!\left(
+ \operatorname{MatMul}_{FP32}(\operatorname{BF16}(U[t,n,:Dn]),WKB[n,:,:])\right),
+$$
+$$
+Q_{RoPE}=\operatorname{BF16}(\operatorname{RoPE}(U[:,:,Dn:])),\qquad
+Q_f=\operatorname{concat}(Q_{NoPE},Q_{RoPE}).
+$$
+
+QR 的 MX 动态量化沿每行每 32 个元素计算 scale，保留本实现的局部 BF16 预舍入及
+SAT 语义；HiF8 QR 沿整个 `(T,Lq)` 张量计算一个 FP32 descale。`return_qr=False`
+仅隐藏 QR 输出，不移除内部 QR 计算。
+
+| QKV 模式 | 公开 Q | `descale_q` |
+|---|---|---|
+| 0 / 1 | `Q_f`，BF16 | 空 Tensor |
+| 2 | `E4M3(Q_f / s)`，每个 `(token,head)` 的 `s=max(abs(Q_f))/448` | FP32 `(T,N,1)` |
+| 3 | `HiF8(Q_f / s)`，整个 Q 的 `s=max(abs(Q_f))/32768` | FP32 `(1,)` |
+
+动态量化全零范围输出零编码；NaN、Inf、饱和、次正规及舍入边界遵循本算子的数值合同，
+不能直接用未处理 `s=0` 的除法替代实现。
+
+### 3. K/V、RoPE 与 Cache
+
+$$
+V=P(x,WKVA),\quad KV=\operatorname{RMSNorm}(V[:,:512],\gamma_{KVA})
+ \cdot\texttt{kvr\_scale},\quad KR=\operatorname{BF16}_{SAT}(\operatorname{RoPE}(V[:,512:])).
+$$
+
+KR 不参加 KV 的 RMSNorm。模式 0 写入 BF16 的 `[KV,KR]`；模式 1 分四组、每组
+128 个 KV 元素动态量化，$s_g=\max(\max|KV_g|,10^{-4})/448$，写入
+`[KV的512字节E4M3编码, KR的BF16字节, 4个FP32 scale字节]`。
+模式 2 / 3 分别写入 `E4M3([KV,KR] * quant_scale_kv)` /
+`HiF8([KV,KR] * quant_scale_kv)`。这里 `quant_scale_kv` 是输入的**量化乘数**，
+不是输出 descale，不能与 Q/QR 的除数混用。
+
+令 $z$ 为 RoPE 输入，$h=Dr/2$，$c,s$ 为对应 token 的 cos/sin：
+
+- `NONE`：不旋转。
+- `HALF`：$y=c\odot z+s\odot[-z_{h:},z_{:h}]$。
+- `INTERLEAVE_HALF`：$y_i=c_i z_{2i}-s_i z_{2i+1}$，
+  $y_{i+h}=s_{i+h}z_{2i}+c_{i+h}z_{2i+1}$，$0\le i<h$。
+
+RoPE 的 cos/sin 按 head 广播。Cache 写入由 `cache_index[t]` 决定；负数跳过，
+非负位置的 block/offset 分别为整除/取模 `block_size`。PA_BSND 和 PA_NZ
+仅改变物理寻址；未命中位置保持原字节，不 clone Cache，也不 copy-back。
+MX 投影结果中有限非零且绝对值小于 $2^{-126}$ 的次正规数置为正零；正常值、已有正负零、NaN 和 Inf 保持对应数值语义。E4M3FN 饱和转换将 NaN 转为零；HiF8 使用 SAT + ties-away，有限溢出及 Inf 饱和、NaN 转为零。BF16、FP8 转换点属于数值契约，Golden 不模拟硬件归约树。
+
+以上全局 scale 公式用于非空输入；T=0 时跳过归约，HiF8 scale 返回 `(0,)`。
+
+## 统一调用接口与执行方式
+
+整网统一调用 `qmlaprolog.quant_mla_prolog(...)`，模块内部完成 Torch/Fake 注册及图分派。
+执行方式、Native 加载配置、输入量化模式和 QKV 输出模式分别配置。
+
+| 执行方式 | 调用入口 | 当前配置 |
+| --- | --- | --- |
+| Eager | `qmlaprolog.quant_mla_prolog` | 检查元信息及设备值，有 D2H 同步成本 |
+| Native require 部署 | 同一公开函数 | 设置 `CANNBOTDSL_NATIVE_BINARY_MODE=require`；缺少变体应报错，可配合 Eager/图模式 |
+| ACLGraph | 捕获预检后的同一公开函数 | 自动选择异步图入口；捕获/回放外保证设备值合法 |
+| NPUGraph-EX | `torch.compile(qmlaprolog.quant_mla_prolog, backend="npugraph_ex", ...)` | 固定 Shape/地址，关闭输入 staging |
+
+Torch namespace 为 `cannbotdsl_quant_mla_prolog`，schema 使用整数序列化枚举，
+`Tensor(a!) kv_cache` 声明原地更新。Native 导出名为 `quant_mla_prolog`。
+低层 `quant_mla_prolog_native` 是显式异步直调入口，调用方负责设备值预检；该名称不代表二进制安装成功。
+
+### 公共输入准备（以下示例均复用）
+
+从仓库根目录运行，先设置 `export PYTHONPATH="$PWD/samples/quant_mla_prolog${PYTHONPATH:+:$PYTHONPATH}"`。
+准备匹配的 CANN、CANNBotDSL、Torch 和 torch_npu。设备初始化、输入构造和 NZ 转换在算子调用/捕获外完成。
+示例使用 MXFP8 输入、mode 0、PA_BSND 和 T=3，四个输出槽位始终固定。
 
 ```python
 import torch
 import torch_npu
-
-from quant_mla_prolog import quant_mla_prolog
-
-
-FP8 = torch.float8_e4m3fn
-E8M0 = torch.float8_e8m0fnu
-
-
-def pack_fp8_nz(weight):
-    """Pack logical FP8 weight W[O,K] as public NZ [O/32,K,32]."""
-    if weight.dtype != FP8 or weight.ndim != 2 or weight.shape[0] % 32:
-        raise ValueError("weight must be FP8 [O,K] with O divisible by 32")
-    output_size, input_size = weight.shape
-    return weight.reshape(output_size // 32, 32, input_size).permute(
-        0, 2, 1
-    ).contiguous()
-
-
-def e8m0_ones(shape):
-    """Create E8M0 value 1.0; raw exponent byte 127 represents 2**0."""
-    return torch.full(shape, 127, dtype=torch.uint8).view(E8M0)
-
+import quant_mla_prolog as qmlaprolog
 
 torch.npu.set_device(0)
-device = "npu:0"
-T = 8
-block_number, block_size = 12, 128
-generator = torch.Generator(device="cpu").manual_seed(20260916)
+device = torch.device("npu:0")
+T, dim, q_lora, N, Dn, Dr = 3, 1024, 1024, 2, 128, 64
+generator = torch.Generator().manual_seed(17)
 
 
-def random_fp8(shape):
-    return (torch.randn(shape, generator=generator) * 0.25).to(FP8)
+def fp8(shape):
+    values = torch.randn(shape, generator=generator) * 0.1
+    return values.to(torch.float8_e4m3fn).to(device)
 
 
-x = random_fp8((T, 7168)).to(device)
-wqa = pack_fp8_nz(random_fp8((1536, 7168))).to(device)
-wqb = pack_fp8_nz(random_fp8((96 * 192, 1536))).to(device)
-wkva = pack_fp8_nz(random_fp8((512 + 64, 7168))).to(device)
-wkb = torch.randn(
-    96, 128, 512, generator=generator, dtype=torch.bfloat16
-).to(device)
+def e8m0(shape):
+    return torch.full(shape, 127, dtype=torch.uint8).view(torch.float8_e8m0fnu).to(device)
 
-descale_x = e8m0_ones((T, 112, 2)).to(device)
-descale_wqa = e8m0_ones((1536, 112, 2)).to(device)
-descale_wqb = e8m0_ones((96 * 192, 24, 2)).to(device)
-descale_wkva = e8m0_ones((512 + 64, 112, 2)).to(device)
-norm_weight_qa = torch.ones(1536, dtype=torch.float32, device=device)
-norm_weight_kva = torch.ones(512, dtype=torch.float32, device=device)
 
-# 全零 cache 的 ND 与 PA_NZ 字节相同，可以直接创建。若 cache 已有有效
-# ND 数据，必须在模型/cache 初始化阶段预先转换为 PA_NZ 物理排列。
-kv_cache = torch.zeros(
-    block_number, block_size, 1, 576, dtype=FP8, device=device
+inputs = dict(
+    x=fp8((T, dim)),
+    wqa=fp8((q_lora, dim)),
+    wqb=fp8((N * (Dn + Dr), q_lora)),
+    wkva=fp8((512 + Dr, dim)),
+    wkb=(torch.randn(N, Dn, 512, generator=generator) * 0.02).bfloat16().to(device),
+    descale_x=e8m0((T, dim // 32)),
+    descale_wqa=e8m0((q_lora, dim // 64, 2)),
+    descale_wqb=e8m0((N * (Dn + Dr), q_lora // 64, 2)),
+    descale_wkva=e8m0((512 + Dr, dim // 64, 2)),
+    norm_weight_qa=torch.ones(q_lora, dtype=torch.float32).to(device),
+    norm_weight_kva=torch.ones(512, dtype=torch.float32).to(device),
+    kv_cache=torch.zeros((2, 128, 1, 512 + Dr), dtype=torch.bfloat16).to(device),
+    cache_index=torch.arange(T, dtype=torch.int64).to(device),
+    quant_scale_kv=None,
+    rope_sin=torch.zeros((T, Dr), dtype=torch.bfloat16).to(device),
+    rope_cos=torch.ones((T, Dr), dtype=torch.bfloat16).to(device),
 )
-cache_index = torch.arange(T, dtype=torch.int64, device=device)
-qscale_kv = torch.tensor([0.5], dtype=torch.float32, device=device)
-
-outputs = quant_mla_prolog(
-    x, wqa, wqb, wkva, wkb,
-    descale_x, descale_wqa, descale_wqb, descale_wkva,
-    norm_weight_qa, norm_weight_kva,
-    kv_cache, cache_index, qscale_kv,
-    norm_eps=1.0e-6,
-    quant_mode_aw=1,
-    quant_mode_c=1,
+attrs = dict(
+    norm_eps=1e-5,
+    w_qr_quant_mode=qmlaprolog.WQrQuantMode.MXFP8,
+    qkv_quant_mode=qmlaprolog.QkvQuantMode.NO_QUANT,
+    cache_mode=qmlaprolog.CacheMode.PA_BSND,
+    qr_scale=1.0,
+    kvr_scale=1.0,
+    rope_mode=qmlaprolog.RopeMode.INTERLEAVE_HALF,
+    return_qr=False,
 )
-torch.npu.synchronize()
-
-q = outputs["q"]
-descale_q = outputs["descale_q"]
-assert q.shape == (T, 96, 576) and q.dtype == FP8
-assert descale_q.shape == (T, 96) and descale_q.dtype == torch.float32
-assert outputs["kv_cache_out"] is kv_cache
-assert outputs["kv_cache_out"].data_ptr() == kv_cache.data_ptr()
 ```
 
-已经按 `(O/32,K,32)` 保存的权重不能再次调用 `pack_fp8_nz`。静态权重和
-weight scale 应在模型加载阶段准备一次并跨调用复用；算子直接消费分别传入的 WQA/WKVA 权重，不需要向公开 API 额外传 prepared handle。
+真实 NZ 接入需一起转换三路投影权重，并按“输入Tensor”规则排列对应 descale；不能仅 reshape 权重。
 
-`quant_mode_c=0` 时，`kv_cache` 改用 BF16，`qscale_kv` 传 `None`，返回字典中
-不包含 `descale_q`；`q` 和 `kv_cache_out` 均为 BF16。
+### Eager 调用
 
 ```python
-kv_cache_bf16 = torch.zeros(
-    block_number, block_size, 1, 576,
-    dtype=torch.bfloat16,
-    device=device,
-)
-
-outputs_bf16 = quant_mla_prolog(
-    x, wqa, wqb, wkva, wkb,
-    descale_x, descale_wqa, descale_wqb, descale_wkva,
-    norm_weight_qa, norm_weight_kva,
-    kv_cache_bf16, cache_index, None,
-    norm_eps=1.0e-6,
-    quant_mode_aw=1,
-    quant_mode_c=0,
-)
-assert list(outputs_bf16) == ["q", "kv_cache_out"]
-assert outputs_bf16["q"].dtype == torch.bfloat16
-assert outputs_bf16["kv_cache_out"] is kv_cache_bf16
+qmlaprolog.quant_mla_prolog_precheck(**inputs, **attrs)
+q, descale_q, qr, descale_qr = qmlaprolog.quant_mla_prolog(**inputs, **attrs)
+torch.npu.synchronize()
+assert q.shape == (T, N, 512 + Dr)
+assert descale_q.shape == qr.shape == descale_qr.shape == (0,)
 ```
 
-## Torch Native wheel 调用
+Cache 原地更新，不另返回。`quant_mla_prolog_precheck` 接收相同输入和属性，返回 `None`；不回读或校验 `cache_index` 数值。非空输入时仅回读启用的 `quant_scale_kv`，拒绝非有限值和负数，不启动融合 Kernel，也不修改 Cache。计算入口要求索引和 scale 已合法，不重复回读；T=0 或未启用 `quant_scale_kv` 时，预检仅校验元信息。
 
-仓库同时提供与 Native 算子包一致的 Torch 入口。相关文件如下：
+### Native require 部署（调用函数不变）
 
-| 文件 | 用途 |
-| :--- | :--- |
-| `net/native_package/run-build.sh` | OpKit Native 编译与 wheel 打包入口 |
-| `net/native_package/operator_groups.toml` | `quant_mla_prolog` 源文件映射及 `k3` 分组 |
-| `net/verification/aclgraph/aclgraph_quant_mla_prolog.py` | ACLGraph capture/replay 与可选 `npugraph_ex` 探针 |
-| `test/quant_mla_prolog/golden.py` | 与算子实现独立的 CPU golden |
+生产文件保留 `@cannbotdsl.aot.export("quant_mla_prolog")`，导出与运行共用完整融合程序和配置构造。
+通过框架 AOT 构建接口收集该模块，不另维护算子专用打包脚本：
 
-Native 构建器直接从 `samples/` 收集源文件（按 `operator_groups.toml` 的文件名
-映射），无需复制到 `net/ops`。构建需要 CANNBot-DSL 与 OpKit 两个 wheel：
+```python
+from cannbotdsl.aot import build
+
+build(
+    collectors="samples/quant_mla_prolog",
+    pattern="quant_mla_prolog.py",
+    target="dav-3510",
+    output="samples/quant_mla_prolog/_native",
+    operators=["quant_mla_prolog"],
+)
+```
+
+构建输出须为新目录，编译产物不提交。将生产文件与同级 `_native/` 一起部署；同名 Python 包也可将二进制置于包内 `_native`。
+在新进程导入前设置：
 
 ```bash
-source /opt/conda/etc/profile.d/conda.sh
-conda activate cannbot
-cd net/native_package
-
-# T 仅按以下切分区间导出，设备/流的有效核数在调用时获取：
-# 5 个 T 切分区间 × C0/C1；不枚举具体 T、核数或 cache 页数。
-CANN_ENV=<cann-toolkit>/set_env.sh \
-  CANNBOTDSL_WHEEL=<path>/cannbotdsl-*.whl \
-  OPKIT_WHEEL=<path>/opkit-0.2.0-*.whl \
-  ./run-build.sh --operator quant_mla_prolog
-
-python -m pip install --no-deps \
-  output/operators/quant_mla_prolog/wheels/cannbot_arena_net-*.whl \
-  <path>/opkit-0.2.0-*.whl
 export CANNBOTDSL_NATIVE_BINARY_MODE=require
-export CANNBOTDSL_NATIVE_BINARY_REPORT=/tmp/quant_mla_native_report.json
+export CANNBOTDSL_NATIVE_BINARY_REPORT=/absolute/results/native-report.json
+export PYTHONPATH="/absolute/deployment-directory${PYTHONPATH:+:$PYTHONPATH}"
 ```
 
-`require` 模式禁止 Native miss 后回退 source-JIT。运行验证后应检查 report：
-`installed_hit > 0` 且 `installed_miss == 0`。只有满足这两个条件，才能证明实际执行的是
-安装 wheel 中的 Provider，而不是源码回退路径。
-
-wheel 的普通 Torch 调用方式与上面的公开 API 完全一致，只需把导入改为：
-
 ```python
-from ops.quant_mla_prolog import quant_mla_prolog
+import quant_mla_prolog as qmlaprolog
 
-outputs = quant_mla_prolog(
-    x, wqa, wqb, wkva, wkb,
-    descale_x, descale_wqa, descale_wqb, descale_wkva,
-    norm_weight_qa, norm_weight_kva,
-    kv_cache, cache_index, qscale_kv,
-    norm_eps=1.0e-6,
-    quant_mode_aw=1,
-    quant_mode_c=1,
-)
-q = outputs["q"]
-descale_q = outputs["descale_q"]
-assert outputs["kv_cache_out"] is kv_cache
+qmlaprolog.quant_mla_prolog_precheck(**inputs, **attrs)
+q, descale_q, qr, descale_qr = qmlaprolog.quant_mla_prolog(**inputs, **attrs)
+torch.npu.synchronize()
 ```
 
-ACLGraph 使用包内的 `torch.library` 适配入口。该入口与公开 API 使用相同参数；
-C1 返回 `q, descale_q`，C0 返回 `q, None`。
-`kv_cache` 在 schema 中标记为 `Tensor(a!)` 并原位更新，因此不作为别名输出返回：
+`require` 保留元信息校验，设备值仍由显式预检检查。`CANNBOTDSL_QMP_PROFILES` 可指定 JSON profile 文件，字段为
+`T, dim, q_lora, N, Dn, Dr, w_qr_quant_mode, qkv_quant_mode, cache_mode, rope_mode, weight_format`；
+不接受外部核数或 tiling 参数，未指定时使用源码中的默认合法组合。
+默认导出不等于任意 Shape 全覆盖，部署前须核对实际规格，未命中时应报错。
+构建、安装、二进制命中和图执行需分别验证；文档示例不代表当前提交完成了新一轮 wheel 验收。
+
+### ACLGraph 捕获和回放
 
 ```python
-from ops.quant_mla_prolog import quant_mla_prolog_op
-
-q, descale_q = quant_mla_prolog_op(
-    x, wqa, wqb, wkva, wkb,
-    descale_x, descale_wqa, descale_wqb, descale_wkva,
-    norm_weight_qa, norm_weight_kva,
-    kv_cache, cache_index, qscale_kv,
-    norm_eps=1.0e-6,
-    quant_mode_aw=1,
-    quant_mode_c=1,
-)
-# q: FP8_E4M3 [T,96,576]
-# descale_q: FP32 [T,96]
-# kv_cache: 已按 PA_NZ 字节布局原位更新
-```
-
-不要绕过包装函数直接调用下面的 Dispatcher 名称：
-
-```python
-torch.ops.cannbotdsl_quant_mla_prolog.quant_mla_prolog
-```
-
-该底层入口为兼容 AOT functionalization，只返回一块内部 packed storage；
-`quant_mla_prolog_op` 会对其建立零拷贝的 FP8 `q` 和 FP32 `descale_q` view。
-`kv_cache` 是 schema 中唯一的可变输入，仍由 kernel 原位更新。
-
-直接 ACLGraph capture/replay 的调用方式如下；C0 只需换成 BF16 cache、
-`qscale_kv=None` 和 `quant_mode_c=0`：
-
-```python
+# 图外预检并完成编译/准备，这次调用也会更新 Cache。
+qmlaprolog.quant_mla_prolog_precheck(**inputs, **attrs)
+prepared = qmlaprolog.quant_mla_prolog(**inputs, **attrs)
+torch.npu.synchronize()
 graph = torch.npu.NPUGraph()
 with torch.npu.graph(graph):
-    captured_q, captured_descale = quant_mla_prolog_op(
-        x, wqa, wqb, wkva, wkb,
-        descale_x, descale_wqa, descale_wqb, descale_wkva,
-        norm_weight_qa, norm_weight_kva,
-        kv_cache, cache_index, qscale_kv,
-        norm_eps=1.0e-6,
-        quant_mode_aw=1,
-        quant_mode_c=1,
-    )
+    graph_outputs = qmlaprolog.quant_mla_prolog(**inputs, **attrs)
 graph.replay()
+torch.npu.synchronize()
+q, descale_q, qr, descale_qr = graph_outputs
+```
+
+回放期间保持输入、Cache、输出和 graph 存活，地址及 Shape/dtype/format 不变。
+输入内容可在图外更新；调用方须始终保证 index 合法，`quant_scale_kv` 改变后必须重新预检。更新输入后须建立流依赖，不能沿用首次合法性结论。
+捕获及 replay 不回读设备值，模块不缓存“曾预检通过”状态。准备调用会写 Cache，若需要恢复初始数据应在捕获外完成。
+更换 Shape、模式或地址时重新捕获；T=0 的空图不能证明非空图模式通过。
+
+### NPUGraph-EX 调用
+
+```python
+qmlaprolog.quant_mla_prolog_precheck(**inputs, **attrs)
+qmlaprolog.quant_mla_prolog(**inputs, **attrs)
+torch.npu.synchronize()
+compiled = torch.compile(
+    qmlaprolog.quant_mla_prolog,
+    backend="npugraph_ex",
+    fullgraph=True,
+    dynamic=False,
+    options={"force_eager": False, "clone_input": False},
+)
+q, descale_q, qr, descale_qr = compiled(**inputs, **attrs)
 torch.npu.synchronize()
 ```
 
-模型代码可以直接编译调用 `quant_mla_prolog_op`；适配层会在图内保留 packed
-storage，并在 Python 边界建立对应的 BF16 或 FP8/FP32 零拷贝 view：
+也可编译 `forward` 中调用公开函数的整网 Module。固定权重建议注册为模型 buffer，所有输入地址及存储保持稳定。
+`clone_input=False` 关闭后端输入 staging；调用方保证 index 合法，`quant_scale_kv` 更新后仍须图外预检。
+仅描述固定 Shape、固定地址、无梯度推理契约，不宣称任意后端或动态 Shape 兼容。
+后端不可用、图编译失败应报错，不将 Eager 或普通 ACLGraph 回退当作 EX 成功。
 
-```python
-import torch
-from ops.quant_mla_prolog import quant_mla_prolog_op
-
-
-class QuantMlaPrologGraph(torch.nn.Module):
-    def forward(self, *args):
-        return quant_mla_prolog_op(
-            *args,
-            norm_eps=1.0e-6,
-            quant_mode_aw=1,
-            quant_mode_c=1,
-        )
-
-
-compiled = torch.compile(
-    QuantMlaPrologGraph(),
-    backend="npugraph_ex",
-    options={"force_eager": False},
-)
-
-q, descale_q = compiled(
-    x, wqa, wqb, wkva, wkb,
-    descale_x, descale_wqa, descale_wqb, descale_wkva,
-    norm_weight_qa, norm_weight_kva,
-    kv_cache, cache_index, qscale_kv,
-)
-
-# q: FP8_E4M3 [T,96,576]
-# descale_q: FP32 [T,96]
-# kv_cache: 由编译图按 PA_NZ 字节布局原位更新
-```
-
-Native 包导出 10 个变体：`T∈[1,8]/[9,32]/[33,64]/[65,128]/[129,+∞)` × C0/C1。
-每个区间内 T 为动态值，核数为运行时标量；`block_number` 从实际 cache shape 取得，
-不构造固定页数的内部描述。模型维度与 `block_size=128` 是该优化实现的固定规格，
-预编译 `norm_eps=1e-6`；其他 epsilon 需要重新导出匹配变体。验证命令：
+## 测试
 
 ```bash
-pytest -q test/quant_mla_prolog/test_quant_mla_prolog.py -s
+python -m pytest -v test/quant_mla_prolog/test_quant_mla_prolog.py
 ```
 
-`npugraph_ex` 通过配套的 functional 算子和 ACLGraph reinplace 规则处理 cache 原位更新。
-图捕获前按上面的调用示例预热；capture 阶段仅记录图，首次 replay 后才检查输出值。
-独立入图验证交替更换 x 和 cache_index，并检查 Q/scale/完整 cache 与对应 eager 结果
-在 `atol=0, rtol=0` 下逐位一致；NaN/Inf 检查独立于误差门限。
+仅收集以下 4 个 Case，每例调用目标算子一次：
 
-## 实现要点
+| Case | 输入 / QKV 模式 | T / q_lora / N | 权重 / Cache | 分支 |
+| --- | --- | --- | --- | --- |
+| MXFP8 BF16 输出 | 1 / 0 | 1 / 1024 / 4 | ND / PA_BSND | 小 T head 交接，RoPE mode 1 |
+| MXFP8 分组 Cache | 1 / 1 | 16 / 1536 / 4 | NZ / PA_BSND | 小 T head 交接，RoPE mode 1 |
+| MXFP8 量化输出 | 1 / 2 | 33 / 2048 / 8 | NZ / PA_NZ | T=33 扩展 head 交接，RoPE mode 1 |
+| HiF8 量化输出 | 2 / 3 | 3 / 1024 / 2 | ND / PA_NZ | HiF8 路径，RoPE mode 2 |
 
-- WQA/WKVA 分阶段执行，使用各自的 NZ 权重；QA 向量阶段与 KVA 投影重叠。
-- MXFP8 数据与 E8M0 scale 通道配套双缓冲。
-- 调用方按 T 切分区间与 `quant_mode_c` 选择一个 AOT device 特化，
-  每次调用只发射一个 MixKernel，不存在两个 kernel 串行执行。
-- T=8/32 的 C1 路径使用 producer-local WKB→Q ready handoff，让下一 head 的
-  Cube 工作与上一 head 的 AIV Q 量化重叠。
-- T>128 的 C0/C1 prefill 路径按 M128 分块执行 QA/KVA/QB/WKB，保持
-  单次 MixKernel launch；大 T 不加入常规网络单元测试参数表。
-- 大 M 路径通过 `produce()/consume()` 选定 Tensor：L1 panel 在对应 K0 循环内复用，
-  L0C 在整次 K 累加中复用，WKB 的 L0A 在四个 N tile 间复用。整块和尾块共用
-  buffer 声明的物理 pitch；动态 prefill 先在 GM 将尾块补齐到 M128，再复用整块计算路径。
-- KVA RMSNorm 与 cache scatter 和 WQB/WKB 流水重叠；C1 在同一尾阶段完成 KV 量化。
-- C0 将 BF16 NoPE/RoPE 直接在 UB 合并；C1 对合并后的 576 维 Q 做 per-token-head 量化。
-- 静态权重与 scale 由调用方准备并复用，不扩展公开 API。
+前三例在公开调用选取编译配置时断言实际启用了 head 交接，避免仅凭 Shape 推断分支覆盖。
+测试的模块 fixture 另检查 `return_qr` 非 bool 值在 Torch 分派前被拒绝，并验证默认 False 和显式 True/False 的传递；不增加 Case 数。
 
-## 精度测试
+每例检查四输出 Shape/dtype/ND Format、Cache 存储身份、未命中区域字节及数值。CPU Golden 和比较器位于同一个测试文件。Q 三方使用提供的 `bm_output` / `bm_output_gold` 独立计算结果，不使用普通 Golden 的量化前中间值。当前接入范围为 MXFP8 mode 2、rope_mode=1、Dr=64，qr_scale/kvr_scale 按传入值计算；其他范围保留二方验收。Cache、scale、QR 及 E8M0 检查不能由 Q 三方豁免。原始高精度分支的 QA descale dtype 分支行为保持不变，并在诊断中明确记录。
 
-CPU golden 与 DSL kernel 源码独立：
+Q 和 KV Cache 各自为同一种 dtype 时，先比较合并后的完整输出，两方或三方任一通过即接受；合并两方、三方均失败后，再拆分 NoPE/KV 与 RoPE/KR。拆分后每个分支均须两方或三方至少一个通过，任一分支两者均失败则该输出失败。混合 dtype 的内容从一开始分别比较，不因使用同一种字节载体而合并。当前 mode 0/1 的 Q 为 BF16，mode 2 为 E4M3FN，mode 3 为 HiF8；mode 1 Cache 中的 FP8 KV、BF16 KR 和 FP32 scale 继续独立检查。其余输出比较规则及阈值不变，三方 warning 视为接受。
 
-- [golden.py](../../test/quant_mla_prolog/golden.py)：E4M3/E8M0 解码、FP32 累加、
-  BF16 边界、RMSNorm、Q/KV 量化和 PA_NZ scatter。
-- [test_quant_mla_prolog.py](../../test/quant_mla_prolog/test_quant_mla_prolog.py)：
-  C0/C1 各四条网络 shape 的 pytest，覆盖 T=8/32/64/128。
-- [test_large_m.py](../../test/quant_mla_prolog/test_large_m.py)：
-  C0/C1 的完整编译覆盖动态 T 与 T=136/256/512，上板精度覆盖 T=136/256，分别检查
-  M128 尾块和整块，并沿用网络 case 的精度与未写 cache 检查。
-
-四组网络输入直接定义在 `golden.py` 中，并分别派生 C0/C1，不依赖外部 CSV fixture。
-
-```bash
-pytest test/quant_mla_prolog/test_quant_mla_prolog.py -v
-pytest test/quant_mla_prolog/test_large_m.py -v
-```
-
-八条网络 case 使用 `1e-2` 相对 L2 门限，并额外检查：
-
-- Q 反量化余弦相似度大于 0.999；
-- `descale_q` 与 KV 写入精度；
-- 未写 cache slot 逐 bit 不变；
-- cache 输出保持输入对象和数据指针。
-
-## 本次核数与同步修复（基于 PR #255）
-
-公开接口与图注册保持原样，每次调用仍发射一个 MixKernel。
-
-- Host 在调用时读取当前流配额，取 `min(device_AIC, stream_AIC, stream_AIV // 2, 32)`，
-  不缓存流配额；不足一个 AIC/两个 AIV 时直接报错。
-- Launcher 和 head ownership 使用同一个有效核数。1～7 核在该核所有 WKB head
-  完成后使用一个 ready flag；8～32 核保留逐 head 通知，避免低核数下 flag 数量越界。
-- QB 按 N128 tile 分核，WKB 按 192 维完整 head 消费。QB 完成后增加显式
-  AIC-wide FIXPIPE arrive/wait，不能把本核 `cube_sync_all()` 当作跨核交接。
-- 小 T 在 WKB 写回之后通过本核 FIXPIPE→MTE2 notify/wait 再发布 head-ready；
-  AIV 读取前等待通知，末尾增加 MTE3 完成确认，避免 workspace/通知过早复用。
-- T8 scale 的生成代码为 4 次 4 字节写回，GM 起点间隔 384 字节、UB 间隔 4 字节；
-  两个 AIV 分别写 token 0～3、4～7。此检查针对本次框架生成的代码，不是旧 wheel 的反汇编结论。
-
-### 验证范围
-
-环境：py312、CANN 9.2 beta、CANNBot-DSL、OpKit。
-在 Ascend950DT_9582 的 32 AIC 设备上验证不同 launch 核数与实际流配额；
-这不等同于逐个硬件 SKU 的验证。
-
-- 源码 pytest：57 passed，含四条网络 case 的 C0/C1、host 核数策略与 NaN/Inf 检查。
-- 源码 C1 动态 T：1/7/8/9/17/31/32/33/63/64/65/127/128/129/255/256/257/511/512/513/1024，全通过。
-- Native require：T8 在 1～32 每个整数核数通过；32 核四条网络 case C0/C1 通过，共 39 项。
-- Native require 泛化：7 核 C1 的 T=1/9/17/33/65/129/257/1024；31 核 C0 的 T=9/33/129/257，全通过。
-- Native require Cache：261、6657 页均通过，检查负索引跳过、跨页、末页、未写区域逐位保持、原位指针不变。
-- 三份整网故障 PT：新 wheel 各回放 100 次，无新 NaN/Inf、无非确定性输出、只读输入不变、未写 cache 保持。
-  Dump 自带的 NaN 输出不是正确性 oracle；这些回放不等同于完整 FA 整网验证。
-
-- Native 连续调用/入图共 540 次：T8 的 1/32 核 eager、双流、ACLGraph、npugraph_ex，
-  实际 1/7 核配额双流与双流图，以及 T128/T129 的 ACLGraph/npugraph_ex。
-  循环中不做 host 同步，交替输入与 slots，Q/scale/完整 cache 与 eager 逐位一致，全部有限。
-- 原始网络片段（已有仅去除 FA 版本、未修改）B4S8/261 页：eager 两步、ACLGraph 两次 replay、
-  npugraph_ex 两次 replay 全部通过，`atol=rtol=0`。本环境没有 FA 包，未验证完整 attention。
-
-Native `require` 命中预编译 provider，不允许 JIT fallback。这不表示同一个已捕获图可以任意改变 T：
-T/缓冲区 shape 变化需要由图后端重新捕获，Native 二进制仍可复用。
-模型 `register_buffer` 静态权重方式的 npugraph_ex 稳态采集中，四条网络 case
-均未观察到整块 Cache 或权重拷贝。图外输入仍可能发生 staging：T8/T32 有
-`ForeachCopy`，T64/T128 另有输入 x `[T,7168]` 的 `TensorMove`。
-如果把静态权重作为每次调用的普通图输入，后端也可能搬运权重；算子不承诺消除图边界上的搬运。
-修改流核数配额后需要重新准备并捕获图，不能改变已捕获 kernel 的 launch width。
-
-## 本次性能采集
-
-2026-09-23 重新采集，算子源码基线为 `bf09a4c`。Ascend950DT_9582，
-32 AIC/64 AIV，C1；上述框架与本轮重新构建的 Native wheel，`native require`。
-`msprof --task-time=l0 --aicore-shape=on`，每条 case 预热 10 次，取后 30 次
-MixKernel 的 `Task Duration(us)`。下表不含图输入 staging、输入构造、首次编译、
-Python 调用或 FA 开销，不从流水图估算。每次 Prolog 调用仍为一个 MixKernel。
-12 组采集前后均通过 CPU golden 与 Q/descale_q 有限值检查，Native 全部命中，
-没有 JIT fallback。共享设备上的单次采集不作为前后版本无退化的证明。
-
-| Case | T | eager 均值（μs） | ACLGraph 均值（μs） | npugraph_ex 均值（μs） |
-| :--- | ---: | ---: | ---: | ---: |
-| B1S8 | 8 | 34.717 | 32.510 | 34.832 |
-| B4S8 | 32 | 40.293 | 42.376 | 40.373 |
-| B8S8 | 64 | 49.498 | 49.268 | 51.272 |
-| B16S8 | 128 | 67.220 | 66.516 | 67.626 |
-
-### 图输入搬运的独立定位
-
-本轮 torch_npu 的 `npugraph_ex` 默认 `clone_input=True`。其 `capture` 为普通
-图输入建立固定缓冲区，`process_input` 在 replay 前执行输入复制。测量模型将
-静态权重注册为 buffers，将 x、descale_x、cache、index 作为调用参数。
-
-T64 对照仅在独立测量脚本中设 `clone_input=False` 并保持输入地址固定：同一
-wheel、同一算子代码下，30 次采样窗口内不再出现 TensorMove 或 ForeachCopy，
-精度和有限值检查通过。这确认了该次输入 x 的 TensorMove 来自图边界 staging。
-T128 观察到相同形状的输入搬运，尚未执行关闭该开关的对照。
-此实验没有修改算子 Torch 接口、schema、Functionalize 或 reinplace 注册，
-也没有把该选项设为算子的默认值；不能据此要求整网直接关闭输入复制。
+这 4 例是代表性回归，不等于全量模式和 Shape 覆盖，也不是性能采集脚本。历史全量 Case、性能原始数据和专项脚本保留在先前提交及独立实验目录。
