@@ -427,7 +427,7 @@ mixed_quant_sparse_flash_mla:
 mixed_quant_sparse_flash_mla_metadata:
   module: True
   src:
-    - samples/mixed_quant_sparse_flash_mla_metadata
+    - samples/mixed_quant_sparse_flash_mla
     - test/mixed_quant_sparse_flash_mla_metadata
   options:
     - mixed_quant_sparse_flash_mla

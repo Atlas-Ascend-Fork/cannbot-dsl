@@ -63,8 +63,8 @@ mixed_quant_sparse_flash_mla_metadata (AICPU)
        mixed_quant_sparse_flash_mla (AICore)
 ```
 
-metadata 实现在同级目录
-[`mixed_quant_sparse_flash_mla_metadata`](../mixed_quant_sparse_flash_mla_metadata/README.md)。
+metadata 实现在同目录
+[`mixed_quant_sparse_flash_mla_metadata`](mixed_quant_sparse_flash_mla_metadata.py)。
 调用方先生成 metadata，再在同一 NPU 流调用主算子；跨流调用由调用方建立依赖。
 主算子不会隐式生成 metadata。
 
@@ -79,7 +79,7 @@ export PYTHON=/path/to/python3.12
 export CANN_ENV=/path/to/Ascend/cann/set_env.sh
 source "$CANN_ENV"
 export CANNBOTDSL_NATIVE_BINARY_MODE=off
-export PYTHONPATH="$PWD/samples/mixed_quant_sparse_flash_mla:$PWD/samples/mixed_quant_sparse_flash_mla_metadata:$PYTHONPATH"
+export PYTHONPATH="$PWD/samples/mixed_quant_sparse_flash_mla:$PYTHONPATH"
 ```
 
 用 `"$PYTHON"` 执行下面的 Python 示例。示例执行单 Query、仅原始 KV 的稀疏 Attention。KV 使用全零字节编码，
@@ -223,7 +223,7 @@ def mixed_quant_sparse_flash_mla(
 
 metadata 接口自身允许省略 `cu_seqlens_q`，此时按单 batch `[0,T1]` 规划；
 主算子始终要求显式传入它。两阶段调用建议传入同一个前缀和 Tensor，完整 metadata
-参数见 [配套接口说明](../mixed_quant_sparse_flash_mla_metadata/README.md#接口)。
+参数见 [配套 metadata 接口](mixed_quant_sparse_flash_mla_metadata.py)。
 
 ## 精度测试
 

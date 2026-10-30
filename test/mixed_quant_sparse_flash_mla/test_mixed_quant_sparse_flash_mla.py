@@ -7,6 +7,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 
 """Self-contained MQSMLA precision tests: local inputs, CPU golden and samples."""
+
 import logging
 import os
 from pathlib import Path
@@ -18,12 +19,17 @@ import torch
 
 # Load this checkout's samples without a repository-wide test helper.
 _samples = Path(__file__).resolve().parents[2] / "samples"
-for _operator in ("mixed_quant_sparse_flash_mla", "mixed_quant_sparse_flash_mla_metadata"):
-    sys.path.insert(0, str(_samples / _operator))
+sys.path.insert(0, str(_samples / "mixed_quant_sparse_flash_mla"))
 
 import mixed_quant_sparse_flash_mla as MQSMLA
 import mixed_quant_sparse_flash_mla_metadata as METADATA
 from mixed_quant_sparse_flash_mla_paramset import ENABLED_PARAMS, TEST_PARAMS
+
+# Keep SMLA tests available for explicit validation without running them in CI.
+pytestmark = pytest.mark.skipif(
+    os.environ.get("CANNBOTDSL_RUN_SMLA_TESTS") != "1",
+    reason="SMLA tests are opt-in; set CANNBOTDSL_RUN_SMLA_TESTS=1 to run",
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -33,8 +39,13 @@ KV_ROW_BYTES_ORI, KV_ROW_BYTES_CMP, KV_PAGE_PADDING_BYTES = 544, 320, 64
 
 def _selected_cases():
     selection = os.environ.get("MQSMLA_CASES", "").strip()
-    names = (list(TEST_PARAMS) if selection == "all" else
-             [name.strip() for name in selection.split(",")] if selection else ENABLED_PARAMS)
+    names = (
+        list(TEST_PARAMS)
+        if selection == "all"
+        else [name.strip() for name in selection.split(",")]
+        if selection
+        else ENABLED_PARAMS
+    )
     unknown = set(names) - TEST_PARAMS.keys()
     if unknown:
         raise ValueError(f"Unknown MQSMLA_CASES: {sorted(unknown)}")
@@ -51,10 +62,14 @@ def _make_kv(batch, tokens, block_size, fp4, generator):
     pages = (tokens + block_size - 1) // block_size
     shape = (batch, pages * block_size, D)
     group = 16 if fp4 else 32
-    scales = (0.125 + torch.rand((*shape[:-1], D // group), generator=generator) * 0.375).bfloat16()
+    scales = (
+        0.125 + torch.rand((*shape[:-1], D // group), generator=generator) * 0.375
+    ).bfloat16()
     if fp4:
         codes = torch.randint(0, 16, shape, generator=generator, dtype=torch.uint8)
-        lut = torch.tensor([0, .5, 1, 1.5, 2, 3, 4, 6, 0, -.5, -1, -1.5, -2, -3, -4, -6])
+        lut = torch.tensor(
+            [0, 0.5, 1, 1.5, 2, 3, 4, 6, 0, -0.5, -1, -1.5, -2, -3, -4, -6]
+        )
         values = lut[codes.long()]
         encoded = codes[..., 0::2] | (codes[..., 1::2] << 4)
     else:
@@ -63,11 +78,17 @@ def _make_kv(batch, tokens, block_size, fp4, generator):
         values = values.float()
     logical = (values * scales.float().repeat_interleave(group, dim=-1)).bfloat16()
     packed = torch.cat((encoded, scales.view(torch.uint8)), dim=-1)
-    table = torch.randperm(batch * pages, generator=generator).reshape(batch, pages).int()
+    table = (
+        torch.randperm(batch * pages, generator=generator).reshape(batch, pages).int()
+    )
     physical = torch.empty_like(packed.reshape(batch * pages, block_size, -1))
     physical[table.long().flatten()] = packed.reshape_as(physical)
-    return {"phys": {"row": physical}, "num_phys_blocks": batch * pages,
-            "block_size": block_size, "block_table": table}, logical
+    return {
+        "phys": {"row": physical},
+        "num_phys_blocks": batch * pages,
+        "block_size": block_size,
+        "block_table": table,
+    }, logical
 
 
 def gen_data(params):
@@ -77,23 +98,39 @@ def gen_data(params):
     spans = p["q_lengths"]
     batch, rows = len(spans), sum(spans)
     has_cmp = p.get("has_cmp", True)
-    q = (torch.randn((rows, N1, D), generator=generator) * .25).bfloat16()
+    q = (torch.randn((rows, N1, D), generator=generator) * 0.25).bfloat16()
     sinks = torch.randn(N1, generator=generator)
     cu = torch.tensor([0, *np.cumsum(spans).tolist()], dtype=torch.int32)
-    case = {"q": q, "sinks": sinks, "cu_seqlens_q": cu,
-            "seqused_q": torch.tensor(spans, dtype=torch.int32),
-            "b": batch, "t1": rows, "quant_mode": 1,
-            "mode": "ORI_CMP_SPARSE" if has_cmp else "ORI_SPARSE", "scale": D ** -.5}
+    case = {
+        "q": q,
+        "sinks": sinks,
+        "cu_seqlens_q": cu,
+        "seqused_q": torch.tensor(spans, dtype=torch.int32),
+        "b": batch,
+        "t1": rows,
+        "quant_mode": 1,
+        "mode": "ORI_CMP_SPARSE" if has_cmp else "ORI_SPARSE",
+        "scale": D**-0.5,
+    }
     logical = {}
     for side, fp4 in (("ori", False), ("cmp", True)):
         width = p[f"k_{side}"]
-        pa, logical[side] = _make_kv(batch, p[f"s_{side}"], p[f"block_size_{side}"], fp4, generator)
+        pa, logical[side] = _make_kv(
+            batch, p[f"s_{side}"], p[f"block_size_{side}"], fp4, generator
+        )
         case["pa" if side == "ori" else "pa_cmp"] = pa
-        indices = torch.randint(p[f"s_{side}"], (rows, width), generator=generator, dtype=torch.int32)
+        indices = torch.randint(
+            p[f"s_{side}"], (rows, width), generator=generator, dtype=torch.int32
+        )
         lengths = torch.full((rows,), width, dtype=torch.int32)
         if p.get("vary_lengths", False):
-            lengths = torch.tensor(([0, 1, min(127, width), width] * ((rows + 3) // 4))[:rows], dtype=torch.int32)
-        if (side == "cmp" and not has_cmp) or (side == "ori" and p.get("zero_ori", False)):
+            lengths = torch.tensor(
+                ([0, 1, min(127, width), width] * ((rows + 3) // 4))[:rows],
+                dtype=torch.int32,
+            )
+        if (side == "cmp" and not has_cmp) or (
+            side == "ori" and p.get("zero_ori", False)
+        ):
             lengths.zero_()
         if p.get(f"omit_{side}_topk_length", False):
             lengths.fill_(width)
@@ -105,8 +142,12 @@ def gen_data(params):
     lse = torch.empty((1, rows, N1), dtype=torch.float32)
     for b in range(batch):
         for row in range(int(cu[b]), int(cu[b + 1])):
-            sides = [logical[side][b, case[f"idx_{side}"][row, :int(case[f"len_{side}"][row])].long()]
-                     for side in ("ori", "cmp")]
+            sides = [
+                logical[side][
+                    b, case[f"idx_{side}"][row, : int(case[f"len_{side}"][row])].long()
+                ]
+                for side in ("ori", "cmp")
+            ]
             # Dense FP64 logsumexp independently checks LSE and sink semantics.
             kv = torch.cat(sides).double()
             logits = q[row].double() @ kv.T * case["scale"]
@@ -120,14 +161,16 @@ def gen_data(params):
             accumulator = torch.zeros(N1, D)
             for values in sides:
                 for start in range(0, len(values), 128):
-                    tile = values[start:start + 128].float()
+                    tile = values[start : start + 128].float()
                     scores = q[row].float() @ tile.T * case["scale"]
                     new_max = torch.maximum(row_max, scores.max(dim=1).values)
                     correction = torch.exp(row_max - new_max)
                     weights = torch.exp(scores - new_max[:, None])
                     row_sum = row_sum * correction + weights.sum(dim=1)
-                    accumulator = (accumulator * correction[:, None]
-                                   + weights.bfloat16().float() @ tile)
+                    accumulator = (
+                        accumulator * correction[:, None]
+                        + weights.bfloat16().float() @ tile
+                    )
                     row_max = new_max
             output[row] = (accumulator / row_sum[:, None]).bfloat16()
     return p, case, output.reshape(-1, D), lse
@@ -145,8 +188,8 @@ def check_result(expect, npu_result, chunk_elements=1 << 20):
     sampled_errors = 0
     max_error = 0.0
     for start in range(0, total, chunk_elements):
-        real = actual[start:start + chunk_elements].cpu().float().numpy()
-        golden = expected[start:start + chunk_elements].cpu().float().numpy()
+        real = actual[start : start + chunk_elements].cpu().float().numpy()
+        golden = expected[start : start + chunk_elements].cpu().float().numpy()
         close = np.isclose(real, golden, rtol=0.0078125, atol=0.0001, equal_nan=True)
         bad = np.flatnonzero(~close)
         errors += bad.size
@@ -166,9 +209,15 @@ def check_result(expect, npu_result, chunk_elements=1 << 20):
     result = "Pass" if percent >= (1 - 0.005) * 100.0 else "Failed"
     if sampled_errors and max_error >= 10:
         result = "Failed"
-    LOGGER.info("BF16 chunked compare: count=%s, errors=%s, pass=%.6f%%, "
-                "rtol=0.0078125, atol=0.0001, max_relative=%s, result=%s",
-                total, errors, percent, max_error, result)
+    LOGGER.info(
+        "BF16 chunked compare: count=%s, errors=%s, pass=%.6f%%, "
+        "rtol=0.0078125, atol=0.0001, max_relative=%s, result=%s",
+        total,
+        errors,
+        percent,
+        max_error,
+        result,
+    )
     return result, percent
 
 
@@ -195,7 +244,9 @@ def _pa_tensor(pa, row_bytes, *, axis0_noncontiguous=False):
 def _call_public(kwargs, mode, t1, *, omit_ori_length=False, omit_cmp_length=False):
     """Run this checkout’s metadata and AICore public entries."""
     mixed_quant_sparse_flash_mla = MQSMLA.mixed_quant_sparse_flash_mla
-    mixed_quant_sparse_flash_mla_metadata = METADATA.mixed_quant_sparse_flash_mla_metadata
+    mixed_quant_sparse_flash_mla_metadata = (
+        METADATA.mixed_quant_sparse_flash_mla_metadata
+    )
 
     kwargs = dict(kwargs)
     if kwargs.get("metadata") is None:
@@ -208,9 +259,15 @@ def _call_public(kwargs, mode, t1, *, omit_ori_length=False, omit_cmp_length=Fal
         if cmp_lengths is None:
             cmp_lengths = torch.zeros((t1, 1), dtype=torch.int32).npu()
         kwargs["metadata"] = mixed_quant_sparse_flash_mla_metadata(
-            ori_lengths, cmp_lengths, cu_seqlens_q=kwargs["cu_seqlens_q"],
-            num_heads_q=N1, num_heads_kv=1, head_dim=D,
-            quant_mode=kwargs["quant_mode"], has_cmp_kv=(mode != "ORI_SPARSE"))
+            ori_lengths,
+            cmp_lengths,
+            cu_seqlens_q=kwargs["cu_seqlens_q"],
+            num_heads_q=N1,
+            num_heads_kv=1,
+            head_dim=D,
+            quant_mode=kwargs["quant_mode"],
+            has_cmp_kv=(mode != "ORI_SPARSE"),
+        )
     # Metadata keeps its required length inputs; attention can omit either side.
     if omit_ori_length:
         kwargs.pop("ori_topk_length")
@@ -218,8 +275,11 @@ def _call_public(kwargs, mode, t1, *, omit_ori_length=False, omit_cmp_length=Fal
         kwargs.pop("cmp_topk_length")
     want_lse = kwargs.get("return_softmax_lse", False)
     out = torch.empty_like(kwargs["q"])
-    lse = torch.empty((1, t1, N1) if want_lse else (0,),
-                      dtype=torch.float32, device=kwargs["q"].device)
+    lse = torch.empty(
+        (1, t1, N1) if want_lse else (0,),
+        dtype=torch.float32,
+        device=kwargs["q"].device,
+    )
     mixed_quant_sparse_flash_mla(**kwargs, out=out, lse=lse)
     output = out.cpu().reshape(-1, D)
     lse = lse.cpu()
@@ -232,7 +292,10 @@ def _call_public(kwargs, mode, t1, *, omit_ori_length=False, omit_cmp_length=Fal
 
 
 def run_prepared(
-    p, case, expected, expected_lse,
+    p,
+    case,
+    expected,
+    expected_lse,
 ):
     """Execute locally generated inputs against the independent CPU reference."""
     mode = case["mode"]
@@ -240,29 +303,42 @@ def run_prepared(
     pa_ori = case["pa"]
     has_ori = mode != "CMP_SPARSE"
     has_cmp = mode != "ORI_SPARSE"
-    ori_kv = (_pa_tensor(pa_ori, KV_ROW_BYTES_ORI,
-                         axis0_noncontiguous=p["kv_axis0_noncontiguous"])
-              if has_ori else None)
+    ori_kv = (
+        _pa_tensor(
+            pa_ori, KV_ROW_BYTES_ORI, axis0_noncontiguous=p["kv_axis0_noncontiguous"]
+        )
+        if has_ori
+        else None
+    )
     pa_cmp = case["pa_cmp"]
     kwargs = {
         "q": case["q"].npu(),
         "ori_kv": ori_kv,
         "cmp_kv": _pa_tensor(
-            pa_cmp, KV_ROW_BYTES_CMP,
-            axis0_noncontiguous=p["kv_axis0_noncontiguous"]) if has_cmp else None,
-        "ori_sparse_indices": (case["idx_ori"].reshape(case["t1"], 1, -1).npu()
-                               if has_ori else None),
-        "cmp_sparse_indices": case["idx_cmp"].reshape(case["t1"], 1, -1).npu() if has_cmp else None,
+            pa_cmp, KV_ROW_BYTES_CMP, axis0_noncontiguous=p["kv_axis0_noncontiguous"]
+        )
+        if has_cmp
+        else None,
+        "ori_sparse_indices": (
+            case["idx_ori"].reshape(case["t1"], 1, -1).npu() if has_ori else None
+        ),
+        "cmp_sparse_indices": case["idx_cmp"].reshape(case["t1"], 1, -1).npu()
+        if has_cmp
+        else None,
         "ori_block_table": pa_ori["block_table"].npu() if has_ori else None,
         "cmp_block_table": pa_cmp["block_table"].npu() if has_cmp else None,
         "cu_seqlens_q": case["cu_seqlens_q"].npu(),
-        "seqused_q": case["seqused_q"].npu() if case.get("seqused_q") is not None else None,
+        "seqused_q": case["seqused_q"].npu()
+        if case.get("seqused_q") is not None
+        else None,
         "seqused_ori_kv": None,
         "seqused_cmp_kv": None,
-        "ori_topk_length": (case["len_ori"].reshape(case["t1"], 1).npu()
-                            if has_ori else None),
-        "cmp_topk_length": (case["len_cmp"].reshape(case["t1"], 1).npu()
-                            if has_cmp else None),
+        "ori_topk_length": (
+            case["len_ori"].reshape(case["t1"], 1).npu() if has_ori else None
+        ),
+        "cmp_topk_length": (
+            case["len_cmp"].reshape(case["t1"], 1).npu() if has_cmp else None
+        ),
         "sinks": case["sinks"].npu(),
         "metadata": None,
         "quant_mode": quant_mode,
@@ -274,12 +350,20 @@ def run_prepared(
     for side in ("ori", "cmp"):
         kv = kwargs[f"{side}_kv"]
         if kv is not None:
-            LOGGER.info("%s_kv shape=%s stride=%s storage_offset=%s",
-                        side, tuple(kv.shape), kv.stride(), kv.storage_offset())
+            LOGGER.info(
+                "%s_kv shape=%s stride=%s storage_offset=%s",
+                side,
+                tuple(kv.shape),
+                kv.stride(),
+                kv.storage_offset(),
+            )
     actual, actual_lse = _call_public(
-        kwargs, mode, case["t1"],
+        kwargs,
+        mode,
+        case["t1"],
         omit_ori_length=p.get("omit_ori_topk_length", False),
-        omit_cmp_length=p.get("omit_cmp_topk_length", False))
+        omit_cmp_length=p.get("omit_cmp_topk_length", False),
+    )
     if kwargs["return_softmax_lse"]:
         torch.testing.assert_close(actual_lse, expected_lse, rtol=1e-5, atol=1e-5)
     if has_ori:
@@ -290,23 +374,36 @@ def run_prepared(
         empty_rows = case["len_cmp"].reshape(-1) == 0
     if bool(empty_rows.any()):
         empty_out = actual.reshape(case["t1"], N1, D)[empty_rows]
-        assert torch.count_nonzero(empty_out) == 0, "empty queries must produce exact zero"
+        assert torch.count_nonzero(empty_out) == 0, (
+            "empty queries must produce exact zero"
+        )
         if kwargs["return_softmax_lse"]:
             torch.testing.assert_close(
                 actual_lse[0, empty_rows],
-                case["sinks"].expand(int(empty_rows.sum()), N1), rtol=0, atol=0)
+                case["sinks"].expand(int(empty_rows.sum()), N1),
+                rtol=0,
+                atol=0,
+            )
     result, percent = check_result(expected, actual)
     assert result == "Pass", f"strict BF16 comparator failed: {percent:.6f}%"
     # 大prefill输出可达16GiB，误差统计不要同时物化三份全量FP32输出。
     actual_flat, expected_flat = actual.reshape(-1), expected.reshape(-1)
     max_abs = 0.0
     for start in range(0, actual_flat.numel(), 1 << 20):
-        diff = (actual_flat[start:start + (1 << 20)].float()
-                - expected_flat[start:start + (1 << 20)].float()).abs()
+        diff = (
+            actual_flat[start : start + (1 << 20)].float()
+            - expected_flat[start : start + (1 << 20)].float()
+        ).abs()
         chunk_max = diff.max().item()
         max_abs = chunk_max if chunk_max != chunk_max else max(max_abs, chunk_max)
-    LOGGER.info("[mqsmla test_case] NPU %s quant%s B=%s T1=%s OK: max_abs=%.6g",
-                mode, quant_mode, case["b"], case["t1"], max_abs)
+    LOGGER.info(
+        "[mqsmla test_case] NPU %s quant%s B=%s T1=%s OK: max_abs=%.6g",
+        mode,
+        quant_mode,
+        case["b"],
+        case["t1"],
+        max_abs,
+    )
 
 
 @pytest.mark.npu

@@ -7,18 +7,26 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 
 """Structural and argument tests for the local MQSMLA AICPU planner."""
+
 from pathlib import Path
 import sys
 
 import pytest
 import torch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "samples" / "mixed_quant_sparse_flash_mla_metadata"))
+sys.path.insert(
+    0,
+    str(
+        Path(__file__).resolve().parents[2] / "samples" / "mixed_quant_sparse_flash_mla"
+    ),
+)
 import mixed_quant_sparse_flash_mla_metadata as METADATA
 
 
 @pytest.mark.npu
-@pytest.mark.parametrize("spans,has_cmp", [([1], False), ([3, 0, 5], True), ([42, 23], True)])
+@pytest.mark.parametrize(
+    "spans,has_cmp", [([1], False), ([3, 0, 5], True), ([42, 23], True)]
+)
 def test_mixed_quant_sparse_flash_mla_metadata_structure(spans, has_cmp):
     pytest.importorskip("torch_npu")
     if not torch.npu.is_available():
@@ -31,39 +39,72 @@ def test_mixed_quant_sparse_flash_mla_metadata_structure(spans, has_cmp):
     ori[::4] = 0
     cmp[::4] = 0
     metadata = METADATA.mixed_quant_sparse_flash_mla_metadata(
-        ori, cmp, cu_seqlens_q=cu.npu(), num_heads_q=64, num_heads_kv=1,
-        head_dim=512, quant_mode=1, has_cmp_kv=has_cmp)
+        ori,
+        cmp,
+        cu_seqlens_q=cu.npu(),
+        num_heads_q=64,
+        num_heads_kv=1,
+        head_dim=512,
+        quant_mode=1,
+        has_cmp_kv=has_cmp,
+    )
     assert metadata.dtype == torch.int32 and metadata.device.type == "npu"
     assert metadata.shape == (METADATA.MQSMLA_METADATA_TOTAL_SIZE,)
     host = metadata.cpu()
-    fa = host[:METADATA.FD_METADATA_BASE].view(METADATA.AIC_CORE_MAX_NUM, METADATA.FA_METADATA_SIZE)
+    fa = host[: METADATA.FD_METADATA_BASE].view(
+        METADATA.AIC_CORE_MAX_NUM, METADATA.FA_METADATA_SIZE
+    )
     enabled = fa[:, METADATA.FA_CORE_ENABLE_INDEX].ne(0)
     count = min(rows, torch.npu.get_device_properties(0).cube_core_num)
     assert enabled.tolist() == [True] * count + [False] * (len(fa) - count)
     assert torch.count_nonzero(fa[~enabled]) == 0
     active = fa[enabled]
-    starts = cu[active[:, METADATA.FA_BN2_START_INDEX].long()] + active[:, METADATA.FA_M_START_INDEX]
-    ends = cu[active[:, METADATA.FA_BN2_END_INDEX].long()] + active[:, METADATA.FA_M_END_INDEX]
+    starts = (
+        cu[active[:, METADATA.FA_BN2_START_INDEX].long()]
+        + active[:, METADATA.FA_M_START_INDEX]
+    )
+    ends = (
+        cu[active[:, METADATA.FA_BN2_END_INDEX].long()]
+        + active[:, METADATA.FA_M_END_INDEX]
+    )
     assert starts[0] == 0 and ends[-1] == rows
     assert torch.all(ends > starts)
     torch.testing.assert_close(starts[1:], ends[:-1], rtol=0, atol=0)
-    assert torch.count_nonzero(active[:, [METADATA.FA_S2_START_INDEX, METADATA.FA_S2_END_INDEX]]) == 0
+    assert (
+        torch.count_nonzero(
+            active[:, [METADATA.FA_S2_START_INDEX, METADATA.FA_S2_END_INDEX]]
+        )
+        == 0
+    )
     # Only the documented FA/FD region is initialized; trailing storage is reserved.
-    assert torch.count_nonzero(host[METADATA.FD_METADATA_BASE:METADATA.FD_USED_VEC_NUM_WORD + 1]) == 0
+    assert (
+        torch.count_nonzero(
+            host[METADATA.FD_METADATA_BASE : METADATA.FD_USED_VEC_NUM_WORD + 1]
+        )
+        == 0
+    )
 
 
-@pytest.mark.parametrize("change,match", [
-    ({"num_heads_q": 63}, "metadata supports"),
-    ({"quant_mode": 0}, "metadata supports"),
-    ({"layout_q": "BSND"}, "TND / PA_BBND"),
-    ({"ori_topk_length": torch.ones(2, 1)}, "int32 tensor"),
-    ({"cmp_topk_length": torch.ones(3, 1, dtype=torch.int32)}, "same shape"),
-])
+@pytest.mark.parametrize(
+    "change,match",
+    [
+        ({"num_heads_q": 63}, "metadata supports"),
+        ({"quant_mode": 0}, "metadata supports"),
+        ({"layout_q": "BSND"}, "TND / PA_BBND"),
+        ({"ori_topk_length": torch.ones(2, 1)}, "int32 tensor"),
+        ({"cmp_topk_length": torch.ones(3, 1, dtype=torch.int32)}, "same shape"),
+    ],
+)
 def test_mixed_quant_sparse_flash_mla_metadata_rejects_invalid_input(change, match):
     # These public argument checks run before any device query or AICPU launch.
-    kwargs = dict(ori_topk_length=torch.ones(2, 1, dtype=torch.int32),
-                  cmp_topk_length=torch.ones(2, 1, dtype=torch.int32),
-                  num_heads_q=64, num_heads_kv=1, head_dim=512, quant_mode=1)
+    kwargs = dict(
+        ori_topk_length=torch.ones(2, 1, dtype=torch.int32),
+        cmp_topk_length=torch.ones(2, 1, dtype=torch.int32),
+        num_heads_q=64,
+        num_heads_kv=1,
+        head_dim=512,
+        quant_mode=1,
+    )
     kwargs.update(change)
     with pytest.raises(ValueError, match=match):
         METADATA.mixed_quant_sparse_flash_mla_metadata(**kwargs)

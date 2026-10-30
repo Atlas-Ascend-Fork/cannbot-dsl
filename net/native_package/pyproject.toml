@@ -15,7 +15,7 @@ name = "cannbot-arena-net"
 version = "0.3.0"
 description = "Selected CANNBotDSL operators and compiled Native resources"
 requires-python = ">=3.10"
-dependencies = ["cannbot-dsl>=0.7.0,<0.8", "torch", "pytest"]
+dependencies = ["cannbot-dsl>=0.8.0", "torch", "pytest"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

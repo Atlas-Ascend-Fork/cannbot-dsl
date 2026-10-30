@@ -29,7 +29,7 @@ def test_catalog_exports_and_staged_resources(tmp_path, monkeypatch):
     operators, _ = builder.load_catalog()
     sources = tmp_path / "sources"
     builder.materialize_flat_sources(sources, list(operators), operators)
-    # Exercise the DSL 0.7 static discovery used by the package builder.
+    # Exercise the DSL static discovery used by the package builder.
     from cannbotdsl.aot.publication import _declares_registration
 
     exports = set()
@@ -105,38 +105,38 @@ def runner(tmp_path):
 
 def test_dsl_discovery_and_cache_invalidation(runner):
     project, env, log, run = runner
-    dsl = project.parent / 'cannbotdsl-0.7-py3-none-any.whl'
-    dsl.write_text('dsl')
+    dsl = project.parent / "cannbotdsl-0.8-py3-none-any.whl"
+    dsl.write_text("dsl")
     # Stale OpKit settings must not require or install a separate distribution.
-    env['OPKIT_WHEEL'] = '/missing/opkit.whl'
+    env["OPKIT_WHEEL"] = "/missing/opkit.whl"
     for _ in range(2):
         result = run()
         assert result.returncode == 0, result.stderr
     records = [json.loads(line) for line in log.read_text().splitlines()]
-    installs = [args for args, _ in records if args[:3] == ['-m', 'pip', 'install']]
+    installs = [args for args, _ in records if args[:3] == ["-m", "pip", "install"]]
     assert len(installs) == 1
     assert Path(installs[0][-1]).resolve() == dsl
-    assert not any('opkit' in arg for arg in installs[0])
+    assert not any("opkit" in arg for arg in installs[0])
     first_site = records[-1][1]
-    dsl.write_text('dsl-updated')
+    dsl.write_text("dsl-updated")
     result = run()
     assert result.returncode == 0, result.stderr
     records = [json.loads(line) for line in log.read_text().splitlines()]
-    assert sum(args[:3] == ['-m', 'pip', 'install'] for args, _ in records) == 2
+    assert sum(args[:3] == ["-m", "pip", "install"] for args, _ in records) == 2
     assert records[-1][1] != first_site
 
 
-@pytest.mark.parametrize('selection', ['explicit', 'dsl_root'])
+@pytest.mark.parametrize("selection", ["explicit", "dsl_root"])
 def test_external_dsl_wheel(runner, tmp_path, selection):
     project, env, log, run = runner
-    location = tmp_path / 'external' / 'build' / 'run' / 'payload'
+    location = tmp_path / "external" / "build" / "run" / "payload"
     location.mkdir(parents=True)
-    wheel = location / 'cannbotdsl-0.7-py3-none-any.whl'
-    wheel.write_text('dsl')
-    if selection == 'explicit':
-        env['CANNBOTDSL_WHEEL'] = str(wheel)
+    wheel = location / "cannbotdsl-0.8-py3-none-any.whl"
+    wheel.write_text("dsl")
+    if selection == "explicit":
+        env["CANNBOTDSL_WHEEL"] = str(wheel)
     else:
-        env['CANNBOTDSL_ROOT'] = str(tmp_path / 'external')
+        env["CANNBOTDSL_ROOT"] = str(tmp_path / "external")
     result = run()
     assert result.returncode == 0, result.stderr
     assert json.loads(log.read_text().splitlines()[0])[0][-1] == str(wheel)
@@ -146,7 +146,7 @@ def test_missing_dsl_fails_before_install(runner):
     project, env, log, run = runner
     result = run()
     assert result.returncode != 0
-    assert 'CANNBOTDSL_WHEEL' in result.stderr
+    assert "CANNBOTDSL_WHEEL" in result.stderr
     assert not log.exists()
 
 
@@ -211,7 +211,7 @@ def test_build_wheel_contains_sources_and_native_resources(tmp_path, monkeypatch
             name for name in archive.namelist() if name.endswith(".dist-info/METADATA")
         )
         assert "Requires-Dist: opkit" not in archive.read(metadata).decode()
-        assert "Requires-Dist: cannbotdsl<0.8,>=0.7.0" in archive.read(metadata).decode()
+        assert "Requires-Dist: cannbot-dsl>=0.8.0" in archive.read(metadata).decode()
 
 
 def test_ds41_selection():

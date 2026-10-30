@@ -187,7 +187,7 @@ python3 -m pytest test/sparse_flash_attention/test_sparse_flash_attention.py -v
 | [flash_mla_with_kvcache](samples/flash_mla_with_kvcache) | `flash_mla_with_kvcache()`、`flash_mla_with_kvcache_metadata()` | Flash MLA 推理，Q 为 TND、KV 走分页 cache |
 | [quant_block_sparse_attn](samples/quant_block_sparse_attn) | `quant_block_sparse_attn()`、`quant_block_sparse_attn_metadata()` | FP8 量化块稀疏注意力，面向分页 prefill |
 | [mixed_quant_sparse_flash_mla](samples/mixed_quant_sparse_flash_mla) | `mixed_quant_sparse_flash_mla()` | 混合量化稀疏 MLA：BF16 Q + FP8 原始 KV + 可选 FP4 压缩 KV |
-| [mixed_quant_sparse_flash_mla_metadata](samples/mixed_quant_sparse_flash_mla_metadata) | `mixed_quant_sparse_flash_mla_metadata()` | MQSMLA 的 AICPU 分核调度，输出整行 / FlashDecode 分片计划 |
+| [mixed_quant_sparse_flash_mla_metadata](samples/mixed_quant_sparse_flash_mla/mixed_quant_sparse_flash_mla_metadata.py) | `mixed_quant_sparse_flash_mla_metadata()` | MQSMLA 的 AICPU 分核调度，输出整行 / FlashDecode 分片计划 |
 | [flash_kda](samples/flash_kda) | `flash_kda()`、`flash_kda_metadata()` | Kimi Delta Attention prefill 融合算子，含 AICPU 调度 metadata |
 | [fused_recurrent_kda_replayssm](samples/fused_recurrent_kda_replayssm) | `fused_recurrent_kda_replayssm()` | 独立 ReplaySSM verify，读取 FP32 checkpoint，写出 FP16 U/K 和 FP32 decay；支持 BSND/BNSD/TND 和 8/24/28/32 控核 |
 | [attn_prologue](samples/attn_prologue) | `attn_prologue()` | MXFP8 的 QA/KV 投影、RMSNorm、QR 量化、QB 投影、RoPE 与 KV cache 写回 |

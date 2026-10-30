@@ -64,7 +64,7 @@ native_package/
 
 `.build/` 包含编译缓存、临时目录、Python 缓存以及被替换的上一版成功产物；`output/` 只包含当前成功发布的 Native、AICPU 目录和 wheel。构建失败时不会替换已有的成功产物。
 
-构建脚本将 DSL wheel 安装到隔离目录，wheel 内容变化时使用新缓存。生成的算子 wheel 依赖 `cannbotdsl>=0.7.0,<0.8`，导入 `ops` 时通过 `cannbotdsl.aot.register_directory` 注册 Native 资源。
+构建脚本将 DSL wheel 安装到隔离目录，wheel 内容变化时使用新缓存。生成的算子 wheel 依赖 `cannbot-dsl>=0.8.0`，导入 `ops` 时通过 `cannbotdsl.aot.register_directory` 注册 Native 资源。
 
 本工程打包 DS41 的 `mqsmla`、`qli`、`qsli` 和 `attn_epilogue`，其中前三个同时携带 metadata 模块。AICore 通过 `cannbotdsl.aot` 导出；AICPU metadata 在各自独立的编译目录生成，随 wheel 安装到 `ops/_aicpu/`，运行时优先加载这些预编译文件。源码直接运行时仍保留原有的 metadata 编译路径。
 
@@ -74,12 +74,12 @@ native_package/
 
 安装后可设置 `CANNBOTDSL_NATIVE_BINARY_MODE=require` 验证二进制覆盖，未命中时立即报错，不回退 JIT。设置 `CANNBOTDSL_NATIVE_BINARY_REPORT=/path/to/native-report.json` 可保存命中记录。
 
-`--list` / `--help` 无需 CANN 环境或 wheel。实际构建前指定 DSL 0.7 wheel，例如（路径请替换为实际安装位置）：
+`--list` / `--help` 无需 CANN 环境或 wheel。实际构建前指定 DSL wheel，例如（路径请替换为实际安装位置）：
 
 ```bash
 export PYTHON=/path/to/python3.12
 export CANN_ENV=/path/to/Ascend/cann/set_env.sh
-export CANNBOTDSL_WHEEL=/path/to/cannbotdsl-0.7.0-cp312-cp312-manylinux_2_28_x86_64.whl
+export CANNBOTDSL_WHEEL=/path/to/cannbotdsl-0.8.0-cp312-cp312-manylinux_2_28_x86_64.whl
 ./run-build.sh --group ds41
 ```
 

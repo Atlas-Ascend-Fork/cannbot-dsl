@@ -9,7 +9,7 @@
 import tempfile
 import threading
 
-from cannbotdsl.aicpu import GmIn, GmOut, I32, I64, aicpu_kernel, current_raw_stream
+from cannbotdsl.aicpu import gm_in, gm_out, I32, I64, aicpu_kernel, current_raw_stream
 
 AIC_CORE_MAX_NUM = 36
 AIV_CORE_MAX_NUM = 72
@@ -46,11 +46,18 @@ FA_TOLERANCE_RATIO = 2
 
 # Metadata owns the FD policy. SUPPORT_FD enables the general cost-based planner;
 # SELECTIVE_FD_72 independently enables the exact 72-row plan. All other inputs
-# use whole rows. The attention AICore binary supports all three plans.
-SUPPORT_FD = False
+# use the general planner when SUPPORT_FD is enabled. The attention AICore
+# binary supports all three plans.
+SUPPORT_FD = True
 # Require at least four 128-token tiles of modeled critical-path saving.
 # Short-row splits do not amortize partial writes, the barrier and reduction.
 FD_MIN_SAVED_TILES = 4
+# Target four tiles per FA core: one-tile parts make the serial FD reducer
+# more expensive than the work removed from a long, otherwise single-core row.
+FD_TARGET_TILES_PER_CORE = 4
+# 短行保留完整 online softmax，避免把少量有效列拆成独立 BF16 P 舍入基准。
+# 长行仍可 FD；固定五 tile 的 selective plan 不受此限制影响。
+FD_MIN_ROW_TILES = 5
 SELECTIVE_FD_72 = True  # Eight groups of nine rows; three split rows per group.
 
 
@@ -77,7 +84,7 @@ def _get_cube_core_num(device=None):
 
 def _md_uniform(a):
     # Initialize every metadata field consumed by attention, including unused FA/FD entries.
-    for i in range(0, FD_USED_VEC_NUM_WORD + 1):
+    for i in range(0, MQSMLA_METADATA_TOTAL_SIZE):
         a.metadata[i] = 0
     rows_per_core = a.rows // a.blocks
     extra = a.rows % a.blocks
@@ -110,13 +117,13 @@ def _md_uniform(a):
 
 
 class _MqsmlaMetadataArgs:
-    win_len: GmIn(I32)  # [T1] valid ORI lengths.
-    cmp_len: GmIn(I32)  # [T1] valid CMP lengths; ignored when has_cmp=0.
-    metadata: GmOut(I32)  # Fixed int32[1024] FA/FD layout.
+    win_len: gm_in(I32)  # [T1] valid ORI lengths.
+    cmp_len: gm_in(I32)  # [T1] valid CMP lengths; ignored when has_cmp=0.
+    metadata: gm_out(I32)  # Fixed int32[1024] FA/FD layout.
     rows: I32  # T1
     blocks: I32  # AIC launch count, matching workspace capacity.
     has_cmp: I32
-    cu_q: GmIn(I32)
+    cu_q: gm_in(I32)
     batch: I32
     support_fd: I32
 
@@ -267,10 +274,17 @@ def _md_selective_fd_72(a):
 def _mqsmla_metadata_kernel(a: _MqsmlaMetadataArgs):
     if a.rows <= 0 or a.blocks <= 0 or a.blocks > AIC_CORE_MAX_NUM:
         return 1
-    if a.support_fd == 2:
-        if a.rows == 72 and a.blocks == 32:
+    if a.support_fd >= 2:
+        selective = 0
+        if a.rows == 72 and a.blocks == 32 and a.has_cmp == 1:
+            selective = 1
+            for row in range(0, 72):
+                if a.win_len[row] != 128 or a.cmp_len[row] != 512:
+                    selective = 0
+        if selective == 1:
             return _md_selective_fd_72(a)
-        return _md_uniform(a)
+        if a.support_fd == 2:
+            return _md_uniform(a)
     if a.support_fd == 0:
         return _md_uniform(a)
     # zeros is an AICPU DSL intrinsic lowered by the compiler.
@@ -304,11 +318,23 @@ def _mqsmla_metadata_kernel(a: _MqsmlaMetadataArgs):
             max_row_tiles = rt
         r = r + 1
 
+    if max_row_tiles < FD_MIN_ROW_TILES:
+        return _md_uniform(a)
+
+    # Limit split fanout while retaining at least whole-row parallelism.
+    plan_blocks = total_tiles // FD_TARGET_TILES_PER_CORE
+    if plan_blocks < a.rows:
+        plan_blocks = a.rows
+    if plan_blocks > a.blocks:
+        plan_blocks = a.blocks
     # Require enough modeled tile savings to amortize staging, synchronization and reduction.
     ceil_rows_blocks = (a.rows + a.blocks - 1) // a.blocks
-    fd_floor = (total_tiles + a.blocks - 1) // a.blocks
+    fd_floor = (total_tiles + plan_blocks - 1) // plan_blocks
     uniform_crit = ceil_rows_blocks * max_row_tiles
-    if total_tiles <= a.blocks or uniform_crit - fd_floor < FD_MIN_SAVED_TILES:
+    # Even fewer tiles than cores benefit from splitting a long single row.
+    # Gate on saved work, not total occupancy; short balanced rows retain the
+    # whole-row path to avoid unnecessary staging and reduction.
+    if uniform_crit - fd_floor < FD_MIN_SAVED_TILES:
         return _md_uniform(a)
 
     # Pass 2: greedy core assignment, following CalcSplitPlan/AssignBlocksToCore.
@@ -328,7 +354,7 @@ def _mqsmla_metadata_kernel(a: _MqsmlaMetadataArgs):
     num_fd = 0
     used = 0
     core = 0
-    while core < a.blocks:
+    while core < plan_blocks:
         if finished == 1:
             break
         # Do not stop when unassigned cost reaches zero: trailing empty rows
@@ -336,12 +362,16 @@ def _mqsmla_metadata_kernel(a: _MqsmlaMetadataArgs):
         fa_first_fd[core] = pre_fd + kv_split - 1
         fa_m_start[core] = cur_row
         fa_s2_start[core] = cur_tile
-        limit = unassigned // (a.blocks - core)
+        limit = unassigned // (plan_blocks - core)
         cost = 0
         blk = 0
         # Assign whole rows, advancing directly past zero-cost empty rows.
         while finished == 0:
-            if tiles_c == 0 or limit + last_c // FA_TOLERANCE_RATIO >= cost + rem_cost:
+            if (
+                tiles_c == 0
+                or limit + last_c // FA_TOLERANCE_RATIO >= cost + rem_cost
+                or (cur_tile == 0 and tiles_c < FD_MIN_ROW_TILES and blk == 0)
+            ):
                 cost = cost + rem_cost
                 blk = blk + (tiles_c - cur_tile)
                 cur_row = cur_row + 1
@@ -361,6 +391,8 @@ def _mqsmla_metadata_kernel(a: _MqsmlaMetadataArgs):
         # The FD gate has passed. Half-tile tolerance
         # keeps a split boundary inside the row, matching the AscendC invariant.
         while finished == 0:
+            if cur_tile == 0 and tiles_c < FD_MIN_ROW_TILES:
+                break
             tcost = _md_tile_cost(wv, wcv, cur_tile)
             if limit + tcost // FA_TOLERANCE_RATIO >= cost + tcost:
                 cost = cost + tcost
@@ -598,7 +630,7 @@ def mixed_quant_sparse_flash_mla_metadata(
             cmp_len=cmp_topk_length.data_ptr(),
             has_cmp=int(has_cmp_kv),
             support_fd=(
-                2
+                2 + int(SUPPORT_FD)
                 if SELECTIVE_FD_72 and rows == 72 and blocks == 32 and has_cmp_kv
                 else int(SUPPORT_FD)
             ),
