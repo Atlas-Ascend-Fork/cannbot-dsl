@@ -2,6 +2,11 @@
 
 ## 🔥 更新日志
 
+### 【2026-10-28】
+#### 特性增强 Feature Enhancement
+- 【matmul / matmul_streamk / grouped_matmul / batch_matmul】片上 staging 接口迁移：`Channel` 与 `make_copy_engine` 改为 `RingBuffer` + `copy_options`，nd2nz 与 L1→L0A/L0B 转置（`src.permute(1, 0)`）由操作数布局推导；batch_matmul 同步修复 K/M/N 尾块正确性（K 尾块 16 对齐裁剪、C 输出按 tile 网格 padding）。全量精度用例通过（20/10/20/18，Ascend950DT）。
+- 【quant_batch_matmul_mx / mxa8w4 / hif8_tt】量化矩阵乘样例接口迁移（`RingBuffer`/`copy_options`/`permute`/`convert`）；mx 含 tiling 重构，mxa8w4 K 尾模型改为 wrapper pad + L1 清零；测试扩充（mx 新增大 shape、mxa8w4 扩至 25-shape 全矩阵）。全量精度用例通过（39/51/16，Ascend950DT）。
+
 ### 【2026-10-13】
 #### 特性增强 Feature Enhancement
 - 【indexer_prologue_qw / indexer_prologue_k】接入 `net/native_package` Native 打包：改用 `cannbotdsl.aot.export` 声明导出入口并登记到 `operator_groups.toml` 的 `ds41` 组，可通过 `./run-build.sh --operator indexer_prologue_qw indexer_prologue_k` 编译为 Native 算子包。`indexer_prologue_k` 新增默认导出 profile（H=5120/512 × mode0 带/不带 scale、mode1 G=8，共 6 个二进制），支持通过 `CANNBOTDSL_DS41_PROFILES` 的 `indexer_prologue_k` 键覆盖。同时移除 `indexer_prologue_qw` 的 `_CompatChannel` 及 `matmul`/`mem_copy` 包装层，直接使用 0.7 的 `Channel.produce()/consume()`，编译产物二进制逐字节不变。

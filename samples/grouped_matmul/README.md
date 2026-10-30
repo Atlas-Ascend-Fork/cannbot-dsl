@@ -43,7 +43,7 @@ $$
 算子结构：host 侧 `GmmTiling` 推导 baseM/baseN/baseK、
 L1/L0 切分与 double buffer 参数；device kernel
 由 `BlockMmad` 完成 per-tile GM→L1→L0A/L0B→MMAD→L0C→GM 流水线，`GmmKernel` 统一调度全部场景，核内读取 `group_list` 迭代各组，
-按组切片到真实 M/K 范围，`tile_view` 裁剪尾 tile 到组动态边界。实现详见 `group_matmul.py`。
+按组切片到真实 M/K 范围，`tile_slice` 裁剪尾 tile 到组动态边界。实现详见 `group_matmul.py`。
 
 ## 快速开始
 

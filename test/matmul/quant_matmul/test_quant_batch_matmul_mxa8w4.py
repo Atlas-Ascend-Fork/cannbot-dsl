@@ -57,14 +57,40 @@ from quant_batch_matmul_mxa8w4 import matmul_mix_quant
 # Test cases
 # ---------------------------------------------------------------------------
 
-# 5 representative shapes (full 25-shape precision matrix kept locally):
-# degenerate minimal, aligned multi-tile, mixed M/N/K tails, a partial
-# last L1 window with bias, and a deep-window big grid.
 _TEST_SHAPES = [
-    pytest.param(1, 32, 1, id="M1-K32-N1-minimal"),
+    # --- basics: aligned K, single/multi tile ---
+    pytest.param(128, 256, 128, id="M128-K256-N128"),
     pytest.param(256, 256, 256, id="M256-K256-N256-multiTile"),
+    # --- small / degenerate ---
+    pytest.param(1, 32, 1, id="M1-K32-N1-minimal"),
+    pytest.param(96, 96, 48, id="M96-K96-N48-smallK"),
+    pytest.param(2, 1024, 3, id="M2-K1024-N3-4winTiny"),
+    pytest.param(17, 1056, 33, id="M17-K1056-N33-tinyMultiWin"),
+    # --- K/M/N tails ---
+    pytest.param(200, 192, 72, id="M200-K192-N72-tailKMN"),
+    pytest.param(64, 128, 136, id="M64-K128-N136-tailN"),
     pytest.param(256, 736, 96, id="M256-K736-N96-mixedTail3"),
+    pytest.param(255, 544, 513, id="M255-K544-N513-primeTail"),
+    pytest.param(127, 512, 129, id="M127-K512-N129-oddPair"),
+    # --- window rings: sub_blocks_per_window x sub_block_k matrix ---
+    pytest.param(128, 1024, 128, id="M128-K1024-N128-4winRing"),
+    pytest.param(256, 512, 256, id="M256-K512-N256-kw256s2"),
+    pytest.param(256, 384, 256, id="M256-K384-N256-kw256step3"),
+    # K2560: k % sub_block_k == 0 but the last L1 window is partial — the
+    # static-trip guard regression
+    pytest.param(256, 2560, 256, id="M256-K2560-N256-kw256s10"),
+    pytest.param(512, 512, 512, id="M512-K512-N512-kw128s4"),
     pytest.param(2048, 4608, 2048, id="M2048-K4608-N2048-kw128s36"),
+    # --- tails on wide rings (partial last L1 window) ---
+    pytest.param(256, 320, 256, id="M256-K320-N256-s2tail"),
+    pytest.param(2048, 2176, 2048, id="M2048-K2176-N2048-b1tail"),
+    # --- tall / wide / big grids ---
+    pytest.param(1024, 128, 32, id="M1024-K128-N32-tinyN"),
+    pytest.param(128, 2048, 4096, id="M128-K2048-N4096-wideN"),
+    pytest.param(512, 512, 576, id="M512-K512-N576-9grp"),
+    pytest.param(1024, 1024, 1024, id="M1024-K1024-N1024-full32"),
+    pytest.param(2048, 7168, 2048, id="M2048-K7168-N2048-kw128"),
+    pytest.param(2048, 7104, 2048, id="M2048-K7104-N2048-kw128tail"),
 ]
 
 

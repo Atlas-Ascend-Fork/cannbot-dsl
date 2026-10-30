@@ -230,8 +230,8 @@ e2m1 元素，偶数 K 在低 nibble）。
 | 数据类型 | A 为 float8_e4m3fn，B 为打包 float4_e2m1（uint8 载体）；输出 float16 |
 | Scale | ScaleA/ScaleB 为 float8_e8m0fnu 三维 paired-scale Tensor |
 | Shape | M/N 任意；K 为 32 的倍数且无上限（片上 K 状态全部窗化） |
-| 尾块 | M/N/K 尾块由引擎在搬运途中补零；K 尾子块运行期缩窄（`k_extent`），读界不超过 `align64(K)` |
-| 多核并行 | 平衡连续 tile 分配，自适应核数（grid 上限 32） |
+| 尾块 | M 尾由 wrapper 将 A 的行 pad 到 tile 网格（补零行仅进被切片丢弃的输出行）；N 尾按实际域裁剪、nd2nz 随路补零；K 尾不 pad A 的 GM 列，设备侧 `cube_fill_l1_zero` 清零 L1 尾部 K 分形（E8M0 scale 列由 wrapper pad 到 k_l1 窗网格，防 stale NaN 污染；B 重排网格 align64(K) 补零），读界不超过 `align64(K)` |
+| 多核并行 | 平衡连续 tile 分配，核数取 tile 数与平台 AIC 核数的较小值 |
 | 架构 | 双核混合：AIV 权重转换 prologue + AIC MX matmul，CrossCore 通道交接 |
 
 算子由 Host 侧 cost-model tiling 推导 baseM/baseN/baseK、L1 K 窗

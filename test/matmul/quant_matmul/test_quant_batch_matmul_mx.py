@@ -116,6 +116,17 @@ _MXFP8_CASES = [
     ),
     _mx_case(128, 130, 128, case_id="bias-n-tail-ft", has_bias=True),
     _mx_case(64, 16384, 256, case_id="bias-a-full-load-ft", has_bias=True),
+    _mx_case(
+        72, 25600, 6144, case_id="streamed-panels-bf16-ft", output_dtype=torch.bfloat16
+    ),
+    _mx_case(
+        4097,
+        5118,
+        8064,
+        case_id="panels-mnk-tail-fp16-ft",
+        b_dtype=_E5,
+        output_dtype=torch.float16,
+    ),
 ]
 
 _MXFP4_CASES = [

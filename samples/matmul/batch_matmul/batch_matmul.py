@@ -21,16 +21,16 @@ import dataclasses
 import os
 
 import torch
-from cannbotdsl import dtypes, get_mem_size, get_platform_info
-from cannbotdsl.channel import Channel
-from cannbotdsl.lang.constexpr import const_expr
+from cannbotdsl import dtypes, get_mem_size, get_platform_info, make_layout
+from cannbotdsl.lang.constexpr import const_expr, range_constexpr
 from cannbotdsl.lang.host import host
 from cannbotdsl.lang.jit import jit
 from cannbotdsl.lang.kernel import kernel
 from cannbotdsl.ops.arch import get_block_idx, get_block_num
 from cannbotdsl.ops.cube import enable_hf32, set_fp32_mode
 from cannbotdsl.ops.matmul import matmul as dsl_matmul
-from cannbotdsl.ops.memcpy import make_copy_engine, mem_copy
+from cannbotdsl.ops.memcpy import copy_options, mem_copy
+from cannbotdsl.ring_buffer import RingBuffer
 from cannbotdsl.tensor import MemLoc, Tensor, ceil_div, tile_slice
 
 
@@ -353,8 +353,10 @@ def _pad_n_tail(ctx: _KernelCtx):
     return b_kern, bias, n_eff
 
 
-def _reshape_output(c, c_n, ctx: _KernelCtx):
-    """Slice the N pad back off (if any) and restore the batch dims."""
+def _reshape_output(c, c_m, c_n, ctx: _KernelCtx):
+    """Slice the M/N tile-grid pad back off and restore the batch dims."""
+    if c_m != ctx.m:
+        c = c.narrow(-2, 0, ctx.m)
     if c_n != ctx.n:
         c = c.narrow(-1, 0, ctx.n)
     if ctx.squeeze_out:
@@ -364,7 +366,13 @@ def _reshape_output(c, c_n, ctx: _KernelCtx):
 
 def _run_kernel(ctx: _KernelCtx):
     """N-tail pad, zero-copy batch flatten, tiling, kernel launch and
-    output shape restore."""
+    output shape restore.
+
+    C is allocated on the full (m_tiles*base_m, n_tiles*base_n) tile grid:
+    the FIXPIPE writes each output tile at its nominal (base_m, base_n)
+    extent, so the pad region absorbs the M/N tail overreach and is sliced
+    back off afterwards.
+    """
     dtype, device = ctx.a_kern.dtype, ctx.a_kern.device
     bs = _prod(ctx.c_batch)
     has_bias = ctx.bias is not None
@@ -384,10 +392,12 @@ def _run_kernel(ctx: _KernelCtx):
         bias3 = bias.reshape(1, n_eff) if ctx.bias_shared else bias.reshape(bs, n_eff)
     else:
         bias3 = torch.zeros(1, tiling.base_n, dtype=torch.float32, device=device)
-    c = torch.zeros(bs, ctx.m, tiling.n, dtype=dtype, device=device)
+    c_m = tiling.m_tiles * tiling.base_m
+    c_n = tiling.n_tiles * tiling.base_n
+    c = torch.zeros(bs, c_m, c_n, dtype=dtype, device=device)
     op = BatchMatmulKernel(tiling, ctx, _TORCH_DTYPE_TO_DSL[bias3.dtype][0])
     op.run(a3, b3, c, bias3)
-    return _reshape_output(c, tiling.n, ctx)
+    return _reshape_output(c, c_m, c_n, ctx)
 
 
 # ============================================================================
@@ -531,10 +541,11 @@ class BatchMatmulKernel:
     decoded per tile from host-constant (div, extent, mul) terms, or
     ``src_idx = b_idx`` when the operand's batch shape equals c_batch.
 
-    GM → L1 (MTE2, nd2nz/dn2nz, ping-pong) → L0A/L0B (MTE1, double buffer)
-    → MMAD (fp32 L0C) → GM (FIXPIPE).  On ping-pong-free (l0c_db == 1)
-    tilings the MMAD/FIXPIPE unit-flag mainline is enabled (the hardware
-    auto-triggers the FIXPIPE on the final K block).
+    GM → L1 (MTE2, nd2nz, ping-pong) → L0A/L0B (MTE1, double buffer;
+    transposed sides spell the transpose as ``src.permute(1, 0)``) → MMAD
+    (fp32 L0C) → GM (FIXPIPE).  On ping-pong-free (l0c_db == 1) tilings the
+    MMAD/FIXPIPE unit-flag mainline is enabled (the hardware auto-triggers
+    the FIXPIPE on the final K block).
     """
 
     # Neutral (div, extent, mul) decode slot: (idx // 1) % 1 * 0 == 0.
@@ -589,11 +600,19 @@ class BatchMatmulKernel:
         # specialization, so only on l0c_db == 1 tilings.
         self.use_unit_flag = tiling.l0c_db == 1
 
-        # Channels and copy engines; created inside the @kernel body.
+        # On-chip staging (created inside the @kernel body by
+        # _create_buffers) and the per-copy option bundles.
         self.l1_a = self.l1_b = None
         self.l0a = self.l0b = self.l0c = None
-        self.l1_bias = self.l1_bt = None
-        self.eng_a = self.eng_b = self.eng_c = self.eng_bias = None
+        self.l1_bias = self.bias_ring = None
+        self.opt_a = copy_options(l2_cache_ctl=self.l2_ctl_a)
+        self.opt_b = copy_options(l2_cache_ctl=self.l2_ctl_b)
+        self.opt_bias = copy_options(l2_cache_ctl=1)
+        self.opt_c_flag = (
+            copy_options(unit_flag=3, l2_cache_ctl=self.l2_ctl_c)
+            if self.use_unit_flag
+            else copy_options(l2_cache_ctl=self.l2_ctl_c)
+        )
 
     @classmethod
     def _pad_terms(cls, terms):
@@ -620,65 +639,63 @@ class BatchMatmulKernel:
             else:
                 set_fp32_mode()
 
-        self._create_channels()
+        self._create_buffers()
 
         for tile_idx in range(get_block_idx(), self.total_tiles, get_block_num()):
             self._compute_output_tile(gm_a, gm_b, gm_c, gm_bias, tile_idx)
 
     @jit
-    def _create_channels(self):
-        """Declare the L1/L0/bias channels and the copy engines."""
+    def _create_buffers(self):
+        """Declare the L1/L0/bias ring buffers."""
         t = self.t
 
+        # Transposed sides stage K-major logical shapes in NZ L1; the L1->L0
+        # copies spell the transpose as src.permute(1, 0).
         l1_b_shape = (t.base_n, t.k_l1) if t.kern_trans_b else (t.k_l1, t.base_n)
         l1_a_shape = (t.k_l1, t.base_m) if self.kern_trans_a else (t.base_m, t.k_l1)
-        self.l1_a = Channel(
+        self.l1_a = RingBuffer(
             MemLoc.L1,
-            shape=l1_a_shape,
-            dtype=t.dtype,
+            t.dtype,
+            make_layout(l1_a_shape),
             depth=t.l1_buffer_num,
-            data_format="zn" if self.kern_trans_a else "nz",
+            data_format="nz",
         )
-        self.l1_b = Channel(
-            MemLoc.L1, shape=l1_b_shape, dtype=t.dtype, depth=t.l1_buffer_num
+        self.l1_b = RingBuffer(
+            MemLoc.L1,
+            t.dtype,
+            make_layout(l1_b_shape),
+            depth=t.l1_buffer_num,
+            data_format="nz",
         )
-        self.l0a = Channel(
-            MemLoc.L0A, shape=(t.base_m, t.base_k), dtype=t.dtype, depth=2
+        self.l0a = RingBuffer(
+            MemLoc.L0A, t.dtype, make_layout((t.base_m, t.base_k)), depth=2
         )
-        self.l0b = Channel(
-            MemLoc.L0B, shape=(t.base_n, t.base_k), dtype=t.dtype, depth=2
+        self.l0b = RingBuffer(
+            MemLoc.L0B, t.dtype, make_layout((t.base_n, t.base_k)), depth=2
         )
-        self.l0c = Channel(
+        self.l0c = RingBuffer(
             MemLoc.L0C,
-            shape=(t.base_m, t.base_n),
-            dtype=dtypes.float32,
+            dtypes.float32,
+            make_layout((t.base_m, t.base_n)),
             depth=t.l0c_db,
         )
         # Bias stage: L1 (nd) -> BT (fp32), consumed by the init MMAD;
-        # bias-only so the channel never eats into exact-fit no-bias L1.
+        # bias-only so the buffers never eat into exact-fit no-bias L1.
         if const_expr(self.has_bias):
-            self.l1_bias = Channel(
+            self.l1_bias = RingBuffer(
                 MemLoc.L1,
-                shape=(t.base_n,),
-                dtype=self.bias_dtype,
+                self.bias_dtype,
+                make_layout((t.base_n,)),
                 depth=2,
                 data_format="nd",
             )
-            self.l1_bt = Channel(
+            self.bias_ring = RingBuffer(
                 MemLoc.BIAS,
-                shape=(t.base_n,),
-                dtype=dtypes.float32,
+                dtypes.float32,
+                make_layout((t.base_n,)),
                 depth=2,
                 data_format="nd",
             )
-
-        self.eng_a = make_copy_engine(
-            format_transform="dn2nz" if self.kern_trans_a else "nd2nz"
-        )
-        self.eng_b = make_copy_engine(format_transform="nd2nz")
-        self.eng_c = make_copy_engine()
-        if const_expr(self.has_bias):
-            self.eng_bias = make_copy_engine(format_transform="identity")
 
     @jit
     def _decode_tile_batch_src(self, tile_idx):
@@ -728,39 +745,32 @@ class BatchMatmulKernel:
 
         # One l0c produce per output tile: the K-loop MMADs write the slot
         # alias, the FIXPIPE consumes it once.
-        c_w = self.l0c.produce()
+        c_w = self.l0c.next_write()
 
         # Bias: GM -> L1 -> BT ([N] load); the init MMAD folds it in once.
         if const_expr(self.has_bias):
             mem_copy(
-                self.l1_bias.produce(),
+                self.l1_bias.next_write(),
                 tile_slice(gm_bias[bias_src, None], (base_n,), (n_idx,)),
-                engine=self.eng_bias,
-                l2_cache_ctl=1,
+                options=self.opt_bias,
             )
-            mem_copy(self.l1_bt.produce(), self.l1_bias.consume())
-            bias = self.l1_bt.consume()
+            mem_copy(self.bias_ring.next_write(), self.l1_bias.next_read())
+            bias = self.bias_ring.next_read()
         else:
             bias = None
 
         # mn_idx packs (m_idx, n_idx) into one scalar purely to keep
         # _k_reduction within the repo's 5-formal-parameter coding rule
         # (codecheck G.FNM.03); it is a rule workaround, not business design.
-        self._k_reduction(a2d, b2d, c_w, bias, mn_idx)
+        c_view = self._k_reduction(a2d, b2d, c_w, bias, mn_idx)
 
         gm_c_tile = tile_slice(c2d, (base_m, base_n), (m_idx, n_idx))
         if const_expr(self.use_unit_flag):
             # Unit-flag path: the FIXPIPE reads the produce alias; a
-            # consume() read would desync against the auto-triggered FIXPIPE.
-            mem_copy(
-                gm_c_tile,
-                c_w,
-                engine=self.eng_c,
-                unit_flag=3,
-                l2_cache_ctl=self.l2_ctl_c,
-            )
+            # next_read() would desync against the auto-triggered FIXPIPE.
+            mem_copy(gm_c_tile, c_view, options=self.opt_c_flag)
         else:
-            mem_copy(gm_c_tile, self.l0c.consume(), l2_cache_ctl=self.l2_ctl_c)
+            mem_copy(gm_c_tile, self.l0c.next_read(), options=self.opt_c_flag)
 
     @jit
     def _load_ab_l1(self, a2d, b2d, k_l1_idx, mn_idx):
@@ -776,59 +786,77 @@ class BatchMatmulKernel:
             gm_a_tile = tile_slice(a2d, (k_l1, base_m), (k_l1_idx, m_idx))
         else:
             gm_a_tile = tile_slice(a2d, (base_m, k_l1), (m_idx, k_l1_idx))
-        mem_copy(
-            self.l1_a.produce(),
-            gm_a_tile,
-            engine=self.eng_a,
-            l2_cache_ctl=self.l2_ctl_a,
-        )
+        mem_copy(self.l1_a.next_write(), gm_a_tile, options=self.opt_a)
 
         if const_expr(t.kern_trans_b):
             gm_b_tile = tile_slice(b2d, (base_n, k_l1), (n_idx, k_l1_idx))
         else:
             gm_b_tile = tile_slice(b2d, (k_l1, base_n), (k_l1_idx, n_idx))
-        mem_copy(
-            self.l1_b.produce(),
-            gm_b_tile,
-            engine=self.eng_b,
-            l2_cache_ctl=self.l2_ctl_b,
-        )
+        mem_copy(self.l1_b.next_write(), gm_b_tile, options=self.opt_b)
 
     @jit
-    def _k_reduction(self, a2d, b2d, c_w, bias, mn_idx):
+    def _k_reduction(self, a2d, b2d, c_view, bias, mn_idx):
         """GM → L1 → L0 K reduction and MMAD accumulation for one tile
-        (mn_idx packs (m_idx, n_idx) for the 5-arg coding rule)."""
+        (mn_idx packs (m_idx, n_idx) for the 5-arg coding rule).  Returns the
+        accumulated L0C view for the FIXPIPE."""
         t = self.t
         base_m, base_n = t.base_m, t.base_n
         base_k, k_l1, k_total = t.base_k, t.k_l1, t.k
         last_l1_idx = self.k_l1_tiles - 1
 
-        for k_l1_idx in range(self.k_l1_tiles):
+        # Static (unrolled) K loops: every tail quantity below stays a
+        # compile-time int, so the L1->L0 tile_slices keep static extents
+        # and the bias/init selects stay Python-level (no runtime branch).
+        for k_l1_idx in range_constexpr(self.k_l1_tiles):
             self._load_ab_l1(a2d, b2d, k_l1_idx, mn_idx)
-            # One consume per k_l1 segment: the inner loop slices the selected
-            # alias (a consume per slice would rotate the cursor off the slot).
-            a_l1 = self.l1_a.consume()
-            b_l1 = self.l1_b.consume()
+            # One read per k_l1 segment: the inner loop slices the selected
+            # slot (a read per slice would rotate the cursor off the slot).
+            a_l1 = self.l1_a.next_read()
+            b_l1 = self.l1_b.next_read()
 
             # The final k_l1 segment carries only its valid base_k blocks.
             k_remaining = k_total - k_l1_idx * k_l1
             k_l0_per_l1 = ceil_div(min(k_l1, k_remaining), base_k)
-            for k_l0_idx in range(k_l0_per_l1):
+            for k_l0_idx in range_constexpr(k_l0_per_l1):
+                # K tail clip: the GM->L1 nd2nz fill covers only
+                # ceil(k_valid/16)*16 columns (fractal granularity), so the
+                # final base_k block is copied/multiplied at that 16-aligned
+                # extent instead of the nominal base_k (which would read
+                # stale slot content past the fill).
+                k_blk = min(base_k, k_total - k_l1_idx * k_l1 - k_l0_idx * base_k)
+                k_eff = (k_blk + 15) // 16 * 16
+
                 if const_expr(self.kern_trans_a):
                     l1_a_slice = tile_slice(a_l1, (base_k, base_m), (k_l0_idx, 0))
+                    if k_eff != base_k:
+                        l1_a_slice = tile_slice(l1_a_slice, (k_eff, base_m), (0, 0))
+                    l1_a_slice = l1_a_slice.permute(1, 0)
                 else:
                     l1_a_slice = tile_slice(a_l1, (base_m, base_k), (0, k_l0_idx))
-                a_l0 = self.l0a.produce()
+                    if k_eff != base_k:
+                        l1_a_slice = tile_slice(l1_a_slice, (base_m, k_eff), (0, 0))
+                a_l0 = self.l0a.next_write()
+                if k_eff != base_k:
+                    a_l0 = tile_slice(a_l0, (base_m, k_eff), (0, 0))
                 mem_copy(a_l0, l1_a_slice)
 
                 if const_expr(t.kern_trans_b):
                     l1_b_slice = tile_slice(b_l1, (base_n, base_k), (0, k_l0_idx))
-                    b_l0 = self.l0b.produce()
-                    mem_copy(b_l0, l1_b_slice, transpose=False)
+                    if k_eff != base_k:
+                        l1_b_slice = tile_slice(l1_b_slice, (base_n, k_eff), (0, 0))
+                    b_l0 = self.l0b.next_write()
+                    if k_eff != base_k:
+                        b_l0 = tile_slice(b_l0, (base_n, k_eff), (0, 0))
+                    mem_copy(b_l0, l1_b_slice)
                 else:
                     l1_b_slice = tile_slice(b_l1, (base_k, base_n), (k_l0_idx, 0))
-                    b_l0 = self.l0b.produce()
-                    mem_copy(b_l0, l1_b_slice, transpose=True)
+                    if k_eff != base_k:
+                        l1_b_slice = tile_slice(l1_b_slice, (k_eff, base_n), (0, 0))
+                    l1_b_slice = l1_b_slice.permute(1, 0)
+                    b_l0 = self.l0b.next_write()
+                    if k_eff != base_k:
+                        b_l0 = tile_slice(b_l0, (base_n, k_eff), (0, 0))
+                    mem_copy(b_l0, l1_b_slice)
 
                 is_first_k_block = k_l1_idx == 0 and k_l0_idx == 0
                 unit_flag = 0
@@ -837,14 +865,15 @@ class BatchMatmulKernel:
                         k_l1_idx == last_l1_idx and k_l0_idx == k_l0_per_l1 - 1
                     )
                     unit_flag = 3 if is_last_k_block else 2
-                dsl_matmul(
-                    c_w,
+                c_view = dsl_matmul(
+                    c_view,
                     a_l0,
                     b_l0,
                     init=is_first_k_block,
-                    bias=bias,
+                    bias=bias if is_first_k_block else None,
                     unit_flag=unit_flag,
                 )
+        return c_view
 
     @host
     def run(self, gm_a: Tensor, gm_b: Tensor, gm_c: Tensor, gm_bias: Tensor):

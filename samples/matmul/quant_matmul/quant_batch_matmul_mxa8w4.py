@@ -71,15 +71,15 @@ import os
 import numpy as np
 import torch
 
-from cannbotdsl import MemLoc, Tensor, dtypes, get_mem_size, vf
-from cannbotdsl.channel import Channel, ChannelKind
-from cannbotdsl.lang.constexpr import const_expr, range_constexpr
+from cannbotdsl import make_layout, MemLoc, Tensor, dtypes, get_mem_size, vf
+from cannbotdsl.ring_buffer import RingBuffer
+from cannbotdsl.lang.constexpr import const_expr
 from cannbotdsl.lang.host import host
 from cannbotdsl.lang.jit import jit
 from cannbotdsl.lang.kernel import kernel
 from cannbotdsl.ops.arch import get_block_idx, get_subblock_id
 from cannbotdsl.ops.matmul import matmul as dsl_matmul
-from cannbotdsl.ops.memcpy import make_copy_engine, mem_copy
+from cannbotdsl.ops.memcpy import copy_options, mem_copy, convert
 from cannbotdsl.ops.sync import cube_fill_l1_zero
 from cannbotdsl.ops.reg import (
     create_mask,
@@ -340,8 +340,9 @@ class MixQuantTiling:
         # the host repack target): align64(k)/32; beyond-k rows are real
         # zero-filled GM
         self.k_fractals_in_grid = _ceil_align(self.k, 64) // 32
-        # K-tail model: full-width window claims; the wrapper pads the
-        # A/scale GM columns to the k_l1 grid (see matmul_mix_quant)
+        # K-tail model: full-width window claims; the wrapper pads only the
+        # E8M0 scale columns to the k_l1 grid (A columns never pad — the
+        # kernel zero-fills the stale L1 tail fractals via cube_fill_l1_zero)
         self.k_fractals_per_window = self.k_l1 // 32
         self.scale_bytes_per_window = self.k_l1 // 32
 
@@ -408,9 +409,8 @@ class MixQuantKernel:
         self.scale_a_window_slot = None
         self.scale_b_window_slot = None
         self.b_window_slot = None
-        self._init_vector_channels()
-        self._init_cube_channels()
-        self._init_engines()
+        self._init_vector_ring_buffers()
+        self._init_cube_ring_buffers()
 
     def __call__(
         self,
@@ -451,10 +451,10 @@ class MixQuantKernel:
             self.produce_bias(tile_n_idx)
             self.stage_tile()
             if const_expr(self.has_bias):
-                self.bias_tensor = self.mmad_bias.consume()
+                self.bias_tensor = self.mmad_bias.next_read()
             # ONE accumulator slot per output tile feeds every mmad and
             # the fixpipe
-            l0c_accumulator = self.l0c.produce()
+            l0c_accumulator = self.l0c.next_write()
             # consume: every L1 window claims the FULL k_l1 width; the
             # partial last window's beyond-k contribution annihilates
             # (A's L1-zeroed tail x finite-converted B = 0 — see the
@@ -469,11 +469,12 @@ class MixQuantKernel:
             # deq_scale=64 compensates the conversion's uniform 2^-6
             # factor (the AIV scales the bias to match, produce_bias)
             mem_copy(
-                tile_slice(gm_c, (t.tile_m, t.tile_n), (tile_m_idx, tile_n_idx)),
-                l0c_accumulator,
-                engine=self.fixpipe_engine,
-                unit_flag=3,
-                deq_scale=64.0,
+                gm_c[
+                    tile_m_idx * t.tile_m : (tile_m_idx + 1) * t.tile_m,
+                    tile_n_idx * t.tile_n : (tile_n_idx + 1) * t.tile_n,
+                ],
+                convert(l0c_accumulator, gm_c.dtype, scale=64.0),
+                options=copy_options(unit_flag=3),
             )
 
     @jit
@@ -483,10 +484,10 @@ class MixQuantKernel:
         self.produce_k_window(tile_n_idx, k_window_idx, t.k_l1)
         # the window's consumed slots (ONE consume per window —
         # the sub-block loop below slices them repeatedly)
-        self.a_window_slot = self.a_ring.consume()
-        self.scale_a_window_slot = self.scale_a_ring.consume()
-        self.scale_b_window_slot = self.scale_b_ring.consume()
-        self.b_window_slot = self.b_ring.consume()
+        self.a_window_slot = self.a_ring.next_read()
+        self.scale_a_window_slot = self.scale_a_ring.next_read().permute(1, 0)
+        self.scale_b_window_slot = self.scale_b_ring.next_read()
+        self.b_window_slot = self.b_ring.next_read()
         if const_expr(t.k % t.k_l1):
             # the partial last window: the staging covers the valid prefix
             # plus the nd2nz auto-fill; zero the remaining L1 k-fractals so
@@ -609,44 +610,25 @@ class MixQuantKernel:
     def _fetch_packed_window(
         self, b_packed_slot, fractals_to_fetch, tile_n_idx, k_window_idx
     ):
-        # Fetch the L1 window's NZ tiles into the packed slot. GM holds
-        # the reference global kb-major fractal grid (tile (kb, g) at
-        # flat row kb*n_grps_full + g): tile_cols == 1 reads one
-        # contiguous block; tile_cols > 1 strides the global grid, so
-        # per-fractal segments go as separate mem_copies.
-        # BOUND: the plain GM->UB copy has NO clamp — bound the window's
-        # k-fractal claim to the repacked grid (k_fractals_in_grid rows); beyond
-        # the bound the packed rows stay stale UB, harmless because the
-        # conversion permutation-maps them to finite fp8 and the excess
-        # K annihilates against A's L1-zeroed tail (see __call__).
+        # GM is a kb-major grid of packed (N16, K32) fractals. Merge
+        # the contiguous N groups into each DMA row, then select this tile's
+        # columns. A full window uses one strided DMA; bounded tails retain
+        # their per-fractal transactions before conversion zeroes stale K.
         t = self.t
         if fractals_to_fetch == t.k_fractals_per_window:
-            if const_expr(t.tile_cols == 1):
-                gm_contiguous_window = tile_slice(
-                    self.gm_b,
-                    (t.k_fractals_per_window * t.n_groups_per_tile, 256),
-                    (k_window_idx * t.tile_cols + tile_n_idx, 0),
-                )
-                mem_copy(b_packed_slot, gm_contiguous_window)
-            else:
-                # one strided DMA: the per-fractal segments share the GM base
-                # with equal n_grps_full-row intervals, so the
-                # multi-source form lowers to a single instruction
-                fetch_segments = []
-                for fractal_idx in range_constexpr(t.k_fractals_per_window):
-                    fetch_segments.append(
-                        tile_slice(
-                            self.gm_b,
-                            (t.n_groups_per_tile, 256),
-                            (
-                                (k_window_idx * t.k_fractals_per_window + fractal_idx)
-                                * t.tile_cols
-                                + tile_n_idx,
-                                0,
-                            ),
-                        )
-                    )
-                mem_copy(b_packed_slot, fetch_segments)
+            packed_grid = self.gm_b.reshape(
+                (t.k_fractals_in_grid, t.n_groups_total * 256)
+            )
+            packed_window = b_packed_slot.reshape(
+                (t.k_fractals_per_window, t.n_groups_per_tile * 256)
+            )
+            first_fractal = k_window_idx * t.k_fractals_per_window
+            first_group_byte = tile_n_idx * t.n_groups_per_tile * 256
+            source = packed_grid[
+                first_fractal : first_fractal + fractals_to_fetch,
+                first_group_byte : first_group_byte + t.n_groups_per_tile * 256,
+            ]
+            mem_copy(packed_window[:fractals_to_fetch, None], source)
         else:
             # bounded tail window — per-fractal segments up to the grid edge
             # (tile_cols == 1 rows are contiguous, so the segment form is
@@ -678,7 +660,7 @@ class MixQuantKernel:
         t = self.t
         aiv_idx = get_subblock_id()
 
-        b_packed_slot = self.packed.produce()
+        b_packed_slot = self.packed.next_write()
         fractals_to_fetch = t.k_fractals_per_window
         fractals_left_in_grid = t.k_fractals_in_grid - k_window_idx * fractals_to_fetch
         if fractals_left_in_grid < fractals_to_fetch:
@@ -694,24 +676,22 @@ class MixQuantKernel:
             split_group if aiv_idx == 0 else t.n_groups_per_tile - split_group
         )
         first_group = 0 if aiv_idx == 0 else split_group
-        b_converted_slot = self.b_converted.produce()
+        b_converted_slot = self.b_converted.next_write()
         self.convert_kspan(
             first_group,
             groups_this_aiv,
             fractals_to_fetch,
             b_converted_slot,
-            self.packed.consume(),
+            self.packed.next_read(),
         )
         # full-width piece: the slot is written across the whole k_l1
         # (the conversion covers every window fractal; beyond-grid
         # fractals carry finite stale-converted values)
-        mem_copy(
-            self.b_ring.produce(),
-            self.b_converted.consume(),
-            engine=self.piece_copy,
-            part_id=aiv_idx,
-            actual=(t.tile_n, k_window_width),
+        destination = self.b_ring.next_write()[: t.tile_n, :k_window_width].partition(
+            dim=0, part_id=aiv_idx, alignment=16
         )
+        converted = self.b_converted.next_read()
+        mem_copy(destination, converted[: destination.shape[0], : destination.shape[1]])
 
     # ---- cube side: A/scale staging + per-L1-window MX mmad ----
     @jit
@@ -721,28 +701,31 @@ class MixQuantKernel:
         # clamps to the real k (the stale L1 tail is zeroed in
         # __call__); the scale GM is column-padded to the k_l1 grid
         t = self.t
+        # Host preparation pads M/N and scales to complete tiles. Only A's
+        # final K window has a live tail; the scheduler proves every origin.
+        m_start = tile_m_idx * t.tile_m
+        n_start = tile_n_idx * t.tile_n
+        scale_start = k_window_idx * (t.scale_bytes_per_window // 2)
+        scale_end = scale_start + t.scale_bytes_per_window // 2
         mem_copy(
-            self.scale_a_ring.produce(),
-            tile_slice(
-                self.gm_sa,
-                (t.tile_m, t.scale_bytes_per_window // 2, 2),
-                (tile_m_idx, k_window_idx, 0),
-            ),
-            engine=self.scale_a_staging_engine,
+            self.scale_a_ring.next_write().permute(1, 0),
+            self.gm_sa[
+                m_start : m_start + t.tile_m, scale_start:scale_end, None
+            ].flatten(-2, -1),
         )
         mem_copy(
-            self.scale_b_ring.produce(),
-            tile_slice(
-                self.gm_sb,
-                (t.tile_n, t.scale_bytes_per_window // 2, 2),
-                (tile_n_idx, k_window_idx, 0),
-            ),
-            engine=self.scale_b_staging_engine,
+            self.scale_b_ring.next_write(),
+            self.gm_sb[n_start : n_start + t.tile_n, scale_start:scale_end, None]
+            .flatten(-2, -1)
+            .permute(1, 0),
+        )
+        k_start = k_window_idx * t.k_l1
+        k_count = (
+            t.k_l1 if const_expr(t.k % t.k_l1 == 0) else min(t.k_l1, t.k - k_start)
         )
         mem_copy(
-            self.a_ring.produce(),
-            tile_slice(self.gm_a, (t.tile_m, t.k_l1), (tile_m_idx, k_window_idx)),
-            engine=self.a_staging_engine,
+            self.a_ring.next_write(),
+            self.gm_a[m_start : m_start + t.tile_m, k_start : k_start + k_count],
         )
 
     @jit
@@ -759,11 +742,10 @@ class MixQuantKernel:
         tile_n = t.tile_n
         if const_expr(self.has_bias):
             mem_copy(
-                self.bias_ub.produce(),
-                tile_slice(self.gm_bias, (tile_n,), (tile_n_idx,)),
-                engine=self.bias_copy_engine,
+                self.bias_ub.next_write(),
+                self.gm_bias[tile_n_idx * tile_n : (tile_n_idx + 1) * tile_n,],
             )
-            bias_ub_slot = self.bias_ub.consume()
+            bias_ub_slot = self.bias_ub.next_read()
             with vf():
                 mask32 = create_mask(pattern="all", elem_bits=32)
                 for off in range(0, tile_n, 64):
@@ -773,8 +755,10 @@ class MixQuantKernel:
                 vmem_bar("vst_vld")
             half_len = tile_n // 2
             mem_copy(
-                tile_slice(self.bias_ring.produce(), (half_len,), (aiv_idx,)),
-                tile_slice(bias_ub_slot, (half_len,), (aiv_idx,)),
+                self.bias_ring.next_write()[
+                    aiv_idx * half_len : (aiv_idx + 1) * half_len,
+                ],
+                bias_ub_slot[aiv_idx * half_len : (aiv_idx + 1) * half_len,],
             )
 
     @jit
@@ -783,7 +767,7 @@ class MixQuantKernel:
         # into BIAS memory for the first mmad's BT operand (nobias
         # kernels touch none of the bias channels)
         if const_expr(self.has_bias):
-            mem_copy(self.mmad_bias.produce(), self.bias_ring.consume())
+            mem_copy(self.mmad_bias.next_write(), self.bias_ring.next_read())
 
     @jit
     def consume_block(self, k_window_idx, sub_block_idx, l0c_accumulator):
@@ -807,10 +791,21 @@ class MixQuantKernel:
         scale_b_sub_block = tile_slice(
             self.scale_b_window_slot, (t.k_l0 // 32, t.tile_n), (sub_block_idx, 0)
         )
-        mem_copy(self.l0a.produce(), a_sub_block, mx_scale=scale_a_sub_block)
-        l0a_slot = self.l0a.consume()
-        mem_copy(self.l0b.produce(), b_sub_block, mx_scale=scale_b_sub_block)
-        l0b_slot = self.l0b.consume()
+        # The producer initializes complete padded K windows. Keep the fixed
+        # compute domain: a dynamic sub-block copy result loses that static K
+        # proof and adds scalar control to every MMAD.
+        mem_copy(
+            self.l0a.next_write(),
+            a_sub_block,
+            options=copy_options(mx_scale=scale_a_sub_block),
+        )
+        l0a_slot = self.l0a.next_read()
+        mem_copy(
+            self.l0b.next_write(),
+            b_sub_block,
+            options=copy_options(mx_scale=scale_b_sub_block),
+        )
+        l0b_slot = self.l0b.next_read()
         # final flag rides the last global sub: k_block_count = ceil(k/k_l0)
         last_sub_idx = t.k_block_count - 1
         # bias rides the init mmad (init is a runtime condition in the
@@ -823,9 +818,10 @@ class MixQuantKernel:
             bias=self.bias_tensor if const_expr(self.has_bias) else None,
             init=(global_sub_idx == 0),
             unit_flag=3 if global_sub_idx == last_sub_idx else 2,
+            mx_mode=True,
         )
 
-    def _init_vector_channels(self):
+    def _init_vector_ring_buffers(self):
         t = self.t
         tile_n = t.tile_n
 
@@ -834,91 +830,93 @@ class MixQuantKernel:
         # n-group-major) — one channel instance per AIV's own UB
         packed_window_bytes = t.packed_bytes_per_window
         # 2-D tile rows: a 4-D writer trips the legacy rank check
-        self.packed = Channel(
-            MemLoc.UB, (packed_window_bytes // 256, 256), dtypes.uint8, depth=1
+        self.packed = RingBuffer(
+            MemLoc.UB,
+            dtypes.uint8,
+            make_layout((packed_window_bytes // 256, 256)),
+            depth=1,
         )
 
         # window ring: one channel epoch per runtime L1-window iteration
         # (ring depths from the tiling's L1 budget)
-        self.b_converted = Channel(
+        self.b_converted = RingBuffer(
             MemLoc.UB,
-            (tile_n, t.k_l1),
             dtypes.float8_e4m3fn,
+            make_layout((tile_n, t.k_l1)),
             depth=1,
             data_format="nz",
         )
-        self.b_ring = Channel(
+        self.b_ring = RingBuffer(
             MemLoc.L1,
-            (tile_n, t.k_l1),
             dtypes.float8_e4m3fn,
+            make_layout((tile_n, t.k_l1)),
             depth=t.ring_depth_b,
-            kind=ChannelKind.CrossCore,
         )
         # bias: the AIVs stage + x 2^-6 scale the raw GM bias into the
         # CrossCore slot (official ScaleMxBias placement); the AIC hands
         # it to BIAS memory (stage_tile)
-        self.bias_ub = Channel(
-            MemLoc.UB, (tile_n,), dtypes.float32, depth=1, data_format="nd"
-        )
-        self.bias_ring = Channel(
-            MemLoc.L1,
-            (tile_n,),
+        self.bias_ub = RingBuffer(
+            MemLoc.UB,
             dtypes.float32,
+            make_layout((tile_n,)),
             depth=1,
-            kind=ChannelKind.CrossCore,
+        )
+        self.bias_ring = RingBuffer(
+            MemLoc.L1,
+            dtypes.float32,
+            make_layout((tile_n,)),
+            depth=1,
             data_format="nd",
         )
 
-    def _init_cube_channels(self):
+    def _init_cube_ring_buffers(self):
         t = self.t
         tile_n = t.tile_n
 
         # cube-side staging — all K-sized state is windowed (K unbounded):
         # A and both scale channels are k_l1-wide rings
-        self.a_ring = Channel(
+        self.a_ring = RingBuffer(
             MemLoc.L1,
-            (t.tile_m, t.k_l1),
             dtypes.float8_e4m3fn,
+            make_layout((t.tile_m, t.k_l1)),
             depth=t.ring_depth_a,
         )
-        self.scale_a_ring = Channel(
+        self.scale_a_ring = RingBuffer(
             MemLoc.L1,
-            (t.tile_m, t.scale_bytes_per_window),
             dtypes.float8_e8m0,
+            make_layout((t.scale_bytes_per_window, t.tile_m)),
             depth=2,
-            data_format="zn",
         )
-        self.scale_b_ring = Channel(
+        self.scale_b_ring = RingBuffer(
             MemLoc.L1,
-            (t.scale_bytes_per_window, tile_n),
             dtypes.float8_e8m0,
+            make_layout((t.scale_bytes_per_window, tile_n)),
             depth=2,
-            data_format="nz",
         )
-        self.mmad_bias = Channel(MemLoc.BIAS, (tile_n,), dtypes.float32, depth=1)
+        self.mmad_bias = RingBuffer(
+            MemLoc.BIAS, dtypes.float32, make_layout((tile_n,)), depth=1
+        )
 
         # L0 operand channels sized to the consume sub-block width
         # (the tail sub-block narrows via channel actuals)
-        self.l0a = Channel(
-            MemLoc.L0A, (t.tile_m, t.k_l0), dtypes.float8_e4m3fn, depth=2
+        self.l0a = RingBuffer(
+            MemLoc.L0A,
+            dtypes.float8_e4m3fn,
+            make_layout((t.tile_m, t.k_l0)),
+            depth=2,
         )
-        self.l0b = Channel(MemLoc.L0B, (tile_n, t.k_l0), dtypes.float8_e4m3fn, depth=2)
+        self.l0b = RingBuffer(
+            MemLoc.L0B, dtypes.float8_e4m3fn, make_layout((tile_n, t.k_l0)), depth=2
+        )
         # L0C single-buffered for big tiles ((256,256) fp32 = 256KB =
         # L0C exactly; the per-tile fixpipe serializes with the next
         # tile's first mmad)
-        self.l0c = Channel(
-            MemLoc.L0C, (t.tile_m, tile_n), dtypes.float32, depth=t.l0c_depth
+        self.l0c = RingBuffer(
+            MemLoc.L0C,
+            dtypes.float32,
+            make_layout((t.tile_m, tile_n)),
+            depth=t.l0c_depth,
         )
-
-    def _init_engines(self):
-        self.a_staging_engine = make_copy_engine(format_transform="nd2nz")
-        self.scale_a_staging_engine = make_copy_engine(format_transform="mx_scale_and")
-        self.scale_b_staging_engine = make_copy_engine(format_transform="mx_scale_bdn")
-        self.bias_copy_engine = make_copy_engine(format_transform="identity")
-        self.fixpipe_engine = make_copy_engine()
-        # AIV piece copy into the CrossCore ring slot: split axis 0
-        # (16-aligned halves, one per vector sub-core)
-        self.piece_copy = make_copy_engine(split_axis=0, split_alignment=16)
 
 
 # ============================================================================

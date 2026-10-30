@@ -38,16 +38,16 @@ import math
 import torch
 import torch_npu
 
-from cannbotdsl import dtypes, get_mem_size, get_platform_info
+from cannbotdsl import make_layout, dtypes, get_mem_size, get_platform_info
 from cannbotdsl.ops.arch import get_block_idx, get_block_num
-from cannbotdsl.channel import Channel
+from cannbotdsl.ring_buffer import RingBuffer
 from cannbotdsl.lang.constexpr import const_expr
 from cannbotdsl.lang.host import host
 from cannbotdsl.lang.kernel import kernel
 from cannbotdsl.ops.matmul import matmul
 from cannbotdsl import MemLoc, Tensor
 from cannbotdsl.tensor import tile_slice
-from cannbotdsl.ops.memcpy import make_copy_engine, mem_copy
+from cannbotdsl.ops.memcpy import copy_options, mem_copy, convert
 
 
 # ============================================================================
@@ -439,8 +439,9 @@ class QbmmTtTiling:
             * self.INPUT_ELEMENT_BYTES
             * self.BASIC_L1_BUFFER_NUM
         )
-        # Keep headroom for channel-arena alignment overhead (a full L1 budget
-        # overflows once slot alignment is applied): == falls back to 2 too.
+        # Keep headroom for on-chip slot-allocation alignment overhead (a
+        # full L1 budget overflows once slot alignment is applied): == falls
+        # back to 2 too.
         self.l1_buffer_num = (
             self.DB_SIZE
             if (a_l1_4buf + b_l1_4buf) >= self.L1_SIZE - 32 * 1024
@@ -592,54 +593,41 @@ class QbmmTtKernel:
         #   B (K,N) transposed -> L1 (k_l1, base_n) "zn" (dn2nz engine)
         # L0A is always (base_m, base_k) nz; L0B is always (base_n, base_k) nz —
         # the DSL matmul computes lhs @ rhs^T with rhs in (N, K).
-        l1_a = Channel(
+        l1_a = RingBuffer(
             MemLoc.L1,
-            (tiling.k_l1, tiling.base_m)
-            if tiling.transpose_a
-            else (tiling.base_m, tiling.k_l1),
             tiling.a_dtype,
+            make_layout((tiling.base_m, tiling.k_l1)),
             depth=tiling.l1_buffer_num,
-            data_format="zn" if tiling.transpose_a else "nz",
         )
-        l1_b = Channel(
+        l1_b = RingBuffer(
             MemLoc.L1,
-            (tiling.base_n, tiling.k_l1)
-            if tiling.transpose_b
-            else (tiling.k_l1, tiling.base_n),
             tiling.b_dtype,
+            make_layout((tiling.base_n, tiling.k_l1)),
             depth=tiling.l1_buffer_num,
-            data_format="nz" if tiling.transpose_b else "zn",
         )
-        l0a = Channel(
+        l0a = RingBuffer(
             MemLoc.L0A,
-            shape=(tiling.base_m, tiling.base_k),
-            dtype=tiling.a_dtype,
+            tiling.a_dtype,
+            make_layout((tiling.base_m, tiling.base_k)),
             depth=2,
         )
-        l0b = Channel(
+        l0b = RingBuffer(
             MemLoc.L0B,
-            shape=(tiling.base_n, tiling.base_k),
-            dtype=tiling.b_dtype,
+            tiling.b_dtype,
+            make_layout((tiling.base_n, tiling.base_k)),
             depth=2,
         )
         # L0C is the cube accumulator (int32 for int8, fp32 for fp8/hif8); the
         # FIXPIPE engine dequants it to the float output dtype using the
         # runtime scalar deq_scale.
         l0c_dtype = dtypes.int32 if tiling.a_dtype == dtypes.int8 else dtypes.float32
-        l0c = Channel(
+        l0c = RingBuffer(
             MemLoc.L0C,
-            shape=(tiling.base_m, tiling.base_n),
-            dtype=l0c_dtype,
+            l0c_dtype,
+            make_layout((tiling.base_m, tiling.base_n)),
             depth=tiling.l0c_db,
         )
         # GM->L1 engines: nd2nz for ND operands, dn2nz for K-major operands.
-        copy_a_engine = make_copy_engine(
-            format_transform="dn2nz" if tiling.transpose_a else "nd2nz"
-        )
-        copy_b_engine = make_copy_engine(
-            format_transform="nd2nz" if tiling.transpose_b else "dn2nz"
-        )
-        fp_engine = make_copy_engine(format_transform="identity")
 
         n_tiles = self.n_tiles
         main_window = self.main_window
@@ -667,41 +655,57 @@ class QbmmTtKernel:
                 n_idx = (tail_index // tail_window) % n_tiles
             n_idx = (n_tiles - 1 - n_idx) if (row_idx % 2 != 0) else n_idx
 
-            l0c_acc = l0c.produce()
+            m_start = m_idx * tiling.base_m
+            n_start = n_idx * tiling.base_n
+            m_count = min(tiling.base_m, tiling.m - m_start)
+            n_count = min(tiling.base_n, tiling.n - n_start)
+            gm_c_tile = gm_c[m_start : m_start + m_count, n_start : n_start + n_count]
+            if const_expr(tiling.transpose_a):
+                a_panel = gm_a[None, m_start : m_start + m_count]
+            else:
+                a_panel = gm_a[m_start : m_start + m_count, None]
+            if const_expr(tiling.transpose_b):
+                b_panel = gm_b[n_start : n_start + n_count, None]
+            else:
+                b_panel = gm_b[None, n_start : n_start + n_count]
+            l0c_acc = (
+                l0c.next_write()
+                .bare()
+                .view(make_layout(gm_c_tile.shape), dtype=l0c_dtype, data_format="nz")
+            )
             for k_l1_idx in range(k_l1_tiles):
                 k_start = k_l1_idx * tiling.k_l1
-                k_end = min(k_start + tiling.k_l1, tiling.k)
-                current_step_k = ceil_div(k_end - k_start, tiling.base_k)
+                k_count = (
+                    tiling.k_l1
+                    if const_expr(tiling.k % tiling.k_l1 == 0)
+                    else min(tiling.k_l1, tiling.k - k_start)
+                )
+                k_end = k_start + k_count
+                current_step_k = ceil_div(k_count, tiling.base_k)
                 if const_expr(tiling.transpose_a):
-                    gm_a_tile = tile_slice(
-                        gm_a, (tiling.k_l1, tiling.base_m), (k_l1_idx, m_idx)
-                    )
+                    gm_a_tile = a_panel[k_start:k_end, None]
                 else:
-                    gm_a_tile = tile_slice(
-                        gm_a, (tiling.base_m, tiling.k_l1), (m_idx, k_l1_idx)
-                    )
+                    gm_a_tile = a_panel[None, k_start:k_end]
                 if const_expr(tiling.transpose_b):
-                    gm_b_tile = tile_slice(
-                        gm_b, (tiling.base_n, tiling.k_l1), (n_idx, k_l1_idx)
-                    )
+                    gm_b_tile = b_panel[None, k_start:k_end]
                 else:
-                    gm_b_tile = tile_slice(
-                        gm_b, (tiling.k_l1, tiling.base_n), (k_l1_idx, n_idx)
-                    )
+                    gm_b_tile = b_panel[k_start:k_end, None]
+                a_slot = l1_a.next_write()
+                b_slot = l1_b.next_write()
+                l1_a_tensor = a_slot.permute(1, 0) if tiling.transpose_a else a_slot
+                l1_a_tensor = l1_a_tensor[tuple(map(slice, gm_a_tile.shape))]
                 mem_copy(
-                    l1_a.produce(),
+                    l1_a_tensor,
                     gm_a_tile,
-                    engine=copy_a_engine,
-                    l2_cache_ctl=self.l2_cache_ctl_a,
+                    options=copy_options(l2_cache_ctl=self.l2_cache_ctl_a),
                 )
-                l1_a_tensor = l1_a.consume()
+                l1_b_tensor = b_slot if tiling.transpose_b else b_slot.permute(1, 0)
+                l1_b_tensor = l1_b_tensor[tuple(map(slice, gm_b_tile.shape))]
                 mem_copy(
-                    l1_b.produce(),
+                    l1_b_tensor,
                     gm_b_tile,
-                    engine=copy_b_engine,
-                    l2_cache_ctl=self.l2_cache_ctl_b,
+                    options=copy_options(l2_cache_ctl=self.l2_cache_ctl_b),
                 )
-                l1_b_tensor = l1_b.consume()
                 for k_l0_idx in range(current_step_k):
                     if const_expr(tiling.transpose_a):
                         l1_a_slice = tile_slice(
@@ -719,14 +723,27 @@ class QbmmTtKernel:
                         l1_b_slice = tile_slice(
                             l1_b_tensor, (tiling.base_k, tiling.base_n), (k_l0_idx, 0)
                         )
-                    mem_copy(l0a.produce(), l1_a_slice)
-                    l0a_tensor = l0a.consume()
-                    mem_copy(l0b.produce(), l1_b_slice)
-                    l0b_tensor = l0b.consume()
+                    a_source = (
+                        l1_a_slice.permute(1, 0) if tiling.transpose_a else l1_a_slice
+                    )
+                    b_source = (
+                        l1_b_slice if tiling.transpose_b else l1_b_slice.permute(1, 0)
+                    )
+                    l0a_tensor = l0a.next_write(bare=True)
+                    l0a_tensor = l0a_tensor.view(make_layout(a_source.shape))
+                    mem_copy(l0a_tensor, a_source)
+                    l0b_tensor = l0b.next_write(bare=True)
+                    l0b_tensor = l0b_tensor.view(make_layout(b_source.shape))
+                    mem_copy(l0b_tensor, b_source)
+                    c_view = l0c_acc.bare().view(
+                        make_layout((l0a_tensor.shape[0], l0b_tensor.shape[0])),
+                        dtype=l0c_dtype,
+                        data_format="nz",
+                    )
                     global_k = k_l1_idx * k_l0_per_l1 + k_l0_idx
                     is_final_acc = global_k + 1 == total_k_l0
                     matmul(
-                        l0c_acc,
+                        c_view,
                         l0a_tensor,
                         l0b_tensor,
                         init=(global_k == 0),
@@ -734,13 +751,10 @@ class QbmmTtKernel:
                     )
             l0c_tensor = l0c_acc
 
-            gm_c_tile = tile_slice(gm_c, (tiling.base_m, tiling.base_n), (m_idx, n_idx))
             mem_copy(
                 gm_c_tile,
-                l0c_tensor,
-                engine=fp_engine,
-                deq_scale=deq_scale,
-                unit_flag=3,
+                convert(l0c_tensor, gm_c_tile.dtype, scale=deq_scale),
+                options=copy_options(unit_flag=3),
             )
 
     @host

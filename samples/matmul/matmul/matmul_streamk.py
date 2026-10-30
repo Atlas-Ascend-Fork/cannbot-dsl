@@ -30,8 +30,8 @@ import logging
 
 import torch
 
-from cannbotdsl import dtypes, get_mem_size, get_platform_info
-from cannbotdsl.channel import Channel
+from cannbotdsl import make_layout, dtypes, get_mem_size, get_platform_info
+from cannbotdsl.ring_buffer import RingBuffer
 from cannbotdsl.ops.arch import (
     get_block_idx,
     get_block_num,
@@ -47,13 +47,9 @@ from cannbotdsl.ops import reg as rr
 from cannbotdsl.lang import const_expr, vf
 from cannbotdsl.tensor import MemLoc
 from cannbotdsl.tensor import Tensor
-from cannbotdsl.tensor import (
-    idx2crd,
-    reinterpret,
-    tile_slice,
-)
+from cannbotdsl.tensor import idx2crd, tile_slice
 from cannbotdsl.ops.sync import global_sync_all
-from cannbotdsl.ops.memcpy import make_copy_engine, mem_copy
+from cannbotdsl.ops.memcpy import copy_options, mem_copy
 
 logger = logging.getLogger(__name__)
 
@@ -333,8 +329,6 @@ class MatmulStreamK:
         self.l0c = None
         self.stage = None
         self.out_stage = None
-        self.nd2nz = None
-        self.fixpipe = None
 
     def print_config(self):
         logger.info(f"DPSK: m={self.m} n={self.n} k={self.k}")
@@ -358,52 +352,75 @@ class MatmulStreamK:
         )
 
     @jit
-    def _init_channels(self):
+    def _init_ring_buffers(self):
         dt = self.in_dtype
-        self.a_l1 = Channel(
-            MemLoc.L1, shape=(self.tile_m, self.slab_k), dtype=dt, depth=self.l1_depth
+        self.a_l1 = RingBuffer(
+            MemLoc.L1,
+            dt,
+            make_layout((self.tile_m, self.slab_k)),
+            depth=self.l1_depth,
         )
-        self.b_l1 = Channel(
-            MemLoc.L1, shape=(self.slab_k, self.tile_n), dtype=dt, depth=self.l1_depth
+        self.b_l1 = RingBuffer(
+            MemLoc.L1,
+            dt,
+            make_layout((self.slab_k, self.tile_n)),
+            depth=self.l1_depth,
         )
-        self.l0a = Channel(
-            MemLoc.L0A, shape=(self.tile_m, self.tile_k), dtype=dt, depth=2
+        self.l0a = RingBuffer(
+            MemLoc.L0A,
+            dt,
+            make_layout((self.tile_m, self.tile_k)),
+            depth=2,
         )
-        self.l0b = Channel(
-            MemLoc.L0B, shape=(self.tile_k, self.tile_n), dtype=dt, depth=2
+        self.l0b = RingBuffer(
+            MemLoc.L0B,
+            dt,
+            make_layout((self.tile_n, self.tile_k)),
+            depth=2,
         )
-        self.l0c = Channel(
+        self.l0c = RingBuffer(
             MemLoc.L0C,
-            shape=(self.tile_m, self.tile_n),
-            dtype=float32,
+            float32,
+            make_layout((self.tile_m, self.tile_n)),
             depth=self.l0c_depth,
         )
-        self.stage = Channel(
+        self.stage = RingBuffer(
             MemLoc.UB,
-            shape=(max(self.k_splits, 1), self.reduce_m * self.tile_n),
-            dtype=float32,
+            float32,
+            make_layout((max(self.k_splits, 1), self.reduce_m * self.tile_n)),
             depth=1,
-        ).produce()
-        self.out_stage = Channel(
-            MemLoc.UB, shape=(self.reduce_m, self.tile_n), dtype=dt, depth=1
-        ).produce()
-        self.nd2nz = make_copy_engine(format_transform="nd2nz")
-        self.fixpipe = make_copy_engine()
+        ).next_write()
+        self.out_stage = RingBuffer(
+            MemLoc.UB,
+            dt,
+            make_layout((self.reduce_m, self.tile_n)),
+            depth=1,
+        ).next_write()
 
     @jit
-    def _mmad_from_l1(self, a_slot, b_slot, accumulator, first_slab, ka_steps):
+    def _mmad_from_l1(self, a_slot, b_slot, accumulator, first_slab):
         # L1 slab -> L0 sub-blocks -> mmad; the accumulator initialises
         # only on the very first sub-block of the first slab
-        for ki in range(ka_steps):
-            a_input = self.l0a.produce()
-            b_input = self.l0b.produce()
-            mem_copy(a_input, tile_slice(a_slot, (self.tile_m, self.tile_k), (0, ki)))
-            mem_copy(
-                b_input,
-                tile_slice(b_slot, (self.tile_k, self.tile_n), (ki, 0)),
-                transpose=True,
+        for ki in range(_ceil_div(a_slot.shape[1], self.tile_k)):
+            a_source = tile_slice(a_slot, (self.tile_m, self.tile_k), (0, ki))
+            b_source = tile_slice(b_slot, (self.tile_k, self.tile_n), (ki, 0)).permute(
+                1, 0
             )
-            matmul(accumulator, a_input, b_input, init=first_slab and (ki == 0))
+            # M/N stay fixed across K sub-blocks; only K can have a new tail.
+            a_input = self.l0a.next_write(bare=True).view(
+                make_layout((a_slot.shape[0], a_source.shape[1]))
+            )
+            mem_copy(a_input, a_source)
+            b_input = self.l0b.next_write(bare=True).view(
+                make_layout((b_slot.shape[1], b_source.shape[1]))
+            )
+            mem_copy(b_input, b_source)
+            c_view = accumulator.bare().view(
+                make_layout((a_input.shape[0], b_input.shape[0])),
+                dtype=float32,
+                data_format="nz",
+            )
+            matmul(c_view, a_input, b_input, init=first_slab and (ki == 0))
 
     @jit
     def _dp_path(self, out_gm: Tensor, a_gm: Tensor, b_gm: Tensor):
@@ -437,27 +454,45 @@ class MatmulStreamK:
                 n_idx = (n_tiles - 1) - n_idx
         else:
             m_idx, n_idx, _ = idx2crd(tile_idx, [self.m_tiles, self.n_tiles, 1])
-        accumulator = self.l0c.produce()
+        m_start = m_idx * self.tile_m
+        n_start = n_idx * self.tile_n
+        m_count = min(self.tile_m, self.m - m_start)
+        n_count = min(self.tile_n, self.n - n_start)
+        a_panel = a_gm[m_start : m_start + m_count, None]
+        b_panel = b_gm[None, n_start : n_start + n_count]
+        output_tile = out_gm[m_start : m_start + m_count, n_start : n_start + n_count]
+        accumulator = (
+            self.l0c.next_write()
+            .bare()
+            .view(make_layout(output_tile.shape), dtype=float32, data_format="nz")
+        )
         for sk in range(self.slab_tiles):
-            a_slot = self.a_l1.produce()
-            b_slot = self.b_l1.produce()
+            k_start = sk * self.slab_k
+            k_count = (
+                self.slab_k
+                if const_expr(self.k % self.slab_k == 0)
+                else min(self.slab_k, self.k - k_start)
+            )
+            a_slot = self.a_l1.next_write()
+            b_slot = self.b_l1.next_write()
+            a_slot_source = a_panel[None, k_start : k_start + k_count]
+            a_slot = a_slot[tuple(map(slice, a_slot_source.shape))]
             mem_copy(
                 a_slot,
-                tile_slice(a_gm, (self.tile_m, self.slab_k), (m_idx, sk)),
-                l2_cache_ctl=self.l2_cache_ctl_a,
-                engine=self.nd2nz,
+                a_slot_source,
+                options=copy_options(l2_cache_ctl=self.l2_cache_ctl_a),
             )
+            b_slot_source = b_panel[k_start : k_start + k_count, None]
+            b_slot = b_slot[tuple(map(slice, b_slot_source.shape))]
             mem_copy(
                 b_slot,
-                tile_slice(b_gm, (self.slab_k, self.tile_n), (sk, n_idx)),
-                l2_cache_ctl=self.l2_cache_ctl_b,
-                engine=self.nd2nz,
+                b_slot_source,
+                options=copy_options(l2_cache_ctl=self.l2_cache_ctl_b),
             )
-            self._mmad_from_l1(a_slot, b_slot, accumulator, sk == 0, self.step_ka)
+            self._mmad_from_l1(a_slot, b_slot, accumulator, sk == 0)
         mem_copy(
-            tile_slice(out_gm, (self.tile_m, self.tile_n), (m_idx, n_idx)),
+            output_tile,
             accumulator,
-            engine=self.fixpipe,
         )
 
     @jit
@@ -475,31 +510,56 @@ class MatmulStreamK:
 
             slab_start = k_split * self.slabs_per
             total_slabs = _ceil_div(self.k, self.slab_k_sk)
-            accumulator = self.l0c.produce()
+            m_start = m_idx * self.tile_m
+            n_start = n_idx * self.tile_n
+            m_count = min(self.tile_m, self.m - m_start)
+            n_count = min(self.tile_n, self.n - n_start)
+            a_panel = a_gm[m_start : m_start + m_count, None]
+            b_panel = b_gm[None, n_start : n_start + n_count]
+            accumulator = (
+                self.l0c.next_write()
+                .bare()
+                .view(make_layout((m_count, n_count)), dtype=float32, data_format="nz")
+            )
             for s in range(self.slabs_per):
                 sk = slab_start + s
                 if sk < total_slabs:
-                    a_slot = self.a_l1.produce()
-                    b_slot = self.b_l1.produce()
+                    k_start = sk * self.slab_k_sk
+                    k_count = (
+                        self.slab_k_sk
+                        if const_expr(self.k % self.slab_k_sk == 0)
+                        else min(self.slab_k_sk, self.k - k_start)
+                    )
+                    a_slot = self.a_l1.next_write()
+                    b_slot = self.b_l1.next_write()
+                    a_slot_source_2 = a_panel[None, k_start : k_start + k_count]
+                    a_slot = a_slot[tuple(map(slice, a_slot_source_2.shape))]
                     mem_copy(
                         a_slot,
-                        tile_slice(a_gm, (self.tile_m, self.slab_k_sk), (m_idx, sk)),
-                        l2_cache_ctl=self.l2_cache_ctl_a,
-                        engine=self.nd2nz,
+                        a_slot_source_2,
+                        options=copy_options(l2_cache_ctl=self.l2_cache_ctl_a),
                     )
+                    b_slot_source_2 = b_panel[k_start : k_start + k_count, None]
+                    b_slot = b_slot[tuple(map(slice, b_slot_source_2.shape))]
                     mem_copy(
                         b_slot,
-                        tile_slice(b_gm, (self.slab_k_sk, self.tile_n), (sk, n_idx)),
-                        l2_cache_ctl=self.l2_cache_ctl_b,
-                        engine=self.nd2nz,
+                        b_slot_source_2,
+                        options=copy_options(l2_cache_ctl=self.l2_cache_ctl_b),
                     )
-                    self._mmad_from_l1(
-                        a_slot, b_slot, accumulator, s == 0, self.step_ka_sk
-                    )
+                    self._mmad_from_l1(a_slot, b_slot, accumulator, s == 0)
 
             ws_tile_idx = tail_mn_global * self.k_splits + k_split
-            ws_dst = tile_slice(ws_gm, (self.tile_m, self.tile_n), (ws_tile_idx, 0))
-            mem_copy(ws_dst, accumulator, engine=self.fixpipe)
+            ws_start = ws_tile_idx * self.tile_m
+            # MMAD writes complete 16-column NZ fragments. Preserve those
+            # columns in the padded workspace so FixPipe writes aligned rows
+            # instead of one narrow burst per row (notably N=1). Reduction
+            # and the final store still use the live output M/N domain.
+            workspace_n = _ceil_div(n_count, 16) * 16
+            workspace_result = accumulator.bare().view(
+                make_layout((m_count, workspace_n)), dtype=float32, data_format="nz"
+            )
+            ws_dst = ws_gm[ws_start : ws_start + m_count, :workspace_n]
+            mem_copy(ws_dst, workspace_result)
 
     @jit
     def _accumulate_splits(self, stage, acc, offset, mask, slab_stride):
@@ -540,44 +600,50 @@ class MatmulStreamK:
                 m_idx = tail_mn_global // self.n_tiles
                 n_idx = tail_mn_global - m_idx * self.n_tiles
 
-                seg = tile_slice(
-                    ws_gm_flat,
-                    (self.k_splits, self.reduce_m * self.tile_n),
-                    (tail_mn_global, m_seg),
+                # Workspace tiles are fully allocated. The output alone has
+                # an M/N tail; compute its live extents once below.
+                ws_row = tail_mn_global * self.k_splits
+                ws_col = m_seg * self.reduce_m * self.tile_n
+                ws_count = (
+                    min(self.reduce_m, self.tile_m - m_seg * self.reduce_m)
+                    * self.tile_n
                 )
+                seg = ws_gm_flat[
+                    ws_row : ws_row + self.k_splits, ws_col : ws_col + ws_count
+                ]
                 mem_copy(self.stage, seg)
 
-                acc = reinterpret(
-                    self.stage, shape=(self.reduce_m, self.tile_n), offset=0
+                acc = self.stage[0:1, 0 : self.reduce_m * self.tile_n].reshape(
+                    self.reduce_m, self.tile_n
                 )
                 if self.k_splits > 1:
                     self._reduce_partial_sums(self.stage, acc)
 
                 cast_tile(self.out_stage, acc)
-                out_m_tile = tile_slice(
-                    out_gm, (self.tile_m, self.tile_n), (m_idx, n_idx)
+                m_start = m_idx * self.tile_m + m_seg * self.reduce_m
+                n_start = n_idx * self.tile_n
+                m_actual = max(
+                    0,
+                    min(
+                        self.reduce_m,
+                        min(self.tile_m - m_seg * self.reduce_m, self.m - m_start),
+                    ),
                 )
-                out_tile = tile_slice(
-                    out_m_tile, (self.reduce_m, self.tile_n), (m_seg, 0)
-                )
-                m_actual = out_tile.shape[0]
-                n_actual = out_tile.shape[1]
-                out_slice = reinterpret(
-                    self.out_stage,
-                    shape=(m_actual, n_actual),
-                    stride=(self.tile_n, 1),
-                )
+                n_actual = min(self.tile_n, self.n - n_start)
+                out_tile = out_gm[
+                    m_start : m_start + m_actual, n_start : n_start + n_actual
+                ]
+                out_slice = self.out_stage[0:m_actual, 0:n_actual]
                 mem_copy(out_tile, out_slice)
 
     @kernel
     def streamk_kernel(self, out_gm: Tensor, ws_gm: Tensor, a_gm: Tensor, b_gm: Tensor):
-        self._init_channels()
-        self._dp_path(out_gm, a_gm, b_gm)
-        self._sk_path(ws_gm, a_gm, b_gm)
-
-        _global_sync()
-
-        if self.tail_tiles > 0:
+        self._init_ring_buffers()
+        if const_expr(self.dp_tiles > 0):
+            self._dp_path(out_gm, a_gm, b_gm)
+        if const_expr(self.sk_work > 0):
+            self._sk_path(ws_gm, a_gm, b_gm)
+            _global_sync()
             self._aiv_reduce_path(out_gm, ws_gm)
 
     @host

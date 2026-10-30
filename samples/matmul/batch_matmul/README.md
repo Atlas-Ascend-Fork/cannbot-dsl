@@ -15,11 +15,11 @@ $$
 | 数据类型   | float16、bfloat16、float32（核内 fp32 累加）；fp32 可选 HF32 快速模式（`hf32=True`，TF32 档截断，误差 ~3e-4，仅 fp32 有效） |
 | 输入秩     | rank 2~6（末两维为矩阵维；2-D 自动升维，双 2-D 返回 2-D） |
 | batch 广播 | numpy/torch.matmul 语义：batch 维右对齐，size-1 维广播（含多维同时广播、混合秩、0 维退化） |
-| 转置推导     | 无转置入参：a/b 逻辑形状固定为 `[...bsA, M, K]` / `[...bsB, N, K]`（K 恒为末维，`F.linear` 语义）；canonical `transpose(-1,-2)` 视图（K-major 存储）由 stride 自动识别并零拷贝翻转到对应 kernel 路径（A 走 dn2nz/zn，B 走 (K,N) 通路），其余非连续布局拒绝 |
+| 转置推导     | 无转置入参：a/b 逻辑形状固定为 `[...bsA, M, K]` / `[...bsB, N, K]`（K 恒为末维，`F.linear` 语义）；canonical `transpose(-1,-2)` 视图（K-major 存储）由 stride 自动识别并零拷贝翻转到对应 kernel 路径（转置侧按 K-major 逻辑形状存入 NZ L1，L1→L0 搬运以 `src.permute(1, 0)` 表达转置），其余非连续布局拒绝 |
 | bias       | 可选加性偏置，经 BT（Bias Table）折入 init MMAD（只加一次）；`[N]` 共享（广播到 M 与 batch）或 `[*c_batch, N]` 逐 batch（需与输出 batch 精确匹配，BatchMatMulV3 契约）；dtype 为 fp32 或输入 dtype |
 | 输入       | a/b 需 contiguous 或 canonical 转置视图（其余非连续布局拒绝） |
 | 多核并行   | 展平 batch×M×N tile 空间线性 stride 调度（grid = min(tile 总数, 平台 cube 核数，dav-3510 为 28)，batch 数任意） |
-| 尾块处理   | `tile_slice` 裁剪 + ND2NZ 引擎零填充，M/N/K 任意值 |
+| 尾块处理   | nd2nz 随路零填充；K 尾块按 16 对齐裁剪 L0 搬运与 MMAD 视图，M/N 尾块由 C 的 tile 网格 padding 吸收（FIXPIPE 按名义 tile 尺寸写出后切片还原），M/N/K 任意值 |
 | L2 hint    | 逐 copy `l2_cache_ctl` 策略：A/B 默认旁路、按复用分析（跨 tile 重读 / broadcast）使能，含 nd2nz 方向 + 128 元素对齐守卫；C 按容量使能；bias 恒使能 |
 | 支持架构   | NPU ARCH 3510（Ascend 950PR / Ascend 950DT） |
 
@@ -35,7 +35,7 @@ host 侧 tiling 镜像主线 `batch_mat_mul_v3` 的 basic 路径（`ResetBaseDav
 
 ### 数据流
 
-device kernel 采用线性 stride 多核调度 + L1/L0 ping-pong 流水线：GM → L1（MTE2 + ND2NZ/DN2NZ）→ L0A/L0B（MTE1）→ MMAD（M，fp32 累加，bias 经 BT 折入 init）→ L0C → GM（FIXPIPE，NZ2ND + 按输出 dtype 量化）。
+device kernel 采用线性 stride 多核调度 + L1/L0 ping-pong 流水线：GM → L1（MTE2 + ND2NZ）→ L0A/L0B（MTE1）→ MMAD（M，fp32 累加，bias 经 BT 折入 init）→ L0C → GM（FIXPIPE，NZ2ND + 按输出 dtype 量化）。
 
 广播寻址在 kernel 内由 host 常量 (div, extent, mul) 解码项完成（源 batch 下标 = Σ((out_idx // div) % extent) × mul），host 侧零拷贝展平 leading 维；A/B 侧各自独立解码。实现详见 `batch_matmul.py`。
 
@@ -96,7 +96,7 @@ c = batch_matmul(a32, b32, hf32=True)          # TF32 档，误差 ~3e-4
 | `b`          | (*b_batch, N, K) | float16/bfloat16/float32 | 右矩阵，`C = A @ B^T`；布局契约同 `a` |
 | `bias`       | [N] 或 (*c_batch, N) | fp32 或输入 dtype | 可选加性偏置，BT 折入 init MMAD |
 | `hf32`       |   -   |       bool       | fp32 专用快速模式：MMAD 以 HF32（TF32 档）计算，误差 ~3e-4；非 fp32 输入时报错（默认 False） |
-| 返回值 `c`   | (*c_batch, M, N) | 同输入 | 批量矩阵乘结果（双 2-D 输入返回 2-D；触发 pad 契约时为 `[..., :N]` 视图） |
+| 返回值 `c`   | (*c_batch, M, N) | 同输入 | 批量矩阵乘结果（双 2-D 输入返回 2-D；触发 pad 契约时切片回真实 M/N） |
 
 ## 精度测试
 

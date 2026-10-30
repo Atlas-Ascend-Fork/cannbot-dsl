@@ -42,15 +42,16 @@ import dataclasses
 
 import torch
 import cannbotdsl
+from cannbotdsl import make_layout
 from cannbotdsl import dtypes, MemLoc, get_mem_size, get_platform_info
-from cannbotdsl.ops.arch import get_block_idx, get_block_num
-from cannbotdsl.channel import Channel
+from cannbotdsl.ops.arch import get_block_idx, get_block_num, get_ctrl, set_ctrl
+from cannbotdsl.ring_buffer import RingBuffer
 from cannbotdsl.lang.constexpr import const_expr
 from cannbotdsl.lang.host import host
 from cannbotdsl.lang.jit import jit
 from cannbotdsl.lang.kernel import kernel
 from cannbotdsl.ops.matmul import matmul
-from cannbotdsl.ops.memcpy import make_copy_engine, mem_copy
+from cannbotdsl.ops.memcpy import copy_options, mem_copy
 from cannbotdsl.tensor import (
     tile_slice,
     permute,
@@ -213,10 +214,76 @@ class GmmTiling:
         self.l1_buffer_num = DB_SIZE
         self.l0c_db = 1
 
-        self.m_tail_cnt = 1
-        self.n_tail_cnt = 1
-
         self._compute()
+        self.a_full_load = False
+
+    def _optimize_base_m_and_a_full_load(self, group_m_sizes):
+        """Reduce padded M rows and reuse full-K A tiles for equal-sized groups."""
+        if not group_m_sizes or len(set(group_m_sizes)) != 1:
+            return
+        group_m = group_m_sizes[0]
+        if group_m and self.base_m >= 64:
+            # Keep the M tile count unchanged, avoiding extra B loads.
+            m_tile_count = _ceil_div(group_m, self.base_m)
+            candidate_base_m = max(
+                64, _ceil_align(_ceil_div(group_m, m_tile_count), BASIC_BLOCK_16)
+            )
+            while (
+                candidate_base_m < self.base_m
+                and _ceil_div(group_m, candidate_base_m) > m_tile_count
+            ):
+                candidate_base_m += BASIC_BLOCK_16
+            if (
+                candidate_base_m < self.base_m
+                and _ceil_div(group_m, candidate_base_m) == m_tile_count
+            ):
+                self.base_m = candidate_base_m
+                self._recalc_base_k()
+                self._cal_l1_tiling()
+        if (
+            group_m
+            and self.k > 0
+            and self.group_type == SPLIT_M
+            and not self.trans_a
+            and not self.trans_b
+            and _ceil_div(group_m, self.base_m) * self.group_num >= AIC_NUM
+            and self.n > self.base_n
+        ):
+            # Keep one full-K A tile while double-buffering streamed B tiles.
+            a_full_load_bytes = (
+                self.base_m * _ceil_align(self.k, BASIC_BLOCK_16) * self.a_dtype_size
+            )
+            max_b_k_l1 = _floor_align(
+                max(0, L1_SIZE - a_full_load_bytes)
+                // (DB_SIZE * self.base_n * self.b_dtype_size),
+                self.base_k,
+            )
+            m_tiles = _ceil_div(group_m, self.base_m)
+            n_tiles = _ceil_div(self.n, self.base_n)
+            # Estimate A+B row traffic per core; K and element size are common factors.
+            streaming_load_rows = _ceil_div(
+                m_tiles * n_tiles * self.group_num, AIC_NUM
+            ) * (self.base_m + self.base_n)
+            a_full_load_rows = _ceil_div(m_tiles * self.group_num, AIC_NUM) * (
+                self.base_m + n_tiles * self.base_n
+            )
+            # Avoid extra B K windows when multiple M tiles reuse the weights.
+            if (
+                max_b_k_l1 >= 2 * self.base_k
+                and (
+                    m_tiles == 1
+                    or max_b_k_l1 >= self.k_l1
+                    or (
+                        self.n >= group_m
+                        and _ceil_div(self.k, max_b_k_l1)
+                        <= _ceil_div(self.k, self.k_l1)
+                    )
+                )
+                and a_full_load_rows < streaming_load_rows
+            ):
+                self.a_full_load = True
+                self.k_l1 = min(self.k_l1, max_b_k_l1)
+                self.l1_buffer_num = DB_SIZE
 
     @staticmethod
     def _resolve_dtype(dtype):
@@ -232,15 +299,38 @@ class GmmTiling:
             raise TypeError(f"unsupported dtype: {dtype}")
         return props
 
+    def _optimize_base_m(self):
+        """Reduce M padding and increase tile count for L0C buffer reuse.
+
+        Clamp base_m to the aligned maximum group M when it is smaller.
+        When the tile count is between half and all AICs, split M further
+        if each group spans multiple M tiles, creating more work for the buffers.
+        """
+        if 0 < self.m < self.base_m:
+            self.base_m = _ceil_align(self.m, BASIC_BLOCK_16)
+            self._recalc_base_k()
+            self._cal_l1_tiling()
+        m_tile_count = _ceil_div(self.m, self.base_m)
+        n_tile_count = _ceil_div(self.n, self.base_n)
+        total_tile_count = m_tile_count * n_tile_count * self.group_num
+        if AIC_NUM // 2 < total_tile_count <= AIC_NUM and m_tile_count >= 2:
+            self.base_m = _ceil_align(
+                _ceil_div(self.m, m_tile_count * 2), BASIC_BLOCK_16
+            )
+            self._recalc_base_k()
+            self._cal_l1_tiling()
+
     def _compute(self):
         self._cal_base_mm_tiling()
         if self.group_num == 1:
             self._formulate_basic_block(AIC_NUM)
-            self._calc_tail_basic_block()
+            self._optimize_base_m()
             self._cal_aswt_l1_tiling()
             self._set_disable_l2_cache()
         else:
             if self.group_type in (SPLIT_M, NO_SPLIT):
+                self._formulate_basic_block(max(1, AIC_NUM // self.group_num))
+                self._optimize_base_m()
                 self._set_disable_l2_cache()
             elif self.group_type == SPLIT_K:
                 remain_core = max(1, AIC_NUM // self.group_num)
@@ -349,19 +439,6 @@ class GmmTiling:
         if self.base_k == 0:
             self.base_k = BASIC_BLOCK_16
 
-    def _calc_tail_basic_block(self):
-        """Compute tail-tile split counts (m_tail_cnt/n_tail_cnt)."""
-        m_cnt = _ceil_div(self.m, self.base_m)
-        n_cnt = _ceil_div(self.n, self.base_n)
-        mn_cnt = m_cnt * n_cnt
-        tail_cnt = mn_cnt % AIC_NUM if mn_cnt > AIC_NUM else 0
-
-        if tail_cnt != 0:
-            while (self.m_tail_cnt + 1) * self.n_tail_cnt * tail_cnt <= AIC_NUM:
-                self.m_tail_cnt += 1
-                if self.m_tail_cnt * (self.n_tail_cnt + 1) * tail_cnt <= AIC_NUM:
-                    self.n_tail_cnt += 1
-
     def _cal_aswt_l1_tiling(self):
         """Single-group L1 tiling using the full L1 budget plus a small reserve."""
         total_l1 = L1_SIZE + 256
@@ -413,6 +490,9 @@ class GmmTiling:
         self.weight_no_l2_cache = (
             (inner_b * dtype_size % ALIGN_128 == 0) and flag and self.l2_disable_seed
         )
+        # Keep B caching enabled when multiple M tiles can reuse the weights.
+        if self.weight_no_l2_cache and _ceil_div(self.m, self.base_m) > 1:
+            self.weight_no_l2_cache = False
 
     def _finalize(self):
         """Finalize k_l1/used_core_num/l1_buffer_num."""
@@ -436,7 +516,10 @@ class GmmTiling:
             if self.l1_buffer_num < DB_SIZE:
                 self.l1_buffer_num = DB_SIZE
 
-        self.l0c_db = 1
+        # Use two L0C slots when they fit, allowing output/computation overlap.
+        self.l0c_db = (
+            2 if self.base_m * self.base_n * DATA_SIZE_FP32 * 2 <= L0C_SIZE else 1
+        )
 
 
 # ============================================================================
@@ -455,48 +538,60 @@ class BlockMmad:
       trans_b on:  L1_B (base_n, k_l1)  <- GM [N,K]
     """
 
-    def __init__(self, tiling):
+    def __init__(self, tiling, *, fixed_k=False):
         self.t = tiling
+        # A single X split along M has the same host-known K in every group.
+        # Preserve full K panels through copy results instead of turning their
+        # size into a runtime min/subtraction chain. Split-K and tensor lists
+        # can have different K per group and retain the bounded tail path.
+        self.full_k_panels = fixed_k and tiling.k % tiling.k_l1 == 0
+        a_l1_k = (
+            _ceil_align(tiling.k, BASIC_BLOCK_16) if tiling.a_full_load else tiling.k_l1
+        )
 
-        self.l1_a = Channel(
+        self.l1_a = RingBuffer(
             MemLoc.L1,
-            (tiling.k_l1, tiling.base_m)
-            if tiling.trans_a
-            else (tiling.base_m, tiling.k_l1),
             tiling.a_dtype,
-            depth=tiling.l1_buffer_num,
+            make_layout(
+                (a_l1_k, tiling.base_m) if tiling.trans_a else (tiling.base_m, a_l1_k)
+            ),
+            depth=1 if tiling.a_full_load else tiling.l1_buffer_num,
         )
-        self.copy_a = make_copy_engine(format_transform="nd2nz")
 
-        self.l1_b = Channel(
+        self.l1_b = RingBuffer(
             MemLoc.L1,
-            (tiling.base_n, tiling.k_l1)
-            if tiling.trans_b
-            else (tiling.k_l1, tiling.base_n),
             tiling.b_dtype,
+            make_layout(
+                (tiling.base_n, tiling.k_l1)
+                if tiling.trans_b
+                else (tiling.k_l1, tiling.base_n)
+            ),
             depth=tiling.l1_buffer_num,
         )
-        self.copy_b = make_copy_engine(format_transform="nd2nz")
 
-        self.l0a = Channel(
+        self.l0a = RingBuffer(
             MemLoc.L0A,
-            (tiling.base_m, tiling.base_k),
             tiling.a_dtype,
+            make_layout((tiling.base_m, tiling.base_k)),
             depth=2,
-            data_format="nz",
         )
-        self.l0b = Channel(
+        self.l0b = RingBuffer(
             MemLoc.L0B,
-            (tiling.base_n, tiling.base_k),
             tiling.b_dtype,
+            make_layout((tiling.base_n, tiling.base_k)),
             depth=2,
         )
-        self.l0c = Channel(
+        self.l0c = RingBuffer(
             MemLoc.L0C,
-            (tiling.base_m, tiling.base_n),
             dtypes.float32,
-            depth=tiling.l0c_db,
+            make_layout((tiling.base_m, tiling.base_n)),
+            # UnitFlag mainline: the FIXPIPE is auto-triggered by the final
+            # MMAD, so L0C stays single-buffered.
+            depth=1,
         )
+        # Keep output stores cached in L2; unit_flag=3 pairs the FIXPIPE
+        # with the final MMAD's auto-trigger.
+        self.fixpipe_options = copy_options(unit_flag=3, l2_cache_ctl=1)
 
     @jit
     def compute_tile(
@@ -513,10 +608,9 @@ class BlockMmad:
         """K reduction (GM→L1→L0→MMAD) + FIXPIPE for one output tile.
 
         a_src/b_src are this group's row-major aliases; c_src is the group's
-        output slice (tail tiles are clipped by tile_slice).  disable_l2 is a
-        runtime per-group flag: groups with M below base_m skip caching
-        weight lines in L2; l2_cache_ctl is a compile-time attribute, so the
-        runtime choice is a branch between two copy sites.
+        output slice (M/N/K tails are clipped once per enclosing loop). disable_l2 is a
+        runtime per-group flag: groups with M at most base_m skip caching
+        weight lines in L2; the copy accepts a runtime cache policy.
         """
         t = self.t
         base_m = t.base_m
@@ -524,43 +618,73 @@ class BlockMmad:
         base_k = t.base_k
         k_l1 = t.k_l1
 
-        l0c_tensor = self.l0c.produce()
+        # Select M/N once. The reduction only changes K, so keep the live
+        # row/column domains instead of repeatedly clipping a two-axis tile.
+        m_start = m_tile_idx * base_m
+        n_start = n_tile_idx * base_n
+        m_extent = min(base_m, a_src.shape[-1 if t.trans_a else -2] - m_start)
+        n_extent = min(base_n, b_src.shape[-2 if t.trans_b else -1] - n_start)
+        if const_expr(t.trans_a):
+            a_panel = a_src[None, m_start : m_start + m_extent]
+        else:
+            a_panel = a_src[m_start : m_start + m_extent, None]
+        if const_expr(t.trans_b):
+            b_panel = b_src[n_start : n_start + n_extent, None]
+        else:
+            b_panel = b_src[None, n_start : n_start + n_extent]
+        # M/N and the physical accumulator pitch stay fixed for this entire
+        # reduction. Bind them once; only the operand views advance along K.
+        accumulator = self.l0c.next_write(bare=True).view(
+            make_layout((m_extent, n_extent)), dtype=dtypes.float32, data_format="nz"
+        )
         for k_l1_idx in range(k_l1_tiles):
+            k_start = k_l1_idx * k_l1
+            k_extent = (
+                k_l1 if const_expr(self.full_k_panels) else min(k_l1, k_total - k_start)
+            )
             if const_expr(t.trans_a):
-                gm_a_tile = tile_slice(a_src, (k_l1, base_m), (k_l1_idx, m_tile_idx))
+                gm_a_tile = a_panel[k_start : k_start + k_extent, None]
             else:
-                gm_a_tile = tile_slice(a_src, (base_m, k_l1), (m_tile_idx, k_l1_idx))
-            mem_copy(self.l1_a.produce(), gm_a_tile, engine=self.copy_a)
-            l1_a_tensor = self.l1_a.consume()
+                gm_a_tile = a_panel[None, k_start : k_start + k_extent]
+            if const_expr(not t.a_full_load):
+                l1_a_tensor = self.l1_a.next_write()
+                l1_a_tensor = l1_a_tensor[tuple(map(slice, gm_a_tile.shape))]
+                mem_copy(l1_a_tensor, gm_a_tile)
+            else:
+                l1_a_tensor = self.l1_a.next_read()[:m_extent, None]
 
             if const_expr(t.trans_b):
-                gm_b_tile = tile_slice(b_src, (base_n, k_l1), (n_tile_idx, k_l1_idx))
+                gm_b_tile = b_panel[None, k_start : k_start + k_extent]
             else:
-                gm_b_tile = tile_slice(b_src, (k_l1, base_n), (k_l1_idx, n_tile_idx))
+                gm_b_tile = b_panel[k_start : k_start + k_extent, None]
 
-            # The two mem_copy sites must stay identical except
-            # l2_cache_ctl (a compile-time attribute).
-            b_slot = self.l1_b.produce()
-            if disable_l2:
-                mem_copy(b_slot, gm_b_tile, engine=self.copy_b, l2_cache_ctl=0)
-            else:
-                mem_copy(b_slot, gm_b_tile, engine=self.copy_b, l2_cache_ctl=1)
-            l1_b_tensor = self.l1_b.consume()
+            # The current copy API accepts a per-call runtime cache policy.
+            l1_b_tensor = self.l1_b.next_write()
+            l1_b_tensor = l1_b_tensor[tuple(map(slice, gm_b_tile.shape))]
+            mem_copy(
+                l1_b_tensor,
+                gm_b_tile,
+                options=copy_options(l2_cache_ctl=4 if disable_l2 else 1),
+            )
 
-            k_remaining = k_total - k_l1_idx * k_l1
-            k_l0_per_l1 = _ceil_div(min(k_l1, k_remaining), base_k)
+            k_l0_per_l1 = _ceil_div(k_extent, base_k)
             for k_l0_idx in range(k_l0_per_l1):
+                a_k_l0_idx = (
+                    k_l1_idx * (k_l1 // base_k) + k_l0_idx
+                    if const_expr(t.a_full_load)
+                    else k_l0_idx
+                )
+                # Keep the nominal K tile explicit for NZ alignment proof.
+                # Interval slicing would hide that the origin is a multiple
+                # of base_k and leave a composed map for transposed operands.
                 if const_expr(t.trans_a):
                     l1_a_slice = tile_slice(
-                        l1_a_tensor, (base_k, base_m), (k_l0_idx, 0)
+                        l1_a_tensor, (base_k, base_m), (a_k_l0_idx, 0)
                     )
                 else:
                     l1_a_slice = tile_slice(
-                        l1_a_tensor, (base_m, base_k), (0, k_l0_idx)
+                        l1_a_tensor, (base_m, base_k), (0, a_k_l0_idx)
                     )
-                mem_copy(self.l0a.produce(), l1_a_slice, transpose=t.trans_a)
-                l0a_tensor = self.l0a.consume()
-
                 if const_expr(t.trans_b):
                     l1_b_slice = tile_slice(
                         l1_b_tensor, (base_n, base_k), (0, k_l0_idx)
@@ -569,13 +693,45 @@ class BlockMmad:
                     l1_b_slice = tile_slice(
                         l1_b_tensor, (base_k, base_n), (k_l0_idx, 0)
                     )
-                mem_copy(self.l0b.produce(), l1_b_slice, transpose=not t.trans_b)
-                l0b_tensor = self.l0b.consume()
-
                 is_first_k_block = k_l1_idx == 0 and k_l0_idx == 0
-                matmul(l0c_tensor, l0a_tensor, l0b_tensor, init=is_first_k_block)
-        gm_c_tile = tile_slice(c_src, (base_m, base_n), (m_tile_idx, n_tile_idx))
-        mem_copy(gm_c_tile, l0c_tensor)
+                l0a_tensor = self._load_l0a_block(l1_a_slice)
+                l0b_tensor = self._load_l0b_block(l1_b_slice)
+                is_final_k = k_l1_idx == k_l1_tiles - 1 and k_l0_idx == k_l0_per_l1 - 1
+                matmul(
+                    accumulator.bare(),
+                    l0a_tensor,
+                    l0b_tensor,
+                    init=is_first_k_block,
+                    unit_flag=3 if is_final_k else 2,
+                )
+        gm_c_tile = c_src[m_start : m_start + m_extent, n_start : n_start + n_extent]
+        mem_copy(gm_c_tile, accumulator, options=self.fixpipe_options)
+
+    @jit
+    def _load_l0a_block(self, l1_a_slice):
+        """Load one base_k A block from L1 to L0A.
+
+        K-major A staging (trans_a) is un-transposed here by the permuted
+        source view; the L0A slot is bound to the source's actual extent.
+        """
+        source = l1_a_slice.permute(1, 0) if self.t.trans_a else l1_a_slice
+        l0a_tensor = self.l0a.next_write(bare=True)
+        l0a_tensor = l0a_tensor.view(make_layout(source.shape))
+        mem_copy(l0a_tensor, source)
+        return l0a_tensor
+
+    @jit
+    def _load_l0b_block(self, l1_b_slice):
+        """Load one base_k B block from L1 to L0B.
+
+        (K, N) B staging (not trans_b) is transposed here by the permuted
+        source view; the L0B slot is bound to the source's actual extent.
+        """
+        source = l1_b_slice if self.t.trans_b else l1_b_slice.permute(1, 0)
+        l0b_tensor = self.l0b.next_write(bare=True)
+        l0b_tensor = l0b_tensor.view(make_layout(source.shape))
+        mem_copy(l0b_tensor, source)
+        return l0b_tensor
 
 
 # ============================================================================
@@ -636,6 +792,10 @@ class GmmKernel:
         # counter, pre_offset the accumulated group-axis offset.
         count = 0
         pre_offset = 0
+        # Preserve ring cursors across groups, including odd K-window counts.
+        block_mmad = BlockMmad(t, fixed_k=self.single_x and not self.is_split_k)
+        saved_ctrl = get_ctrl()
+        self._enable_mmad_row_major(saved_ctrl)
 
         for group_idx in range(group_num):
             # Element access must stay inside the @kernel body (DSL
@@ -660,7 +820,7 @@ class GmmKernel:
 
             # Everything else lives in the @jit per-group body.
             count, pre_offset = self._iterate_group(
-                t,
+                block_mmad,
                 a_elem,
                 w_elem,
                 y_elem,
@@ -676,10 +836,30 @@ class GmmKernel:
                 block_num,
             )
 
+        self._restore_ctrl(saved_ctrl)
+
+    @jit
+    def _enable_mmad_row_major(self, saved_ctrl):
+        """Set CTRL.MM_LAYOUT_MODE_BIT for the UnitFlag MMAD mainline.
+
+        AscendC SetMMRowMajor: the layout-mode bit is 51; set it only when
+        the saved CTRL does not already carry it.
+        """
+        mm_layout_mode_mask = 1 << 51
+        set_ctrl(
+            saved_ctrl
+            + (1 - saved_ctrl // mm_layout_mode_mask % 2) * mm_layout_mode_mask
+        )
+
+    @jit
+    def _restore_ctrl(self, saved_ctrl):
+        """Restore the CTRL captured before the row-major mainline."""
+        set_ctrl(saved_ctrl)
+
     @jit
     def _iterate_group(
         self,
-        t,
+        block_mmad,
         a_elem,
         w_elem,
         y_elem,
@@ -699,6 +879,7 @@ class GmmKernel:
         Returns (count, pre_offset): the cross-group tile counter and the
         accumulated group-axis offset.
         """
+        t = self.t
         is_split_k = self.is_split_k
         is_count = self.is_count
         single_x = self.single_x
@@ -763,14 +944,19 @@ class GmmKernel:
             else:
                 c_group = y_elem[group_start:group_end, None]
 
+            # Selecting a group keeps its leading singleton axis. Collapse
+            # that axis so the tile body sees the same two-dimensional planes
+            # for tensor lists and grouped three-dimensional storage.
+            b_src = b_src.flatten(0, -2)
+            c_group = c_group.flatten(0, -2)
+
             k_total = k_val
             k_l1_tiles = ceil_div(k_val, t.k_l1)
-            # Constructed once per group and reused by every tile.
-            block_mmad = BlockMmad(t)
-
             m_tile_num = ceil_div(m_val, t.base_m)
             n_tile_num = ceil_div(n_val, t.base_n)
             total_tile_num = m_tile_num * n_tile_num
+            if const_expr(t.a_full_load):
+                total_tile_num = m_tile_num
             cur_count = count + total_tile_num
 
             cur_block = (
@@ -804,20 +990,39 @@ class GmmKernel:
                 if row_idx % EVEN_ROWS != 0:
                     n_tile_idx = n_tile_num - 1 - n_tile_idx
 
-                # Skip L2 caching for this group's weight DMA when the host
-                # policy allows it and the group's M is below base_m (tail
-                # group with low weight reuse).
-                disable_l2 = self.weight_no_l2_cache and t.base_m > m_val
-                block_mmad.compute_tile(
-                    a_group,
-                    b_src,
-                    c_group,
-                    m_tile_idx,
-                    n_tile_idx,
-                    k_l1_tiles,
-                    k_total,
-                    disable_l2,
-                )
+                # NOTALLOC_KEEP for B streamed once by a single M tile.
+                disable_l2 = self.weight_no_l2_cache and t.base_m >= m_val
+                if const_expr(t.a_full_load):
+                    # One task owns an M tile and reuses its resident A across N.
+                    m_tile_idx = index
+                    gm_a_full = tile_slice(
+                        a_group,
+                        (t.base_m, _ceil_align(t.k, BASIC_BLOCK_16)),
+                        (m_tile_idx, 0),
+                    )
+                    mem_copy(block_mmad.l1_a.next_write(), gm_a_full)
+                    for full_n_idx in range(n_tile_num):
+                        block_mmad.compute_tile(
+                            a_group,
+                            b_src,
+                            c_group,
+                            m_tile_idx,
+                            full_n_idx,
+                            k_l1_tiles,
+                            k_total,
+                            disable_l2,
+                        )
+                else:
+                    block_mmad.compute_tile(
+                        a_group,
+                        b_src,
+                        c_group,
+                        m_tile_idx,
+                        n_tile_idx,
+                        k_l1_tiles,
+                        k_total,
+                        disable_l2,
+                    )
 
             count = cur_count % block_num
         return count, new_pre_offset
@@ -1096,6 +1301,20 @@ def _resolve_scenario(
             n_dim = n_list[0]
             gl_total_ok(single_m, "M")
         m_, n_, k_ = single_m, n_dim, k_dim
+        if group_type == SPLIT_M and has_group_list:
+            # Tiling plans per-group tiles: feed the max per-group M (not
+            # the total M) so core-count rebalancing sizes blocks against
+            # per-group work, matching the multi-x path's max(m_list).
+            group_list_values = [int(v) for v in group_list.tolist()]
+            if group_list_type == GROUPLIST_TYPE_CUMSUM:
+                group_m_sizes = [group_list_values[0]] + [
+                    group_list_values[i] - group_list_values[i - 1]
+                    for i in range(1, len(group_list_values))
+                ]
+            else:
+                group_m_sizes = group_list_values
+            if group_m_sizes:
+                m_ = max(group_m_sizes)
     else:
         # S1 / S4: group count = len(x) == len(weight).
         if len(x) != len(weight):
@@ -1227,7 +1446,11 @@ def group_matmul(
             ]
     elif plan.single_y:
         if plan.single_x:
-            y = [torch.zeros(plan.single_m, plan.n, dtype=x_dtype, device=dev)]
+            # Positive-K M-split groups overwrite the entire output.
+            allocate = (
+                torch.empty if group_type == SPLIT_M and plan.k > 0 else torch.zeros
+            )
+            y = [allocate(plan.single_m, plan.n, dtype=x_dtype, device=dev)]
         else:
             y = [
                 torch.zeros(sum(plan.m_list), plan.n_list[0], dtype=x_dtype, device=dev)
@@ -1238,8 +1461,25 @@ def group_matmul(
             for xg, wg in zip(x, weight)
         ]
 
-    if plan.m == 0 or plan.n == 0:
+    if plan.m == 0 or plan.n == 0 or plan.k == 0:
         return y
+
+    # ---- per-group M extents for host tiling ----
+    if group_type == SPLIT_K:
+        group_m_sizes = [plan.m]  # every group computes the full M
+    elif plan.m_list is not None:
+        group_m_sizes = plan.m_list
+    elif group_list is not None and group_list.numel() > 0:
+        group_list_values = [int(v) for v in group_list.tolist()]
+        if group_list_type == 1:
+            group_m_sizes = group_list_values
+        else:
+            group_m_sizes = [group_list_values[0]] + [
+                group_list_values[i] - group_list_values[i - 1]
+                for i in range(1, len(group_list_values))
+            ]
+    else:
+        group_m_sizes = [plan.m] if plan.group_num == 1 else []
 
     # ---- tiling ----
     tiling = GmmTiling(
@@ -1256,6 +1496,7 @@ def group_matmul(
         group_list_type=group_list_type,
         l2_disable_seed=plan.l2_seed,
     )
+    tiling._optimize_base_m_and_a_full_load(group_m_sizes)
 
     # ---- kernel launch ----------------------------------------------------
     op = GmmKernel(
