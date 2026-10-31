@@ -43,7 +43,7 @@ from cannbotdsl.lang.constexpr import const_expr
 from cannbotdsl.lang.control_flow import range as dsl_range
 from cannbotdsl.lang.host import host
 from cannbotdsl.ops.arch import get_block_idx
-from cannbotdsl.channel import Channel
+from cannbotdsl.ring_buffer import RingBuffer
 from cannbotdsl.types.dtypes import (
     bfloat16 as BFloat16,
     float32 as Float32,
@@ -77,7 +77,7 @@ from cannbotdsl.ops.reg import (
     vstore_pack,
 )
 from cannbotdsl.ops.memcpy import mem_copy
-from cannbotdsl.tensor import MemLoc, Tensor, tile_slice
+from cannbotdsl.tensor import MemLoc, Tensor, make_layout, tile_slice
 from cannbotdsl.lang.vf import vf
 from cannbotdsl.aot import export
 
@@ -575,27 +575,27 @@ class UpdateVector:
         self.stats_stride = _ceil_div(tile_t, 8) * 8
         self.delta_dtype = delta_dtype
         self.norm_eps = norm_eps
-        self.partial = Channel(
-            MemLoc.UB, shape=(tile_t, self.fp_stride), dtype=Float32, depth=depth
+        self.partial = RingBuffer(
+            MemLoc.UB, Float32, make_layout((tile_t, self.fp_stride)), depth=depth
         )
-        self.delta = Channel(
-            MemLoc.UB, shape=(tile_t, self.b16_stride), dtype=delta_dtype, depth=depth
+        self.delta = RingBuffer(
+            MemLoc.UB, delta_dtype, make_layout((tile_t, self.b16_stride)), depth=depth
         )
-        self.numerator = Channel(
-            MemLoc.UB, shape=(tile_t, self.fp_stride), dtype=Float32, depth=depth
+        self.numerator = RingBuffer(
+            MemLoc.UB, Float32, make_layout((tile_t, self.fp_stride)), depth=depth
         )
-        self.query = Channel(
-            MemLoc.UB, shape=(1, self.fp_stride), dtype=Float32, depth=1
-        ).produce()
-        self.stats = Channel(
-            MemLoc.UB, shape=(2, self.stats_stride), dtype=Float32, depth=depth
+        self.query = RingBuffer(
+            MemLoc.UB, Float32, make_layout((1, self.fp_stride)), depth=1
+        ).next_write()
+        self.stats = RingBuffer(
+            MemLoc.UB, Float32, make_layout((2, self.stats_stride)), depth=depth
         )
-        self.score = Channel(
-            MemLoc.UB, shape=(1, self.stats_stride), dtype=Float32, depth=depth
+        self.score = RingBuffer(
+            MemLoc.UB, Float32, make_layout((1, self.stats_stride)), depth=depth
         )
-        self.gamma = Channel(
-            MemLoc.UB, shape=(1, self.b16_stride), dtype=delta_dtype, depth=1
-        ).produce()
+        self.gamma = RingBuffer(
+            MemLoc.UB, delta_dtype, make_layout((1, self.b16_stride)), depth=1
+        ).next_write()
 
     def load_query(self, gm_query):
         slot = self.query
@@ -609,8 +609,8 @@ class UpdateVector:
 
     @jit
     def load_partial_delta(self, buffers, row, t_size):
-        partial_in = self.partial.produce()
-        delta_in = self.delta.produce()
+        partial_in = self.partial.next_write()
+        delta_in = self.delta.next_write()
         mem_copy(
             tile_slice(partial_in, (self.tile_t, self.d), (0, 0)),
             self.row_tile(buffers.partial, row, t_size),
@@ -620,16 +620,16 @@ class UpdateVector:
             self.row_tile(buffers.delta, row, t_size),
         )
         # Advance each cursor once per tile. Keep these aliases for all V/MTE3
-        # accesses; Channel selection itself neither copies data nor waits.
-        partial = self.partial.consume()
-        delta_h = self.delta.consume()
-        score_out = self.score.produce()
+        # accesses; RingBuffer selection itself neither copies data nor waits.
+        partial = self.partial.next_read()
+        delta_h = self.delta.next_read()
+        score_out = self.score.next_write()
         return _UpdateBuffers(partial, delta_h, score_out, query=self.query)
 
     @jit
     def load_softmax_state(self, buffers, row, t_size):
-        numerator_in = self.numerator.produce()
-        stats_in = self.stats.produce()
+        numerator_in = self.numerator.next_write()
+        stats_in = self.stats.next_write()
         mem_copy(
             tile_slice(numerator_in, (self.tile_t, self.d), (0, 0)),
             self.row_tile(buffers.numerator, row, t_size),
@@ -643,9 +643,9 @@ class UpdateVector:
             tile_slice(stats_in, (1, self.tile_t), (1, 0)),
             tile_slice(buffers.exp_sum[0:1, row:row_end], (1, self.tile_t), (0, 0)),
         )
-        numerator = self.numerator.consume()
-        stats = self.stats.consume()
-        score = self.score.consume()
+        numerator = self.numerator.next_read()
+        stats = self.stats.next_read()
+        score = self.score.next_read()
         return numerator, stats, score
 
     @jit
