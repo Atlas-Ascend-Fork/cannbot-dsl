@@ -36,6 +36,9 @@ else:
     import attn_epilogue_common as common
 
 
+_MAX_BASE_M = 256
+
+
 def core_budget(ref):
     """Return (device, AIC blocks, AIV blocks) without caching stream quotas."""
     if ref.device.type not in ("npu", "privateuseone"):
@@ -51,45 +54,62 @@ def core_budget(ref):
     return device, min(cube, vector // 2), vector
 
 
-def _tile_fits(base_m, base_n, block_num):
+def _tile_fits(base_m, base_n):
     """Check operand and accumulator capacities for a tiling candidate."""
     scale_k = common.NG * common.O_LORA // 32
-    depth = 1 if block_num == 32 else 2
-    step_k = 2 if block_num == 32 else common.STEPK
-    if max(base_m, base_n) * common.BASE_K * 2 > 65536:
+    if max(base_m, base_n) * common.BASE_K * 2 > min(
+        common.L0A_BYTES, common.L0B_BYTES
+    ):
         return False
-    if base_m * base_n * 4 * depth > 262144:
+    # One L0C accumulator must hold the tile; double buffering is optional.
+    if base_m * base_n * 4 > common.L0C_BYTES:
         return False
-    return (base_m + base_n) * (common.BASE_K * step_k * 2 + scale_k) <= 524288
+    # The smallest K step must fit the L1 operand and scale buffers.
+    step_k = common.STEPK // 2
+    return (base_m + base_n) * (common.BASE_K * step_k * 2 + scale_k) <= common.L1_BYTES
 
 
 @lru_cache(maxsize=1024)
 def tiling_for_cores(block_num, t=72, m_pad=None):
-    """Select M/N tiles from the stream core quota and Cube buffer limits."""
+    """Select M/N tiles from the core quota, row extent and Cube limits."""
     block_num, t = int(block_num), int(t)
     if block_num <= 0 or t <= 0:
         raise ValueError("core count and T must be positive")
     aligned_t = (t + 15) // 16 * 16
     if m_pad is not None and (int(m_pad) < t or int(m_pad) % 16):
         raise ValueError("m_pad must cover T and be a multiple of 16")
+    extent = aligned_t if m_pad is None else int(m_pad)
     candidates = []
-    widths = range(16, 257, 16) if block_num == 32 else (192,)
-    large_t_32_core = block_num == 32 and t >= 1000
-    max_m = 128 if large_t_32_core else 256
+    widths = range(16, 257, 16)
+    large_t = t >= 1000
+    max_m = 128 if large_t else _MAX_BASE_M
     for base_m in range(16, min(aligned_t, max_m) + 1, 16):
-        if large_t_32_core and aligned_t % base_m:
-            continue
-        legal_n = [n for n in widths if _tile_fits(base_m, n, block_num)]
-        if not legal_n:
+        if large_t and aligned_t % base_m:
             continue
         m_tiles = (t + base_m - 1) // base_m
+        # Every M tile must stay inside the allocated row extent.
+        if m_tiles * base_m > extent:
+            continue
+        legal_n = [n for n in widths if _tile_fits(base_m, n)]
+        if not legal_n:
+            continue
         score, selected = 0, []
+        feasible = True
         for groups, n_size, k in (
             (common.NG, common.O_LORA, common.F),
             (1, common.DIM, common.NG * common.O_LORA),
         ):
+            if n_size == common.DIM:
+                # MM2 writes whole N tiles: its tile must divide the output width.
+                stage_widths = [n for n in legal_n if n_size % n == 0]
+            else:
+                # MM1 quantizes in 32-column groups: tile starts must align.
+                stage_widths = [n for n in legal_n if n % common.QUANT_GROUP == 0]
+            if not stage_widths:
+                feasible = False
+                break
             stage = []
-            for n in legal_n:
+            for n in stage_widths:
                 tiles = groups * m_tiles * ((n_size + n - 1) // n)
                 waves = (tiles + block_num - 1) // block_num
                 cost = waves * k * (2 * base_m * n + 256 * (base_m + n))
@@ -97,6 +117,8 @@ def tiling_for_cores(block_num, t=72, m_pad=None):
             best = min(stage)
             score += best[0]
             selected.append(best[2])
+        if not feasible:
+            continue
         candidates.append((score, -base_m, *selected))
     if not candidates:
         raise ValueError("no TP1 tile fits the configured Cube buffers")
@@ -104,18 +126,26 @@ def tiling_for_cores(block_num, t=72, m_pad=None):
     return -negative_m, n1, n2
 
 
+def _row_extent(block_num, t):
+    """Return the M row extent covered by the tiles selected at runtime."""
+    aligned_t = (t + 15) // 16 * 16
+    base_m, _, _ = tiling_for_cores(block_num, t, aligned_t + _MAX_BASE_M)
+    return max(aligned_t, (t + base_m - 1) // base_m * base_m)
+
+
 def _matmul_resources(base_m, base_n1, base_n2, k=common.NG * common.O_LORA):
     """Fit double-buffered L1 operands and one or two L0C accumulators."""
     width = max(base_n1, base_n2)
     step_k = (
         common.STEPK
-        if (base_m + width) * (common.BASE_K * common.STEPK * 2 + k // 32) <= 524288
+        if (base_m + width) * (common.BASE_K * common.STEPK * 2 + k // 32)
+        <= common.L1_BYTES
         else common.STEPK // 2
     )
-    depths = [min(2, 262144 // (base_m * n * 4)) for n in (base_n1, base_n2)]
+    depths = [min(2, common.L0C_BYTES // (base_m * n * 4)) for n in (base_n1, base_n2)]
     if (
         min(depths) < 1
-        or (base_m + width) * (common.BASE_K * step_k * 2 + k // 32) > 524288
+        or (base_m + width) * (common.BASE_K * step_k * 2 + k // 32) > common.L1_BYTES
     ):
         raise ValueError("TP1 matmul tile exceeds Cube buffers")
     return step_k, depths[0], depths[1]
@@ -144,11 +174,14 @@ class AttnEpilogueTP1Kernel:
             * ((self.t + self.base_m - 1) // self.base_m)
             * ((self.o_lora + self.base_n1 - 1) // self.base_n1)
         )
-        # All launched Cubes must consume the first slab notification. Keep
-        # the established path for other core budgets and shared MM objects.
+        # All launched Cubes must consume the first slab notification, so only
+        # split K when the first MM1 slab has at least one tile per block and
+        # every NG group owns a lane.
         self.stream_k = (
             2048
-            if self.block_num == 32 and self.split_tiles and mm1_tiles >= self.block_num
+            if self.split_tiles
+            and mm1_tiles >= self.block_num
+            and self.block_num * 2 >= self.ng
             else 0
         )
         lanes = self.block_num * 2 // self.ng
@@ -199,7 +232,7 @@ class AttnEpilogueTP1Kernel:
         self._prefetch_weight(mm1, woaq, dwa, ng, self.o_lora)
         if const_expr(not self.stream_k):
             global_sync_all()
-        qy = common.QuantTile(self.base_m, self.base_n1, 65536 + rq.extra_ub)
+        qy = common.QuantTile(self.base_m, self.base_n1, rq.ub_bytes)
         self._tile_mm1_quant(
             mm1,
             qy,
@@ -505,10 +538,13 @@ def attn_epilogue(o, woa, wob, descale_woa, descale_wob, rope_sin, rope_cos):
     if t < 1:
         raise ValueError("T must be positive")
     with torch.npu.device(o.device):
+        _, blocks, _ = core_budget(o)
+        # A tight 16-row padding can force tiny M tiles when the aligned T has
+        # a large prime factor, so size the buffers to the tile coverage.
+        m = _row_extent(blocks, t)
         scratch = common.get_scratch(
-            o.device, t, torch.npu.is_current_stream_capturing()
+            o.device, t, torch.npu.is_current_stream_capturing(), m
         )
-        m = (t + 15) // 16 * 16
         out = torch.empty((m, common.DIM), dtype=torch.bfloat16, device=o.device)
         _attn_epilogue_out(
             o.view(common.NG * t, common.F),
@@ -563,7 +599,7 @@ def export_attn_epilogue():
             handles.append(
                 _compiled(
                     shape,
-                    (t + 15) // 16 * 16,
+                    _row_extent(block_num, t),
                     device=0,
                     block_num=block_num,
                 )

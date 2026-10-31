@@ -53,6 +53,16 @@ BASE_N = 192
 BASE_K = 128
 STEPK = 4
 
+# On-chip capacities come from the per-arch table so tiling follows the target
+# arch instead of assuming one product's buffer sizes.
+L1_BYTES = int(dsl.get_mem_size("l1"))
+L0A_BYTES = int(dsl.get_mem_size("l0a"))
+L0B_BYTES = int(dsl.get_mem_size("l0b"))
+L0C_BYTES = int(dsl.get_mem_size("l0c"))
+UB_BYTES = int(dsl.get_mem_size("ub"))
+if min(L1_BYTES, L0A_BYTES, L0B_BYTES, L0C_BYTES, UB_BYTES) <= 0:
+    raise RuntimeError("on-chip memory capacities are unavailable for the target arch")
+
 
 # Keep the sample usable with both layout-based DSL builds and the 0.8.0
 # CI wheel, whose constructors still expose the shape-based call convention.
@@ -577,7 +587,7 @@ class MatmulMx:
             )
 
     def _init_l1_channels(self, reuse_n):
-        storage = dsl.L1.view(524288) if reuse_n else None
+        storage = dsl.L1.view(L1_BYTES) if reuse_n else None
         a_shape = (self.base_m, self.k_l1)
         b_shape = (self.base_n, self.k_l1)
         # The layout API uses (scale, M); shape-based builds require (M, scale)
@@ -606,9 +616,9 @@ class MatmulMx:
         )
 
     def _init_l0_channels(self, reuse_n, depth):
-        a_storage = dsl.L0A.view(65536) if reuse_n else None
-        b_storage = dsl.L0B.view(65536) if reuse_n else None
-        c_storage = dsl.L0C.view(262144) if reuse_n else None
+        a_storage = dsl.L0A.view(L0A_BYTES) if reuse_n else None
+        b_storage = dsl.L0B.view(L0B_BYTES) if reuse_n else None
+        c_storage = dsl.L0C.view(L0C_BYTES) if reuse_n else None
         a_shape = (self.base_m, self.base_k)
         b_shape = (self.base_n, self.base_k)
         c_shape = (self.base_m, self.base_n)
@@ -622,7 +632,7 @@ class MatmulMx:
 class QuantTile:
     """Quantize a full Cube tile using bounded Vec temporary storage."""
 
-    def __init__(self, base_m, base_n, reserved_ub=65536):
+    def __init__(self, base_m, base_n, reserved_ub):
         self.rows = int(base_m) // 2
         self.cols = int(base_n)
         # The caller reserves RoPE/QuantA storage, including input buffers.
@@ -644,7 +654,7 @@ class QuantTile:
                 + rows * 32
                 + 512
             )
-            if ub_bytes <= 262144:
+            if ub_bytes <= UB_BYTES:
                 choices.append((chunks, padded - self.rows, -rows))
         if not choices:
             raise ValueError("no quant chunk fits UB")
@@ -676,7 +686,7 @@ class QuantTile:
         else:
             mem_copy(
                 matrix_view(self.x.next_write(), 0, self.rows, 0, self.cols),
-                accumulator,
+                accumulator.partition(dim=0),
                 options=copy_options(unit_flag=3),
             )
         src = self.x.next_read()
@@ -739,8 +749,15 @@ class RopeQuant:
         self.ngroups = self.f // QUANT_GROUP
         self.count = self.rows * self.f
         self.input_depth = 2 if self.stream_k else 1
-        self.extra_ub = (self.input_depth - 1) * (
-            2 * self.count + 8 * self.rows * ROPE_DIM
+        # UB footprint of the buffers below, charged to QuantTile's budget.
+        self.ub_bytes = (
+            self.rows * self.f * 2 * self.input_depth
+            + self.rows * self.f * 2
+            + 2 * self.count
+            + self.rows * self.ngroups
+            + 2 * self.rows * ROPE_DIM * 4 * self.input_depth
+            + self.rows * self.num_heads * ROPE_DIM * 4
+            + (self.count // 256) * (16 * 2 + 128 * 2)
         )
         self.in_ch = _make_ring_buffer(
             MemLoc.UB, dtypes.bfloat16, (self.rows, self.f), depth=self.input_depth
@@ -999,15 +1016,15 @@ SCRATCH_LOCK = threading.RLock()
 _CACHE_LIMIT = 8
 
 
-def get_scratch(device, t, capture):
+def get_scratch(device, t, capture, m_pad=None):
     stream = torch.npu.current_stream(device)
-    key = (device, stream.npu_stream, t)
+    m = (t + 15) // 16 * 16 if m_pad is None else int(m_pad)
+    key = (device, stream.npu_stream, t, m)
     # Capture gets graph-pool storage, independent of eager calls and other graphs.
     with SCRATCH_LOCK:
         if not capture and key in _SCRATCH:
             _SCRATCH.move_to_end(key)
             return _SCRATCH[key]
-        m = (t + 15) // 16 * 16
         k = NG * O_LORA
         rows = NG * m
         specs = [

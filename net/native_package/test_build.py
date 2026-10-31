@@ -299,6 +299,8 @@ def test_attn_epilogue_export_profiles(monkeypatch, tmp_path):
         "common": SimpleNamespace(
             NG=8, F=4096, O_LORA=1024, DIM=5120, ProjectionShape=lambda *args: args
         ),
+        # The real helper tiles T=257 into 288 rows; defaults use 16-row padding.
+        "_row_extent": lambda block_num, t: (288 if t == 257 else (t + 15) // 16 * 16),
         "_compiled": lambda shape, m_pad, *, device, block_num: (
             calls.append((block_num, shape[0], m_pad))
             or SimpleNamespace(close=lambda: None)
@@ -321,10 +323,12 @@ def test_attn_epilogue_export_profiles(monkeypatch, tmp_path):
 
     calls.clear()
     profiles = tmp_path / "profiles.json"
-    profiles.write_text('{"attn_epilogue": [{"block_num": 32, "tokens": [72, 1000]}]}')
+    profiles.write_text(
+        '{"attn_epilogue": [{"block_num": 32, "tokens": [72, 1000, 257]}]}'
+    )
     monkeypatch.setenv("CANNBOTDSL_DS41_PROFILES", str(profiles))
     export_fn()
-    assert calls == [(32, 72, 80), (32, 1000, 1008)]
+    assert calls == [(32, 72, 80), (32, 1000, 1008), (32, 257, 288)]
 
 
 def _extract_export_collector(operator):

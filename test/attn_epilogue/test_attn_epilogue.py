@@ -271,9 +271,18 @@ def test_tiling_capacity_and_padding_independence():
             assert (m, n1, n2) == tp1.tiling_for_cores(cores, t, padded + 16)
 
 
+def test_tiling_stays_within_row_extent():
+    for cores in (8, 28, 32):
+        for t in range(1, 300):
+            padded = (t + 15) // 16 * 16
+            m, _, _ = tp1.tiling_for_cores(cores, t, padded)
+            assert (t + m - 1) // m * m <= padded
+
+
+@pytest.mark.parametrize("cores", [8, 28, 32])
 @pytest.mark.parametrize("t", [1000, 1024])
-def test_large_t_32_core_tiling_uses_dividing_m_tile(t):
-    m, _, _ = tp1.tiling_for_cores(32, t)
+def test_large_t_tiling_uses_dividing_m_tile(cores, t):
+    m, _, _ = tp1.tiling_for_cores(cores, t)
     aligned_t = (t + 15) // 16 * 16
     assert m <= 128
     assert aligned_t % m == 0
@@ -334,6 +343,7 @@ def check_intermediate_quantization(rotated, quantized, activation, intermediate
         (129, 0, 1.0),
         (193, 0, 1.0),
         (255, 0, 1.0),
+        (257, 0, 1.0),
         (257, 16, 1.0),
         (1000, 0, 1.0),
         (72, 0, 0.0),
