@@ -163,6 +163,7 @@ python3 -m pytest test/flash_kda/test_flash_kda.py -v
 | [quant_sparse_lightning_indexer_metadata](samples/quant_sparse_lightning_indexer_metadata) | `quant_sparse_lightning_indexer_metadata()` | QSLI 配套的 AICPU 调度算子 |
 | [kv_compress_epilog](samples/kv_compress_epilog) | `kv_compress_epilog()` | KV Cache 量化压缩与按槽位原地更新 |
 | [reduce_scatter](samples/reduce_scatter) | `AivReduceScatterSoleMesh` | HIF8 多卡 ReduceScatter，支持 sum/max/min 与 UBMem/URMA |
+| [dynamic_mx_quant_sr](samples/dynamic_mx_quant_sr/README.md) | `dynamic_mx_quant_sr()` | block32 MXFP8 随机舍入量化，FP32/BF16 → E4M3FN/E5M2；依赖 CANNBot-DSL 0.8.0，环境要求见样例文档 |
 | [rms_norm](samples/rms_norm) | `rms_norm()` | RMSNorm，`y = x · rstd · γ` |
 | [engram_gate](samples/engram_gate) | `engram_gate()` | Engram 残差门：双路 RMS、加权点积与 signed-sqrt sigmoid 门控 |
 | [pointnet_sa](samples/pointnet_sa) | `pointnet_sa()` | PointNet++ SA 层的 shared MLP + max-pool |

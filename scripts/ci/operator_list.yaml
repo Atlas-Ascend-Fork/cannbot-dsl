@@ -57,3 +57,4 @@ operators:
   - moonep
   - sparse_flash_mla
   - sparse_flash_mla_metadata
+  - dynamic_mx_quant_sr
