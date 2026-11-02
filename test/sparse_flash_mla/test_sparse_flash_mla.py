@@ -12,7 +12,7 @@ Golden and input-generation definitions are based on
 ops-transformer/attention/sparse_flash_mla/tests/pytest/sparse_flash_mla_golden.py.
 Keep the upstream RUN_MODE and arithmetic (including dtype rounding) intact.
 The CPU golden additionally accepts sinks=None as a zero-mass (-inf) sink.
-Tests are opt-in: CANNBOTDSL_RUN_SMLA_TESTS=1 pytest test/sparse_flash_mla.
+Run with pytest test/sparse_flash_mla; no opt-in environment variable is required.
 SMLA_CASES selects the named in-file cases.
 """
 
@@ -32,13 +32,6 @@ import math
 import numpy as np
 import os
 import torch
-
-# Keep SMLA tests available for explicit validation without running them in CI.
-pytestmark = pytest.mark.skipif(
-    os.environ.get("CANNBOTDSL_RUN_SMLA_TESTS") != "1",
-    reason="SMLA tests are opt-in; set CANNBOTDSL_RUN_SMLA_TESTS=1 to run",
-)
-
 
 logger = logging.getLogger(__name__)
 

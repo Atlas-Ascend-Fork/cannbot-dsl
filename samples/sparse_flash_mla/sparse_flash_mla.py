@@ -12,10 +12,10 @@ The public entry routes sparse inputs with 1..64 query heads to the N64 sparse
 module and all other inputs to the generic implementation in this file.
 """
 
-import functools
 import math
 import torch
 import cannbotdsl
+from cannbotdsl import aot
 from cannbotdsl import (
     Dim,
     MemLoc,
@@ -27,17 +27,14 @@ from cannbotdsl import (
     get_platform_info,
     host,
 )
-from cannbotdsl.ring_buffer import RingBuffer
 from cannbotdsl.lang.constexpr import const_expr, range_constexpr
-from cannbotdsl.types.delay_line import DelayLineGroup
 from cannbotdsl.ops.arch import get_subblock_id, get_block_idx
 from cannbotdsl.types._integer import Int64
 from cannbotdsl.lang.jit import jit
 from cannbotdsl.lang.kernel import kernel
 from cannbotdsl.ops import matmul
-from cannbotdsl.tensor import reinterpret, tile_slice
+from cannbotdsl.tensor import tile_slice
 from cannbotdsl.ops.memcpy import mem_copy
-from cannbotdsl.buffer import Buffer
 from cannbotdsl.lang.vf import vf
 from cannbotdsl._mlir.dialects import arith
 from cannbotdsl.ops import reg as rr
@@ -52,6 +49,12 @@ from cannbotdsl.ops.sync import (
     vec_sync_intra_wait,
 )
 from sparse_flash_mla_sparse_n64_kernel import sparse_n64_kernel
+
+from cannbotdsl import Array
+from cannbotdsl.buffer import Buffer
+from cannbotdsl.ring_buffer import RingBuffer
+from cannbotdsl.tensor import make_layout, reinterpret
+
 
 _BITS_PER_BYTE = 8
 _F32_BITS = 32
@@ -155,16 +158,30 @@ class SmlaMatmulBase:
         self.tile_n = tile_n
         self.tile_d = _D
         self.q_ring = RingBuffer(
-            MemLoc.L1, (tile_cube_m, _D // 2), dtype, depth=_Q_RING
+            MemLoc.L1, dtype, make_layout((tile_cube_m, _D // 2)), depth=_Q_RING
         )
-        self.kv_ring = RingBuffer(MemLoc.L1, (tile_n, _D), dtype, depth=_KV_RING)
-        self.l0a = RingBuffer(MemLoc.L0A, (tile_cube_m, _TILE), dtype, depth=2)
-        self.l0a_p = RingBuffer(MemLoc.L0A, (tile_cube_m, tile_n), dtype, depth=2)
-        self.l0b = RingBuffer(MemLoc.L0B, (_TILE, _TILE), dtype, depth=2)
+        self.kv_ring = RingBuffer(
+            MemLoc.L1, dtype, make_layout((tile_n, _D)), depth=_KV_RING
+        )
+        self.l0a = RingBuffer(
+            MemLoc.L0A, dtype, make_layout((tile_cube_m, _TILE)), depth=2
+        )
+        self.l0a_p = RingBuffer(
+            MemLoc.L0A, dtype, make_layout((tile_cube_m, tile_n)), depth=2
+        )
+        self.l0b = RingBuffer(MemLoc.L0B, dtype, make_layout((_TILE, _TILE)), depth=2)
         self.l0c_qk = RingBuffer(
-            MemLoc.L0C, (tile_cube_m, _TILE), dtypes.float32, depth=2
+            MemLoc.L0C,
+            dtypes.float32,
+            make_layout((tile_cube_m, _TILE)),
+            depth=2,
         )
-        self.l0c = RingBuffer(MemLoc.L0C, (tile_cube_m, _TILE), dtypes.float32, depth=2)
+        self.l0c = RingBuffer(
+            MemLoc.L0C,
+            dtypes.float32,
+            make_layout((tile_cube_m, _TILE)),
+            depth=2,
+        )
 
     @jit
     def load_q_wide(self, q_tile_gm, m_seq: Int64, rows=None):
@@ -202,19 +219,35 @@ class SmlaMatmulBase:
         # the 16-row fractal; P is masked to zero beyond actual_n.
         pv_k = (valid_kv_rows + (_NZ_ROW - 1)) // _NZ_ROW * _NZ_ROW
         l0_a_view = reinterpret(
-            l0_a, shape=(self.tile_cube_m, pv_k), stride=(self.tile_n, 1)
+            l0_a,
+            layout=make_layout((self.tile_cube_m, pv_k), stride=(self.tile_n, 1)),
+            physical_layout=make_layout(
+                l0_a.physical_shape,
+                stride=l0_a.physical_stride,
+            ),
         )
         for chunk in range_constexpr(_D_TILES):
             l0_b = self.l0b.next_write()
             # A ZN destination view makes this L1 -> L0B copy transpose the
             # KV chunk; the matmul reads the same view at the pv_k extent.
-            l0_b_view = reinterpret(l0_b, shape=(self.tile_n, _TILE), data_format="zn")
+            l0_b_view = reinterpret(
+                l0_b,
+                layout=make_layout((self.tile_n, _TILE)),
+                data_format="zn",
+            )
             mem_copy(l0_b_view, self._kv_chunk(kv_slot, chunk))
             pv_accumulator = self.l0c.next_write()
             matmul(
                 pv_accumulator,
                 l0_a_view,
-                reinterpret(l0_b_view, shape=(pv_k, _TILE)),
+                reinterpret(
+                    l0_b_view,
+                    layout=make_layout((pv_k, _TILE)),
+                    physical_layout=make_layout(
+                        l0_b_view.physical_shape,
+                        stride=l0_b_view.physical_stride,
+                    ),
+                ),
                 init=True,
             )
             mem_copy(
@@ -267,33 +300,56 @@ class GeneralSmlaVector:
                 f"({_F32_VL}); the output path uses a full mask for every tile."
             )
         self.sm_max_tb = [
-            Buffer(MemLoc.UB, (tile_vec_m, 1), dtypes.float32)
+            Buffer(MemLoc.UB, dtypes.float32, make_layout((tile_vec_m, 1)))
             for _ in range(preload_num)
         ]
         self.sm_sum_tb = [
-            Buffer(MemLoc.UB, (tile_vec_m, 1), dtypes.float32)
+            Buffer(MemLoc.UB, dtypes.float32, make_layout((tile_vec_m, 1)))
             for _ in range(preload_num)
         ]
         self.sm_exp_tb = [
-            Buffer(MemLoc.UB, (tile_vec_m, 1), dtypes.float32)
+            Buffer(MemLoc.UB, dtypes.float32, make_layout((tile_vec_m, 1)))
             for _ in range(preload_num)
         ]
-        self.tmp_new_max = Buffer(MemLoc.UB, (tile_vec_m, 1), dtypes.float32)
-        self.tmp_sum = Buffer(MemLoc.UB, (tile_vec_m, 1), dtypes.float32)
-        self.res_o = Buffer(MemLoc.UB, (tile_vec_m, tile_d), dtypes.float32)
-        self.res_o_b16 = self.res_o.reinterpret(self.dtype, shape=(tile_vec_m, tile_d))
+        self.tmp_new_max = Buffer(
+            MemLoc.UB, dtypes.float32, make_layout((tile_vec_m, 1))
+        )
+        self.tmp_sum = Buffer(MemLoc.UB, dtypes.float32, make_layout((tile_vec_m, 1)))
+        self.res_o = Buffer(
+            MemLoc.UB, dtypes.float32, make_layout((tile_vec_m, tile_d))
+        )
+        self.res_o_b16 = reinterpret(
+            self.res_o, self.dtype, layout=make_layout((tile_vec_m, tile_d))
+        )
         p_n1_pad = _DATA_BLOCK_BYTES // (_F16_BITS // _BITS_PER_BYTE)
         self.p_ub = RingBuffer(
             MemLoc.UB,
-            shape=(tile_vec_m, tile_n),
-            dtype=self.dtype,
+            self.dtype,
+            make_layout((tile_vec_m, tile_n)),
             depth=2,
             data_format="nz",
-            n1_pad=p_n1_pad,
+            physical_layout=make_layout(
+                (
+                    tile_n // _NZ_ROW,
+                    (tile_vec_m + _NZ_ROW - 1) // _NZ_ROW,
+                    _NZ_ROW,
+                    _NZ_ROW,
+                ),
+                stride=(
+                    (tile_vec_m + _NZ_ROW - 1) // _NZ_ROW * _NZ_ROW * _NZ_ROW
+                    + p_n1_pad,
+                    _NZ_ROW * _NZ_ROW,
+                    _NZ_ROW,
+                    1,
+                ),
+            ),
         )
         if n_heads and self.use_sinks:
             self.sinks_ub = RingBuffer(
-                MemLoc.UB, shape=(self.sinks_span,), dtype=dtypes.float32, depth=1
+                MemLoc.UB,
+                dtypes.float32,
+                make_layout((self.sinks_span,)),
+                depth=1,
             )
 
     @staticmethod
@@ -504,7 +560,11 @@ class GeneralSmlaVector:
         # res_o and its dtype view share the framework's Buffer sync identity.
         mem_copy(
             o_tile_gm.partition(dim=0, part_id=self.subblock_idx),
-            self.res_o.reinterpret(self.dtype, shape=(self.tile_vec_m, self.tile_d)),
+            reinterpret(
+                self.res_o,
+                self.dtype,
+                layout=make_layout((self.tile_vec_m, self.tile_d)),
+            ),
         )
 
     @jit
@@ -770,10 +830,10 @@ class SmlaVec0:
         self.n1 = n1
         self.shared_workspace = False
         self.gather_ping = RingBuffer(
-            MemLoc.UB, (_GATHER_TILE_ROWS, _D), dtype, depth=1
+            MemLoc.UB, dtype, make_layout((_GATHER_TILE_ROWS, _D)), depth=1
         )
         self.gather_pong = RingBuffer(
-            MemLoc.UB, (_GATHER_TILE_ROWS, _D), dtype, depth=1
+            MemLoc.UB, dtype, make_layout((_GATHER_TILE_ROWS, _D)), depth=1
         )
         self.ready_flag = _WORKSPACE_READY_FLAG
 
@@ -980,7 +1040,10 @@ class SmlaVec0:
                 ready = self.gather_ping.next_read()
                 mem_copy(
                     workspace[tail_kv_row_start : tail_kv_row_start + tail_rows, None],
-                    reinterpret(ready, shape=(tail_rows, _D), stride=(_D, 1)),
+                    reinterpret(
+                        ready,
+                        layout=make_layout((tail_rows, _D), stride=(_D, 1)),
+                    ),
                 )
             else:
                 dst = self.gather_pong.next_write()
@@ -1001,7 +1064,10 @@ class SmlaVec0:
                 ready = self.gather_pong.next_read()
                 mem_copy(
                     workspace[tail_kv_row_start : tail_kv_row_start + tail_rows, None],
-                    reinterpret(ready, shape=(tail_rows, _D), stride=(_D, 1)),
+                    reinterpret(
+                        ready,
+                        layout=make_layout((tail_rows, _D), stride=(_D, 1)),
+                    ),
                 )
         vec_sync_intra_arrive(PIPE.MTE3, self.ready_flag)
 
@@ -1174,7 +1240,7 @@ class SmlaZeroOutput:
         self.n1 = n1
         self.dtype = dtype
         self.mode = mode
-        self.zero_row = Buffer(MemLoc.UB, (1, _D), dtype)
+        self.zero_row = Buffer(MemLoc.UB, dtype, make_layout((1, _D)))
 
     @jit
     def write(self, out: Tensor, query: Int64):
@@ -1446,10 +1512,17 @@ class SparseFlashMlaCsaKernel:
         self.block_dim = block_dim
         self.zero_output = SmlaZeroOutput(n1, dtype, "CSA")
         self.qk_ub = RingBuffer(
-            MemLoc.UB, (_VEC_TILE_M, _TILE), dtypes.float32, depth=2
+            MemLoc.UB,
+            dtypes.float32,
+            make_layout((_VEC_TILE_M, _TILE)),
+            depth=2,
         )
-        self.pv_ub = RingBuffer(MemLoc.UB, (_VEC_TILE_M, _D), dtypes.float32, depth=1)
-        self.p_l1 = RingBuffer(MemLoc.L1, (_Q_TILE_ROWS, _TILE), dtype, depth=2)
+        self.pv_ub = RingBuffer(
+            MemLoc.UB, dtypes.float32, make_layout((_VEC_TILE_M, _D)), depth=1
+        )
+        self.p_l1 = RingBuffer(
+            MemLoc.L1, dtype, make_layout((_Q_TILE_ROWS, _TILE)), depth=2
+        )
         self.matmul = SmlaMatmul(_Q_TILE_ROWS, _VEC_TILE_M, _TILE, dtype)
         # N1=128 uses two Cube blocks per query. Both read the same KV
         # workspace group, so its buffer-release handshake is shared.
@@ -1467,17 +1540,15 @@ class SparseFlashMlaCsaKernel:
         )
         self.vec0 = SmlaVec0(n1, dtype)
         self.vec0.shared_workspace = n1 == _MAX_QUERY_HEADS
-        self.run_info = DelayLineGroup(
-            _SPARSE_PIPELINE_SLOTS,
-            "batch",
-            "query_row_idx",
-            "query_job_idx",
-            "kv_tile_idx",
-            "last_loop",
-            "kv_segment_start",
-            "valid_kv_rows",
-            "cmp",
-        )
+        self.run_info_clock = Array(dtypes.int64, 1, init=[0])
+        self.run_info_batch = Array(dtypes.int64, _SPARSE_PIPELINE_SLOTS)
+        self.run_info_query_row_idx = Array(dtypes.int64, _SPARSE_PIPELINE_SLOTS)
+        self.run_info_query_job_idx = Array(dtypes.int64, _SPARSE_PIPELINE_SLOTS)
+        self.run_info_kv_tile_idx = Array(dtypes.int64, _SPARSE_PIPELINE_SLOTS)
+        self.run_info_last_loop = Array(dtypes.int64, _SPARSE_PIPELINE_SLOTS)
+        self.run_info_kv_segment_start = Array(dtypes.int64, _SPARSE_PIPELINE_SLOTS)
+        self.run_info_valid_kv_rows = Array(dtypes.int64, _SPARSE_PIPELINE_SLOTS)
+        self.run_info_cmp = Array(dtypes.int64, _SPARSE_PIPELINE_SLOTS)
 
     def __call__(
         self,
@@ -1653,15 +1724,26 @@ class SparseFlashMlaCsaKernel:
                         valid = cmp_valid if is_cmp else ori_valid
                         # Valid KV rows along the N axis in this sparse tile.
                         valid_kv_rows = _rt_min(_TILE, valid - tile_start)
-                        self.run_info.push(
-                            batch=batch,
-                            query_row_idx=query,
-                            query_job_idx=query_job_idx,
-                            kv_tile_idx=kv_tile_idx,
-                            last_loop=dtypes.int64(kv_tile_idx == kv_tile_count - 1),
-                            kv_segment_start=kv_segment_start,
-                            valid_kv_rows=valid_kv_rows,
-                            cmp=dtypes.int64(is_cmp),
+                        run_info_slot = self.run_info_clock[0] % _SPARSE_PIPELINE_SLOTS
+                        self.run_info_batch[run_info_slot] = dtypes.int64(batch)
+                        self.run_info_query_row_idx[run_info_slot] = dtypes.int64(query)
+                        self.run_info_query_job_idx[run_info_slot] = dtypes.int64(
+                            query_job_idx
+                        )
+                        self.run_info_kv_tile_idx[run_info_slot] = dtypes.int64(
+                            kv_tile_idx
+                        )
+                        self.run_info_last_loop[run_info_slot] = dtypes.int64(
+                            dtypes.int64(kv_tile_idx == kv_tile_count - 1)
+                        )
+                        self.run_info_kv_segment_start[run_info_slot] = dtypes.int64(
+                            kv_segment_start
+                        )
+                        self.run_info_valid_kv_rows[run_info_slot] = dtypes.int64(
+                            valid_kv_rows
+                        )
+                        self.run_info_cmp[run_info_slot] = dtypes.int64(
+                            dtypes.int64(is_cmp)
                         )
                         if is_cmp:
                             self.vec0.gather(
@@ -1701,7 +1783,9 @@ class SparseFlashMlaCsaKernel:
                             q_half1,
                         )
                         tick = tick + 1
-                    query_job_idx = query_job_idx + 1
+                    # Empty queries are zeroed before the pipeline and own no bank.
+                    if kv_tile_count > 0:
+                        query_job_idx = query_job_idx + 1
             for drain in range(_STAGE_PV):
                 kv_qk, kv_pv, q_half0, q_half1 = self.pipeline(
                     tick + drain,
@@ -1754,7 +1838,8 @@ class SparseFlashMlaCsaKernel:
         exp_bank = tick % 2
         score_ub_slot = self.qk_ub.next_read()
         score_ub = reinterpret(
-            score_ub_slot, shape=(_VEC_TILE_M, _TILE), stride=(_TILE, 1)
+            score_ub_slot,
+            layout=make_layout((_VEC_TILE_M, _TILE), stride=(_TILE, 1)),
         )
         if kv_tile_idx == 0:
             sink_ub_write = self.vector.sinks_ub.next_write()
@@ -1826,7 +1911,15 @@ class SparseFlashMlaCsaKernel:
     ):
         next_pv = kv_pv
         if tick >= _STAGE_LOAD and tick < kv_tile_count + _STAGE_LOAD:
-            info = self.run_info.tap(1)
+            info_slot = (self.run_info_clock[0] - 1) % _SPARSE_PIPELINE_SLOTS
+            info_batch = self.run_info_batch[info_slot]
+            info_query_row_idx = self.run_info_query_row_idx[info_slot]
+            info_query_job_idx = self.run_info_query_job_idx[info_slot]
+            info_kv_tile_idx = self.run_info_kv_tile_idx[info_slot]
+            info_last_loop = self.run_info_last_loop[info_slot]
+            info_kv_segment_start = self.run_info_kv_segment_start[info_slot]
+            info_valid_kv_rows = self.run_info_valid_kv_rows[info_slot]
+            info_cmp = self.run_info_cmp[info_slot]
             load_tick = tick - 1
             if load_tick == 0:
                 self.matmul.load_q_wide(
@@ -1834,14 +1927,14 @@ class SparseFlashMlaCsaKernel:
                         q,
                         (_Q_TILE_ROWS, _D),
                         (
-                            info.query_row_idx * self.n1 // _Q_TILE_ROWS
+                            info_query_row_idx * self.n1 // _Q_TILE_ROWS
                             + query_head_half_idx,
                             0,
                         ),
                     ),
-                    info.query_job_idx,
+                    info_query_job_idx,
                 )
-            if info.cmp != 0:
+            if info_cmp != 0:
                 self.vec0.wait()
             self.barrier()
             self.matmul.load_kv(
@@ -1852,65 +1945,89 @@ class SparseFlashMlaCsaKernel:
                 ),
                 ori_kv_gm,
                 table,
-                info.batch,
-                info.kv_segment_start,
-                info.valid_kv_rows,
+                info_batch,
+                info_kv_segment_start,
+                info_valid_kv_rows,
                 page_stride,
                 load_tick % _KV_RING,
-                info.cmp,
+                info_cmp,
                 ori_page,
             )
         if tick >= _STAGE_QK and tick < kv_tile_count + _STAGE_QK:
-            info = self.run_info.tap(2)
+            info_slot = (self.run_info_clock[0] - 2) % _SPARSE_PIPELINE_SLOTS
+            info_batch = self.run_info_batch[info_slot]
+            info_query_row_idx = self.run_info_query_row_idx[info_slot]
+            info_query_job_idx = self.run_info_query_job_idx[info_slot]
+            info_kv_tile_idx = self.run_info_kv_tile_idx[info_slot]
+            info_last_loop = self.run_info_last_loop[info_slot]
+            info_kv_segment_start = self.run_info_kv_segment_start[info_slot]
+            info_valid_kv_rows = self.run_info_valid_kv_rows[info_slot]
+            info_cmp = self.run_info_cmp[info_slot]
             qk_tick = tick - 2
             self.matmul.bmm1_fanout_q(
-                kv_qk, q_half0, q_half1, actual_n=info.valid_kv_rows
+                kv_qk, q_half0, q_half1, actual_n=info_valid_kv_rows
             )
             next_pv = kv_qk
             kv_qk = self.matmul.kv_ring.next_read()
-            if info.last_loop != 0:
+            if info_last_loop != 0:
                 q_half0 = self.matmul.q_ring.next_read()
                 q_half1 = self.matmul.q_ring.next_read()
-            if info.last_loop != 0 and tick < kv_tile_count + _STAGE_LOAD:
-                next_info = self.run_info.tap(1)
+            if info_last_loop != 0 and tick < kv_tile_count + _STAGE_LOAD:
+                next_info_slot = (self.run_info_clock[0] - 1) % _SPARSE_PIPELINE_SLOTS
+                self.run_info_batch[next_info_slot]
+                next_info_query_row_idx = self.run_info_query_row_idx[next_info_slot]
+                next_info_query_job_idx = self.run_info_query_job_idx[next_info_slot]
+                self.run_info_kv_tile_idx[next_info_slot]
+                self.run_info_last_loop[next_info_slot]
+                self.run_info_kv_segment_start[next_info_slot]
+                self.run_info_valid_kv_rows[next_info_slot]
+                self.run_info_cmp[next_info_slot]
                 self.matmul.load_q_wide(
                     tile_slice(
                         q,
                         (_Q_TILE_ROWS, _D),
                         (
-                            next_info.query_row_idx * self.n1 // _Q_TILE_ROWS
+                            next_info_query_row_idx * self.n1 // _Q_TILE_ROWS
                             + query_head_half_idx,
                             0,
                         ),
                     ),
-                    next_info.query_job_idx,
+                    next_info_query_job_idx,
                 )
             self.matmul.store_s(self.qk_ub)
             self.stage_softmax(
                 qk_tick,
-                info.query_job_idx,
-                info.kv_tile_idx,
-                info.valid_kv_rows,
+                info_query_job_idx,
+                info_kv_tile_idx,
+                info_valid_kv_rows,
                 sinks,
                 scale,
                 query_head_half_idx,
             )
         if tick >= _STAGE_PV and tick < kv_tile_count + _STAGE_PV:
-            info = self.run_info.tap(_STAGE_PV)
+            info_slot = (self.run_info_clock[0] - _STAGE_PV) % _SPARSE_PIPELINE_SLOTS
+            info_batch = self.run_info_batch[info_slot]
+            info_query_row_idx = self.run_info_query_row_idx[info_slot]
+            info_query_job_idx = self.run_info_query_job_idx[info_slot]
+            info_kv_tile_idx = self.run_info_kv_tile_idx[info_slot]
+            info_last_loop = self.run_info_last_loop[info_slot]
+            info_kv_segment_start = self.run_info_kv_segment_start[info_slot]
+            info_valid_kv_rows = self.run_info_valid_kv_rows[info_slot]
+            info_cmp = self.run_info_cmp[info_slot]
             pv_tick = tick - _STAGE_PV
             self.matmul.compute_pv_fanout(
-                self.p_l1, self.pv_ub, kv_pv, actual_n=info.valid_kv_rows
+                self.p_l1, self.pv_ub, kv_pv, actual_n=info_valid_kv_rows
             )
             self.stage_update(
                 pv_tick,
-                info.query_job_idx,
-                info.kv_tile_idx,
-                info.last_loop,
-                info.query_row_idx,
+                info_query_job_idx,
+                info_kv_tile_idx,
+                info_last_loop,
+                info_query_row_idx,
                 out,
                 query_head_half_idx,
             )
-        self.run_info.advance()
+        self.run_info_clock[0] = self.run_info_clock[0] + 1
         return kv_qk, next_pv, q_half0, q_half1
 
 
@@ -1925,10 +2042,17 @@ class SparseFlashMlaSwaHcaKernel:
         self.mode = mode
         self.zero_output = SmlaZeroOutput(n1, dtype, mode)
         self.qk_ub = RingBuffer(
-            MemLoc.UB, (_VEC_TILE_M, _TILE), dtypes.float32, depth=2
+            MemLoc.UB,
+            dtypes.float32,
+            make_layout((_VEC_TILE_M, _TILE)),
+            depth=2,
         )
-        self.pv_ub = RingBuffer(MemLoc.UB, (_VEC_TILE_M, _D), dtypes.float32, depth=1)
-        self.p_l1 = RingBuffer(MemLoc.L1, (_Q_TILE_ROWS, _TILE), dtype, depth=2)
+        self.pv_ub = RingBuffer(
+            MemLoc.UB, dtypes.float32, make_layout((_VEC_TILE_M, _D)), depth=1
+        )
+        self.p_l1 = RingBuffer(
+            MemLoc.L1, dtype, make_layout((_Q_TILE_ROWS, _TILE)), depth=2
+        )
         self.matmul = SmlaMatmul(_Q_TILE_ROWS, _VEC_TILE_M, _TILE, dtype)
         self.vector = GeneralSmlaVector(
             _VEC_TILE_M,
@@ -1941,17 +2065,15 @@ class SparseFlashMlaSwaHcaKernel:
             rt_split=True,
             dtype=dtype,
         )
-        self.run_info = DelayLineGroup(
-            _INLINE_PIPELINE_SLOTS,
-            "batch",
-            "query_row_idx",
-            "query_job_idx",
-            "kv_tile_idx",
-            "last_loop",
-            "kv_segment_start",
-            "valid_kv_rows",
-            "cmp",
-        )
+        self.run_info_clock = Array(dtypes.int64, 1, init=[0])
+        self.run_info_batch = Array(dtypes.int64, _INLINE_PIPELINE_SLOTS)
+        self.run_info_query_row_idx = Array(dtypes.int64, _INLINE_PIPELINE_SLOTS)
+        self.run_info_query_job_idx = Array(dtypes.int64, _INLINE_PIPELINE_SLOTS)
+        self.run_info_kv_tile_idx = Array(dtypes.int64, _INLINE_PIPELINE_SLOTS)
+        self.run_info_last_loop = Array(dtypes.int64, _INLINE_PIPELINE_SLOTS)
+        self.run_info_kv_segment_start = Array(dtypes.int64, _INLINE_PIPELINE_SLOTS)
+        self.run_info_valid_kv_rows = Array(dtypes.int64, _INLINE_PIPELINE_SLOTS)
+        self.run_info_cmp = Array(dtypes.int64, _INLINE_PIPELINE_SLOTS)
 
     def __call__(
         self,
@@ -2123,15 +2245,26 @@ class SparseFlashMlaSwaHcaKernel:
                         valid = cmp_valid if is_cmp else ori_valid
                         # Valid KV rows along the N axis in this sparse tile.
                         valid_kv_rows = _rt_min(_TILE, valid - tile_start)
-                        self.run_info.push(
-                            batch=batch,
-                            query_row_idx=query,
-                            query_job_idx=query_job_idx,
-                            kv_tile_idx=kv_tile_idx,
-                            last_loop=dtypes.int64(kv_tile_idx == kv_tile_count - 1),
-                            kv_segment_start=kv_segment_start,
-                            valid_kv_rows=valid_kv_rows,
-                            cmp=dtypes.int64(is_cmp),
+                        run_info_slot = self.run_info_clock[0] % _INLINE_PIPELINE_SLOTS
+                        self.run_info_batch[run_info_slot] = dtypes.int64(batch)
+                        self.run_info_query_row_idx[run_info_slot] = dtypes.int64(query)
+                        self.run_info_query_job_idx[run_info_slot] = dtypes.int64(
+                            query_job_idx
+                        )
+                        self.run_info_kv_tile_idx[run_info_slot] = dtypes.int64(
+                            kv_tile_idx
+                        )
+                        self.run_info_last_loop[run_info_slot] = dtypes.int64(
+                            dtypes.int64(kv_tile_idx == kv_tile_count - 1)
+                        )
+                        self.run_info_kv_segment_start[run_info_slot] = dtypes.int64(
+                            kv_segment_start
+                        )
+                        self.run_info_valid_kv_rows[run_info_slot] = dtypes.int64(
+                            valid_kv_rows
+                        )
+                        self.run_info_cmp[run_info_slot] = dtypes.int64(
+                            dtypes.int64(is_cmp)
                         )
                         kv_qk, kv_pv, q_half0, q_half1 = self.pipeline(
                             tick,
@@ -2161,7 +2294,9 @@ class SparseFlashMlaSwaHcaKernel:
                             q_half1,
                         )
                         tick = tick + 1
-                    query_job_idx = query_job_idx + 1
+                    # Empty queries are zeroed before the pipeline and own no bank.
+                    if kv_tile_count > 0:
+                        query_job_idx = query_job_idx + 1
             for drain in range(_STAGE_PV_INLINE):
                 kv_qk, kv_pv, q_half0, q_half1 = self.pipeline(
                     tick + drain,
@@ -2207,7 +2342,8 @@ class SparseFlashMlaSwaHcaKernel:
         exp_bank = tick % 2
         score_ub_slot = self.qk_ub.next_read()
         score_ub = reinterpret(
-            score_ub_slot, shape=(_VEC_TILE_M, _TILE), stride=(_TILE, 1)
+            score_ub_slot,
+            layout=make_layout((_VEC_TILE_M, _TILE), stride=(_TILE, 1)),
         )
         if kv_tile_idx == 0:
             sink_ub_write = self.vector.sinks_ub.next_write()
@@ -2327,17 +2463,25 @@ class SparseFlashMlaSwaHcaKernel:
                     ori_page,
                 )
         if tick >= _STAGE_QK_INLINE and tick < kv_tile_count + _STAGE_QK_INLINE:
-            info = self.run_info.tap(1)
+            info_slot = (self.run_info_clock[0] - 1) % _INLINE_PIPELINE_SLOTS
+            self.run_info_batch[info_slot]
+            info_query_row_idx = self.run_info_query_row_idx[info_slot]
+            info_query_job_idx = self.run_info_query_job_idx[info_slot]
+            info_kv_tile_idx = self.run_info_kv_tile_idx[info_slot]
+            info_last_loop = self.run_info_last_loop[info_slot]
+            self.run_info_kv_segment_start[info_slot]
+            info_valid_kv_rows = self.run_info_valid_kv_rows[info_slot]
+            self.run_info_cmp[info_slot]
             qk_tick = tick - 1
             self.matmul.bmm1_fanout_q(
-                kv_qk, q_half0, q_half1, actual_n=info.valid_kv_rows
+                kv_qk, q_half0, q_half1, actual_n=info_valid_kv_rows
             )
             next_pv = kv_qk
             kv_qk = self.matmul.kv_ring.next_read()
-            if info.last_loop != 0:
+            if info_last_loop != 0:
                 q_half0 = self.matmul.q_ring.next_read()
                 q_half1 = self.matmul.q_ring.next_read()
-            if info.last_loop != 0 and tick < kv_tile_count:
+            if info_last_loop != 0 and tick < kv_tile_count:
                 self.matmul.load_q_wide(
                     tile_slice(
                         q,
@@ -2353,29 +2497,37 @@ class SparseFlashMlaSwaHcaKernel:
             self.matmul.store_s(self.qk_ub)
             self.stage_softmax(
                 qk_tick,
-                info.query_job_idx,
-                info.kv_tile_idx,
-                info.valid_kv_rows,
+                info_query_job_idx,
+                info_kv_tile_idx,
+                info_valid_kv_rows,
                 sinks,
                 scale,
                 query_head_half_idx,
             )
         if tick >= _STAGE_PV_INLINE and tick < kv_tile_count + _STAGE_PV_INLINE:
-            info = self.run_info.tap(2)
+            info_slot = (self.run_info_clock[0] - 2) % _INLINE_PIPELINE_SLOTS
+            self.run_info_batch[info_slot]
+            info_query_row_idx = self.run_info_query_row_idx[info_slot]
+            info_query_job_idx = self.run_info_query_job_idx[info_slot]
+            info_kv_tile_idx = self.run_info_kv_tile_idx[info_slot]
+            info_last_loop = self.run_info_last_loop[info_slot]
+            self.run_info_kv_segment_start[info_slot]
+            info_valid_kv_rows = self.run_info_valid_kv_rows[info_slot]
+            self.run_info_cmp[info_slot]
             pv_tick = tick - 2
             self.matmul.compute_pv_fanout(
-                self.p_l1, self.pv_ub, kv_pv, actual_n=info.valid_kv_rows
+                self.p_l1, self.pv_ub, kv_pv, actual_n=info_valid_kv_rows
             )
             self.stage_update(
                 pv_tick,
-                info.query_job_idx,
-                info.kv_tile_idx,
-                info.last_loop,
-                info.query_row_idx,
+                info_query_job_idx,
+                info_kv_tile_idx,
+                info_last_loop,
+                info_query_row_idx,
                 out,
                 query_head_half_idx,
             )
-        self.run_info.advance()
+        self.run_info_clock[0] = self.run_info_clock[0] + 1
         return kv_qk, next_pv, q_half0, q_half1
 
 
@@ -2456,7 +2608,7 @@ class SparseFlashMlaDirectLauncher:
         )
 
 
-@functools.cache
+@aot.compile_cache
 def _compile_smla_direct(n1, block_dim, mode, dtype):
     token_idx = Dim("TN1")
     ori_capacity = Dim("PO")
@@ -2584,7 +2736,7 @@ class SparseFlashMlaCsaLauncher:
         )
 
 
-@functools.cache
+@aot.compile_cache
 def _compile_smla(n1, block_dim, dtype):
     token_idx = Dim("T")
     ori_capacity = Dim("PO")
@@ -2654,10 +2806,17 @@ class SparseFlashMlaOriSparseKernel:
         self.block_dim = block_dim
         self.zero_output = SmlaZeroOutput(n1, dtype, mode)
         self.qk_ub = RingBuffer(
-            MemLoc.UB, (_VEC_TILE_M, _TILE), dtypes.float32, depth=2
+            MemLoc.UB,
+            dtypes.float32,
+            make_layout((_VEC_TILE_M, _TILE)),
+            depth=2,
         )
-        self.pv_ub = RingBuffer(MemLoc.UB, (_VEC_TILE_M, _D), dtypes.float32, depth=1)
-        self.p_l1 = RingBuffer(MemLoc.L1, (_Q_TILE_ROWS, _TILE), dtype, depth=2)
+        self.pv_ub = RingBuffer(
+            MemLoc.UB, dtypes.float32, make_layout((_VEC_TILE_M, _D)), depth=1
+        )
+        self.p_l1 = RingBuffer(
+            MemLoc.L1, dtype, make_layout((_Q_TILE_ROWS, _TILE)), depth=2
+        )
         self.matmul = SmlaMatmul(_Q_TILE_ROWS, _VEC_TILE_M, _TILE, dtype)
         # N1=128 uses two Cube blocks per query. Both read the same KV
         # workspace group, so its buffer-release handshake is shared.
@@ -2675,17 +2834,15 @@ class SparseFlashMlaOriSparseKernel:
         )
         self.vec0 = SmlaVec0(n1, dtype)
         self.vec0.shared_workspace = n1 == _MAX_QUERY_HEADS
-        self.run_info = DelayLineGroup(
-            _SPARSE_PIPELINE_SLOTS,
-            "batch",
-            "query_row_idx",
-            "query_job_idx",
-            "kv_tile_idx",
-            "last_loop",
-            "kv_segment_start",
-            "valid_kv_rows",
-            "cmp",
-        )
+        self.run_info_clock = Array(dtypes.int64, 1, init=[0])
+        self.run_info_batch = Array(dtypes.int64, _SPARSE_PIPELINE_SLOTS)
+        self.run_info_query_row_idx = Array(dtypes.int64, _SPARSE_PIPELINE_SLOTS)
+        self.run_info_query_job_idx = Array(dtypes.int64, _SPARSE_PIPELINE_SLOTS)
+        self.run_info_kv_tile_idx = Array(dtypes.int64, _SPARSE_PIPELINE_SLOTS)
+        self.run_info_last_loop = Array(dtypes.int64, _SPARSE_PIPELINE_SLOTS)
+        self.run_info_kv_segment_start = Array(dtypes.int64, _SPARSE_PIPELINE_SLOTS)
+        self.run_info_valid_kv_rows = Array(dtypes.int64, _SPARSE_PIPELINE_SLOTS)
+        self.run_info_cmp = Array(dtypes.int64, _SPARSE_PIPELINE_SLOTS)
 
     def __call__(
         self,
@@ -2878,15 +3035,26 @@ class SparseFlashMlaOriSparseKernel:
                             min(_TILE, cmp_valid - (kv_tile_idx - ori_tiles) * _TILE),
                             min(_TILE, ori_valid - kv_tile_idx * _TILE),
                         )
-                        self.run_info.push(
-                            batch=batch,
-                            query_row_idx=query,
-                            query_job_idx=query_job_idx,
-                            kv_tile_idx=kv_tile_idx,
-                            last_loop=dtypes.int64(kv_tile_idx == kv_tile_count - 1),
-                            kv_segment_start=kv_segment_start,
-                            valid_kv_rows=valid_kv_rows,
-                            cmp=dtypes.int64(is_cmp),
+                        run_info_slot = self.run_info_clock[0] % _SPARSE_PIPELINE_SLOTS
+                        self.run_info_batch[run_info_slot] = dtypes.int64(batch)
+                        self.run_info_query_row_idx[run_info_slot] = dtypes.int64(query)
+                        self.run_info_query_job_idx[run_info_slot] = dtypes.int64(
+                            query_job_idx
+                        )
+                        self.run_info_kv_tile_idx[run_info_slot] = dtypes.int64(
+                            kv_tile_idx
+                        )
+                        self.run_info_last_loop[run_info_slot] = dtypes.int64(
+                            dtypes.int64(kv_tile_idx == kv_tile_count - 1)
+                        )
+                        self.run_info_kv_segment_start[run_info_slot] = dtypes.int64(
+                            kv_segment_start
+                        )
+                        self.run_info_valid_kv_rows[run_info_slot] = dtypes.int64(
+                            valid_kv_rows
+                        )
+                        self.run_info_cmp[run_info_slot] = dtypes.int64(
+                            dtypes.int64(is_cmp)
                         )
                         if const_expr(self.mode == "ORI_CMP_SPARSE"):
                             if is_cmp:
@@ -2963,7 +3131,9 @@ class SparseFlashMlaOriSparseKernel:
                             q_half1,
                         )
                         tick += 1
-                    query_job_idx += 1
+                    # Empty queries are zeroed before the pipeline and own no bank.
+                    if kv_tile_count > 0:
+                        query_job_idx += 1
             for drain in range(_STAGE_PV):
                 kv_qk, kv_pv, q_half0, q_half1 = self.pipeline(
                     tick + drain,
@@ -3015,7 +3185,8 @@ class SparseFlashMlaOriSparseKernel:
         exp_bank = tick % 2
         score_ub_slot = self.qk_ub.next_read()
         score_ub = reinterpret(
-            score_ub_slot, shape=(_VEC_TILE_M, _TILE), stride=(_TILE, 1)
+            score_ub_slot,
+            layout=make_layout((_VEC_TILE_M, _TILE), stride=(_TILE, 1)),
         )
         if kv_tile_idx == 0:
             sink_ub_write = self.vector.sinks_ub.next_write()
@@ -3086,7 +3257,15 @@ class SparseFlashMlaOriSparseKernel:
     ):
         next_pv = kv_pv
         if tick >= _STAGE_LOAD and tick < kv_tile_count + _STAGE_LOAD:
-            info = self.run_info.tap(1)
+            info_slot = (self.run_info_clock[0] - 1) % _SPARSE_PIPELINE_SLOTS
+            info_batch = self.run_info_batch[info_slot]
+            info_query_row_idx = self.run_info_query_row_idx[info_slot]
+            info_query_job_idx = self.run_info_query_job_idx[info_slot]
+            info_kv_tile_idx = self.run_info_kv_tile_idx[info_slot]
+            info_last_loop = self.run_info_last_loop[info_slot]
+            info_kv_segment_start = self.run_info_kv_segment_start[info_slot]
+            info_valid_kv_rows = self.run_info_valid_kv_rows[info_slot]
+            self.run_info_cmp[info_slot]
             load_tick = tick - 1
             if load_tick == 0:
                 self.matmul.load_q_wide(
@@ -3094,12 +3273,12 @@ class SparseFlashMlaOriSparseKernel:
                         q,
                         (_Q_TILE_ROWS, _D),
                         (
-                            info.query_row_idx * self.n1 // _Q_TILE_ROWS
+                            info_query_row_idx * self.n1 // _Q_TILE_ROWS
                             + query_head_half_idx,
                             0,
                         ),
                     ),
-                    info.query_job_idx,
+                    info_query_job_idx,
                 )
             self.vec0.wait()
             self.barrier()
@@ -3111,65 +3290,89 @@ class SparseFlashMlaOriSparseKernel:
                 ),
                 ori_kv_gm,
                 table,
-                info.batch,
-                info.kv_segment_start,
-                info.valid_kv_rows,
+                info_batch,
+                info_kv_segment_start,
+                info_valid_kv_rows,
                 page_stride,
                 load_tick % _KV_RING,
                 1,
                 ori_page,
             )
         if tick >= _STAGE_QK and tick < kv_tile_count + _STAGE_QK:
-            info = self.run_info.tap(2)
+            info_slot = (self.run_info_clock[0] - 2) % _SPARSE_PIPELINE_SLOTS
+            info_batch = self.run_info_batch[info_slot]
+            info_query_row_idx = self.run_info_query_row_idx[info_slot]
+            info_query_job_idx = self.run_info_query_job_idx[info_slot]
+            info_kv_tile_idx = self.run_info_kv_tile_idx[info_slot]
+            info_last_loop = self.run_info_last_loop[info_slot]
+            info_kv_segment_start = self.run_info_kv_segment_start[info_slot]
+            info_valid_kv_rows = self.run_info_valid_kv_rows[info_slot]
+            self.run_info_cmp[info_slot]
             qk_tick = tick - 2
             self.matmul.bmm1_fanout_q(
-                kv_qk, q_half0, q_half1, actual_n=info.valid_kv_rows
+                kv_qk, q_half0, q_half1, actual_n=info_valid_kv_rows
             )
             next_pv = kv_qk
             kv_qk = self.matmul.kv_ring.next_read()
-            if info.last_loop != 0:
+            if info_last_loop != 0:
                 q_half0 = self.matmul.q_ring.next_read()
                 q_half1 = self.matmul.q_ring.next_read()
-            if info.last_loop != 0 and tick < kv_tile_count + _STAGE_LOAD:
-                next_info = self.run_info.tap(1)
+            if info_last_loop != 0 and tick < kv_tile_count + _STAGE_LOAD:
+                next_info_slot = (self.run_info_clock[0] - 1) % _SPARSE_PIPELINE_SLOTS
+                self.run_info_batch[next_info_slot]
+                next_info_query_row_idx = self.run_info_query_row_idx[next_info_slot]
+                next_info_query_job_idx = self.run_info_query_job_idx[next_info_slot]
+                self.run_info_kv_tile_idx[next_info_slot]
+                self.run_info_last_loop[next_info_slot]
+                self.run_info_kv_segment_start[next_info_slot]
+                self.run_info_valid_kv_rows[next_info_slot]
+                self.run_info_cmp[next_info_slot]
                 self.matmul.load_q_wide(
                     tile_slice(
                         q,
                         (_Q_TILE_ROWS, _D),
                         (
-                            next_info.query_row_idx * self.n1 // _Q_TILE_ROWS
+                            next_info_query_row_idx * self.n1 // _Q_TILE_ROWS
                             + query_head_half_idx,
                             0,
                         ),
                     ),
-                    next_info.query_job_idx,
+                    next_info_query_job_idx,
                 )
             self.matmul.store_s(self.qk_ub)
             self.stage_softmax(
                 qk_tick,
-                info.query_job_idx,
-                info.kv_tile_idx,
-                info.valid_kv_rows,
+                info_query_job_idx,
+                info_kv_tile_idx,
+                info_valid_kv_rows,
                 sinks,
                 scale,
                 query_head_half_idx,
             )
         if tick >= _STAGE_PV and tick < kv_tile_count + _STAGE_PV:
-            info = self.run_info.tap(_STAGE_PV)
+            info_slot = (self.run_info_clock[0] - _STAGE_PV) % _SPARSE_PIPELINE_SLOTS
+            info_batch = self.run_info_batch[info_slot]
+            info_query_row_idx = self.run_info_query_row_idx[info_slot]
+            info_query_job_idx = self.run_info_query_job_idx[info_slot]
+            info_kv_tile_idx = self.run_info_kv_tile_idx[info_slot]
+            info_last_loop = self.run_info_last_loop[info_slot]
+            info_kv_segment_start = self.run_info_kv_segment_start[info_slot]
+            info_valid_kv_rows = self.run_info_valid_kv_rows[info_slot]
+            self.run_info_cmp[info_slot]
             pv_tick = tick - _STAGE_PV
             self.matmul.compute_pv_fanout(
-                self.p_l1, self.pv_ub, kv_pv, actual_n=info.valid_kv_rows
+                self.p_l1, self.pv_ub, kv_pv, actual_n=info_valid_kv_rows
             )
             self.stage_update(
                 pv_tick,
-                info.query_job_idx,
-                info.kv_tile_idx,
-                info.last_loop,
-                info.query_row_idx,
+                info_query_job_idx,
+                info_kv_tile_idx,
+                info_last_loop,
+                info_query_row_idx,
                 out,
                 query_head_half_idx,
             )
-        self.run_info.advance()
+        self.run_info_clock[0] = self.run_info_clock[0] + 1
         return (kv_qk, next_pv, q_half0, q_half1)
 
 
@@ -3260,7 +3463,7 @@ class SparseFlashMlaOriSparseLauncher:
         )
 
 
-@functools.cache
+@aot.compile_cache
 def _compile_smla_ori_sparse(n1, block_dim, mode, dtype):
     token_idx = Dim("T")
     ori_capacity = Dim("PO")

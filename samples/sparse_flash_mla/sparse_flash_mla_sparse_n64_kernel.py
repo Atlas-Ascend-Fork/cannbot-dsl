@@ -9,11 +9,6 @@
 """Metadata-scheduled sparse flash MLA kernels for N1 <= 64."""
 
 import contextlib
-import fcntl
-import functools
-import hashlib
-import importlib.metadata
-import json
 import math
 import numbers
 import os
@@ -25,41 +20,43 @@ from pathlib import Path
 from dataclasses import dataclass
 import torch
 import cannbotdsl
+from cannbotdsl import aot
 from cannbotdsl import (
     Dim,
     MemLoc,
     Tensor,
     TensorSpec,
-    TensorViewSpec,
-    ViewLayout,
     copy_options,
     datastruct,
     dtypes,
     host,
     is_aic,
-    load,
 )
 from cannbotdsl.ops.cube import set_mmad_direction
-from cannbotdsl.ring_buffer import RingBuffer
-from cannbotdsl.types.delay_line import DelayLineGroup
 from cannbotdsl.lang.constexpr import const_expr, range_constexpr
 from cannbotdsl.ops.arch import get_subblock_id, get_block_idx
 from cannbotdsl.lang.jit import jit
 from cannbotdsl.lang.kernel import kernel
 from cannbotdsl.ops import matmul
-from cannbotdsl.tensor import reinterpret, tile_slice
+from cannbotdsl.tensor import tile_slice
 from cannbotdsl.ops.memcpy import mem_copy
 from cannbotdsl.ops.sync import (
     PIPE,
     onchip_rewind,
+    global_sync_all,
     cube_sync_block_arrive,
     cube_sync_intra_wait,
     vec_sync_block_wait,
     vec_sync_intra_arrive,
 )
-from cannbotdsl.buffer import Buffer
 from cannbotdsl.lang.vf import vf
 from cannbotdsl.ops import reg as rr
+
+from cannbotdsl import Array
+from cannbotdsl.buffer import Buffer
+from cannbotdsl.ring_buffer import RingBuffer
+from cannbotdsl.tensor import make_layout, reinterpret
+
 
 _BITS_PER_BYTE = 8
 _F32_BITS = 32
@@ -69,6 +66,9 @@ _VECTOR_REGISTER_BITS = 2048
 _F16_BYTES = _F16_BITS // _BITS_PER_BYTE
 _F32_BYTES = _F32_BITS // _BITS_PER_BYTE
 _I32_BYTES = _I32_BITS // _BITS_PER_BYTE
+_FD_METADATA_BASE = 36 * 9
+_FD_USED_VEC_WORD = 900
+_FD_MAX_SLOTS = 72
 _HEAD_DIM = 512
 _BASE_TILE_SIZE = 128
 _QUERY_HEAD_TILE_SIZE = 64
@@ -138,10 +138,8 @@ _MASK_SLIDING_WINDOW = 4
 _METADATA_STRIDE = 9
 _METADATA_LAST_BATCH = 4
 _METADATA_LAST_QUERY = 5
-# Storage alignment, cache sizing, and device instruction options.
+# Storage alignment and device instruction options.
 _UB_CAPACITY_ALIGNMENT_BYTES = 8
-_COMPILED_VARIANT_CACHE_SIZE = 8
-_BUILD_HASH_PREFIX_LENGTH = 16
 _KV_COPY_L2_CACHE_CONTROL = 4
 _MMAD_FINAL_UNIT_FLAG = 3
 # PA physical-row prepass owns UB before the attention pipeline is allocated.
@@ -168,14 +166,25 @@ _COMPILER_FLAGS = (
     "-cce-aicore-dcpreload-args=false",
     "--cce-res-usage",
 )
-_COMPILER_WRAPPER = (
-    "import sys, subprocess\nreal, flags = _compiler_config\nargs = sys"
-    ".argv[1:]\nif '-c' in args and '-x' in args and 'asc' in args:\n  "
-    "  args = list(flags) + [x for x in args if x != '-O3']\nsys.exit("
-    "subprocess.run([real] + args).returncode)\n"
-)
+_COMPILER_WRAPPER = r"""import sys, subprocess
+real, flags = _compiler_config
+args = sys.argv[1:]
+if args == ['--version']:
+    result = subprocess.run([real] + args, capture_output=True, text=True)
+    lines = (result.stdout or result.stderr).splitlines()
+    if lines:
+        lines[0] += ' SMLA flags=' + repr(flags)
+    print('\n'.join(lines))
+    sys.exit(result.returncode)
+if '-c' in args and '-x' in args and 'asc' in args:
+    args = list(flags) + [x for x in args if x != '-O3']
+sys.exit(subprocess.run([real] + args).returncode)
+"""
 
 _COMPILATION_LOCK = threading.RLock()
+# Keep compiler overrides stable for factory lookups; binaries are owned by DSL.
+_COMPILER_WRAPPERS = {}
+
 
 _STORAGE_DTYPE_LABELS = {
     torch.bfloat16: "bf16",
@@ -209,11 +218,11 @@ def scalar_select(condition, yes, no):
 
 
 def view_nz(tensor, rows, cols):
-    return reinterpret(tensor, shape=(rows, cols), data_format="nz")
+    return reinterpret(tensor, layout=make_layout((rows, cols)), data_format="nz")
 
 
 def get_nz_column_tile(tensor, rows, column_tile):
-    matrix = view_nz(tensor, rows, math.prod(tensor.spec.shape_bound) // rows)
+    matrix = view_nz(tensor, rows, math.prod(tensor.shape) // rows)
     return tile_slice(matrix, (rows, _FP32_VECTOR_LENGTH), (0, column_tile))
 
 
@@ -221,15 +230,24 @@ def get_bmm1_operand_half(tensor, rows, row_group_idx):
     # QK joins two NZ row groups in one operand buffer.
     return reinterpret(
         tensor,
-        shape=(rows, _FP32_VECTOR_LENGTH),
+        layout=make_layout((rows, _FP32_VECTOR_LENGTH)),
         offset=row_group_idx * rows * _NZ_ROW * _F16_BYTES,
+        physical_layout=make_layout(
+            (
+                _FP32_VECTOR_LENGTH // _NZ_ROW,
+                (rows + _NZ_ROW - 1) // _NZ_ROW,
+                _NZ_ROW,
+                _NZ_ROW,
+            ),
+            stride=tensor.physical_stride,
+        ),
     )
 
 
 def get_bmm2_operand_half(tensor, kv_row_group_idx):
     return reinterpret(
         tensor,
-        shape=(_FP32_VECTOR_LENGTH, _KV_ROWS_PER_VECTOR),
+        layout=make_layout((_FP32_VECTOR_LENGTH, _KV_ROWS_PER_VECTOR)),
         offset=kv_row_group_idx
         * _FP32_VECTOR_LENGTH
         * _KV_ROWS_PER_VECTOR
@@ -253,35 +271,33 @@ def _restore_compilation_environment(old):
 
 
 @contextlib.contextmanager
-def _compilation_environment(output):
-    """Use the public compiler override; do not patch DSL internals."""
-    output = Path(output).resolve()
-    output.mkdir(parents=True, exist_ok=True)
-    real_compiler = (
-        os.environ.get("CANNBOTDSL_BISHENG_PATH")
-        or os.environ.get("CANNBOTDSL_BISHENG")
-        or shutil.which("bisheng")
-    )
-    if not real_compiler:
-        raise RuntimeError("Source the CANN environment before compiling")
-    real_compiler = str(Path(real_compiler).resolve())
-    wrapper = output / "bisheng-wrapper"
-    wrapper_code = _COMPILER_WRAPPER
-    wrapper_code = wrapper_code.replace(
-        "_compiler_config", repr((real_compiler, _COMPILER_FLAGS)), 1
-    )
-    wrapper.write_text("#!" + sys.executable + "\n" + wrapper_code)
-    wrapper.chmod(0o755)
-    settings = {
-        "CANNBOTDSL_BISHENG_PATH": str(wrapper),
-        "CANNBOTDSL_NPU_ARCH": "dav-3510",
-        "CANNBOTDSL_AUTO_BUFFER_SYNC": "1",
-        "CANNBOTDSL_BARALL": "0",
-        "CANNBOTDSL_DEBUG_ASC_SYNC": "",
-        "CANNBOTDSL_CACHE_MEM_DISABLE": "1",
-        "CANNBOTDSL_CACHE_DISK_DISABLE": "1",
-    }
+def _compilation_environment():
+    """Apply SMLA options before the official factory performs its lookup."""
     with _COMPILATION_LOCK:
+        real_compiler = (
+            os.environ.get("CANNBOTDSL_BISHENG_PATH")
+            or os.environ.get("CANNBOTDSL_BISHENG")
+            or shutil.which("bisheng")
+        )
+        if not real_compiler:
+            raise RuntimeError("Source the CANN environment before compiling")
+        real_compiler = str(Path(real_compiler).resolve())
+        key = (real_compiler, _COMPILER_FLAGS)
+        if key not in _COMPILER_WRAPPERS:
+            directory = tempfile.TemporaryDirectory(prefix="cannbot_smla_compiler_")
+            wrapper = Path(directory.name) / "bisheng-wrapper"
+            wrapper_code = _COMPILER_WRAPPER.replace("_compiler_config", repr(key), 1)
+            wrapper.write_text("#!" + sys.executable + "\n" + wrapper_code)
+            wrapper.chmod(0o755)
+            _COMPILER_WRAPPERS[key] = (directory, wrapper)
+        _, wrapper = _COMPILER_WRAPPERS[key]
+        settings = {
+            "CANNBOTDSL_BISHENG_PATH": str(wrapper),
+            "CANNBOTDSL_NPU_ARCH": "dav-3510",
+            "CANNBOTDSL_AUTO_BUFFER_SYNC": "1",
+            "CANNBOTDSL_BARALL": "0",
+            "CANNBOTDSL_DEBUG_ASC_SYNC": "",
+        }
         old = {key: os.environ.get(key) for key in settings}
         os.environ.update(settings)
         try:
@@ -296,8 +312,10 @@ def allocate_buffer(
     del spaces, address
     tensor_shape = shape or (element_count,)
     if cross:
-        return RingBuffer(loc, tensor_shape, dtype, depth=1, data_format="nd")
-    return Buffer(loc, tensor_shape, dtype, data_format="nd")
+        return RingBuffer(
+            loc, dtype, make_layout(tensor_shape), depth=1, data_format="nd"
+        )
+    return Buffer(loc, dtype, make_layout(tensor_shape), data_format="nd")
 
 
 def build_ub_buffer_plan(query_head_tile_size, has_sinks, dtype):
@@ -403,8 +421,8 @@ class HighPerfSmlaStorage:
         self.bmm2_res_ub_rings = [
             RingBuffer(
                 MemLoc.UB,
-                (self.subblock_query_head_count * 2, _RESULT_HALF_COLS),
                 dtypes.float32,
+                make_layout((self.subblock_query_head_count * 2, _RESULT_HALF_COLS)),
                 depth=1,
                 data_format="nd",
             )
@@ -430,97 +448,83 @@ class HighPerfSmlaStorage:
         self.ub_buffer_plan["sparse_indices_ub_bufs"][0]
         self.sparse_indices_ub_ring = RingBuffer(
             MemLoc.UB,
-            (_KV_ROWS_PER_VECTOR,),
             dtypes.int32,
+            make_layout((_KV_ROWS_PER_VECTOR,)),
             depth=2,
             data_format="nd",
         )
         # Q 的 N1 行连续存放；只在 NZ 物理分型上按 16 行对齐。
         self.query_heads_l1_ring = RingBuffer(
             MemLoc.L1,
-            (self.query_head_tile_size, _Q_WIDE_COLS),
             dtype,
+            make_layout((self.query_head_tile_size, _Q_WIDE_COLS)),
             data_format="nz",
             depth=2,
         )
         self.query_heads_l1_tail = Buffer(
             MemLoc.L1,
-            (self.query_head_tile_size, _BASE_TILE_SIZE),
             dtype,
+            make_layout((self.query_head_tile_size, _BASE_TILE_SIZE)),
             data_format="nz",
         )
         self.kv_l1_rings = [
             RingBuffer(
                 MemLoc.L1,
-                (_KV_SLOT_ELEMS,),
                 dtype,
+                make_layout((_KV_SLOT_ELEMS,)),
                 depth=_KV_RING_DEPTH,
                 data_format="nd",
             )
         ]
         self.bmm2_a_l1_ring = RingBuffer(
             MemLoc.L1,
-            (self.aligned_head_count * _BASE_TILE_SIZE,),
             dtype,
+            make_layout((self.aligned_head_count * _BASE_TILE_SIZE,)),
             depth=1,
             data_format="nd",
         )
         self.kv_l1_rings.append(
             RingBuffer(
                 MemLoc.L1,
-                (_KV_SLOT_ELEMS,),
                 dtype,
+                make_layout((_KV_SLOT_ELEMS,)),
                 depth=_KV_RING_DEPTH,
                 data_format="nd",
             )
         )
         self.l0a_ring = RingBuffer(
             MemLoc.L0A,
+            dtype,
+            make_layout((query_head_tile_size, _BASE_TILE_SIZE)),
             depth=_L0A_RING_DEPTH,
-            view=TensorViewSpec(
-                (query_head_tile_size, _BASE_TILE_SIZE),
-                dtype,
-                layout=ViewLayout(
-                    "nz",
-                    physical_shape=(
-                        _TILE_NZ_TILES,
-                        self.aligned_head_count // _NZ_ROW,
-                        _NZ_ROW,
-                        _NZ_ROW,
-                    ),
-                    physical_stride=(
-                        self.aligned_head_count * _NZ_ROW,
-                        _NZ_FACE,
-                        _NZ_ROW,
-                        1,
-                    ),
-                ),
+            physical_layout=make_layout(
+                (_TILE_NZ_TILES, self.aligned_head_count // _NZ_ROW, _NZ_ROW, _NZ_ROW),
+                stride=(self.aligned_head_count * _NZ_ROW, _NZ_FACE, _NZ_ROW, 1),
             ),
+            data_format="nz",
         )
         self.l0b_ring = RingBuffer(
             MemLoc.L0B,
+            self.dtype,
+            make_layout((_BASE_TILE_SIZE, _FP32_VECTOR_LENGTH)),
             depth=_L0B_SLOTS,
-            view=TensorViewSpec(
-                (_BASE_TILE_SIZE, _FP32_VECTOR_LENGTH),
-                self.dtype,
-                layout=ViewLayout(
-                    "nz",
-                    physical_shape=(_F32_NZ_TILES, _TILE_NZ_TILES, _NZ_ROW, _NZ_ROW),
-                    physical_stride=(_BASE_TILE_SIZE * _NZ_ROW, _NZ_FACE, _NZ_ROW, 1),
-                ),
+            physical_layout=make_layout(
+                (_F32_NZ_TILES, _TILE_NZ_TILES, _NZ_ROW, _NZ_ROW),
+                stride=(_BASE_TILE_SIZE * _NZ_ROW, _NZ_FACE, _NZ_ROW, 1),
             ),
+            data_format="nz",
         )
         self.bmm2_res_l0c_ring = RingBuffer(
             MemLoc.L0C,
-            (self.query_head_tile_size, _FP32_VECTOR_LENGTH),
             dtypes.float32,
+            make_layout((self.query_head_tile_size, _FP32_VECTOR_LENGTH)),
             depth=_D_F32_TILES,
             data_format="nz",
         )
         self.bmm1_res_l0c = Buffer(
             MemLoc.L0C,
-            (self.query_head_tile_size, _BASE_TILE_SIZE),
             dtypes.float32,
+            make_layout((self.query_head_tile_size, _BASE_TILE_SIZE)),
             data_format="nz",
         )
         self.cross_core_rings = {
@@ -740,7 +744,8 @@ class HighPerfSmlaVec0Indices:
         valid_subblock_kv_rows,
         is_full_gather_chunk,
     ):
-        for i in range_constexpr(_GATHER_PAIRS):
+        # Keep gather scalar code compact; retain pair order and DMA synchronization.
+        for i in range(_GATHER_PAIRS):
             # Each gather pair copies two adjacent destination KV rows.
             kv_row = kv_row_start + i * 2
             if const_expr(is_full_gather_chunk):
@@ -758,7 +763,9 @@ class HighPerfSmlaVec0Indices:
                 higher_kv_row = scalar_select(
                     first_kv_row < second_kv_row, second_kv_row, first_kv_row
                 )
-                src = kv_gm.view(math.prod(kv_gm.shape) // _HEAD_DIM, _HEAD_DIM)
+                src = kv_gm.view(
+                    dtypes.uint64(math.prod(kv_gm.shape)) // _HEAD_DIM, _HEAD_DIM
+                )
                 dst = self.buffer_storage.kv_in_ub_bufs[kv_buffer_idx].view(
                     _GATHER_TILE_ROWS, _HEAD_DIM
                 )
@@ -796,7 +803,9 @@ class HighPerfSmlaVec0Indices:
                     higher_kv_row = scalar_select(
                         first_kv_row < second_kv_row, second_kv_row, first_kv_row
                     )
-                    src = kv_gm.view(math.prod(kv_gm.shape) // _HEAD_DIM, _HEAD_DIM)
+                    src = kv_gm.view(
+                        dtypes.uint64(math.prod(kv_gm.shape)) // _HEAD_DIM, _HEAD_DIM
+                    )
                     dst = self.buffer_storage.kv_in_ub_bufs[kv_buffer_idx].view(
                         _GATHER_TILE_ROWS, _HEAD_DIM
                     )
@@ -827,7 +836,10 @@ class HighPerfSmlaVec0Indices:
                             (2 * i, 0),
                         ),
                         tile_slice(
-                            kv_gm.view(math.prod(kv_gm.shape) // _HEAD_DIM, _HEAD_DIM),
+                            kv_gm.view(
+                                dtypes.uint64(math.prod(kv_gm.shape)) // _HEAD_DIM,
+                                _HEAD_DIM,
+                            ),
                             (1, _HEAD_DIM),
                             (valid_kv_index, 0),
                         ),
@@ -862,7 +874,7 @@ class HighPerfSmlaVec0Indices:
             0,
         )
         copied = dtypes.int64(0)
-        src = kv_gm.view(math.prod(kv_gm.shape) // _HEAD_DIM, _HEAD_DIM)
+        src = kv_gm.view(dtypes.uint64(math.prod(kv_gm.shape)) // _HEAD_DIM, _HEAD_DIM)
         dst = self.buffer_storage.kv_in_ub_bufs[chunk].view(
             _GATHER_TILE_ROWS, _HEAD_DIM
         )
@@ -919,7 +931,7 @@ class HighPerfSmlaVec0Indices:
         )
         if valid_rows > 0:
             source_start = kv_base_row + ori_kv_start_row + subblock_start
-            source = kv_gm.view(math.prod(kv_gm.shape) // _HEAD_DIM, _HEAD_DIM)[
+            source = kv_gm.view(dtypes.uint64(math.prod(kv_gm.shape)) // _HEAD_DIM, _HEAD_DIM)[
                 source_start: source_start + valid_rows,
                 0:_HEAD_DIM,
             ]  # fmt: skip
@@ -1055,6 +1067,7 @@ class HighPerfSmlaVector:
         bmm1_res_ub,
         vec1_res_ub,
         valid_tile_kv_rows,
+        continuation=0,
     ):
         # VF softmax: reduce QK scores, update online state and pack 16-bit P in NZ order.
         active_heads = self.subblock_query_head_count
@@ -1074,6 +1087,13 @@ class HighPerfSmlaVector:
             softmax_state_offset = active_query_idx % 2 * _FP32_VECTOR_LENGTH
             if const_expr(is_first_tile):
                 sink_reg = rr.vload(self.buffer_storage.sinks_ub)
+                no_sink = rr.vreinterpret(
+                    rr.vdups(_F32_NEG_INF_BITS, dtypes.uint32), dtypes.float32
+                )
+                continued = rr.vges(
+                    rr.vdups(dtypes.int32(continuation), dtypes.int32), 1, mask=mask
+                )
+                sink_reg = rr.vselect(no_sink, sink_reg, cond_mask=continued)
                 neg_inf = rr.veqs(
                     rr.vreinterpret(sink_reg, dtypes.uint32),
                     _F32_NEG_INF_BITS,
@@ -1268,7 +1288,9 @@ class HighPerfSmlaVector:
             )
 
     @jit
-    def finalize_vec1_softmax_state(self, active_query_idx, scale):
+    def finalize_vec1_softmax_state(
+        self, active_query_idx, scale, partial: cannbotdsl.Constexpr[bool] = False
+    ):
         # VF softmax finalization: compact per-head state and optionally produce LSE.
         with vf(mode="simd"):
             mask = rr.full_mask(elem_bits=_F32_BITS)
@@ -1285,7 +1307,14 @@ class HighPerfSmlaVector:
             pos_inf_reg = rr.vreinterpret(
                 rr.vdups(_F32_POS_INF_BITS, dtypes.uint32), dtypes.float32
             )
-            if const_expr(self.return_softmax_lse):
+            if const_expr(partial):
+                rr.vstore(
+                    self.buffer_storage.softmax_max_ub,
+                    softmax_state_offset,
+                    softmax_max_reg,
+                    mask,
+                )
+            if const_expr(self.return_softmax_lse and not partial):
                 softmax_lse_reg = rr.vadd(
                     rr.vlog(softmax_sum_reg, mask=mask), softmax_max_reg, mask=mask
                 )
@@ -1321,6 +1350,7 @@ class HighPerfSmlaVector:
         attention_acc_ub,
         bmm2_res_ub,
         attention_out_ub,
+        partial: cannbotdsl.Constexpr[bool] = False,
     ):
         # VF output update: accumulate PV tiles, then normalize and pack the final result.
         active_heads = self.subblock_query_head_count
@@ -1376,21 +1406,29 @@ class HighPerfSmlaVector:
                         )
                     if const_expr(is_last_tile):
                         output_reg = rr.vmul(output_reg, inv_softmax_sum_reg, mask=mask)
-                        packed_output_reg = rr.vcast(
-                            output_reg,
-                            self.buffer_storage.dtype,
-                            mask=mask,
-                            rounding="rn",
-                        )
-                        rr.vstore_pack(
-                            attention_out_ub,
-                            query_head_row
-                            * (_RESULT_HALF_COLS * _F32_BYTES // _F16_BYTES)
-                            + d_vector_tile * _FP32_VECTOR_LENGTH,
-                            packed_output_reg,
-                            mask,
-                            pack_mode="b32_to_b16",
-                        )
+                        if const_expr(partial):
+                            rr.vstore(
+                                attention_acc_ub,
+                                output_element_offset,
+                                output_reg,
+                                mask,
+                            )
+                        else:
+                            packed_output_reg = rr.vcast(
+                                output_reg,
+                                self.buffer_storage.dtype,
+                                mask=mask,
+                                rounding="rn",
+                            )
+                            rr.vstore_pack(
+                                attention_out_ub,
+                                query_head_row
+                                * (_RESULT_HALF_COLS * _F32_BYTES // _F16_BYTES)
+                                + d_vector_tile * _FP32_VECTOR_LENGTH,
+                                packed_output_reg,
+                                mask,
+                                pack_mode="b32_to_b16",
+                            )
                     else:
                         rr.vstore(
                             attention_acc_ub,
@@ -1398,6 +1436,214 @@ class HighPerfSmlaVector:
                             output_reg,
                             mask,
                         )
+
+    @jit
+    def stage_partial_ms(
+        self,
+        fd_slot,
+        active_query_idx,
+        h0,
+        valid_head_count,
+        workspace,
+        num_heads_q,
+        cube_core_count,
+    ):
+        if valid_head_count > 0:
+            stats_base = 2 * cube_core_count * num_heads_q * _HEAD_DIM + fd_slot * 128
+            state_base = active_query_idx % 2 * _FP32_VECTOR_LENGTH
+            mem_copy(
+                workspace[stats_base + h0 : stats_base + h0 + valid_head_count,],
+                self.buffer_storage.softmax_max_ub[
+                    state_base : state_base + valid_head_count,
+                ],
+            )
+            mem_copy(
+                workspace[
+                    stats_base + 64 + h0 : stats_base + 64 + h0 + valid_head_count,
+                ],
+                self.buffer_storage.softmax_sum_ub[
+                    state_base : state_base + valid_head_count,
+                ],
+            )
+
+    @jit
+    def stage_partial_o(
+        self,
+        fd_slot,
+        h0,
+        valid_head_count,
+        d_half_idx,
+        attention_acc_ub,
+        workspace,
+        num_heads_q,
+    ):
+        if valid_head_count > 0:
+            base = (fd_slot * num_heads_q + h0) * _HEAD_DIM
+            mem_copy(
+                workspace[base : base + valid_head_count * _HEAD_DIM,].view(
+                    valid_head_count, _HEAD_DIM
+                )[0:valid_head_count, d_half_idx * 256 : (d_half_idx + 1) * 256],
+                attention_acc_ub[0:valid_head_count, 0:256],
+            )
+
+    def setup_fd_reduce_buffers(self):
+        # FD merge storage is allocated only after the global publication
+        # barrier and UB rewind, matching the former reducer's lifetime.
+        self.stats = RingBuffer(
+            MemLoc.UB, dtypes.float32, make_layout((72, 128)), depth=1
+        )
+        self.landing = RingBuffer(
+            MemLoc.UB, dtypes.float32, make_layout((16, 512)), depth=2
+        )
+        self.acc = Buffer(MemLoc.UB, dtypes.float32, make_layout((16, 512)))
+        self.out = Buffer(MemLoc.UB, self.buffer_storage.dtype, make_layout((16, 512)))
+        self.maximum = Buffer(MemLoc.UB, dtypes.float32, make_layout((64,)))
+        self.total = Buffer(MemLoc.UB, dtypes.float32, make_layout((64,)))
+        self.weights = Buffer(MemLoc.UB, dtypes.float32, make_layout((72, 64)))
+        self.lse = Buffer(MemLoc.UB, dtypes.float32, make_layout((64,)))
+
+    @jit
+    def _fd_init_acc(self, heads):
+        with vf(mode="simd"):
+            mask, _ = rr.update_mask(heads, elem_bits=32)
+            rr.vstore(self.maximum, 0, rr.vdups(_F32_MIN, dtypes.float32), mask)
+            rr.vstore(self.total, 0, rr.vdups(0.0, dtypes.float32), mask)
+
+    @jit
+    def _fd_acc_max_save(self, stats, part, heads):
+        with vf(mode="simd"):
+            mask, _ = rr.update_mask(heads, elem_bits=32)
+            value = rr.vload(stats, part * 128)
+            rr.vstore(
+                self.maximum,
+                0,
+                rr.vmax(rr.vload(self.maximum), value, mask=mask),
+                mask,
+            )
+            rr.vstore(self.weights, part * 64, value, mask)
+
+    @jit
+    def _fd_acc_sum(self, stats, part, heads):
+        with vf(mode="simd"):
+            mask, _ = rr.update_mask(heads, elem_bits=32)
+            maximum = rr.vload(self.weights, part * 64)
+            empty = rr.veqs(maximum, _F32_MIN, mask=mask)
+            weight = rr.vmul(
+                rr.vexp_sub(maximum, rr.vload(self.maximum), mask=mask),
+                rr.vload(stats, part * 128 + 64),
+                mask=mask,
+            )
+            weight = rr.vselect(rr.vdups(0.0, dtypes.float32), weight, cond_mask=empty)
+            rr.vstore(
+                self.total,
+                0,
+                rr.vadd(rr.vload(self.total), weight, mask=mask),
+                mask,
+            )
+            rr.vstore(self.weights, part * 64, weight, mask)
+
+    @jit
+    def _fd_acc_full(self, landing, part, heads, first: cannbotdsl.Constexpr[bool]):
+        with vf(mode="simd"):
+            mask = rr.full_mask(elem_bits=32)
+            for row in range(heads):
+                denominator = rr.vload_broadcast(self.total, row)
+                empty = rr.veqs(denominator, 0.0, mask=mask)
+                denominator = rr.vselect(
+                    rr.vdups(1.0, dtypes.float32), denominator, cond_mask=empty
+                )
+                weight = rr.vdiv(
+                    rr.vload_broadcast(self.weights, part * 64 + row),
+                    denominator,
+                    mask=mask,
+                )
+                for col in range_constexpr(8):
+                    offset = row * 512 + col * 64
+                    value = rr.vmul(rr.vload(landing, offset), weight, mask=mask)
+                    if const_expr(not first):
+                        value = rr.vadd(rr.vload(self.acc, offset), value, mask=mask)
+                    rr.vstore(self.acc, offset, value, mask)
+
+    @jit
+    def _fd_finalize_output(self, heads):
+        with vf(mode="simd"):
+            mask = rr.full_mask(elem_bits=32)
+            for row in range(heads):
+                for col in range_constexpr(8):
+                    offset = row * 512 + col * 64
+                    packed = rr.vcast(
+                        rr.vload(self.acc, offset),
+                        self.buffer_storage.dtype,
+                        mask=mask,
+                        rounding="rn",
+                    )
+                    rr.vstore_pack(
+                        self.out, offset, packed, mask, pack_mode="b32_to_b16"
+                    )
+            if const_expr(self.return_softmax_lse):
+                rows, _ = rr.update_mask(heads, elem_bits=32)
+                value = rr.vadd(
+                    rr.vlog(rr.vload(self.total), mask=rows),
+                    rr.vload(self.maximum),
+                    mask=rows,
+                )
+                empty = rr.veqs(rr.vload(self.total), 0.0, mask=rows)
+                inf = rr.vreinterpret(
+                    rr.vdups(_F32_POS_INF_BITS, dtypes.uint32), dtypes.float32
+                )
+                rr.vstore(
+                    self.lse,
+                    0,
+                    rr.vselect(inf, value, cond_mask=empty),
+                    rows,
+                )
+
+    @jit
+    def fd_reduce(
+        self, workspace, output, lse, info, query, slot0, parts, head0, head_count
+    ):
+        stats_base = 2 * info.cube_core_count * info.num_heads_q * 512 + slot0 * 128
+        # Arbitrary metadata head starts land at UB offset zero, preserving DMA alignment.
+        for offset in range(0, head_count, 16):
+            heads = min(dtypes.int64(16), head_count - offset)
+            h0 = head0 + offset
+            target = self.stats.next_write()
+            source = workspace[stats_base : stats_base + parts * 128,].view(parts, 128)
+            mem_copy(target[0:parts, 0:heads], source[0:parts, h0 : h0 + heads])
+            mem_copy(
+                target[0:parts, 64 : 64 + heads],
+                source[0:parts, 64 + h0 : 64 + h0 + heads],
+            )
+            stats = self.stats.next_read()
+            self._fd_init_acc(heads)
+            for part in range(parts):
+                self._fd_acc_max_save(stats, part, heads)
+            for part in range(parts):
+                self._fd_acc_sum(stats, part, heads)
+            base = (slot0 * info.num_heads_q + h0) * 512
+            landing = self.landing.next_write()
+            mem_copy(
+                landing[0:heads, 0:512],
+                workspace[base : base + heads * 512,].view(heads, 512),
+            )
+            self._fd_acc_full(self.landing.next_read(), dtypes.int64(0), heads, True)
+            for part in range(1, parts):
+                base = ((slot0 + part) * info.num_heads_q + h0) * 512
+                landing = self.landing.next_write()
+                mem_copy(
+                    landing[0:heads, 0:512],
+                    workspace[base : base + heads * 512,].view(heads, 512),
+                )
+                self._fd_acc_full(self.landing.next_read(), part, heads, False)
+            self._fd_finalize_output(heads)
+            base = (query * info.num_heads_q + h0) * 512
+            mem_copy(
+                output[base : base + heads * 512,].view(heads, 512),
+                self.out[0:heads, 0:512],
+            )
+            if const_expr(self.return_softmax_lse):
+                base = query * info.num_heads_q + h0
+                mem_copy(lse[base : base + heads,], self.lse[0:heads,])
 
 
 class HighPerfSmlaMatmul:
@@ -1504,13 +1750,13 @@ class HighPerfSmlaMatmul:
                 get_bmm2_operand_half(l0_b, 0),
                 get_nz_column_tile(
                     kv_lower_rows_l1, _KV_ROWS_PER_VECTOR, d_tile
-                ).transpose(0, 1),
+                ).permute(1, 0),
             )
             mem_copy(
                 get_bmm2_operand_half(l0_b, 1),
                 get_nz_column_tile(
                     kv_upper_rows_l1, _KV_ROWS_PER_VECTOR, d_tile
-                ).transpose(0, 1),
+                ).permute(1, 0),
             )
             if const_expr(d_tile == 0):
                 mem_copy(
@@ -1609,7 +1855,9 @@ def calc_ori_sparse_capacity(const_info):
 
 
 @jit
-def get_metadata_task_count(metadata_gm, seqused_q_gm, cu_seqlens_q, const_info):
+def get_metadata_task_count(
+    metadata_gm, seqused_q_gm, cu_seqlens_q, const_info, fd_end=0
+):
     base = get_block_idx() * _METADATA_STRIDE
     count = dtypes.int64(0)
     if dtypes.int32(metadata_gm[base]) != 0:
@@ -1617,6 +1865,7 @@ def get_metadata_task_count(metadata_gm, seqused_q_gm, cu_seqlens_q, const_info)
         first_query = dtypes.int64(metadata_gm[base + 2])
         last_batch = dtypes.int64(metadata_gm[base + _METADATA_LAST_BATCH])
         last_query = dtypes.int64(metadata_gm[base + _METADATA_LAST_QUERY])
+        last_query = last_query + scalar_select(fd_end > 0, 1, 0)
         # The exclusive end can be the (B, 0) sentinel.
         batch_stop = scalar_select(
             last_batch < const_info.batch_count, last_batch + 1, const_info.batch_count
@@ -1635,7 +1884,12 @@ def get_metadata_task_count(metadata_gm, seqused_q_gm, cu_seqlens_q, const_info)
 
 @jit
 def get_metadata_task_context(
-    metadata_gm, seqused_q_gm, cu_seqlens_q, const_info, metadata_task_idx
+    metadata_gm,
+    seqused_q_gm,
+    cu_seqlens_q,
+    const_info,
+    metadata_task_idx,
+    fd_end=0,
 ):
     """Resolve one metadata task without rescanning its entire batch range.
 
@@ -1654,6 +1908,7 @@ def get_metadata_task_context(
         first_query = dtypes.int64(metadata_gm[base + 2])
         last_batch = dtypes.int64(metadata_gm[base + _METADATA_LAST_BATCH])
         last_query = dtypes.int64(metadata_gm[base + _METADATA_LAST_QUERY])
+        last_query = last_query + scalar_select(fd_end > 0, 1, 0)
         if const_info.batch_mode == _BATCH_MODE_TND:
             range_start = dtypes.int64(cu_seqlens_q[first_batch]) + first_query
             range_end = dtypes.int64(cu_seqlens_q[const_info.batch_count])
@@ -1910,6 +2165,8 @@ def get_next_nonempty_metadata_task(
     const_info,
     metadata_task_idx,
     metadata_task_count,
+    fd_start=0,
+    fd_end=0,
 ):
     query_row_idx = dtypes.int64(0)
     batch_idx = dtypes.int64(0)
@@ -1927,7 +2184,12 @@ def get_next_nonempty_metadata_task(
     while scan != 0:
         query_row_idx, batch_idx, query_seq_idx, valid_query_count, context_found = (
             get_metadata_task_context(
-                metadata_gm, seqused_q_gm, cu_seqlens_q, const_info, metadata_task_idx
+                metadata_gm,
+                seqused_q_gm,
+                cu_seqlens_q,
+                const_info,
+                metadata_task_idx,
+                fd_end,
             )
         )
         if context_found != 0 and query_seq_idx < valid_query_count:
@@ -1955,9 +2217,12 @@ def get_next_nonempty_metadata_task(
                 query_seq_idx,
                 valid_query_count,
             )
-        found = scalar_select(
-            ori_valid_kv_length > 0, 1, scalar_select(cmp_valid_kv_length > 0, 1, 0)
-        )
+        segment_begin = scalar_select(metadata_task_idx == 0, fd_start, 0)
+        segment_end = kv_tile_count
+        if metadata_task_idx + 1 == metadata_task_count and fd_end > 0:
+            segment_end = min(segment_end, fd_end)
+        kv_tile_count = max(dtypes.int64(0), segment_end - segment_begin)
+        found = scalar_select(kv_tile_count > 0, 1, 0)
         if found == 0:
             metadata_task_idx = metadata_task_idx + 1
         scan = scalar_select(
@@ -2027,7 +2292,34 @@ class SparseN64Kernel:
         attention_out_gm: Tensor,
         softmax_lse_gm: Tensor,
         const_info: HighPerfSmlaConstInfo,
+        fd_workspace_gm: Tensor,
     ):
+        self.fd_start = dtypes.int64(0)
+        self.fd_end = dtypes.int64(0)
+        self.fd_first_row = dtypes.int64(-1)
+        self.fd_last_row = dtypes.int64(-1)
+        self.fd_first_slot = dtypes.int64(0)
+        self.fd_query_rows = dtypes.int64(const_info.query_row_count)
+        base = get_block_idx() * _METADATA_STRIDE
+        self.fd_start = dtypes.int64(metadata_gm[base + 3])
+        self.fd_end = dtypes.int64(metadata_gm[base + 6])
+        self.fd_first_slot = dtypes.int64(metadata_gm[base + 7])
+        first_b = dtypes.int64(metadata_gm[base + 1])
+        last_b = dtypes.int64(metadata_gm[base + 4])
+        self.fd_first_row = first_b * const_info.query_rows_per_batch + dtypes.int64(
+            metadata_gm[base + 2]
+        )
+        self.fd_last_row = last_b * const_info.query_rows_per_batch + dtypes.int64(
+            metadata_gm[base + 5]
+        )
+        if const_expr(self.batch_mode == _BATCH_MODE_TND):
+            self.fd_first_row = dtypes.int64(cu_seqlens_q[first_b]) + dtypes.int64(
+                metadata_gm[base + 2]
+            )
+            self.fd_last_row = dtypes.int64(cu_seqlens_q[last_b]) + dtypes.int64(
+                metadata_gm[base + 5]
+            )
+        self.fd_workspace = fd_workspace_gm
         if const_expr(self.kv_mode == _KV_MODE_PA):
             self.init_pa_address_buffers()
             if is_aic():
@@ -2100,6 +2392,53 @@ class SparseN64Kernel:
                 softmax_lse_gm,
                 const_info,
             )
+        # Every launched AIC/AIV observes the same metadata gate, including
+        # disabled FA cores, before entering the global barrier.
+        if dtypes.int32(metadata_gm[_FD_USED_VEC_WORD]) != 0:
+            global_sync_all()
+            onchip_rewind(reset_sync_id=False)
+            self.vector_block.setup_fd_reduce_buffers()
+            if not is_aic():
+                fd_base = (
+                    _FD_METADATA_BASE + (get_block_idx() * 2 + get_subblock_id()) * 8
+                )
+                if dtypes.int32(metadata_gm[fd_base]) != 0:
+                    batch = dtypes.int64(metadata_gm[fd_base + 1])
+                    query = batch * const_info.query_rows_per_batch + dtypes.int64(
+                        metadata_gm[fd_base + 2]
+                    )
+                    if const_info.batch_mode == _BATCH_MODE_TND:
+                        query = dtypes.int64(cu_seqlens_q[batch]) + dtypes.int64(
+                            metadata_gm[fd_base + 2]
+                        )
+                    self.vector_block.fd_reduce(
+                        fd_workspace_gm,
+                        attention_out_gm,
+                        softmax_lse_gm,
+                        const_info,
+                        query,
+                        dtypes.int64(metadata_gm[fd_base + 3]),
+                        dtypes.int64(metadata_gm[fd_base + 4]),
+                        dtypes.int64(metadata_gm[fd_base + 5]),
+                        dtypes.int64(metadata_gm[fd_base + 6]),
+                    )
+
+    @jit
+    def fd_slot_for_row(self, query_row):
+        slot = dtypes.int64(-1)
+        if query_row == self.fd_first_row and self.fd_start > 0:
+            slot = self.fd_first_slot
+        elif query_row == self.fd_last_row and self.fd_end > 0:
+            slot = self.fd_first_slot + scalar_select(self.fd_start > 0, 1, 0)
+        return slot
+
+    @jit
+    def fd_address_row(self, query_row):
+        address_row = query_row
+        slot = self.fd_slot_for_row(query_row)
+        if slot >= 0:
+            address_row = self.fd_query_rows + slot
+        return address_row
 
     @jit
     def init_main_pipeline_buffers(self):
@@ -2112,23 +2451,23 @@ class SparseN64Kernel:
         self.vector_block = HighPerfSmlaVector(
             self.buffer_storage, self.return_softmax_lse
         )
-        self.run_info_delay = DelayLineGroup(
-            _PIPELINE_SLOTS,
-            "active_query_idx",
-            "query_row_idx",
-            "kv_tile_idx",
-            "valid_kv_length",
-            "kv_tile_count",
-            "prior_query_tile_count",
-            "stream_kv_tile_idx",
-            "batch_idx",
-            "ori_kv_base_row",
-            "cmp_kv_base_row",
-            "ori_kv_length",
-            "cmp_kv_length",
-            "ori_kv_start_row",
-            "is_cmp",
+        self.run_info_delay_clock = Array(dtypes.int64, 1, init=[0])
+        self.run_info_delay_active_query_idx = Array(dtypes.int64, _PIPELINE_SLOTS)
+        self.run_info_delay_query_row_idx = Array(dtypes.int64, _PIPELINE_SLOTS)
+        self.run_info_delay_kv_tile_idx = Array(dtypes.int64, _PIPELINE_SLOTS)
+        self.run_info_delay_valid_kv_length = Array(dtypes.int64, _PIPELINE_SLOTS)
+        self.run_info_delay_kv_tile_count = Array(dtypes.int64, _PIPELINE_SLOTS)
+        self.run_info_delay_prior_query_tile_count = Array(
+            dtypes.int64, _PIPELINE_SLOTS
         )
+        self.run_info_delay_stream_kv_tile_idx = Array(dtypes.int64, _PIPELINE_SLOTS)
+        self.run_info_delay_batch_idx = Array(dtypes.int64, _PIPELINE_SLOTS)
+        self.run_info_delay_ori_kv_base_row = Array(dtypes.int64, _PIPELINE_SLOTS)
+        self.run_info_delay_cmp_kv_base_row = Array(dtypes.int64, _PIPELINE_SLOTS)
+        self.run_info_delay_ori_kv_length = Array(dtypes.int64, _PIPELINE_SLOTS)
+        self.run_info_delay_cmp_kv_length = Array(dtypes.int64, _PIPELINE_SLOTS)
+        self.run_info_delay_ori_kv_start_row = Array(dtypes.int64, _PIPELINE_SLOTS)
+        self.run_info_delay_is_cmp = Array(dtypes.int64, _PIPELINE_SLOTS)
 
     @jit
     def init_pa_address_buffers(self):
@@ -2136,18 +2475,18 @@ class SparseN64Kernel:
         # slots have distinct protocol owners.  The allocator still packs their
         # combined 248 KiB footprint, and rewind reclaims it before the main UB.
         self.pa_block_table_ub = Buffer(
-            MemLoc.UB, (1, _PA_BLOCK_TABLE_CAPACITY), dtypes.int32
+            MemLoc.UB, dtypes.int32, make_layout((1, _PA_BLOCK_TABLE_CAPACITY))
         )
         self.pa_sparse_indices_ub_ring = RingBuffer(
             MemLoc.UB,
-            (1, _PA_BUFFER_CAPACITY),
             dtypes.int32,
+            make_layout((1, _PA_BUFFER_CAPACITY)),
             depth=_PA_BUFFER_COUNT,
         )
         self.pa_physical_rows_ub_ring = RingBuffer(
             MemLoc.UB,
-            (1, _PA_BUFFER_CAPACITY),
             dtypes.int32,
+            make_layout((1, _PA_BUFFER_CAPACITY)),
             depth=_PA_BUFFER_COUNT,
         )
 
@@ -2244,13 +2583,16 @@ class SparseN64Kernel:
         addresses_ub = self.pa_physical_rows_ub_ring.next_write()
         if batch_idx != staged_batch:
             mem_copy(
-                reinterpret(self.pa_block_table_ub, shape=(1, block_table_width)),
+                reinterpret(
+                    self.pa_block_table_ub,
+                    layout=make_layout((1, block_table_width)),
+                ),
                 block_table_gm[
                     batch_idx * block_table_width: (batch_idx + 1) * block_table_width,
                 ].view(1, block_table_width),
             )  # fmt: skip
         mem_copy(
-            reinterpret(indices_ub, shape=(1, sparse_index_stride)),
+            reinterpret(indices_ub, layout=make_layout((1, sparse_index_stride))),
             sparse_indices_gm[
                 query_row_idx * sparse_index_stride: (query_row_idx + 1)
                 * sparse_index_stride,
@@ -2274,9 +2616,9 @@ class SparseN64Kernel:
                 )
         mem_copy(
             kv_physical_rows_gm[
-                query_row_idx * padded_width: (query_row_idx + 1) * padded_width,
+                self.fd_address_row(query_row_idx) * padded_width: (self.fd_address_row(query_row_idx) + 1) * padded_width,
             ].view(1, padded_width),
-            reinterpret(addresses_ub, shape=(1, padded_width)),
+            reinterpret(addresses_ub, layout=make_layout((1, padded_width))),
         )  # fmt: skip
         # Preserve fallback slot 0; selection alone has no storage access.
         self.pa_sparse_indices_ub_ring.next_write(bare=True)
@@ -2318,7 +2660,12 @@ class SparseN64Kernel:
         padded_width = (sparse_index_stride + _NZ_ROW - 1) // _NZ_ROW * _NZ_ROW
         first_query_row, _batch, _query_pos, _valid_q, _found = (
             get_metadata_task_context(
-                metadata_gm, seqused_q_gm, cu_seqlens_q, const_info, task_start
+                metadata_gm,
+                seqused_q_gm,
+                cu_seqlens_q,
+                const_info,
+                task_start,
+                self.fd_end,
             )
         )
         # Keep grouped DMA for all-valid Query groups. Mixed groups must not
@@ -2331,6 +2678,7 @@ class SparseN64Kernel:
                 cu_seqlens_q,
                 const_info,
                 task_start + row,
+                self.fd_end,
             )
             if _ok == 0 or _qp >= _vq:
                 all_queries_valid = dtypes.int64(0)
@@ -2343,6 +2691,7 @@ class SparseN64Kernel:
                     cu_seqlens_q,
                     const_info,
                     task_start + row,
+                    self.fd_end,
                 )
             )
             if _found != 0 and query_seq_idx < valid_query_count:
@@ -2378,7 +2727,8 @@ class SparseN64Kernel:
                         if indices_loaded == 0:
                             mem_copy(
                                 reinterpret(
-                                    indices_ub, shape=(1, rows * sparse_index_stride)
+                                    indices_ub,
+                                    layout=make_layout((1, rows * sparse_index_stride)),
                                 ),
                                 sparse_indices_gm[
                                     first_query_row * sparse_index_stride: (
@@ -2390,7 +2740,10 @@ class SparseN64Kernel:
                             indices_loaded = dtypes.int64(1)
                     else:
                         mem_copy(
-                            reinterpret(indices_ub, shape=(rows * padded_width,))[
+                            reinterpret(
+                                indices_ub,
+                                layout=make_layout((rows * padded_width,)),
+                            )[
                                 row * padded_width: row * padded_width
                                 + sparse_index_stride,
                             ].view(1, sparse_index_stride),
@@ -2404,7 +2757,8 @@ class SparseN64Kernel:
                     if batch_idx != staged_batch:
                         mem_copy(
                             reinterpret(
-                                self.pa_block_table_ub, shape=(1, block_table_width)
+                                self.pa_block_table_ub,
+                                layout=make_layout((1, block_table_width)),
                             ),
                             block_table_gm[
                                 batch_idx * block_table_width: (batch_idx + 1)
@@ -2436,7 +2790,10 @@ class SparseN64Kernel:
                                 query_row_idx * padded_width: (query_row_idx + 1)
                                 * padded_width,
                             ].view(1, padded_width),
-                            reinterpret(addresses_ub, shape=(rows * padded_width,))[
+                            reinterpret(
+                                addresses_ub,
+                                layout=make_layout((rows * padded_width,)),
+                            )[
                                 row * padded_width: (row + 1) * padded_width,
                             ].view(1, padded_width),
                         )  # fmt: skip
@@ -2446,7 +2803,7 @@ class SparseN64Kernel:
                     first_query_row * padded_width: (first_query_row + rows)
                     * padded_width,
                 ].view(1, rows * padded_width),
-                reinterpret(addresses_ub, shape=(1, rows * padded_width)),
+                reinterpret(addresses_ub, layout=make_layout((1, rows * padded_width))),
             )  # fmt: skip
         return staged_batch
 
@@ -2564,7 +2921,7 @@ class SparseN64Kernel:
         const_info,
     ):
         metadata_task_count = get_metadata_task_count(
-            metadata_gm, seqused_q_gm, cu_seqlens_q, const_info
+            metadata_gm, seqused_q_gm, cu_seqlens_q, const_info, self.fd_end
         )
         per = metadata_task_count // _VECTOR_SUBBLOCKS
         tail = metadata_task_count % _VECTOR_SUBBLOCKS
@@ -2586,6 +2943,9 @@ class SparseN64Kernel:
                 ori_padded_width * _PA_QUERY_GROUP_SIZE <= _PA_BUFFER_CAPACITY, 1, 0
             )
             ori_batch_rows = scalar_select(ori_can_batch != 0, _PA_BATCH_ROWS, 1)
+            # Split rows use a private workspace row per partial slot.
+            if self.fd_start > 0 or self.fd_end > 0:
+                ori_batch_rows = 1
             ori_bulk_end = start
             if ori_batch_rows == _PA_BATCH_ROWS:
                 ori_bulk_end = start + count // _PA_BATCH_ROWS * _PA_BATCH_ROWS
@@ -2625,6 +2985,7 @@ class SparseN64Kernel:
                         cu_seqlens_q,
                         const_info,
                         metadata_task_idx,
+                        self.fd_end,
                     )
                 )
                 if _found != 0 and query_seq_idx < valid_query_count:
@@ -2680,6 +3041,9 @@ class SparseN64Kernel:
                 cmp_padded_width * _PA_QUERY_GROUP_SIZE <= _PA_BUFFER_CAPACITY, 1, 0
             )
             cmp_batch_rows = scalar_select(cmp_can_batch != 0, _PA_BATCH_ROWS, 1)
+            # Split rows use a private workspace row per partial slot.
+            if self.fd_start > 0 or self.fd_end > 0:
+                cmp_batch_rows = 1
             cmp_bulk_end = start
             if cmp_batch_rows == _PA_BATCH_ROWS:
                 cmp_bulk_end = start + count // _PA_BATCH_ROWS * _PA_BATCH_ROWS
@@ -2719,6 +3083,7 @@ class SparseN64Kernel:
                         cu_seqlens_q,
                         const_info,
                         metadata_task_idx,
+                        self.fd_end,
                     )
                 )
                 if _found != 0 and query_seq_idx < valid_query_count:
@@ -2783,6 +3148,10 @@ class SparseN64Kernel:
         bmm2_a_l1,
         valid_kv_length,
     ):
+        fd_slot = self.fd_slot_for_row(query_row_idx)
+        continuation = scalar_select(
+            query_row_idx == self.fd_first_row and self.fd_start > 0, 1, 0
+        )
         valid_segment_kv_rows = scalar_select(
             valid_kv_length < kv_len, valid_kv_length, kv_len
         )
@@ -2805,6 +3174,7 @@ class SparseN64Kernel:
                     bmm1_res_ub,
                     vec1_res_ub,
                     valid_tile_kv_rows,
+                    continuation,
                 )
             else:
                 self.vector_block.compute_vec1_softmax(
@@ -2816,6 +3186,7 @@ class SparseN64Kernel:
                     bmm1_res_ub,
                     vec1_res_ub,
                     valid_tile_kv_rows,
+                    continuation,
                 )
         elif kv_tile_idx == 0:
             self.vector_block.compute_vec1_softmax(
@@ -2827,6 +3198,7 @@ class SparseN64Kernel:
                 bmm1_res_ub,
                 vec1_res_ub,
                 valid_tile_kv_rows,
+                continuation,
             )
         else:
             self.vector_block.compute_vec1_softmax(
@@ -2838,6 +3210,7 @@ class SparseN64Kernel:
                 bmm1_res_ub,
                 vec1_res_ub,
                 valid_tile_kv_rows,
+                continuation,
             )
         # P 的物理 NZ 列距按 ceil16(N1)；两个 AIV 仅写各自真实行数。
         if get_subblock_id() == 0:
@@ -2867,28 +3240,57 @@ class SparseN64Kernel:
             ]  # fmt: skip
             mem_copy(target, source)
         if kv_tile_idx + 1 == kv_tile_count:
-            self.vector_block.finalize_vec1_softmax_state(
-                active_query_idx, const_info.softmax_scale
-            )
-            if const_expr(self.return_softmax_lse):
-                mem_copy(
-                    softmax_lse_gm[
-                        query_row_idx * const_info.num_heads_q
-                        + get_subblock_id()
-                        * self.buffer_storage.subblock_query_head_count: (
+            if fd_slot >= 0:
+                self.vector_block.finalize_vec1_softmax_state(
+                    active_query_idx, const_info.softmax_scale, True
+                )
+                h0 = get_subblock_id() * self.buffer_storage.subblock_query_head_count
+                self.vector_block.stage_partial_ms(
+                    fd_slot,
+                    active_query_idx,
+                    h0,
+                    valid_head_count,
+                    self.fd_workspace,
+                    const_info.num_heads_q,
+                    const_info.cube_core_count,
+                )
+            else:
+                self.vector_block.finalize_vec1_softmax_state(
+                    active_query_idx, const_info.softmax_scale, False
+                )
+            if fd_slot < 0:
+                if const_expr(self.return_softmax_lse):
+                    mem_copy(
+                        softmax_lse_gm[
                             query_row_idx * const_info.num_heads_q
                             + get_subblock_id()
-                            * self.buffer_storage.subblock_query_head_count
-                        )
-                        + valid_head_count,
-                    ],
-                    self.buffer_storage.softmax_max_ub[
-                        active_query_idx % 2 * _FP32_VECTOR_LENGTH: (
-                            active_query_idx % 2 * _FP32_VECTOR_LENGTH
-                        )
-                        + valid_head_count,
-                    ],
-                )  # fmt: skip
+                            * self.buffer_storage.subblock_query_head_count: (
+                                query_row_idx * const_info.num_heads_q
+                                + get_subblock_id()
+                                * self.buffer_storage.subblock_query_head_count
+                            )
+                            + valid_head_count,
+                        ],
+                        self.buffer_storage.softmax_max_ub[
+                            active_query_idx % 2 * _FP32_VECTOR_LENGTH: (
+                                active_query_idx % 2 * _FP32_VECTOR_LENGTH
+                            )
+                            + valid_head_count,
+                        ],
+                    )  # fmt: skip
+
+    @jit
+    def compute_vec2_output(
+        self, active_query_idx, kv_tile_idx, first, last, acc, pv, out, fd_slot
+    ):
+        if fd_slot >= 0:
+            self.vector_block.compute_vec2_attention_out(
+                active_query_idx, kv_tile_idx, first, last, acc, pv, out, True
+            )
+        else:
+            self.vector_block.compute_vec2_attention_out(
+                active_query_idx, kv_tile_idx, first, last, acc, pv, out, False
+            )
 
     @jit
     def process_vec2(
@@ -2905,6 +3307,7 @@ class SparseN64Kernel:
         bmm2_res_ub,
         attention_out_ub,
     ):
+        fd_slot = self.fd_slot_for_row(query_row_idx)
         is_last_tile = kv_tile_idx + 1 == kv_tile_count
         if kv_tile_idx == 0:
             # VF first-tile store: read and write the first FP32 lane of the PV accumulator.
@@ -2914,7 +3317,7 @@ class SparseN64Kernel:
                 rr.vstore(attention_acc_ub, 0, value, first_element)
         if kv_tile_idx == 0:
             if is_last_tile:
-                self.vector_block.compute_vec2_attention_out(
+                self.compute_vec2_output(
                     active_query_idx,
                     kv_tile_idx,
                     True,
@@ -2922,9 +3325,10 @@ class SparseN64Kernel:
                     attention_acc_ub,
                     bmm2_res_ub,
                     attention_out_ub,
+                    fd_slot,
                 )
         elif is_last_tile:
-            self.vector_block.compute_vec2_attention_out(
+            self.compute_vec2_output(
                 active_query_idx,
                 kv_tile_idx,
                 False,
@@ -2932,9 +3336,10 @@ class SparseN64Kernel:
                 attention_acc_ub,
                 bmm2_res_ub,
                 attention_out_ub,
+                fd_slot,
             )
         else:
-            self.vector_block.compute_vec2_attention_out(
+            self.compute_vec2_output(
                 active_query_idx,
                 kv_tile_idx,
                 False,
@@ -2942,25 +3347,38 @@ class SparseN64Kernel:
                 attention_acc_ub,
                 bmm2_res_ub,
                 attention_out_ub,
+                fd_slot,
             )
-        if is_last_tile:
-            if valid_head_count > 0:
-                mem_copy(
-                    attention_out_gm[
-                        dtypes.int64(query_row_idx)
-                        * const_info.num_heads_q
-                        * _HEAD_DIM:,
-                    ].view(const_info.num_heads_q, _HEAD_DIM)[
-                        get_subblock_id()
-                        * self.buffer_storage.subblock_query_head_count: get_subblock_id()
-                        * self.buffer_storage.subblock_query_head_count
-                        + valid_head_count,
-                        d_half_idx * _RESULT_HALF_COLS: (d_half_idx + 1)
-                        * _RESULT_HALF_COLS,
-                    ],
-                    attention_out_ub[0:valid_head_count, 0:_RESULT_HALF_COLS],
-                    options=copy_options(l2_cache_ctl=_KV_COPY_L2_CACHE_CONTROL),
-                )  # fmt: skip
+        if is_last_tile and fd_slot >= 0:
+            h0 = get_subblock_id() * self.buffer_storage.subblock_query_head_count
+            self.vector_block.stage_partial_o(
+                fd_slot,
+                h0,
+                valid_head_count,
+                d_half_idx,
+                attention_acc_ub,
+                self.fd_workspace,
+                const_info.num_heads_q,
+            )
+        if fd_slot < 0:
+            if is_last_tile:
+                if valid_head_count > 0:
+                    mem_copy(
+                        attention_out_gm[
+                            dtypes.int64(query_row_idx)
+                            * const_info.num_heads_q
+                            * _HEAD_DIM:,
+                        ].view(const_info.num_heads_q, _HEAD_DIM)[
+                            get_subblock_id()
+                            * self.buffer_storage.subblock_query_head_count: get_subblock_id()
+                            * self.buffer_storage.subblock_query_head_count
+                            + valid_head_count,
+                            d_half_idx * _RESULT_HALF_COLS: (d_half_idx + 1)
+                            * _RESULT_HALF_COLS,
+                        ],
+                        attention_out_ub[0:valid_head_count, 0:_RESULT_HALF_COLS],
+                        options=copy_options(l2_cache_ctl=_KV_COPY_L2_CACHE_CONTROL),
+                    )  # fmt: skip
 
     @jit
     def process_vector_step(
@@ -2996,26 +3414,58 @@ class SparseN64Kernel:
         kv_upper_rows_l1_write,
         indices_read,
     ):
-        is_cmp = kv_tile_idx >= ori_tile_count
+        logical_tile_idx = kv_tile_idx + scalar_select(
+            query_row_idx == self.fd_first_row, self.fd_start, 0
+        )
+        is_cmp = logical_tile_idx >= ori_tile_count
         stream_kv_tile_idx = scalar_select(
-            is_cmp, kv_tile_idx - ori_tile_count, kv_tile_idx
+            is_cmp, logical_tile_idx - ori_tile_count, logical_tile_idx
         )
         valid_len = scalar_select(is_cmp, cmp_valid_kv_length, ori_valid_kv_length)
-        self.run_info_delay.push(
-            active_query_idx=dtypes.int64(active_query_idx),
-            query_row_idx=dtypes.int64(query_row_idx),
-            kv_tile_idx=dtypes.int64(kv_tile_idx),
-            valid_kv_length=dtypes.int64(valid_len),
-            kv_tile_count=dtypes.int64(kv_tile_count),
-            prior_query_tile_count=dtypes.int64(prior_query_tile_count),
-            stream_kv_tile_idx=dtypes.int64(stream_kv_tile_idx),
-            batch_idx=dtypes.int64(batch_idx),
-            ori_kv_base_row=dtypes.int64(ori_kv_base_row),
-            cmp_kv_base_row=dtypes.int64(cmp_kv_base_row),
-            ori_kv_length=dtypes.int64(ori_kv_length),
-            cmp_kv_length=dtypes.int64(cmp_kv_length),
-            ori_kv_start_row=dtypes.int64(ori_kv_start_row),
-            is_cmp=dtypes.int64(is_cmp),
+        run_info_delay_slot = (
+            dtypes.uint64(self.run_info_delay_clock[0]) % _PIPELINE_SLOTS
+        )
+        self.run_info_delay_active_query_idx[run_info_delay_slot] = dtypes.int64(
+            dtypes.int64(active_query_idx)
+        )
+        self.run_info_delay_query_row_idx[run_info_delay_slot] = dtypes.int64(
+            dtypes.int64(query_row_idx)
+        )
+        self.run_info_delay_kv_tile_idx[run_info_delay_slot] = dtypes.int64(
+            dtypes.int64(kv_tile_idx)
+        )
+        self.run_info_delay_valid_kv_length[run_info_delay_slot] = dtypes.int64(
+            dtypes.int64(valid_len)
+        )
+        self.run_info_delay_kv_tile_count[run_info_delay_slot] = dtypes.int64(
+            dtypes.int64(kv_tile_count)
+        )
+        self.run_info_delay_prior_query_tile_count[run_info_delay_slot] = dtypes.int64(
+            dtypes.int64(prior_query_tile_count)
+        )
+        self.run_info_delay_stream_kv_tile_idx[run_info_delay_slot] = dtypes.int64(
+            dtypes.int64(stream_kv_tile_idx)
+        )
+        self.run_info_delay_batch_idx[run_info_delay_slot] = dtypes.int64(
+            dtypes.int64(batch_idx)
+        )
+        self.run_info_delay_ori_kv_base_row[run_info_delay_slot] = dtypes.int64(
+            dtypes.int64(ori_kv_base_row)
+        )
+        self.run_info_delay_cmp_kv_base_row[run_info_delay_slot] = dtypes.int64(
+            dtypes.int64(cmp_kv_base_row)
+        )
+        self.run_info_delay_ori_kv_length[run_info_delay_slot] = dtypes.int64(
+            dtypes.int64(ori_kv_length)
+        )
+        self.run_info_delay_cmp_kv_length[run_info_delay_slot] = dtypes.int64(
+            dtypes.int64(cmp_kv_length)
+        )
+        self.run_info_delay_ori_kv_start_row[run_info_delay_slot] = dtypes.int64(
+            dtypes.int64(ori_kv_start_row)
+        )
+        self.run_info_delay_is_cmp[run_info_delay_slot] = dtypes.int64(
+            dtypes.int64(is_cmp)
         )
         bmm1_res_ub_read = self.buffer_storage.get_next_bmm1_res_ub(False)
         vec1_res_ub = self.buffer_storage.vec1_res_ub
@@ -3033,14 +3483,18 @@ class SparseN64Kernel:
         attention_out_lower_d_ub = reinterpret(
             bmm2_res_lower_d_ub,
             self.buffer_storage.dtype,
-            (self.buffer_storage.subblock_query_head_count, _RESULT_HALF_COLS),
-            stride=(_RESULT_HALF_COLS * _F32_BYTES // _F16_BYTES, 1),
+            layout=make_layout(
+                (self.buffer_storage.subblock_query_head_count, _RESULT_HALF_COLS),
+                stride=(_RESULT_HALF_COLS * _F32_BYTES // _F16_BYTES, 1),
+            ),
         )
         attention_out_upper_d_ub = reinterpret(
             bmm2_res_upper_d_ub,
             self.buffer_storage.dtype,
-            (self.buffer_storage.subblock_query_head_count, _RESULT_HALF_COLS),
-            stride=(_RESULT_HALF_COLS * _F32_BYTES // _F16_BYTES, 1),
+            layout=make_layout(
+                (self.buffer_storage.subblock_query_head_count, _RESULT_HALF_COLS),
+                stride=(_RESULT_HALF_COLS * _F32_BYTES // _F16_BYTES, 1),
+            ),
         )
         if kv_tile_idx >= 0:
             if const_expr(self.kv_mode == _KV_MODE_LINEAR):
@@ -3067,29 +3521,124 @@ class SparseN64Kernel:
                         kv_tile_idx,
                         indices_write,
                     )
-        vec0_run_info = self.run_info_delay.tap(_VEC0_PIPELINE_DELAY)
-        vec1_run_info = self.run_info_delay.tap(_VEC1_PIPELINE_DELAY)
-        vec2_run_info = self.run_info_delay.tap(_VEC2_PIPELINE_DELAY)
-        softmax_kv_len = scalar_select(
-            vec1_run_info.is_cmp,
-            vec1_run_info.cmp_kv_length,
-            vec1_run_info.ori_kv_length,
+        vec0_run_info_slot = (
+            dtypes.uint64(
+                self.run_info_delay_clock[0] + _PIPELINE_SLOTS - _VEC0_PIPELINE_DELAY
+            )
+            % _PIPELINE_SLOTS
         )
-        if pipeline_tick >= _VEC0_PIPELINE_DELAY and vec0_run_info.kv_tile_idx >= 0:
-            if vec0_run_info.is_cmp:
+        self.run_info_delay_active_query_idx[vec0_run_info_slot]
+        vec0_run_info_query_row_idx = self.run_info_delay_query_row_idx[
+            vec0_run_info_slot
+        ]
+        vec0_run_info_kv_tile_idx = self.run_info_delay_kv_tile_idx[vec0_run_info_slot]
+        vec0_run_info_valid_kv_length = self.run_info_delay_valid_kv_length[
+            vec0_run_info_slot
+        ]
+        self.run_info_delay_kv_tile_count[vec0_run_info_slot]
+        vec0_run_info_prior_query_tile_count = (
+            self.run_info_delay_prior_query_tile_count[vec0_run_info_slot]
+        )
+        vec0_run_info_stream_kv_tile_idx = self.run_info_delay_stream_kv_tile_idx[
+            vec0_run_info_slot
+        ]
+        vec0_run_info_batch_idx = self.run_info_delay_batch_idx[vec0_run_info_slot]
+        vec0_run_info_ori_kv_base_row = self.run_info_delay_ori_kv_base_row[
+            vec0_run_info_slot
+        ]
+        vec0_run_info_cmp_kv_base_row = self.run_info_delay_cmp_kv_base_row[
+            vec0_run_info_slot
+        ]
+        vec0_run_info_ori_kv_length = self.run_info_delay_ori_kv_length[
+            vec0_run_info_slot
+        ]
+        vec0_run_info_cmp_kv_length = self.run_info_delay_cmp_kv_length[
+            vec0_run_info_slot
+        ]
+        vec0_run_info_ori_kv_start_row = self.run_info_delay_ori_kv_start_row[
+            vec0_run_info_slot
+        ]
+        vec0_run_info_is_cmp = self.run_info_delay_is_cmp[vec0_run_info_slot]
+        vec1_run_info_slot = (
+            dtypes.uint64(
+                self.run_info_delay_clock[0] + _PIPELINE_SLOTS - _VEC1_PIPELINE_DELAY
+            )
+            % _PIPELINE_SLOTS
+        )
+        vec1_run_info_active_query_idx = self.run_info_delay_active_query_idx[
+            vec1_run_info_slot
+        ]
+        vec1_run_info_query_row_idx = self.run_info_delay_query_row_idx[
+            vec1_run_info_slot
+        ]
+        vec1_run_info_kv_tile_idx = self.run_info_delay_kv_tile_idx[vec1_run_info_slot]
+        vec1_run_info_valid_kv_length = self.run_info_delay_valid_kv_length[
+            vec1_run_info_slot
+        ]
+        vec1_run_info_kv_tile_count = self.run_info_delay_kv_tile_count[
+            vec1_run_info_slot
+        ]
+        self.run_info_delay_prior_query_tile_count[vec1_run_info_slot]
+        vec1_run_info_stream_kv_tile_idx = self.run_info_delay_stream_kv_tile_idx[
+            vec1_run_info_slot
+        ]
+        self.run_info_delay_batch_idx[vec1_run_info_slot]
+        self.run_info_delay_ori_kv_base_row[vec1_run_info_slot]
+        self.run_info_delay_cmp_kv_base_row[vec1_run_info_slot]
+        vec1_run_info_ori_kv_length = self.run_info_delay_ori_kv_length[
+            vec1_run_info_slot
+        ]
+        vec1_run_info_cmp_kv_length = self.run_info_delay_cmp_kv_length[
+            vec1_run_info_slot
+        ]
+        self.run_info_delay_ori_kv_start_row[vec1_run_info_slot]
+        vec1_run_info_is_cmp = self.run_info_delay_is_cmp[vec1_run_info_slot]
+        vec2_run_info_slot = (
+            dtypes.uint64(
+                self.run_info_delay_clock[0] + _PIPELINE_SLOTS - _VEC2_PIPELINE_DELAY
+            )
+            % _PIPELINE_SLOTS
+        )
+        vec2_run_info_active_query_idx = self.run_info_delay_active_query_idx[
+            vec2_run_info_slot
+        ]
+        vec2_run_info_query_row_idx = self.run_info_delay_query_row_idx[
+            vec2_run_info_slot
+        ]
+        vec2_run_info_kv_tile_idx = self.run_info_delay_kv_tile_idx[vec2_run_info_slot]
+        self.run_info_delay_valid_kv_length[vec2_run_info_slot]
+        vec2_run_info_kv_tile_count = self.run_info_delay_kv_tile_count[
+            vec2_run_info_slot
+        ]
+        self.run_info_delay_prior_query_tile_count[vec2_run_info_slot]
+        self.run_info_delay_stream_kv_tile_idx[vec2_run_info_slot]
+        self.run_info_delay_batch_idx[vec2_run_info_slot]
+        self.run_info_delay_ori_kv_base_row[vec2_run_info_slot]
+        self.run_info_delay_cmp_kv_base_row[vec2_run_info_slot]
+        self.run_info_delay_ori_kv_length[vec2_run_info_slot]
+        self.run_info_delay_cmp_kv_length[vec2_run_info_slot]
+        self.run_info_delay_ori_kv_start_row[vec2_run_info_slot]
+        self.run_info_delay_is_cmp[vec2_run_info_slot]
+        softmax_kv_len = scalar_select(
+            vec1_run_info_is_cmp,
+            vec1_run_info_cmp_kv_length,
+            vec1_run_info_ori_kv_length,
+        )
+        if pipeline_tick >= _VEC0_PIPELINE_DELAY and vec0_run_info_kv_tile_idx >= 0:
+            if vec0_run_info_is_cmp:
                 self.process_vec0(
                     cmp_kv_gm,
                     cmp_sparse_indices_gm,
                     cmp_block_table_gm,
                     cmp_kv_physical_rows_gm,
-                    vec0_run_info.query_row_idx,
-                    vec0_run_info.batch_idx,
-                    vec0_run_info.cmp_kv_base_row,
-                    vec0_run_info.prior_query_tile_count + vec0_run_info.kv_tile_idx,
+                    vec0_run_info_query_row_idx,
+                    vec0_run_info_batch_idx,
+                    vec0_run_info_cmp_kv_base_row,
+                    vec0_run_info_prior_query_tile_count + vec0_run_info_kv_tile_idx,
                     0,
-                    vec0_run_info.cmp_kv_length,
-                    vec0_run_info.valid_kv_length,
-                    vec0_run_info.stream_kv_tile_idx,
+                    vec0_run_info_cmp_kv_length,
+                    vec0_run_info_valid_kv_length,
+                    vec0_run_info_stream_kv_tile_idx,
                     kv_lower_rows_l1_write,
                     kv_upper_rows_l1_write,
                     dtypes.int64(0),
@@ -3106,17 +3655,17 @@ class SparseN64Kernel:
                     ori_sparse_indices_gm,
                     ori_block_table_gm,
                     ori_kv_physical_rows_gm,
-                    vec0_run_info.query_row_idx,
-                    vec0_run_info.batch_idx,
-                    vec0_run_info.ori_kv_base_row,
-                    vec0_run_info.prior_query_tile_count + vec0_run_info.kv_tile_idx,
+                    vec0_run_info_query_row_idx,
+                    vec0_run_info_batch_idx,
+                    vec0_run_info_ori_kv_base_row,
+                    vec0_run_info_prior_query_tile_count + vec0_run_info_kv_tile_idx,
                     0,
-                    vec0_run_info.ori_kv_length,
-                    vec0_run_info.valid_kv_length,
-                    vec0_run_info.stream_kv_tile_idx,
+                    vec0_run_info_ori_kv_length,
+                    vec0_run_info_valid_kv_length,
+                    vec0_run_info_stream_kv_tile_idx,
                     kv_lower_rows_l1_write,
                     kv_upper_rows_l1_write,
-                    vec0_run_info.ori_kv_start_row,
+                    vec0_run_info_ori_kv_start_row,
                     const_info.is_ori_dense,
                     const_info.ori_sparse_index_width,
                     const_info.ori_page_size,
@@ -3124,37 +3673,37 @@ class SparseN64Kernel:
                     const_info.ori_block_table_width,
                     indices_read,
                 )
-        if pipeline_tick >= _VEC1_PIPELINE_DELAY and vec1_run_info.kv_tile_idx >= 0:
+        if pipeline_tick >= _VEC1_PIPELINE_DELAY and vec1_run_info_kv_tile_idx >= 0:
             self.process_vec1(
                 softmax_lse_gm,
                 const_info,
-                vec1_run_info.active_query_idx,
-                vec1_run_info.query_row_idx,
-                vec1_run_info.kv_tile_idx,
-                vec1_run_info.stream_kv_tile_idx,
+                vec1_run_info_active_query_idx,
+                vec1_run_info_query_row_idx,
+                vec1_run_info_kv_tile_idx,
+                vec1_run_info_stream_kv_tile_idx,
                 softmax_kv_len,
-                vec1_run_info.kv_tile_count,
+                vec1_run_info_kv_tile_count,
                 valid_head_count,
                 bmm1_res_ub_read,
                 vec1_res_ub,
                 bmm2_a_l1_write,
-                vec1_run_info.valid_kv_length,
+                vec1_run_info_valid_kv_length,
             )
-        if pipeline_tick >= _VEC0_PIPELINE_DELAY and vec0_run_info.kv_tile_idx >= 0:
-            if vec0_run_info.is_cmp:
+        if pipeline_tick >= _VEC0_PIPELINE_DELAY and vec0_run_info_kv_tile_idx >= 0:
+            if vec0_run_info_is_cmp:
                 self.process_vec0(
                     cmp_kv_gm,
                     cmp_sparse_indices_gm,
                     cmp_block_table_gm,
                     cmp_kv_physical_rows_gm,
-                    vec0_run_info.query_row_idx,
-                    vec0_run_info.batch_idx,
-                    vec0_run_info.cmp_kv_base_row,
-                    vec0_run_info.prior_query_tile_count + vec0_run_info.kv_tile_idx,
+                    vec0_run_info_query_row_idx,
+                    vec0_run_info_batch_idx,
+                    vec0_run_info_cmp_kv_base_row,
+                    vec0_run_info_prior_query_tile_count + vec0_run_info_kv_tile_idx,
                     1,
-                    vec0_run_info.cmp_kv_length,
-                    vec0_run_info.valid_kv_length,
-                    vec0_run_info.stream_kv_tile_idx,
+                    vec0_run_info_cmp_kv_length,
+                    vec0_run_info_valid_kv_length,
+                    vec0_run_info_stream_kv_tile_idx,
                     kv_lower_rows_l1_write,
                     kv_upper_rows_l1_write,
                     dtypes.int64(0),
@@ -3171,17 +3720,17 @@ class SparseN64Kernel:
                     ori_sparse_indices_gm,
                     ori_block_table_gm,
                     ori_kv_physical_rows_gm,
-                    vec0_run_info.query_row_idx,
-                    vec0_run_info.batch_idx,
-                    vec0_run_info.ori_kv_base_row,
-                    vec0_run_info.prior_query_tile_count + vec0_run_info.kv_tile_idx,
+                    vec0_run_info_query_row_idx,
+                    vec0_run_info_batch_idx,
+                    vec0_run_info_ori_kv_base_row,
+                    vec0_run_info_prior_query_tile_count + vec0_run_info_kv_tile_idx,
                     1,
-                    vec0_run_info.ori_kv_length,
-                    vec0_run_info.valid_kv_length,
-                    vec0_run_info.stream_kv_tile_idx,
+                    vec0_run_info_ori_kv_length,
+                    vec0_run_info_valid_kv_length,
+                    vec0_run_info_stream_kv_tile_idx,
                     kv_lower_rows_l1_write,
                     kv_upper_rows_l1_write,
-                    vec0_run_info.ori_kv_start_row,
+                    vec0_run_info_ori_kv_start_row,
                     const_info.is_ori_dense,
                     const_info.ori_sparse_index_width,
                     const_info.ori_page_size,
@@ -3189,15 +3738,15 @@ class SparseN64Kernel:
                     const_info.ori_block_table_width,
                     indices_read,
                 )
-        if pipeline_tick >= _VEC2_PIPELINE_DELAY and vec2_run_info.kv_tile_idx >= 0:
+        if pipeline_tick >= _VEC2_PIPELINE_DELAY and vec2_run_info_kv_tile_idx >= 0:
             self.process_vec2(
                 attention_out_gm,
                 const_info,
-                vec2_run_info.active_query_idx,
-                vec2_run_info.query_row_idx,
-                vec2_run_info.kv_tile_idx,
+                vec2_run_info_active_query_idx,
+                vec2_run_info_query_row_idx,
+                vec2_run_info_kv_tile_idx,
                 0,
-                vec2_run_info.kv_tile_count,
+                vec2_run_info_kv_tile_count,
                 valid_head_count,
                 attention_acc_lower_d_ub,
                 bmm2_res_lower_d_ub,
@@ -3206,22 +3755,22 @@ class SparseN64Kernel:
             self.process_vec2(
                 attention_out_gm,
                 const_info,
-                vec2_run_info.active_query_idx,
-                vec2_run_info.query_row_idx,
-                vec2_run_info.kv_tile_idx,
+                vec2_run_info_active_query_idx,
+                vec2_run_info_query_row_idx,
+                vec2_run_info_kv_tile_idx,
                 1,
-                vec2_run_info.kv_tile_count,
+                vec2_run_info_kv_tile_count,
                 valid_head_count,
                 attention_acc_upper_d_ub,
                 bmm2_res_upper_d_ub,
                 attention_out_upper_d_ub,
             )
-        if pipeline_tick >= _VEC0_PIPELINE_DELAY and vec0_run_info.kv_tile_idx >= 0:
+        if pipeline_tick >= _VEC0_PIPELINE_DELAY and vec0_run_info_kv_tile_idx >= 0:
             kv_lower_rows_l1_write = self.buffer_storage.kv_l1_rings[0].next_write()
             kv_upper_rows_l1_write = self.buffer_storage.kv_l1_rings[1].next_write()
             if const_expr(self.kv_mode == _KV_MODE_LINEAR):
                 indices_read = self.buffer_storage.sparse_indices_ub_ring.next_read()
-        self.run_info_delay.advance()
+        self.run_info_delay_clock[0] = self.run_info_delay_clock[0] + 1
         return (kv_lower_rows_l1_write, kv_upper_rows_l1_write, indices_read)
 
     @jit
@@ -3270,7 +3819,7 @@ class SparseN64Kernel:
                         self.vec0_block.copy_in_pa_sparse_kv(
                             kv_gm,
                             kv_physical_rows_gm,
-                            query_row_idx,
+                            self.fd_address_row(query_row_idx),
                             kv_half_idx,
                             chunk,
                             valid_kv_length,
@@ -3281,7 +3830,7 @@ class SparseN64Kernel:
                     self.vec0_block.copy_in_pa_sparse_kv(
                         kv_gm,
                         kv_physical_rows_gm,
-                        query_row_idx,
+                        self.fd_address_row(query_row_idx),
                         kv_half_idx,
                         chunk,
                         valid_kv_length,
@@ -3404,26 +3953,55 @@ class SparseN64Kernel:
         # Preserve the original zero-filled history without changing any stage.
         # A full turn leaves the write slot unchanged and avoids negative taps.
         for _ in range_constexpr(_PIPELINE_SLOTS):
-            self.run_info_delay.push(
-                active_query_idx=dtypes.int64(0),
-                query_row_idx=dtypes.int64(0),
-                kv_tile_idx=dtypes.int64(0),
-                valid_kv_length=dtypes.int64(0),
-                kv_tile_count=dtypes.int64(0),
-                prior_query_tile_count=dtypes.int64(0),
-                stream_kv_tile_idx=dtypes.int64(0),
-                batch_idx=dtypes.int64(0),
-                ori_kv_base_row=dtypes.int64(0),
-                cmp_kv_base_row=dtypes.int64(0),
-                ori_kv_length=dtypes.int64(0),
-                cmp_kv_length=dtypes.int64(0),
-                ori_kv_start_row=dtypes.int64(0),
-                is_cmp=dtypes.int64(0),
+            run_info_delay_slot = (
+                dtypes.uint64(self.run_info_delay_clock[0]) % _PIPELINE_SLOTS
             )
-            self.run_info_delay.advance()
+            self.run_info_delay_active_query_idx[run_info_delay_slot] = dtypes.int64(
+                dtypes.int64(0)
+            )
+            self.run_info_delay_query_row_idx[run_info_delay_slot] = dtypes.int64(
+                dtypes.int64(0)
+            )
+            self.run_info_delay_kv_tile_idx[run_info_delay_slot] = dtypes.int64(
+                dtypes.int64(0)
+            )
+            self.run_info_delay_valid_kv_length[run_info_delay_slot] = dtypes.int64(
+                dtypes.int64(0)
+            )
+            self.run_info_delay_kv_tile_count[run_info_delay_slot] = dtypes.int64(
+                dtypes.int64(0)
+            )
+            self.run_info_delay_prior_query_tile_count[run_info_delay_slot] = (
+                dtypes.int64(dtypes.int64(0))
+            )
+            self.run_info_delay_stream_kv_tile_idx[run_info_delay_slot] = dtypes.int64(
+                dtypes.int64(0)
+            )
+            self.run_info_delay_batch_idx[run_info_delay_slot] = dtypes.int64(
+                dtypes.int64(0)
+            )
+            self.run_info_delay_ori_kv_base_row[run_info_delay_slot] = dtypes.int64(
+                dtypes.int64(0)
+            )
+            self.run_info_delay_cmp_kv_base_row[run_info_delay_slot] = dtypes.int64(
+                dtypes.int64(0)
+            )
+            self.run_info_delay_ori_kv_length[run_info_delay_slot] = dtypes.int64(
+                dtypes.int64(0)
+            )
+            self.run_info_delay_cmp_kv_length[run_info_delay_slot] = dtypes.int64(
+                dtypes.int64(0)
+            )
+            self.run_info_delay_ori_kv_start_row[run_info_delay_slot] = dtypes.int64(
+                dtypes.int64(0)
+            )
+            self.run_info_delay_is_cmp[run_info_delay_slot] = dtypes.int64(
+                dtypes.int64(0)
+            )
+            self.run_info_delay_clock[0] = self.run_info_delay_clock[0] + 1
         active_query_idx = dtypes.int64(0)
         metadata_task_count = get_metadata_task_count(
-            metadata_gm, seqused_q_gm, cu_seqlens_q, const_info
+            metadata_gm, seqused_q_gm, cu_seqlens_q, const_info, self.fd_end
         )
         metadata_task_idx = dtypes.int64(0)
         query_row_idx = dtypes.int64(0)
@@ -3466,6 +4044,7 @@ class SparseN64Kernel:
                     cu_seqlens_q,
                     const_info,
                     metadata_task_idx,
+                    self.fd_end,
                 )
                 if _context_found != 0 and query_seq_idx < valid_query_count:
                     (
@@ -3508,6 +4087,11 @@ class SparseN64Kernel:
                         head_start,
                         valid_head_count,
                     )
+                segment_begin = scalar_select(metadata_task_idx == 0, self.fd_start, 0)
+                segment_end = kv_tile_count
+                if metadata_task_idx + 1 == metadata_task_count and self.fd_end > 0:
+                    segment_end = min(segment_end, self.fd_end)
+                kv_tile_count = max(dtypes.int64(0), segment_end - segment_begin)
                 steps = kv_tile_count
             for step in range(steps):
                 kv_tile_idx = scalar_select(is_draining, -1, step)
@@ -3603,7 +4187,7 @@ class SparseN64Kernel:
         const_info,
     ):
         metadata_task_count = get_metadata_task_count(
-            metadata_gm, seqused_q_gm, cu_seqlens_q, const_info
+            metadata_gm, seqused_q_gm, cu_seqlens_q, const_info, self.fd_end
         )
         metadata_task_idx = dtypes.int64(0)
         active_query_idx = dtypes.int64(0)
@@ -3635,6 +4219,8 @@ class SparseN64Kernel:
             const_info,
             metadata_task_idx,
             metadata_task_count,
+            self.fd_start,
+            self.fd_end,
         )
         if found != 0:
             current_q = self.cube_block.copy_q_gm_to_l1(
@@ -3683,6 +4269,8 @@ class SparseN64Kernel:
                     const_info,
                     next_task_idx,
                     metadata_task_count,
+                    self.fd_start,
+                    self.fd_end,
                 )
                 if next_found != 0:
                     # Prefetch the next query's first three D tiles while this query runs.
@@ -3785,6 +4373,7 @@ class HighPerfSparseFlashMlaLauncher:
         softmax_lse_gm: Tensor,
         const_info: HighPerfSmlaConstInfo,
         blocks: dtypes.int32,
+        fd_workspace_gm: Tensor,
     ):
         SparseN64Kernel(
             self.query_head_tile_size,
@@ -3818,52 +4407,8 @@ class HighPerfSparseFlashMlaLauncher:
             attention_out_gm,
             softmax_lse_gm,
             const_info,
+            fd_workspace_gm,
         )
-
-
-def _build_compile_identity(
-    query_head_tile_size,
-    has_sink,
-    return_softmax_lse,
-    dtype_label,
-    batch_mode,
-    kv_mode,
-    is_ori_dense,
-):
-    compiler = (
-        os.environ.get("CANNBOTDSL_BISHENG_PATH")
-        or os.environ.get("CANNBOTDSL_BISHENG")
-        or shutil.which("bisheng")
-    )
-    if not compiler:
-        raise RuntimeError("Source the CANN environment before compiling or loading")
-    compiler = Path(compiler).resolve()
-    compiler_stat = compiler.stat()
-    distributions = {}
-    for name in ("cannbot-dsl", "opkit"):
-        distribution = importlib.metadata.distribution(name)
-        record = distribution.read_text("RECORD") or ""
-        distributions[name] = {
-            "version": distribution.version,
-            "record_sha256": hashlib.sha256(record.encode()).hexdigest(),
-        }
-    return {
-        "source_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
-        "query_tile_rows": query_head_tile_size,
-        "has_sink": bool(has_sink),
-        "return_softmax_lse": bool(return_softmax_lse),
-        "dtype": dtype_label,
-        "batch_mode": batch_mode,
-        "kv_mode": kv_mode,
-        "ori_dense": bool(is_ori_dense),
-        "compiler_flags": list(_COMPILER_FLAGS),
-        "architecture": "dav-3510",
-        "compiler": str(compiler),
-        "compiler_size": compiler_stat.st_size,
-        "compiler_mtime_ns": compiler_stat.st_mtime_ns,
-        "cann_home": os.environ.get("ASCEND_HOME_PATH"),
-        "distributions": distributions,
-    }
 
 
 def _sparse_n64_tensor_specs(storage_dtype):
@@ -3890,6 +4435,7 @@ def _sparse_n64_tensor_specs(storage_dtype):
         ("sink_numel", dtypes.float32),
         ("out_numel", storage_dtype),
         ("lse_numel", dtypes.float32),
+        ("fd_workspace_numel", dtypes.float32),
     )
     specs = [
         TensorSpec((Dim(name, min=0 if name == "lse_numel" else 1),), dtype)
@@ -3898,8 +4444,8 @@ def _sparse_n64_tensor_specs(storage_dtype):
     return specs
 
 
-@functools.lru_cache(maxsize=_COMPILED_VARIANT_CACHE_SIZE)
-def _get_compiled_sparse_n64(
+@aot.compile_cache
+def _compile_sparse_n64(
     query_head_tile_size,
     has_sink,
     return_softmax_lse=False,
@@ -3922,100 +4468,42 @@ def _get_compiled_sparse_n64(
         raise ValueError(f"Unsupported KV mode: {kv_mode}") from error
     specs = _sparse_n64_tensor_specs(storage_dtype)
 
-    def compile_kernel():
-        return cannbotdsl.compile(
-            HighPerfSparseFlashMlaLauncher(
-                query_head_tile_size,
-                has_sink,
-                return_softmax_lse,
-                storage_dtype,
-                batch_mode_value,
-                kv_mode_value,
-                is_ori_dense,
-            ).run,
-            *specs,
-            HighPerfSmlaConstInfo,
-            dtypes.int32,
-        )
-
-    return _load_or_compile_kernel(
-        query_head_tile_size,
-        has_sink,
-        return_softmax_lse,
-        dtype,
-        batch_mode,
-        kv_mode,
-        is_ori_dense,
-        compile_kernel,
+    return cannbotdsl.compile(
+        HighPerfSparseFlashMlaLauncher(
+            query_head_tile_size,
+            has_sink,
+            return_softmax_lse,
+            storage_dtype,
+            batch_mode_value,
+            kv_mode_value,
+            is_ori_dense,
+        ).run,
+        *specs[:-1],
+        HighPerfSmlaConstInfo,
+        dtypes.int32,
+        specs[-1],
     )
 
 
-def _load_cached_n64_artifact(artifact, manifest, identity):
-    if not artifact.is_file() or not manifest.is_file():
-        return None
-    try:
-        if json.loads(manifest.read_text()) == identity:
-            return load(str(artifact))
-    except (OSError, ValueError):
-        pass  # Rebuild invalid entries while the caller still owns the lock.
-    return None
-
-
-def _publish_n64_manifest(build_dir, manifest, identity):
-    with tempfile.NamedTemporaryFile(
-        mode="w", dir=build_dir, suffix=".json", delete=False
-    ) as output:
-        json.dump(identity, output, indent=2)
-        temporary_manifest = Path(output.name)
-    temporary_manifest.replace(manifest)
-
-
-def _load_or_compile_kernel(
+def _get_compiled_sparse_n64(
     query_head_tile_size,
     has_sink,
-    return_softmax_lse,
-    dtype,
-    batch_mode,
-    kv_mode,
-    is_ori_dense,
-    compile_kernel,
+    return_softmax_lse=False,
+    dtype="bf16",
+    batch_mode="single",
+    kv_mode="linear",
+    is_ori_dense=False,
 ):
-    identity = _build_compile_identity(
-        query_head_tile_size,
-        has_sink,
-        return_softmax_lse,
-        dtype,
-        batch_mode,
-        kv_mode,
-        is_ori_dense,
-    )
-    fingerprint = hashlib.sha256(
-        json.dumps(identity, sort_keys=True).encode()
-    ).hexdigest()[:_BUILD_HASH_PREFIX_LENGTH]
-    build_root = Path(__file__).parent
-    build_dir = (
-        build_root
-        / (
-            f"build_h{query_head_tile_size}_sink{int(has_sink)}_lse{int(return_softmax_lse)}"
-            f"_dtype{dtype}_batch{batch_mode}"
-            f"_kv{kv_mode}_csa{int(is_ori_dense)}"
+    with _compilation_environment():
+        return _compile_sparse_n64(
+            query_head_tile_size,
+            has_sink,
+            return_softmax_lse,
+            dtype,
+            batch_mode,
+            kv_mode,
+            is_ori_dense,
         )
-        / fingerprint
-    )
-    build_dir.mkdir(parents=True, exist_ok=True)
-    artifact = build_dir / "kernel.so"
-    manifest = build_dir / "build_identity.json"
-    # Serialize publication across processes and keep the .so/sidecar pair intact.
-    with _COMPILATION_LOCK, (build_dir / "compile.lock").open("a") as compile_lock:
-        fcntl.flock(compile_lock, fcntl.LOCK_EX)
-        result = _load_cached_n64_artifact(artifact, manifest, identity)
-        if result is not None:
-            return result
-        with _compilation_environment(build_dir):
-            result = compile_kernel()
-            result.save(str(artifact))
-        _publish_n64_manifest(build_dir, manifest, identity)
-        return result
 
 
 def _require(condition, message):
@@ -4159,6 +4647,7 @@ class SparseN64Scratch:
     cu_ori_kv: torch.Tensor
     cu_cmp_kv: torch.Tensor
     sinks_gm: torch.Tensor
+    fd_workspace_gm: torch.Tensor
 
 
 def _validate_n64_query(call):
@@ -4459,7 +4948,7 @@ def _prepare_n64_physical_rows(call, prepared, empty_int32):
     )
     ori_kv_physical_rows_gm = (
         torch.empty(
-            prepared.query.shape[0] * ori_addr_stride,
+            (prepared.query.shape[0] + 2 * prepared.cube_core_count) * ori_addr_stride,
             dtype=torch.int32,
             device=prepared.query.device,
         )
@@ -4468,7 +4957,7 @@ def _prepare_n64_physical_rows(call, prepared, empty_int32):
     )
     cmp_kv_physical_rows_gm = (
         torch.empty(
-            prepared.query.shape[0] * cmp_addr_stride,
+            (prepared.query.shape[0] + 2 * prepared.cube_core_count) * cmp_addr_stride,
             dtype=torch.int32,
             device=prepared.query.device,
         )
@@ -4520,6 +5009,11 @@ def _prepare_n64_scratch(call, layout, prepared):
         cu_ori_kv=cu_ori_kv,
         cu_cmp_kv=cu_cmp_kv,
         sinks_gm=sinks_gm,
+        fd_workspace_gm=torch.empty(
+            2 * prepared.cube_core_count * (prepared.query.shape[1] * _HEAD_DIM + 128),
+            dtype=torch.float32,
+            device=prepared.query.device,
+        ),
     )
 
 
@@ -4604,6 +5098,7 @@ def _pack_n64_kernel_arguments(
         prepared.cube_core_count
         if call.metadata is not None
         else min(prepared.query.shape[0], prepared.cube_core_count),
+        scratch.fd_workspace_gm,
     )
     return arguments
 

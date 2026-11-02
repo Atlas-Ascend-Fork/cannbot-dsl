@@ -9,13 +9,14 @@
 
 The public ABI follows ops-transformer SparseFlashMlaMetadata.  The scheduling
 algorithm is ported from its arch35 AICPU source.  This target deliberately keeps
-FlashDecode and batch-consistency disabled, matching the supported SMLA kernel.
+batch-consistency disabled; ordinary FlashDecode is enabled explicitly by the caller.
 """
 
 import tempfile
 from functools import lru_cache
 
-from cannbotdsl.aicpu import GmIn, GmOut, I32, I64, U32, aicpu_kernel
+from cannbotdsl.aicpu import I32, I64, U32, aicpu_kernel
+from cannbotdsl.aicpu import gm_in, gm_out
 
 AIC_CORE_MAX_NUM = 36
 AIV_CORE_MAX_NUM = 72
@@ -61,19 +62,22 @@ FA_TOLERANCE_RATIO = 2
 COST_WEIGHT_M = 6
 COST_WEIGHT_S2 = 10
 S2_BASE_SIZE = 128
+# The metadata planner owns the FD policy. It is intentionally not exposed by
+# the public metadata or attention interfaces.
+SUPPORT_FD = True
 
 
 class _SparseFlashMlaMetadataArgs:
-    cu_seqlens_q: GmIn(I32)
-    cu_seqlens_ori_kv: GmIn(I32)
-    cu_seqlens_cmp_kv: GmIn(I32)
-    seqused_q: GmIn(I32)
-    seqused_ori_kv: GmIn(I32)
-    seqused_cmp_kv: GmIn(I32)
-    cmp_residual_kv: GmIn(I32)
-    ori_topk_length: GmIn(I32)
-    cmp_topk_length: GmIn(I32)
-    metadata: GmOut(I32)
+    cu_seqlens_q: gm_in(I32)
+    cu_seqlens_ori_kv: gm_in(I32)
+    cu_seqlens_cmp_kv: gm_in(I32)
+    seqused_q: gm_in(I32)
+    seqused_ori_kv: gm_in(I32)
+    seqused_cmp_kv: gm_in(I32)
+    cmp_residual_kv: gm_in(I32)
+    ori_topk_length: gm_in(I32)
+    cmp_topk_length: gm_in(I32)
+    metadata: gm_out(I32)
 
     cu_q_len: U32
     cu_ori_len: U32
@@ -106,6 +110,7 @@ class _SparseFlashMlaMetadataArgs:
     aic_core_num: U32
     aiv_core_num: U32
     is_batch_consistency: U32
+    support_fd: I32
 
 
 def _ceil_div(x, y):
@@ -322,6 +327,201 @@ def _calc_row(a, b, row, out):
     out[3] = ori_blocks + cmp_blocks
 
 
+def _schedule_fd(a, total_cost, whole_max_cost, batch_cost, batch_loops):
+    # Keep only per-core cuts. Query-sized arrays exceed the AICPU arena on
+    # long prefills; row costs can be recomputed while walking the same cuts.
+    group = a.num_heads_q // a.num_heads_kv
+    full_cost = _block_cost(group, S2_BASE_SIZE)
+    ends_batch = zeros(I64, AIC_CORE_MAX_NUM)
+    ends_query = zeros(I64, AIC_CORE_MAX_NUM)
+    ends_tile = zeros(I64, AIC_CORE_MAX_NUM)
+    loops = zeros(I64, AIC_CORE_MAX_NUM)
+    batch = 0
+    query = 0
+    tile = 0
+    remaining = total_cost
+    used = 0
+    split_max = 0
+    for core in range(0, a.aic_core_num):
+        while batch < a.batch_size and query >= _seq_q(a, batch):
+            batch += 1
+            query = 0
+        if batch >= a.batch_size:
+            break
+        limit = remaining // (a.aic_core_num - core)
+        core_cost = 0
+        core_loops = 0
+        while batch < a.batch_size:
+            if query >= _seq_q(a, batch):
+                batch += 1
+                query = 0
+                continue
+            ori = _active_tokens(a, batch, query, 0) if a.has_ori_kv != 0 else 0
+            cmp = _active_tokens(a, batch, query, 1) if a.has_cmp_kv != 0 else 0
+            ori_blocks = _ceil_div(ori, S2_BASE_SIZE)
+            cmp_blocks = _ceil_div(cmp, S2_BASE_SIZE)
+            blocks = ori_blocks + cmp_blocks
+            if blocks == 0:
+                query += 1
+                tile = 0
+                continue
+            ori_last = _block_cost(
+                group, ori % S2_BASE_SIZE if ori % S2_BASE_SIZE != 0 else S2_BASE_SIZE
+            )
+            cmp_last = _block_cost(
+                group, cmp % S2_BASE_SIZE if cmp % S2_BASE_SIZE != 0 else S2_BASE_SIZE
+            )
+            row_left = (ori_blocks - 1) * full_cost + ori_last if ori_blocks > 0 else 0
+            row_left += (cmp_blocks - 1) * full_cost + cmp_last if cmp_blocks > 0 else 0
+            if tile > 0:
+                prior_ori = tile if tile < ori_blocks else ori_blocks
+                prior_cmp = tile - prior_ori
+                consumed = prior_ori * full_cost
+                if ori_blocks > 0 and prior_ori == ori_blocks:
+                    consumed += ori_last - full_cost
+                consumed += prior_cmp * full_cost
+                row_left -= consumed
+            last_cost = cmp_last if cmp_blocks > 0 else ori_last
+            # Preserve whole-batch acceptance using the FA planner's totals.
+            if tile == 0 and query == 0:
+                batch_left = batch_cost[batch]
+                if limit + last_cost // FA_TOLERANCE_RATIO >= core_cost + batch_left:
+                    core_loops += batch_loops[batch]
+                    core_cost += batch_left
+                    batch += 1
+                    query = 0
+                    continue
+            if (
+                core + 1 == a.aic_core_num
+                or limit + last_cost // FA_TOLERANCE_RATIO >= core_cost + row_left
+            ):
+                core_cost += row_left
+                core_loops += blocks - tile
+                query += 1
+                tile = 0
+                continue
+            cost = full_cost
+            if tile + 1 == ori_blocks:
+                cost = ori_last
+            if tile + 1 == blocks and cmp_blocks > 0:
+                cost = cmp_last
+            if core_loops > 0 and limit + cost // FA_TOLERANCE_RATIO < core_cost + cost:
+                break
+            core_cost += cost
+            core_loops += 1
+            tile += 1
+            if tile == blocks:
+                query += 1
+                tile = 0
+        # Match the flattened row representation, including empty batches and
+        # its terminal (batch_size, 0) sentinel.
+        while batch < a.batch_size and query >= _seq_q(a, batch):
+            batch += 1
+            query = 0
+        ends_batch[core] = batch
+        ends_query[core] = query
+        ends_tile[core] = tile
+        loops[core] = core_loops
+        used = core + 1
+        remaining -= core_cost
+        if core_cost > split_max:
+            split_max = core_cost
+    split_points = 0
+    for core in range(0, used):
+        if ends_tile[core] != 0:
+            split_points += 1
+    if split_points == 0 or whole_max_cost - split_max < 4 * full_cost:
+        return 0
+    slot_b = zeros(I64, AIV_CORE_MAX_NUM)
+    slot_q = zeros(I64, AIV_CORE_MAX_NUM)
+    slot_count = 0
+    previous_batch = 0
+    previous_query = 0
+    previous_tile = 0
+    max_loops = 0
+    for core in range(0, a.aic_core_num):
+        fa = core * FA_METADATA_SIZE
+        for field in range(0, FA_METADATA_SIZE):
+            a.metadata[fa + field] = 0
+        if core < used:
+            end_batch = ends_batch[core]
+            end_query = ends_query[core]
+            end_tile = ends_tile[core]
+            a.metadata[fa] = 1
+            a.metadata[fa + 1] = 0 if core == 0 else previous_batch
+            a.metadata[fa + 2] = 0 if core == 0 else previous_query
+            a.metadata[fa + 3] = previous_tile
+            a.metadata[fa + 4] = end_batch
+            a.metadata[fa + 5] = end_query
+            a.metadata[fa + 6] = end_tile
+            a.metadata[fa + 7] = slot_count
+            if previous_tile > 0:
+                slot_b[slot_count] = previous_batch
+                slot_q[slot_count] = previous_query
+                slot_count += 1
+            if end_tile > 0 and (
+                end_batch != previous_batch
+                or end_query != previous_query
+                or previous_tile == 0
+            ):
+                slot_b[slot_count] = end_batch
+                slot_q[slot_count] = end_query
+                slot_count += 1
+            previous_batch = end_batch
+            previous_query = end_query
+            previous_tile = end_tile
+            if loops[core] > max_loops:
+                max_loops = loops[core]
+    for core in range(0, a.aic_core_num):
+        a.metadata[core * FA_METADATA_SIZE + FA_S2_MAX_NUM] = max_loops
+    group_start = zeros(I64, AIC_CORE_MAX_NUM)
+    group_size = zeros(I64, AIC_CORE_MAX_NUM)
+    group_count = 0
+    position = 0
+    while position < slot_count:
+        end = position + 1
+        while (
+            end < slot_count
+            and slot_b[end] == slot_b[position]
+            and slot_q[end] == slot_q[position]
+        ):
+            end += 1
+        group_start[group_count] = position
+        group_size[group_count] = end - position
+        group_count += 1
+        position = end
+    used_vec = 0
+    remaining_parts = slot_count
+    for g in range(0, group_count):
+        parts = group_size[g]
+        available = a.aiv_core_num - used_vec
+        heads = a.num_heads_q
+        vectors = available * parts // remaining_parts
+        if vectors < 1:
+            vectors = 1
+        reserve = group_count - g - 1
+        if vectors > available - reserve:
+            vectors = available - reserve
+        if vectors > heads:
+            vectors = heads
+        for v in range(0, vectors):
+            base = AIC_CORE_MAX_NUM * FA_METADATA_SIZE + used_vec * FD_METADATA_SIZE
+            slot = group_start[g]
+            h0 = heads * v // vectors
+            h1 = heads * (v + 1) // vectors
+            a.metadata[base] = 1
+            a.metadata[base + 1] = slot_b[slot]
+            a.metadata[base + 2] = slot_q[slot]
+            a.metadata[base + 3] = slot
+            a.metadata[base + 4] = parts
+            a.metadata[base + 5] = h0
+            a.metadata[base + 6] = h1 - h0
+            used_vec += 1
+        remaining_parts -= parts
+    a.metadata[900] = used_vec
+    return 0
+
+
 @aicpu_kernel
 def _sparse_flash_mla_metadata_kernel(a: _SparseFlashMlaMetadataArgs):
     # AICPU resolves these allocation intrinsics from the AST, not Python globals.
@@ -358,6 +558,7 @@ def _sparse_flash_mla_metadata_kernel(a: _SparseFlashMlaMetadataArgs):
     if split_g != 0:
         schedule_cores = schedule_cores // 2
 
+    max_core_cost = 0
     used_core_num = 0
     max_s2_loop_num = 0
     bn2_total = a.batch_size * a.num_heads_kv
@@ -437,6 +638,8 @@ def _sparse_flash_mla_metadata_kernel(a: _SparseFlashMlaMetadataArgs):
             gs1_end[core] = cur_row
             s2_end[core] = 0
             remaining_cost = remaining_cost - core_cost
+            if core_cost > max_core_cost:
+                max_core_cost = core_cost
             if core_loops > max_s2_loop_num:
                 max_s2_loop_num = core_loops
             used_core_num = core + 1
@@ -472,6 +675,8 @@ def _sparse_flash_mla_metadata_kernel(a: _SparseFlashMlaMetadataArgs):
                 a.metadata[base + FA_M_END_INDEX] = gs1_end[i]
                 a.metadata[base + FA_S2_END_INDEX] = 0
                 a.metadata[base + FA_FIRST_FD_DATA_WORKSPACE_IDX_INDEX] = 0
+    if a.support_fd != 0 and a.num_heads_q <= 64 and a.num_heads_kv == 1:
+        _schedule_fd(a, total_cost, max_core_cost, batch_cost, batch_loops)
     return 0
 
 
@@ -639,6 +844,7 @@ def sparse_flash_mla_metadata(
         aic_core_num=aic,
         aiv_core_num=aiv,
         is_batch_consistency=0,
+        support_fd=int(SUPPORT_FD),
     )
     for tensor in tensors.values():
         if tensor is not None:
