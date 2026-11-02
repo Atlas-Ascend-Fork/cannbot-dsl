@@ -13,8 +13,8 @@ import tempfile
 import torch
 
 from cannbotdsl.aicpu import (
-    GmIn,
-    GmOut,
+    gm_in,
+    gm_out,
     I32,
     I64,
     U32,
@@ -45,9 +45,9 @@ METADATA_ALIGNMENT_ELEMENTS = 4096
 
 
 class _Args:
-    q_seq_lens: GmIn(I32)
-    kv_seq_lens: GmIn(I32)
-    metadata: GmOut(I32)
+    q_seq_lens: gm_in(I32)
+    kv_seq_lens: gm_in(I32)
+    metadata: gm_out(I32)
     batch_size: U32
     q_heads: U32
     kv_heads: U32

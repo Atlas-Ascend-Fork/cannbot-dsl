@@ -38,6 +38,56 @@ SCENARIOS = (
 )
 
 
+@pytest.mark.parametrize(
+    "input_dtype,output_dtype",
+    [
+        (torch.float16, torch.float16),
+        (torch.float8_e4m3fn, torch.float16),
+        (torch.float8_e4m3fn, torch.bfloat16),
+    ],
+)
+def test_single_key_dtype_paths(input_dtype, output_dtype):
+    """A single visible key makes the exact result V for every query head."""
+    pytest.importorskip("torch_npu")
+    q = torch.zeros((1, 3, 128)).to(input_dtype).npu()
+    k = torch.zeros((1, 128, 1, 128)).to(input_dtype).npu()
+    v = torch.full((1, 128, 1, 128), 0.5).to(input_dtype).npu()
+    indices = torch.zeros((1, 1, 1), dtype=torch.int32).npu()
+    counts = torch.ones((1, 1), dtype=torch.int32).npu()
+    cu = torch.tensor([0, 1], dtype=torch.int64).npu()
+    lengths = torch.ones(1, dtype=torch.int32).npu()
+    table = torch.zeros((1, 1), dtype=torch.int32).npu()
+    planned = metadata128.qwen_sparse_attn_metadata(
+        indices, counts, cu, lengths, q, table, seqused_q=lengths, pack_queries=10
+    )
+    mode = (
+        qsa.QuantMode.FP8_FULL_QUANT
+        if input_dtype == torch.float8_e4m3fn
+        else qsa.QuantMode.NO_QUANT
+    )
+    actual, _ = qsa.qwen_sparse_attn(
+        q,
+        k,
+        v,
+        indices,
+        counts,
+        [1, 128],
+        attn_mask=_causal_mask(q.device),
+        cu_seqlens_q=cu,
+        seqused_q=lengths,
+        seqused_kv=lengths,
+        block_table=table,
+        metadata=planned,
+        quant_mode=mode,
+        attention_out_dtype=output_dtype,
+    )
+    torch.npu.synchronize()
+    assert actual.dtype == output_dtype
+    torch.testing.assert_close(
+        actual.cpu(), torch.full((1, 3, 128), 0.5, dtype=output_dtype), rtol=0, atol=0
+    )
+
+
 def _cube_dot(lhs, rhs):
     acc = torch.zeros(lhs.shape[0], rhs.shape[1], dtype=torch.float32)
     lhs, rhs = lhs.double(), rhs.double()

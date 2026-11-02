@@ -14,8 +14,8 @@ import tempfile
 import torch
 
 from cannbotdsl.aicpu import (
-    GmIn,
-    GmOut,
+    gm_in,
+    gm_out,
     I32,
     I64,
     U32,
@@ -74,10 +74,10 @@ VECTOR_OUTPUT_BASE_COST = 1
 
 
 class _MetadataArgs:
-    actual_seq: GmIn(I32)
-    query_positions: GmIn(I32)
-    block_table: GmIn(I32)
-    metadata: GmOut(I32)
+    actual_seq: gm_in(I32)
+    query_positions: gm_in(I32)
+    block_table: gm_in(I32)
+    metadata: gm_out(I32)
     batch_size: U32
     total_query: U32
     max_pages: U32

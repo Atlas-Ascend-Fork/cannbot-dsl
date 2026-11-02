@@ -16,17 +16,18 @@ import os
 from threading import RLock
 
 import cannbotdsl as dsl
+from cannbotdsl import make_layout
 from cannbotdsl.lang.host import host
 import torch
 from cannbotdsl import Constexpr, Dim, TensorSpec, const_expr, dtypes
 from cannbotdsl.buffer import Buffer
-from cannbotdsl.channel import Channel, ChannelKind
+from cannbotdsl.ring_buffer import RingBuffer
 from cannbotdsl.lang.jit import jit
 from cannbotdsl.lang.kernel import kernel
 from cannbotdsl.lang.vf import vf
 from cannbotdsl.ops.arch import get_block_idx, get_subblock_id
 from cannbotdsl.ops.matmul import matmul
-from cannbotdsl.ops.memcpy import make_copy_engine, mem_copy
+from cannbotdsl.ops.memcpy import mem_copy
 from cannbotdsl.ops.sync import vec_sync_all
 from cannbotdsl.reg import (
     update_mask,
@@ -257,34 +258,37 @@ class Matmul:
     """管理 Query/Key 搬运、Matmul 点积和跨核分数输出。"""
 
     def __init__(self):
-        self.nd2nz = make_copy_engine(format_transform="nd2nz")
         # 每个物理页包含一个完整 N256 评分分组。
-        self.key_nd2nz = make_copy_engine(format_transform="nd2nz")
-        self.fixpipe = make_copy_engine(split_axis=0)
-        self.q_l1 = Buffer(MemLoc.L1, (M_TILE, DIM), dtypes.bfloat16)
-        self.k_l1 = Channel(
+        self.q_l1 = Buffer(MemLoc.L1, dtypes.bfloat16, make_layout((M_TILE, DIM)))
+        self.k_l1 = RingBuffer(
             MemLoc.L1,
-            (K_COMPRESSED_UNITS_PER_BLOCK, DIM),
             dtypes.bfloat16,
+            make_layout((K_COMPRESSED_UNITS_PER_BLOCK, DIM)),
             depth=KEY_L1_CHANNEL_DEPTH,
         )
-        self.l0a = Channel(
-            MemLoc.L0A, (M_TILE, DIM), dtypes.bfloat16, depth=CUBE_CHANNEL_DEPTH
+        self.l0a = RingBuffer(
+            MemLoc.L0A,
+            dtypes.bfloat16,
+            make_layout((M_TILE, DIM)),
+            depth=CUBE_CHANNEL_DEPTH,
         )
-        self.l0b = Channel(
-            MemLoc.L0B, (N_CHUNK, DIM), dtypes.bfloat16, depth=K_L0_CHANNEL_DEPTH
+        self.l0b = RingBuffer(
+            MemLoc.L0B,
+            dtypes.bfloat16,
+            make_layout((N_CHUNK, DIM)),
+            depth=K_L0_CHANNEL_DEPTH,
         )
-        self.l0c = Channel(
+        self.l0c = RingBuffer(
             MemLoc.L0C,
-            (M_TILE, K_COMPRESSED_UNITS_PER_BLOCK),
             dtypes.float32,
+            make_layout((M_TILE, K_COMPRESSED_UNITS_PER_BLOCK)),
             depth=CUBE_CHANNEL_DEPTH,
         )
 
     @jit
     def load_q_resident(self, q, q_block_start):
         base = q[q_block_start * HEADS :, None]
-        mem_copy(self.q_l1, tile_slice(base, (M_TILE, DIM), (0, 0)), engine=self.nd2nz)
+        mem_copy(self.q_l1, tile_slice(base, (M_TILE, DIM), (0, 0)))
 
     @jit
     def load_key(self, k, page_table, bn, key_base, valid_blocks):
@@ -294,20 +298,17 @@ class Matmul:
         if logical_page * PAGE_SIZE < valid_blocks:
             physical_page = dtypes.int64(page_table[bn, logical_page])
         source = tile_slice(k[physical_page, None, None], (PAGE_SIZE, DIM), (0, 0))
-        mem_copy(self.k_l1.produce(), source, engine=self.key_nd2nz)
+        mem_copy(self.k_l1.next_write(), source)
 
     @jit
     def compute_qk(self):
-        k_ready = self.k_l1.consume()
-        score_write = self.l0c.produce()
+        k_ready = self.k_l1.next_read()
+        score_write = self.l0c.next_write()
         for n_sub in tuple(range(K_COMPRESSED_UNITS_PER_BLOCK // N_CHUNK)):
-            q_l0 = self.l0a.produce()
-            k_l0 = self.l0b.produce()
+            q_l0 = self.l0a.next_write()
+            k_l0 = self.l0b.next_write()
             mem_copy(q_l0, self.q_l1)
-            mem_copy(
-                k_l0,
-                tile_slice(k_ready, (N_CHUNK, DIM), (n_sub, 0)),
-            )
+            mem_copy(k_l0, tile_slice(k_ready, (N_CHUNK, DIM), (n_sub, 0)))
             matmul(
                 tile_slice(score_write, (M_TILE, N_CHUNK), (0, n_sub)),
                 q_l0,
@@ -317,7 +318,7 @@ class Matmul:
 
     @jit
     def store_score(self, score_channel):
-        mem_copy(score_channel.produce(), self.l0c.consume(), engine=self.fixpipe)
+        mem_copy(score_channel.next_write(), self.l0c.next_read().partition(dim=0))
 
 
 class Vector:
@@ -326,8 +327,6 @@ class Vector:
     def __init__(self):
         ub_storage = dsl.UB.view(262144)
         self.subblock = get_subblock_id()
-        self.copy_i32 = make_copy_engine()
-        self.copy_u16 = make_copy_engine()
         # TopK 使用 UB 区间 [UB_MERGED_CANDIDATE_SCORES_ADDR, TOPK_UB_END)。
         # 跨核分数 Channel 在该区间之后对齐分配，避免与 TopK 工作区重叠。
         # score_output 与 merged_candidate_scores 在 Vector 的不同计算阶段复用空间；
@@ -460,7 +459,7 @@ class Vector:
             .view(dtype=dtypes.int32)
             .view((RADIX_ROWS, PARAM_ROW_STRIDE)),
         )
-        self.output = dsl.make_channel(
+        self.output = dsl.make_ring_buffer(
             [
                 ub_storage[
                     UB_OUTPUT_ADDR + slot * (1 * OUTPUT_STRIDE * 4) : UB_OUTPUT_ADDR
@@ -470,9 +469,9 @@ class Vector:
                 .view(dtype=dtypes.int32)
                 .view((1, OUTPUT_STRIDE))
                 for slot in range(OUTPUT_CHANNEL_DEPTH)
-            ],
+            ]
         )
-        self.score_input = dsl.make_channel(
+        self.score_input = dsl.make_ring_buffer(
             [
                 ub_storage[
                     UB_SCORE_INPUT_ADDR
@@ -486,9 +485,9 @@ class Vector:
                 .view(dtype=dtypes.uint16)
                 .view((RADIX_ROWS, K_COMPRESSED_UNITS_PER_TOPK_CHUNK))
                 for slot in range(SCORE_INPUT_CHANNEL_DEPTH)
-            ],
+            ]
         )
-        self.score_output = dsl.make_channel(
+        self.score_output = dsl.make_ring_buffer(
             [
                 ub_storage[
                     UB_MERGED_CANDIDATE_SCORES_ADDR
@@ -502,7 +501,7 @@ class Vector:
                 .view(dtype=dtypes.uint16)
                 .view((M_VECTOR, K_COMPRESSED_UNITS_PER_BLOCK))
                 for slot in range(SCORE_CHANNEL_DEPTH)
-            ],
+            ]
         )
         self.empty_indices = self.stream_indices
         # 单个 AIV 的 TopK UB 峰值由 TOPK_UB_END 给出。
@@ -571,7 +570,7 @@ class Vector:
 
     @jit
     def relu_reduce_stream(self, head_scores):
-        score_slot = self.score_output.produce()
+        score_slot = self.score_output.next_write()
         # 评分 VF：逐 head 将负分数置零，再累加四个 head；转换为 UINT16 排序分数写入输出槽。
         with vf(mode="simd"):
             fp32_mask, _ = update_mask(VL_U32, elem_bits=32)
@@ -605,13 +604,12 @@ class Vector:
         dst = gm_score_workspace[core_base:, group * K_COMPRESSED_UNITS_PER_BLOCK :]
         mem_copy(
             tile_slice(dst, (M_VECTOR, K_COMPRESSED_UNITS_PER_BLOCK), (0, 0)),
-            self.score_output.consume(),
-            engine=self.copy_u16,
+            self.score_output.next_read(),
         )
 
     @jit
     def zero_scores(self):
-        score_slot = self.score_output.produce()
+        score_slot = self.score_output.next_write()
         # 补零 VF：将当前评分输出槽填为无效分数 0，补齐最后一个 TopK chunk 的缺失基本块。
         with vf(mode="simd"):
             mask, _ = update_mask(VL_U16, elem_bits=16)
@@ -628,9 +626,8 @@ class Vector:
             topk_chunk_index * K_COMPRESSED_UNITS_PER_TOPK_CHUNK :,
         ]
         mem_copy(
-            self.score_input.produce(),
+            self.score_input.next_write(),
             tile_slice(src, (RADIX_ROWS, K_COMPRESSED_UNITS_PER_TOPK_CHUNK), (0, 0)),
-            engine=self.copy_u16,
         )
 
     @jit
@@ -1294,8 +1291,7 @@ class Vector:
                 dest = gm_out[q_block_start + query :, None]
                 mem_copy(
                     tile_slice(dest, (1, OUTPUT_STRIDE), (0, 0)),
-                    self.output.consume(),
-                    engine=self.copy_i32,
+                    self.output.next_read(),
                 )
 
     @jit
@@ -1408,7 +1404,7 @@ class Vector:
                     (RADIX_ROWS, MAX_TOPK),
                     ((topk_chunk_index + 1) % TOPK_INDEX_SLOT_COUNT, 0),
                 )
-                input_scores = self.score_input.consume()
+                input_scores = self.score_input.next_read()
                 # 输入双缓冲：提交下一 chunk 的搬运，再消费当前 chunk，
                 # 使 MTE2 搬运有机会与当前组的 Vector 计算重叠。
                 if topk_chunk_index + 1 < k_topk_chunk_count:
@@ -1545,7 +1541,7 @@ class Vector:
 
     @jit
     def _pack_one(self, row_in_group, index_source):
-        output_slot = self.output.produce()
+        output_slot = self.output.next_write()
         # 将组内第 row_in_group 行的压缩 K 逻辑索引打包到 output UB；GM 写出由调用方完成。
         # 输出 VF：将入选压缩块展开为原始 token 索引，追加可见尾部，填充无效列并写入有效数量。
         with vf(mode="simd"):
@@ -1645,7 +1641,7 @@ class QSAIndexerKernel:
         gm_score_workspace: Tensor,
     ):
         ub_storage = dsl.UB.view(262144)
-        score_channel = dsl.make_channel(
+        score_channel = dsl.make_ring_buffer(
             [
                 ub_storage[
                     CROSS_CORE_SCORE_ADDR
@@ -1659,8 +1655,7 @@ class QSAIndexerKernel:
                 .view(dtype=dtypes.float32)
                 .view((SCORE_ROWS_PER_VECTOR, K_COMPRESSED_UNITS_PER_BLOCK))
                 for slot in range(SCORE_CHANNEL_DEPTH)
-            ],
-            kind=ChannelKind.CrossCore,
+            ]
         )
         cube_ops = Matmul()
         vector = Vector()
@@ -1715,7 +1710,7 @@ class QSAIndexerKernel:
     ):
         cube_ops.compute_qk()
         cube_ops.store_score(score_channel)
-        vector.relu_reduce_stream(score_channel.consume())
+        vector.relu_reduce_stream(score_channel.next_read())
         vector.save_scores(gm_score_workspace, core_base, k_block_idx)
 
     @jit
@@ -1785,6 +1780,9 @@ class QSAIndexerKernel:
             ):
                 vector.zero_scores()
                 vector.save_scores(gm_score_workspace, core_base, k_block_idx)
+            # 评分输出与 TopK 候选复用 UB；先完成 MTE3 写出，再切换到
+            # MTE2 读取工作区及 Vector 覆写候选，避免短 K 路径读到旧分数。
+            vec_sync_all()
             vector.select_and_store(
                 gm_score_workspace,
                 core_base,

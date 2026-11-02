@@ -29,7 +29,6 @@ from threading import Lock
 import cannbotdsl as cb
 import torch
 from cannbotdsl import (
-    ChannelKind,
     Constexpr,
     MemLoc,
     Tensor,
@@ -38,7 +37,6 @@ from cannbotdsl import (
     get_block_idx,
     get_subblock_id,
     jit,
-    make_copy_engine,
     matmul,
     mem_copy,
     reinterpret,
@@ -48,7 +46,8 @@ from cannbotdsl import (
 )
 from cannbotdsl import reg as rr
 from cannbotdsl.buffer import Buffer
-from cannbotdsl.channel import Channel
+from cannbotdsl.ring_buffer import RingBuffer
+from cannbotdsl import make_layout
 from cannbotdsl.lang.host import host
 
 if __package__:
@@ -94,8 +93,8 @@ class QueryTail:
         self.dim = dim
         # 无法组成完整 M32 Q tile 的 GQA group 使用这些回退缓冲区；完整 M32
         # group 通过 Cube MTE2 直接搬运，不经过这些缓冲区。
-        self.row = Channel(MemLoc.UB, (1, dim), dtype, depth=2)
-        self.q = Buffer(MemLoc.UB, (16, dim), dtype, data_format="nz")
+        self.row = RingBuffer(MemLoc.UB, dtype, make_layout((1, dim)), depth=2)
+        self.q = Buffer(MemLoc.UB, dtype, make_layout((16, dim)), data_format="nz")
 
     @jit
     def clear_q_tail(self, dst):
@@ -160,15 +159,10 @@ class QueryTail:
         for row in range(active_rows):
             g_idx = g_chunk_idx * 32 + logical_row_base + row
             n1_idx = n2_idx * group + g_idx
-            mem_copy(self.row.produce(), _bf16_row_tnd(q, t_idx, n1_idx, self.dim))
-            self.scatter(dst, self.row.consume(), row)
+            mem_copy(self.row.next_write(), _bf16_row_tnd(q, t_idx, n1_idx, self.dim))
+            self.scatter(dst, self.row.next_read(), row)
         vec_sync_all()
-        mem_copy(
-            target.produce(),
-            self.q,
-            engine=make_copy_engine(split_axis=0),
-            part_id=vec_idx,
-        )
+        mem_copy(target.next_write().partition(dim=0, part_id=vec_idx), self.q)
 
     @jit
     def load_q_packed_tnd(
@@ -192,17 +186,12 @@ class QueryTail:
             g_idx = packed_row % group
             if q_slot < q_token_num:
                 mem_copy(
-                    self.row.produce(),
+                    self.row.next_write(),
                     _bf16_row_tnd(q, q_idx + q_slot, n2_idx * group + g_idx, self.dim),
                 )
-                self.scatter(self.q, self.row.consume(), row)
+                self.scatter(self.q, self.row.next_read(), row)
         vec_sync_all()
-        mem_copy(
-            target.produce(),
-            self.q,
-            engine=make_copy_engine(split_axis=0),
-            part_id=vec_idx,
-        )
+        mem_copy(target.next_write().partition(dim=0, part_id=vec_idx), self.q)
 
 
 class Fp8QueryTail:
@@ -210,9 +199,13 @@ class Fp8QueryTail:
 
     def __init__(self, dim):
         self.dim = dim
-        self.row_bytes = Channel(MemLoc.UB, (1, dim), dtypes.int8, depth=2)
-        self.q_bytes = Buffer(MemLoc.UB, (16, dim), dtypes.int8, data_format="nz")
-        self.q = self.q_bytes.reinterpret(dtypes.float8_e4m3fn)
+        self.row_bytes = RingBuffer(
+            MemLoc.UB, dtypes.int8, make_layout((1, dim)), depth=2
+        )
+        self.q_bytes = Buffer(
+            MemLoc.UB, dtypes.int8, make_layout((16, dim)), data_format="nz"
+        )
+        self.q = reinterpret(self.q_bytes, dtype=dtypes.float8_e4m3fn)
 
     @jit
     def clear(self):
@@ -263,18 +256,15 @@ class Fp8QueryTail:
             g_idx = g_chunk_idx * 32 + logical_row_base + row
             n1_idx = n2_idx * group + g_idx
             row_write = reinterpret(
-                self.row_bytes.produce(), dtype=dtypes.float8_e4m3fn
+                self.row_bytes.next_write(), dtype=dtypes.float8_e4m3fn
             )
             mem_copy(row_write, _bf16_row_tnd(q, t_idx, n1_idx, self.dim))
-            row_read = reinterpret(self.row_bytes.consume(), dtype=dtypes.float8_e4m3fn)
+            row_read = reinterpret(
+                self.row_bytes.next_read(), dtype=dtypes.float8_e4m3fn
+            )
             self.scatter(row_read, row)
         vec_sync_all()
-        mem_copy(
-            target.produce(),
-            self.q,
-            engine=make_copy_engine(split_axis=0),
-            part_id=vec_idx,
-        )
+        mem_copy(target.next_write().partition(dim=0, part_id=vec_idx), self.q)
 
     @jit
     def load_q_packed_tnd(
@@ -298,28 +288,18 @@ class Fp8QueryTail:
             g_idx = packed_row % group
             if q_slot < q_token_num:
                 row_write = reinterpret(
-                    self.row_bytes.produce(), dtype=dtypes.float8_e4m3fn
+                    self.row_bytes.next_write(), dtype=dtypes.float8_e4m3fn
                 )
                 mem_copy(
                     row_write,
-                    _bf16_row_tnd(
-                        q,
-                        q_idx + q_slot,
-                        n2_idx * group + g_idx,
-                        self.dim,
-                    ),
+                    _bf16_row_tnd(q, q_idx + q_slot, n2_idx * group + g_idx, self.dim),
                 )
                 row_read = reinterpret(
-                    self.row_bytes.consume(), dtype=dtypes.float8_e4m3fn
+                    self.row_bytes.next_read(), dtype=dtypes.float8_e4m3fn
                 )
                 self.scatter(row_read, row)
         vec_sync_all()
-        mem_copy(
-            target.produce(),
-            self.q,
-            engine=make_copy_engine(split_axis=0),
-            part_id=vec_idx,
-        )
+        mem_copy(target.next_write().partition(dim=0, part_id=vec_idx), self.q)
 
 
 class QwenSparseAttnBlock128Vector:
@@ -329,30 +309,34 @@ class QwenSparseAttnBlock128Vector:
         self.output_dtype = output_dtype
         self.fp8 = fp8
         self.half_softmax = score_dtype == dtypes.float16
-        self.m = Buffer(MemLoc.UB, (16, 8), dtypes.float32)
-        self.l = Buffer(MemLoc.UB, (16, 8), dtypes.float32)
-        self.new_max = Buffer(MemLoc.UB, (16, 8), dtypes.float32)
-        self.new_sum = Buffer(MemLoc.UB, (16, 8), dtypes.float32)
+        self.m = Buffer(MemLoc.UB, dtypes.float32, make_layout((16, 8)))
+        self.l = Buffer(MemLoc.UB, dtypes.float32, make_layout((16, 8)))
+        self.new_max = Buffer(MemLoc.UB, dtypes.float32, make_layout((16, 8)))
+        self.new_sum = Buffer(MemLoc.UB, dtypes.float32, make_layout((16, 8)))
         # Softmax 比对应的 PV 更新提前两个宏阶段执行，因此每个在线重缩放系数都要
         # 保留到对应 PV 更新消费完成。
-        self.alpha = Channel(MemLoc.UB, (16, 8), dtypes.float32, depth=3)
-        self.u = Buffer(MemLoc.UB, (16, dim), dtypes.float32)
+        self.alpha = RingBuffer(
+            MemLoc.UB, dtypes.float32, make_layout((16, 8)), depth=3
+        )
+        self.u = Buffer(MemLoc.UB, dtypes.float32, make_layout((16, dim)))
         # sparse_mode=3 使用外部 2048x2048 上三角模板。MTE2 每次搬入一行，
         # Vector 再把该行扩展到同一 Query 对应的所有 head 行。
-        self.mask_template = Channel(MemLoc.UB, (1, 128), dtypes.int8, depth=2)
-        self.mask = Buffer(MemLoc.UB, (16, 128), dtypes.int8)
+        self.mask_template = RingBuffer(
+            MemLoc.UB, dtypes.int8, make_layout((1, 128)), depth=2
+        )
+        self.mask = Buffer(MemLoc.UB, dtypes.int8, make_layout((16, 128)))
         # raw-VF writes P and MTE3 consumes it one stage later.  Keeping P as
         # a depth-2 Channel lets the compiler insert the V<->MTE3 transactions
         # and overlap the next softmax with the previous UB->L1 copy.
-        self.p_storage = Channel(
+        self.p_storage = RingBuffer(
             MemLoc.UB,
-            (16, 128),
             dtypes.int8 if fp8 else score_dtype,
+            make_layout((16, 128)),
             depth=2,
             data_format="nz",
         )
         self.p_dtype = dtypes.float8_e4m3fn if fp8 else score_dtype
-        self.out = Buffer(MemLoc.UB, (16, dim), output_dtype)
+        self.out = Buffer(MemLoc.UB, output_dtype, make_layout((16, dim)))
 
     @jit
     def load_mask(self, attn_mask, val_col):
@@ -368,12 +352,12 @@ class QwenSparseAttnBlock128Vector:
             (1, 128),
             (0, 0),
         )
-        mem_copy(self.mask_template.produce(), source)
+        mem_copy(self.mask_template.next_write(), source)
 
     @jit
     def expand_mask(self, first_row, row_num):
         """把一个 Query 的模板行复制到该 Query 的所有 head 行。"""
-        template = self.mask_template.consume()
+        template = self.mask_template.next_read()
         with vf(mode="simd"):
             full, _ = rr.update_mask(128, elem_bits=8)
             value = rr.vload(template, 0)
@@ -720,14 +704,16 @@ class QwenSparseAttnBlock128Cube:
     def __init__(self, dim, q_channel, input_dtype):
         self.dim = dim
         self.q = q_channel
-        self.k = Channel(MemLoc.L1, (128, dim), input_dtype, depth=3, data_format="nz")
-        self.v = Channel(MemLoc.L1, (128, dim), input_dtype, depth=3, data_format="nz")
+        self.k = RingBuffer(
+            MemLoc.L1, input_dtype, make_layout((128, dim)), depth=3, data_format="nz"
+        )
+        self.v = RingBuffer(
+            MemLoc.L1, input_dtype, make_layout((128, dim)), depth=3, data_format="nz"
+        )
         # 阶段内共享 L0 槽位：QK 按 128 宽分块归约 D，PV 每次输出 128 个维度。
-        self.a = Channel(MemLoc.L0A, (32, 128), input_dtype, depth=2)
-        self.b = Channel(MemLoc.L0B, (128, 128), input_dtype, depth=2)
-        self.c = Channel(MemLoc.L0C, (32, 128), dtypes.float32, depth=2)
-        self.gm2l1_nd2nz = make_copy_engine(format_transform="nd2nz")
-        self.fix = make_copy_engine(split_axis=0)
+        self.a = RingBuffer(MemLoc.L0A, input_dtype, make_layout((32, 128)), depth=2)
+        self.b = RingBuffer(MemLoc.L0B, input_dtype, make_layout((128, 128)), depth=2)
+        self.c = RingBuffer(MemLoc.L0C, dtypes.float32, make_layout((32, 128)), depth=2)
 
     @jit
     def load_q_tnd(self, q, t_idx, n2_idx, g_chunk_idx, group):
@@ -738,7 +724,7 @@ class QwenSparseAttnBlock128Cube:
             (32, self.dim),
             (0, 0),
         )
-        mem_copy(self.q.produce(), src, engine=self.gm2l1_nd2nz)
+        mem_copy(self.q.next_write(), src)
 
     @jit
     def load_page(self, target, cache, page_idx, n2_idx):
@@ -748,40 +734,38 @@ class QwenSparseAttnBlock128Cube:
             (128, self.dim),
             (0, 0),
         )
-        mem_copy(target.produce(), src, engine=self.gm2l1_nd2nz)
+        mem_copy(target.next_write(), src)
 
     @jit
     def compute_qk(self, q_tile):
-        k_tile = self.k.consume()
-        result = self.c.produce()
+        k_tile = self.k.next_read()
+        result = self.c.next_write()
         for part in range(self.dim // 128):
-            mem_copy(self.a.produce(), tile_slice(q_tile, (32, 128), (0, part)))
-            mem_copy(self.b.produce(), tile_slice(k_tile, (128, 128), (0, part)))
+            mem_copy(self.a.next_write(), tile_slice(q_tile, (32, 128), (0, part)))
+            mem_copy(self.b.next_write(), tile_slice(k_tile, (128, 128), (0, part)))
             matmul(
                 result,
-                self.a.consume(),
-                self.b.consume(),
+                self.a.next_read(),
+                self.b.next_read(),
                 init=part == 0,
             )
 
     @jit
     def compute_pv_block(self, p, v_tile, part):
-        mem_copy(self.a.produce(), p)
+        mem_copy(self.a.next_write(), p)
         mem_copy(
-            self.b.produce(),
-            tile_slice(v_tile, (128, 128), (0, part)),
-            transpose=True,
+            self.b.next_write(), tile_slice(v_tile, (128, 128), (0, part)).permute(1, 0)
         )
         matmul(
-            self.c.produce(),
-            self.a.consume(),
-            self.b.consume(),
+            self.c.next_write(),
+            self.a.next_read(),
+            self.b.next_read(),
             init=True,
         )
 
     @jit
     def store(self, target):
-        mem_copy(target.produce(), self.c.consume(), engine=self.fix)
+        mem_copy(target.next_write(), self.c.next_read().partition(dim=0))
 
 
 @cb.kernel(profile=cb.ProfileSpec(name="Qwen_Sparse_Attn", op_type="Qwen_Sparse_Attn"))
@@ -798,38 +782,23 @@ class QwenSparseAttnBlock128:
         self.group = group
         self.fp8 = fp8
         self.queries_per_tile = queries_per_tile
-        self.q_l1 = Channel(
+        self.q_l1 = RingBuffer(
             MemLoc.L1,
-            (32, 128),
             input_dtype,
-            # Only the single-query tail path pipelines Q across tasks.  Keep
-            # the original single slot for packed-query and full-M32 paths so
-            # their compile-time and on-chip footprint remain unchanged.
+            make_layout((32, 128)),
             depth=2 if queries_per_tile == 1 and group % 32 != 0 else 1,
             data_format="nz",
-            kind=ChannelKind.CrossCore,
         )
         self.cube = QwenSparseAttnBlock128Cube(128, self.q_l1, input_dtype)
         self.vec = QwenSparseAttnBlock128Vector(score_dtype, output_dtype, 128, fp8)
         self.query_tail = Fp8QueryTail(128) if fp8 else QueryTail(input_dtype, 128)
-        self.scores = Channel(
-            MemLoc.UB,
-            (16, 128),
-            dtypes.float32,
-            depth=3,
-            kind=ChannelKind.CrossCore,
+        self.scores = RingBuffer(
+            MemLoc.UB, dtypes.float32, make_layout((16, 128)), depth=3
         )
-        self.pv = Channel(
-            MemLoc.UB, (16, 128), dtypes.float32, depth=2, kind=ChannelKind.CrossCore
-        )
+        self.pv = RingBuffer(MemLoc.UB, dtypes.float32, make_layout((16, 128)), depth=2)
         p_dtype = dtypes.float8_e4m3fn if fp8 else score_dtype
-        self.p = Channel(
-            MemLoc.L1,
-            (32, 128),
-            p_dtype,
-            depth=2,
-            data_format="nz",
-            kind=ChannelKind.CrossCore,
+        self.p = RingBuffer(
+            MemLoc.L1, p_dtype, make_layout((32, 128)), depth=2, data_format="nz"
         )
 
     def __call__(self, out, q, k, v, attn_mask, metadata, tasks, pages, scale):
@@ -873,8 +842,10 @@ class QwenSparseAttnBlock128:
                 val_col = dtypes.int64(pages[q_slot + 1, page_row_idx])
                 self.vec.load_mask(attn_mask, val_col)
                 self.vec.expand_mask(first_row - logical_row_base, row_num)
-        scores = self.scores.consume()
-        probability = reinterpret(self.vec.p_storage.produce(), dtype=self.vec.p_dtype)
+        scores = self.scores.next_read()
+        probability = reinterpret(
+            self.vec.p_storage.next_write(), dtype=self.vec.p_dtype
+        )
         if const_expr(self.fp8):
             if is_first:
                 self.vec.softmax_fp8_first(scores, probability, scale, active_rows)
@@ -882,7 +853,7 @@ class QwenSparseAttnBlock128:
                 self.vec.softmax_fp8_rest(
                     scores,
                     probability,
-                    self.vec.alpha.produce(),
+                    self.vec.alpha.next_write(),
                     scale,
                     active_rows,
                 )
@@ -893,32 +864,29 @@ class QwenSparseAttnBlock128:
                 self.vec.softmax_rest(
                     scores,
                     probability,
-                    self.vec.alpha.produce(),
+                    self.vec.alpha.next_write(),
                     scale,
                     active_rows,
                 )
         probability_ready = reinterpret(
-            self.vec.p_storage.consume(), dtype=self.vec.p_dtype
+            self.vec.p_storage.next_read(), dtype=self.vec.p_dtype
         )
         mem_copy(
-            self.p.produce(),
-            probability_ready,
-            engine=make_copy_engine(split_axis=0),
-            part_id=vec_idx,
+            self.p.next_write().partition(dim=0, part_id=vec_idx), probability_ready
         )
 
     @jit
     def _stage_pv(self):
-        self.cube.compute_pv_block(self.p.consume(), self.cube.v.consume(), 0)
+        self.cube.compute_pv_block(self.p.next_read(), self.cube.v.next_read(), 0)
         self.cube.store(self.pv)
 
     @jit
     def _stage_update(self, active_rows, is_first):
-        pv = self.pv.consume()
+        pv = self.pv.next_read()
         if is_first:
             self.vec.update_first(pv, 0, active_rows)
         else:
-            self.vec.update_rest(pv, 0, self.vec.alpha.consume(), active_rows)
+            self.vec.update_rest(pv, 0, self.vec.alpha.next_read(), active_rows)
 
     @jit
     def store_output(
@@ -1082,7 +1050,7 @@ class QwenSparseAttnBlock128:
                             logical_row_base,
                             active_rows,
                         )
-                q_tile = self.q_l1.consume()
+                q_tile = self.q_l1.next_read()
                 # The second Channel slot carries the next single-query tail
                 # tile across the task boundary without explicit notify/wait.
                 if const_expr(self.queries_per_tile == 1 and self.group % 32 != 0):

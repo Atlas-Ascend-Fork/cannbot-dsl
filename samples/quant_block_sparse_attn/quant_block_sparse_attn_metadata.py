@@ -20,8 +20,8 @@ import tempfile
 import torch
 
 from cannbotdsl.aicpu import (
-    GmIn,
-    GmOut,
+    gm_in,
+    gm_out,
     I32,
     I64,
     U32,
@@ -43,8 +43,8 @@ BLOCK_TOLERANCE_RATIO = 2
 
 
 class _MetadataArgs:
-    sparse_seq_len: GmIn(I32)
-    metadata: GmOut(I32)
+    sparse_seq_len: gm_in(I32)
+    metadata: gm_out(I32)
     batch_size: U32
     num_heads_q: U32
     num_heads_kv: U32
@@ -88,17 +88,9 @@ def _advance_to_nonempty_row(a, bn_limit, bn_block_counts, cursor):
 
 @aicpu_kernel
 def _quant_block_sparse_attn_metadata_kernel(a: _MetadataArgs):
-    if (
-        a.batch_size == 0
-        or a.num_heads_q == 0
-        or a.num_heads_kv == 0
-    ):
+    if a.batch_size == 0 or a.num_heads_q == 0 or a.num_heads_kv == 0:
         return 1
-    if (
-        a.num_heads_q % a.num_heads_kv != 0
-        or a.q_capacity == 0
-        or a.aic_core_num == 0
-    ):
+    if a.num_heads_q % a.num_heads_kv != 0 or a.q_capacity == 0 or a.aic_core_num == 0:
         return 1
     if a.aic_core_num > METADATA_AIC_SLOTS:
         return 1
@@ -311,8 +303,9 @@ def _check_optional_sequence(name, tensor, expected_length, device):
         raise ValueError(f"Input {name} must be contiguous on {device}")
 
 
-def _check_sparse_sequence_contract(sparse_seq_len, batch_size, num_heads_q,
-                                    num_heads_kv):
+def _check_sparse_sequence_contract(
+    sparse_seq_len, batch_size, num_heads_q, num_heads_kv
+):
     message = "The sparse_seq_len tensor must be a contiguous 3D int32 tensor"
     if not isinstance(sparse_seq_len, torch.Tensor):
         raise ValueError(message)
@@ -341,16 +334,15 @@ def _check_sparse_sequence_contract(sparse_seq_len, batch_size, num_heads_q,
     return batch_size, q_capacity
 
 
-def _check_metadata_shape_options(head_dim, sparse_block_size_q,
-                                  sparse_block_size_k, quant_mode, mask_mode):
+def _check_metadata_shape_options(
+    head_dim, sparse_block_size_q, sparse_block_size_k, quant_mode, mask_mode
+):
     if head_dim != 128:
         raise NotImplementedError("Only head_dim=128 is supported")
     if sparse_block_size_q != 128 or sparse_block_size_k != 128:
         raise NotImplementedError("Only 128-token sparse blocks are supported")
     if quant_mode != 1 or mask_mode not in (0, 3):
-        raise NotImplementedError(
-            "Only quant_mode=1 and mask_mode=0/3 are supported"
-        )
+        raise NotImplementedError("Only quant_mode=1 and mask_mode=0/3 are supported")
 
 
 def _check_metadata_layout_options(layout_q, layout_kv, layout_sparse_indices):
@@ -384,21 +376,24 @@ def quant_block_sparse_attn_metadata(
 ):
     """Asynchronously generate QBSA metadata on AICPU and the current stream."""
     batch_size, q_capacity = _check_sparse_sequence_contract(
-        sparse_seq_len, batch_size, num_heads_q, num_heads_kv,
+        sparse_seq_len,
+        batch_size,
+        num_heads_q,
+        num_heads_kv,
     )
     _check_metadata_shape_options(
-        head_dim, sparse_block_size_q, sparse_block_size_k, quant_mode, mask_mode,
+        head_dim,
+        sparse_block_size_q,
+        sparse_block_size_k,
+        quant_mode,
+        mask_mode,
     )
     _check_metadata_layout_options(layout_q, layout_kv, layout_sparse_indices)
 
     device_id = sparse_seq_len.device.index
     device = torch.device("npu", device_id)
-    _check_optional_sequence(
-        "cu_seqlens_q", cu_seqlens_q, batch_size + 1, device
-    )
-    _check_optional_sequence(
-        "cu_seqlens_kv", cu_seqlens_kv, batch_size + 1, device
-    )
+    _check_optional_sequence("cu_seqlens_q", cu_seqlens_q, batch_size + 1, device)
+    _check_optional_sequence("cu_seqlens_kv", cu_seqlens_kv, batch_size + 1, device)
     _check_optional_sequence("seqused_q", seqused_q, batch_size, device)
     _check_optional_sequence("seqused_kv", seqused_kv, batch_size, device)
 

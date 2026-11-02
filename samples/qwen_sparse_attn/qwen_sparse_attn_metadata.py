@@ -47,7 +47,7 @@ import os
 import tempfile
 from functools import lru_cache
 
-from cannbotdsl.aicpu import GmIn, GmOut, I32, I64, aicpu_kernel
+from cannbotdsl.aicpu import gm_in, gm_out, I32, I64, aicpu_kernel
 
 # QSA Block 128 固定使用 128-token 逻辑块和 M32 Cube tile。
 BLOCK_SIZE = 128
@@ -107,22 +107,22 @@ class QsaMetadataArgs:
     """
 
     # 描述符输入
-    sparse_block_idx: GmIn(I32)
-    sparse_block_count: GmIn(I32)
-    cu_seqlens_q: GmIn(I64)
-    seqused_kv: GmIn(I32)
-    block_table: GmIn(I32)
-    seqused_q: GmIn(I32)
+    sparse_block_idx: gm_in(I32)
+    sparse_block_count: gm_in(I32)
+    cu_seqlens_q: gm_in(I64)
+    seqused_kv: gm_in(I32)
+    block_table: gm_in(I32)
+    seqused_q: gm_in(I32)
     # 标量传输与 metadata 输出
-    params: GmIn(I32)
-    counts: GmOut(I32)
-    core_spans: GmOut(I64)
-    tasks: GmOut(I64)
-    pages: GmOut(I32)
+    params: gm_in(I32)
+    counts: gm_out(I32)
+    core_spans: gm_out(I64)
+    tasks: gm_out(I64)
+    pages: gm_out(I32)
     # 每个 `(token, KV head)` 的已接收页计数，以及按 `(batch, head, token)`
     # 访问顺序生成的全局页号前缀和；两者均由页扫描阶段写入、任务阶段消费。
-    token_counts: GmOut(I32)
-    slot_end: GmOut(I32)
+    token_counts: gm_out(I32)
+    slot_end: gm_out(I32)
 
 
 # ``params`` 张量字段下标

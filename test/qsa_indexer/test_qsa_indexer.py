@@ -124,18 +124,16 @@ def _validate_sampled_topk(actual_ids, visible, q, cache, table):
     assert ratio <= MAX_BOUNDARY_RE_EXCEED_RATIO
 
 
-@pytest.mark.npu
-@pytest.mark.parametrize("case", QSA_INDEXER_CASES)
-def test_qsa_indexer(case):
+def _run_qsa_indexer_case(case, query_length):
     pytest.importorskip("torch_npu")
     torch.manual_seed(case.seed)
     page_count = case.compressed_k_length // PAGE_SIZE
-    q = torch.randn((QUERY_LENGTH, HEADS, HEAD_DIM), dtype=torch.bfloat16)
+    q = torch.randn((query_length, HEADS, HEAD_DIM), dtype=torch.bfloat16)
     cache = torch.randn((page_count, PAGE_SIZE, 1, HEAD_DIM), dtype=torch.bfloat16)
     table = torch.randperm(page_count).int().reshape(1, -1)
-    starts = torch.tensor([0, QUERY_LENGTH], dtype=torch.int32)
+    starts = torch.tensor([0, query_length], dtype=torch.int32)
     query_positions = torch.arange(
-        case.context_length - QUERY_LENGTH,
+        case.context_length - query_length,
         case.context_length,
         dtype=torch.int32,
     )
@@ -163,3 +161,20 @@ def test_qsa_indexer(case):
 
     actual_ids, visible = _validate_structure(actual.cpu(), query_positions)
     _validate_sampled_topk(actual_ids, visible, q, cache, table)
+
+
+@pytest.mark.npu
+@pytest.mark.parametrize("case", QSA_INDEXER_CASES)
+def test_qsa_indexer(case):
+    _run_qsa_indexer_case(case, QUERY_LENGTH)
+
+
+@pytest.mark.npu
+@pytest.mark.parametrize("compressed_length", [2304, 2560, 4096, 8192])
+@pytest.mark.parametrize("query_length", [1, 17, 129])
+def test_qsa_indexer_short_k(compressed_length, query_length):
+    """覆盖评分写出后立即读取的短 K、Query 尾块和不同 chunk 数量。"""
+    _run_qsa_indexer_case(
+        QSAIndexerCase(compressed_length * 4 - 2, compressed_length, seed=410000),
+        query_length,
+    )

@@ -15,6 +15,7 @@ from functools import lru_cache
 import os
 from threading import RLock
 
+from cannbotdsl import make_layout
 from cannbotdsl.lang.host import host
 import torch
 import torch.nn.functional as F
@@ -24,7 +25,6 @@ from cannbotdsl.reg import vpack, vmin, vscatter, vdiv, vshr
 import cannbotdsl.reg as _raw_reg
 
 from cannbotdsl import (
-    ChannelKind,
     Constexpr,
     Dim,
     MemLoc,
@@ -35,12 +35,12 @@ from cannbotdsl import (
 )
 from cannbotdsl.ops.arch import get_block_idx, get_subblock_id
 from cannbotdsl.buffer import Buffer
-from cannbotdsl.channel import Channel
+from cannbotdsl.ring_buffer import RingBuffer
 from cannbotdsl.lang.jit import jit
 from cannbotdsl.lang.kernel import kernel
 from cannbotdsl.lang.vf import vf
 from cannbotdsl.ops.matmul import matmul
-from cannbotdsl.ops.memcpy import make_copy_engine, mem_copy
+from cannbotdsl.ops.memcpy import copy_options, mem_copy
 from cannbotdsl.tensor import tile_slice
 from cannbotdsl.reg import (
     update_mask,
@@ -56,6 +56,7 @@ from cannbotdsl.reg import (
     vmax,
     vmaxs,
     vmins,
+    vmadd,
     vmuls,
     vnot,
     vreinterpret,
@@ -227,44 +228,44 @@ class Matmul:
     """管理Cube侧Channel，完成Q/K加载、矩阵乘和分数搬运。"""
 
     def __init__(self):
-        self.nd2nz = make_copy_engine(format_transform="nd2nz")
-        self.fixpipe = make_copy_engine(split_axis=0)
         # 遍历整个S2期间，将完整Q[64, 2048]分块驻留在L1；两个单槽Channel分别保存K维上的1024元素分块。
         # Q前1024维的L1驻留分片，供整个S2循环的MTE1读取。
-        self.q_l1_0 = Channel(
-            MemLoc.L1, (M_TILE, K_L1), dtypes.bfloat16, depth=1
-        ).produce()
+        self.q_l1_0 = RingBuffer(
+            MemLoc.L1, dtypes.bfloat16, make_layout((M_TILE, K_L1)), depth=1
+        ).next_write()
         # Q后1024维的L1驻留分片，与前半分片分别管理生命周期。
-        self.q_l1_1 = Channel(
-            MemLoc.L1, (M_TILE, K_L1), dtypes.bfloat16, depth=1
-        ).produce()
+        self.q_l1_1 = RingBuffer(
+            MemLoc.L1, dtypes.bfloat16, make_layout((M_TILE, K_L1)), depth=1
+        ).next_write()
         # 两个64×1024 K-L1槽由MTE2交替使用，仅在槽复用时等待，使后续K块加载与另一槽的MTE1/MMAD计算重叠。
         # K前1024维的L1分片，承接MTE2加载并交给MTE1。
-        self.k_l1_0 = Channel(
-            MemLoc.L1, (N_CHUNK, K_L1), dtypes.bfloat16, depth=1
-        ).produce()
+        self.k_l1_0 = RingBuffer(
+            MemLoc.L1, dtypes.bfloat16, make_layout((N_CHUNK, K_L1)), depth=1
+        ).next_write()
         # K后1024维的L1分片，供后续特征维分块计算。
-        self.k_l1_1 = Channel(
-            MemLoc.L1, (N_CHUNK, K_L1), dtypes.bfloat16, depth=1
-        ).produce()
+        self.k_l1_1 = RingBuffer(
+            MemLoc.L1, dtypes.bfloat16, make_layout((N_CHUNK, K_L1)), depth=1
+        ).next_write()
         # Q的L0A偶数分片槽，将MTE1搬入的64×256数据交给MMAD。
-        self.l0a_0 = Channel(
-            MemLoc.L0A, (M_TILE, K_L0), dtypes.bfloat16, depth=1
-        ).produce()
+        self.l0a_0 = RingBuffer(
+            MemLoc.L0A, dtypes.bfloat16, make_layout((M_TILE, K_L0)), depth=1
+        ).next_write()
         # Q的L0A奇数分片槽，与偶数槽交替使用。
-        self.l0a_1 = Channel(
-            MemLoc.L0A, (M_TILE, K_L0), dtypes.bfloat16, depth=1
-        ).produce()
+        self.l0a_1 = RingBuffer(
+            MemLoc.L0A, dtypes.bfloat16, make_layout((M_TILE, K_L0)), depth=1
+        ).next_write()
         # K的L0B偶数分片槽，将MTE1搬入的64×256数据交给MMAD。
-        self.l0b_0 = Channel(
-            MemLoc.L0B, (N_CHUNK, K_L0), dtypes.bfloat16, depth=1
-        ).produce()
+        self.l0b_0 = RingBuffer(
+            MemLoc.L0B, dtypes.bfloat16, make_layout((N_CHUNK, K_L0)), depth=1
+        ).next_write()
         # K的L0B奇数分片槽，与对应L0A槽配对参与MMAD。
-        self.l0b_1 = Channel(
-            MemLoc.L0B, (N_CHUNK, K_L0), dtypes.bfloat16, depth=1
-        ).produce()
+        self.l0b_1 = RingBuffer(
+            MemLoc.L0B, dtypes.bfloat16, make_layout((N_CHUNK, K_L0)), depth=1
+        ).next_write()
         # 保存64×64的FP32累加结果，双槽管理MMAD到Fixpipe的交接与复用。
-        self.l0c = Channel(MemLoc.L0C, (M_TILE, N_CHUNK), dtypes.float32, depth=2)
+        self.l0c = RingBuffer(
+            MemLoc.L0C, dtypes.float32, make_layout((M_TILE, N_CHUNK)), depth=2
+        )
 
     @staticmethod
     def _q_tile(gm_q, batch, q_head, q_block0, k_chunk):
@@ -281,20 +282,18 @@ class Matmul:
         mem_copy(
             self.q_l1_0,
             self._q_tile(gm_q, batch, q_head, q_block_start, 0),
-            engine=self.nd2nz,
-            l2_cache_ctl=1,
+            options=copy_options(l2_cache_ctl=1),
         )
         mem_copy(
             self.q_l1_1,
             self._q_tile(gm_q, batch, q_head, q_block_start, 1),
-            engine=self.nd2nz,
-            l2_cache_ctl=1,
+            options=copy_options(l2_cache_ctl=1),
         )
 
     @jit
     def compute_qk(self, gm_k, batch, kv_head, chunk_base):
         # 所有K分块共用同一个累加器，保留中间累加结果。
-        accumulator = self.l0c.produce()
+        accumulator = self.l0c.next_write()
         for k_l1_chunk in tuple(range(2)):
             q_l1 = self.q_l1_0 if k_l1_chunk == 0 else self.q_l1_1
             key_op_index = k_l1_chunk
@@ -305,8 +304,7 @@ class Matmul:
             mem_copy(
                 k_l1,
                 self._k_tile(gm_k, batch, kv_head, chunk_base, k_l1_chunk),
-                engine=self.nd2nz,
-                l2_cache_ctl=1,
+                options=copy_options(l2_cache_ctl=1),
             )
             for k_l0_chunk in tuple(range(K_L0_CHUNKS_PER_L1)):
                 op_index = k_l1_chunk * K_L0_CHUNKS_PER_L1 + k_l0_chunk
@@ -316,22 +314,8 @@ class Matmul:
                 else:
                     l0a = self.l0a_1
                     l0b = self.l0b_1
-                mem_copy(
-                    l0a,
-                    tile_slice(
-                        q_l1,
-                        (M_TILE, K_L0),
-                        (0, k_l0_chunk),
-                    ),
-                )
-                mem_copy(
-                    l0b,
-                    tile_slice(
-                        k_l1,
-                        (N_CHUNK, K_L0),
-                        (0, k_l0_chunk),
-                    ),
-                )
+                mem_copy(l0a, tile_slice(q_l1, (M_TILE, K_L0), (0, k_l0_chunk)))
+                mem_copy(l0b, tile_slice(k_l1, (N_CHUNK, K_L0), (0, k_l0_chunk)))
                 global_k = k_l1_chunk * K_L0_CHUNKS_PER_L1 + k_l0_chunk
                 matmul(
                     accumulator,
@@ -341,7 +325,7 @@ class Matmul:
                 )
 
     def store_score(self, score_channel):
-        mem_copy(score_channel.produce(), self.l0c.consume(), engine=self.fixpipe)
+        mem_copy(score_channel.next_write(), self.l0c.next_read().partition(dim=0))
 
 
 class Vector:
@@ -358,88 +342,103 @@ class Vector:
         self.window_size = attrs.window_size
         self.score_scale = 1.0 / ((attrs.stem_block_size // attrs.stem_stride) ** 2)
         self.subblock = subblock
-        self.copy_f32 = make_copy_engine(format_transform="identity")
-        self.copy_i32 = make_copy_engine(format_transform="identity")
         # Vector工作区：p1存当前N256的u32排序键，p2复用为TopK临时区；不直接接收Fixpipe。
-        self.score_ub = Buffer(MemLoc.UB, (M_VECTOR, N_OUTER), dtypes.float32)
+        self.score_ub = Buffer(
+            MemLoc.UB, dtypes.float32, make_layout((M_VECTOR, N_OUTER))
+        )
         # MTE2加载当前N256的偏置，Vector各Q行共享读取。
-        self.bias_ub = Channel(MemLoc.UB, (N_OUTER,), dtypes.float32, depth=1).produce()
+        self.bias_ub = RingBuffer(
+            MemLoc.UB, dtypes.float32, make_layout((N_OUTER,)), depth=1
+        ).next_write()
         # Vector批量生成32行可见范围、预算等参数，供后续VF及S2轮次复用。
-        self.params_ub = Buffer(MemLoc.UB, (M_VECTOR, ROW_PARAM_STRIDE), dtypes.int32)
+        self.params_ub = Buffer(
+            MemLoc.UB, dtypes.int32, make_layout((M_VECTOR, ROW_PARAM_STRIDE))
+        )
 
         # p1基数排序状态：保存阈值字节和剩余排名，按广播加载需要保留行间距。
         self.p1_radix_state = Buffer(
-            MemLoc.UB, (M_VECTOR, P1_RADIX_STATE_STRIDE), dtypes.int32
+            MemLoc.UB, dtypes.int32, make_layout((M_VECTOR, P1_RADIX_STATE_STRIDE))
         )
         # Vector打包最终索引后交给MTE3；非直出行最多为4+256+4项。
-        self.out_rows = Channel(
-            MemLoc.UB, (M_VECTOR, self.output_capacity), dtypes.int32, depth=1
-        ).produce()
+        self.out_rows = RingBuffer(
+            MemLoc.UB,
+            dtypes.int32,
+            make_layout((M_VECTOR, self.output_capacity)),
+            depth=1,
+        ).next_write()
         # 长度暂存仅在Vector侧使用，最终长度通过独立Channel从V流水交给MTE3。
-        self.output_lens = Channel(
-            MemLoc.UB, (M_VECTOR, 1), dtypes.int32, depth=1
-        ).produce()
+        self.output_lens = RingBuffer(
+            MemLoc.UB, dtypes.int32, make_layout((M_VECTOR, 1)), depth=1
+        ).next_write()
         if self.precision == 2:
             # p2每行保存历史256项与当前256项的u16排序键，供流式合并。
             self.merge_values = Buffer(
-                MemLoc.UB, (M_VECTOR, STREAM_INPUT), dtypes.uint16
+                MemLoc.UB, dtypes.uint16, make_layout((M_VECTOR, STREAM_INPUT))
             )
             # p2历史保留项的全局u32索引，跨N256轮次保留。
-            self.global_indices = Buffer(MemLoc.UB, (M_VECTOR, MAX_TOPK), dtypes.uint32)
+            self.global_indices = Buffer(
+                MemLoc.UB, dtypes.uint32, make_layout((M_VECTOR, MAX_TOPK))
+            )
             # vstore_unalign要求目标数据类型一致，因此这些压缩和基数排序区域独立于MM1分数槽。
             # p2四行radix的256桶计数，高低字节阶段复用。
-            self.hist = Buffer(MemLoc.UB, (RADIX_ROWS, HISTOGRAM_BINS), dtypes.uint16)
+            self.hist = Buffer(
+                MemLoc.UB, dtypes.uint16, make_layout((RADIX_ROWS, HISTOGRAM_BINS))
+            )
             # 每行使用独立的物理压缩缓冲区，使同一VF生成四个不同的C++ UnalignRegForStore对象。
             # 暂存每行高字节阈值桶的压缩查找结果。
             self.idx_high = tuple(
-                Buffer(MemLoc.UB, (HISTOGRAM_BINS,), dtypes.uint16)
+                Buffer(MemLoc.UB, dtypes.uint16, make_layout((HISTOGRAM_BINS,)))
                 for _ in range(RADIX_ROWS)
             )
             # 暂存每行低字节阈值桶的压缩查找结果。
             self.idx_low = tuple(
-                Buffer(MemLoc.UB, (HISTOGRAM_BINS,), dtypes.uint16)
+                Buffer(MemLoc.UB, dtypes.uint16, make_layout((HISTOGRAM_BINS,)))
                 for _ in range(RADIX_ROWS)
             )
             # 高字节筛选后剩余的目标排名，交给低字节阶段读取。
-            self.next_k = Buffer(MemLoc.UB, (RADIX_ROWS, VL_U16), dtypes.uint16)
+            self.next_k = Buffer(
+                MemLoc.UB, dtypes.uint16, make_layout((RADIX_ROWS, VL_U16))
+            )
             # 四行各自的候选局部位置，供GT/EQ压缩和gather使用。
             self.tmp_indices = tuple(
-                Buffer(MemLoc.UB, (STREAM_POS_STRIDE,), dtypes.uint16)
+                Buffer(MemLoc.UB, dtypes.uint16, make_layout((STREAM_POS_STRIDE,)))
                 for _ in range(RADIX_ROWS)
             )
             # p2本轮选中的四行全局索引暂存，随后更新历史状态。
             self.stream_out_indices = Buffer(
-                MemLoc.UB, (RADIX_ROWS, MAX_TOPK), dtypes.uint32
+                MemLoc.UB, dtypes.uint32, make_layout((RADIX_ROWS, MAX_TOPK))
             )
         else:
             # precision=1与precision=2采用相同的历史256项加当前256项的流式生命周期。当前u32排序键覆盖已消费的FP32 MM1分数槽，仅历史键和索引跨N256组保留。
             # p1每行历史保留的256个u32排序键，跨N256轮次复用。
             self.p1_merge_values = Buffer(
-                MemLoc.UB, (M_VECTOR, MAX_TOPK), dtypes.uint32
+                MemLoc.UB, dtypes.uint32, make_layout((M_VECTOR, MAX_TOPK))
             )
             # p1历史保留键对应的全局u32索引。
             self.p1_global_indices = Buffer(
-                MemLoc.UB, (M_VECTOR, MAX_TOPK), dtypes.uint32
+                MemLoc.UB, dtypes.uint32, make_layout((M_VECTOR, MAX_TOPK))
             )
             # p1四行radix桶计数，四轮字节筛选复用。
             self.p1_hist = Buffer(
-                MemLoc.UB, (RADIX_ROWS, HISTOGRAM_BINS), dtypes.uint16
+                MemLoc.UB, dtypes.uint16, make_layout((RADIX_ROWS, HISTOGRAM_BINS))
             )
             # p1每行当前字节阈值桶的压缩查找结果。
             self.p1_idx_bucket = tuple(
-                Buffer(MemLoc.UB, (HISTOGRAM_BINS,), dtypes.uint16)
+                Buffer(MemLoc.UB, dtypes.uint16, make_layout((HISTOGRAM_BINS,)))
                 for _ in range(RADIX_ROWS)
             )
             # p1四行候选的局部位置，供最终选择和gather使用。
             self.p1_tmp_indices = tuple(
-                Buffer(MemLoc.UB, (STREAM_POS_STRIDE,), dtypes.int32)
+                Buffer(MemLoc.UB, dtypes.int32, make_layout((STREAM_POS_STRIDE,)))
                 for _ in range(RADIX_ROWS)
             )
             # p1本轮选中的四行排序键暂存，防止更新时覆盖输入。
-            self.p1_out_keys = Buffer(MemLoc.UB, (RADIX_ROWS, MAX_TOPK), dtypes.uint32)
+            self.p1_out_keys = Buffer(
+                MemLoc.UB, dtypes.uint32, make_layout((RADIX_ROWS, MAX_TOPK))
+            )
             # p1本轮选中键对应的全局索引暂存。
             self.p1_out_indices = Buffer(
-                MemLoc.UB, (RADIX_ROWS, MAX_TOPK), dtypes.uint32
+                MemLoc.UB, dtypes.uint32, make_layout((RADIX_ROWS, MAX_TOPK))
             )
 
     @staticmethod
@@ -524,8 +523,12 @@ class Vector:
                 relative_f = vcast(relative, dtypes.float32, mask=mask32)
                 denominator = vdup_scalar(denominator_f, dtypes.float32, mask=mask32)
                 ratio = vdiv(relative_f, denominator, mask=mask32)
-                interpolated = vadds(
-                    vmuls(ratio, delta_f, mask=mask32), start_f, mask=mask32
+                # 与标量 FP32 插值保持一次舍入，避免整数边界处两次舍入使 budget 多 1。
+                interpolated = vmadd(
+                    ratio,
+                    vdup_scalar(delta_f, dtypes.float32, mask=mask32),
+                    vdup_scalar(start_f, dtypes.float32, mask=mask32),
+                    mask=mask32,
                 )
                 decayed = vcast(interpolated, dtypes.int32, mask=mask32, rounding="rz")
                 decayed = vmin(vmaxs(decayed, 1, mask=mask32), start_reg, mask=mask32)
@@ -1131,12 +1134,10 @@ class Vector:
             mem_copy(
                 self._indices_prefix_tile(gm_indices, batch, q_head, q_block0),
                 self.out_rows,
-                engine=self.copy_i32,
             )
             mem_copy(
                 self._lens_prefix_tile(gm_lens, batch, q_head, q_block0),
                 self.output_lens,
-                engine=self.copy_i32,
             )
         else:
             # 每个尾块迭代生成并消费一次完整输出事务，不写入跨头片段中的无效行。
@@ -1148,20 +1149,14 @@ class Vector:
                         gm_indices, batch, q_head, q_block0 + row, 1
                     ),
                     tile_slice(self.out_rows, (1, self.output_capacity), (0, 0)),
-                    engine=self.copy_i32,
                 )
                 mem_copy(
                     self._lens_prefix_tile(gm_lens, batch, q_head, q_block0 + row, 1),
                     tile_slice(self.output_lens, (1, 1), (0, 0)),
-                    engine=self.copy_i32,
                 )
 
     def load_bias(self, gm_bias, batch, kv_head, key_base):
-        mem_copy(
-            self.bias_ub,
-            self._bias_tile(gm_bias, batch, kv_head, key_base),
-            engine=self.copy_f32,
-        )
+        mem_copy(self.bias_ub, self._bias_tile(gm_bias, batch, kv_head, key_base))
 
     def _indices_prefix_tile(self, gm_indices, batch, q_head, q_block0, rows=M_VECTOR):
         base = gm_indices[batch, q_head, q_block0:, None]
@@ -1719,12 +1714,8 @@ class StemIndexerKernel:
         self.subblock = get_subblock_id()
         self.matmul = Matmul()
         # 接收Fixpipe分发的32×64原始分数，三槽跨核交给Vector的Scale/Bias消费。
-        self.score_channel = Channel(
-            MemLoc.UB,
-            (M_VECTOR, N_CHUNK),
-            dtypes.float32,
-            depth=3,
-            kind=ChannelKind.CrossCore,
+        self.score_channel = RingBuffer(
+            MemLoc.UB, dtypes.float32, make_layout((M_VECTOR, N_CHUNK)), depth=3
         )
         self.vector = Vector(precision, attrs, self.subblock)
 
@@ -1851,7 +1842,7 @@ class StemIndexerKernel:
             if chunk_base < compute_blocks:
                 self.matmul.compute_qk(gm_k, batch, kv_head, chunk_base)
                 self.matmul.store_score(self.score_channel)
-                score = self.score_channel.consume()
+                score = self.score_channel.next_read()
                 if const_expr(self.precision == 2):
                     self.vector.p2_scale_bias_stream(
                         key_base,
