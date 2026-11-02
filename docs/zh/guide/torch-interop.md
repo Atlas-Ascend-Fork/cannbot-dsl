@@ -50,8 +50,22 @@ _TORCH_TO_DSL = {
 }
 ```
 
-::: info 待核实
-低精度类型（FP8 的两种、FP4、E8M0）在 `cbd.dtypes` 下的确切名字请以 [API 接口清单](../api/language/decorators.md)为准。torch 侧对应的是 `torch.float8_e4m3fn`、`torch.float8_e5m2` 等；打包的 FP4 在 torch 侧通常以 `uint8` 承载，由算子接口按约定解释。格式层面的说明见[数据类型与量化](./data-types.md)。
+低精度类型的对应关系（DSL 侧拼写取自 `cannbotdsl/types/dtypes.py`，承载方式取自 `cannbotdsl/core/contracts/elements.py`）：
+
+| `cbd.dtypes` | torch 侧 |
+| --- | --- |
+| `float8_e4m3fn` | `torch.float8_e4m3fn`（原生） |
+| `float8_e5m2` | `torch.float8_e5m2`（原生） |
+| `float8_e8m0` | `torch.float8_e8m0fnu`，或按字节承载 |
+| `hifloat8` | **无原生 dtype**，按字节承载 |
+| `fp4x2_e2m1` / `fp4x2_e1m2` | **无原生 dtype**，`torch.int8` / `torch.uint8` 承载打包字节 |
+
+::: warning 「按字节承载」意味着 torch 不帮你做任何检查
+只有两种 FP8 在 torch 侧有原生 dtype。HiF8、E8M0 scale 和打包 FP4 都是把裸字节塞进 `torch.int8` / `torch.uint8`——torch 看到的是整数，**dtype 系统不会拦住你传错格式**，解释权完全在 DSL 侧的 `TensorSpec` / Buffer 声明上。
+
+FP4 还多一层：`e2m1` 和 `e1m2` 在 torch 侧是同一个字节张量（一字节两个元素），选哪个只由 DSL 侧的声明决定，传错不报错、只是数值全错。算子接口层应当把这个约定写进文档和参数名。
+
+格式层面的说明见[数据类型与量化](./data-types.md)。
 :::
 
 ## stream 语义：为什么必须 synchronize
@@ -161,36 +175,33 @@ def matmul_streamk(a, b):
 - **dtype 通常是 fp32**，因为存的是待归约的部分和，精度不能降。
 - **要不要清零取决于算法**。如果每个核都会完整写自己那一段，就不用清；如果用 `atomic_add` 累加，必须先清零。
 - 允许调用方传入自己的 workspace（便于跨调用复用），但要校验。`flash_attn` 的 `validate_workspace()` 检查 ndim、宽度、行数下界、dtype、device 与连续性，这个做法值得照搬。
-- workspace 的**阶段间同步要自己写**，Channel 不管它。见[同步、Cache 与跨核交接](./synchronization.md)。
+- workspace 的**阶段间同步要自己写**，`RingBuffer` 不管它。见[同步、Cache 与跨核交接](./synchronization.md)。
 
-## 非整除长度：在这一层对齐
+## 非整除长度：显式绑定实际 View
 
-`tile_slice` 与 Channel 槽位的 shape 必须一致，所以**不要把尾块缩成 `(actual,)` 再拷进 `(tile,)` 的槽**。正确做法是在这一层把 GM 对齐，设备侧用掩码屏蔽多余 lane：
+`tile_slice` 会按父 Tensor 的剩余范围裁剪尾块；`RingBuffer` 选槽则始终返回声明时的布局，不会恢复“最近一次写入”的尾块布局。搬运前要对选中的 Tensor 显式绑定实际范围，读端保存这个 View，或用同一运行时范围重新构造：
 
 ```python
-n = x.numel()
-n_tiles = math.ceil(n / tile)
-n_pad = n_tiles * tile
+src_tile = tile_slice(gm_x, (tile,), (t,))
+actual = src_tile.shape[0]
+write = self._x_rb.next_write()[:actual,]
+mem_copy(write, src_tile)
 
-x1d = x.reshape(n)
-if n_pad != n:
-    x1d = torch.nn.functional.pad(x1d, (0, n_pad - n))
-    o1d = torch.empty(n_pad, dtype=x.dtype, device=x.device)
-else:
-    o1d = out.reshape(n)
-
-VecAdd().run(x1d, y1d, o1d, block_dim)
-
-if n_pad != n:
-    out.copy_(o1d[:n].reshape_as(out))
+# 计算后写回时，同样显式限定有效范围。
+mem_copy(
+    tile_slice(gm_out, (tile,), (t,)),
+    self._o_rb.next_read()[:actual,],
+)
 ```
+
+因此，**不再需要仅为了让尾块搬运 shape 一致而在 torch 层 padding GM**。矢量计算仍用掩码屏蔽无效 lane；如果算法本身要求对齐地址或完整 tile，才在接口层额外 padding。
 
 ## 封装成 torch 自定义算子
 
 仓库样例对外暴露的是**普通 Python 函数**。这对脚本和测试够用，但要在模型里用、或者走 `torch.compile` 的图模式，就需要注册成自定义算子。
 
 ::: info 待核实
-CANNBot-DSL 0.7.0 没有提供专门的 torch 算子注册辅助接口，仓库样例也没有这么做。下面给出的是 PyTorch 通用路径，可行性需要你在目标版本上实际验证，本文档不作保证。
+CANNBot-DSL 0.8.0 没有提供专门的 torch 算子注册辅助接口，仓库样例也没有这么做。下面给出的是 PyTorch 通用路径，可行性需要你在目标版本上实际验证，本文档不作保证。
 :::
 
 通用做法是用 `torch.library` 注册，并补一个 meta 实现（只推形状、不算数值），让 `torch.compile` 和 fake tensor 能走通：
@@ -234,7 +245,7 @@ def _(x, y):
 | 输出 | 分配了吗，dtype 与 shape 对吗 |
 | workspace | 容量按 tiling 推的吗，要不要清零 |
 | `block_dim` | 是 `min(需要的核数, 可用核数)` 吗 |
-| 对齐 | 非整除长度在这一层 pad 了吗 |
+| 尾块 | 设备侧是否给目的 Tensor 绑定实际范围；只有算法要求对齐时才在这一层 pad |
 | 同步 | 读结果前 `torch.npu.synchronize()` 了吗 |
 | 计时 | 预热了吗，同步在循环外吗 |
 | 原地 | 被修改的张量在签名和文档里写明了吗 |

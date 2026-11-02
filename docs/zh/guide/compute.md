@@ -24,8 +24,10 @@ $$
 
 ```python
 def matmul(dst, lhs, rhs, *, bias=None, init=True,
-           unit_flag=0, disable_gemv=True) -> None
+           unit_flag=0, disable_gemv=True, mx_mode=False) -> Tensor
 ```
+
+`matmul` 返回实际目的 View。后续 K 向累加和搬出应继续使用返回值；忽略返回值不会取消写入，但会丢弃本次计算推导出的布局元数据。
 
 | 矩阵 | 存储位置 | 形状 | 数据格式 | 分形大小 |
 | --- | --- | --- | --- | --- |
@@ -40,19 +42,19 @@ def matmul(dst, lhs, rhs, *, bias=None, init=True,
 `matmul()` 的 Python 层和底层的 `MmadOp` 验证都**不检查** M/N/K 是否落在 [0, 4095]——CAPI 用 `uint16_t` 承载维度，越界会静默回绕。超了不会报错，只会算错。tiling 阶段自己保证。
 :::
 
-常用 dtype 组合：fp16×fp16→fp32、bf16×bf16→fp32、fp32×fp32→fp32、int8×int8→int32，以及 HiFloat8 / FP8 的多种组合，完整表见 [`matmul`](../api/compute/matrix/matmul.md)。
+常用 dtype 组合：fp16×fp16→fp32、bf16×bf16→fp32、fp32×fp32→fp32、int8×int8→int32，以及 HiFloat8 / FP8 的多种组合，完整表见 [`matmul`](../api/compute/matrix/matmul.md)。MX 路径要显式传 `mx_mode=True`，编译器不会根据之前的搬运自动推断。
 
 ### 四步流程
 
 ```text
-① GM ──mem_copy(engine=nd2nz)──► L1       搬入 A、B（ND 输入随路转分形）
+① GM ──mem_copy──► L1                     目的布局决定 ND 输入的随路分形转换
                                           Bias 和随路量化系数也先进 L1
-② L1 ──mem_copy(transpose=?)──► L0A/L0B   按输入布局选择是否转置
+② L1 ──mem_copy──► L0A/L0B               用 permute 视图表达所需轴序
    L1 ──mem_copy──► BIAS                  Bias 进专用 Buffer
-③ matmul(l0c, l0a, l0b, init=...)         M/K/N 由入参 Tensor 的 shape 决定
+③ acc = matmul(l0c, l0a, l0b, init=...)  M/K/N 由入参 Tensor 的 shape 决定
                                           首块 init=True，后续 K 块 init=False
-④ L0C ──mem_copy(deq_scale=?, relu=?)──► GM / UB / L1
-                                          可配置随路量化、激活和输出格式
+④ L0C ──mem_copy──► GM / UB / L1          目的布局、convert / relu 表达式
+                                          描述输出格式、量化和激活
 ```
 
 一个完整的 16×16 例子：
@@ -60,18 +62,20 @@ def matmul(dst, lhs, rhs, *, bias=None, init=True,
 ```python
 @kernel
 def _matmul_kernel(a, b, c):
-    l1a = Channel(MemLoc.L1, shape=(16, 16), dtype=dtypes.float16, depth=1)
-    l1b = Channel(MemLoc.L1, shape=(16, 16), dtype=dtypes.float16, depth=1)
-    l0a = Channel(MemLoc.L0A, shape=(16, 16), dtype=dtypes.float16, depth=1)
-    l0b = Channel(MemLoc.L0B, shape=(16, 16), dtype=dtypes.float16, depth=1)
-    l0c = Channel(MemLoc.L0C, shape=(16, 16), dtype=dtypes.float32, depth=1)
+    l1a = RingBuffer(MemLoc.L1, dtypes.float16, make_layout((16, 16)), depth=1)
+    l1b = RingBuffer(MemLoc.L1, dtypes.float16, make_layout((16, 16)), depth=1)
+    l0a = RingBuffer(MemLoc.L0A, dtypes.float16, make_layout((16, 16)), depth=1)
+    l0b = RingBuffer(MemLoc.L0B, dtypes.float16, make_layout((16, 16)), depth=1)
+    l0c = RingBuffer(MemLoc.L0C, dtypes.float32, make_layout((16, 16)), depth=1)
 
-    mem_copy(l1a.produce(), a, engine=make_copy_engine(format_transform="nd2nz"))
-    mem_copy(l1b.produce(), b, engine=make_copy_engine(format_transform="nd2nz"))
-    mem_copy(l0a.produce(), l1a.consume())
-    mem_copy(l0b.produce(), l1b.consume())
-    matmul(l0c.produce(), l0a.consume(), l0b.consume(), init=True)
-    mem_copy(c, l0c.consume())
+    mem_copy(l1a.next_write(), a)
+    mem_copy(l1b.next_write(), b)
+    mem_copy(l0a.next_write(), l1a.next_read())
+    mem_copy(l0b.next_write(), l1b.next_read().permute(1, 0))
+    acc = matmul(
+        l0c.next_write(), l0a.next_read(), l0b.next_read(), init=True
+    )
+    mem_copy(c, acc)
 ```
 
 ### K 方向累加
@@ -79,13 +83,15 @@ def _matmul_kernel(a, b, c):
 实际矩阵乘的 K 往往远大于 L0A 能放下的量，所以要切 K 并累加：
 
 ```python
-l0c_acc = l0c.produce()                       # 整个 K 循环共用同一块 L0C
+l0c_acc = l0c.next_write()                    # 整个 K 循环共用同一块 L0C
 for k_l1_idx in range(k_l1_tiles):
     ...                                        # GM → L1
     for k_l0_idx in range(k_l0_per_l1):
         ...                                    # L1 → L0A/L0B
         global_k = k_l1_idx * k_l0_per_l1 + k_l0_idx
-        dsl_matmul(l0c_acc, l0a_tensor, l0b_tensor, init=(global_k == 0))
+        l0c_acc = dsl_matmul(
+            l0c_acc, l0a_tensor, l0b_tensor, init=(global_k == 0)
+        )
 mem_copy(gm_c_tile, l0c_acc)                   # 累加完成后一次搬出
 ```
 
@@ -150,7 +156,7 @@ with vf(mode="simd"):
 VF 作用域的流水类型是 `PIPE_V`。区域内如存在 UB 地址重叠或跨流水依赖，需要按具体接口约束插入 [`vmem_bar`](../api/compute/vector/reg_sync/vmem-bar.md)。
 
 ::: warning 进 VF 之前要做两件事
-**一、不要在 VF 区域内调用 `Channel.produce()` / `consume()`。** 在进入 `with vf(...)` 之前选好槽位，把返回的 Tensor 传进去。
+**一、不要在 VF 区域内调用 `RingBuffer.next_write()` / `next_read()`。** 在进入 `with vf(...)` 之前选好槽位，把返回的 Tensor 传进去。
 
 **二、不要在 VF 区域内访问对象的成员变量。** 读 `self._xxx` 可能让成员变量从栈溢出到矢量寄存器，既挤占寄存器预算，也会**阻断 VF 融合**。先取成局部变量：
 
@@ -346,7 +352,7 @@ from cannbotdsl.ops.reg import full_mask, vdups, vstore
 
 @cbd.kernel
 def mixed_kernel(dst: Tensor):
-    buf = Buffer(MemLoc.UB, (128,), dtypes.float32)
+    buf = Buffer(MemLoc.UB, dtypes.float32, make_layout((128,)))
     with vf(mode="simd"):
         mask = full_mask()
         value = vdups(1.0, dtypes.float32, mask=mask)
@@ -453,7 +459,7 @@ Tensor 下标读写（`y[i] = x[j]`）走的是标量流水，**只适合搬少�
 
 `atomic_add`、`atomic_sub`、`atomic_max`、`atomic_min`、`atomic_and`、`atomic_or`、`atomic_xor`、`atomic_cas`、`atomic_exch`、`atomic_inc`、`atomic_dec`。
 
-批量累加不要用标量原子接口，而是用 `mem_copy(..., atomic_add=True)` 在搬运时完成——支持 int8/int16/int32/bf16/fp16/fp32，仅支持 UB/L0C → GM。
+批量累加不要用标量原子接口，而是用 `mem_copy(..., options=copy_options(atomic_add=True))` 在搬运时完成——支持 int8/int16/int32/bf16/fp16/fp32，仅支持 UB/L0C → GM。
 
 ## 选哪条路径
 
@@ -463,8 +469,8 @@ Tensor 下标读写（`y[i] = x[j]`）走的是标量流水，**只适合搬少�
 | 逐元素运算、归一化、激活、softmax、归约 | Vector / SIMD（`vf(mode="simd")`） |
 | 不规则控制流、重度 gather / scatter、需要 warp 原语 | Vector / SIMT（`vf(mode="simt")`） |
 | 地址计算、tile 编号、分支判断、少量元数据 | Scalar |
-| 多核把结果累加到同一块 GM | `mem_copy(..., atomic_add=True)` 或原子接口 |
-| 矩阵乘之后紧接逐元素后处理 | Mix 算子：AIC 做 Cube，AIV 做 Vector，用 `ChannelKind.CrossCore` 交接 |
+| 多核把结果累加到同一块 GM | `mem_copy(..., options=copy_options(atomic_add=True))` 或原子接口 |
+| 矩阵乘之后紧接逐元素后处理 | Mix 算子：AIC 做 Cube，AIV 做 Vector，用普通 `RingBuffer` 交接，跨核属性自动推导 |
 
 ## 下一步
 

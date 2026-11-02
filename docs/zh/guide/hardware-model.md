@@ -113,9 +113,9 @@ for tile_idx in range(bi, total_tiles, bn):
 | L0C | `MemLoc.L0C` | 256 KB | Cube 输出端 | 矩阵计算结果与累加初值 | NZ |
 | BIAS | `MemLoc.BIAS` | 4 KB | Cube 专用 | Bias（偏置）数据，只接受 32 位元素 | ND |
 | FBUF | `MemLoc.FBUF` | 4 KB | Fixpipe 数据通路 | 量化参数等 | ND |
-| SSBUF | `MemLoc.SSBUF` | — | Scalar 共享 Buffer | AIC 与 AIV 之间交换少量标量 | ND |
+| SSBUF | `MemLoc.SSBUF` | **3 KB（Mix）/ 1 KB（纯核）** | Scalar 共享 Buffer | AIC 与 AIV 之间交换少量标量 | ND |
 
-**上表这 8 个是 `Buffer` / `Channel` 可以申请的全部位置。** `MemLoc` 枚举本身还有 `GM`、`RegFile`、`L0A_MX`、`L0B_MX` 四个成员（共 12 个），但它们不用于片上申请：GM 由 Kernel 形参带入，`RegFile` 是 VF 内的寄存器，`L0A_MX` / `L0B_MX` 是 MX scale 的从属区（地址由数据地址推导）。L2 不在枚举里。
+**上表这 8 个是 `Buffer` 可以申请的全部位置；`RingBuffer` 支持其中 UB、L1、L0A、L0B、L0C、BIAS，不支持 SSBUF 和 FBUF。** `MemLoc` 枚举本身还有 `GM`、`RegFile`、`L0A_MX`、`L0B_MX` 四个成员（共 12 个），但它们不用于片上申请：GM 由 Kernel 形参带入，`RegFile` 是 VF 内的寄存器，`L0A_MX` / `L0B_MX` 是 MX scale 的从属区（地址由数据地址推导）。L2 不在枚举里。
 
 ::: danger 「每 AI Core」和「每 AIV」不是一回事
 一个 AI Core 含 **1 个 AIC 和 2 个 AIV**。所以：
@@ -157,6 +157,8 @@ SIMT 的寄存器配额还与线程数挂钩（线程数越多、每线程寄存
 片上 Buffer 容量在 Host 侧用 [`get_mem_size`](../api/compilation/host/platform/get-mem-size.md) 查询，参数取 `"ub"`、`"l1"`、`"l0a"`、`"l0b"`、`"l0c"`、`"bt"`（BiasTable）、`"fb0"`（Fixpipe Buffer），大小写不敏感，返回字节数。核数用 [`get_platform_info`](../api/compilation/host/platform/get-platform-info.md) 查询。能查到的一律不要硬编码。
 
 **查不到的有两个：L2 和 SSBUF。** 传 `"l2"` / `"ssbuf"` 会抛 `ValueError`，不是返回 0。样例里 L2 仍写经验值 `128 * 1024 * 1024`。
+
+SSBUF 查不到，但容量本身是确定的，由后端的 arch 能力表固定（`include/CANNIR/Transforms/ChipCapability.h`）：**Mix Kernel 下 3 KB，纯 Cube / 纯 Vector Kernel 下 1 KB**。超限或 32 字节基址不对齐会在 `split-mix-kernel` 阶段**编译报错**，不是运行时静默出错——这一点和 UB 不同，所以不必额外留余量，但也别指望纯核 Kernel 能用满 3 KB。
 
 dav-3510 上的典型返回值：
 
@@ -213,13 +215,13 @@ Vector 通路（矢量计算）
 
 在 DSL 里你一般不需要手写分形排布，而是：
 
-- 声明 L1/L0 的 `Channel` 时用默认的 `data_format="nz"`；
-- 从 GM 搬进 L1 时用 `make_copy_engine(format_transform="nd2nz")` 做随路转换；
-- 从 L0C 搬到 ND 的 GM/UB 时，可不写 `engine`：接口按源、目标布局选择搬运方式，官方示例和 `matmul` 样例都是直接 `mem_copy(gm, l0c)`。需要显式 NZ2ND、量化或 ReLU 时再用 `make_copy_engine`。
+- 声明 L1/L0 的 `Buffer` 或 `RingBuffer` 时使用默认的 `data_format="nz"`；
+- 从 GM 搬进 L1 时直接写 `mem_copy`，编译器根据源、目标布局选择 ND→NZ 随路转换；
+- 从 L0C 搬到 ND 的 GM/UB 时同样由目标布局表达 NZ2ND；量化、数值转换和 ReLU 分别用 `convert(...)`、`relu(...)` 等源表达式描述。
 
 ```python
-nd2nz = make_copy_engine(format_transform="nd2nz")
-mem_copy(l1_a.produce(), gm_a_tile, engine=nd2nz)
+l1_a = RingBuffer(MemLoc.L1, dtypes.float16, make_layout((M, K)), depth=2)
+mem_copy(l1_a.next_write(), gm_a_tile)  # ND GM → NZ L1
 ```
 
 需要理解分形细节的场景（手写非常规排布、对齐调优）见[背景与核心概念](../api/compute/matrix/fractal-intro.md)和[关键分形格式](../api/compute/matrix/fractal-formats.md)。
@@ -238,14 +240,14 @@ mem_copy(l1_a.produce(), gm_a_tile, engine=nd2nz)
 
 同步在本章只给一个结论，细节单独成章。
 
-**结论是：核内「搬运与计算之间」的等待由框架按 `Channel` 的 `produce()` / `consume()` 配对自动插入，其余四类同步要你自己写。**
+**结论是：`Buffer` / `RingBuffer` 的核内及跨核数据依赖由框架根据实际 Tensor 访问生成同步，其余需要精确控制的流水屏障、核间屏障和 GM Cache 一致性仍要你自己写。**
 
 | 场景 | 谁负责 |
 | --- | --- |
-| 核内搬运与计算之间 | **框架**（`Channel`） |
+| 核内搬运与计算之间 | **框架**（按 Tensor 实际访问） |
 | 核内跨流水、VF 内的 UB 重叠 | 你（`vmem_bar`、pipe 级同步） |
 | 核间（AIC 之间、AIV 之间、AIC 与 AIV 之间） | 你（四种模式） |
-| 跨核数据交接 | **框架**，但要你声明 `ChannelKind.CrossCore` |
+| 跨核数据交接 | **框架**（跨核属性按实际访问推导） |
 | 多核经 Scalar 读写同一块 GM | 你（DCache 维护或 bypass） |
 
 完整说明见[同步、Cache 与跨核交接](./synchronization.md)。
@@ -271,10 +273,10 @@ mem_copy(l1_a.produce(), gm_a_tile, engine=nd2nz)
 | 知道自己是第几个核 | `get_block_idx()` / `get_block_num()` |
 | 知道自己是哪个 AIV | `get_subblock_id()` / `get_subblock_dim()`（AIC 上分别为 0 和 1，AIV 上为 0/1 和 2） |
 | 知道当前编译的是 AIC 还是 AIV 侧 | `is_aic()` / `is_aiv()`，**编译期常量；MIX 编译下两者都为 false** |
-| 申请一块片上存储 | `Buffer(MemLoc.UB, shape, dtype)` |
-| 申请一组可轮转的片上槽位 | `Channel(MemLoc.UB, shape, dtype, depth=N)` |
-| 在存储层级之间搬数据 | `mem_copy(dst, src, engine=...)` |
-| 配置格式转换 / 分区 / 转置 | `make_copy_engine(...)` |
+| 申请一块片上存储 | `Buffer(MemLoc.UB, dtype, make_layout(shape))` |
+| 申请一组可轮转的片上槽位 | `RingBuffer(MemLoc.UB, dtype, make_layout(shape), depth=N)` |
+| 在存储层级之间搬数据 | `mem_copy(dst, src, options=...)` |
+| 配置搬运选项 | `copy_options(...)`；布局变换用 Tensor 视图表达 |
 | 取一个 tile 的视图 | `tile_slice(tensor, tiler, coord)` |
 | 做矩阵乘 | `matmul(l0c, l0a, l0b, init=...)` |
 | 做矢量计算（SIMD） | `with vf(mode="simd"):` 内的 `v*` 接口 |

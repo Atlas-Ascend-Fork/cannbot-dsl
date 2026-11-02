@@ -12,7 +12,7 @@
 | **Cube 受限** | 大矩阵乘，MAC 利用率是上限 | tile 大小、L0C 复用、K 方向累加、UnitFlag |
 | **Vector 受限** | 长依赖链的逐元素计算、复杂归约 | VF 内保持寄存器驻留、指令双发、融合接口 |
 | **调度受限** | tile 数不能被核数整除、长尾 | 分核策略、Stream-K、滑动窗口 |
-| **同步受限** | 频繁的核间同步、跨核交接 | 减少同步次数、加深 Channel、拆分 VF |
+| **同步受限** | 频繁的核间同步、跨核交接 | 减少同步次数、加深 RingBuffer、拆分 VF |
 
 算一下**计算访存比**（FLOP / Byte）：向量加是 1/12（每搬 12 字节做 1 次加法），矩阵乘是 O(tile 边长)。前者注定访存受限，再怎么调计算都没用。
 
@@ -171,7 +171,7 @@ else:
 
 ### double buffer 是起点
 
-Channel `depth=2` + 循环外预取一拍，见[写出第一个算子 Step 3](./first-operator.md)。
+`RingBuffer` `depth=2` + 循环外预取一拍，见[写出第一个算子 Step 3](./first-operator.md)。
 
 ### 按预算自适应加深
 
@@ -190,7 +190,7 @@ self.l0c_db = (
 
 ### depth 不等于流水
 
-再强调一次：`depth` 只提供容量和在途重叠能力。**真正的流水由程序顺序决定。** 深度流水时用 `DelayLineGroup` 记住每一拍的 tile 坐标。
+再强调一次：`depth` 只提供容量和在途重叠能力。**真正的流水由程序顺序决定。** 深度流水时用 `Array` 显式保存每一拍的 tile 坐标；旧的 `DelayLineGroup` 已删除。
 
 ### UnitFlag：乘加与搬出的细粒度并行
 
@@ -201,12 +201,12 @@ matmul(l0c, l0a, l0b, init=..., unit_flag=2)   # 中间指令：ENABLE_KEEP
 matmul(l0c, l0a, l0b, init=..., unit_flag=3)   # 最后一条：ENABLE_UPDATE
 ```
 
-乘加指令与对应的搬出指令必须**同时**开启或同时不开启，开启后两者之间无需再插同步。方向必须一致：搬出开启 NZ2ND 随路转换或 B8/B4 量化触发 Channel Merge 时用 `cube.set_mmad_direction("n")`，其他用 `"m"`。
+乘加指令与对应的搬出指令必须**同时**开启或同时不开启，开启后两者之间无需再插同步。方向必须一致：搬出开启 NZ2ND 随路转换或 B8/B4 量化触发 Channel Merge 时用 `cube.set_mmad_direction("n")`，其他用 `"m"`。搬出侧的 UnitFlag 通过 `copy_options(unit_flag=...)` 配置。
 
 ### 减少同步次数
 
 - VF 内包含同步时，切分循环把同步外提。
-- 跨核交接优先用 `ChannelKind.CrossCore` 的 Channel，而不是手写 `*_sync_*` + GM 中转。
+- 跨核交接优先用普通 `RingBuffer`，让编译器按实际访问生成协议，而不是手写 `*_sync_*` + GM 中转。
 - `global_sync_all()` 是全核屏障，代价不低，不要放在内层循环里。
 
 ## 层次 4：搬运效率
@@ -217,12 +217,12 @@ matmul(l0c, l0a, l0b, init=..., unit_flag=3)   # 最后一条：ENABLE_UPDATE
 
 | 想做的事 | 随路写法 |
 | --- | --- |
-| ND → NZ | `engine=make_copy_engine(format_transform="nd2nz")` |
-| 转置加载进 L0A/L0B | `mem_copy(l0a, l1_slice, transpose=True)` |
-| L0C 搬出时反量化 | `mem_copy(dst, l0c, deq_scale=...)` |
-| L0C 搬出时 ReLU | `engine=make_copy_engine(relu=True)` |
-| 搬出时原子累加 | `mem_copy(gm, ub, atomic_add=True)` |
-| NZ → ND | `engine=make_copy_engine(format_transform="nz2nd")` |
+| ND → NZ | 声明 NZ 目的 Tensor，直接 `mem_copy(dst, src)` |
+| 转置加载进 L0A/L0B | `mem_copy(l0a, l1_slice.permute(...))` |
+| L0C 搬出时数值转换和 scale | `mem_copy(dst, convert(l0c, dtype=..., scale=...))` |
+| L0C 搬出时 ReLU | `mem_copy(dst, relu(l0c))` |
+| 搬出时原子累加 | `mem_copy(gm, ub, options=copy_options(atomic_add=True))` |
+| NZ → ND | 声明 ND 目的 Tensor，直接 `mem_copy(dst, src)` |
 
 ### L2 Cache 策略
 
@@ -235,11 +235,13 @@ left_not_l2_cache = (
     and inner_a * self.a_dtype_size % self.ALIGN_128 == 0 and flag_a
 )
 ...
-mem_copy(l1_a.produce(), gm_a_tile, engine=nd2nz_engine_a,
-         l2_cache_ctl=self.l2_cache_ctl_a)
+mem_copy(
+    l1_a.next_write(), gm_a_tile,
+    options=copy_options(l2_cache_ctl=self.l2_cache_ctl_a),
+)
 ```
 
-`l2_cache_ctl` 取值 0、1、2、4，仅支持 GM→UB、UB→GM、GM→L1 和 L0C→GM。
+`l2_cache_ctl` 常用取值 0、1、2、4；GM→UB 的加载路径还支持 5、6。合法取值随搬运方向而异，由 `copy_options` 和 CANNIR 校验。
 
 ### 对齐
 
@@ -252,30 +254,34 @@ mem_copy(l1_a.produce(), gm_a_tile, engine=nd2nz_engine_a,
 
 ### NDDMA 与 padding
 
-GM→UB 的多维非连续搬运用 NDDMA（1～5 维，源和目标维度相同，dtype 一致）。需要边界填充时直接在搬运时做：
+GM→UB 的多维非连续搬运用 NDDMA（1～5 维，源和目标维度相同，dtype 一致）。逻辑边界填充用 `pad` 源表达式，NDDMA 通过 `copy_options` 显式选择：
 
 ```python
-engine = make_copy_engine(kind="nddma", padding_mode="constant")
-mem_copy(slot, src, engine=engine,
-         left_padding=(8,), right_padding=(8,), pad_value=-1.0)
+mem_copy(
+    slot,
+    pad(src, (8, 8), value=-1.0),
+    options=copy_options(engine="nddma"),
+)
 ```
 
-比「搬进来再写零」少一趟。
+比「搬进来再写零」少一趟。普通 GM→UB/L1 的尾块填充值可用 `copy_options(pad_val=...)`，不要与逻辑 `pad` 混为一谈。
 
 ### 多源 / 多目标搬运
 
 - 一个 ND GM 源广播到多个 UB 或 L1 目标：`dst` 传序列。
-- 多个同存储源按顺序拼进一个目标：`src` 传序列，仅支持 `axis=0`。
+- 多个同存储源按顺序拼进一个目标：`src` 传序列，按轴 0 拼接。
 
 这两种模式能把多次 `mem_copy` 合并成一次，减少指令数和同步点。
 
 ### 分区搬运
 
-1:2 配置下让两个 AIV 各搬一半：
+1:2 配置下让两个 AIV 各处理一个分区，用 Tensor 的 `partition` 视图表达：
 
 ```python
-engine = make_copy_engine(split_axis=0)
-mem_copy(dst, src, engine=engine, part_id=get_subblock_id())
+mem_copy(
+    dst,
+    src.partition(dim=0, part_id=get_subblock_id()),
+)
 ```
 
 ## 层次 5：计算效率
@@ -345,7 +351,7 @@ for i in cannbotdsl.range(n, unroll=4):
 | fp32 → HF32 | `enable_hf32`、`set_hf32_round_mode`、`set_fp32_mode` |
 | FP8 矩阵乘 | `enable_fp8` |
 | HiFloat8 | `enable_hif8` |
-| MX 块量化（MXFP8 / MXFP4） | `mem_copy(..., mx_scale=...)` + 对应 engine |
+| MX 块量化（MXFP8 / MXFP4） | L1→L0 用 `options=copy_options(mx_scale=...)`，并显式 `matmul(..., mx_mode=True)` |
 
 仓库里 `matmul/quant_matmul` 覆盖了 MXFP8 / MXFP4 全量化、per-tensor HiFloat8 / INT8 / FP8，以及 MXA8W4 混合量化三条路径。
 
@@ -366,10 +372,10 @@ for i in cannbotdsl.range(n, unroll=4):
 | --- | --- | --- |
 | 用 Tensor 下标循环搬批量数据 | 走标量流水，慢几个数量级 | `mem_copy` + 矢量接口 |
 | 每个 tile 一次 `mem_copy` 且 tile 很小 | 搬运指令数爆炸，带宽打不满 | 加大 tile，或合并成多源/多目标搬运 |
-| `depth=1` 的 Channel 做主循环缓冲 | 搬运和计算完全串行 | `depth>=2` + 循环外预取 |
+| `depth=1` 的 RingBuffer 做主循环缓冲 | 搬运和计算完全串行 | `depth>=2` + 循环外预取 |
 | 内层循环里写运行时 `if` | 阻碍 Hardware Loop 和指令双发 | 提到循环外，或用 `const_expr` / mask 替代 |
 | 中间结果反复写回 UB | 浪费 UB 带宽 | 整条链留在 VF 内的寄存器上 |
-| 在 VF 内调 `produce()` / `consume()` | 不支持 | 进 VF 前取好 Tensor |
+| 在 VF 内调 `next_write()` / `next_read()` | 不支持 | 进 VF 前取好 Tensor |
 | 硬编码 UB / L1 容量 | 换硬件就错 | `get_mem_size()` |
 | `block_dim` 固定为最大核数 | tile 少时空转 | `min(需要的核数, 可用核数)` |
 | 先搬运再单独写一遍量化/ReLU | 多一趟计算 | 用随路转换 |
@@ -419,7 +425,7 @@ for i in cannbotdsl.range(n, unroll=4):
 | Cube + Vector 混合流水 | `samples/flash_attn/`、`samples/flash_mla_with_kvcache/` |
 | AI CPU 调度 + 稀疏访问 | `samples/qwen_sparse_attn/`、`samples/qsa_indexer/` |
 | 量化矩阵乘 | `samples/matmul/quant_matmul/` |
-| 深度软件流水 + 跨核 Channel | `samples/flash_kda/`、`samples/mixed_quant_sparse_flash_mla/` |
+| 深度软件流水 + 跨核 RingBuffer | `samples/flash_kda/`、`samples/mixed_quant_sparse_flash_mla/` |
 
 各样例目录下的 README 带有性能对比图和测试条件，是判断「我的算子算不算快」的参照。
 

@@ -42,7 +42,7 @@
 
 ```python
 from cannbotdsl.aicpu import (
-    GmIn, GmOut,              # 输入 / 输出 GM 指针声明
+    gm_in, gm_out,            # 输入 / 输出 GM 指针声明
     I32, I64, U32, U64,       # 标量类型
     aicpu_kernel,             # 装饰器
     current_raw_stream,       # 取当前 NPU stream
@@ -50,10 +50,20 @@ from cannbotdsl.aicpu import (
 from cannbotdsl.aicpu.toolchain import compile_aicpu_kernel
 ```
 
+::: danger 是 `gm_in` / `gm_out`，不是 `GmIn` / `GmOut`
+这两个名字是**小写蛇形**的。它们本质上是返回注解对象的工厂函数（`cannbotdsl/aicpu/types.py` 里的 `def gm_in(elem)` / `def gm_out(elem)`），不是类，所以不按类名首字母大写。
+
+写成 `GmIn` / `GmOut` 会在 import 时就 `ImportError`。包内样例 `test/cannbotdsl/flash_attn_metadata_aicpu.py` 的写法是权威参考：
+
+```python
+from cannbotdsl.aicpu import I32, I64, U32, aicpu_kernel, gm_in, gm_out
+```
+:::
+
 | 名字 | 作用 |
 | --- | --- |
 | `@aicpu_kernel` | 声明一个在 AI CPU 上执行的函数 |
-| `GmIn(T)` / `GmOut(T)` | 参数注解：这是一个指向 GM 的只读 / 可写指针，元素类型为 `T` |
+| `gm_in(T)` / `gm_out(T)` | 参数注解：这是一个指向 GM 的只读 / 可写指针，元素类型为 `T` |
 | `I32` / `I64` / `U32` / `U64` | 标量与 GM 元素类型 |
 | `current_raw_stream(device_id)` | 取当前设备的原生 stream，下发时需要 |
 | [`compile_aicpu_kernel(...)`](../api/aicpu/build/compile.md) | 编译 AI CPU kernel，得到带 `launch(...)` 方法的对象 |
@@ -62,7 +72,7 @@ from cannbotdsl.aicpu.toolchain import compile_aicpu_kernel
 | `AicpuTraceError` | AI CPU 侧的异常类型 |
 
 ::: warning `compile_aicpu_kernel` 不在 `cannbotdsl.aicpu` 的 `__all__` 里
-`cannbotdsl.aicpu` 导出的是：`aicpu_kernel`、`AicpuTraceError`、`GmIn`、`GmOut`、`I32`、`I64`、`U32`、`U64`、`X86Buffer`、`current_raw_stream`、`pack_struct_bytes`。
+`cannbotdsl.aicpu` 导出的是：`aicpu_kernel`、`AicpuTraceError`、`gm_in`、`gm_out`、`I32`、`I64`、`U32`、`U64`、`X86Buffer`、`current_raw_stream`、`pack_struct_bytes`。
 
 `compile_aicpu_kernel` 要从子模块导入：
 
@@ -80,16 +90,19 @@ AI CPU kernel 的参数用一个**参数类**描述，字段注解标明每个�
 
 ```python
 class MetadataParams:
-    cu_seqlens_q: GmIn(I32)      # 输入：查询的累积序列长度
-    cu_seqlens_kv: GmIn(I32)     # 输入：KV 的累积序列长度
-    seqused_q: GmIn(I32)         # 输入：实际使用长度
-    seqused_kv: GmIn(I32)
-    metadata: GmOut(U32)         # 输出：调度计划
+    cu_seqlens_q: gm_in(I32)     # 输入：查询的累积序列长度
+    cu_seqlens_kv: gm_in(I32)    # 输入：KV 的累积序列长度
+    seqused_q: gm_in(I32)        # 输入：实际使用长度
+    seqused_kv: gm_in(I32)
+    metadata: gm_out(U32)        # 输出：调度计划
+    cu_q_len: U32                # 标量参数直接用类型注解
 ```
+
+字段的**声明顺序就是 C 结构体的字段顺序**，也是 `launch(...)` 和 `run_host(...)` 按名传参时的底层布局依据。
 
 要点：
 
-- **`GmIn` / `GmOut` 声明的是指针，不是张量。** AI CPU 侧按裸指针加偏移访问，没有 Layout 抽象，也没有 `tile_slice`。
+- **`gm_in` / `gm_out` 声明的是指针，不是张量。** AI CPU 侧按裸指针加偏移访问，没有 Layout 抽象，也没有 `tile_slice`。
 - 标量参数直接用 `I32` / `I64` 这类类型注解。
 - 输出同样由调用方预先分配，AI CPU 只负责填。
 
@@ -191,7 +204,7 @@ Host 解释执行通过，只能说明该路径的参考逻辑符合预期，不
 | 你想做的事 | 用什么 |
 | --- | --- |
 | 声明 AI CPU 函数 | `@aicpu_kernel` |
-| 声明输入 / 输出 GM 指针 | `GmIn(I32)` / `GmOut(U32)` |
+| 声明输入 / 输出 GM 指针 | `gm_in(I32)` / `gm_out(U32)`（小写蛇形） |
 | 编译 | `compile_aicpu_kernel(...)`，用 `lru_cache` 包住 |
 | 下发 | `compiled.launch(current_raw_stream(device_id), **kwargs)`；GM 参数传设备地址，标量参数传整数 |
 | AI Core 侧读计划 | `metadata[base + FIELD_INDEX]`，结果是运行期值 |

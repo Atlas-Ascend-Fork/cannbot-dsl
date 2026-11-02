@@ -15,8 +15,8 @@
       放不下 → 切分 + 在线归约 / 状态递推 / 两趟遍历
                               ↓
 ③ 阶段之间在哪里交接？
-      同核内 → Channel
-      AIC ↔ AIV → CrossCore Channel
+      同核内 → RingBuffer
+      AIC ↔ AIV → RingBuffer（跨核属性自动推导）
       跨核归约 → workspace GM + 核间同步
 ```
 
@@ -83,13 +83,16 @@ $$
 
 \(\alpha\) 是修正因子。每块只需维护三个状态：**行最大 \(m\)、行分母 \(\ell\)、累积输出 \(O\)**。片上开销从 \(O(S_2)\) 降到 \(O(1)\)。
 
-落到代码上，这三个状态是常驻的 `Buffer`（不是 `Channel`，因为它们不轮转）：
+落到代码上，这三个状态是常驻的 `Buffer`（不是 `RingBuffer`，因为它们不轮转）：
 
 ```python
-self.softmax_max_bufs = [Buffer(MemLoc.UB, (tile_m, 1), dtypes.float32) for _ in range(...)]
-self.run_max = Buffer(MemLoc.UB, (tile_m, 1), dtypes.float32)
-self.run_den = Buffer(MemLoc.UB, (tile_m, 1), dtypes.float32)
-self.old_scale_buf = Buffer(MemLoc.UB, (tile_m, 1), dtypes.float32)
+self.softmax_max_bufs = [
+    Buffer(MemLoc.UB, dtypes.float32, make_layout((tile_m, 1)))
+    for _ in range(...)
+]
+self.run_max = Buffer(MemLoc.UB, dtypes.float32, make_layout((tile_m, 1)))
+self.run_den = Buffer(MemLoc.UB, dtypes.float32, make_layout((tile_m, 1)))
+self.old_scale_buf = Buffer(MemLoc.UB, dtypes.float32, make_layout((tile_m, 1)))
 ```
 
 每块更新时用 `vload_broadcast` 把行标量广播到全 lane、`vstore_first` 写回单个行标量——这是「按行的标量运算」在 Reg 模型里的标准写法。
@@ -124,15 +127,15 @@ chunk 2 ← state_1   │
 
 | 边界 | 方式 | 注意 |
 | --- | --- | --- |
-| 同核内，搬运 ↔ 计算 | `Channel` | 同步自动；`depth >= 2` 才有流水 |
-| 同核内，阶段 A ↔ 阶段 B | `Buffer` 或 `Channel` | 阶段间复用片上地址用 `channel_rewind()` |
-| AIC ↔ AIV | `Channel(kind=CrossCore)` | `depth <= 8`；别手写同步加 GM 中转 |
+| 同核内，搬运 ↔ 计算 | `RingBuffer` | 编译器按实际 Tensor 访问生成同步；流水仍需显式预取 |
+| 同核内，阶段 A ↔ 阶段 B | `Buffer` 或 `RingBuffer` | 自动分配场景可用 `onchip_rewind()` 声明资源分配边界 |
+| AIC ↔ AIV | `RingBuffer` | 跨核属性由编译器按实际访问推导，不需要 `kind` |
 | 多核归约 | workspace GM + 核间同步 | 这道屏障**不会**自动生成 |
 | 少量标量跨核 | `MemLoc.SSBUF` | 上一代要绕 GM，3510 不用了 |
 
 选交接粒度的权衡：
 
-- **交接太细**：同步次数多，Channel 槽位小，流水填不满。
+- **交接太细**：同步次数多，`RingBuffer` 槽位小，流水填不满。
 - **交接太粗**：片上放不下，或者下游要等很久才开始干活。
 
 实践上的起点是**让交接块的大小等于下游一次计算的输入量**，然后按 profiling 结果调。
@@ -157,12 +160,12 @@ chunk 2 ← state_1   │
 
 | 样例 | 阶段划分 | 片上不够的解法 | 交接方式 |
 | --- | --- | --- | --- |
-| `rms_norm` | Vector 两段 | UB 放得下整行就一趟；否则列切分**两趟** | 同核 `Channel` |
-| `matmul` | 纯 Cube | K 向切块 + L0C 累加 | 同核 `Channel`，两级 tile |
+| `rms_norm` | Vector 两段 | UB 放得下整行就一趟；否则列切分**两趟** | 同核 `RingBuffer` |
+| `matmul` | 纯 Cube | K 向切块 + L0C 累加 | 同核 `RingBuffer`，两级 tile |
 | `matmul_streamk` | Cube + AIV 归约 | DP / SK 混合调度 | **workspace GM** + 核间同步 |
-| `flash_attn` | Cube(QK) → Vector(softmax) → Cube(PV) | **在线归约** | `CrossCore Channel`，三级流水 |
-| `flash_kda` | Vector 预处理 + Chunk 递推 | **状态递推**（64 token / chunk） | AI CPU 调度 + 跨核 Channel |
-| `quant_matmul` MXA8W4 | AIV 权重 prologue → AIC MX matmul | K 状态全部窗化 | `CrossCore Channel` |
+| `flash_attn` | Cube(QK) → Vector(softmax) → Cube(PV) | **在线归约** | 跨核 `RingBuffer`，三级流水 |
+| `flash_kda` | Vector 预处理 + Chunk 递推 | **状态递推**（64 token / chunk） | AI CPU 调度 + 跨核 `RingBuffer` |
+| `quant_matmul` MXA8W4 | AIV 权重 prologue → AIC MX matmul | K 状态全部窗化 | 跨核 `RingBuffer` |
 | `qwen_sparse_attn` | AI CPU 筛块 → Cube + Vector | 块稀疏，只访问候选块 | AI CPU metadata + 跨核 |
 | `mixed_quant_sparse_flash_mla` | 多路量化 KV + MLA | 在线归约 + FlashDecode 分片 | AI CPU 计划 + workspace |
 

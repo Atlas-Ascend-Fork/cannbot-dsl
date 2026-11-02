@@ -115,14 +115,14 @@ export CANNBOTDSL_JIT_TIME_PROFILING=1
 
 | 变量 | 默认 | 作用 |
 | --- | --- | --- |
-| `CANNBOTDSL_AUTO_BUFFER_SYNC` | **开** | Buffer / Channel 的自动同步。为同核 Buffer 的跨 pipe 读写插入 `get_buf` / `release_buf` 并补齐读写完成依赖 |
+| `CANNBOTDSL_AUTO_BUFFER_SYNC` | **开** | Buffer / RingBuffer 的自动同步。根据 Tensor 的实际访问、资源身份和控制流补齐读写依赖 |
 | `CANNBOTDSL_INTRABLOCK_MATCH_MANUAL` | 关 | 为显式整数 ID 的核内同步补齐函数入口 priming 与出口 drain |
 | `CANNBOTDSL_BUFFER_READ_SHARING` | 开 | 读共享优化 |
 | `CANNBOTDSL_DEBUG_ASC_SYNC` | 关 | 取 `pipe` / `vf` / `all`，插入对应范围的同步调试操作 |
 | `CANNBOTDSL_BARALL` | 关 | 给毕昇追加 `-mllvm -cce-aicore-sync-bar-all=true`，打开全局 `bar.all` 自动插入 |
 
 ::: danger 不要用 `AUTO_BUFFER_SYNC=0` 来「兼容」老代码
-显式 `produce()` / `consume()` 选槽**必须**开启自动同步。`AUTO_BUFFER_SYNC=0` 只用于全手工同步的路径，不是 Channel 接口的兼容开关。关掉它再用 Channel，结果是数据错而不是报错。
+显式 `next_write()` / `next_read()` 选槽**必须**开启自动同步。`AUTO_BUFFER_SYNC=0` 只用于全手工同步的路径，不是 `RingBuffer` 接口的兼容开关。关掉它再用 `RingBuffer`，结果是数据错而不是报错。
 :::
 
 `CANNBOTDSL_BARALL=1` 是定位同步问题的大锤：全局插屏障，正确性优先、流水并行性全丢。**它不能替代跨核握手**——确认「加了 bar.all 就对了」只说明缺同步，还要回去找到底缺在哪里，见[同步、Cache 与跨核交接](./synchronization.md)。
@@ -156,9 +156,9 @@ NPU ARCH 3510 的硬件**不实现非规格化数**（subnormal）。基础接�
 | [`set_mmad_direction`](../api/compute/matrix/set-mmad-direction.md) | 取 `"m"` / `"n"`；开 UnitFlag 时必须与搬出读取顺序一致 |
 
 ::: warning 上面这张表就是全部，没有别的
-`cannbotdsl.ops.cube` 的 `__all__` 只有 `HF32RoundingMode` 加上表里这六个函数。
+`cannbotdsl.ops.cube` 的 `__all__` 一共 8 项：表里这六个函数，加上两个枚举 `HF32RoundingMode` 和 `RoundingMode`。
 
-**别去找 `enable_hf32_trans`。** 有些接口清单里还能见到这个名字，但 0.7.0 的包里没有它，包内测试也把那条路径标为 obsolete。转置由 `mem_copy(..., transpose=True)` 负责，和 HF32 开关是两件事。
+**别去找 `enable_hf32_trans`。** 有些接口清单里还能见到这个名字，但 0.8.0 的包里没有它，包内测试也把那条路径标为 obsolete。转置通过 Tensor 的 `permute` 视图表达，和 HF32 开关是两件事。
 :::
 
 ### 目标架构
@@ -284,7 +284,7 @@ class MyKernel:
 `cbd.print` 的约束要记住：
 
 - 只支持 **UB、L1、L0C** 上的 Tensor，以及 Kernel 局部标量和点索引标量。
-- Channel 不能直接打印，先 `produce()` / `consume()` 取出 Tensor。
+- `RingBuffer` 不能直接打印，先 `next_write()` / `next_read()` 取出 Tensor。
 - 按**物理存储顺序**采样，最多 1024 字节。NZ / ZN 数据不会重排成 ND，看到的是分形顺序。
 - 每个打印点在每个 block / subblock 上保留 **64 条**记录（`mode="ring"` 留最近的，`"stop"` 留最早的）。
 - **会增加设备内存占用并触发 Host 回读与同步，不能用于性能测量。**

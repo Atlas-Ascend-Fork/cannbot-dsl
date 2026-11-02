@@ -16,7 +16,7 @@ CANNBot-DSL 是一个**显式**的 DSL：它不替你决定数据放在哪一级
 
 代价是：你需要先理解一点硬件。本章第二节就是为此准备的。
 
-「显式」不等于「没有编译器优化」。VF 融合、Hardware Loop、`Channel` 的依赖同步仍由后端插入。显式的是存储层级、搬运方向、tile 和程序顺序，不是每一条硬件指令。
+「显式」不等于「没有编译器优化」。VF 融合、Hardware Loop、`RingBuffer` 的依赖同步仍由后端插入。显式的是存储层级、搬运方向、tile 和程序顺序，不是每一条硬件指令。
 
 ## 阅读顺序
 
@@ -37,7 +37,7 @@ CANNBot-DSL 是一个**显式**的 DSL：它不替你决定数据放在哪一级
 | 顺序 | 文档 | 读完之后你会知道 |
 | --- | --- | --- |
 | 6 | [数据、布局与切块](./data-and-layout.md) | Shape/Stride/Layout/Tensor、逻辑布局与物理布局、`tile_slice` |
-| 7 | [片上存储、流水与 GM 协作](./onchip-memory.md) | `Buffer` 与 `Channel`、double buffer、UB 预算、bank 冲突、workspace |
+| 7 | [片上存储、流水与 GM 协作](./onchip-memory.md) | `Buffer` 与 `RingBuffer`、double buffer、UB 预算、bank 冲突、workspace |
 | 8 | [矢量寄存器与 lane 模型](./vector-registers.md) | VL = 256 字节、lane 怎么排、寄存器预算、掩码与 lane 的关系 |
 | 9 | [三类计算单元](./compute.md) | Cube 矩阵乘流程、VF 寄存器级矢量计算、SIMD + SIMT 混合与纯 SIMT 的启动方式、Scalar 与原子操作 |
 | 10 | [数据类型与量化](./data-types.md) | HiF8、MXFP8/MXFP4、scale 存在哪里、谁负责搬 |
@@ -98,7 +98,7 @@ CANNBot-DSL 是一个**显式**的 DSL：它不替你决定数据放在哪一级
 | CPU 架构 | x86_64 / aarch64 |
 | Python | 3.10、3.11、3.12 |
 | CANN | 建议 9.2.0-beta.2(SIMT 必须 9.2.0 及以上版本) |
-| CANNBot-DSL | 0.7.0 |
+| CANNBot-DSL | 0.8.0 |
 | torch | 2.7.1 / 2.9.0 / 2.10.0 / 2.11.0 / 2.12.0 |
 
 ### 安装
@@ -138,7 +138,7 @@ python -c 'import cannbotdsl; print(cannbotdsl.__version__)'
 :::
 
 ::: info 两种标注的区别
-官方 API 文档站没有完全覆盖 0.7.0 的接口面，所以本章有些内容的依据是 `samples/` 和 `cannbotdsl` 包源码。按可信度分两档标注：
+官方 API 文档站没有完全覆盖 0.8.0 的接口面，所以本章有些内容的依据是 `samples/` 和 `cannbotdsl` 包源码。按可信度分两档标注：
 
 | 标注 | 含义 |
 | --- | --- |

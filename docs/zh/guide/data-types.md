@@ -3,7 +3,22 @@
 Ascend 950 这一代最大的变化不在存储层级，而在**数值格式**：Cube 原生支持 HiF8 与 MX 微缩放格式，低精度矩阵乘的吞吐是 FP16 的 2 到 4 倍。仓库里一半样例是量化算子，所以这一章要讲清三件事：**有哪些格式**、**scale 存在哪里**、**谁负责把 scale 搬进去**。
 
 ::: info 本章的核实口径
-格式层面的事实（位宽、块长、分形、对齐）来自昇腾官方架构资料，可以照用。**接口层面的类型拼写**（即 `cbd.dtypes` 下的具体名字）请以 [API 接口清单](../api/language/decorators.md)为准——本章在表格里同时给出 Ascend C 的类型名，便于交叉对照。
+格式层面的事实（位宽、块长、分形、对齐）来自昇腾官方架构资料，可以照用。表格里的 `cbd.dtypes` 拼写取自包内 `cannbotdsl/types/dtypes.py` 的定义，同时给出 Ascend C 的 C++ 类型名便于交叉对照。
+:::
+
+::: danger `cbd.dtypes` 的名字没有 `_t` 后缀，也不叫 `fp8_*`
+两套命名很容易串：**Ascend C 的 C++ 类型**叫 `fp8_e4m3fn_t`、`hifloat8_t`，**DSL 的 dtype** 叫 `cbd.dtypes.float8_e4m3fn`、`cbd.dtypes.hifloat8`。照着 C++ 名写 `cbd.dtypes.fp8_e4m3fn_t` 会 `AttributeError`。
+
+| Ascend C 类型名 | `cbd.dtypes` 拼写 |
+| --- | --- |
+| `fp8_e4m3fn_t` | `float8_e4m3fn` |
+| `fp8_e5m2_t` | `float8_e5m2` |
+| `fp8_e8m0_t` | `float8_e8m0` |
+| `hifloat8_t` | `hifloat8` |
+| `fp4x2_e2m1_t` | `fp4x2_e2m1` |
+| `fp4x2_e1m2_t` | `fp4x2_e1m2` |
+
+唯一两个保留 `x2` 的是 FP4：它们本来就表示「两个 4 位元素打包进一个字节」，不是命名风格。`dtypes` 下另有一批 `*x2` / `*x3` / `*x4` 短向量类型（`float32x4`、`int8x4` 等），那是 SIMT 短向量，和 FP4 打包是两回事。
 :::
 
 ## 为什么单独一章
@@ -18,19 +33,21 @@ Ascend 950 这一代最大的变化不在存储层级，而在**数值格式**�
 
 ## 数值格式总览
 
-| 格式 | 位宽 | Ascend C 类型名 | 需要 scale | Cube 支持 | 典型用途 |
-| --- | --- | --- | :---: | :---: | --- |
-| FP32 | 32 | `float` | — | ✓ | 累加、归约、参考实现 |
-| HF32（TF32 档） | 32 存储 / 降精度计算 | — | — | ✓ | 用精度换 FP32 矩阵乘吞吐 |
-| BF16 | 16 | `bfloat16_t` | — | ✓ | 训练与推理的主力 |
-| FP16 | 16 | `half` | — | ✓ | 推理主力 |
-| INT8 | 8 | `int8_t` | per-tensor / per-channel | ✓ | 传统量化 |
-| **HiF8** | 8 | `hifloat8_t` | **不需要** | ✓ | 接近 FP16 精度的 8 位浮点 |
-| FP8 E4M3 | 8 | `fp8_e4m3fn_t` | per-tensor 或 MX | ✓ | 标准 FP8 |
-| FP8 E5M2 | 8 | `fp8_e5m2_t` | per-tensor 或 MX | ✓ | 标准 FP8，动态范围更大 |
-| **MXFP8** | 8 + 8/32 | 上两者 + `fp8_e8m0_t` | **每 32 元素一个** | ✓ | 块量化，内存减半 |
-| **MXFP4** | 4（双元素打包）+ 8/32 | `fp4x2_e2m1_t` / `fp4x2_e1m2_t` + `fp8_e8m0_t` | **每 32 元素一个** | ✓ | 块量化，吞吐 4× FP16 |
-| E8M0 | 8 | `fp8_e8m0_t` | — | 作为 scale | MX 的缩放因子，纯指数 |
+| 格式 | 位宽 | `cbd.dtypes` 拼写 | Ascend C 类型名 | 需要 scale | Cube 支持 | 典型用途 |
+| --- | --- | --- | --- | :---: | :---: | --- |
+| FP32 | 32 | `float32` | `float` | — | ✓ | 累加、归约、参考实现 |
+| HF32（TF32 档） | 32 存储 / 降精度计算 | `float32` + `enable_hf32` | — | — | ✓ | 用精度换 FP32 矩阵乘吞吐 |
+| BF16 | 16 | `bfloat16` | `bfloat16_t` | — | ✓ | 训练与推理的主力 |
+| FP16 | 16 | `float16` | `half` | — | ✓ | 推理主力 |
+| INT8 | 8 | `int8` | `int8_t` | per-tensor / per-channel | ✓ | 传统量化 |
+| **HiF8** | 8 | `hifloat8` | `hifloat8_t` | **不需要** | ✓ | 接近 FP16 精度的 8 位浮点 |
+| FP8 E4M3 | 8 | `float8_e4m3fn` | `fp8_e4m3fn_t` | per-tensor 或 MX | ✓ | 标准 FP8 |
+| FP8 E5M2 | 8 | `float8_e5m2` | `fp8_e5m2_t` | per-tensor 或 MX | ✓ | 标准 FP8，动态范围更大 |
+| **MXFP8** | 8 + 8/32 | 上两者 + `float8_e8m0` | 上两者 + `fp8_e8m0_t` | **每 32 元素一个** | ✓ | 块量化，内存减半 |
+| **MXFP4** | 4（双元素打包）+ 8/32 | `fp4x2_e2m1` / `fp4x2_e1m2` + `float8_e8m0` | `fp4x2_e2m1_t` / `fp4x2_e1m2_t` + `fp8_e8m0_t` | **每 32 元素一个** | ✓ | 块量化，吞吐 4× FP16 |
+| E8M0 | 8 | `float8_e8m0` | `fp8_e8m0_t` | — | 作为 scale | MX 的缩放因子，纯指数 |
+
+HF32 不是独立 dtype：数据仍是 `float32`，由 [`enable_hf32`](../api/compute/matrix/enable-hf32.md) 切换 Cube 的计算精度档。
 
 吞吐关系（同频）：**HiF8 / MXFP8 / FP8 约为 FP16 的 2 倍，MXFP4 约为 4 倍。** 这是选型的首要依据。
 
@@ -112,8 +129,8 @@ scaleB : [Ceil(K / 64), N, 2]
 scale 和数据走**同一条两跳通路**，但在 L1 上的布局要求不同：
 
 ```text
-GM ──mem_copy(engine=mx_scale_*)──► L1 ──mem_copy──► L0A/L0B 的 MX scale 区
-     （数据走 nd2nz，scale 走 mx_scale_*）
+GM ──mem_copy──► L1 ──mem_copy(options=copy_options(mx_scale=...))──► L0A/L0B
+     源、目的布局决定格式转换          数据与配套 scale 在这里关联
 ```
 
 - L1 上 `scaleA` 要求 **Zz** 布局（外层按行、内层按行），`scaleB` 要求 **Nn** 布局（外层按列、内层按列）。原因是 MX 加载指令对 A 按行读、对 B 按列读。
@@ -129,38 +146,23 @@ GM ──mem_copy(engine=mx_scale_*)──► L1 ──mem_copy──► L0A/L0B
 | [`copy_options(mx_scale=l1_scale)`](../api/data-movement/copy-options.md) | 为 L1→L0A/L0B 搬运指定配套的 L1 缩放因子 Tensor；布局及形状要求见参数说明 |
 | `mem_copy(l0_data, l1_data, options=options)` | 使用上述配置，将数据及配套缩放因子加载到目标 |
 
-::: warning 接口版本说明
-下文的 `format_transform`、`make_copy_engine` 和 `mem_copy(..., mx_scale=...)` 为历史写法，尚未迁移，不适用于当前源码。当前配置入口及可执行示例以 [copy_options](../api/data-movement/copy-options.md) 为准；不能将旧的 `format_transform` 参数直接传给 `copy_options`。
-:::
-
-`format_transform` 的 MX 取值共六个：
-
-| 取值 | 含义 |
-| --- | --- |
-| `"mx_scale_a"` | A 侧 scale，按默认布局 |
-| `"mx_scale_b"` | B 侧 scale，按默认布局 |
-| `"mx_scale_and"` | A 侧 scale，源为 ND |
-| `"mx_scale_adn"` | A 侧 scale，源为 DN |
-| `"mx_scale_bnd"` | B 侧 scale，源为 ND |
-| `"mx_scale_bdn"` | B 侧 scale，源为 DN |
-
-`mem_copy` 的方向表里也写明了这两处：**GM→L1 支持 MX scale 格式转换**，**L1→L0A/L0B 支持 MX scale 加载**。
+GM→L1 的数据和 scale 分别通过各自的源、目的布局及必要的 `permute` 等视图表达，不再使用 `make_copy_engine(format_transform="mx_scale_*")`。L1→L0A/L0B 时才用 `copy_options(mx_scale=...)` 将两者关联。
 
 ```python
-nd2nz = make_copy_engine(format_transform="nd2nz")
-sa_eng = make_copy_engine(format_transform="mx_scale_and")
-
-# 数据与 scale 分别搬入 L1
-mem_copy(l1_a.produce(), gm_a_tile, engine=nd2nz)
-mem_copy(l1_sa.produce(), gm_sa_tile, engine=sa_eng)
+# 数据与 scale 分别搬入 L1，格式由各自目的布局决定
+mem_copy(l1_a.next_write(), gm_a_tile)
+mem_copy(l1_sa.next_write(), gm_sa_tile)
 
 # 搬入 L0A 时把两者关联
-mem_copy(l0a.produce(), l1_a.consume(), mx_scale=l1_sa.consume())
-```
+mem_copy(
+    l0a.next_write(),
+    l1_a.next_read(),
+    options=copy_options(mx_scale=l1_sa.next_read()),
+)
 
-::: info 待核实
-上面的代码是按 `mem_copy` 与 `make_copy_engine` 的参数语义组织的示意，用于说明**两类搬运的配对关系**。落到具体算子时，参数的确切组合请以 `samples/matmul/quant_matmul/quant_batch_matmul_mx.py` 为准。
-:::
+# MX 矩阵乘必须显式选择，不能依赖之前的搬运推断。
+acc = matmul(acc, l0a_tensor, l0b_tensor, init=..., mx_mode=True)
+```
 
 ## 混合量化：MXA8W4
 
@@ -169,10 +171,10 @@ mem_copy(l0a.produce(), l1_a.consume(), mx_scale=l1_sa.consume())
 硬件的 MX 矩阵乘要求两侧元素位宽一致，所以这条路径的做法是：
 
 1. AIV 先做一段 prologue，把 FP4 权重**纯位置换**成 FP8（不是数值转换，只是重排位域）。
-2. 位置换带来的 \(2^{-6}\) 因子由 Fixpipe 的 `deq_scale=64` 和 Host 侧的 `bias/64` 两处联合补偿。
-3. 转换结果经 **`ChannelKind.CrossCore` 通道**交给 AIC 做 MX matmul。
+2. 位置换带来的 \(2^{-6}\) 因子由 Fixpipe 的 `convert(..., scale=64)` 和 Host 侧的 `bias/64` 两处联合补偿。
+3. 转换结果经普通 `RingBuffer` 交给 AIC 做 MX matmul，跨核属性由实际访问推导。
 
-这是一个「用 Vector 补硬件能力缺口、用跨核 Channel 交接」的典型结构，详见[融合算子的设计方法论](./fusion-design.md)。
+这是一个「用 Vector 补硬件能力缺口、用跨核 `RingBuffer` 交接」的典型结构，详见[融合算子的设计方法论](./fusion-design.md)。
 
 ## 随路量化与反量化
 
@@ -180,9 +182,9 @@ mem_copy(l0a.produce(), l1_a.consume(), mx_scale=l1_sa.consume())
 
 | 想做的事 | 写法 |
 | --- | --- |
-| L0C 搬出时反量化 | `mem_copy(dst, l0c, deq_scale=...)` |
-| L0C 搬出时 ReLU | `engine=make_copy_engine(relu=True)` |
-| 搬出时转 ND | `engine=make_copy_engine(format_transform="nz2nd")` |
+| L0C 搬出时数值转换和 scale | `mem_copy(dst, convert(l0c, dtype=..., scale=...))` |
+| L0C 搬出时 ReLU | `mem_copy(dst, relu(l0c))` |
+| 搬出时转 ND | 声明 ND 目的 Tensor，再 `mem_copy(dst, l0c)` |
 
 L0C→UB 的写回还可以把 FP32/INT32 直接量化成 BF16/FP16/FP8/INT8。能在搬运里做的事，不要单独写一遍矢量计算。
 
@@ -220,8 +222,8 @@ K 方向切块累加的顺序决定了浮点舍入的累积方式。设备上按
 | 开 HiF8 矩阵乘 | [`enable_hif8`](../api/compute/matrix/enable-hif8.md) |
 | 开 FP8 矩阵乘 | [`enable_fp8`](../api/compute/matrix/enable-fp8.md) |
 | 用精度换 FP32 吞吐 | [`enable_hf32`](../api/compute/matrix/enable-hf32.md)、[`set_hf32_round_mode`](../api/compute/matrix/set-hf32-round-mode.md) |
-| 搬 MX scale | `make_copy_engine(format_transform="mx_scale_*")` + `mem_copy(..., mx_scale=...)` |
-| 搬出时反量化 | `mem_copy(dst, l0c, deq_scale=...)` |
+| 搬 MX scale | GM→L1 由布局表达；L1→L0 用 `options=copy_options(mx_scale=...)` |
+| 搬出时数值转换和 scale | `mem_copy(dst, convert(l0c, dtype=..., scale=...))` |
 | 矢量侧转换数值类型 | `vcast`（可配 `RoundingMode`） |
 | 标量侧转换数值类型 | `cast` |
 | 按另一种 dtype 重新解释字节 | `t.view(dtype=...)` / `t.reinterpret(...)`，**不做数值转换** |

@@ -61,9 +61,12 @@ CANNBot-DSL **不提供 Layout 代数**（没有 `composition`、`logical_divide
 ND 场景下二者可以一致。NZ、ZN 等分形场景下物理布局采用分形排布，但**计算代码仍按逻辑布局访问**：
 
 ```python
-# 声明一个 L1 上的 Channel，逻辑上是 (base_m, k_l1) 的二维矩阵
-l1_a = Channel(MemLoc.L1, shape=(t.base_m, t.k_l1), dtype=t.a_dtype, depth=4)
+# 声明一个 L1 上的 RingBuffer，逻辑上是 (base_m, k_l1) 的二维矩阵
+l1_a = RingBuffer(
+    MemLoc.L1, t.a_dtype, make_layout((t.base_m, t.k_l1)), depth=4
+)
 # 物理上按 NZ 分形存放（L1 的 data_format 默认就是 "nz"）
+l1_a_tensor = l1_a.next_write()
 
 # 切 tile 时写的还是逻辑坐标
 l1_a_slice = tile_slice(l1_a_tensor, (t.base_m, t.base_k), (0, k_l0_idx))
@@ -88,29 +91,34 @@ dtype_view = bits.view(dtype=cbd.dtypes.float32)  # 保留字节，换 dtype 解
 
 约束：仅支持逻辑格式和物理格式**均为 ND** 的 Tensor；`dtype view` 要求源 Tensor 的末维 Stride 为 1，且不支持 `bool`。dtype view **不执行数值转换**，需要转换数值请用 `vcast` / `cast`。
 
-### `reinterpret()`：改类型、形状、跨度、起点
+### `reinterpret()`：改类型、布局、物理步长、起点
 
 ```python
-tmp = cbd.Buffer(cbd.MemLoc.UB, (4,), dtypes.float32)
-view = tmp.reinterpret(dtype=dtypes.float16, shape=(8,))   # 16 字节换一种解释
+tmp = cbd.Buffer(cbd.MemLoc.UB, dtypes.float32, cbd.make_layout((4,)))
+view = tmp.reinterpret(
+    dtype=dtypes.float16, layout=cbd.make_layout((8,))
+)  # 16 字节换一种解释
 ```
 
 ```python
-t.reinterpret(dtype=None, shape=None, *, stride=None, offset=0)
+t.reinterpret(
+    dtype=None, layout=None, *,
+    physical_layout=None, data_format=None, offset=0,
+)
 ```
 
-`offset` 的单位始终是**字节**，基线是调用 `reinterpret()` 的当前 Tensor。改变 dtype 时，Shape、Stride 和 offset 必须在编译时确定。这个接口常用于在一块片上存储上叠放不同用途的视图（例如把一段 fp32 scratch 临时当成 fp16 用）。
+`offset` 的单位始终是**字节**，基线是调用 `reinterpret()` 的当前 Tensor。`layout` 描述逻辑形状和元素步长，`physical_layout` 描述包含 padding 的物理布局，两者都用 `make_layout` 创建。布局可以包含运行时尺寸或步长；重绑定不搬动数据，也不做通用容量检查，调用方保证访问范围有效。
 
 ### `permute()`：重排轴顺序
 
 ```python
-view = cbd.permute(x, (1, 0))
+view = x.permute(1, 0)
 ```
 
-只重排逻辑和物理 Shape/Stride 元数据，不移动数据。**仅支持 GM Tensor**，且必须采用 Identity/ND 布局映射。
+只重排逻辑和物理 Shape/Stride 元数据，不移动数据。它可用于 GM 以及搬运、计算接口支持的片上 Tensor；具体组合是否可由硬件执行，由后续 `mem_copy` 或计算接口检查。
 
 ::: warning 视图不等于搬运
-三个接口都不动数据。要真正改变物理排布（ND→NZ、转置加载），必须通过 `mem_copy` 加 `make_copy_engine` 的随路转换。
+三个接口都不动数据。要真正改变物理排布（ND→NZ、转置加载），需要通过 `mem_copy` 的源、目的布局和轴变换视图表达；不再使用 `make_copy_engine` 或 `transpose=True`。
 :::
 
 ## `tile_slice`：切块的主力接口
@@ -141,15 +149,18 @@ tile = tile_slice(gm_x, (64, 128), (2, 1))
 `matmul` 样例用两层 `tile_slice` 完成 GM→L1→L0 的两级切分：
 
 ```python
-# 第一级：从 GM 取一个 L1 块
+# 第一级：从 GM 取一个 L1 块，格式由目的布局决定
 gm_a_tile = tile_slice(gm_a, (t.base_m, t.k_l1), (m_idx, k_l1_idx))
-mem_copy(l1_a.produce(), gm_a_tile, engine=nd2nz_engine_a, l2_cache_ctl=...)
-l1_a_tensor = l1_a.consume()
+mem_copy(
+    l1_a.next_write(), gm_a_tile,
+    options=copy_options(l2_cache_ctl=...),
+)
+l1_a_tensor = l1_a.next_read()
 
 # 第二级：从 L1 块里取一个 L0 块
 for k_l0_idx in range(k_l0_per_l1):
     l1_a_slice = tile_slice(l1_a_tensor, (t.base_m, t.base_k), (0, k_l0_idx))
-    mem_copy(l0a.produce(), l1_a_slice)
+    mem_copy(l0a.next_write(), l1_a_slice)
 ```
 
 注意第二级的 `coord=(0, k_l0_idx)`：第 0 维取 0 表示覆盖整个 M 轴，第 1 维按 K 方向滚动。
@@ -213,19 +224,23 @@ def k(x: cbd.Tensor, y: cbd.Tensor):
 
 这条路径走的是 Scalar 流水，**只适合搬少量标量**（元数据、标志位、小规模索引表）。批量数据必须走 `mem_copy` + 矢量/矩阵计算接口，否则性能会差几个数量级。
 
-## 动态 shape：`capacity` 的作用
+## 动态 shape：逻辑布局与物理布局
 
-片上资源的 shape 可以包含运行期维度，但必须同时给出静态 `capacity`：
+片上资源的逻辑布局可以包含运行期维度，但物理分配必须在编译期确定。动态逻辑布局可以搭配静态 `physical_layout`：
 
 ```python
-# shape 含动态维时，capacity 必须显式提供
-ch = Channel(MemLoc.UB, shape=(rows, 128), dtype=dtypes.float32,
-             depth=2, capacity=(MAX_ROWS, 128))
+ch = RingBuffer(
+    MemLoc.UB,
+    dtypes.float32,
+    make_layout((rows, 128)),
+    depth=2,
+    physical_layout=make_layout((MAX_ROWS, 128)),
+)
 ```
 
-- `capacity` 是实际预留存储的**静态容量边界**，物理存储按 capacity 规划。
-- 每个静态维必须满足 `shape[i] <= capacity[i]`；动态维的运行时值必须为正且不超过 capacity。
-- `shape != capacity` 是合法的。
+- `layout` 描述当前逻辑范围；`physical_layout` 决定每槽实际预留的存储。
+- 运行时实际范围不得超过物理布局可承载的范围；`reinterpret` 和普通视图不做通用容量或越界检查。
+- 需要预留更大空间时，也可以先声明一维 `Buffer` / `RingBuffer`，再通过 `view` 或 `reinterpret` 派生所需 Tensor。
 
 ::: danger 静态形状用错会静默算错，不会报错
 这是动态 shape 机制最危险的一面。看这个序列：
@@ -251,7 +266,7 @@ program = cbd.compile(Add().run, cbd.TensorSpec((M,), dtype), ...)
 Add().run(x, y, out)
 ```
 
-同理，Kernel 内部用 `capacity` 预留的空间也不做运行时校验：动态维的实际值超过 capacity 时写越界，由调用方保证不发生。
+同理，Kernel 内部的静态物理布局只限定分配，不替调用方检查运行时 View 是否越界；实际范围由调用方保证。
 :::
 
 这个机制让一份编译产物能处理一个范围内的不同 shape，配合 Host 侧的 [`Dim`](../api/compilation/host/specs/dim.md) 使用，详见 [JIT 参数与编译缓存](./jit-arguments.md)。
@@ -262,11 +277,11 @@ Add().run(x, y, out)
 | --- | --- |
 | 从大 Tensor 取第 (i, j) 块 | `tile_slice(t, tiler, (i, j))` |
 | 改变逻辑形状，不动数据 | `t.view(...)` |
-| 按另一种 dtype 解释同一段字节 | `t.view(dtype=...)` 或 `t.reinterpret(dtype=..., shape=...)` |
+| 按另一种 dtype 解释同一段字节 | `t.view(dtype=...)` 或 `t.reinterpret(dtype=..., layout=...)` |
 | 在片上存储的某个字节偏移处开一个新视图 | `t.reinterpret(..., offset=bytes)` |
-| 交换 GM Tensor 的轴顺序 | `cbd.permute(t, dims)` |
-| ND 数据变成 Cube 要的 NZ | `mem_copy(..., engine=make_copy_engine(format_transform="nd2nz"))` |
-| 矩阵转置加载进 L0A/L0B | `mem_copy(l0a, l1_slice, transpose=True)` |
+| 交换 Tensor 的轴顺序 | `t.permute(...)` |
+| ND 数据变成 Cube 要的 NZ | 声明 NZ 目的 Tensor，再 `mem_copy(dst, src)` |
+| 矩阵转置加载进 L0A/L0B | `mem_copy(l0a, l1_slice.permute(...))` |
 | 真正做数值类型转换 | `vcast`（矢量）/ `cast`（标量） |
 
 ## 下一步

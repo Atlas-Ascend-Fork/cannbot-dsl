@@ -12,7 +12,7 @@ CANNBot-DSL 是一个用 Python 编写昇腾 NPU 算子的领域专用语言。�
 import torch
 import torch_npu  # noqa: F401  # 向 PyTorch 注册 Ascend NPU 后端
 
-from cannbotdsl import Channel, host, mem_copy
+from cannbotdsl import RingBuffer, host, make_layout, mem_copy
 from cannbotdsl.lang.kernel import kernel
 from cannbotdsl.lang.vf import vf
 from cannbotdsl.ops.reg import update_mask, vadd, vload, vstore
@@ -21,17 +21,17 @@ from cannbotdsl.tensor import MemLoc
 
 @kernel
 def _reg_add_kernel(src0, src1, dst):
-    buf0 = Channel(MemLoc.UB, (64,), src0.dtype, depth=1)
-    buf1 = Channel(MemLoc.UB, (64,), src1.dtype, depth=1)
-    out = Channel(MemLoc.UB, (64,), dst.dtype, depth=1)
+    buf0 = RingBuffer(MemLoc.UB, src0.dtype, make_layout((64,)), depth=1)
+    buf1 = RingBuffer(MemLoc.UB, src1.dtype, make_layout((64,)), depth=1)
+    out = RingBuffer(MemLoc.UB, dst.dtype, make_layout((64,)), depth=1)
 
     # GM 数据搬运至 UB
-    mem_copy(buf0.produce(), src0)
-    mem_copy(buf1.produce(), src1)
+    mem_copy(buf0.next_write(), src0)
+    mem_copy(buf1.next_write(), src1)
 
-    in0 = buf0.consume()
-    in1 = buf1.consume()
-    res = out.produce()
+    in0 = buf0.next_read()
+    in1 = buf1.next_read()
+    res = out.next_write()
     # Vector Function：更新 mask、搬入寄存器、计算、搬出
     with vf(mode="simd"):
         mask, _ = update_mask(64, 32)
@@ -39,7 +39,7 @@ def _reg_add_kernel(src0, src1, dst):
         vstore(res, 0, acc, mask)
 
     # UB 数据搬运至 GM
-    mem_copy(dst, out.consume())
+    mem_copy(dst, out.next_read())
 
 
 @host
@@ -66,7 +66,7 @@ if __name__ == "__main__":
 即使还没读过后面的章节，这段代码里也已经出现了编程模型的全部骨架：
 
 - `@kernel` 标出跑在 AI Core 上的代码，`@host` 标出从 Python 调用的入口。
-- `Channel` 声明片上存储，`mem_copy` 在存储层级之间搬数据。
+- `RingBuffer` 声明一组循环复用的片上槽位，`mem_copy` 在存储层级之间搬数据。
 - `with vf(...)` 圈出一段矢量计算。`mode="simd"` 是寄存器级 SIMD，也是主力模式；另有 `mode="simt"` 的线程模型，见[三类计算单元](./compute.md#simt-模式)。
 - `_reg_add_kernel[1]` 中方括号里的 `1` 是启动的 block 数量。
 - 输出 Tensor `dst` 由调用方准备好传进来，kernel 不返回值。
@@ -75,15 +75,15 @@ if __name__ == "__main__":
 
 ### 1. 存储层级是显式的
 
-很多编程模型把片上存储和寄存器的分配交给编译器决定。CANNBot-DSL 不这样做：UB、L1、L0A、L0B、L0C 等每一级片上存储都要你用 `Buffer` 或 `Channel` 显式声明，`mem_copy` 的每一次搬运都要你显式写出来。
+很多编程模型把片上存储和寄存器的分配交给编译器决定。CANNBot-DSL 不这样做：UB、L1、L0A、L0B、L0C 等每一级片上存储都要你用 `Buffer` 或 `RingBuffer` 显式声明，`mem_copy` 的每一次搬运都要你显式写出来。
 
 原因是昇腾 AI Core 的性能几乎完全由数据通路决定：同一个算子，把数据停在 L1 复用还是每次从 GM 读，性能可以差一个数量级。把这件事交给编译器猜，调优时就没有抓手了。
 
 ### 2. 同步由框架生成，排布由你决定
 
-显式搬运最容易出错的地方是同步：什么时候数据已经搬完可以算了、什么时候上一轮算完了可以覆盖缓冲区了。这部分样板代码由 `Channel` 承担——你声明槽位数量 `depth`，用 `produce()` 取写入槽位、`consume()` 取读取槽位。这两个调用本身只推进游标、不会等待；搬运与计算之间的等待由 lowering 按配对插入。VF 里的 UB 重叠仍要自己写 `vmem_bar`。
+显式搬运最容易出错的地方是同步：什么时候数据已经搬完可以算了、什么时候上一轮算完了可以覆盖缓冲区了。`RingBuffer` 用 `next_write()` 和 `next_read()` 分别推进独立的写、读选槽序列，返回绑定声明布局的 Tensor。选槽本身不访问数据，也不等待；编译器根据这些 Tensor 的实际读写和资源身份生成同步。VF 里的 UB 重叠仍要自己写 `vmem_bar`。
 
-但 `Channel` 只消除同步样板，**不替你做软件流水调度**。预取几拍、主循环怎么排、尾部怎么排空，仍然是你写出来的程序顺序决定的。详见[片上存储与流水](./onchip-memory.md)。
+但 `RingBuffer` 只提供槽位与游标，**不替你做软件流水调度**。预取几拍、主循环怎么排、尾部怎么排空，仍然是你写出来的程序顺序决定的；它也不检查两个游标是否配对或缓冲区是否满空。详见[片上存储与流水](./onchip-memory.md)。
 
 ### 3. Python 既是宿主语言，也是元编程语言
 
@@ -245,7 +245,7 @@ config = TileConfig(rows=64, columns=128)
 
 `@aicpu_kernel` 定义在 AI CPU 上执行的函数，通常用于生成元数据、计算调度信息或完成轻量控制任务。仓库里凡是带 `_metadata` 后缀的样例（`flash_attn_metadata`、`qsa_indexer_metadata`、`mixed_quant_sparse_flash_mla_metadata` 等）都走这条路径：先由 AI CPU 算出每个核该处理哪些 tile，再由 AI Core 按计划执行。
 
-它的接口自成一套（`GmIn` / `GmOut` 声明指针、按 stream 下发），和 `@kernel` 完全不同，详见 [AI CPU 与调度计划](./aicpu.md)。
+它的接口自成一套（`gm_in` / `gm_out` 声明指针、按 stream 下发），和 `@kernel` 完全不同，详见 [AI CPU 与调度计划](./aicpu.md)。
 
 ## 一个算子通常包含哪几层
 
@@ -262,7 +262,7 @@ config = TileConfig(rows=64, columns=128)
 │   例：MatmulTiling 类 + MatmulKernel.run()            │
 ├──────────────────────────────────────────────────────┤
 │ 第 1 层：@kernel 设备代码                             │
-│   声明 Channel、切 tile、搬运、Cube/Vector 计算、写回  │
+│   声明 RingBuffer、切 tile、搬运、Cube/Vector 计算、写回 │
 │   例：MatmulKernel.matmul_kernel()                    │
 └──────────────────────────────────────────────────────┘
 ```

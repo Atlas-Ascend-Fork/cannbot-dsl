@@ -12,18 +12,18 @@
 | `__simd_vf__` | `with vf(mode="simd"):` | VF 作用域 |
 | `__simt_vf__` / `__launch_bounds__(N)` | `with vf(mode="simt", thread=N):` | SIMT VF；`thread` 同时决定每线程寄存器配额 |
 | `__simd_callee__` | VF 内调用的 `@jit` 方法 | — |
-| `TPipe` + `TQue` | `Channel(..., depth=N)` | **同步不用手写**，这是最大的差别 |
-| `TBuf` | `Buffer(...)` | 单块 scratch |
-| `InitBuffer` / `AllocTensor` / `FreeTensor` | `produce()` / `consume()` | 只选槽并推进游标，不阻塞 |
-| `EnQue` / `DeQue` | 由 lowering 自动插入 | — |
-| `SetFlag` / `WaitFlag` | 核内由 Channel 负责；跨流水用 pipe 级同步 | — |
-| `DataCopy` | `mem_copy(dst, src, ...)` | 方向表见 API 文档 |
-| `DataCopyPad` | `mem_copy(..., left_padding=, right_padding=, pad_value=)` | 随路填充 |
+| `TPipe` + `TQue` | `RingBuffer(..., depth=N)` | 选槽由你写，数据同步按实际 Tensor 访问生成 |
+| `TBuf` | `Buffer(...)` | 单块 scratch，直接返回 Tensor |
+| `InitBuffer` / `AllocTensor` / `FreeTensor` | `Buffer` / `RingBuffer` 声明与选中 Tensor | 不保留一一对应的申请、释放调用 |
+| `EnQue` / `DeQue` | 由编译器按实际访问生成 | — |
+| `SetFlag` / `WaitFlag` | 数据依赖由框架生成；精确流水屏障用 pipe 级同步 | — |
+| `DataCopy` | `mem_copy(dst, src, options=...)` | 方向表见 API 文档 |
+| `DataCopyPad` | `mem_copy(dst, pad(src, ...), options=copy_options(engine="nddma"))` | 逻辑 padding 由源表达式描述 |
 | `LoadData` / `LoadData2D` | `mem_copy` 到 L0A / L0B | — |
-| `LoadDataWithTranspose` | `mem_copy(..., transpose=True)` | — |
-| `Mmad` | `matmul(dst, lhs, rhs, init=...)` | `init` 控制是否累加 |
+| `LoadDataWithTranspose` | `mem_copy(l0, l1.permute(...))` | 用轴变换视图表达 |
+| `Mmad` | `acc = matmul(dst, lhs, rhs, init=...)` | `init` 控制是否累加；返回实际目的 View |
 | `MmadWithSparse` | **不支持** | 3510 取消了 4:2 结构化稀疏 |
-| `Fixpipe` 随路量化 | `mem_copy(..., deq_scale=...)` / `make_copy_engine(relu=True)` | — |
+| `Fixpipe` 随路量化 / ReLU | `mem_copy(dst, convert(...))` / `mem_copy(dst, relu(...))` | — |
 | `RegTensor<T>` | `vload` 返回的寄存器值 | 生命周期限于单个 VF |
 | `MaskReg` | `Mask`（`full_mask` / `update_mask` 等） | — |
 | `AddrReg` | 由编译器从地址表达式自动生成 | 不需要手写 |
@@ -69,7 +69,7 @@
 | 前缀 | 含义 | 例子 |
 | --- | --- | --- |
 | `gm_` | GM 上的张量（通常是 Kernel 形参） | `gm_a`、`gm_x`、`gm_out` |
-| `l1_` | L1 上的 Channel 或其槽位 | `l1_a`、`l1_b`、`l1_a_tensor` |
+| `l1_` | L1 上的 RingBuffer 或其槽位 | `l1_a`、`l1_b`、`l1_a_tensor` |
 | `l0a` / `l0b` / `l0c` | 对应 L0 Buffer | `l0c_acc` |
 | `ub_` | UB 上的资源 | `ub_out` |
 | 无前缀 | 多为编译期常量或循环变量 | `base_m`、`k_l1_idx` |
@@ -78,15 +78,15 @@
 
 | 后缀 | 含义 | 例子 |
 | --- | --- | --- |
-| `_ch` | 一个 `Channel` 对象（**不是** Tensor，要 `produce` / `consume`） | `x_ch`、`qk_ch` |
+| `_rb` | 一个 `RingBuffer` 对象（**不是** Tensor，要 `next_write` / `next_read`） | `x_rb`、`qk_rb` |
 | `_buf` | 一个 `Buffer`（直接就是 Tensor） | `gamma_buf`、`softmax_max_buf` |
-| `_t` / `_tensor` | 从 Channel 取出的槽位 Tensor | `l1_a_tensor` |
+| `_t` / `_tensor` | 从 RingBuffer 取出的槽位 Tensor | `l1_a_tensor` |
 | `_tile` | 一个 tile 视图（`tile_slice` 的结果） | `gm_a_tile` |
 | `_slice` | 第二级 tile 视图 | `l1_a_slice` |
 | `_acc` | 累加器（整个循环共用一块） | `l0c_acc` |
 | `_idx` | tile 序号（**不是元素下标**） | `m_idx`、`k_l1_idx`、`tile_idx` |
 | `_num` / `_tiles` | 数量 | `used_core_num`、`n_tiles` |
-| `_engine` / `_eng` | `make_copy_engine` 的结果 | `nd2nz_engine_a`、`fixpipe` |
+| `_options` | `copy_options(...)` 创建的不可变搬运配置 | `load_options`、`store_options` |
 
 ### tiling 参数
 
@@ -95,7 +95,7 @@
 | `base_m` / `base_n` / `base_k` | 最内层（L0 级）tile 尺寸 |
 | `m_l1` / `n_l1` / `k_l1` | L1 级 tile 尺寸 |
 | `k_l0_per_l1` | 一个 L1 块里有几个 L0 块 |
-| `l1_buffer_num` | L1 Channel 的 depth（通常 2 或 4） |
+| `l1_buffer_num` | L1 RingBuffer 的 depth（通常 2 或 4） |
 | `l0c_db` | L0C 是否双缓冲（2 或 1） |
 | `used_core_num` | 实际启动的核数 |
 | `row_factor` / `col_factor` | 一次处理多少行 / 列（Vector 侧） |
@@ -170,9 +170,9 @@ info.ai_cpu_num        # AI CPU 数
 | **随路（on-the-fly）** | 由搬运单元在搬运过程中完成的转换，不占用计算单元 |
 | **UnitFlag** | 让乘加与搬出细粒度并行的机制 |
 | **Fixpipe** | L0C 搬出路径上的处理单元，可做量化、激活、格式转换 |
-| **double buffer** | `depth=2` 的 Channel 加循环外预取，使搬运与计算重叠 |
+| **double buffer** | `depth=2` 的 RingBuffer 加循环外预取，使搬运与计算重叠 |
 | **在途（in-flight）** | 已发出但未完成的搬运 |
-| **延迟线（DelayLine）** | 记录「若干拍之前那次搬运对应哪个 tile」的标量历史 |
+| **标量历史（Array）** | 用 `Array` 记录「若干拍之前那次搬运对应哪个 tile」等标量元数据；旧的 DelayLineGroup 已删除 |
 | **workspace** | 算子自用的 GM 暂存区，由调用方分配 |
 | **Stream-K** | 把尾部 tile 按 K 维切开以缓解长尾的调度策略 |
 | **在线归约** | 边扫边修正统计量的归约形式，如 online softmax |

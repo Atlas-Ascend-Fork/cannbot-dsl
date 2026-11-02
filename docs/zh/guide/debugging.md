@@ -50,10 +50,12 @@ import cannbotdsl as cbd
 
 @cbd.kernel
 def debug_kernel(src: cbd.Tensor):
-    tmp = cbd.Channel(cbd.MemLoc.UB, shape=(16,), dtype=src.dtype, depth=1)
-    slot = tmp.produce()
+    tmp = cbd.RingBuffer(
+        cbd.MemLoc.UB, src.dtype, cbd.make_layout((16,)), depth=1
+    )
+    slot = tmp.next_write()
     cbd.mem_copy(slot, src)
-    slot = tmp.consume()
+    slot = tmp.next_read()
     cbd.print(slot, label="ub_data")        # 打印 UB 上的整个 Tensor
     cbd.print(src[(0,)], label="first")     # 打印 GM 上点索引得到的标量
 ```
@@ -68,7 +70,7 @@ def debug_kernel(src: cbd.Tensor):
 ### 约束
 
 - 必须在 `@kernel` 函数中调用，不能直接打印 Python 数值或 `torch.Tensor`。
-- **Channel 不能直接打印**，要先 `produce()` / `consume()` 取出 Tensor。
+- **`RingBuffer` 不能直接打印**，要先 `next_write()` / `next_read()` 取出 Tensor。
 - Tensor 按物理存储顺序采样，**最多 1024 字节**。非连续视图不会自动压紧，NZ/ZN 数据也不会自动重排为 ND——打印分形数据时看到的顺序是物理顺序。
 - 每个打印点在每个 block/subblock 上独立保留 **64 条**记录。`mode="ring"` 保留最近 64 次，`mode="stop"` 保留最早 64 次（只停止保存新数据，不停止 Kernel 执行）。
 - **会增加设备内存占用并触发 Host 回读和同步，不能用于性能测量。**
@@ -217,7 +219,7 @@ Host 侧的构图、编译和运行错误由 `CANNBotError` 及 `DiagnosticCode`
 
 | 现象 | 优先检查 |
 | --- | --- |
-| 全部为 0 或未初始化值 | 输出 Tensor 没搬回 GM；或 `produce()` / `consume()` 配对错了 |
+| 全部为 0 或未初始化值 | 输出 Tensor 没搬回 GM；或 RingBuffer 选槽顺序、保存的 Tensor / View 使用错误 |
 | 只有第一个核的结果对 | 分核逻辑：`get_block_idx()` 没参与 tile 坐标计算 |
 | 最后几个元素错 | 尾块：掩码没覆盖到，或 `tile_slice` 的 coord 越界 |
 | 矩阵乘结果错位 | 分形对齐：M/N 没对齐 16，K 没对齐 K0；或 transpose 配置与实际布局不符 |
@@ -285,8 +287,8 @@ Host API 提供 `ProfileSpec` 和 `profiler.report_tensor_info` 用于配置 pro
 - [ ] 输出 Tensor 分配了吗、dtype 对吗
 - [ ] `block_dim` 是不是 0 或者超过了可用核数
 - [ ] tile 大小是不是算成了 0 或负数（构图期 `print` 一下）
-- [ ] 每个 `produce()` 都有对应的 `consume()` 吗
-- [ ] 是不是在 VF 内调用了 `produce()` / `consume()`
+- [ ] 每个 RingBuffer 的选槽顺序和保存的 Tensor / View 都符合生产、使用、环绕覆盖顺序吗
+- [ ] 是不是在 VF 内调用了 `next_write()` / `next_read()`
 - [ ] 掩码在使用前赋值了吗
 - [ ] K 方向累加的第一块是不是 `init=True`
 

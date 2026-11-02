@@ -92,9 +92,11 @@ def demo_kernel(x: cbd.Tensor, out: cbd.Tensor):
     tile = 128                     # 编译期值
     print("[构图期] tile =", tile)  # Python 内建 print，构图期打印
 
-    buf = cbd.Channel(cbd.MemLoc.UB, (tile,), x.dtype, depth=1)
-    cbd.mem_copy(buf.produce(), x)
-    slot = buf.consume()
+    buf = cbd.RingBuffer(
+        cbd.MemLoc.UB, x.dtype, cbd.make_layout((tile,)), depth=1
+    )
+    cbd.mem_copy(buf.next_write(), x)
+    slot = buf.next_read()
 
     cbd.print(slot, label="ub_data")   # 设备侧打印，执行期输出真实数据
 ```
@@ -113,7 +115,7 @@ def demo_kernel(x: cbd.Tensor, out: cbd.Tensor):
 `cbd.print` 的三条硬约束（完整清单见[调试与精度验证](./debugging.md)）：
 
 - 只支持 **UB、L1、L0C** 上的 Tensor，以及 Kernel 局部标量和点索引标量。**看不到矢量寄存器**——那要用 [`dump_reg`](./debugging.md)。
-- Channel 不能直接打印，要先 `produce()` / `consume()` 取出 Tensor。
+- `RingBuffer` 不能直接打印，要先 `next_write()` / `next_read()` 取出 Tensor。
 - 会增加设备内存占用并触发 Host 回读与同步，**不能用于性能测量**。
 
 Host 侧还可以拿到结构化记录：
@@ -128,7 +130,7 @@ records = get_debug_prints()   # 含标签、dtype、shape、存储位置、bloc
 ```
 
 ::: tip 还有一条更直接的路
-从 0.7.0 起可以直接把生成的 AscendC 源码 dump 出来：`CANNBOTDSL_DUMP_ASCENDC=1`。构图期 `print` 回答「我以为生成了什么」，`.asc` 文件回答「实际生成了什么」。见[编译选项与产物观察](./compiler-options.md#转储-mlir-与-ascendc-源码)。
+从 0.8.0 起可以直接把生成的 AscendC 源码 dump 出来：`CANNBOTDSL_DUMP_ASCENDC=1`。构图期 `print` 回答「我以为生成了什么」，`.asc` 文件回答「实际生成了什么」。见[编译选项与产物观察](./compiler-options.md#转储-mlir-与-ascendc-源码)。
 :::
 
 ## 元编程：用 Python 生成不同的 Kernel
@@ -216,9 +218,9 @@ def compile_time_kernel(out: cbd.Tensor):
 | 接收或传递 Tensor 值 | ✗ | ✓ | ✓ | ✓ | ✓ |
 | 读写或计算 Tensor 数据 | ✗ | ✗ | ✗ | ✓ | ✓ |
 | `Buffer(...)` 分配片上存储 | ✗ | ✗ | ✗ | ✓ | ✓ |
-| 创建 `Channel` | ✗ | ✗ | ✗ | ✓ | ✓ |
-| `produce()` / `consume()` | ✗ | ✗ | ✗ | ✓ | ✓ |
-| 创建 `DelayLineGroup` 并调用其方法 | ✗ | ✗ | ✗ | ✓ | ✓ |
+| 创建 `RingBuffer` | ✗ | ✗ | ✗ | ✓ | ✓ |
+| `next_write()` / `next_read()` | ✗ | ✗ | ✗ | ✓ | ✓ |
+| 创建 `Array` 并读写标量历史 | ✗ | ✗ | ✗ | ✓ | ✓ |
 | `const_expr()` / `target_version()` 作为控制流条件 | ✗ | 见下 | ✓ | ✓ | ✓ |
 | 启动 Kernel（`k[n](...)`） | ✗ | ✓ | ✗ | ✗ | ✗ |
 

@@ -244,7 +244,7 @@ for j in range(col_loops):
 ```python
 # ✗ buf 在分支内创建，分支外不可见
 if cond:
-    buf = cbd.Buffer(cbd.MemLoc.UB, (128,), dtypes.float32)
+    buf = cbd.Buffer(cbd.MemLoc.UB, cbd.dtypes.float32, cbd.make_layout((128,)))
 cbd.mem_copy(out, buf)
 ```
 
@@ -253,7 +253,7 @@ cbd.mem_copy(out, buf)
 ```python
 class K:
     def __init__(self, n):
-        self._buf = Buffer(MemLoc.UB, (n,), dtypes.float32)
+        self._buf = Buffer(MemLoc.UB, dtypes.float32, make_layout((n,)))
 
     def __call__(self, ...):
         if cond:

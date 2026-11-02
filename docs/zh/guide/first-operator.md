@@ -25,7 +25,7 @@ python -c 'import cannbotdsl; print(cannbotdsl.__version__)'
 import torch
 import torch_npu  # noqa: F401  # 向 PyTorch 注册 Ascend NPU 后端
 
-from cannbotdsl import Channel, host, mem_copy
+from cannbotdsl import RingBuffer, host, make_layout, mem_copy
 from cannbotdsl.lang.kernel import kernel
 from cannbotdsl.lang.vf import vf
 from cannbotdsl.ops.reg import update_mask, vadd, vload, vstore
@@ -34,17 +34,17 @@ from cannbotdsl.tensor import MemLoc
 
 @kernel
 def _reg_add_kernel(src0, src1, dst):
-    buf0 = Channel(MemLoc.UB, (64,), src0.dtype, depth=1)
-    buf1 = Channel(MemLoc.UB, (64,), src1.dtype, depth=1)
-    out = Channel(MemLoc.UB, (64,), dst.dtype, depth=1)
+    buf0 = RingBuffer(MemLoc.UB, src0.dtype, make_layout((64,)), depth=1)
+    buf1 = RingBuffer(MemLoc.UB, src1.dtype, make_layout((64,)), depth=1)
+    out = RingBuffer(MemLoc.UB, dst.dtype, make_layout((64,)), depth=1)
 
     # GM 数据搬运至 UB
-    mem_copy(buf0.produce(), src0)
-    mem_copy(buf1.produce(), src1)
+    mem_copy(buf0.next_write(), src0)
+    mem_copy(buf1.next_write(), src1)
 
-    in0 = buf0.consume()
-    in1 = buf1.consume()
-    res = out.produce()
+    in0 = buf0.next_read()
+    in1 = buf1.next_read()
+    res = out.next_write()
     # Vector Function：更新 mask、搬入、计算、搬出
     with vf(mode="simd"):
         mask, _ = update_mask(64, 32)
@@ -52,7 +52,7 @@ def _reg_add_kernel(src0, src1, dst):
         vstore(res, 0, acc, mask)
 
     # UB 数据搬运至 GM
-    mem_copy(dst, out.consume())
+    mem_copy(dst, out.next_read())
 
 
 @host
@@ -93,21 +93,21 @@ def _reg_add_kernel(src0, src1, dst):
 设备函数。三个参数都是 GM 上的 Tensor，`dst` 是输出——**Kernel 不返回值，输出通过参数传入**。
 
 ```python
-    buf0 = Channel(MemLoc.UB, (64,), src0.dtype, depth=1)
+    buf0 = RingBuffer(MemLoc.UB, src0.dtype, make_layout((64,)), depth=1)
 ```
-在 UB 上申请 1 个长度为 64 的槽位。`depth=1` 表示不轮转，纯粹当一块缓冲用。地址由框架规划。
+在 UB 上申请 1 个长度为 64 的槽位。`make_layout` 描述槽内 Tensor 的逻辑布局，`depth=1` 表示不轮转。地址由框架规划。
 
 ```python
-    mem_copy(buf0.produce(), src0)
+    mem_copy(buf0.next_write(), src0)
 ```
-`produce()` 取写入槽位的 Tensor，`mem_copy` 把 GM 数据搬进去。**同步由框架生成**，这里不需要写 wait。
+`next_write()` 选择写游标当前槽位并推进写游标，`mem_copy` 把 GM 数据搬进去。**数据同步由框架根据实际 Tensor 访问生成**，这里不需要写 wait。
 
 ```python
-    in0 = buf0.consume()
-    res = out.produce()
+    in0 = buf0.next_read()
+    res = out.next_write()
     with vf(mode="simd"):
 ```
-先在 VF 外把所有要用到的槽位取出来，再进入 VF 作用域——**不要在 VF 内调用 `produce()` / `consume()`**。
+先在 VF 外把所有要用到的槽位取出来，再进入 VF 作用域——**不要在 VF 内调用 `next_write()` / `next_read()`**。
 
 ```python
         mask, _ = update_mask(64, 32)
@@ -135,7 +135,7 @@ Step 1 写死了 64 个元素、1 个核。实际算子要能处理任意长度�
 
 1. 把长度和 tile 大小作为**编译期配置**传给 `@kernel` 类的 `__init__`。
 2. 用 `get_block_idx()` / `get_block_num()` 做多核切分。
-3. 用 `tile_slice` 按 tile 序号取 GM 视图。
+3. 用 `tile_slice` 按 tile 序号取 GM 视图，并对尾块显式绑定实际范围。
 
 ```python
 import math
@@ -144,8 +144,7 @@ import torch
 import torch_npu  # noqa: F401
 
 import cannbotdsl
-from cannbotdsl import dtypes, get_mem_size
-from cannbotdsl.channel import Channel
+from cannbotdsl import RingBuffer, dtypes, get_mem_size, make_layout
 from cannbotdsl.lang.host import host
 from cannbotdsl.lang.jit import jit
 from cannbotdsl.lang.kernel import kernel
@@ -176,9 +175,15 @@ class VecAddKernel:
         self._seg = self._tile // VL          # 每个 tile 内的 VF 迭代次数
 
         # ── 声明片上资源 ──
-        self._x_ch = Channel(MemLoc.UB, (self._tile,), dtype, depth=2)
-        self._y_ch = Channel(MemLoc.UB, (self._tile,), dtype, depth=2)
-        self._o_ch = Channel(MemLoc.UB, (self._tile,), dtype, depth=2)
+        self._x_rb = RingBuffer(
+            MemLoc.UB, dtype, make_layout((self._tile,)), depth=2
+        )
+        self._y_rb = RingBuffer(
+            MemLoc.UB, dtype, make_layout((self._tile,)), depth=2
+        )
+        self._o_rb = RingBuffer(
+            MemLoc.UB, dtype, make_layout((self._tile,)), depth=2
+        )
 
     def __call__(self, gm_x: Tensor, gm_y: Tensor, gm_out: Tensor):
         tile = self._tile
@@ -187,20 +192,26 @@ class VecAddKernel:
         bn = get_block_num()
 
         for t in cannbotdsl.range(bi, n_tiles, bn):
-            # 本 tile 的有效元素数（最后一块可能不足 tile）。
-            # tile_slice / Channel 仍用完整 tile，不要缩成 (actual,)——
-            # mem_copy 要求源、目标 shape 一致；尾块多出来的 lane 用掩码屏蔽。
+            # tile_slice 会裁剪尾块；选中槽也要显式绑定相同的实际范围。
             actual = min(tile, self._n - t * tile)
+            mem_copy(
+                self._x_rb.next_write()[:actual,],
+                tile_slice(gm_x, (tile,), (t,)),
+            )
+            mem_copy(
+                self._y_rb.next_write()[:actual,],
+                tile_slice(gm_y, (tile,), (t,)),
+            )
 
-            mem_copy(self._x_ch.produce(), tile_slice(gm_x, (tile,), (t,)))
-            mem_copy(self._y_ch.produce(), tile_slice(gm_y, (tile,), (t,)))
-
-            x = self._x_ch.consume()
-            y = self._y_ch.consume()
-            o = self._o_ch.produce()
+            x = self._x_rb.next_read()
+            y = self._y_rb.next_read()
+            o = self._o_rb.next_write()
             self._add(x, y, o, actual)
 
-            mem_copy(tile_slice(gm_out, (tile,), (t,)), self._o_ch.consume())
+            mem_copy(
+                tile_slice(gm_out, (tile,), (t,)),
+                self._o_rb.next_read()[:actual,],
+            )
 
     @jit
     def _add(self, x, y, o, actual):
@@ -222,12 +233,12 @@ class VecAdd:
 
 - **`__init__` 里全是普通 Python 算术**。它们在构图期执行，结果固化进设备代码。UB 容量用 `get_mem_size("ub")` 查询，不要写死 `248 * 1024`。
 - `for t in cannbotdsl.range(bi, n_tiles, bn)` 是轮转分核：第 `bi` 个核处理第 `bi`、`bi+bn`、`bi+2bn`… 个 tile。
-- **尾块用掩码处理，不用分支，也不要缩小 `tile_slice`**。`mask_counter(actual)` 建计数器，`update_mask` 每轮消耗一个 VL，超出的 lane 被屏蔽。GM 一侧需要先对齐到 tile，否则最后一次 `mem_copy` 会越界。
+- **尾块搬运和计算都按实际范围处理。** `tile_slice` 返回裁剪后的 GM View；`next_write()[:actual,]` 给目的槽绑定相同范围。`mask_counter(actual)` 建计数器，`update_mask` 每轮消耗一个 VL，超出的 lane 被屏蔽。读端用同一 `actual` 构造输出 View，不依赖选槽恢复写入布局。
 - 计算逻辑拆进 `@jit` 方法，`__call__` 只负责调度。这是样例里统一的组织方式。
 
 ## Step 3：加上 double buffer
 
-Step 2 的 Channel 已经是 `depth=2`，但程序顺序还是「搬完就用」，搬运和计算没有重叠。把下一拍的搬运提前发出去就能重叠：
+Step 2 的 `RingBuffer` 已经是 `depth=2`，但程序顺序还是「搬完就用」，搬运和计算没有重叠。把下一拍的搬运提前发出去就能重叠：
 
 ```python
     def __call__(self, gm_x: Tensor, gm_y: Tensor, gm_out: Tensor):
@@ -238,28 +249,45 @@ Step 2 的 Channel 已经是 `depth=2`，但程序顺序还是「搬完就用」
 
         # ── 预取第一拍 ──
         if bi < n_tiles:
-            mem_copy(self._x_ch.produce(), tile_slice(gm_x, (tile,), (bi,)))
-            mem_copy(self._y_ch.produce(), tile_slice(gm_y, (tile,), (bi,)))
+            actual = min(tile, self._n - bi * tile)
+            mem_copy(
+                self._x_rb.next_write()[:actual,],
+                tile_slice(gm_x, (tile,), (bi,)),
+            )
+            mem_copy(
+                self._y_rb.next_write()[:actual,],
+                tile_slice(gm_y, (tile,), (bi,)),
+            )
 
         for t in cannbotdsl.range(bi, n_tiles, bn):
             # ── 先发下一拍的搬运 ──
             nxt = t + bn
             if nxt < n_tiles:
-                mem_copy(self._x_ch.produce(), tile_slice(gm_x, (tile,), (nxt,)))
-                mem_copy(self._y_ch.produce(), tile_slice(gm_y, (tile,), (nxt,)))
+                next_actual = min(tile, self._n - nxt * tile)
+                mem_copy(
+                    self._x_rb.next_write()[:next_actual,],
+                    tile_slice(gm_x, (tile,), (nxt,)),
+                )
+                mem_copy(
+                    self._y_rb.next_write()[:next_actual,],
+                    tile_slice(gm_y, (tile,), (nxt,)),
+                )
 
-            # ── 再消费当前拍 ──
+            # ── 再使用当前拍 ──
             actual = min(tile, self._n - t * tile)
-            x = self._x_ch.consume()
-            y = self._y_ch.consume()
-            o = self._o_ch.produce()
+            x = self._x_rb.next_read()
+            y = self._y_rb.next_read()
+            o = self._o_rb.next_write()
             self._add(x, y, o, actual)
-            mem_copy(tile_slice(gm_out, (tile,), (t,)), self._o_ch.consume())
+            mem_copy(
+                tile_slice(gm_out, (tile,), (t,)),
+                self._o_rb.next_read()[:actual,],
+            )
 ```
 
-这个「**循环外预取一拍，循环内先发下一拍再消费当前拍**」的骨架，几乎所有访存受限的算子都用得上。
+这个「**循环外预取一拍，循环内先发下一拍再使用当前拍**」的骨架，几乎所有访存受限的算子都用得上。
 
-一次搬运从发到完成跨过多轮计算时，可以把 `depth` 加到 4，让更多块同时在途，而不是只预装几块就停。这时候还需要 [`DelayLineGroup`](./onchip-memory.md) 来记住每一拍对应的 tile 坐标。
+一次搬运从发到完成跨过多轮计算时，可以增加 `depth`，让更多块同时在途，而不是只预装几块就停。这时候还需要用 [`Array`](./onchip-memory.md#array保存软件流水的标量历史) 保存每一拍对应的 tile 坐标和其他标量元数据；旧的 `DelayLineGroup` 已删除。
 
 ## Step 4：Host 侧包装成 torch 算子
 
@@ -290,25 +318,16 @@ def vec_add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     dsl_dtype = _TORCH_TO_DSL[x.dtype]
     tile = choose_tile(dsl_dtype, get_mem_size("ub"))
     n_tiles = math.ceil(n / tile)
-    n_pad = n_tiles * tile
 
-    # Channel / tile_slice 按完整 tile 搬运。长度不是 tile 的倍数时，
-    # 先把 GM 对齐，再用掩码丢掉 padding。
+    # 设备侧通过实际 View + 掩码处理尾块，无需仅为搬运而 padding。
     x1d = x.reshape(n)
     y1d = y.reshape(n)
-    if n_pad != n:
-        x1d = torch.nn.functional.pad(x1d, (0, n_pad - n))
-        y1d = torch.nn.functional.pad(y1d, (0, n_pad - n))
-        o1d = torch.empty(n_pad, dtype=x.dtype, device=x.device)
-    else:
-        o1d = out.reshape(n)
+    o1d = out.reshape(n)
 
     # 按真实 tile 数启动核，不要用 VL 去猜
     block_dim = min(DEFAULT_BLOCK_NUM, max(1, n_tiles))
 
     VecAdd().run(x1d, y1d, o1d, block_dim)
-    if n_pad != n:
-        out.copy_(o1d[:n].reshape_as(out))
     return out
 ```
 
@@ -386,8 +405,8 @@ print(f"{dt * 1e6:.1f} us, {bytes_moved / dt / 1e9:.1f} GB/s")
 | 编译期配置 | tile 大小、分支选择、循环次数都在 `__init__` 里算好 |
 | 片上预算 | UB / L1 / L0 容量用 `get_mem_size()` 查询，不硬编码 |
 | 分核 | 用 `get_block_idx()` / `get_block_num()`，tile 数少于核数时不启动多余的核 |
-| 尾块 | 用掩码处理，不用设备分支；`tile_slice` 保持与 Channel 相同的完整 tile，GM 先对齐 |
-| 流水 | Channel `depth >= 2`，循环外预取一拍 |
+| 尾块 | 用掩码处理计算；搬运前给目的 Tensor 显式绑定实际范围，读端保存或重建相同 View |
+| 流水 | RingBuffer `depth >= 2`，循环外预取一拍；深度流水的标量历史用 `Array` 保存 |
 | 对齐 | 矢量侧对齐到 VL，Cube 侧对齐到 16 / K0 |
 | 校验 | shape / dtype / contiguous 在 torch 接口层检查并抛出清晰异常 |
 | 测试 | 覆盖整除、尾块、单 tile、超大四类长度 |

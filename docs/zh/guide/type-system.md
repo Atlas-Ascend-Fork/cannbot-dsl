@@ -10,7 +10,7 @@
 | --- | --- | --- | :---: | :---: |
 | **编译期值** | 真正的 Python 对象 | `VL = 64`、`self._tile`、`get_mem_size("ub")` | ✓ | 以常量形式固化 |
 | **运行期标量** | 设备上的标量寄存器 | Kernel 标量形参、`get_block_idx()`、`x[i]` | ✗ | ✓ |
-| **Tensor** | 存储位置 + 布局 | `gm_x`、`buf.consume()` | ✗ | ✓ |
+| **Tensor** | 存储位置 + 布局 | `gm_x`、`buf.next_read()` | ✗ | ✓ |
 
 判断一个值属于哪类，最快的办法是在构图期 `print` 它：**打出数值的是编译期值，打出对象的是运行期值。**
 
@@ -74,12 +74,17 @@ if dynamic_n > 10:
 ### 规则二：运行期值不能决定片上资源的物理容量
 
 ```python
-# 动态 shape 必须同时给静态 capacity
-ch = Channel(MemLoc.UB, shape=(rows, 128), dtype=dtypes.float32,
-             depth=2, capacity=(MAX_ROWS, 128))
+# 逻辑布局可以含运行期维度，物理布局必须在编译期确定
+ch = RingBuffer(
+    MemLoc.UB,
+    dtypes.float32,
+    make_layout((rows, 128)),
+    depth=2,
+    physical_layout=make_layout((MAX_ROWS, 128)),
+)
 ```
 
-`capacity` 决定实际预留多少存储，必须是编译期值；`shape` 可以含运行期维度，但运行时值必须为正且不超过 capacity，**设备侧不做越界检查**。
+`physical_layout` 决定实际预留多少存储，必须在编译期确定；`make_layout((rows, 128))` 描述当前逻辑范围。运行时实际范围不得超过物理布局可承载的范围，**重绑定和切片不做通用容量或越界检查**。
 
 ### 规则三：类型在控制流里必须保持一致
 
@@ -97,7 +102,7 @@ if pred:
 ```python
 # ✗ buf 在分支内创建
 if cond:
-    buf = cbd.Buffer(cbd.MemLoc.UB, (128,), dtypes.float32)
+    buf = cbd.Buffer(cbd.MemLoc.UB, cbd.dtypes.float32, cbd.make_layout((128,)))
 cbd.mem_copy(out, buf)
 ```
 
@@ -109,7 +114,7 @@ cbd.mem_copy(out, buf)
 
 | 放在哪 | 可以是 | 不建议 |
 | --- | --- | --- |
-| `__init__` 里赋给 `self` | tile 大小、循环次数、分支标志、`Buffer` / `Channel` 声明 | — |
+| `__init__` 里赋给 `self` | tile 大小、循环次数、分支标志、`Buffer` / `RingBuffer` 声明 | — |
 | `__call__` 的形参 | Tensor、运行期标量 | — |
 | `__call__` 里赋给 `self` | — | **运行期值**。它会让同一个对象在不同调用点携带状态，跨方法传递时作用域和类型都难以保证 |
 
@@ -120,7 +125,9 @@ cbd.mem_copy(out, buf)
 class K:
     def __init__(self, n, dtype):
         self._tile = compute_tile(n, dtype)          # ✓ 编译期配置
-        self._x_ch = Channel(MemLoc.UB, (self._tile,), dtype, depth=2)   # ✓ 资源声明
+        self._x_rb = RingBuffer(                     # ✓ 资源声明
+            MemLoc.UB, dtype, make_layout((self._tile,)), depth=2
+        )
 
     def __call__(self, gm_x, gm_y, eps: dtypes.float32):
         bi = cbd.get_block_idx()                     # 运行期值

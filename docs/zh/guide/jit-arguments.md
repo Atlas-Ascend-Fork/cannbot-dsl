@@ -217,21 +217,26 @@ Host 侧用 `Dim` 声明的动态维度，到了 Kernel 里就是运行期整数
 
 - 作为 `cbd.range()` 的边界；
 - 参与地址和循环次数计算；
-- 作为 `Channel` / `Buffer` 的动态 shape（**必须同时提供静态 `capacity`**）。
+- 作为 `RingBuffer` / `Buffer` 的逻辑布局维度，或作为选中 Tensor 的视图范围。
 
 它们不能：
 
 - 作为 `range_constexpr()` 的参数；
 - 作为 `const_expr()` 的条件；
-- 决定片上资源的物理容量（容量由 `capacity` 决定）。
+- 决定片上资源的物理分配大小，物理布局必须在编译期确定。
 
 ```python
-# Kernel 内：动态行数 + 静态容量上界
-ch = Channel(MemLoc.UB, shape=(rows, 128), dtype=dtypes.float32,
-             depth=2, capacity=(MAX_ROWS, 128))
+# Kernel 内：动态逻辑行数 + 静态物理布局
+ch = RingBuffer(
+    MemLoc.UB,
+    dtypes.float32,
+    make_layout((rows, 128)),
+    depth=2,
+    physical_layout=make_layout((MAX_ROWS, 128)),
+)
 ```
 
-动态维的运行时值必须大于 0 且不超过 capacity，**设备侧不会执行越界检查**，这由调用方保证。
+运行时实际范围不得超过物理布局可承载的范围，**设备侧不会执行通用容量或越界检查**，这由调用方保证。需要预留更大空间时，也可以先声明一维 `Buffer` / `RingBuffer`，再通过 `view` 或 `reinterpret` 派生所需 Tensor。
 
 ## 决策清单
 

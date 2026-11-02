@@ -72,11 +72,11 @@ ds41 = ["mqsmla", "qli", "qsli"]
 ```bash
 export PYTHON=/path/to/python3.12
 export CANN_ENV=/path/to/Ascend/cann/set_env.sh
-export CANNBOTDSL_WHEEL=/path/to/cannbotdsl-0.7.0-cp312-cp312-manylinux_2_28_x86_64.whl
+export CANNBOTDSL_WHEEL=/path/to/cannbotdsl-0.8.0-cp312-cp312-manylinux_2_28_x86_64.whl
 ./run-build.sh --group ds41
 ```
 
-`run-build.sh` 会优先选择 `net/` 下修改时间最新的 `cannbotdsl-*.whl`；`CANNBOTDSL_WHEEL` 可以显式指定版本。需要包含 `cannbotdsl.aot.export/build/register_directory` 的 0.7.0 wheel。`--list` / `--help` 不需要 CANN 环境或 wheel。
+`run-build.sh` 会优先选择 `net/` 下修改时间最新的 `cannbotdsl-*.whl`；`CANNBOTDSL_WHEEL` 可以显式指定版本。需要包含 `cannbotdsl.aot.export/build/register_directory` 的 0.8.0 wheel。`--list` / `--help` 不需要 CANN 环境或 wheel。
 
 ### 产物布局
 
@@ -97,7 +97,7 @@ native_package/
 
 `.build/` 是编译缓存和临时目录，`output/` 只包含当前成功发布的产物。**构建失败时不会替换已有的成功产物。**
 
-生成的算子 wheel 依赖 `cannbotdsl>=0.7.0,<0.8`，导入时通过 `cannbotdsl.aot.register_directory` 注册 Native 资源。
+生成的算子 wheel 依赖 `cannbotdsl>=0.8.0,<0.9`，导入时通过 `cannbotdsl.aot.register_directory` 注册 Native 资源。
 
 ### AICore 与 AICPU 两条路径
 

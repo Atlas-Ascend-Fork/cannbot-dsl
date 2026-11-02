@@ -4,9 +4,9 @@
 
 ## 950 新特性的覆盖边界
 
-Ascend 950 的对外宣传里有几项能力，当前**没有**由 DSL 0.7.0 暴露，或者方向与直觉相反。先把边界划清楚，省掉找接口的时间。
+Ascend 950 的对外宣传里有几项能力，当前**没有**由 DSL 0.8.0 暴露，或者方向与直觉相反。先把边界划清楚，省掉找接口的时间。
 
-| 特性 | DSL 0.7.0 的状态 |
+| 特性 | DSL 0.8.0 的状态 |
 | --- | --- |
 | SIMD 矢量编程（RegBase） | ✓ 完整支持，`with vf(mode="simd")` |
 | **SIMD + SIMT 混合编程** | ✓ **支持**。`with vf(mode="simt", thread=N)` 加 `cannbotdsl.ops.simt` 的线程 / warp / 原子接口，见[三类计算单元](./compute.md#simt-模式) |
@@ -55,7 +55,7 @@ SIMD + SIMT 混合编程和纯 SIMT 编程都需要 CANN 9.2.0 及以上版本�
 
 - 不能 `break` / `continue` / `return` / `raise`。
 - 循环变量不能直接带出循环。
-- 分支里创建的 `Buffer` / `Channel` / Tensor 不能带到分支外。
+- 分支里创建的 `Buffer` / `RingBuffer` / Tensor 不能带到分支外。
 - `cannbotdsl.range()` 是设备循环标记，不是 Python 的 `range` 对象。Host 侧遍历用 `builtins.range()`。
 - `unroll` / `unroll_full` 不会把 `cbd.range()` 变成编译期循环。
 - Hardware Loop 是编译器约束（从 0 起步长 1、无运行时跳转、边界不变），不是 Python 类型。不要在 DSL 里写 `uint16_t`。
@@ -64,22 +64,33 @@ SIMD + SIMT 混合编程和纯 SIMT 编程都需要 CANN 9.2.0 及以上版本�
 
 | 限制 | 说明 |
 | --- | --- |
-| `produce()` / `consume()` 不等待 | 只选槽并推进游标。同步由 lowering 按配对插入。配对写错时不会在这两个调用上报「等不到」 |
-| VF 内调用 `produce()` / `consume()` | 不支持。进 `with vf(...)` 之前取好 Tensor |
-| VF 内的 UB 重叠 / 跨流水 | `Channel` 不管；按接口约束自己插 `vmem_bar` |
-| CrossCore `depth` | `1 <= depth <= 8` |
-| `dsl.UB.view()` 之后 | 当前 Kernel 的 UB `Buffer` 必须走 `make_buffer()`，不能再混用普通 UB `Channel` |
-| `n1_pad` | 仅 NZ。额外 N1 stride，不自动补零，也不是 bank 冲突一键开关 |
+| `next_write()` / `next_read()` 不等待 | 只选槽并分别推进写、读游标；没有满空检查或调用配对检查。同步由编译器按 Tensor 实际访问生成 |
+| VF 内调用 `next_write()` / `next_read()` | 不支持。进 `with vf(...)` 之前取好 Tensor |
+| VF 内的 UB 重叠 / 跨流水 | `RingBuffer` 选槽不管；按接口约束自己插 `vmem_bar` |
+| 跨核 `RingBuffer` | 不需要 `kind`；跨核属性由实际访问推导，`depth` 没有跨核专用的 8 槽上限 |
+| `dsl.UB.view()` 之后 | 当前 Kernel 的 UB 自动 `Buffer` / `RingBuffer` 与手动空间根不能混用；手动视图分别通过 `make_buffer()` / `make_ring_buffer()` 绑定 |
+| NZ 物理 padding | 用 `physical_layout=make_layout(..., stride=...)` 表达；不再使用构造参数 `n1_pad` |
 | `get_mem_size` | 可查 `"ub"` / `"l1"` / `"l0a"` / `"l0b"` / `"l0c"` / `"bt"` / `"fb0"`。**L2 和 SSBUF 查不到**，传进去抛 `ValueError`。`"ub"` 返回 253952（248 KB），预留已扣除 |
-| `UB.view()` | 一旦调用，当前 Kernel 的 UB `Buffer` 必须走 `make_buffer()`，普通 UB `Channel` 也不能再创建。两种风格不能混用 |
-| 尾块 `mem_copy` | `tile_slice` 与 Channel 槽位 shape 必须一致。不要把尾块缩成 `(actual,)` 再拷进 `(tile,)` 的槽；GM 先对齐，多余 lane 用掩码 |
+| `onchip_rewind()` | 只声明地址和 ID 分配边界，不重置 RingBuffer 游标、不插入完成屏障；含手动空间根的 Kernel 禁止使用 |
+| 尾块 `mem_copy` | 先对目的 Tensor 显式绑定实际范围，再执行拷贝；选槽不会恢复最近一次写入的 View，读端保存或重建相同布局 |
 | Scalar 直接读写 GM 的 Cache 一致性 | 框架不会自动插入 `dcci` / `dci`；调用方必须显式处理 Cache 可见性，或使用 `*_bypass` |
+
+## 核间同步的两个静默陷阱
+
+这两条都不报错，错了只表现为多核偶发数据错乱，单独列出来：
+
+| 项 | 事实 |
+| --- | --- |
+| `*_sync_block_arrive` / `wait` 的 `mode` | **默认 2（核内），不是 0。** 要全核屏障必须显式写 `mode=0`；第二个位置参数是 `flag_id`，不是 `mode` |
+| `flag_id` 取值范围 | **必须 ≤ 15**，codegen 只保留低 4 位，超出静默回绕。编译期常量有检查，运行时 SSA 的 id 没有。`global_sync_all()` 占用 0 / 1 / 2 |
+
+详见[同步、Cache 与跨核交接 · 场景 3](./synchronization.md#场景-3核间同步)。
 
 ## 矩阵乘
 
 - 接口数学语义是 \(C = A[M,K] \times B[K,N]\)。
-- 样例里 GM 右矩阵常为 `(N, K)`，搬入 L0B 时转置，golden 用 `A @ B.T`。读代码时先分清「官方公式」和「这份 GM 怎么存」。
-- `matmul` 只在 AIC 上生效。从 L0C 搬到 ND 的 GM/UB 时，样例通常不写 `engine`；需要显式 NZ2ND、量化或 ReLU 时再配 `make_copy_engine`。
+- 样例里 GM 右矩阵常为 `(N, K)`，搬入 L0B 时用 `permute` 表达轴序，golden 用 `A @ B.T`。读代码时先分清「官方公式」和「这份 GM 怎么存」。
+- `matmul` 只在 AIC 上生效，并返回实际目的 View；后续累加或搬出应使用该返回值。从 L0C 搬到 ND 的 GM/UB 时由源、目标布局决定格式转换，量化或 ReLU 用 `convert(...)` / `relu(...)` 源表达式。
 
 ## JIT 参数
 
@@ -100,8 +111,11 @@ SIMD + SIMT 混合编程和纯 SIMT 编程都需要 CANN 9.2.0 及以上版本�
 | 普通 Python 调 Kernel / `@jit` 报错 | 入口是不是 `@host` |
 | `const_expr` / `target_version` 报错 | 是不是写在 `@jit` / `@kernel` 里；传入的是不是编译期值 |
 | `cbd.range` 不能迭代 | 是不是当成 Python `range` 用在了 Host 普通循环里 |
-| 同步相关的数据错乱 | `produce` / `consume` 是否成对；有没有在 VF 里选槽；VF 是否缺 `vmem_bar` |
-| 最后几个元素错 | 尾块掩码、GM 是否对齐到 tile、`tile_slice` 有没有被缩 shape |
+| 同步相关的数据错乱 | RingBuffer 选槽顺序和保存的 Tensor 是否正确；有没有在 VF 里选槽；VF 是否缺 `vmem_bar` |
+| 多核才错、`block_dim=1` 正常 | `*_sync_block_*` 是不是漏写了 `mode=0`（默认 2 只管核内）；`flag_id` 是否超过 15 或与 `global_sync_all` 的 0/1/2 撞号 |
+| AI CPU 代码 `ImportError` | 是不是写成了 `GmIn` / `GmOut`；正确拼写是 `gm_in` / `gm_out` |
+| `cbd.dtypes.xxx` 报 `AttributeError` | 是不是照抄了 Ascend C 的 C++ 类型名（`fp8_e4m3fn_t`）；DSL 侧是 `float8_e4m3fn`，无 `_t` 后缀 |
+| 最后几个元素错 | 尾块掩码、目的 Tensor 是否绑定实际范围、读端是否沿用相同 View |
 | 换卡容量不够 / 莫名变慢 | 有没有硬编码 UB/L1；L2 是否误用了 `get_mem_size` |
 | 矩阵乘结果像转置错了 | GM 上 B 是 `(K, N)` 还是 `(N, K)`，golden 该不该 `A @ B.T` |
 
@@ -116,7 +130,7 @@ SIMD + SIMT 混合编程和纯 SIMT 编程都需要 CANN 9.2.0 及以上版本�
 | `from_torch_npu` 改为 `from torch import as_tensor` | 适配 cannbotdsl 0.0.3 时的调整，涉及 flash_attn、flash_kda、matmul、pointnet_sa、rms_norm、voxel_conv 多个样例 |
 | `flash_kda()` 新增**必选**参数 `metadata` | 算子改为「调度与计算解耦」，不再自行生成调度信息、也不再启动 AI CPU。旧调用方式不可用 |
 | `samples/matmul/` 拆成 `matmul/` 与 `quant_matmul/` | 导入路径与测试路径变化 |
-| `flash_kda_metadata` 与 `fused_recurrent_kda_snapshot` 撤并 | 前者实现并入 `samples/flash_kda/`，后者删除 |
+| `flash_kda_metadata` 撤并 | 实现并入 `samples/flash_kda/flash_kda_metadata.py`，不再是独立顶层样例目录 |
 
 升级版本时的建议：先跑一遍自己算子的精度测试，再看 CHANGELOG 里涉及到的接口。
 
@@ -132,7 +146,7 @@ SIMD + SIMT 混合编程和纯 SIMT 编程都需要 CANN 9.2.0 及以上版本�
 | --- | --- |
 | AI CPU 接口详情 | 官方 `/zh/api/aicpu/` 只有名字索引。本章内容据样例与包源码整理，见 [AI CPU 与调度计划](./aicpu.md) |
 | 分布式通信 | `cannbotdsl.distributed` 存在，无详情页 |
-| L1 / SSBUF / FBUF 容量 | API 文档不给数值；L1 用 `get_mem_size("l1")` 可查，**SSBUF 查不到**（传 `"ssbuf"` 抛 `ValueError`） |
+| L1 / SSBUF / FBUF 容量 | API 文档不给数值；L1 / FBUF 用 `get_mem_size("l1")` / `get_mem_size("fb0")` 可查，**SSBUF 查不到**（传 `"ssbuf"` 抛 `ValueError`）。SSBUF 容量由后端能力表固定为 Mix 3 KB / 纯核 1 KB，超限是编译错误，见[硬件与执行模型](./hardware-model.md#数据放在哪存储层级) |
 
 这些可以在 [GitCode 仓库](https://gitcode.com/cann/cannbot-dsl)的 Issues 里反馈。
 

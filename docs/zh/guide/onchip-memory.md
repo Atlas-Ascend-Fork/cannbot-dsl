@@ -1,10 +1,10 @@
 # 片上存储、流水与 GM 协作
 
-片上存储用得好不好，基本决定了算子性能。CANNBot-DSL 给了两个抽象：`Buffer` 和 `Channel`。这一节讲它们的区别、怎么用 `Channel` 搭流水线、框架替你做了什么没替你做什么，以及片上装不下时怎么用 GM 上的 workspace 做多核协作。
+片上存储用得好不好，基本决定了算子性能。CANNBot-DSL 给了两个抽象：`Buffer` 和 `RingBuffer`。这一节讲它们的区别、怎么用 `RingBuffer` 搭流水线、框架替你做了什么没替你做什么，以及片上装不下时怎么用 GM 上的 workspace 做多核协作。
 
 ## 先算预算
 
-写 Channel 之前先算清楚 UB 够不够。三个数要记住：
+写 RingBuffer 之前先算清楚 UB 够不够。三个数要记住：
 
 | 量 | 值 |
 | --- | --- |
@@ -34,107 +34,102 @@ ub_factor = (UB_SIZE - RETAINED_SIZE_1K - nca * gamma_bytes) // (
 self._row_factor = max(int(ub_factor), 1)
 ```
 
-## `Buffer` 还是 `Channel`
+## `Buffer` 还是 `RingBuffer`
 
-| | `Buffer` | `Channel` |
+| | `Buffer` | `RingBuffer` |
 | --- | --- | --- |
 | 对应存储 | 一块 | `depth` 块等大槽位 |
-| 轮转 | 无 | 按固定顺序自动循环复用 |
-| 生产者/消费者同步 | 不提供 | `produce()` / `consume()` 本身不等待；lowering 按配对插入同步 |
-| 返回值 | `Tensor` | Channel 对象，用 `produce()` / `consume()` 取 `Tensor` |
+| 轮转 | 无 | 写、读两个游标分别按固定顺序循环 |
+| 返回值 | 直接返回 `Tensor` | 资源对象；`next_write()` / `next_read()` 返回选中槽的 `Tensor` |
+| 数据同步 | 编译器根据实际 Tensor 访问生成 | 同样根据实际 Tensor 访问生成，不按选槽次数配对 |
 | 典型用途 | 临时 scratch、归约中间量、常驻表 | 搬运与计算之间的数据交接、double buffer、跨核交接 |
 
-一句话判断：**只要一块片上 scratch 就用 `Buffer`；要轮换多个槽做流水就用 `Channel`。**
+一句话判断：**只要一块片上 scratch 就用 `Buffer`；要轮换多个槽做流水就用 `RingBuffer`。**
 
-两者的地址都由内存规划自动分配。需要固定地址或在不同阶段共享同一段存储时，可以先用 `dsl.UB.view()` 划分空间，再用 [`make_buffer()`](../api/data-structures/storage/buffer/make_buffer.md) / `make_channel()` 把已有视图绑定成 `Buffer` / `Channel`。
+自动声明的地址由内存规划分配。需要固定地址、guard 或阶段间共享区域时，先通过 `dsl.UB.view()` 等完整空间根划分手动视图，再用 [`make_buffer()`](../api/data-structures/storage/buffer/make_buffer.md) / `make_ring_buffer()` 绑定资源。
 
-::: warning
-调用 `dsl.UB.view()` 之后，当前 Kernel 的 UB `Buffer` 必须通过 `make_buffer()` 创建，普通 UB `Channel` 也不再允许创建。两种风格不能混用。
+::: warning 自动分配与手动绑定不能在同一空间混用
+模式按 **Kernel × 存储空间** 检查。调用 `dsl.UB.view()` 后，当前 Kernel 的 UB 资源必须来自手动视图；其他存储空间可以独立选择自动或手动方式。含手动空间根的 Kernel 禁止使用 `onchip_rewind()`。
 :::
 
 ## `Buffer`
 
 ```python
-tmp = Buffer(MemLoc.UB, shape=(rf, row_stride), dtype=dtypes.float32)
+tmp = Buffer(MemLoc.UB, dtypes.float32, make_layout((rf, row_stride)))
 ```
 
-构造函数返回的直接就是 `Tensor`，可以立刻用于 `mem_copy` 和计算接口。
-
-两种互斥的布局声明形式：
+构造函数直接返回 `Tensor`，可以立刻用于 `mem_copy` 和计算接口。当前签名为：
 
 ```python
-# shape 形式：由 shape / capacity / stride / 格式推导布局
-Buffer(mem_loc, shape, dtype, capacity=..., stride=..., data_format=..., n1_pad=...)
-
-# layout 形式：直接给逻辑布局和物理布局
-Buffer(mem_loc, dtype=..., capacity=..., layout=..., physical_layout=..., ...)
+Buffer(mem_loc, dtype, layout, *, physical_layout=None, data_format=None)
 ```
 
-`data_format` 省略时的默认值：UB、BIAS、SSBUF、FBUF 为 ND；L1、L0A、L0B、L0C 为 NZ。详见 [Buffer](../api/data-structures/storage/buffer/Buffer.md)。
+- `layout` 必须使用 `make_layout(shape, stride=...)` 创建；旧的 `shape`、`capacity`、`size_bytes`、`stride`、`n1_pad`、`view`、`alignment` 构造参数已删除。
+- 分配大小由物理布局推导。需要预留更大空间时，先声明一维 Tensor，再通过 `view` 或 `reinterpret` 派生所需视图。
+- `physical_layout` 描述 padding 和物理步长；动态逻辑布局可以搭配静态物理布局，但完全动态的物理分配不支持。
+- `data_format` 省略时，UB、BIAS、SSBUF、FBUF 为 ND；L1、L0A、L0B、L0C 为 NZ。
 
-## `Channel`
+## `RingBuffer`
 
 ### 心智模型
 
-`Channel` 是一个**环形的槽位容器**：
+`RingBuffer` 是一个**带两条独立选槽序列的环形槽位容器**：
 
 ```text
-depth = 3 的 Channel
+depth = 3 的 RingBuffer
 
         ┌────────┬────────┬────────┐
-        │ slot 0 │ slot 1 │ slot 2 │  ← 片上连续地址，等大
+        │ slot 0 │ slot 1 │ slot 2 │
         └────────┴────────┴────────┘
              ▲        ▲
     写游标 ──┘        └── 读游标      两个游标各自独立推进
 
-    produce() → 返回写游标当前槽位的 Tensor，并推进写游标
-    consume() → 返回读游标当前槽位的 Tensor，并推进读游标
+    next_write() → 返回写游标当前槽位的 Tensor，再推进写游标
+    next_read()  → 返回读游标当前槽位的 Tensor，再推进读游标
 ```
 
-- 所有槽位有相同的 shape、dtype 和存储布局。
-- `produce()` / `consume()` **只选槽位并推进游标**，它们本身不访问数据、不复制数据。
-- 真正的等待由 lowering 根据 `produce` / `consume` 的配对插入。选槽这一步不会阻塞：写满了不会在 `produce()` 里等空槽，读的时候也不会在 `consume()` 里检查数据是否已到。
-- VF 内部的 UB 重叠或跨流水依赖仍要按接口约束自己插 [`vmem_bar`](../api/compute/vector/reg_sync/vmem-bar.md)，`Channel` 不会替你做这件事。
+- 所有槽位有相同的 dtype、逻辑布局和物理布局。
+- 每次声明动态执行时，两个游标都从槽 0 开始；`depth=1` 时始终选择唯一槽。
+- 选槽只返回 Tensor 并推进对应游标，**不读写数据、不等待、不检查满空，也不要求两个游标一一配对**。需要再次访问同一槽时，保存并复用返回的 Tensor，不要额外推进游标。
+- 返回值固定指向所选槽，不是数据快照。环绕覆盖该槽后，旧 Tensor 及其视图别名会看到新内容。
+- 默认 View 始终使用声明布局，不会跟随“最近一次写入”的实际尾块变化。需要其他范围或布局时，对选中的 Tensor 显式切片或调用 `reinterpret`。
+- 编译器根据 Tensor 的实际访问和资源身份生成同步。VF 内部的 UB 重叠或跨流水依赖仍要按接口约束自己插 [`vmem_bar`](../api/compute/vector/reg_sync/vmem-bar.md)。
 
 ### 构造参数
 
 ```python
-Channel(
-    mem_loc: MemLoc,
-    shape: Shape | None = None,
-    dtype: DType | None = None,
+RingBuffer(
+    mem_loc,
+    dtype,
+    layout,
     *,
-    depth: int,
-    capacity: Shape | None = None,
-    kind: ChannelKind = ChannelKind.SameCore,
-    stride: tuple[int, ...] | None = None,
-    data_format: str | None = None,
-    n1_pad: int = 0,
-) -> Channel
+    depth,
+    physical_layout=None,
+    data_format=None,
+)
 ```
-
-`shape` 和 `dtype` 在签名里有 `None` 默认值，但语义上都是必选的。
 
 | 参数 | 说明 |
 | --- | --- |
-| `depth` | 槽位数量，也决定最多能同时保留多少批尚未被覆盖的数据。`SameCore` 时 `depth >= 1`（还受片上容量限制），`CrossCore` 时 `1 <= depth <= 8` |
-| `kind` | `ChannelKind.SameCore`（默认，同核）或 `ChannelKind.CrossCore`（跨核交接） |
-| `capacity` | 动态 shape 必须显式提供；物理存储按 capacity 规划 |
-| `data_format` | `None` 时 UB/BIAS 用 `"nd"`，L1/L0A/L0B/L0C 用 `"nz"` |
-| `n1_pad` | 仅 NZ 可用。给相邻 N1 切片额外 stride，**不会自动补零**。用途是对齐或拉开相邻 N1，不是「打开即可消除 bank 冲突」的开关 |
+| `depth` | 必填的正编译期 Python 整数，表示物理槽数量；没有跨核专用的 8 槽上限 |
+| `layout` | 每个槽的默认逻辑布局，用 `make_layout` 创建；属性描述一个槽，不包含环形维度 |
+| `physical_layout` | 可选物理布局，决定每槽分配大小，描述 padding 和步长 |
+| `data_format` | 仅支持 `nd` / `nz`；UB 默认 `nd`，L1/L0 默认 `nz` |
 
-完整参数见 Channel。
+跨核交接不需要 `kind` 或 `RingBufferKind`：编译器根据实际 Tensor 访问推导跨核属性。旧的 `capacity`、`shape`、`stride`、`n1_pad`、`addr` 等构造参数同样已删除。
 
 ### 最简用法：depth=1
 
 ```python
 @cbd.kernel
 def copy_kernel(src: cbd.Tensor, dst: cbd.Tensor):
-    tmp = cbd.Channel(cbd.MemLoc.UB, shape=(16,), dtype=src.dtype, depth=1)
+    tmp = cbd.RingBuffer(
+        cbd.MemLoc.UB, src.dtype, cbd.make_layout((16,)), depth=1
+    )
 
-    slot = tmp.produce()
+    slot = tmp.next_write()
     cbd.mem_copy(slot, src)       # GM → UB
-    slot = tmp.consume()
+    slot = tmp.next_read()
     cbd.mem_copy(dst, slot)       # UB → GM
 ```
 
@@ -143,20 +138,20 @@ def copy_kernel(src: cbd.Tensor, dst: cbd.Tensor):
 把 `depth` 提到 2，并在使用当前数据之前就发出下一块的搬运，搬运与计算就能重叠：
 
 ```python
-# 取自 samples/rms_norm/rms_norm.py 的 ColSplitKernel
-mem_copy(self._x_db_ch.produce(), tile_slice(gm_x, (1, ct), (gm_row, 0)))   # 预取第 0 块
+mem_copy(self._x_db_rb.next_write(),
+         tile_slice(gm_x, (1, ct), (gm_row, 0)))       # 预取第 0 块
 for t in range(nt):
     nxt = t + 1
     if nxt < nt:
-        mem_copy(self._x_db_ch.produce(),
-                 tile_slice(gm_x, (1, ct), (gm_row, nxt)))                  # 预取下一块
-    x = self._x_db_ch.consume()                                             # 消费当前块
+        mem_copy(self._x_db_rb.next_write(),
+                 tile_slice(gm_x, (1, ct), (gm_row, nxt)))  # 预取下一块
+    x = self._x_db_rb.next_read()                            # 使用当前块
     self._compute_x_squared_sum(x, self._tile_ss_buf, t)
 ```
 
-这是最常见的流水写法：**循环开始前预取一拍，循环内先发下一拍的搬运、再消费当前拍。**
+这是最常见的流水写法：**循环开始前预取一拍，循环内先发下一拍的搬运、再使用当前拍。**
 
-预取不是「先搬几块存货，用完又回到等搬运」。每一轮都会**新发一次搬运、消费一次更早发出的搬运**，在途的块数大致保持为 `depth - 1`。它改变的是时间怎么叠，不是搬运变快：
+预取不是「先搬几块存货，用完又回到等搬运」。每一轮都会**新发一次搬运、使用一次更早发出的搬运**，在途的块数大致保持为 `depth - 1`。它改变的是时间怎么叠，不是搬运变快：
 
 ```text
 串行（depth=1）     拷 算 拷 算 拷 算          总时间 ≈ N × (T拷 + T算)
@@ -170,7 +165,7 @@ for t in range(nt):
 
 ### 多级流水：depth=4
 
-`depth=2` 只能再挂 1 次在途搬运，藏得住大约「一轮循环」的延迟。一次 `mem_copy` 从发到完成如果跨过好几轮计算（或多级通路要同时在飞：GM→L1、L1→L0、算、搬出），槽位不够就会在 `consume` 时出现空档，DMA 也会一段忙一段闲。加深 depth 是为了**多挂几笔在途搬运，把这条延迟链填满**。
+`depth=2` 通常只能保留 1 次预取在途，藏得住大约「一轮循环」的延迟。一次 `mem_copy` 从发到完成如果跨过好几轮计算，或多级通路要同时在飞（GM→L1、L1→L0、算、搬出），就需要更多独立槽位来保留尚未处理的数据。加深 `depth` 是为了**多保留几笔在途搬运，把这条延迟链填满**。
 
 它同样不能突破带宽上限：搬运已经 100% 打满时，再加深只会多占片上内存。所以 `matmul` 样例按 L1 容量在 2 和 4 之间选，不是越大越好：
 
@@ -181,139 +176,135 @@ self.l1_buffer_num = (
     else self.BASIC_L1_BUFFER_NUM     # 4
 )
 ...
-l1_a = Channel(MemLoc.L1, shape=(t.base_m, t.k_l1),
-               dtype=t.a_dtype, depth=t.l1_buffer_num)
+l1_a = RingBuffer(
+    MemLoc.L1,
+    t.a_dtype,
+    make_layout((t.base_m, t.k_l1)),
+    depth=t.l1_buffer_num,
+)
 ```
 
 ::: warning depth 不等于流水
-`depth` 提供的是**容量和在途重叠能力**，它不会替你重排跨迭代的发射顺序。真正的流水仍由你写出来的程序顺序决定：预取写在前面，消费写在后面。
+`depth` 提供的是**容量和在途重叠能力**，不会替你重排跨迭代的发射顺序，也不存在通用的 `depth = lag + 1` 规则。真正的流水仍由你写出来的预取、主循环和收尾顺序决定。
 :::
 
-### 跨核 Channel
+### 跨核 RingBuffer
 
-生产者和消费者在不同核时（典型是 AIC 算矩阵乘、AIV 接着做后处理），只需要加一个 `kind`：
-
-```python
-p_l1 = Channel(MemLoc.L1, (CHUNK, CHUNK), dtypes.float16,
-               depth=2, kind=ChannelKind.CrossCore)
-```
-
-**写法与同核 Channel 完全一致**，仍然是 `produce()` / `consume()`。纯 AIC、纯 AIV、Mix 三种 Kernel 的 Channel 写法统一，不需要切换编译模式。
-
-### `channel_rewind`：阶段之间复用片上资源
-
-一个大算子常常分成几个阶段，各阶段需要的片上缓冲完全不同。`channel_rewind()` 为后续 Channel 建立新的片上资源规划边界，让后面的阶段可以复用前面阶段已经用完的地址：
+生产者和消费者在不同核时（典型是 AIC 算矩阵乘、AIV 接着做后处理），仍然使用普通声明：
 
 ```python
-from cannbotdsl.ops.sync import channel_rewind
-
-# 阶段 1 的 Channel ...
-channel_rewind()                      # 默认 reset_sync_id=True
-# 阶段 2 的 Channel 从新的规划边界开始分配
+p_l1 = RingBuffer(
+    MemLoc.L1, dtypes.float16, make_layout((CHUNK, CHUNK)), depth=2
+)
 ```
 
-签名是 `channel_rewind(reset_sync_id=True)`：`reset_sync_id` 控制是否**同时**重置同步资源计数器，**默认为 `True`**。需要跨融合阶段继续复用同步资源时，要**显式传** `False`：
+**写法与同核完全一致**，仍然是 `next_write()` / `next_read()`。编译器根据实际 Tensor 访问识别跨核交接并生成协议；不要手写 `*_sync_*` 加 GM 中转。
+
+### `onchip_rewind`：声明资源分配边界
+
+自动分配场景下，一个大算子可以分成多个阶段。`onchip_rewind()` 为后续资源声明建立地址和 Buffer-ID 分配边界：
 
 ```python
-channel_rewind(reset_sync_id=False)   # 只重置地址规划，保留同步资源计数器
+from cannbotdsl import onchip_rewind
+
+# 阶段 1 的自动 Buffer / RingBuffer ...
+onchip_rewind()                      # 默认 reset_sync_id=True
+# 阶段 2 从新的分配边界开始
 ```
 
-::: warning 默认会把同步资源一起重置
-读到 `reset_sync_id` 这个参数名，容易以为「不传就不重置」。实际相反：**不传就会重置**。融合算子里如果后续阶段还要接着用前面分配的同步资源，必须显式传 `False`，否则症状是同步 ID 冲撞导致的偶发数据错。
+签名是 `onchip_rewind(reset_sync_id=True)`。`reset_sync_id=True` 同时重置同步计数器分配位置；传 `False` 可保留原计数器分配阶段：
+
+```python
+onchip_rewind(reset_sync_id=False)
+```
+
+::: warning 它不是屏障，也不是游标重置
+`onchip_rewind()` **不插入硬件完成屏障、不释放仍存活的资源、不重置任何 RingBuffer 的写读游标**。跨边界复用必须已有运行时互斥或完成证明；含手动空间根的 Kernel 禁止调用。
 :::
 
-详见 `channel_rewind`。
+### RingBuffer 的使用约束
 
-### Channel 的使用约束
+- 创建 `RingBuffer` 和调用 `next_write()` / `next_read()` **只能在 `@kernel` 或 `@kernel` 内调用的 `@jit` 中**。
+- **不要在 VF 区域内选槽**：应在进入 `with vf(...)` 之前选好槽位，再把返回的 Tensor 传进去。
+- 选槽没有满空或配对检查；算法必须保证生产、使用和环绕覆盖的顺序正确。
+- 绑定 View 不分配新存储，也不推进游标。读端需要尾块布局时，保存生产者的 View，或显式构造相同布局。
+- `RingBuffer` 不能通过继承定义子类，也不能直接 `cbd.print`；先取出 Tensor。
 
-- 创建 Channel 和调用 `produce()` / `consume()` **只能在 `@kernel` 或 `@kernel` 内调用的 `@jit` 中**。
-- **不要在 VF 区域内调用 `produce()` / `consume()`**：应在进入 `with vf(...)` 之前选好槽位，再把返回的 Tensor 传进去。
-- `produce()` 不等待空槽，`consume()` 不检查槽位是否已写入——这些由框架根据配对关系生成的同步负责，但前提是你的 `produce` / `consume` 配对是正确的。
-- Channel 不能通过继承定义子类。
-- Channel 不能直接 `cbd.print`，要先取出 Tensor。
+## `Array`：保存软件流水的标量历史
 
-## `DelayLineGroup`：软件流水的标量延迟线
-
-深度流水下会遇到一个问题：第 i 拍发出的搬运，到第 i+2 拍才被消费，这时你需要知道「当时那一拍对应的是哪个 tile」。手写就要维护一堆下标数组和回绕逻辑。
-
-`DelayLineGroup` 就是为此准备的：它管理多组**命名标量**的历史值，所有字段共享同一个推进位置。
+深度流水下，第 i 拍发出的搬运可能到第 i+2 拍才使用，这时需要保存「那一拍对应哪个 tile」。旧的 `DelayLine` / `DelayLineGroup` 已删除，当前用公开的 `Array(dtype, length, *, init=None)` 显式保存元数据。
 
 ```python
-from cannbotdsl.types.delay_line import DelayLineGroup
+from cannbotdsl import Array, dtypes
 
-dl = DelayLineGroup(4, "m", "n", "t", "last")     # depth=4，四个字段
+# 在动态工作循环外分配，覆盖所有使用位置。
+task_tiles = Array(dtypes.int64, 4)
+task_kv_tiles = Array(dtypes.int64, 4)
+tick = 0
+issued = 0
 
 for i in range(total):
-    dl.push(m=m_idx, n=n_idx, t=t_idx, last=is_last)
+    write_slot = tick % 4
+    task_tiles[write_slot] = dtypes.int64(m_idx)
+    task_kv_tiles[write_slot] = dtypes.int64(n_idx)
+    issued += 1
 
-    # 读两拍之前写入的全部字段
-    snap = dl.tap(2)
-    use(snap.m, snap.n, snap.t, snap.last)
+    # 读取两拍前的元数据；预热条件保证历史已经写入。
+    if tick >= 2 and tick - 2 < issued:
+        read_slot = (tick - 2) % 4
+        use(task_tiles[read_slot], task_kv_tiles[read_slot])
 
-    # 或者按字段分别指定滞后量
-    m_at_1 = dl.m.tap(1)
-    t_at_3 = dl.t.tap(3)
-
-    dl.advance()                                   # 每轮迭代末尾调用一次
+    tick += 1
 ```
 
 要点：
 
-- `depth >= 2`，并且必须**大于实际使用的最大 `lag`**。要读两拍前的值，`depth` 至少为 3。
-- 每个字段只保存整数标量，统一按 `int64` 存放。
-- `push()` 必须提供全部字段；`advance()` 每轮只调用一次。
-- 主循环和流水排空阶段必须采用一致的推进规则，遗漏或重复调用 `advance()` 会让字段值与流水阶段错位。
-
-完整说明见 DelayLineGroup。
+- 数组长度必须覆盖仍在使用的历史范围；读取下标和有效性条件由你维护，动态下标不做边界检查。
+- 无 `init` 的数组不会默认清零，首次读取必须由预热条件保护；写入要求严格的同类型，窄整数显式转换为 `int64`。
+- 主循环和收尾采用一致的时钟规则。收尾不再产生新任务时冻结 `issued`，继续按原协议推进 `tick`。
+- `Array` 与 `RingBuffer` 的游标是两套独立状态；数组只保存标量历史，不替代数据同步，也不能在 VF/SIMT 中捕获或访问。
 
 ## `mem_copy`：搬运的统一入口
 
 ```python
-mem_copy(dst, src, *, engine=None, transpose=None, deq_scale=None,
-         dst_subblock=None, unit_flag=0, pad_value=None,
-         left_padding=None, right_padding=None, mx_scale=None,
-         part_id=None, actual=None, l2_cache_ctl=0, atomic_add=False, axis=None)
+mem_copy(dst, src, options=None) -> None
 ```
 
-除 `dst` 和 `src` 外，其他参数都必须用关键字传入。使用 Channel 时，`dst` 要通过 `produce()` 取、`src` 要通过 `consume()` 取。
+`options` 由 [copy_options](../api/data-movement/copy-options.md) 创建。`mem_copy` 返回 `None`：先显式绑定目的 Tensor 的布局和实际范围，再执行搬运，后续操作继续使用这个 Tensor 或其派生 View。使用 `RingBuffer` 时，`dst` 和 `src` 都是已经选中的 Tensor。
 
 ### 默认搬运方式
 
-当前接口通过 `mem_copy(dst, src, options=...)` 使用 [copy_options](../api/data-movement/copy-options.md) 创建的配置；省略 `options` 时使用默认配置：
-
-- 一般情况下执行不改变逻辑布局的普通搬运。
+- 一般情况下执行不改变已声明 Tensor 解释的搬运；写入不会反向修改其他 View 的布局。
 - GM→L1 时，如果目标 Tensor 的布局要求 ND→NZ 或 DN→NZ，**自动执行对应的格式转换**。
 - GM→UB 默认使用普通 DMA，**不会自动选择 NDDMA**；需要 NDDMA 时显式传入 `copy_options(engine="nddma")`。
+- 转置、分区和逻辑数据变换由 Tensor 视图或 `pad` / `convert` / `relu` 等表达式描述，不使用旧的 `format_transform`、`transpose` 等 `mem_copy` 关键字。
 
-转置、分区及数据变换由 Tensor 视图或相应变换接口表达，不通过 `copy_options` 设置 `format_transform`。
+### 常用写法
 
-::: warning 接口版本说明
-本节上下文中的 `engine=make_copy_engine(...)`、直接向 `mem_copy` 传控制参数以及 Channel 示例仍为历史写法，尚未迁移。当前配置参数与可执行示例见 [copy_options](../api/data-movement/copy-options.md)。
-:::
-
-### 几个高价值选项
-
-| 选项 | 作用 | 典型场景 |
+| 需求 | 当前写法 | 典型场景 |
 | --- | --- | --- |
-| `engine=make_copy_engine(format_transform="nd2nz")` | 随路 ND→NZ | GM/UB → L1 |
-| `transpose=True` | 转置加载 | L1 → L0A/L0B |
-| `deq_scale=...` | Fixpipe 随路反量化 | L0C 搬出 |
-| `relu=True`（在 engine 上） | 随路 ReLU | L0C → GM/UB/L1 |
-| `atomic_add=True` | 写 GM 时原子累加 | Split-K、多核归约 |
-| `l2_cache_ctl=0/1/2/4` | L2 Cache 策略 | 大矩阵乘按复用情况开关 |
-| `split_axis` + `part_id` | 分区搬运 | 两个 AIV 各搬一半 |
+| ND→NZ | 声明 NZ 目的 Tensor，直接 `mem_copy(dst, src)` | GM/UB → L1 |
+| 转置加载 | `mem_copy(l0, l1.permute(...))` | L1 → L0A/L0B |
+| Fixpipe 数值转换和 scale | `mem_copy(dst, convert(src, dtype=..., scale=...))` | L0C 搬出 |
+| 随路 ReLU | `mem_copy(dst, relu(src))` | L0C → GM/UB/L1 |
+| 原子累加 | `mem_copy(gm, src, options=copy_options(atomic_add=True))` | Split-K、多核归约 |
+| L2 Cache 策略 | `options=copy_options(l2_cache_ctl=...)` | 大矩阵乘按复用情况开关 |
+| MX scale | `options=copy_options(mx_scale=l1_scale)` | L1 → L0A/L0B |
+| 分区搬运 | 对源或目的调用 `.partition(...)` | 两个 AIV 各处理一部分 |
+| NDDMA | `options=copy_options(engine="nddma")` | GM → UB 多维非连续搬运 |
+| 逻辑 padding | `mem_copy(dst, pad(src, ...), options=...)` | 显式扩展输入逻辑域 |
 | `dst` 传序列 | 一个 GM 源广播到多个 UB/L1 目标 | 常量表广播 |
 | `src` 传序列 | 多个同存储源拼接到一个目标 | 聚合输入 |
 
-::: tip 随路即免费
-随路转换（格式转换、量化、ReLU）由搬运单元在搬运过程中完成，不额外占用计算单元。能用随路做的事就不要单独写一遍计算。
+::: tip 随路处理不占用计算单元
+格式转换、量化、ReLU 由搬运单元在搬运过程中完成。能用随路做的事就不要单独写一遍计算。
 :::
 
 ### 多源 / 多目标的主要约束
 
 - 不能同时传入源序列和目标序列。
-- 多源：必须同一存储空间、同 dtype 的 ND Tensor，仅支持 `axis=0`，不能与分区、scale、padding 或原子累加组合。
-- 多目标：源必须是一个 ND GM Tensor，目标必须全部位于 UB 或全部位于 L1，并且 shape/dtype/布局相同、地址等间隔排列。
+- 多源：源必须位于同一存储空间，具有相同 rank 和可证明相等的内部范围与地址间隔，按轴 0 拼接；不能与分区、scale、padding 或原子累加组合。
+- 多目标：源必须是一个 ND GM Tensor，目标必须全部位于 UB 或全部位于 L1，形状、dtype 和布局一致，地址按固定间隔排列。
 
 完整约束见 [`mem_copy`](../api/data-movement/mem-copy.md)。
 
@@ -334,10 +325,22 @@ UB 不是一块平坦的 SRAM。NPU ARCH 3510 上它分成 **8 个 bank group，
 
 1. **调整 tile 的行宽（stride）**，让并发访问的地址落在不同 bank group 上。16 KB 是一个 bank 的跨度，行宽接近 16 KB 整数倍时最容易撞。
 2. **错开并发访问的起始偏移**，而不是让多个缓冲从同一个相对位置开始。
-3. **NZ 布局下用 `n1_pad`** 给相邻 N1 切片加额外 stride，把它们拉开。
+3. **NZ 布局下通过 `physical_layout` 增加 N1 方向的物理步长**，把相邻分形拉开。
 
-::: warning `n1_pad` 不是「打开即可消除冲突」的开关
-它只是给相邻 N1 切片增加 stride，**不会自动补零**，也不保证解决冲突。用它之前要先知道自己的访问模式撞在哪里，否则只是白占片上空间。
+```python
+padded = RingBuffer(
+    MemLoc.L1,
+    dtypes.float16,
+    make_layout((64, 128)),
+    depth=2,
+    physical_layout=make_layout(
+        (8, 4, 16, 16), stride=(1056, 256, 16, 1)
+    ),
+)
+```
+
+::: warning 物理 padding 不是「打开即可消除冲突」的开关
+增加物理步长只会改变地址分布，**不会自动补零**，也不保证解决冲突。使用前先确认访问模式撞在哪里，并确保逻辑 View 与实际物理布局匹配，否则只是白占片上空间。旧的 `n1_pad` 构造参数已删除。
 :::
 
 ## GM 协作：workspace
@@ -371,7 +374,7 @@ Kernel 里它就是一个 GM Tensor，用 `tile_slice` 取视图、用 `mem_copy
 
 ### workspace 的同步不会自动生成
 
-这是最容易漏的一条。Channel 的自动同步只管片上槽位，**workspace 是普通 GM 张量，框架不知道它的生产消费关系**：
+这是最容易漏的一条。`RingBuffer` 的自动数据同步只管片上资源，**workspace 是普通 GM 张量，框架不知道它的阶段间生产消费关系**：
 
 ```text
 阶段 A：多个核各算一段，部分和写入 workspace
@@ -388,7 +391,7 @@ Kernel 里它就是一个 GM Tensor，用 `tile_slice` 取视图、用 `mem_copy
 | 情况 | 选择 |
 | --- | --- |
 | 部分和需要高精度累加，或需要复杂归约 | workspace + 显式归约阶段 |
-| 只是简单求和，且精度允许 | `mem_copy(gm, ub, atomic_add=True)`，省掉一个阶段和一次屏障 |
+| 只是简单求和，且精度允许 | `mem_copy(gm, ub, options=copy_options(atomic_add=True))`，省掉一个阶段和一次屏障 |
 | 归约结果还要参与后续计算 | workspace（原子累加完成时间不确定） |
 
 `matmul_streamk` 用 workspace 是因为它要在 AIV 上做 fp32 归约再 cast 回输出 dtype；纯粹的多核求和用 `atomic_add` 更简单。
@@ -406,9 +409,13 @@ class MyKernel:
         self._tile = compute_tile_from_ub_budget(n, dtype)
 
         # —— 声明片上资源（地址由框架规划）——
-        self._x_ch = Channel(MemLoc.UB, (self._tile,), dtype, depth=2)
-        self._y_ch = Channel(MemLoc.UB, (self._tile,), dtype, depth=2)
-        self._tmp = Buffer(MemLoc.UB, (VL,), dtypes.float32)
+        self._x_rb = RingBuffer(
+            MemLoc.UB, dtype, make_layout((self._tile,)), depth=2
+        )
+        self._y_rb = RingBuffer(
+            MemLoc.UB, dtype, make_layout((self._tile,)), depth=2
+        )
+        self._tmp = Buffer(MemLoc.UB, dtypes.float32, make_layout((VL,)))
 
     def __call__(self, gm_x: Tensor, gm_y: Tensor):
         bi, bn = get_block_idx(), get_block_num()
@@ -417,20 +424,28 @@ class MyKernel:
         # —— 预取第一拍 ——
         first = bi
         if first < n_tiles:
-            mem_copy(self._x_ch.produce(), tile_slice(gm_x, (self._tile,), (first,)))
+            mem_copy(
+                self._x_rb.next_write(),
+                tile_slice(gm_x, (self._tile,), (first,)),
+            )
 
         for t in range(bi, n_tiles, bn):
             # —— 发下一拍搬运 ——
             nxt = t + bn
             if nxt < n_tiles:
-                mem_copy(self._x_ch.produce(),
-                         tile_slice(gm_x, (self._tile,), (nxt,)))
+                mem_copy(
+                    self._x_rb.next_write(),
+                    tile_slice(gm_x, (self._tile,), (nxt,)),
+                )
 
-            # —— 消费当前拍 ——
-            x = self._x_ch.consume()
-            out = self._y_ch.produce()
+            # —— 使用当前拍 ——
+            x = self._x_rb.next_read()
+            out = self._y_rb.next_write()
             self._compute(x, out)                 # @jit 方法，内部是 with vf(...)
-            mem_copy(tile_slice(gm_y, (self._tile,), (t,)), self._y_ch.consume())
+            mem_copy(
+                tile_slice(gm_y, (self._tile,), (t,)),
+                self._y_rb.next_read(),
+            )
 
     @jit
     def _compute(self, x, out):
