@@ -37,14 +37,13 @@ from cannbotdsl import (
     kernel,
     matmul,
     vf,
-    ChannelKind,
     MemLoc,
     RegLayout,
+    RingBuffer,
     Tensor,
 )
 from cannbotdsl.buffer import Buffer
-from cannbotdsl.channel import Channel
-from cannbotdsl.ops.memcpy import make_copy_engine, mem_copy
+from cannbotdsl.ops.memcpy import mem_copy
 from cannbotdsl.tensor import (
     ceil_div,
     make_tiler,
@@ -116,7 +115,7 @@ MASK_CAUSAL = 1
 # 关闭因果掩码时，屏蔽最后一个 KV 块中超出实际 S2 长度的填充行。
 MASK_KV_TAIL = 2
 
-# 通道深度配置。Q、L0A/B 和 P-NZ 使用双 Buffer；K/V 共用四槽 L1；
+# RingBuffer 槽位深度配置。Q、L0A/B 和 P-NZ 使用双 Buffer；K/V 共用四槽 L1；
 # L0C 独立分配：MM1 单槽，MM2 双槽，共占 256 KB。
 # P-L1 为适配两拍延迟使用三槽；K scale 使用两个独立 UB 槽 ping-pong。
 DEPTHS = {
@@ -176,49 +175,43 @@ class Matmul:
         self.m_base_size, self.s2_base_size, self.d = m_base_size, s2_base_size, d
         self.block_size = block_size
         self.cache_blocks_per_kv_tile = s2_base_size // block_size
-        self.fp8_copy_engine = make_copy_engine(format_transform="nd2nz")
-        self.fp8_wide_copy_engine = make_copy_engine(format_transform="nd2nz")
-        self.score_fixpipe_engine = make_copy_engine(split_axis=1)
-        self.output_fixpipe_engine = make_copy_engine(split_axis=0)
-        self.q_l1 = Channel(
+        self.q_l1 = RingBuffer(
             MemLoc.L1, shape=(m_base_size, d), dtype=Float8E4M3FN, depth=depths["q_l1"]
         )
-        self.kv_l1 = Channel(
+        self.kv_l1 = RingBuffer(
             MemLoc.L1,
             shape=(s2_base_size, d),
             dtype=Float8E4M3FN,
             depth=depths["kv_l1"],
         )
-        self.l0a = Channel(
+        self.l0a = RingBuffer(
             MemLoc.L0A, shape=(s2_base_size, d), dtype=Float8E4M3FN, depth=depths["l0a"]
         )
-        self.l0b = Channel(
+        self.l0b = RingBuffer(
             MemLoc.L0B, shape=(s2_base_size, d), dtype=Float8E4M3FN, depth=depths["l0b"]
         )
-        self.l0c_mm1 = Channel(
+        self.l0c_mm1 = RingBuffer(
             MemLoc.L0C,
             shape=(s2_base_size, m_base_size),
             dtype=dtypes.float32,
             depth=depths["l0c_mm1"],
         )
-        self.l0c_mm2 = Channel(
+        self.l0c_mm2 = RingBuffer(
             MemLoc.L0C,
             shape=(m_base_size, d),
             dtype=dtypes.float32,
             depth=depths["l0c_mm2"],
         )
-        self.score_actual = (s2_base_size, m_base_size)
-        self.output_actual = (m_base_size, d)
 
     @jit
     def load_q(self, q_tile):
-        q_slot = self.q_l1.produce()
-        mem_copy(q_slot, q_tile, engine=self.fp8_copy_engine)
+        q_slot = self.q_l1.next_write()
+        mem_copy(q_slot, q_tile)
         return q_slot
 
     @jit
     def load_k(self, gm_key_cache, gm_block_table, batch_idx, kv_head, kv_block_idx):
-        slot = self.kv_l1.produce()
+        slot = self.kv_l1.next_write()
         for cache_block_offset in tuple(range(self.cache_blocks_per_kv_tile)):
             physical_cache_block_index = gm_block_table[
                 batch_idx,
@@ -231,29 +224,27 @@ class Matmul:
                     (self.block_size, self.d),
                     (0, 0),
                 ),
-                engine=self.fp8_wide_copy_engine,
             )
 
     @jit
     def compute_qk(self, score_ub, q_slot):
-        key_l0a = self.l0a.produce()
-        query_l0b = self.l0b.produce().reinterpret(
-            Float8E4M3FN, (self.m_base_size, self.d)
+        key_l0a = self.l0a.next_write()
+        # 复用较大 L0 槽位时，显式 NZ 布局按本次矩阵形状重建紧凑物理跨度。
+        query_l0b = self.l0b.next_write().reinterpret(
+            Float8E4M3FN, (self.m_base_size, self.d), data_format="nz"
         )
-        score_l0c = self.l0c_mm1.produce()
-        mem_copy(key_l0a, self.kv_l1.consume())
+        score_l0c = self.l0c_mm1.next_write()
+        mem_copy(key_l0a, self.kv_l1.next_read())
         mem_copy(query_l0b, q_slot)
         matmul(score_l0c, key_l0a, query_l0b, init=True)
         mem_copy(
-            score_ub.produce(),
-            score_l0c,
-            engine=self.score_fixpipe_engine,
-            actual=self.score_actual,
+            score_ub.next_write(),
+            score_l0c.partition(dim=1),
         )
 
     @jit
     def load_v(self, gm_value_cache, gm_block_table, batch_idx, kv_head, kv_block_idx):
-        slot = self.kv_l1.produce()
+        slot = self.kv_l1.next_write()
         for cache_block_offset in tuple(range(self.cache_blocks_per_kv_tile)):
             physical_cache_block_index = gm_block_table[
                 batch_idx,
@@ -266,22 +257,24 @@ class Matmul:
                     (self.block_size, self.d),
                     (0, 0),
                 ),
-                engine=self.fp8_wide_copy_engine,
             )
 
     @jit
     def compute_pv(self, p_l1, output_ub):
-        probability_l0a = self.l0a.produce()
-        value_l0b = self.l0b.produce()
-        output_l0c = self.l0c_mm2.produce()
-        mem_copy(probability_l0a, p_l1.consume(), transpose=True)
-        mem_copy(value_l0b, self.kv_l1.consume(), transpose=True)
+        # P/V 的逻辑转置与目标 L0 形状一起声明，搬运按两端视图选择格式转换。
+        probability_l0a = self.l0a.next_write().reinterpret(
+            Float8E4M3FN, (self.m_base_size, self.s2_base_size), data_format="nz"
+        )
+        value_l0b = self.l0b.next_write().reinterpret(
+            Float8E4M3FN, (self.d, self.s2_base_size), data_format="nz"
+        )
+        output_l0c = self.l0c_mm2.next_write()
+        mem_copy(probability_l0a, p_l1.next_read().transpose(0, 1))
+        mem_copy(value_l0b, self.kv_l1.next_read().transpose(0, 1))
         matmul(output_l0c, probability_l0a, value_l0b, init=True)
         mem_copy(
-            output_ub.produce(),
-            output_l0c,
-            engine=self.output_fixpipe_engine,
-            actual=self.output_actual,
+            output_ub.next_write(),
+            output_l0c.partition(dim=0),
         )
 
 
@@ -294,10 +287,7 @@ class Vector:
             s2_base_size,
             d,
         )
-        self.fp32_copy_engine = make_copy_engine(format_transform="identity")
-        self.fp16_copy_engine = make_copy_engine(format_transform="identity")
-        self.uint8_copy_engine = make_copy_engine(format_transform="identity")
-        self.p_nz = Channel(
+        self.p_nz = RingBuffer(
             MemLoc.UB,
             shape=(m_base_size_per_aiv, s2_base_size),
             dtype=Float8E4M3FN,
@@ -305,7 +295,7 @@ class Vector:
             data_format="nz",
             n1_pad=NZ_N1_PADDING,
         )
-        self.query_dequant_scale_ub = Channel(
+        self.query_dequant_scale_ub = RingBuffer(
             MemLoc.UB,
             shape=(m_base_size_per_aiv, 1),
             dtype=dtypes.float32,
@@ -315,23 +305,23 @@ class Vector:
             MemLoc.UB, (m_base_size_per_aiv, 1), dtypes.float32
         )
         self.key_dequant_scale_stride = s2_base_size + KEY_DEQUANT_SCALE_PADDING
-        self.key_dequant_scale_ub_channels = [
-            Channel(
+        self.key_dequant_scale_ub_slots = [
+            RingBuffer(
                 MemLoc.UB,
                 shape=(KEY_DEQUANT_SCALE_COPIES, self.key_dequant_scale_stride),
                 dtype=dtypes.float32,
                 depth=1,
-            ).produce()
+            ).next_write()
             for _ in range(KEY_SCALE_BUFFER_SLOTS)
         ]
         self.key_dequant_scale_byte_views = [
-            ch.reinterpret(
+            slot.reinterpret(
                 dtypes.uint8,
                 (KEY_DEQUANT_SCALE_COPIES, self.key_dequant_scale_stride * 4),
             )
-            for ch in self.key_dequant_scale_ub_channels
+            for slot in self.key_dequant_scale_ub_slots
         ]
-        self.value_dequant_scale_ub = Channel(
+        self.value_dequant_scale_ub = RingBuffer(
             MemLoc.UB,
             shape=(1, 1),
             dtype=dtypes.float32,
@@ -341,13 +331,13 @@ class Vector:
         self.nz_gather_indices_ub = Buffer(
             MemLoc.UB, (1, len(self.nz_gather_indices)), dtypes.uint8
         )
-        self.nz_gather_indices_channel = Channel(
+        self.nz_gather_indices_slot = RingBuffer(
             MemLoc.UB,
             shape=(1, len(self.nz_gather_indices)),
             dtype=dtypes.uint8,
             depth=1,
-        ).produce()
-        self.output_fp16_ub = Channel(
+        ).next_write()
+        self.output_fp16_ub = RingBuffer(
             MemLoc.UB,
             shape=(m_base_size_per_aiv, d),
             dtype=dtypes.float16,
@@ -367,7 +357,7 @@ class Vector:
     @jit
     def initialize(self):
         """初始化当前 Q tile 的 Softmax 状态和输出累加器。"""
-        query_dequant_scale_slot = self.query_dequant_scale_ub.consume()
+        query_dequant_scale_slot = self.query_dequant_scale_ub.next_read()
         with vf(mode="simd"):
             row_mask, _ = update_mask(self.m_base_size_per_aiv, elem_bits=32)
             # 复用初始化 VF 完成 dq 的一次自动读取，供整个 S2 循环使用。
@@ -415,9 +405,9 @@ class Vector:
 
         ``l`` 累加的是 Cast 前的 FP32 指数和，P 则以 FP8 NZ 形式供 MM2。
         """
-        p_slot = self.p_nz.produce()
+        p_slot = self.p_nz.next_write()
         corr_buffer = self.corr_buffers[pipeline_slot]
-        key_dequant_scale_ub = self.key_dequant_scale_ub_channels[
+        key_dequant_scale_ub = self.key_dequant_scale_ub_slots[
             int(const_expr(k_scale_slot))
         ]
         with vf(mode="simd"):
@@ -777,9 +767,9 @@ class Vector:
 
     @jit
     def store_p(self, p_l1, vector_subblock_index):
-        """在一次生产事务内将全部带 padding 的 P-NZ 分片重排写入 L1。"""
-        p_source = self.p_nz.consume()
-        p_destination = p_l1.produce()
+        """将全部带 padding 的 P-NZ 分片重排写入同一个 L1 槽位。"""
+        p_source = self.p_nz.next_read()
+        p_destination = p_l1.next_write()
         fragment_shape = (self.m_base_size_per_aiv, self.p_nz_fragment_width)
         fragment_count = self.s2_base_size // self.p_nz_fragment_width
         for fragment_index in tuple(range(fragment_count)):
@@ -832,14 +822,13 @@ class Vector:
         valid_query_rows,
     ):
         """按 ``O=acc*deq_v/row_l`` 归一化，Cast 为 FP16 后写回 GM。"""
-        value_dequant_scale_slot = self.value_dequant_scale_ub.produce()
-        output_slot = self.output_fp16_ub.produce()
+        value_dequant_scale_slot = self.value_dequant_scale_ub.next_write()
+        output_slot = self.output_fp16_ub.next_write()
         mem_copy(
             value_dequant_scale_slot,
             tile_slice(
                 gm_value_dequant_scale[key_value_head_index, None, None], (1, 1), (0, 0)
             ),
-            engine=self.fp32_copy_engine,
         )
         with vf(mode="simd"):
             fp32_mask, _ = update_mask(FP32_VECTOR_LANES, elem_bits=32)
@@ -869,19 +858,20 @@ class Vector:
                     fp16_mask,
                 )
 
-        mem_copy(
-            _query_row_tile(
-                gm_output,
-                layout,
-                batch_index,
-                query_head_index,
-                query_token_start + vector_subblock_index * self.m_base_size_per_aiv,
-                valid_query_rows,
-                self.d,
-            ),
-            output_slot,
-            engine=self.fp16_copy_engine,
-        )
+        # 两端都限定有效行；空 AIV 不写回，避免尾 tile 覆盖下一段 TND 序列。
+        if valid_query_rows > 0:
+            mem_copy(
+                _query_row_tile(
+                    gm_output,
+                    layout,
+                    batch_index,
+                    query_head_index,
+                    query_token_start + vector_subblock_index * self.m_base_size_per_aiv,
+                    valid_query_rows,
+                    self.d,
+                ),
+                output_slot[:valid_query_rows, : self.d],
+            )
 
 
 @kernel
@@ -930,27 +920,24 @@ class FlashAttnFp8FullQuantKernel:
 
         self.matmul = Matmul(m_base_size, s2_base_size, d, bs, dep)
 
-        self.p_l1 = Channel(
+        self.p_l1 = RingBuffer(
             MemLoc.L1,
             shape=(s2_base_size, m_base_size),
             dtype=Float8E4M3FN,
             depth=dep["p_l1"],
-            kind=ChannelKind.CrossCore,
         )
 
-        self.s_ub = Channel(
+        self.s_ub = RingBuffer(
             MemLoc.UB,
             shape=(s2_base_size, m_base_size_per_aiv),
             dtype=dtypes.float32,
             depth=dep["s_ub"],
-            kind=ChannelKind.CrossCore,
         )
-        self.pv_ub = Channel(
+        self.pv_ub = RingBuffer(
             MemLoc.UB,
             shape=(m_base_size_per_aiv, d),
             dtype=dtypes.float32,
             depth=dep["pv_ub"],
-            kind=ChannelKind.CrossCore,
         )
 
     def __call__(
@@ -976,16 +963,15 @@ class FlashAttnFp8FullQuantKernel:
 
         # NZ gather 索引在整个 Kernel 生命周期内固定，每个核只需搬入 UB 一次。
         mem_copy(
-            self.vector.nz_gather_indices_channel,
+            self.vector.nz_gather_indices_slot,
             gm_nz_gather_indices,
-            engine=self.vector.uint8_copy_engine,
         )
         with vf(mode="simd"):
             idx_mask, _ = update_mask(len(self.vector.nz_gather_indices), elem_bits=8)
             vstore(
                 self.vector.nz_gather_indices_ub,
                 0,
-                vload(self.vector.nz_gather_indices_channel, 0),
+                vload(self.vector.nz_gather_indices_slot, 0),
                 idx_mask,
             )
 
@@ -1230,7 +1216,7 @@ class FlashAttnFp8FullQuantKernel:
             gm_value_cache, gm_block_table, batch_idx, kv_head, kv_block_idx
         )
         self.matmul.compute_pv(self.p_l1, self.pv_ub)
-        self.vector.update_output_acc(self.pv_ub.consume(), pipeline_slot)
+        self.vector.update_output_acc(self.pv_ub.next_read(), pipeline_slot)
 
     @jit
     def _load_query_and_scale(
@@ -1256,9 +1242,8 @@ class FlashAttnFp8FullQuantKernel:
             self.d,
         )
         mem_copy(
-            self.vector.query_dequant_scale_ub.produce(),
+            self.vector.query_dequant_scale_ub.next_write(),
             query_dequant_scale_tile,
-            engine=self.vector.fp32_copy_engine,
         )
         return self.matmul.load_q(query_tile)
 
@@ -1275,14 +1260,13 @@ class FlashAttnFp8FullQuantKernel:
     ):
         """将 K scale 搬入双 Buffer，并复制 4 份供 Pass A 无 bank 冲突广播。"""
         k_scale_slot = int(const_expr(k_scale_slot))
-        key_dequant_scale_ub = self.vector.key_dequant_scale_ub_channels[k_scale_slot]
+        key_dequant_scale_ub = self.vector.key_dequant_scale_ub_slots[k_scale_slot]
         key_dequant_scale_byte_view = self.vector.key_dequant_scale_byte_views[
             k_scale_slot
         ]
         mem_copy(
             tile_slice(key_dequant_scale_ub, (1, 1), (0, self.s2_base_size)),
             tile_slice(gm_value_dequant_scale[kv_head, None, None], (1, 1), (0, 0)),
-            engine=self.vector.fp32_copy_engine,
         )
         for cache_block_offset in tuple(range(self.cache_blocks_per_kv_tile)):
             physical_cache_block_index = gm_block_table[
@@ -1290,19 +1274,19 @@ class FlashAttnFp8FullQuantKernel:
                 kv_block_idx * self.cache_blocks_per_kv_tile + cache_block_offset,
             ]
 
+            # cache 中连续的 4 行字节与 UB 单行字节窗口按一维域对应。
             for copy_index in tuple(range(KEY_DEQUANT_SCALE_COPIES)):
                 mem_copy(
                     tile_slice(
                         key_dequant_scale_byte_view,
                         (1, KEY_SCALE_ROWS * self.d),
                         (copy_index, cache_block_offset),
-                    ),
+                    ).flatten(),
                     tile_slice(
                         gm_key_cache[physical_cache_block_index, kv_head, None, None],
                         (KEY_SCALE_ROWS, self.d),
                         (self.block_size // KEY_SCALE_ROWS, 0),
-                    ),
-                    engine=self.vector.uint8_copy_engine,
+                    ).flatten(),
                 )
 
     @jit
@@ -1344,7 +1328,7 @@ class FlashAttnFp8FullQuantKernel:
                 + self.vector_subblock_index * self.m_base_size_per_aiv
             )
         self.vector.softmax(
-            self.s_ub.consume(),
+            self.s_ub.next_read(),
             visible_limit,
             pipeline_slot,
             kv_block_mask_type,
