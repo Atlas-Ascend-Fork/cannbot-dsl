@@ -217,6 +217,22 @@ batch_matmul:
   options:
     - matmul/batch_matmul
 
+fused_matmul:
+  module: True
+  src:
+    - samples/matmul/fused_matmul
+    - test/matmul/fused_matmul
+  options:
+    - matmul/fused_matmul
+
+dual_level_quant_matmul:
+  module: True
+  src:
+    - samples/matmul/dual_level_quant_matmul
+    - test/matmul/dual_level_quant_matmul
+  options:
+    - matmul/dual_level_quant_matmul
+
 quant_matmul:
   module: True
   src:

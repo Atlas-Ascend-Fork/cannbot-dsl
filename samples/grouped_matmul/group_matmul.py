@@ -79,7 +79,6 @@ L0B_SIZE = get_mem_size("l0b")
 L0C_SIZE = get_mem_size("l0c")
 PARTA_L1_SIZE = L1_SIZE // 2
 L2_SIZE = 128 * 1024 * 1024
-AIC_NUM = get_platform_info().cube_core_num
 MAX_TENSOR = 1024
 
 WINDOW_LEN = 4
@@ -183,6 +182,8 @@ class GmmTiling:
         group_list_type=GROUPLIST_TYPE_CUMSUM,
         l2_disable_seed=False,
     ):
+        stream = torch.npu.current_stream()
+        self.aic_num = int(get_platform_info(stream=stream).cube_core_num)
         self.m = m
         self.n = n
         self.k = k
@@ -206,7 +207,7 @@ class GmmTiling:
         self.step_kb = 4
         self.depth_a1 = 8
         self.depth_b1 = 8
-        self.used_core_num = AIC_NUM
+        self.used_core_num = self.aic_num
         self.weight_no_l2_cache = False
         self.group_list_type = group_list_type
         # Finalized by _finalize() during _compute() below.
@@ -246,7 +247,7 @@ class GmmTiling:
             and self.group_type == SPLIT_M
             and not self.trans_a
             and not self.trans_b
-            and _ceil_div(group_m, self.base_m) * self.group_num >= AIC_NUM
+            and _ceil_div(group_m, self.base_m) * self.group_num >= self.aic_num
             and self.n > self.base_n
         ):
             # Keep one full-K A tile while double-buffering streamed B tiles.
@@ -262,9 +263,9 @@ class GmmTiling:
             n_tiles = _ceil_div(self.n, self.base_n)
             # Estimate A+B row traffic per core; K and element size are common factors.
             streaming_load_rows = _ceil_div(
-                m_tiles * n_tiles * self.group_num, AIC_NUM
+                m_tiles * n_tiles * self.group_num, self.aic_num
             ) * (self.base_m + self.base_n)
-            a_full_load_rows = _ceil_div(m_tiles * self.group_num, AIC_NUM) * (
+            a_full_load_rows = _ceil_div(m_tiles * self.group_num, self.aic_num) * (
                 self.base_m + n_tiles * self.base_n
             )
             # Avoid extra B K windows when multiple M tiles reuse the weights.
@@ -313,7 +314,7 @@ class GmmTiling:
         m_tile_count = _ceil_div(self.m, self.base_m)
         n_tile_count = _ceil_div(self.n, self.base_n)
         total_tile_count = m_tile_count * n_tile_count * self.group_num
-        if AIC_NUM // 2 < total_tile_count <= AIC_NUM and m_tile_count >= 2:
+        if self.aic_num // 2 < total_tile_count <= self.aic_num and m_tile_count >= 2:
             self.base_m = _ceil_align(
                 _ceil_div(self.m, m_tile_count * 2), BASIC_BLOCK_16
             )
@@ -323,17 +324,17 @@ class GmmTiling:
     def _compute(self):
         self._cal_base_mm_tiling()
         if self.group_num == 1:
-            self._formulate_basic_block(AIC_NUM)
+            self._formulate_basic_block(self.aic_num)
             self._optimize_base_m()
             self._cal_aswt_l1_tiling()
             self._set_disable_l2_cache()
         else:
             if self.group_type in (SPLIT_M, NO_SPLIT):
-                self._formulate_basic_block(max(1, AIC_NUM // self.group_num))
+                self._formulate_basic_block(max(1, self.aic_num // self.group_num))
                 self._optimize_base_m()
                 self._set_disable_l2_cache()
             elif self.group_type == SPLIT_K:
-                remain_core = max(1, AIC_NUM // self.group_num)
+                remain_core = max(1, self.aic_num // self.group_num)
                 self._formulate_basic_block(remain_core)
         self._finalize()
 
@@ -425,7 +426,7 @@ class GmmTiling:
 
         m_cnt = _ceil_div(self.m, self.base_m)
         n_cnt = _ceil_div(self.n, self.base_n)
-        self.used_core_num = min(m_cnt * n_cnt * self.group_num, AIC_NUM)
+        self.used_core_num = min(m_cnt * n_cnt * self.group_num, self.aic_num)
         self._recalc_base_k()
 
     def _recalc_base_k(self):
@@ -504,7 +505,7 @@ class GmmTiling:
         if self.group_num == 1:
             m_cnt = _ceil_div(self.m, self.base_m)
             n_cnt = _ceil_div(self.n, self.base_n)
-            self.used_core_num = min(m_cnt * n_cnt, AIC_NUM)
+            self.used_core_num = min(m_cnt * n_cnt, self.aic_num)
 
         a_l1_4buf = self.k_l1 * self.base_m * self.a_dtype_size * self.depth_a1
         b_l1_4buf = self.k_l1 * self.base_n * self.b_dtype_size * self.depth_b1

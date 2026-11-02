@@ -158,7 +158,8 @@ class StreamKTiling:
         self.k = k
         self.dtype = dtype
         self.dtype_size = _DTYPE_SIZE[dtype]
-        self.aic_num = get_platform_info().cube_core_num
+        stream = torch.npu.current_stream()
+        self.aic_num = int(get_platform_info(stream=stream).cube_core_num)
         self._compute()
 
     def _compute(self):

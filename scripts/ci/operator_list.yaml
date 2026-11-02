@@ -22,6 +22,8 @@ operators:
   - flash_kda_cp_main
   - matmul
   - matmul/batch_matmul
+  - matmul/fused_matmul
+  - matmul/dual_level_quant_matmul
   - pointnet_sa
   - rms_norm
   - kv_compress_epilog

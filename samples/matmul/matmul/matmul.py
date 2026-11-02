@@ -86,7 +86,6 @@ class MatmulTiling:
     L0A_SIZE = get_mem_size("l0a")
     L0C_SIZE = get_mem_size("l0c")
     L2_SIZE = 128 * 1024 * 1024
-    AIC_NUM = get_platform_info().cube_core_num
 
     # ---- tiling constants ----
     BASIC_BLOCK_16 = 16
@@ -144,6 +143,8 @@ class MatmulTiling:
             transpose_a=False and transpose_b=True.
           has_bias: reserved keyword-only flag for future bias tiling support.
         """
+        stream = torch.npu.current_stream()
+        self.AIC_NUM = int(get_platform_info(stream=stream).cube_core_num)
         self.m = m
         self.n = n
         self.k = k

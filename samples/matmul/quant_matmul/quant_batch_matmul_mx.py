@@ -60,7 +60,6 @@ MX_L0C_PINGPONG_OUTPUT_SIZE_LIMIT = 128 * 1024 * 1024
 L2_CACHE_THRESHOLD_BYTES = 128 * 1024 * 1024 * 80 // 100
 MMAD_BLOCK_SIZE = 256
 CUBE_BLOCK = 16
-AIC_NUM = get_platform_info().cube_core_num
 BASIC_BLOCK_SIZE_128 = 128
 LOAD_BALANCE_BASE_N_128_ALIGN_K_THRESHOLD = 2560
 LOAD_BALANCE_THRESHOLD = 1792
@@ -152,29 +151,31 @@ def _optimize_base_block_for_load_balance(
     FP4 also searches larger grids, retaining aligned writeback and rejecting
     candidates that cross from compute-bound to MTE2-bound. Return (baseM, baseN).
     """
+    stream = torch.npu.current_stream()
+    aic_num = int(get_platform_info(stream=stream).cube_core_num)
     is_fp4 = element_bytes == 0.5
     l1_align_size = MX_K_ALIGN if is_fp4 else MX_GROUP_SIZE
     origin_base_m, origin_base_n = base_m, base_n
-    round_limit = ceil_div(ceil_div(m, base_m) * ceil_div(n, base_n), AIC_NUM)
+    round_limit = ceil_div(ceil_div(m, base_m) * ceil_div(n, base_n), aic_num)
     if round_limit == 1 or (round_limit > 3 and not is_fp4):
         return base_m, base_n
 
     origin_blocks = ceil_div(m, base_m) * ceil_div(n, base_n)
-    origin_tail_blocks = origin_blocks % AIC_NUM or AIC_NUM
-    origin_tail_used_cores = origin_tail_blocks * (AIC_NUM // origin_tail_blocks)
+    origin_tail_blocks = origin_blocks % aic_num or aic_num
+    origin_tail_used_cores = origin_tail_blocks * (aic_num // origin_tail_blocks)
     origin_memory_score = (base_m + base_n) / (base_m * base_n)
 
     best_m, best_n = base_m, base_n
     best_balance = 0.0
     best_memory_score = float("inf")
     if is_fp4:
-        best_balance = m * n / AIC_NUM / (round_limit * base_m * base_n)
+        best_balance = m * n / aic_num / (round_limit * base_m * base_n)
         best_memory_score = origin_memory_score
         roofline_intensity = (
             _MX_CUBE_MACS_PER_CYCLE
             / element_bytes
             * _CUBE_FREQ_MHZ
-            * AIC_NUM
+            * aic_num
             / (_MAX_L2_BW_TBPS * _MTE2_BW_UTILIZATION * _BYTES_PER_US_PER_TBPS)
         )
         origin_intensity = 1 / (origin_memory_score * element_bytes)
@@ -198,12 +199,12 @@ def _optimize_base_block_for_load_balance(
                 candidate_m = min(candidate_m, ceil_align(m, m_tile_align))
                 candidate_n = min(candidate_n, ceil_align(n, n_tile_align))
             blocks = ceil_div(m, candidate_m) * ceil_div(n, candidate_n)
-            rounds = ceil_div(blocks, AIC_NUM)
+            rounds = ceil_div(blocks, aic_num)
             if rounds > round_limit:
                 break
             if candidate_m == base_m and candidate_n == base_n:
                 continue
-            tail_blocks = blocks % AIC_NUM or AIC_NUM
+            tail_blocks = blocks % aic_num or aic_num
             memory_score = (candidate_m + candidate_n) / (candidate_m * candidate_n)
             if is_fp4:
                 if require_base_n_128_align and candidate_n % BASIC_BLOCK_SIZE_128:
@@ -229,7 +230,7 @@ def _optimize_base_block_for_load_balance(
             ):
                 continue
             # Fraction of scheduled tile capacity that contains valid output.
-            balance = m * n / AIC_NUM / (rounds * candidate_m * candidate_n)
+            balance = m * n / aic_num / (rounds * candidate_m * candidate_n)
             tie_break = (
                 abs(balance - best_balance) <= SCORE_COMPARE_EPS
                 and memory_score + (SCORE_COMPARE_EPS if is_fp4 else 0)
@@ -268,6 +269,8 @@ def _get_base_block(
     launch, redistribute the core grid and improve the tile aspect ratio.
     Finally, limit baseK by the double-buffered L0A/L0B capacity.
     """
+    stream = torch.npu.current_stream()
+    aic_num = int(get_platform_info(stream=stream).cube_core_num)
     base_m_align = profile.l1_align_size if transpose_a else CUBE_BLOCK
     base_n_align = CUBE_BLOCK if transpose_b else profile.l1_align_size
     base_k_align = (
@@ -282,7 +285,7 @@ def _get_base_block(
     # Retain a conservative K block for the packed transpose-A copy footprint.
     default_base_k = 256 if profile.element_bytes == 0.5 and not transpose_a else 128
     base_k = ceil_align(min(k, default_base_k), MX_K_ALIGN)
-    if ceil_div(m, base_m) * ceil_div(n, base_n) >= AIC_NUM:
+    if ceil_div(m, base_m) * ceil_div(n, base_n) >= aic_num:
         base_m, base_n = _optimize_base_block_for_load_balance(
             m,
             n,
@@ -302,7 +305,7 @@ def _get_base_block(
     # Leave underfilled FP4 inner-axis grids for single-round normalization.
     if (
         profile.element_bytes == 0.5
-        and m_max_tile * n_max_tile < AIC_NUM
+        and m_max_tile * n_max_tile < aic_num
         and (transpose_a or not transpose_b)
     ):
         return base_m, base_n, base_k
@@ -313,32 +316,32 @@ def _get_base_block(
     ):
         base_m = ceil_align(ceil_div(m, m_core), adjust_base_m_align)
         m_core = ceil_div(m, base_m)
-        n_core = AIC_NUM // m_core
+        n_core = aic_num // m_core
         base_n = ceil_align(ceil_div(n, n_core), adjust_base_n_align)
     else:
         base_n = ceil_align(ceil_div(n, n_core), adjust_base_n_align)
         n_core = ceil_div(n, base_n)
-        m_core = AIC_NUM // n_core
+        m_core = aic_num // n_core
         base_m = ceil_align(ceil_div(m, m_core), adjust_base_m_align)
 
     # Move baseM/baseN toward a square tile. This lowers the A/B transfer ratio
     # and may allow a larger baseK under the double-buffered L0 capacity limit.
-    # When baseN >= 2*baseM, double n_core and derive m_core from BLOCK_DIM.
+    # When baseN >= 2*baseM, double n_core and derive m_core from aic_num.
     while (
-        base_n >= base_m * 2 and n_core < AIC_NUM // 2 and base_n != adjust_base_n_align
+        base_n >= base_m * 2 and n_core < aic_num // 2 and base_n != adjust_base_n_align
     ):
         n_core *= 2
-        m_core = AIC_NUM // n_core
+        m_core = aic_num // n_core
         base_m = ceil_align(ceil_div(m, m_core), adjust_base_m_align)
         base_n = ceil_align(ceil_div(n, n_core), adjust_base_n_align)
         m_core = ceil_div(m, base_m)
         n_core = ceil_div(n, base_n)
     # Apply the symmetric adjustment when the M direction is too long.
     while (
-        base_m >= base_n * 2 and m_core < AIC_NUM // 2 and base_m != adjust_base_m_align
+        base_m >= base_n * 2 and m_core < aic_num // 2 and base_m != adjust_base_m_align
     ):
         m_core *= 2
-        n_core = AIC_NUM // m_core
+        n_core = aic_num // m_core
         base_m = ceil_align(ceil_div(m, m_core), adjust_base_m_align)
         base_n = ceil_align(ceil_div(n, n_core), adjust_base_n_align)
         m_core = ceil_div(m, base_m)
@@ -354,7 +357,7 @@ def _get_base_block(
             m_tiles = ceil_div(m, candidate_m)
             n_tiles = ceil_div(n, candidate_n)
             blocks = m_tiles * n_tiles
-            if blocks > AIC_NUM:
+            if blocks > aic_num:
                 continue
             # Non-allocating loads come from GM; cached repeats can hit L2.
             a_gm_blocks = (
@@ -376,7 +379,7 @@ def _get_base_block(
                 blocks - b_gm_blocks
             ) * candidate_n
             load_score = (
-                AIC_NUM
+                aic_num
                 / blocks
                 * (gm_rows / _MAX_HBM_BW_TBPS + l2_rows / _MAX_L2_BW_TBPS)
             )
@@ -796,19 +799,21 @@ def _can_use_a_full_load(
     otherwise require two buffers in NORMAL_MODE or more than 20 percent
     repeated A traffic.
     """
+    stream = torch.npu.current_stream()
+    aic_num = int(get_platform_info(stream=stream).cube_core_num)
     elem = profile.element_bytes
     m_tiles = ceil_div(m, base_m)
     n_tiles = ceil_div(n, base_n)
     candidate = (
         base_m * ceil_align(k, MX_K_ALIGN) * elem <= L1_CAPACITY_BYTES // 2
         and m_tiles < WINDOW_LEN
-        and AIC_NUM % m_tiles == 0
-        and m_tiles * n_tiles > AIC_NUM
+        and aic_num % m_tiles == 0
+        and m_tiles * n_tiles > aic_num
     )
     if not candidate:
         return False
 
-    used_core_num = min(AIC_NUM, m_tiles * n_tiles)
+    used_core_num = min(aic_num, m_tiles * n_tiles)
     _, _, full_buffers = _cal_l1_tiling(
         m,
         n,
@@ -860,6 +865,8 @@ def _optimize_edge_basic_block(
     transpose_b=True,
 ):
     """Rebalance the final M/N blocks across adjacent outer-axis blocks."""
+    stream = torch.npu.current_stream()
+    aic_num = int(get_platform_info(stream=stream).cube_core_num)
     m_tiles = ceil_div(m, base_m)
     n_tiles = ceil_div(n, base_n)
     m_base_tail_split_count = n_base_tail_split_count = 1
@@ -899,15 +906,15 @@ def _optimize_edge_basic_block(
     is_n_inner_balanced = inner_axis_aligned or n >= LOAD_BALANCE_THRESHOLD
     if n_tail and transpose_b and not balance_after_fixpipe and is_n_inner_balanced:
         total_blocks = m_tiles * n_tiles
-        total_rounds = ceil_div(total_blocks, AIC_NUM)
+        total_rounds = ceil_div(total_blocks, aic_num)
         main_rounds = ceil_div(
-            (n_tiles - 1) * m_tiles + m_tiles % AIC_NUM,
-            AIC_NUM,
+            (n_tiles - 1) * m_tiles + m_tiles % aic_num,
+            aic_num,
         )
-        is_aligned_window = m_tiles % AIC_NUM == 0 and (
+        is_aligned_window = m_tiles % aic_num == 0 and (
             n_tiles % WINDOW_LEN == 0 or WINDOW_LEN % n_tiles == 0
         )
-        if total_blocks <= AIC_NUM or is_aligned_window:
+        if total_blocks <= aic_num or is_aligned_window:
             main_rounds = total_rounds
         best_cost = main_rounds * base_n + (total_rounds - main_rounds) * n_tail
         merge_count_max = min((base_n - n_tail) // CUBE_BLOCK, n_tiles)
@@ -922,14 +929,14 @@ def _optimize_edge_basic_block(
             if merge_len < n_tiles - 1:
                 new_main_rounds = ceil_div(
                     (n_tiles - 1 - merge_len) * m_tiles
-                    + (merge_len + 1) * m_tiles % AIC_NUM,
-                    AIC_NUM,
+                    + (merge_len + 1) * m_tiles % aic_num,
+                    aic_num,
                 )
             if merge_len:
                 new_tail_rounds = min(
                     ceil_div(
-                        merge_len * m_tiles + m_tiles % AIC_NUM,
-                        AIC_NUM,
+                        merge_len * m_tiles + m_tiles % aic_num,
+                        aic_num,
                     ),
                     total_rounds - new_main_rounds,
                 )
@@ -1091,6 +1098,8 @@ def get_qbmm_mx_tile_config(
     profile=FP8_TILING_PROFILE,
 ):
     """Generate the complete MX host tiling for one shape."""
+    stream = torch.npu.current_stream()
+    aic_num = int(get_platform_info(stream=stream).cube_core_num)
     is_fp8 = profile.element_bytes == 1.0
     is_fp8_false_true = is_fp8 and not transpose_a and transpose_b
     # Both GM-contiguous inner extents must satisfy the dtype's byte alignment.
@@ -1143,7 +1152,7 @@ def get_qbmm_mx_tile_config(
         n,
         base_m,
         base_n,
-        AIC_NUM,
+        aic_num,
         optimized_edge_tiling,
         transpose_a,
         transpose_b,
@@ -1153,7 +1162,7 @@ def get_qbmm_mx_tile_config(
     if (
         not is_fp8
         and not full_load
-        and total_tiles < AIC_NUM
+        and total_tiles < aic_num
         and (m_tail_tile > 1 or n_tail_tile > 1)
     ):
         m_align = profile.l1_align_size if transpose_a else CUBE_BLOCK
@@ -1180,7 +1189,7 @@ def get_qbmm_mx_tile_config(
         transpose_a,
         transpose_b,
         has_bias,
-        min(AIC_NUM, total_tiles),
+        min(aic_num, total_tiles),
         enable_l0c_pingpong,
         profile=profile,
     )
@@ -1190,7 +1199,7 @@ def get_qbmm_mx_tile_config(
     if (
         normal_fp8_false_true
         and ceil_div(m, base_m) == 1
-        and total_tiles <= AIC_NUM
+        and total_tiles <= aic_num
         and k_l1 < k < 2 * k_l1
         and k_l1 // base_k >= 3
         and k % BASIC_BLOCK_SIZE_128 == 0
@@ -1219,7 +1228,7 @@ def get_qbmm_mx_tile_config(
     if (
         normal_fp8_false_true
         and ceil_div(m, base_m) == 1
-        and total_tiles >= 2 * AIC_NUM
+        and total_tiles >= 2 * aic_num
         and k % MTE2_ADDRESS_ALIGN_SIZE == 0
         and output_dtype in (torch.float16, torch.bfloat16)
     ):
@@ -1272,7 +1281,7 @@ def get_qbmm_mx_tile_config(
             candidate_l0c_n,
         ) in candidates:
             blocks = ceil_div(n, candidate_n)
-            rounds = ceil_div(blocks, AIC_NUM)
+            rounds = ceil_div(blocks, aic_num)
             candidate_edge_tiling = (
                 optimized_edge_tiling
                 if candidate_l0c_n == 0
@@ -1291,14 +1300,14 @@ def get_qbmm_mx_tile_config(
                 n,
                 base_m,
                 candidate_n,
-                AIC_NUM,
+                aic_num,
                 candidate_edge_tiling,
                 transpose_a,
                 transpose_b,
                 profile=profile,
             )
-            tail_blocks = blocks % AIC_NUM
-            split_tail = tail_blocks > 0 and tail_blocks * m_split * n_split <= AIC_NUM
+            tail_blocks = blocks % aic_num
+            split_tail = tail_blocks > 0 and tail_blocks * m_split * n_split <= aic_num
             m_load_rows = (rounds - 1) * m + (ceil_div(m, m_split) if split_tail else m)
             n_load_rows = (rounds - 1) * candidate_n + (
                 ceil_div(candidate_n, n_split) if split_tail else candidate_n
@@ -1317,7 +1326,7 @@ def get_qbmm_mx_tile_config(
                 - scale_stride_gcd
                 * (1 + (scale_window_count - 1) // scale_window_period)
             )
-            cold_a_rows = m / AIC_NUM
+            cold_a_rows = m / aic_num
             score = (k + scale_load_bytes) * (
                 (cold_a_rows + n_load_rows) / _MAX_HBM_BW_TBPS
                 + (m_load_rows - cold_a_rows) / _MAX_L2_BW_TBPS
@@ -1348,7 +1357,7 @@ def get_qbmm_mx_tile_config(
         full_load
         and is_fp8_false_true
         and not has_bias
-        and total_tiles >= 4 * AIC_NUM
+        and total_tiles >= 4 * aic_num
         and k >= 3 * k_l1
         and output_dtype in (torch.float16, torch.bfloat16)
     ):
@@ -1373,7 +1382,7 @@ def get_qbmm_mx_tile_config(
         and l0c_tile_n == 0
         and normal_fp8_false_true
         and ceil_div(m, base_m) > 1
-        and total_tiles >= 2 * AIC_NUM
+        and total_tiles >= 2 * aic_num
         and base_n % (2 * CUBE_BLOCK) == 0
         and (
             enable_l0c_pingpong
@@ -1395,9 +1404,9 @@ def get_qbmm_mx_tile_config(
             l1_buffers = 3
     edge_tiling = (1, 1, 0, 0) if full_load else optimized_edge_tiling
     if full_load:
-        used_core_num = min(AIC_NUM, total_tiles)
-    elif total_tiles > AIC_NUM or total_tiles % AIC_NUM == 0:
-        used_core_num = AIC_NUM
+        used_core_num = min(aic_num, total_tiles)
+    elif total_tiles > aic_num or total_tiles % aic_num == 0:
+        used_core_num = aic_num
     else:
         used_core_num = total_tiles * m_tail_tile * n_tail_tile
     # An even number of whole ASW windows per core stride preserves its N tile.
@@ -2293,7 +2302,7 @@ class QbmmMxKernel:
             # Keep A/ScaleA for one M tile resident and reuse them across N tiles.
             full_m_idx = block_idx % self.block_scheduler.m_tiles
             n_lane = block_idx // self.block_scheduler.m_tiles
-            n_stride = AIC_NUM // self.block_scheduler.m_tiles
+            n_stride = self.used_core_num // self.block_scheduler.m_tiles
             a_k_len = ceil_align(self.k, MX_K_ALIGN)
             a_tile = tile_slice(
                 a_gm,
@@ -2489,7 +2498,7 @@ def _infer_qbmm_mx_layout(a, b, scale_a, scale_b, is_mxfp4=False):
 
 
 # AOT compilation is expensive (tiling + kernel build + run.compile), so the
-# builder is memoized per (shape config, dtypes, profile) with lru_cache.
+# builder is memoized per (shape config, dtypes, profile, effective core count).
 @functools.cache
 def _build_mx_aot_callable(
     m,
@@ -2502,6 +2511,7 @@ def _build_mx_aot_callable(
     a_dtype,
     b_dtype,
     profile,
+    aic_num,
 ):
     tiling = get_qbmm_mx_tile_config(
         m,
@@ -2627,17 +2637,22 @@ def npu_quant_matmul(
         b_dtype = _TORCH_FP8_INPUT_TO_DSL[b.dtype]
         profile = FP8_TILING_PROFILE
         a_input, b_input = a, b
-    compiled_kernel = _build_mx_aot_callable(
-        m,
-        n,
-        k,
-        has_bias,
-        output_dtype,
-        transpose_a,
-        transpose_b,
-        a_dtype,
-        b_dtype,
-        profile,
-    )
+    # The tiler and cache key must use the same device stream.
+    with torch.npu.device(a.device):
+        stream = torch.npu.current_stream()
+        aic_num = int(get_platform_info(stream=stream).cube_core_num)
+        compiled_kernel = _build_mx_aot_callable(
+            m,
+            n,
+            k,
+            has_bias,
+            output_dtype,
+            transpose_a,
+            transpose_b,
+            a_dtype,
+            b_dtype,
+            profile,
+            aic_num,
+        )
     compiled_kernel(output, a_input, b_input, scale_a, scale_b, bias)
     return output

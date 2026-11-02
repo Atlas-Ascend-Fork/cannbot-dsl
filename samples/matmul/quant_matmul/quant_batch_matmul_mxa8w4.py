@@ -71,7 +71,15 @@ import os
 import numpy as np
 import torch
 
-from cannbotdsl import make_layout, MemLoc, Tensor, dtypes, get_mem_size, vf
+from cannbotdsl import (
+    make_layout,
+    MemLoc,
+    Tensor,
+    dtypes,
+    get_mem_size,
+    get_platform_info,
+    vf,
+)
 from cannbotdsl.ring_buffer import RingBuffer
 from cannbotdsl.lang.constexpr import const_expr
 from cannbotdsl.lang.host import host
@@ -147,10 +155,6 @@ class MixQuantTiling:
     L0B_BYTES = get_mem_size("l0b")
     L0C_BYTES = get_mem_size("l0c")
     L0_DEPTH = 2
-    # MIX_AIC launch grid: the platform-reported core count (queried
-    # lazily — module import must stay NPU-free)
-    aic_core_count = 0
-    _platform_queried = False
     HBM_BW = 1.4  # TB/s-class weight for the roofline score
     CUBE_TPUT = 864.0  # GOPS-class weight (qbmm MXFP8 constants)
     MAX_RING_DEPTH = 4
@@ -161,22 +165,13 @@ class MixQuantTiling:
         self.m = m
         self.n = n
         self.k = k
-        self._query_platform_cores()
+        stream = torch.npu.current_stream()
+        self.aic_core_count = int(get_platform_info(stream=stream).cube_core_num)
         self._pick_block()
         self._pick_step()
         self._pick_depths()
         self._derive()
         self._report()
-
-    @classmethod
-    def _query_platform_cores(cls):
-        # lazy: module import must stay NPU-free
-        if cls._platform_queried:
-            return
-        cls._platform_queried = True
-        from cannbotdsl import get_platform_info
-
-        cls.aic_core_count = int(get_platform_info().core_num)
 
     # ---- 1/2: candidate base blocks under L0 budgets, roofline pick ----
     def _fits_l0(self, mb: int, nb: int, k_l1: int) -> bool:

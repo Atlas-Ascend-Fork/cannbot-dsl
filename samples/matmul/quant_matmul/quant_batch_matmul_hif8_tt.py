@@ -94,7 +94,6 @@ class QbmmTtTiling:
     L0A_SIZE = get_mem_size("l0a")
     L0C_SIZE = get_mem_size("l0c")
     L2_SIZE = 128 * 1024 * 1024
-    AIC_NUM = get_platform_info().cube_core_num
     L1_ALIGN_SIZE = 32  # zn-layout L1 fractal alignment (outer dim)
 
     BASIC_BLOCK_16 = 16
@@ -133,6 +132,8 @@ class QbmmTtTiling:
         transpose_b=True,
     ):
         """Build the complete host tiling plan from the matrix metadata."""
+        stream = torch.npu.current_stream()
+        self.AIC_NUM = int(get_platform_info(stream=stream).cube_core_num)
         self.m = m
         self.n = n
         self.k = k

@@ -137,6 +137,8 @@ python3 -m pytest test/flash_kda/test_flash_kda.py -v
 | [matmul/matmul](samples/matmul/matmul) | `matmul()` | A16W16 矩阵乘，`C[M,N] = A[M,K] × B[N,K]^T` |
 | [matmul/matmul](samples/matmul/matmul) | `matmul_streamk()` | 同目录的 Stream-K（DPSK）实现，DP + SK 混合调度，适合小 M/N、大 K |
 | [matmul/batch_matmul](samples/matmul/batch_matmul) | `batch_matmul()` | 批量矩阵乘，batch 维右对齐广播，支持 rank 2~6 |
+| [matmul/fused_matmul](samples/matmul/fused_matmul) | `fused_matmul()` | 矩阵乘融合逐列 Add / Mul 和 GELU / ReLU，支持 FP16 / BF16 输入及 FP32 输出 |
+| [matmul/dual_level_quant_matmul](samples/matmul/dual_level_quant_matmul) | `npu_dual_level_quant_matmul()` | MXFP4 双层 Scale 矩阵乘，使用 NZ 权重，支持 FP16 / BF16 输出和 Bias |
 | [matmul/quant_matmul](samples/matmul/quant_matmul) | `npu_quant_matmul()` | MXFP8 / MXFP4 全量化矩阵乘（`quant_batch_matmul_mx.py`） |
 | [matmul/quant_matmul](samples/matmul/quant_matmul) | `npu_quant_matmul()` | per-tensor（TT）量化矩阵乘，支持 HiFloat8 / INT8 / FP8（`quant_batch_matmul_hif8_tt.py`） |
 | [matmul/quant_matmul](samples/matmul/quant_matmul) | `matmul_mix_quant()` | MXA8W4：MXFP8 激活 × MXFP4 权重（`quant_batch_matmul_mxa8w4.py`） |

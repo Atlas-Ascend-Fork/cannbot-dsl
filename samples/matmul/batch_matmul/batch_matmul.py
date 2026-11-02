@@ -411,7 +411,7 @@ class BatchMatmulTiling:
     GetBaseK).
 
     Hardware constants are queried from the platform: L1/L0A/L0B/L0C sizes
-    via get_mem_size, AIC count via get_platform_info().cube_core_num.
+    via get_mem_size, AIC count via get_platform_info(stream=stream).cube_core_num.
 
     The batch dim is orthogonal to the tile sizes — every batch matrix
     shares (M, N, K), so batch only multiplies the tile count.  Key
@@ -424,7 +424,6 @@ class BatchMatmulTiling:
     L0A_SIZE = get_mem_size("l0a")
     L0B_SIZE = get_mem_size("l0b")
     L0C_SIZE = get_mem_size("l0c")
-    AIC_NUM = get_platform_info().cube_core_num
 
     BASIC_BLOCK_16 = 16
     MAX_STEP_K = 8
@@ -441,6 +440,8 @@ class BatchMatmulTiling:
         kern_trans_b: bool = True,
         has_bias: bool = False,
     ):
+        stream = torch.npu.current_stream()
+        self.AIC_NUM = int(get_platform_info(stream=stream).cube_core_num)
         self.m = m
         self.n = n
         self.k = k
