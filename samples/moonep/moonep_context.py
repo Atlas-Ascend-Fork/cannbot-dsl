@@ -23,10 +23,10 @@ import warnings
 import torch
 
 import cannbotdsl
-from cannbotdsl import dtypes
+from cannbotdsl import dtypes, make_layout
 from cannbotdsl import TensorSpec
-from cannbotdsl.types.datastruct import StructRef
 from cannbotdsl.buffer import Buffer
+from cannbotdsl.types.datastruct import StructRef
 from cannbotdsl.tensor import MemLoc, tile_slice
 from cannbotdsl.lang.constexpr import const_expr, range_constexpr
 from cannbotdsl.lang.host import host
@@ -398,8 +398,8 @@ def busy_wait_flag(view, gm_epoch, event_id, ub_flag=None, ub_epoch=None, exact=
       巧合，概率可忽略。
     """
     if ub_flag is None:
-        ub_flag = Buffer(MemLoc.UB, (1,), dtypes.int32)
-        ub_epoch = Buffer(MemLoc.UB, (1,), dtypes.int32)
+        ub_flag = Buffer(MemLoc.UB, dtypes.int32, make_layout((1,)))
+        ub_epoch = Buffer(MemLoc.UB, dtypes.int32, make_layout((1,)))
 
     def _check():
         vec_sync_notify(PIPE.S, PIPE.MTE2, event_id)
@@ -447,7 +447,7 @@ class _MoonepBarrierKernel:
             rank_size=world_size,
             base_offset=BAR_FLAGS_OFF,
         )
-        ub_xfer = Buffer(MemLoc.UB, (512,), dtypes.uint8)
+        ub_xfer = Buffer(MemLoc.UB, dtypes.uint8, make_layout((512,)))
         xfer = create_transfer_context(ctx, ub_xfer, role=TransferRole.VEC)
         for r in range_constexpr(world_size):
             if const_expr(r != me):
@@ -459,8 +459,8 @@ class _MoonepBarrierKernel:
         # busy_wait_flag 实例各占一对 UB 缓冲——R=8 时 7 对耗尽 VEC buf_id
         # （aivec 271 "scalar access internal buffer out of bounds"；R=4 的
         # 3 对未触界）。与 reduce _poll_row 的共享形态同源。
-        ub_flag = Buffer(MemLoc.UB, (1,), dtypes.int32)
-        ub_epoch = Buffer(MemLoc.UB, (1,), dtypes.int32)
+        ub_flag = Buffer(MemLoc.UB, dtypes.int32, make_layout((1,)))
+        ub_epoch = Buffer(MemLoc.UB, dtypes.int32, make_layout((1,)))
         for r in range_constexpr(world_size):
             if const_expr(r != me):
                 busy_wait_flag(

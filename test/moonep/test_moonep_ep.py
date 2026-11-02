@@ -478,31 +478,35 @@ def test_moonep_prefetch_weight(num_tokens, top_k, epn, mode, seed):
     ctx, etc, *_ = _plan_case(rank, shape, mode, seed)
 
     # 对称区权重视图 [2epn, W]：真实专家行填编码值，预取槽初始 -1
-    w_real = _fill_weight_real(rank, epn, w_elems)
-    w_local = create_weight_view(ctx, epn, w_elems)
-    w_local.fill_(-1.0)
+    reals = [_fill_weight_real(rank, epn, w_elems, g) for g in range(3)]
+    views = [create_weight_view(ctx, epn, w_elems, group=g, groups=3) for g in range(3)]
+    for view in views:
+        view.fill_(-1.0)
 
-    prefetch_weight(ctx, etc, w_real, w_local, epn)
+    prefetch_weight(ctx, etc, reals, views, epn)
     torch.npu.synchronize()
 
-    _verify_prefetch_view(w_local.cpu(), etc.cpu(), _PrefetchCase(rank, epn, w_elems))
-    # home 行同步（功能校验，非精度对比）：视图前 epn 行必须由 prefetch 写入
-    # real_weights；期望值按 (rank, 行号) 编码公式独立计算，不引用 w_real 本身。
-    exp_home = (
-        torch.tensor(
-            [float(rank * 1000 + rank * epn + i) for i in range(epn)],
-            dtype=torch.bfloat16,
+    case = _PrefetchCase(rank, epn, w_elems)
+    for g, view in enumerate(views):
+        w_cpu = view.cpu()
+        _verify_prefetch_view(w_cpu, etc.cpu(), case, g=g, tag=f"组{g} ")
+        # home 行同步（功能校验，非精度对比）：视图前 epn 行必须由 prefetch 写入
+        # real_weights；期望值按 (rank, 行号) 编码公式独立计算，不引用 w_real 本身。
+        exp_home = (
+            torch.tensor(
+                [float((rank * 1000 + rank * epn + i) * (g + 1)) for i in range(epn)],
+                dtype=torch.bfloat16,
+            )
+            .unsqueeze(1)
+            .expand(epn, w_elems)
         )
-        .unsqueeze(1)
-        .expand(epn, w_elems)
-    )
-    assert torch.equal(w_local.cpu()[:epn], exp_home), (
-        "home 行未被 prefetch 写入（预期 = real_weights 的 (rank*1000+expert) 编码）"
-    )
-    # materialize_weights 落地助手：返回普通显存拷贝且内容一致
-    assert torch.equal(materialize_weights(w_local).cpu(), w_local.cpu()), (
-        "materialize_weights 拷贝内容不符"
-    )
+        assert torch.equal(w_cpu[:epn], exp_home), (
+            f"组 {g} home 行未被 prefetch 写入（预期 = real_weights 的 (rank*1000+expert) 编码）"
+        )
+        # materialize_weights 落地助手：返回普通显存拷贝且内容一致
+        assert torch.equal(materialize_weights(view).cpu(), w_cpu), (
+            "materialize_weights 拷贝内容不符"
+        )
 
 
 @pytest.mark.npu
@@ -524,16 +528,19 @@ def test_moonep_one_source_full_slot_fanout():
     _assert_one_source_etc(etc_cpu, epn)
     etc = etc_cpu.npu()
 
-    w_real = _fill_weight_real(rank, epn, w_elems)
-    w_view = create_weight_view(ctx, epn, w_elems)
-    w_view.fill_(-1.0)
-    prefetch_weight(ctx, etc, w_real, w_view, epn)
+    reals = [_fill_weight_real(rank, epn, w_elems, g) for g in range(3)]
+    views = [create_weight_view(ctx, epn, w_elems, group=g, groups=3) for g in range(3)]
+    for view in views:
+        view.fill_(-1.0)
+    prefetch_weight(ctx, etc, reals, views, epn)
     torch.npu.synchronize()
-    _verify_prefetch_view(
-        w_view.cpu(), etc_cpu, _PrefetchCase(rank, epn, w_elems), tag="full-slot "
-    )
+    prefetch_case = _PrefetchCase(rank, epn, w_elems)
+    for g, view in enumerate(views):
+        _verify_prefetch_view(
+            view.cpu(), etc_cpu, prefetch_case, g=g, tag=f"full-slot 组{g} "
+        )
 
-    grads = _fill_grad_views(1, epn, w_elems, 0.0)
+    grads = _fill_grad_views(3, epn, w_elems, 0.0)
     reduce_grad(ctx, etc, grads, epn)
     torch.npu.synchronize()
     case = _ReduceCase(rank, world_size, epn, w_elems, "full-slot", etc_cpu)
@@ -602,7 +609,7 @@ def test_moonep_prefetch_weight_multislot():
     w_elems = _H * 16
     ctx, etc, *_ = _plan_case(rank, shape)
 
-    num_groups, num_slots = 2, 2
+    num_groups, num_slots = 3, 2
     slot_views = []
     for s in range(num_slots):
         views = []
