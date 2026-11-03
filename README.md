@@ -1,6 +1,6 @@
 # CANNBot-DSL
 
-> 基于 CANNBot-DSL 的 Ascend NPU 复杂算子样例集合，配套完整的文档站与精度测试。
+> 基于 CANNBot-DSL 的 Huawei Ascend NPU 复杂算子样例集合，配套完整的文档站与精度测试。
 
 [📖 概述](docs/zh/guide/overview.md) · [💻 软硬件配套](docs/zh/guide/hardware-model.md) · [⚡️ 快速上手](docs/zh/install/source-build.md) · [📦 算子列表](samples/) · [📚 文档导航](docs/zh/api/index.md) · [📂 目录结构](docs/zh/guide/repository.md) · [🔥 更新日志](CHANGELOG.md) · [📜 许可证](LICENSE)
 
