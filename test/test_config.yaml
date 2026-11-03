@@ -472,3 +472,11 @@ dynamic_mx_quant_sr:
     - test/dynamic_mx_quant_sr
   options:
     - dynamic_mx_quant_sr
+
+mega_full_index:
+  module: True
+  src:
+    - samples/mega_full_index
+    - test/mega_full_index
+  options:
+    - mega_full_index

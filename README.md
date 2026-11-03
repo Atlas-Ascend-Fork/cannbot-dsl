@@ -157,6 +157,7 @@ python3 -m pytest test/flash_kda/test_flash_kda.py -v
 | [attn_epilogue](samples/attn_epilogue) | `attn_epilogue()` | Attention 输出投影：inverse RoPE、两次 MXFP8 激活量化与 WoA/WoB 两级矩阵乘；BF16 输入/输出，E4M3FN 权重与 E8M0 scale |
 | [indexer_prologue_qw](samples/indexer_prologue_qw) | `indexer_prologue_qw()` | MXFP8 Q GEMM、尾部 RoPE、MXFP4 量化，以及 BF16 W GEMM |
 | [indexer_prologue_k](samples/indexer_prologue_k) | `indexer_prologue_k()` | Indexer K 路前处理：BF16 投影、RMSNorm、RoPE、MXFP4 量化与分页 cache 写入 |
+| [mega_full_index](samples/mega_full_index) | `mega_full_index()` | DeepSeek V4.1 第 20 层融合：Indexer Prologue QW/K 前处理与 Quant Lightning Indexer 单 kernel 启动，输出 Top-512 token 索引与候选块 |
 | [qsa_indexer](samples/qsa_indexer) | `qsa_indexer()`、`qsa_indexer_metadata()` | 压缩 Key 稀疏索引，选高分压缩块并展开为 token 索引 |
 | [stem_indexer](samples/stem_indexer) | `stem_indexer()`、`stem_indexer_metadata()` | 块级特征打分 + 动态 TopK 选择 Key Block |
 | [quant_lightning_indexer](samples/quant_lightning_indexer) | `quant_lightning_indexer()` | MXFP4 Lightning Indexer（QLI），遍历上下文选 TopK token |
