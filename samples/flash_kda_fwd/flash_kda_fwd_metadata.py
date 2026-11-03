@@ -7,9 +7,34 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 
 # fmt: off
-# Keep compact call argument groups consistent with the original FlashKDA samples.
+# 保持参数分组紧凑，与原有 FlashKDA 样例风格一致。
 
-"""Cost-aware AICPU metadata producer for FlashKDA training forward."""
+"""根据成本模型生成 FlashKDA 训练前向的 AICPU 调度元数据。"""
+
+import os
+import tempfile
+import threading
+from collections.abc import Sequence
+from typing import Optional
+
+from cannbotdsl import get_platform_info
+from cannbotdsl.aicpu import (
+    I32,
+    I64,
+    U32,
+    gm_in,
+    gm_out,
+    aicpu_kernel,
+    current_raw_stream,
+)
+from cannbotdsl.aicpu.toolchain import compile_aicpu_kernel
+import torch
+
+from .flash_kda_fwd_validation import (
+    CHUNK_SIZE, SUPPORTED_HEAD_DIM, MAX_VALUE_HEADS, WORKSPACE_SLOTS, MAX_CHUNK_GROUP, HEADER_WORDS, INT32_MAX, STATUS_OK,
+    SequenceSpec, require, validate_layout, validate_sizes, validate_length_specs,
+    read_lengths, validate_schedule,
+)
 
 __all__ = [
     "HEADER_TEMPLATE",
@@ -51,24 +76,6 @@ __all__ = [
     "round_record_words",
 ]
 
-import os
-import tempfile
-import threading
-from collections.abc import Sequence
-from typing import Optional
-
-from cannbotdsl import get_platform_info
-from cannbotdsl.aicpu import (
-    I32,
-    I64,
-    U32,
-    GmIn,
-    GmOut,
-    aicpu_kernel,
-    current_raw_stream,
-)
-from cannbotdsl.aicpu.toolchain import compile_aicpu_kernel
-import torch
 
 os.environ.setdefault("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")
 
@@ -76,8 +83,6 @@ os.environ.setdefault("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")
 MAGIC = 0x4B444132
 ABI_VERSION = 4
 MAX_AIC_CORES = 32
-WORKSPACE_SLOTS = 861
-CHUNK_SIZE = 64
 ROUND_FIXED_WORDS = 133
 ROUND_WORDS_PER_BATCH = 9
 
@@ -92,7 +97,6 @@ HEADER_HAS_CU = 7
 HEADER_WORKSPACE_SLOTS = 8
 HEADER_TEMPLATE = 9
 HEADER_CHUNK_TASK_NUM = 10
-HEADER_WORDS = 11
 
 TEMPLATE_AUTO = 0
 TEMPLATE_STAGED = 1
@@ -106,7 +110,6 @@ CHUNK_TASK_VALUE_HEAD = 4
 CHUNK_TASK_NEXT = 5
 
 
-STATUS_OK = 0
 STATUS_BAD_CORE_NUM = 1
 STATUS_BAD_WORKSPACE_SLOTS = 2
 STATUS_BAD_FLAGS = 3
@@ -116,6 +119,25 @@ STATUS_BAD_LENGTH = 6
 STATUS_BAD_PADDED_LENGTH = 7
 STATUS_BAD_PACKED_END = 8
 STATUS_BAD_METADATA_CAPACITY = 9
+
+# 单批次 32 头长序列训练的调优分组，保持已有调度行为。
+SHORT_TRAIN_CHUNK_GROUP = 13
+SHORT_TRAIN_MIN_LENGTH = 8192
+SHORT_TRAIN_HEADS = 32
+
+# 调度模型使用定点系数，先限制乘法范围以避免 INT64 溢出。
+INT64_MAX = 2**63 - 1
+ROUTE_COST_SCALE = 64
+MAX_SCALED_QUANTITY = INT64_MAX // ROUTE_COST_SCALE
+ROUTE_PARAMETER_WORDS = 16
+ROUTE_SCHEMA_INDEX = 13
+ROUTE_MARGIN_INDEX = 14
+PARTS_PER_MILLION = 1_000_000
+PICOSECONDS_PER_NANOSECOND = 1000
+FULL_CHUNK_COST_NS = 4930
+CALIBRATED_MIN_CHUNKS = 64
+CALIBRATED_MAX_CHUNKS = 256
+CALIBRATED_GROUP_LIMIT = 16
 
 MAX_ACTIVE_BATCHES = WORKSPACE_SLOTS
 MAX_STAGE1_TASKS = WORKSPACE_SLOTS
@@ -129,12 +151,12 @@ def _interpolate_stage1_task_cost(
     right_row_num,
     right_cost,
 ):
-    # Fit coefficients use picoseconds; scheduler costs use nanoseconds.
+    # 拟合系数单位为皮秒，调度成本单位为纳秒。
     row_span = right_row_num - left_row_num
     numerator = left_cost * row_span + (valid_row_num - left_row_num) * (
         right_cost - left_cost
     )
-    denominator = row_span * 1000
+    denominator = row_span * PICOSECONDS_PER_NANOSECOND
     return (numerator + denominator // 2) // denominator
 
 
@@ -150,7 +172,7 @@ def _stage1_task_cost(valid_row_num):
         elif valid_row_num <= 63:
             cost = _interpolate_stage1_task_cost(valid_row_num, 48, 4992347, 63, 4952972)
         else:
-            cost = 4930
+            cost = FULL_CHUNK_COST_NS
     return cost
 
 
@@ -170,12 +192,12 @@ def _stage2_task_cost(candidate_idx, chunk_num):
 
 
 def round_record_words(active_batch_num: int) -> int:
-    """Return the words in one variable record."""
+    """返回一条变长记录占用的字数。"""
 
     active_batch_num = int(active_batch_num)
     if active_batch_num <= 0:
         raise ValueError("active_batch_num must be positive")
-    return 133 + 9 * active_batch_num
+    return ROUND_FIXED_WORDS + ROUND_WORDS_PER_BATCH * active_batch_num
 
 
 def metadata_capacity_upper_bound(
@@ -183,9 +205,9 @@ def metadata_capacity_upper_bound(
     storage_length: int,
     *,
     is_packed: bool,
-    value_heads: int = WORKSPACE_SLOTS,
+    value_heads: int = MAX_VALUE_HEADS,
 ) -> int:
-    """Return a safe capacity for every legal round decomposition."""
+    """返回覆盖所有合法轮次划分的安全容量上界。"""
 
     batch = int(batch)
     storage_length = int(storage_length)
@@ -198,15 +220,15 @@ def metadata_capacity_upper_bound(
         chunk_entries = storage_chunk_num + batch - 1
     else:
         chunk_entries = batch * storage_chunk_num
-    if not 1 <= int(value_heads) <= WORKSPACE_SLOTS:
-        raise ValueError("value_heads must be in [1, 861]")
-    # One directory word and one single-batch record per possible chunk entry.
+    if not 1 <= int(value_heads) <= MAX_VALUE_HEADS:
+        raise ValueError("value_heads must be in [1, 96]")
+    # 每个可能的 chunk 条目预留一个目录字和一条单批次记录。
     group_capacity = (
         HEADER_WORDS
         + 1
         + (1 + ROUND_FIXED_WORDS + ROUND_WORDS_PER_BATCH) * chunk_entries
     )
-    # The chunk scheduler uses B temporary batch indices after the task records.
+    # chunk 调度器在任务记录后使用 B 个临时批次索引。
     chunk_capacity = (
         HEADER_WORDS
         + MAX_AIC_CORES
@@ -217,16 +239,17 @@ def metadata_capacity_upper_bound(
 
 
 class FlashKDAFwdMetadataArgs:
-    cu_seqlens: GmIn(I32)
-    route_coefficients: GmIn(I64)
+    cu_seqlens: gm_in(I32)
+    route_coefficients: gm_in(I64)
     calibration_enabled: U32
     layout_kind: U32
-    metadata: GmOut(U32)
+    metadata: gm_out(U32)
     metadata_word_capacity: U32
     batch: U32
     physical_batches: U32
     storage_length: U32
     value_heads: U32
+    query_heads: U32
     has_cu: U32
     is_packed: U32
     core_num: U32
@@ -255,8 +278,7 @@ def _select_group_num(
     workspace_group_limit = workspace_slots // value_heads
     if upper_group_num > workspace_group_limit:
         upper_group_num = workspace_group_limit
-    # Slot use grows monotonically with group size.  Select the exact largest
-    # feasible group so long sequences cross fewer global Stage1/Stage2 barriers.
+    # 槽位用量随组大小单调增长。选取最大可行分组，减少长序列跨越全局阶段屏障的次数。
     while lower_group_num <= upper_group_num:
         candidate_group_num = (lower_group_num + upper_group_num) // 2
         slot_num = 0
@@ -336,7 +358,7 @@ def _chunk_batch_precedes(cu_seqlens, left_batch, right_batch):
 
 
 def _chunk_heap_sift_down(cu_seqlens, metadata, heap_base, heap_num, root_idx):
-    # A max heap orders by chunk count, then by the original batch index.
+    # 最大堆先按 chunk 数排序，再按原始批次索引排序。
     while root_idx * 2 + 1 < heap_num:
         child_idx = root_idx * 2 + 1
         if child_idx + 1 < heap_num:
@@ -354,121 +376,216 @@ def _chunk_heap_sift_down(cu_seqlens, metadata, heap_base, heap_num, root_idx):
         root_idx = child_idx
 
 
-def _route_profile_covers(schedule_args, model_base, max_chunk_num):
-    # Keep measured calibration inside its validated shape and core bounds.
-    core_num = schedule_args.core_num
-    minimum_core = schedule_args.route_coefficients[model_base + 8]
-    maximum_core = schedule_args.route_coefficients[model_base + 9]
-    if core_num < minimum_core or core_num > maximum_core:
-        return False
-    batch = schedule_args.batch
-    minimum_batch = schedule_args.route_coefficients[model_base + 10]
-    maximum_batch = schedule_args.route_coefficients[model_base + 11]
-    if batch < minimum_batch or batch > maximum_batch:
-        return False
-    value_heads = schedule_args.value_heads
-    minimum_heads = schedule_args.route_coefficients[model_base + 12]
-    maximum_heads = schedule_args.route_coefficients[model_base + 13]
-    if value_heads < minimum_heads or value_heads > maximum_heads:
-        return False
-    minimum_chunks = schedule_args.route_coefficients[model_base + 14]
-    maximum_chunks = schedule_args.route_coefficients[model_base + 15]
-    if max_chunk_num < minimum_chunks or max_chunk_num > maximum_chunks:
-        return False
-    return True
 
 
 def _training_group_limit(schedule_args, max_chunks):
     requested = schedule_args.max_chunk_group
     if schedule_args.calibration_enabled == 0:
         return requested
-    # Bound the partially occupied second wave only inside the measured training profile.
-    if schedule_args.layout_kind == 1 and schedule_args.value_heads > schedule_args.core_num:
-        if _route_profile_covers(schedule_args, 2 * 16, max_chunks):
-            if requested > 16:
-                return 16
+    if (schedule_args.layout_kind == 1 and schedule_args.core_num == MAX_AIC_CORES
+        and schedule_args.batch == 1 and schedule_args.value_heads > 32
+        and schedule_args.value_heads <= MAX_VALUE_HEADS and max_chunks >= CALIBRATED_MIN_CHUNKS and max_chunks <= CALIBRATED_MAX_CHUNKS):
+        return min(requested, CALIBRATED_GROUP_LIMIT)
     return requested
 
 
-def _select_route_from_model(schedule_args, max_chunk_num, peak_chunk_num, total_chunk_num):
-    layout_kind = schedule_args.layout_kind
-    batch = schedule_args.batch
-    value_heads = schedule_args.value_heads
-    core_num = schedule_args.core_num
-    # This arithmetic stays in the metadata source so its AICPU image manifest
-    # binds every instruction. Calibration bounds only select local profiles.
-    model_base = layout_kind * 16
-    calibrated_base = 2 * 16
-    if layout_kind == 1 and _route_profile_covers(schedule_args, calibrated_base, max_chunk_num):
-        model_base = calibrated_base
-    if core_num < 1 or core_num > MAX_AIC_CORES or batch < 1:
+
+def _route_add_cost(time, cost, quantity):
+    if time < 0 or cost < 0 or quantity < 0:
+        return -1
+    if quantity > 0 and cost > (INT64_MAX - time) // quantity:
+        return -1
+    return time + cost * quantity
+
+
+def _route_rounds(schedule_args, max_group, remaining_chunks):
+    rounds = 0
+    batch_start = 0
+    batches_per_set = schedule_args.workspace_slots // schedule_args.value_heads
+    while batch_start < schedule_args.batch:
+        batch_count = min(batches_per_set, schedule_args.batch - batch_start)
+        longest = 0
+        for local_batch in range(batch_count):
+            batch = batch_start + local_batch
+            length = schedule_args.storage_length
+            if schedule_args.has_cu == 1:
+                length = schedule_args.cu_seqlens[batch + 1] - schedule_args.cu_seqlens[batch]
+            chunks = (length + CHUNK_SIZE - 1) // CHUNK_SIZE
+            remaining_chunks[local_batch] = chunks
+            longest = max(longest, chunks)
+        while longest > 0:
+            low = 1
+            high = min(max_group, min(longest, batches_per_set))
+            while low < high:
+                middle = (low + high + 1) // 2
+                chunk_count = 0
+                for local_batch in range(batch_count):
+                    chunk_count += min(remaining_chunks[local_batch], middle)
+                if chunk_count <= schedule_args.workspace_slots // schedule_args.value_heads:
+                    low = middle
+                else:
+                    high = middle - 1
+            longest = 0
+            for local_batch in range(batch_count):
+                chunks = max(0, remaining_chunks[local_batch] - low)
+                remaining_chunks[local_batch] = chunks
+                longest = max(longest, chunks)
+            rounds += 1
+        batch_start += batch_count
+    return rounds
+
+
+def _route_persistent_loads(schedule_args, uniform_chunks, core_chunks, core_rows):
+    # 使用与执行调度相同的堆及按 chunk 数排序的 LPT 顺序。
+    task_count = schedule_args.batch * schedule_args.value_heads
+    heap_base = HEADER_WORDS + MAX_AIC_CORES + CHUNK_TASK_WORDS * task_count
+    if heap_base + schedule_args.batch > schedule_args.metadata_word_capacity:
+        return -1
+    heap_count = schedule_args.batch
+    if uniform_chunks == 0:
+        for batch in range(schedule_args.batch):
+            schedule_args.metadata[heap_base + batch] = batch
+        root = heap_count // 2
+        while root > 0:
+            root -= 1
+            _chunk_heap_sift_down(
+                schedule_args.cu_seqlens, schedule_args.metadata, heap_base, heap_count, root
+            )
+    peak = 0
+    for scheduled_batch in range(schedule_args.batch):
+        batch = scheduled_batch
+        if uniform_chunks == 0:
+            batch = schedule_args.metadata[heap_base]
+            heap_count -= 1
+            if heap_count > 0:
+                schedule_args.metadata[heap_base] = schedule_args.metadata[heap_base + heap_count]
+                _chunk_heap_sift_down(
+                    schedule_args.cu_seqlens, schedule_args.metadata, heap_base, heap_count, 0
+                )
+        length = schedule_args.storage_length
+        if schedule_args.has_cu == 1:
+            length = schedule_args.cu_seqlens[batch + 1] - schedule_args.cu_seqlens[batch]
+        chunks = (length + CHUNK_SIZE - 1) // CHUNK_SIZE
+        for head in range(schedule_args.value_heads):
+            selected_core = 0
+            for core in range(1, schedule_args.core_num):
+                if core_chunks[core] < core_chunks[selected_core]:
+                    selected_core = core
+            core_chunks[selected_core] += chunks
+            core_rows[selected_core] += length
+            peak = max(peak, core_chunks[selected_core])
+    return peak
+
+
+def _select_route_from_model(
+    schedule_args, staged_peak, total_chunks, total_rows, query_rows,
+    persistent_peak, core_rows, max_group, remaining_chunks,
+):
+    # 非负成本单位为飞秒，两种时间均乘以 64 后比较。
+    if staged_peak < 1 or total_chunks < 1 or total_rows < 1 or query_rows < 1 or persistent_peak < 1:
         return TEMPLATE_STAGED
-    if value_heads < 1 or value_heads > WORKSPACE_SLOTS:
+    parallel_chunks = (total_chunks - 1) // schedule_args.core_num + 1
+    head_count = schedule_args.batch * schedule_args.value_heads
+    rounds = _route_rounds(schedule_args, max_group, remaining_chunks)
+    if (parallel_chunks > MAX_SCALED_QUANTITY or staged_peak > MAX_SCALED_QUANTITY
+        or persistent_peak > MAX_SCALED_QUANTITY or rounds > MAX_SCALED_QUANTITY
+        or head_count > MAX_SCALED_QUANTITY):
         return TEMPLATE_STAGED
-    if max_chunk_num < 1 or peak_chunk_num < 1 or total_chunk_num < 1:
+    base = schedule_args.layout_kind * ROUTE_PARAMETER_WORDS
+    schema = schedule_args.route_coefficients[base + ROUTE_SCHEMA_INDEX]
+    if schema != 6 and schema != 7:
         return TEMPLATE_STAGED
-    # Check the largest feature products before multiplying, then reserve the
-    # sum of absolute terms to bound every signed partial score below.
-    if max_chunk_num > 9223372036854775807 // core_num // core_num:
-        return TEMPLATE_STAGED
-    if peak_chunk_num > 9223372036854775807 // core_num // core_num:
-        return TEMPLATE_STAGED
-    if total_chunk_num > 9223372036854775807 // core_num:
-        return TEMPLATE_STAGED
-    score = 0
-    remaining_score_budget = 9223372036854775807
-    for feature_idx in range(0, 8):
-        feature = core_num * core_num
-        if feature_idx == 0:
-            feature = max_chunk_num * core_num
-        elif feature_idx == 1:
-            feature = max_chunk_num * core_num * core_num
-        elif feature_idx == 2:
-            feature = peak_chunk_num * core_num
-        elif feature_idx == 3:
-            feature = peak_chunk_num * core_num * core_num
-        elif feature_idx == 4:
-            feature = total_chunk_num
-        elif feature_idx == 5:
-            feature = total_chunk_num * core_num
-        elif feature_idx == 6:
-            feature = core_num
-        coefficient = schedule_args.route_coefficients[model_base + feature_idx]
-        if coefficient < -9223372036854775807:
+    for index in range(ROUTE_SCHEMA_INDEX):
+        if schedule_args.route_coefficients[base + index] < 0:
             return TEMPLATE_STAGED
-        coefficient_magnitude = abs(coefficient)
-        if coefficient_magnitude > remaining_score_budget // feature:
+    staged = 0
+    for index in range(5):
+        quantity = ROUTE_COST_SCALE
+        if index == 1:
+            quantity = parallel_chunks * ROUTE_COST_SCALE
+        elif index == 2:
+            quantity = staged_peak * ROUTE_COST_SCALE
+        elif index == 3:
+            quantity = rounds * ROUTE_COST_SCALE
+        elif index == 4:
+            quantity = query_rows
+        staged = _route_add_cost(staged, schedule_args.route_coefficients[base + index], quantity)
+        if staged < 0:
             return TEMPLATE_STAGED
-        score += coefficient * feature
-        remaining_score_budget -= coefficient_magnitude * feature
-    if score > 0:
+    compute = _route_add_cost(0, schedule_args.route_coefficients[base + 5], parallel_chunks * ROUTE_COST_SCALE)
+    memory = _route_add_cost(0, schedule_args.route_coefficients[base + 6], total_rows)
+    if compute < 0 or memory < 0:
+        return TEMPLATE_STAGED
+    staged = _route_add_cost(staged, max(compute, memory), 1)
+    if staged < 0:
+        return TEMPLATE_STAGED
+    persistent = 0
+    for index in range(7, 11):
+        quantity = ROUTE_COST_SCALE
+        if index == 8:
+            quantity = persistent_peak * ROUTE_COST_SCALE
+        elif index == 9:
+            quantity = head_count * ROUTE_COST_SCALE
+        elif index == 10:
+            quantity = query_rows
+        persistent = _route_add_cost(persistent, schedule_args.route_coefficients[base + index], quantity)
+        if persistent < 0:
+            return TEMPLATE_STAGED
+    previous_rows = 0
+    for phase in range(schedule_args.core_num):
+        next_rows = 0
+        active_cores = 0
+        for core in range(schedule_args.core_num):
+            rows = core_rows[core]
+            if rows > previous_rows:
+                active_cores += 1
+                if next_rows == 0 or rows < next_rows:
+                    next_rows = rows
+        if next_rows == 0:
+            break
+        memory = _route_add_cost(0, schedule_args.route_coefficients[base + 12], active_cores)
+        if memory < 0:
+            return TEMPLATE_STAGED
+        cost = max(schedule_args.route_coefficients[base + 11], memory)
+        persistent = _route_add_cost(persistent, cost, next_rows - previous_rows)
+        if persistent < 0:
+            return TEMPLATE_STAGED
+        previous_rows = next_rows
+    margin = schedule_args.route_coefficients[base + ROUTE_MARGIN_INDEX]
+    if margin < 0 or margin >= PARTS_PER_MILLION:
+        return TEMPLATE_STAGED
+    required_gain = (staged // PARTS_PER_MILLION) * margin + (staged % PARTS_PER_MILLION) * margin // PARTS_PER_MILLION
+    if persistent < staged - required_gain:
         return TEMPLATE_PERSISTENT
     return TEMPLATE_STAGED
 
 
+
 @aicpu_kernel
 def flash_kda_fwd_metadata_kernel(a: FlashKDAFwdMetadataArgs):
-    valid_seq_len_by_batch = zeros(I64, MAX_ACTIVE_BATCHES)  # noqa: F821 - AICPU compiler intrinsic.
-    token_start_by_batch = zeros(I64, MAX_ACTIVE_BATCHES)  # noqa: F821 - AICPU compiler intrinsic.
-    chunk_num_by_batch = zeros(I64, MAX_ACTIVE_BATCHES)  # noqa: F821 - AICPU compiler intrinsic.
-    tail_row_num_by_batch = zeros(I64, MAX_ACTIVE_BATCHES)  # noqa: F821 - AICPU compiler intrinsic.
-    active_local_batch_idx = zeros(I64, MAX_ACTIVE_BATCHES)  # noqa: F821 - AICPU compiler intrinsic.
-    remaining_chunk_num = zeros(I64, MAX_ACTIVE_BATCHES)  # noqa: F821 - AICPU compiler intrinsic.
-    chunk_num_per_group = zeros(I64, MAX_ACTIVE_BATCHES)  # noqa: F821 - AICPU compiler intrinsic.
-    stage1_task_costs = zeros(I64, MAX_STAGE1_TASKS)  # noqa: F821 - AICPU compiler intrinsic.
-    stage1_core_ranges = zeros(I64, MAX_AIC_CORES * 2)  # noqa: F821 - AICPU compiler intrinsic.
-    stage1_core_costs = zeros(I64, MAX_AIC_CORES)  # noqa: F821 - AICPU compiler intrinsic.
-    stage2_task_costs = zeros(I64, MAX_STAGE2_TASKS)  # noqa: F821 - AICPU compiler intrinsic.
-    candidate_stage2_core_ranges = zeros(I64, MAX_AIC_CORES * 2)  # noqa: F821 - AICPU compiler intrinsic.
-    candidate_stage2_core_costs = zeros(I64, MAX_AIC_CORES)  # noqa: F821 - AICPU compiler intrinsic.
-    selected_stage2_core_ranges = zeros(I64, MAX_AIC_CORES * 2)  # noqa: F821 - AICPU compiler intrinsic.
-    route_core_costs = zeros(I64, MAX_AIC_CORES)  # noqa: F821 - AICPU compiler intrinsic.
-    chunk_core_costs = zeros(I64, MAX_AIC_CORES)  # noqa: F821 - AICPU compiler intrinsic.
-    chunk_core_tails = zeros(I64, MAX_AIC_CORES)  # noqa: F821 - AICPU compiler intrinsic.
+    valid_seq_len_by_batch = zeros(I64, MAX_ACTIVE_BATCHES)  # noqa: F821 - AICPU 编译器内建函数。
+    token_start_by_batch = zeros(I64, MAX_ACTIVE_BATCHES)  # noqa: F821 - AICPU 编译器内建函数。
+    chunk_num_by_batch = zeros(I64, MAX_ACTIVE_BATCHES)  # noqa: F821 - AICPU 编译器内建函数。
+    tail_row_num_by_batch = zeros(I64, MAX_ACTIVE_BATCHES)  # noqa: F821 - AICPU 编译器内建函数。
+    active_local_batch_idx = zeros(I64, MAX_ACTIVE_BATCHES)  # noqa: F821 - AICPU 编译器内建函数。
+    remaining_chunk_num = zeros(I64, MAX_ACTIVE_BATCHES)  # noqa: F821 - AICPU 编译器内建函数。
+    chunk_num_per_group = zeros(I64, MAX_ACTIVE_BATCHES)  # noqa: F821 - AICPU 编译器内建函数。
+    stage1_task_costs = zeros(I64, MAX_STAGE1_TASKS)  # noqa: F821 - AICPU 编译器内建函数。
+    stage1_core_ranges = zeros(I64, MAX_AIC_CORES * 2)  # noqa: F821 - AICPU 编译器内建函数。
+    stage1_core_costs = zeros(I64, MAX_AIC_CORES)  # noqa: F821 - AICPU 编译器内建函数。
+    stage2_task_costs = zeros(I64, MAX_STAGE2_TASKS)  # noqa: F821 - AICPU 编译器内建函数。
+    candidate_stage2_core_ranges = zeros(I64, MAX_AIC_CORES * 2)  # noqa: F821 - AICPU 编译器内建函数。
+    candidate_stage2_core_costs = zeros(I64, MAX_AIC_CORES)  # noqa: F821 - AICPU 编译器内建函数。
+    selected_stage2_core_ranges = zeros(I64, MAX_AIC_CORES * 2)  # noqa: F821 - AICPU 编译器内建函数。
+    route_core_costs = zeros(I64, MAX_AIC_CORES)  # noqa: F821 - AICPU 编译器内建函数。
+    route_lpt_costs = zeros(I64, MAX_AIC_CORES)  # noqa: F821 - AICPU 编译器内建函数。
+    route_valid_rows = zeros(I64, MAX_AIC_CORES)  # noqa: F821 - AICPU 编译器内建函数。
+    chunk_core_costs = zeros(I64, MAX_AIC_CORES)  # noqa: F821 - AICPU 编译器内建函数。
+    chunk_core_tails = zeros(I64, MAX_AIC_CORES)  # noqa: F821 - AICPU 编译器内建函数。
 
     if a.metadata_word_capacity < HEADER_WORDS:
-        # AICPU treats a non-zero kernel return as a task exception (ACL 507005).
-        # Diagnostic codes belong in the metadata header, not in the return value.
+        # AICPU 将非零内核返回值视为任务异常（ACL 507005）。
+        # 诊断码写入 metadata 头部，不作为内核返回值。
         return STATUS_OK
 
     a.metadata[HEADER_MAGIC] = MAGIC
@@ -500,7 +617,7 @@ def flash_kda_fwd_metadata_kernel(a: FlashKDAFwdMetadataArgs):
         status = STATUS_BAD_FLAGS
     elif a.workspace_slots != WORKSPACE_SLOTS:
         status = STATUS_BAD_WORKSPACE_SLOTS
-    elif a.max_chunk_group < 1 or a.max_chunk_group > 512:
+    elif a.max_chunk_group < 1 or a.max_chunk_group > MAX_CHUNK_GROUP:
         status = STATUS_BAD_FLAGS
     elif not (a.has_cu == 0 or a.has_cu == 1):
         status = STATUS_BAD_FLAGS
@@ -510,7 +627,7 @@ def flash_kda_fwd_metadata_kernel(a: FlashKDAFwdMetadataArgs):
         status = STATUS_BAD_FLAGS
     elif a.batch < 1 or a.storage_length < 1 or a.value_heads < 1:
         status = STATUS_BAD_SHAPE
-    elif a.value_heads > a.workspace_slots:
+    elif a.value_heads > MAX_VALUE_HEADS:
         status = STATUS_BAD_SHAPE
     elif a.is_packed == 1 and a.physical_batches != 1:
         status = STATUS_BAD_SHAPE
@@ -525,12 +642,14 @@ def flash_kda_fwd_metadata_kernel(a: FlashKDAFwdMetadataArgs):
             a.metadata[HEADER_STATUS] = STATUS_BAD_CU_START
             return STATUS_OK
 
-    # Validate all real lengths before the route or any task is published.
+    # 发布选路结果或任务前，检查所有实际序列长度。
     uniform_chunk_num = 1
     first_chunk_num = 0
     route_max_chunk_num = 0
     route_total_chunk_num = 0
     route_peak_chunk_num = 0
+    route_total_rows = 0
+    route_query_rows = 0
     evaluate_route = 0
     if a.template_kind == TEMPLATE_AUTO and a.calibration_enabled == 1:
         evaluate_route = 1
@@ -551,15 +670,19 @@ def flash_kda_fwd_metadata_kernel(a: FlashKDAFwdMetadataArgs):
             if current_chunk_num > route_max_chunk_num:
                 route_max_chunk_num = current_chunk_num
             if evaluate_route == 1:
-                if current_chunk_num > 9223372036854775807 // a.value_heads:
+                if current_chunk_num > INT64_MAX // a.value_heads:
                     evaluate_route = 0
                 else:
                     batch_chunk_num = a.value_heads * current_chunk_num
-                    if route_total_chunk_num > 9223372036854775807 - batch_chunk_num:
+                    if route_total_chunk_num > INT64_MAX - batch_chunk_num:
                         evaluate_route = 0
                     else:
                         route_total_chunk_num += batch_chunk_num
-                        # Each core cost is at most the checked total cost.
+                        route_total_rows = _route_add_cost(route_total_rows, a.value_heads, valid_seq_len)
+                        route_query_rows = _route_add_cost(route_query_rows, a.query_heads, valid_seq_len)
+                        if route_total_rows < 0 or route_query_rows < 0:
+                            evaluate_route = 0
+                        # 每个核的成本不超过已检查的总成本。
                         for value_head_idx in range(0, a.value_heads):
                             cyclic_core = (
                                 batch_idx * a.value_heads + value_head_idx
@@ -578,9 +701,17 @@ def flash_kda_fwd_metadata_kernel(a: FlashKDAFwdMetadataArgs):
             for core_idx in range(0, a.core_num):
                 if route_core_costs[core_idx] > route_peak_chunk_num:
                     route_peak_chunk_num = route_core_costs[core_idx]
-            selected_template = _select_route_from_model(
-                a, route_max_chunk_num, route_peak_chunk_num, route_total_chunk_num,
+            persistent_peak = _route_persistent_loads(
+                a, uniform_chunk_num, route_lpt_costs, route_valid_rows
             )
+            selected_template = _select_route_from_model(
+                a, route_peak_chunk_num, route_total_chunk_num, route_total_rows,
+                route_query_rows, persistent_peak, route_valid_rows,
+                _training_group_limit(a, route_max_chunk_num), remaining_chunk_num,
+            )
+            # 短多序列训练保留直接 U 路径的缓存。
+            if a.has_cu == 1 and a.batch > 1 and route_max_chunk_num <= 2:
+                selected_template = TEMPLATE_PERSISTENT
     a.metadata[HEADER_TEMPLATE] = selected_template
     if selected_template == TEMPLATE_PERSISTENT:
         task_num = a.batch * a.value_heads
@@ -592,9 +723,8 @@ def flash_kda_fwd_metadata_kernel(a: FlashKDAFwdMetadataArgs):
             return STATUS_OK
         for core_idx in range(0, MAX_AIC_CORES):
             a.metadata[HEADER_WORDS + core_idx] = 0
-        # Keep the common uniform case in its original batch/head order.
-        # Ragged batches use O(B log B) LPT scheduling, with B GM scratch words
-        # rather than a fixed local array or repeated scans over all batches.
+        # 等长序列保持原始批次和头顺序；变长批次采用 O(B log B) 的 LPT 调度。
+        # 使用 B 个 GM 临时字，避免固定本地数组和反复扫描全部批次。
         heap_num = a.batch
         if uniform_chunk_num == 0:
             for batch_idx in range(0, a.batch):
@@ -675,8 +805,8 @@ def flash_kda_fwd_metadata_kernel(a: FlashKDAFwdMetadataArgs):
                 chunk_num_by_batch[local_batch_idx] = 0
                 tail_row_num_by_batch[local_batch_idx] = 0
             else:
-                chunk_num_by_batch[local_batch_idx] = (valid_seq_len + 63) // 64
-                tail_row_num_by_batch[local_batch_idx] = ((valid_seq_len - 1) % 64) + 1
+                chunk_num_by_batch[local_batch_idx] = (valid_seq_len + CHUNK_SIZE - 1) // CHUNK_SIZE
+                tail_row_num_by_batch[local_batch_idx] = ((valid_seq_len - 1) % CHUNK_SIZE) + 1
 
         chunk_start = 0
         while True:
@@ -706,7 +836,7 @@ def flash_kda_fwd_metadata_kernel(a: FlashKDAFwdMetadataArgs):
         return STATUS_OK
 
     record_begin = HEADER_WORDS + stage12_round_num + 1
-    used_words = record_begin + 133 * stage12_round_num + 9 * total_active_batch_entries
+    used_words = record_begin + ROUND_FIXED_WORDS * stage12_round_num + ROUND_WORDS_PER_BATCH * total_active_batch_entries
     if used_words > a.metadata_word_capacity:
         a.metadata[HEADER_STATUS] = STATUS_BAD_METADATA_CAPACITY
         return STATUS_OK
@@ -729,8 +859,8 @@ def flash_kda_fwd_metadata_kernel(a: FlashKDAFwdMetadataArgs):
                 valid_seq_len = token_end - token_start
             valid_seq_len_by_batch[local_batch_idx] = valid_seq_len
             token_start_by_batch[local_batch_idx] = token_start
-            chunk_num_by_batch[local_batch_idx] = (valid_seq_len + 63) // 64
-            tail_row_num_by_batch[local_batch_idx] = ((valid_seq_len - 1) % 64) + 1
+            chunk_num_by_batch[local_batch_idx] = (valid_seq_len + CHUNK_SIZE - 1) // CHUNK_SIZE
+            tail_row_num_by_batch[local_batch_idx] = ((valid_seq_len - 1) % CHUNK_SIZE) + 1
 
         chunk_start = 0
         while True:
@@ -808,10 +938,10 @@ def flash_kda_fwd_metadata_kernel(a: FlashKDAFwdMetadataArgs):
                 for _ in range(0, a.value_heads):
                     for local_chunk_idx in range(0, chunk_num_per_group[active_idx]):
                         global_chunk_idx = chunk_start + local_chunk_idx
-                        stage1_cost = 4930
+                        stage1_cost = FULL_CHUNK_COST_NS
                         if (
                             global_chunk_idx + 1 == chunk_num_by_batch[local_batch_idx]
-                            and tail_row_num_by_batch[local_batch_idx] < 64
+                            and tail_row_num_by_batch[local_batch_idx] < CHUNK_SIZE
                         ):
                             stage1_cost = _stage1_task_cost(tail_row_num_by_batch[local_batch_idx])
                         stage1_task_costs[stage1_task_idx] = stage1_cost
@@ -895,7 +1025,7 @@ def flash_kda_fwd_metadata_kernel(a: FlashKDAFwdMetadataArgs):
 
 def _take(words: list[int], cursor: int, count: int) -> tuple[list[int], int]:
     end = cursor + count
-    if end > len(words):
+    if cursor < 0 or count < 0 or end > len(words):
         raise ValueError("metadata record extends past available words")
     return words[cursor:end], end
 
@@ -937,12 +1067,16 @@ def _decode_round(
     batch: int,
     value_heads: int,
 ) -> dict[str, object]:
-    if start + 2 > end:
+    if start < 0 or end > len(words) or start + 2 > end:
         raise ValueError("metadata round record is truncated")
-    cursor = start
-    header_end = cursor + 2
-    stage12_round_idx, active_batch_num = words[cursor:header_end]
+    # 将后续所有 _take 和标量访问限制在当前记录范围内。
+    words = words[start:end]
+    start, end = 0, end - start
+    cursor = 0
+    stage12_round_idx, active_batch_num = words[cursor : cursor + 2]
     cursor += 2
+    if not 1 <= active_batch_num <= min(batch, WORKSPACE_SLOTS):
+        raise ValueError("metadata active_batch_num outside batch/workspace bounds")
     if start + round_record_words(active_batch_num) != end:
         raise ValueError("metadata round record length does not match active batches")
 
@@ -964,7 +1098,7 @@ def _decode_round(
 
     if group_num <= 0:
         raise ValueError("group_num must be positive")
-    if any(index >= batch for index in batch_idx):
+    if any(index < 0 or index >= batch for index in batch_idx):
         raise ValueError("batch_idx is outside logical batch")
     if any(length <= 0 for length in valid_seq_len):
         raise ValueError("valid_seq_len must be positive")
@@ -986,6 +1120,8 @@ def _decode_round(
             raise ValueError("stage2_task_prefix does not match DV tasks")
     if stage1_task_prefix[-1] > WORKSPACE_SLOTS:
         raise ValueError("stage1 task total exceeds workspace slots")
+    if stage2_task_prefix[-1] > WORKSPACE_SLOTS * 8:
+        raise ValueError("stage2 task total exceeds workspace slots")
 
     stage1_core_ranges = _decode_ranges(stage1_ranges_flat)
     stage2_core_ranges = _decode_ranges(stage2_ranges_flat)
@@ -1010,7 +1146,7 @@ def _decode_round(
 
 
 def decode_metadata(raw: Sequence[int]) -> dict[str, object]:
-    """Decode and validate metadata for tests and diagnostics."""
+    """解码并检查 metadata，供测试和诊断使用。"""
 
     words = [int(value) for value in raw]
     if len(words) < HEADER_WORDS:
@@ -1041,9 +1177,13 @@ def decode_metadata(raw: Sequence[int]) -> dict[str, object]:
         raise ValueError("metadata core_num must be in [1, 32]")
     if header["workspace_slots"] != WORKSPACE_SLOTS:
         raise ValueError("metadata workspace_slots must be 861")
-    if header["batch"] <= 0 or header["value_heads"] <= 0:
-        raise ValueError("successful metadata requires positive shapes")
+    if header["batch"] <= 0:
+        raise ValueError("successful metadata requires positive batch")
+    if not 1 <= header["value_heads"] <= MAX_VALUE_HEADS:
+        raise ValueError("metadata value_heads must be in [1, 96]")
 
+    if header["has_cu"] not in (0, 1):
+        raise ValueError("metadata has_cu must be 0 or 1")
     if header["template"] == "unknown":
         raise ValueError("metadata template is invalid")
     if header["template"] == "persistent":
@@ -1109,12 +1249,21 @@ def decode_metadata(raw: Sequence[int]) -> dict[str, object]:
         )
         return header
 
+    if words[HEADER_CHUNK_TASK_NUM] != 0:
+        raise ValueError("staged metadata must not contain persistent tasks")
     stage12_round_num = int(header["stage12_round_num"])
+    if stage12_round_num < 1:
+        raise ValueError("staged metadata round count must be positive")
     offset_begin = HEADER_WORDS
     offset_end = offset_begin + stage12_round_num + 1
     if offset_end > len(words):
         raise ValueError("metadata offset table is truncated")
+    min_record_words = round_record_words(1)
+    if offset_end + stage12_round_num * min_record_words > len(words):
+        raise ValueError("metadata capacity is insufficient for round records")
     offsets = words[offset_begin:offset_end]
+    if any(offset < 0 for offset in offsets):
+        raise ValueError("metadata offset must be nonnegative")
     if offsets[0] < offset_end:
         raise ValueError("metadata first record offset overlaps the offset table")
     if offsets[-1] > len(words):
@@ -1133,27 +1282,23 @@ def decode_metadata(raw: Sequence[int]) -> dict[str, object]:
     return header
 
 
-SUPPORTED_HEAD_DIM = 128
 
 _AICPU_COMPILED = None
-_AICPU_LOCK = threading.Lock()
+_AICPU_LOCK = threading.RLock()
+_AICPU_STREAMS = {}
 
 
 def _device_block_num(ref: Optional[torch.Tensor] = None) -> int:
-    """Return a grid-barrier-safe launch size for the current NPU stream."""
+    """返回当前 NPU 流上可安全使用全核屏障的启动核数。"""
     if ref is not None and ref.device.type not in {"npu", "privateuseone"}:
         return MAX_AIC_CORES
     npu = getattr(torch, "npu", None)
     if npu is None:
-        return MAX_AIC_CORES
-    device_index = ref.device.index if ref is not None else None
+        raise RuntimeError("NPU runtime is unavailable")
+    device_index = ref.device.index if ref is not None else npu.current_device()
     if device_index is None:
-        try:
-            device_index = npu.current_device()
-        except RuntimeError:
-            return MAX_AIC_CORES
-    stream = npu.current_stream(device_index)
-    platform_info = get_platform_info(stream=stream)
+        device_index = npu.current_device()
+    platform_info = get_platform_info(stream=npu.current_stream(device_index))
     try:
         cube_core_num = int(platform_info.cube_core_num)
     except (AttributeError, TypeError, ValueError) as exc:
@@ -1174,204 +1319,133 @@ def _get_aicpu_kernel():
         return _AICPU_COMPILED
 
 
-_STATUS_NAMES = (
-    "STATUS_OK",
-    "STATUS_BAD_CORE_NUM",
-    "STATUS_BAD_WORKSPACE_SLOTS",
-    "STATUS_BAD_FLAGS",
-    "STATUS_BAD_SHAPE",
-    "STATUS_BAD_CU_START",
-    "STATUS_BAD_LENGTH",
-    "STATUS_BAD_PADDED_LENGTH",
-    "STATUS_BAD_PACKED_END",
-    "STATUS_BAD_METADATA_CAPACITY",
-)
-
-
-def _host_validate_cu_seqlens(cu_seqlens, batch, storage_length, is_packed) -> None:
-    """Reject empty sequences on the host before AICPU can fault the stream."""
-
-    prefix = [int(value) for value in cu_seqlens.detach().to("cpu").tolist()]
-    if len(prefix) != batch + 1:
-        raise ValueError(f"cu_seqlens length must be {batch + 1}, got {len(prefix)}")
-    if prefix[0] != 0:
-        raise ValueError("cu_seqlens must start at 0")
-    empty = []
-    for index, (start, end) in enumerate(zip(prefix, prefix[1:])):
-        length = end - start
-        if length <= 0:
-            empty.append(index)
-        elif not is_packed and length > storage_length:
-            raise ValueError(
-                f"cu_seqlens batch {index} length {length} exceeds storage length {storage_length}"
-            )
-    if empty:
-        raise ValueError(
-            "cu_seqlens has non-positive lengths at batch indices "
-            f"{empty}; drop empty sequences before calling flash_kda_metadata"
-        )
-    if is_packed and prefix[-1] != int(storage_length):
-        raise ValueError(
-            f"packed cu_seqlens end {prefix[-1]} must equal storage length {int(storage_length)}"
-        )
-
-
-def _raise_if_metadata_failed(metadata: torch.Tensor) -> None:
-    if metadata.device.type in {"npu", "privateuseone"}:
-        torch.npu.synchronize()
-    status = int(metadata[HEADER_STATUS].item())
-    if status != STATUS_OK:
-        name = _STATUS_NAMES[status] if 0 <= status < len(_STATUS_NAMES) else str(status)
-        raise ValueError(f"flash_kda_metadata failed with {name} ({status})")
+def flash_kda_fwd_metadata(
+    cu_seqlens: Optional[torch.Tensor] = None,
+    seqused: Optional[torch.Tensor] = None,
+    *,
+    batch_size: int,
+    nheads_qk: int,
+    nheads_v: int,
+    seqlens: int,
+    headdim_qk: int = SUPPORTED_HEAD_DIM,
+    headdim_v: int = SUPPORTED_HEAD_DIM,
+    enable_grad: bool = False,
+    layout: str = "TND",
+) -> torch.Tensor:
+    """根据显式存储维度在当前 NPU 上构建 metadata。"""
+    return _build_flash_kda_fwd_metadata(
+        batch_size, nheads_qk, nheads_v, cu_seqlens, seqused, seqlens,
+        headdim_qk, headdim_v, enable_grad, layout,
+    )
 
 
 def _build_flash_kda_fwd_metadata(
-    q: torch.Tensor,
-    v: torch.Tensor,
-    initial_state: torch.Tensor,
-    layout_qkv: str,
-    cu_seqlens: Optional[torch.Tensor],
-    max_chunk_group: int,
-    template: str = "auto",
-) -> torch.Tensor:
-    """Build reusable training-forward metadata on the current stream."""
-    if template not in ("auto", "staged", "persistent"):
-        raise ValueError("template must be auto, staged, or persistent")
-    template_id = {
-        "auto": TEMPLATE_AUTO,
-        "staged": TEMPLATE_STAGED,
-        "persistent": TEMPLATE_PERSISTENT,
-    }[template]
-    if layout_qkv not in ("TND", "BNSD", "BSND"):
-        raise AssertionError(f"layout_qkv must be TND, BNSD, or BSND, got {layout_qkv!r}")
-    if initial_state.dim() != 4:
-        raise AssertionError("initial_state must be rank-4")
-    batch, n_v, state_dv, state_dk = initial_state.shape
-    if not state_dv == state_dk == SUPPORTED_HEAD_DIM:
-        raise AssertionError(f"FlashKDA only supports D={SUPPORTED_HEAD_DIM}")
-    if layout_qkv == "TND":
-        if cu_seqlens is None:
-            raise AssertionError("cu_seqlens is required for TND")
-    if cu_seqlens is not None:
-        if cu_seqlens.dtype != torch.int32:
-            raise AssertionError("cu_seqlens must be int32")
-        if cu_seqlens.dim() != 1:
-            raise AssertionError("cu_seqlens must be rank-1")
-        if cu_seqlens.shape != (batch + 1,):
-            raise AssertionError(f"cu_seqlens shape must be ({batch + 1},)")
-        if not cu_seqlens.is_contiguous():
-            raise AssertionError("cu_seqlens must be contiguous")
-
-    if layout_qkv == "TND":
-        if not q.dim() == v.dim() == 3:
-            raise AssertionError("TND q/v must be rank-3")
-        storage_length, n_qk, dim = q.shape
-        if v.shape != (storage_length, n_v, dim):
-            raise AssertionError("v shape does not match TND layout")
-        physical_batches = 1
-        is_packed = True
-    elif layout_qkv == "BNSD":
-        if not q.dim() == v.dim() == 4:
-            raise AssertionError("BNSD q/v must be rank-4")
-        physical_batches, n_qk, storage_length, dim = q.shape
-        if v.shape != (physical_batches, n_v, storage_length, dim):
-            raise AssertionError("v shape does not match BNSD layout")
-        is_packed = False
-    else:
-        if not q.dim() == v.dim() == 4:
-            raise AssertionError("BSND q/v must be rank-4")
-        physical_batches, storage_length, n_qk, dim = q.shape
-        if v.shape != (physical_batches, storage_length, n_v, dim):
-            raise AssertionError("v shape does not match BSND layout")
-        is_packed = False
-
-    if layout_qkv != "TND":
-        if physical_batches != batch:
-            raise AssertionError("padded storage batch must match initial_state")
-    if dim != SUPPORTED_HEAD_DIM:
-        raise AssertionError(f"FlashKDA only supports D={SUPPORTED_HEAD_DIM}")
-    if n_v % n_qk != 0:
-        raise AssertionError(f"GQA requires Nv % Nqk == 0, got Nv={n_v}, Nqk={n_qk}")
-    if storage_length <= 0:
-        raise AssertionError("storage sequence length must be positive")
-    if not q.dtype == v.dtype == torch.bfloat16:
-        raise AssertionError("q/v must be bf16")
-    if initial_state.dtype != torch.float32:
-        raise AssertionError("initial_state must be fp32")
-    if not q.device == v.device == initial_state.device:
-        raise AssertionError("all inputs must be on the same device")
-    if not (q.is_contiguous() and v.is_contiguous() and initial_state.is_contiguous()):
-        raise AssertionError("all public inputs must be contiguous")
-    if cu_seqlens is not None:
-        if cu_seqlens.device != q.device:
-            raise AssertionError("all inputs must be on the same device")
-        _host_validate_cu_seqlens(cu_seqlens, int(batch), int(storage_length), is_packed)
-
-    core_num = _device_block_num(q)
-    metadata_capacity = metadata_capacity_upper_bound(batch, storage_length, is_packed=is_packed, value_heads=n_v)
-    # AICPU initializes every consumed word; capacity beyond its schedule is undefined.
-    metadata = torch.empty(metadata_capacity, dtype=torch.int32, device=q.device)
-    route_parameters, calibration_enabled = _get_route_parameters(q.device)
-    aicpu = _get_aicpu_kernel()
-    device_id = (
-        q.get_device() if hasattr(q, "get_device") and q.device.type != "cpu" else 0
-    )
-    stream = current_raw_stream(device_id)
-    aicpu.launch(
-        stream, route_coefficients=0 if route_parameters is None else route_parameters.data_ptr(),
-        calibration_enabled=calibration_enabled, layout_kind=0 if layout_qkv == "BNSD" else 1,
-        cu_seqlens=0 if cu_seqlens is None else cu_seqlens.data_ptr(), metadata=metadata.data_ptr(),
-        metadata_word_capacity=metadata.numel(), batch=batch, physical_batches=physical_batches,
-        storage_length=storage_length, value_heads=n_v, has_cu=int(cu_seqlens is not None), is_packed=int(is_packed),
-        core_num=core_num, workspace_slots=WORKSPACE_SLOTS, max_chunk_group=max_chunk_group, template_kind=template_id,
-    )
-    _raise_if_metadata_failed(metadata)
-    return metadata
-
-
-def flash_kda_fwd_metadata(
-    q: torch.Tensor,
-    v: torch.Tensor,
-    initial_state: torch.Tensor,
-    layout_qkv: str,
+    batch_size: int,
+    nheads_qk: int,
+    nheads_v: int,
     cu_seqlens: Optional[torch.Tensor] = None,
+    seqused: Optional[torch.Tensor] = None,
+    seqlens: Optional[int] = None,
+    headdim_qk: int = SUPPORTED_HEAD_DIM,
+    headdim_v: int = SUPPORTED_HEAD_DIM,
+    enable_grad: bool = False,
+    layout: str = "TND",
     *,
     template: str = "auto",
 ) -> torch.Tensor:
-    """Build scheduling metadata for the training forward."""
-    expected_q_rank = 3 if layout_qkv == "TND" else 4
-    if (
-        initial_state.dim() != 4
-        or layout_qkv not in ("TND", "BNSD", "BSND")
-        or q.dim() != expected_q_rank
-    ):
-        return _build_flash_kda_fwd_metadata(q, v, initial_state, layout_qkv, cu_seqlens, 512, template)
-    batch, n_v = initial_state.shape[:2]
-    if layout_qkv == "BNSD":
-        storage_length = q.shape[2]
-    elif layout_qkv == "BSND":
-        storage_length = q.shape[1]
-    else:
-        storage_length = q.shape[0]
-    # Short groups help contiguous BNSD training writes; strided layouts keep
-    # the original schedule because their extra round barriers cost more.
-    use_short_group = (
-        layout_qkv == "BNSD"
-        and batch == 1
-        and q.shape[1] == n_v == 32
-        and storage_length >= 8192
-        and storage_length % 64 == 0
-        and cu_seqlens is None
-        and _device_block_num(q) == 32
-    )
-    max_chunk_group = 13 if use_short_group else 512
-    return _build_flash_kda_fwd_metadata(q, v, initial_state, layout_qkv, cu_seqlens, max_chunk_group, template)
+    """根据标量存储维度和长度生成经过校验的 ABI4 metadata。
+
+    seqlens 必须显式指定填充长度 S 或紧凑长度 T，有效长度不能确定填充存储容量。
+    无需构造虚拟输入或状态张量。"""
+    validate_layout(layout)
+    require(isinstance(template, str) and template in ("auto", "staged", "persistent"),
+            "template must be auto, staged, or persistent")
+    template_id = {"auto": TEMPLATE_AUTO, "staged": TEMPLATE_STAGED, "persistent": TEMPLATE_PERSISTENT}[template]
+    for name, value in (("batch_size", batch_size), ("nheads_qk", nheads_qk),
+                        ("nheads_v", nheads_v), ("seqlens", seqlens),
+                        ("headdim_qk", headdim_qk), ("headdim_v", headdim_v)):
+        require(isinstance(value, int) and not isinstance(value, bool) and value > 0,
+                f"{name} must be a positive integer, got {value!r}")
+        require(value <= INT32_MAX, f"{name} exceeds INT32 representable range")
+    require(headdim_qk == headdim_v == SUPPORTED_HEAD_DIM, "headdim_qk/headdim_v must be 128")
+    require(isinstance(enable_grad, bool), "enable_grad must be bool")
+    validate_sizes(batch_size, nheads_qk, nheads_v, seqlens)
+    spec = SequenceSpec(batch_size, nheads_qk, nheads_v, seqlens, layout)
+    is_packed = layout == "TND"
+    capacity = metadata_capacity_upper_bound(batch_size, seqlens, is_packed=is_packed, value_heads=nheads_v)
+    require(capacity <= INT32_MAX, "metadata capacity exceeds INT32 representable range")
+    # 查询运行时或读取数据前，检查张量规格。
+    length_device = None
+    for value in (cu_seqlens, seqused):
+        if isinstance(value, torch.Tensor):
+            length_device = value.device
+            break
+    validate_length_specs(cu_seqlens, seqused, spec, length_device)
+    npu = getattr(torch, "npu", None)
+    if npu is None:
+        raise RuntimeError("NPU runtime is unavailable")
+    device = torch.device("npu", npu.current_device())
+    validate_length_specs(cu_seqlens, seqused, spec, device)
+    lengths = read_lengths(cu_seqlens, seqused, spec)
+    core_num = _device_block_num()
+    use_short_group = (enable_grad and layout == "BNSD" and batch_size == 1
+                       and nheads_qk == nheads_v == SHORT_TRAIN_HEADS and seqlens >= SHORT_TRAIN_MIN_LENGTH
+                       and seqlens % CHUNK_SIZE == 0 and cu_seqlens is None
+                       and seqused is None and core_num == MAX_AIC_CORES)
+    max_chunk_group = SHORT_TRAIN_CHUNK_GROUP if use_short_group else MAX_CHUNK_GROUP
+    has_cu = cu_seqlens is not None or seqused is not None
+    if cu_seqlens is None and seqused is not None:
+        prefix = [0]
+        for size in lengths:
+            prefix.append(prefix[-1] + size)
+        cu_seqlens = torch.tensor(prefix, dtype=torch.int32, device=device)
+    metadata = torch.empty(capacity, dtype=torch.int32, device=device)
+    # 两个模板的舍入边界不同，同一输入在训推模式下选择相同模板。
+    # 输出和缓存需求仍由调用方执行模式控制。
+    route_parameters, calibration_enabled = _get_route_parameters(device)
+    device_id = device.index
+    with torch.npu.device(device_id), _AICPU_LOCK:
+        stream = torch.npu.current_stream(device_id)
+        for tensor in (cu_seqlens, route_parameters, metadata):
+            if tensor is not None:
+                tensor.record_stream(stream)
+        _AICPU_STREAMS[(device_id, stream.npu_stream)] = stream
+        try:
+            aicpu = _get_aicpu_kernel()
+            aicpu.launch(
+                current_raw_stream(device_id),
+                route_coefficients=0 if route_parameters is None else route_parameters.data_ptr(),
+                calibration_enabled=calibration_enabled, layout_kind=0 if layout == "BNSD" else 1,
+                cu_seqlens=0 if cu_seqlens is None else cu_seqlens.data_ptr(),
+                metadata=metadata.data_ptr(), metadata_word_capacity=capacity,
+                batch=batch_size, physical_batches=1 if is_packed else batch_size,
+                storage_length=seqlens, value_heads=nheads_v, query_heads=nheads_qk, has_cu=int(has_cu),
+                is_packed=int(is_packed), core_num=core_num, workspace_slots=WORKSPACE_SLOTS,
+                max_chunk_group=max_chunk_group, template_kind=template_id,
+            )
+        except Exception:
+            stream.synchronize()
+            raise
+    # 复制失败保留运行时异常；生产结果格式错误时，保留校验原因并报告生成失败。
+    words = metadata.detach().cpu().tolist()
+    if words[HEADER_STATUS] != STATUS_OK:
+        raise ValueError(f"flash_kda_fwd_metadata produced status {words[HEADER_STATUS]}")
+    try:
+        decoded = decode_metadata(words)
+        validate_schedule(decoded, spec, lengths, core_num, has_cu)
+    except ValueError as exc:
+        raise ValueError(f"flash_kda_fwd_metadata produced invalid metadata: {exc}") from exc
+    return metadata
 
 
 def clear_metadata_caches():
-    """Drop the compiled metadata executable."""
+    """等待已使用的流完成后，再释放 metadata 可执行对象。"""
     global _AICPU_COMPILED
     with _AICPU_LOCK:
+        for (device_id, _), stream in _AICPU_STREAMS.items():
+            with torch.npu.device(device_id):
+                stream.synchronize()
+        _AICPU_STREAMS.clear()
         if _AICPU_COMPILED is not None:
             close = getattr(_AICPU_COMPILED, "close", None)
             if callable(close):
@@ -1379,47 +1453,14 @@ def clear_metadata_caches():
         _AICPU_COMPILED = None
 
 
-# BNSD and BSND/TND coefficients, followed by historical calibration coverage.
+# 非负 PR/DT 重叠成本以飞秒计，同时记录格式版本和切换余量（ppm）。
 _ROUTE_PARAMETERS = (
-    1955132,
-    -81672,
-    -6704957,
-    131986,
-    8359371,
-    -137912,
-    3113211,
-    83958,
-    8,
-    32,
-    1,
-    4,
-    3,
-    96,
-    1,
-    256,
-    -279990,
-    -89340,
-    -5024529,
-    93508,
-    6274567,
-    -45738,
-    6434440,
-    16693,
-    8,
-    32,
-    1,
-    4,
-    3,
-    96,
-    1,
-    256,
+    0, 2711857704, 699286307, 16555661144, 28359460, 94263834, 94263834, 12013349865, 1045656019, 84358156, 12842477, 2527878117, 181898838, 6, 8441, 0,
+    0, 692059912, 851406583, 21510815509, 73490570, 81791118, 166178779, 12029971961, 2552246171, 459139222, 45086212, 2303638937, 143977434, 6, 18992, 0,
 )
-# Full-cache training calibration: 32 AIC, one sequence, BSND/TND, 4K..16K tokens.
-# Persistent wins above 18 effective heads per occupied recurrence wave in this domain.
-# Other shapes retain the original differential model; explicit template requests bypass both.
-_ROUTE_PARAMETERS += (
-    0, 0, -562500, 0, 1000000, 0, 0, 0,
-    32, 32, 1, 1, 3, 96, 64, 256,
+_DT_ROUTE_PARAMETERS = (
+    4135271144, 193981546, 366448654, 12881511041, 29417161, 4351059785, 158980371, 10652650460, 3206978745, 332321804, 0, 419242242, 29945874, 7, 0, 0,
+    20317858430, 1160598799, 1018161115, 1015361233, 14389959, 933231823, 115749683, 11499084207, 4373896639, 413928806, 41555011, 0, 0, 7, 0, 0,
 )
 _ROUTE_TENSORS = {}
 _ROUTE_PARAMETER_LOCK = threading.Lock()
@@ -1427,11 +1468,15 @@ _ROUTE_PARAMETER_LOCK = threading.Lock()
 
 def _get_route_parameters(device):
     device = torch.device(device)
-    with _ROUTE_PARAMETER_LOCK:
-        tensor = _ROUTE_TENSORS.get(device)
-        if tensor is None:
-            tensor = torch.tensor(_ROUTE_PARAMETERS, dtype=torch.int64).to(device=device)
-            _ROUTE_TENSORS[device] = tensor
-    if device.type in ("npu", "privateuseone"):
-        tensor.record_stream(torch.npu.current_stream(device))
+    with torch.npu.device(device):
+        stream = torch.npu.current_stream(device)
+        key = (device, stream.npu_stream)
+        with _ROUTE_PARAMETER_LOCK:
+            tensor = _ROUTE_TENSORS.get(key)
+            if tensor is None:
+                device_name = torch.npu.get_device_properties(device).name.upper()
+                parameters = _DT_ROUTE_PARAMETERS if device_name.startswith("ASCEND950DT") else _ROUTE_PARAMETERS
+                tensor = torch.tensor(parameters, dtype=torch.int64).to(device=device, non_blocking=True)
+                _ROUTE_TENSORS[key] = tensor
+        tensor.record_stream(stream)
     return tensor, 1

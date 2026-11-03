@@ -7,12 +7,11 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 
 # fmt: off
-# Keep compact call argument groups consistent with the original FlashKDA samples.
+# 保持参数分组紧凑，与原有 FlashKDA 样例风格一致。
 
 
-"""Training forward entry with metadata-selected staged/persistent device templates."""
+"""训练前向入口，根据 metadata 选择 staged 或 persistent 设备模板。"""
 
-import math
 import os
 import threading
 from typing import Optional, Tuple
@@ -20,10 +19,11 @@ from typing import Optional, Tuple
 import cannbotdsl
 from cannbotdsl import Tensor, dtypes
 from cannbotdsl.aot import export
+from cannbotdsl.aot.runtime import COLLECTOR
 from cannbotdsl.lang.host import host
 from cannbotdsl.lang.kernel import kernel
 from cannbotdsl.ops.arch import get_block_num
-from cannbotdsl.ops.sync import channel_rewind
+from cannbotdsl.ops.sync import onchip_rewind
 import torch
 
 from .flash_kda_fwd_metadata import (
@@ -33,41 +33,37 @@ from .flash_kda_fwd_metadata import (
     HEADER_MAGIC,
     HEADER_STATUS,
     HEADER_TEMPLATE,
-    HEADER_WORDS,
     MAGIC,
     MAX_AIC_CORES,
     STATUS_OK,
+    TEMPLATE_AUTO,
     TEMPLATE_PERSISTENT,
     TEMPLATE_STAGED,
     WORKSPACE_SLOTS,
     _device_block_num,
+    decode_metadata,
 )
-from .flash_kda_fwd_staged import (
-    CHUNK_SIZE,
-    GATE_MODE_FUSED_WITH_DT_BIAS,
-    GATE_MODE_FUSED_WITHOUT_DT_BIAS,
-    GATE_MODE_PREPROCESSED,
-    SUPPORTED_HEAD_DIM,
-    allocate_qk_exchange_workspace,
-    allocate_stage1_workspace,
-    run_staged_flash_kda_fwd,
-    _tnd_state_chunk_capacity,
-    _public_bnsd_tensor,
-    _public_bnsd_scalar,
-    _public_chunk_tensor,
-    _public_chunk_state,
+from . import flash_kda_fwd_staged as staged
+from . import flash_kda_fwd_persistent as persistent
+from .flash_kda_fwd_validation import (
+    CHUNK_SIZE, SUPPORTED_HEAD_DIM,
+    require, validate_inputs, read_lengths, validate_schedule, validate_buffer, output_conditions,
 )
-from .flash_kda_fwd_persistent import run_persistent_flash_kda_fwd
+
+LOW_DTYPE = torch.bfloat16
+HIGH_DTYPE = torch.float32
 
 
 def compile_environment():
-    """Use the framework's complete factory environment identity plus PID."""
+    """使用框架完整的工厂环境标识和进程号作为缓存标识。"""
     environment = tuple(
         sorted(
+            (
             (name, value)
             for name, value in os.environ.items()
             if name.startswith("CANNBOTDSL_") or name == "ASCEND_HOME_PATH"
-        )
+        ),
+        ),
     )
     return os.getpid(), environment
 
@@ -134,6 +130,8 @@ class flash_kda_fwd_kernel:
         save_qg: int,
         save_g_cumsum: int,
         save_intermediate_state: int,
+        save_matrices: int,
+        save_final_state: int,
     ):
         _block_num = get_block_num()
         if (
@@ -148,24 +146,24 @@ class flash_kda_fwd_kernel:
         ):
             template = gm_metadata[HEADER_TEMPLATE]
             if template == TEMPLATE_STAGED:
-                channel_rewind(reset_sync_id=True)
-                run_staged_flash_kda_fwd(
+                onchip_rewind(reset_sync_id=True)
+                staged.run_staged_flash_kda_fwd(
                     gm_K, gm_V, gm_Q, gm_beta, gm_g, gm_qk_exchange, gm_A_log, gm_dt_bias, gm_kg, gm_gamma,
                     gm_q_decayed, gm_u, gm_saved_w, gm_qg, gm_g_cumsum, gm_v_new, gm_h, gm_O, gm_state_in, gm_state_out,
                     gm_identity16, gm_q_norm, gm_k_norm, gm_q_rstd, gm_k_rstd, gm_beta_activated, gm_Aqk, gm_Akk,
                     gm_metadata, scale_value, lower_bound, use_qk_l2norm_in_kernel, use_gate_in_kernel,
                     use_beta_sigmoid_in_kernel, allow_neg_eigval, has_lower_bound, state_is_compact, save_qg,
-                    save_g_cumsum, save_intermediate_state,
+                    save_g_cumsum, save_intermediate_state, save_matrices, save_final_state,
                 )
             elif template == TEMPLATE_PERSISTENT:
-                channel_rewind(reset_sync_id=True)
-                run_persistent_flash_kda_fwd(
+                onchip_rewind(reset_sync_id=True)
+                persistent.run_persistent_flash_kda_fwd(
                     gm_K, gm_V, gm_Q, gm_beta, gm_g, gm_qk_exchange, gm_A_log, gm_dt_bias, gm_kg, gm_gamma,
                     gm_q_decayed, gm_u, gm_saved_w, gm_qg, gm_g_cumsum, gm_v_new, gm_h, gm_O, gm_state_in, gm_state_out,
                     gm_identity16, gm_q_norm, gm_k_norm, gm_q_rstd, gm_k_rstd, gm_beta_activated, gm_Aqk, gm_Akk,
                     gm_metadata, scale_value, lower_bound, use_qk_l2norm_in_kernel, use_gate_in_kernel,
                     use_beta_sigmoid_in_kernel, allow_neg_eigval, has_lower_bound, state_is_compact, save_qg,
-                    save_g_cumsum, save_intermediate_state,
+                    save_g_cumsum, save_intermediate_state, save_matrices, save_final_state,
                 )
 
 
@@ -231,6 +229,8 @@ class staged_flash_kda_fwd_kernel:
         save_qg: int,
         save_g_cumsum: int,
         save_intermediate_state: int,
+        save_matrices: int,
+        save_final_state: int,
     ):
         if (
             gm_metadata[HEADER_MAGIC] == MAGIC
@@ -239,13 +239,13 @@ class staged_flash_kda_fwd_kernel:
             and (gm_metadata[HEADER_CORE_NUM] == get_block_num())
             and (gm_metadata[HEADER_TEMPLATE] == TEMPLATE_STAGED)
         ):
-            channel_rewind(reset_sync_id=True)
-            run_staged_flash_kda_fwd(
+            onchip_rewind(reset_sync_id=True)
+            staged.run_staged_flash_kda_fwd(
                 gm_K, gm_V, gm_Q, gm_beta, gm_g, gm_qk_exchange, gm_A_log, gm_dt_bias, gm_kg, gm_gamma, gm_q_decayed,
                 gm_u, gm_saved_w, gm_qg, gm_g_cumsum, gm_v_new, gm_h, gm_O, gm_state_in, gm_state_out, gm_identity16,
                 gm_q_norm, gm_k_norm, gm_q_rstd, gm_k_rstd, gm_beta_activated, gm_Aqk, gm_Akk, gm_metadata, scale_value,
                 lower_bound, use_qk_l2norm_in_kernel, use_gate_in_kernel, use_beta_sigmoid_in_kernel, allow_neg_eigval,
-                has_lower_bound, state_is_compact, save_qg, save_g_cumsum, save_intermediate_state,
+                has_lower_bound, state_is_compact, save_qg, save_g_cumsum, save_intermediate_state, save_matrices, save_final_state,
             )
 
 
@@ -311,6 +311,8 @@ class persistent_flash_kda_fwd_kernel:
         save_qg: int,
         save_g_cumsum: int,
         save_intermediate_state: int,
+        save_matrices: int,
+        save_final_state: int,
     ):
         if (
             gm_metadata[HEADER_MAGIC] == MAGIC
@@ -319,18 +321,18 @@ class persistent_flash_kda_fwd_kernel:
             and (gm_metadata[HEADER_CORE_NUM] == get_block_num())
             and (gm_metadata[HEADER_TEMPLATE] == TEMPLATE_PERSISTENT)
         ):
-            channel_rewind(reset_sync_id=True)
-            run_persistent_flash_kda_fwd(
+            onchip_rewind(reset_sync_id=True)
+            persistent.run_persistent_flash_kda_fwd(
                 gm_K, gm_V, gm_Q, gm_beta, gm_g, gm_qk_exchange, gm_A_log, gm_dt_bias, gm_kg, gm_gamma, gm_q_decayed,
                 gm_u, gm_saved_w, gm_qg, gm_g_cumsum, gm_v_new, gm_h, gm_O, gm_state_in, gm_state_out, gm_identity16,
                 gm_q_norm, gm_k_norm, gm_q_rstd, gm_k_rstd, gm_beta_activated, gm_Aqk, gm_Akk, gm_metadata, scale_value,
                 lower_bound, use_qk_l2norm_in_kernel, use_gate_in_kernel, use_beta_sigmoid_in_kernel, allow_neg_eigval,
-                has_lower_bound, state_is_compact, save_qg, save_g_cumsum, save_intermediate_state,
+                has_lower_bound, state_is_compact, save_qg, save_g_cumsum, save_intermediate_state, save_matrices, save_final_state,
             )
 
 
 class FlashKDAFwd:
-    """Compiled AICore entry used by :func:`flash_kda_fwd`."""
+    """供 :func:`flash_kda_fwd` 使用的已编译 AICore 入口。"""
 
     @host
     def run(
@@ -375,6 +377,8 @@ class FlashKDAFwd:
         save_qg: int,
         save_g_cumsum: int,
         save_intermediate_state: int,
+        save_matrices: int,
+        save_final_state: int,
         core_num: int,
     ):
         op = flash_kda_fwd_kernel()
@@ -382,12 +386,12 @@ class FlashKDAFwd:
             K, V, Q, beta, g, qk_exchange, A_log, dt_bias, kg, gamma, qd, u, saved_w, qg, g_cumsum, v_new, h, out,
             state_in, state_out, identity, q_norm, k_norm, q_rstd, k_rstd, beta_activated, Aqk, Akk, metadata, scale,
             lower_bound, use_qk_l2norm_in_kernel, use_gate_in_kernel, use_beta_sigmoid_in_kernel, allow_neg_eigval,
-            has_lower_bound, state_is_compact, save_qg, save_g_cumsum, save_intermediate_state,
+            has_lower_bound, state_is_compact, save_qg, save_g_cumsum, save_intermediate_state, save_matrices, save_final_state,
         )
 
 
 class StagedFlashKDAFwd:
-    """Compiled AICore entry used by :func:`flash_kda_fwd`."""
+    """供 :func:`flash_kda_fwd` 使用的已编译 AICore 入口。"""
 
     @host
     def run(
@@ -432,6 +436,8 @@ class StagedFlashKDAFwd:
         save_qg: int,
         save_g_cumsum: int,
         save_intermediate_state: int,
+        save_matrices: int,
+        save_final_state: int,
         core_num: int,
     ):
         op = staged_flash_kda_fwd_kernel()
@@ -439,12 +445,12 @@ class StagedFlashKDAFwd:
             K, V, Q, beta, g, qk_exchange, A_log, dt_bias, kg, gamma, qd, u, saved_w, qg, g_cumsum, v_new, h, out,
             state_in, state_out, identity, q_norm, k_norm, q_rstd, k_rstd, beta_activated, Aqk, Akk, metadata, scale,
             lower_bound, use_qk_l2norm_in_kernel, use_gate_in_kernel, use_beta_sigmoid_in_kernel, allow_neg_eigval,
-            has_lower_bound, state_is_compact, save_qg, save_g_cumsum, save_intermediate_state,
+            has_lower_bound, state_is_compact, save_qg, save_g_cumsum, save_intermediate_state, save_matrices, save_final_state,
         )
 
 
 class PersistentFlashKDAFwd:
-    """Compiled AICore entry used by :func:`flash_kda_fwd`."""
+    """供 :func:`flash_kda_fwd` 使用的已编译 AICore 入口。"""
 
     @host
     def run(
@@ -489,6 +495,8 @@ class PersistentFlashKDAFwd:
         save_qg: int,
         save_g_cumsum: int,
         save_intermediate_state: int,
+        save_matrices: int,
+        save_final_state: int,
         core_num: int,
     ):
         op = persistent_flash_kda_fwd_kernel()
@@ -496,7 +504,7 @@ class PersistentFlashKDAFwd:
             K, V, Q, beta, g, qk_exchange, A_log, dt_bias, kg, gamma, qd, u, saved_w, qg, g_cumsum, v_new, h, out,
             state_in, state_out, identity, q_norm, k_norm, q_rstd, k_rstd, beta_activated, Aqk, Akk, metadata, scale,
             lower_bound, use_qk_l2norm_in_kernel, use_gate_in_kernel, use_beta_sigmoid_in_kernel, allow_neg_eigval,
-            has_lower_bound, state_is_compact, save_qg, save_g_cumsum, save_intermediate_state,
+            has_lower_bound, state_is_compact, save_qg, save_g_cumsum, save_intermediate_state, save_matrices, save_final_state,
         )
 
 
@@ -515,9 +523,15 @@ def _sequence_spec(dtype, physical_batches, length, heads, width, stride_prefix)
     )
 
 
-def _get_compiled_kernel(template=0):
+def _chunk_cache_spec(dtype, batches, heads, chunks, width, stride_prefix):
+    outer_stride = tuple(cannbotdsl.Dim(f"{stride_prefix}_S{i}", min=1) for i in range(3))
+    return cannbotdsl.TensorSpec(
+        (batches, heads, chunks, width, width), dtype, stride=(*outer_stride, width, 1),
+    )
+
+
+def _get_compiled_kernel(template=TEMPLATE_AUTO):
     global _COMPILED_KERNEL, _COMPILED_KERNEL_ENVIRONMENT, _COMPILED_KERNEL_LOCK
-    from cannbotdsl.aot.runtime import COLLECTOR
 
     current_collection = COLLECTOR.get
     environment = compile_environment()
@@ -556,16 +570,18 @@ def _get_compiled_kernel(template=0):
         fake = cannbotdsl.TensorSpec
         qk_spec = _sequence_spec(dtypes.bfloat16, physical_batches, storage_length, n_qk, SUPPORTED_HEAD_DIM, "QK")
         v_spec = _sequence_spec(dtypes.bfloat16, physical_batches, storage_length, n_v, SUPPORTED_HEAD_DIM, "V")
-        beta_spec = _sequence_spec(dtypes.bfloat16, physical_batches, storage_length, n_v, 1, "BETA")
+        beta_spec = _sequence_spec(dtypes.float32, physical_batches, storage_length, n_v, 1, "BETA")
         output_spec = _sequence_spec(dtypes.bfloat16, physical_batches, output_length, n_v, SUPPORTED_HEAD_DIM, "OUT")
         state_spec = fake((batch, n_v, SUPPORTED_HEAD_DIM, SUPPORTED_HEAD_DIM), dtypes.float32)
         rstd_spec = _sequence_spec(dtypes.float32, physical_batches, storage_length, n_qk, 1, "RSTD")
         activated_spec = _sequence_spec(dtypes.float32, physical_batches, storage_length, n_v, 1, "ACT")
-        matrix_spec = fake((physical_batches, n_v, storage_chunks, CHUNK_SIZE, CHUNK_SIZE), dtypes.bfloat16)
-        gate_cumsum_spec = _sequence_spec(
-            dtypes.float32, physical_batches, storage_length, n_v, SUPPORTED_HEAD_DIM, "G_CUMSUM",
+        matrix_spec = _chunk_cache_spec(
+            dtypes.bfloat16, cannbotdsl.Dim("MATRIX_B"), cannbotdsl.Dim("MATRIX_N"), storage_chunks, CHUNK_SIZE, "MATRIX",
         )
-        h_spec = fake((state_batches, n_v, state_chunks, SUPPORTED_HEAD_DIM, SUPPORTED_HEAD_DIM), dtypes.float32)
+        gate_cumsum_spec = _sequence_spec(
+            dtypes.float32, cannbotdsl.Dim("G_B"), cannbotdsl.Dim("G_L"), cannbotdsl.Dim("G_N"), SUPPORTED_HEAD_DIM, "G_CUMSUM",
+        )
+        h_spec = _chunk_cache_spec(dtypes.float32, state_batches, n_v, state_chunks, SUPPORTED_HEAD_DIM, "H")
         runner = (FlashKDAFwd, StagedFlashKDAFwd, PersistentFlashKDAFwd)[template]()
         compiled_kernel = cannbotdsl.compile(
             runner.run, qk_spec, v_spec, qk_spec, beta_spec, v_spec, fake((core_num, 2, 2, CHUNK_SIZE), dtypes.float32),
@@ -575,10 +591,29 @@ def _get_compiled_kernel(template=0):
             fake((16, 16), dtypes.float16), qk_spec, qk_spec, rstd_spec, rstd_spec, activated_spec, matrix_spec,
             matrix_spec, fake((metadata_capacity,), dtypes.int32), dtypes.float32, dtypes.float32, dtypes.int64,
             dtypes.int64, dtypes.int64, dtypes.int64, dtypes.int64, dtypes.int64, dtypes.int64, dtypes.int64,
-            dtypes.int64, dtypes.int64,
+            dtypes.int64, dtypes.int64, dtypes.int64, dtypes.int64,
         )
         _COMPILED_KERNEL[template] = compiled_kernel
         return compiled_kernel
+
+
+def _allocate_output(spec, device):
+    """公开输出与内核视图共用按 chunk 对齐的存储，Meta 复用相同的步长。"""
+    batch, _, n_v, storage_length, layout = spec
+    dim = SUPPORTED_HEAD_DIM
+    padded_length = (storage_length + CHUNK_SIZE - 1) // CHUNK_SIZE * CHUNK_SIZE
+    if layout == "TND":
+        out_storage = torch.empty((padded_length, n_v, dim), dtype=LOW_DTYPE, device=device)
+        out = out_storage[:storage_length]
+        out_stage = out_storage.unsqueeze(0).transpose(1, 2)
+    elif layout == "BSND":
+        out_storage = torch.empty((batch, padded_length, n_v, dim), dtype=LOW_DTYPE, device=device)
+        out = out_storage[:, :storage_length]
+        out_stage = out_storage.transpose(1, 2)
+    else:
+        out_stage = torch.empty((batch, n_v, padded_length, dim), dtype=LOW_DTYPE, device=device)
+        out = out_stage[:, :, :storage_length]
+    return out, out_stage
 
 
 def _flash_kda_fwd_impl(
@@ -587,380 +622,340 @@ def _flash_kda_fwd_impl(
     v: torch.Tensor,
     g: torch.Tensor,
     beta: torch.Tensor,
-    scale: Optional[float] = SUPPORTED_HEAD_DIM ** (-0.5),
+    metadata: torch.Tensor,
     initial_state: Optional[torch.Tensor] = None,
     A_log: Optional[torch.Tensor] = None,
     dt_bias: Optional[torch.Tensor] = None,
-    lower_bound: Optional[float] = None,
-    layout_qkv: str = "TND",
-    metadata: Optional[torch.Tensor] = None,
+    cu_seqlens: Optional[torch.Tensor] = None,
+    seqused: Optional[torch.Tensor] = None,
+    *,
+    scale: Optional[float] = SUPPORTED_HEAD_DIM ** (-0.5),
+    output_final_state: bool = False,
+    return_intermediate_states: bool = False,
     use_qk_l2norm_in_kernel: bool = True,
     use_gate_in_kernel: bool = True,
     use_beta_sigmoid_in_kernel: bool = True,
-    disable_recompute: bool = True,
-    return_intermediate_state: bool = False,
     allow_neg_eigval: bool = False,
-    output_final_state: bool = False,
-    *,
-    internal_template: int = 0,
-) -> Tuple[torch.Tensor, ...]:
-    """FlashKDAFwd forward (Flash Kimi Delta Attention).
+    disable_recompute: bool = True,
+    lower_bound: Optional[float] = None,
+    layout: str = "TND",
+    internal_template: int = TEMPLATE_AUTO,
+) -> Tuple[Optional[torch.Tensor], ...]:
+    """前向返回固定的 16 个槽位，未启用的槽位为 None。
 
-    Args:
-        q (torch.Tensor): Query, bf16, BNSD ``[B, Nqk, S, D]``, BSND ``[B, S, Nqk, D]``, or TND ``[T, Nqk, D]``.
-        k (torch.Tensor): Key, bf16, with the same shape and layout as ``q``.
-        v (torch.Tensor): Value, bf16, BNSD ``[B, Nv, S, D]``, BSND ``[B, S, Nv, D]``, or TND ``[T, Nv, D]``.
-        g (torch.Tensor): Gate input, bf16 or fp32, with the shape and layout of ``v``.
-            With gate fusion this contains raw logits; otherwise it contains log decay.
-        beta (torch.Tensor): Beta input, bf16 or fp32, BNSD ``[B, Nv, S]``, BSND ``[B, S, Nv]``, or TND ``[T, Nv]``.
-            With sigmoid fusion this contains logits; otherwise it contains activated beta.
-        scale (float or None): Query-key scaling factor. ``None`` uses
-            ``1 / sqrt(headdim_qk)``.
-        initial_state (torch.Tensor): Initial recurrent state, fp32, shape ``[B, Nv, D, D]``.
-        A_log (torch.Tensor or None): Per-value-head decay coefficient, fp32, shape ``[Nv]``;
-            required when the gate is activated in the kernel.
-        dt_bias (torch.Tensor or None): Per-value-head bias, fp32, shape ``[Nv, D]``;
-            None means zero when the gate is activated in the kernel.
-        lower_bound (float or None): Optional gate lower bound in ``[-5, 0]``;
-            it is used only when ``use_gate_in_kernel=True``. None selects softplus.
-        layout_qkv (str): Input layout: ``"BNSD"``, ``"BSND"``, or ``"TND"``.
-        metadata (torch.Tensor): Reusable int32 scheduling metadata returned by ``flash_kda_fwd_metadata()``.
-
-    Returns:
-        out (torch.Tensor): Output in the same physical layout as ``v``. Padding rows are undefined.
-        final_state (torch.Tensor or None): Final recurrent state when
-            ``output_final_state=True``.
-        q_norm, k_norm (torch.Tensor or None): BF16 normalized inputs, saved when
-            ``disable_recompute`` and ``use_qk_l2norm_in_kernel`` are both True.
-            BNSD/BSND inputs produce BNSD caches; TND produces TND caches.
-        q_rstd, k_rstd (torch.Tensor or None): FP32 inverse norms saved with q_norm/k_norm.
-        beta_activated (torch.Tensor or None): FP32 beta saved when
-            ``disable_recompute`` and ``use_beta_sigmoid_in_kernel`` are both True;
-            BNSD/BSND inputs produce BNSD caches and TND produces a TND cache.
-        Aqk, Akk (torch.Tensor): BF16 causal QK and inverse rows in chunk-major public layout.
-            Padded layouts are ``[B, Nv, num_chunks, 64, 64]`` and TND is
-            ``[num_chunks, Nv, 64, 64]``.
-            Metadata-invalid tokens are undefined in all sequence outputs.
-        w, u, qg, kg, v_new (torch.Tensor or None): BF16 backward caches returned when
-            ``disable_recompute=True``.
-        g_cumsum (torch.Tensor or None): FP32 cumulative log decay for the real
-            sequence length, returned when ``disable_recompute=True``. BNSD/BSND
-            inputs use ``[B, Nv, S, D]`` and TND uses ``[T, Nv, D]``.
-        h (torch.Tensor or None): FP32 chunk-entry states; returned only when
-            ``return_intermediate_state=True``.
-
-    Notes:
-        * Currently requires ``Dk = Dv = 128``.
-        * Consumed tensor inputs must be contiguous, on the same device, and have the dtypes listed above.
-        * FP32 gate/beta inputs are rounded to BF16 before AICore execution.
-        * ``1 <= Nqk <= Nv <= WORKSPACE_SLOTS``.
-        * ``Nv % Nqk == 0``.
-        * ``lower_bound`` is optional and, when provided with gate fusion, is in ``[-5, 0]``.
-        * Internal output storage is padded to a multiple of 64 rows for kernel computation.
-    """
-    if initial_state is None:
-        raise AssertionError("initial_state is required")
-    if metadata is None:
-        raise AssertionError("metadata is required")
-    if layout_qkv not in ("TND", "BNSD", "BSND"):
-        raise AssertionError(f"layout_qkv must be TND, BNSD, or BSND, got {layout_qkv!r}")
-    if initial_state.dim() != 4:
-        raise AssertionError("initial_state must be rank-4")
-    batch, n_v, state_dv, state_dk = initial_state.shape
-    if not state_dv == state_dk == SUPPORTED_HEAD_DIM:
-        raise AssertionError(f"FlashKDAFwd only supports D={SUPPORTED_HEAD_DIM}")
-    if layout_qkv == "TND":
-        if not q.dim() == k.dim() == v.dim() == g.dim() == 3:
-            raise AssertionError("TND q/k/v/g must be rank-3")
-        physical_batches = 1
-        storage_length, n_qk, dim = q.shape
-        if k.shape != q.shape:
-            raise AssertionError("q/k shape does not match TND layout")
-        if not v.shape == g.shape == (storage_length, n_v, dim):
-            raise AssertionError("v/g shape does not match TND layout")
-        if not (beta.dim() == 2 and beta.shape == (storage_length, n_v)):
-            raise AssertionError("beta must be [T, Nv] for TND")
-        q_logical = torch.as_strided(
-            q, (1, n_qk, storage_length, dim), (storage_length * n_qk * dim, dim, n_qk * dim, 1),
-        )
-        k_logical = torch.as_strided(
-            k, (1, n_qk, storage_length, dim), (storage_length * n_qk * dim, dim, n_qk * dim, 1),
-        )
-        v_logical = torch.as_strided(v, (1, n_v, storage_length, dim), (storage_length * n_v * dim, dim, n_v * dim, 1))
-        g_logical = torch.as_strided(g, (1, n_v, storage_length, dim), (storage_length * n_v * dim, dim, n_v * dim, 1))
-        beta_logical = torch.as_strided(beta, (1, n_v, storage_length, 1), (storage_length * n_v, 1, n_v, 1))
-        padded_length = (storage_length + CHUNK_SIZE - 1) // CHUNK_SIZE * CHUNK_SIZE
-        out_stage_storage = torch.empty(padded_length, n_v, dim, dtype=torch.bfloat16, device=q.device)
-        out = out_stage_storage[:storage_length]
-        out_stage = torch.as_strided(
-            out_stage_storage, (1, n_v, padded_length, dim), (padded_length * n_v * dim, dim, n_v * dim, 1),
-        )
-    else:
-        if not q.dim() == k.dim() == v.dim() == g.dim() == 4:
-            raise AssertionError("BNSD/BSND q/k/v/g must be rank-4")
-        if layout_qkv == "BNSD":
-            physical_batches, n_qk, storage_length, dim = q.shape
-            if k.shape != q.shape:
-                raise AssertionError("q/k shape does not match BNSD layout")
-            if not v.shape == g.shape == (physical_batches, n_v, storage_length, dim):
-                raise AssertionError("v/g shape does not match BNSD layout")
-            if not (
-                beta.dim() == 3
-                and beta.shape == (physical_batches, n_v, storage_length)
-            ):
-                raise AssertionError("beta must be [B, Nv, S] for BNSD")
-            q_logical, k_logical, v_logical, g_logical = (q, k, v, g)
-            beta_logical = beta.unsqueeze(-1)
-        else:
-            physical_batches, storage_length, n_qk, dim = q.shape
-            if k.shape != q.shape:
-                raise AssertionError("q/k shape does not match BSND layout")
-            if not v.shape == g.shape == (physical_batches, storage_length, n_v, dim):
-                raise AssertionError("v/g shape does not match BSND layout")
-            if not (
-                beta.dim() == 3
-                and beta.shape == (physical_batches, storage_length, n_v)
-            ):
-                raise AssertionError("beta must be [B, S, Nv] for BSND")
-            q_logical = q.transpose(1, 2)
-            k_logical = k.transpose(1, 2)
-            v_logical = v.transpose(1, 2)
-            g_logical = g.transpose(1, 2)
-            beta_logical = beta.unsqueeze(-1).transpose(1, 2)
-        if physical_batches != batch:
-            raise AssertionError("padded storage batch must match initial_state")
-        padded_length = (storage_length + CHUNK_SIZE - 1) // CHUNK_SIZE * CHUNK_SIZE
-        if layout_qkv == "BNSD":
-            out_stage_storage = torch.empty(batch, n_v, padded_length, dim, dtype=torch.bfloat16, device=q.device)
-            out = out_stage_storage[:, :, :storage_length, :]
-            out_stage = out_stage_storage
-        else:
-            out_stage_storage = torch.empty(batch, padded_length, n_v, dim, dtype=torch.bfloat16, device=q.device)
-            out = out_stage_storage[:, :storage_length, :, :]
-            out_stage = out_stage_storage.transpose(1, 2)
-    if dim != SUPPORTED_HEAD_DIM:
-        raise AssertionError(f"FlashKDAFwd only supports D={SUPPORTED_HEAD_DIM}")
+    模式由 torch.is_inference_mode_enabled() 决定，不依赖 requires_grad/no_grad。
+    禁用 gate/beta 激活时使用预处理输入。转换或分配前检查静态输入，
+    回读后检查 metadata，启动前检查内部缓冲区。"""
+    spec = validate_inputs(
+        q, k, v, g, beta, initial_state, A_log, dt_bias,
+        metadata=metadata, cu_seqlens=cu_seqlens, seqused=seqused, scale=scale,
+        output_final_state=output_final_state,
+        return_intermediate_states=return_intermediate_states,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        use_gate_in_kernel=use_gate_in_kernel,
+        use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel,
+        allow_neg_eigval=allow_neg_eigval, disable_recompute=disable_recompute,
+        lower_bound=lower_bound, layout=layout,
+        real_execution=True,
+    )
+    lengths = read_lengths(cu_seqlens, seqused, spec)
+    core_num = _device_block_num(q)
+    words = metadata.detach().cpu().tolist()
+    decoded = decode_metadata(words)
+    validate_schedule(decoded, spec, lengths, core_num,
+                      cu_seqlens is not None or seqused is not None)
+    batch, n_qk, n_v, storage_length, layout = spec
+    dim = SUPPORTED_HEAD_DIM
+    physical_batches = 1 if layout == "TND" else batch
+    inference = torch.is_inference_mode_enabled()
+    outputs = output_conditions(
+        inference=inference, output_final_state=output_final_state,
+        return_intermediate_states=return_intermediate_states,
+        disable_recompute=disable_recompute,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel,
+    )
+    template = TEMPLATE_PERSISTENT if decoded["template"] == "persistent" else TEMPLATE_STAGED
+    if internal_template:
+        require(template == internal_template, "metadata template does not match the selected entry")
+    # persistent 共用一个存储开关控制预处理和递推缓存。
+    # 独立请求 norm/beta 输出时仍需开启存储，再按输出条件筛选公开返回值。
+    save_kernel_caches = outputs.caches or (
+        template == TEMPLATE_PERSISTENT and not inference
+        and (use_qk_l2norm_in_kernel or use_beta_sigmoid_in_kernel)
+    )
     if scale is None:
-        scale = dim ** (-0.5)
-    if not math.isfinite(float(scale)):
-        raise AssertionError("scale must be finite")
-    if batch < 1:
-        raise AssertionError("logical batch must be positive")
-    if not 1 <= n_qk <= n_v <= WORKSPACE_SLOTS:
-        raise AssertionError("heads must satisfy 1 <= Nqk <= Nv <= WORKSPACE_SLOTS")
-    if n_v % n_qk != 0:
-        raise AssertionError(f"GQA requires Nv % Nqk == 0, got Nv={n_v}, Nqk={n_qk}")
-    if storage_length <= 0:
-        raise AssertionError("storage sequence length must be positive")
-    if not q.dtype == k.dtype == v.dtype == torch.bfloat16:
-        raise AssertionError("q/k/v must be bf16")
-    if g.dtype not in (torch.bfloat16, torch.float32):
-        raise AssertionError("g must be bf16 or fp32")
-    if beta.dtype not in (torch.bfloat16, torch.float32):
-        raise AssertionError("beta must be bf16 or fp32")
-    if initial_state.dtype != torch.float32:
-        raise AssertionError("initial_state must be fp32")
+        scale = dim ** -0.5
+    if initial_state is None:
+        initial_state = torch.zeros((batch, n_v, dim, dim), dtype=HIGH_DTYPE, device=q.device)
+    # 转换前已检查原始输入的数据类型、设备和连续性。
+    g = g.to(dtype=LOW_DTYPE)
+    beta = beta.to(dtype=HIGH_DTYPE)
+
+    def logical(value):
+        if layout == "TND":
+            return value.unsqueeze(0).transpose(1, 2)
+        return value.transpose(1, 2) if layout == "BSND" else value
+
+    q_logical, k_logical, v_logical, g_logical = map(logical, (q, k, v, g))
+    beta_logical = logical(beta.unsqueeze(-1))
+    out, out_stage = _allocate_output(spec, q.device)
+    padded_length = (storage_length + CHUNK_SIZE - 1) // CHUNK_SIZE * CHUNK_SIZE
+    gate_input_mode = staged.GATE_MODE_PREPROCESSED
     if use_gate_in_kernel:
-        if A_log is None:
-            raise AssertionError("A_log is required when use_gate_in_kernel=True")
-        if not (A_log.dtype == torch.float32 and A_log.shape == (n_v,)):
-            raise AssertionError(f"A_log must be fp32 with shape ({n_v},)")
-        if dt_bias is not None:
-            if not (dt_bias.dtype == torch.float32 and dt_bias.shape == (n_v, dim)):
-                raise AssertionError(f"dt_bias must be fp32 with shape ({n_v}, {dim})")
-    if use_gate_in_kernel and lower_bound is not None:
-        if not -5.0 <= float(lower_bound) <= 0.0:
-            raise AssertionError("lower_bound must be None or in [-5, 0]")
-    if allow_neg_eigval:
-        if not use_beta_sigmoid_in_kernel:
-            raise AssertionError("allow_neg_eigval=True requires use_beta_sigmoid_in_kernel=True")
-    if g.dtype != torch.bfloat16:
-        g = g.to(dtype=torch.bfloat16)
-        if layout_qkv == "TND":
-            g_logical = torch.as_strided(
-                g, (1, n_v, storage_length, dim), (storage_length * n_v * dim, dim, n_v * dim, 1),
-            )
-        elif layout_qkv == "BNSD":
-            g_logical = g
-        else:
-            g_logical = g.transpose(1, 2)
-    if beta.dtype != torch.bfloat16:
-        beta = beta.to(dtype=torch.bfloat16)
-        if layout_qkv == "TND":
-            beta_logical = torch.as_strided(beta, (1, n_v, storage_length, 1), (storage_length * n_v, 1, n_v, 1))
-        elif layout_qkv == "BNSD":
-            beta_logical = beta.unsqueeze(-1)
-        else:
-            beta_logical = beta.unsqueeze(-1).transpose(1, 2)
-    tensors = (q, k, v, g, beta, initial_state)
-    if use_gate_in_kernel:
-        tensors += (A_log,)
-        if dt_bias is not None:
-            tensors += (dt_bias,)
-    if not all((tensor.device == q.device for tensor in tensors)):
-        raise AssertionError("all inputs must be on the same device")
-    if not all((tensor.is_contiguous() for tensor in tensors)):
-        raise AssertionError("all public inputs must be contiguous")
-    if metadata.dtype != torch.int32:
-        raise AssertionError("metadata must be int32")
-    if metadata.dim() != 1:
-        raise AssertionError("metadata must be rank-1")
-    if not metadata.is_contiguous():
-        raise AssertionError("metadata must be contiguous")
-    if metadata.numel() < HEADER_WORDS:
-        raise AssertionError("metadata must contain the complete scheduling header")
-    if metadata.device != q.device:
-        raise AssertionError("all inputs must be on the same device")
-    gate_input_mode = GATE_MODE_PREPROCESSED
-    if use_gate_in_kernel:
-        gate_input_mode = GATE_MODE_FUSED_WITH_DT_BIAS
+        gate_input_mode = staged.GATE_MODE_FUSED_WITH_DT_BIAS
+        kernel_lower_bound = 0.0 if lower_bound is None else lower_bound
         if dt_bias is None:
-            gate_input_mode = GATE_MODE_FUSED_WITHOUT_DT_BIAS
-            # The absent-bias path never reads this ABI-compatible placeholder.
-            dt_bias = initial_state.view(-1)[: n_v * dim].view(n_v, dim)
+            gate_input_mode = staged.GATE_MODE_FUSED_WITHOUT_DT_BIAS
+            dt_bias = initial_state.view(-1)[:n_v * dim].view(n_v, dim)
     else:
+        # 固定内核 ABI 即使不执行 gate 分支也需要张量占位。
+        # 不检查或转换未使用的公开条件输入。
+        kernel_lower_bound = -5.0
         state_flat = initial_state.view(-1)
         A_log = state_flat[:n_v]
-        dt_bias = state_flat[: n_v * dim].view(n_v, dim)
+        dt_bias = state_flat[:n_v * dim].view(n_v, dim)
 
     def empty_with_layout(ref, shape=None, dtype=None):
         shape = ref.shape if shape is None else shape
-        if internal_template == 2 and not disable_recompute and dtype == torch.float32:
-            return torch.as_strided(initial_state, shape, (0,) * len(shape))
-        stride = ref.stride()[: len(shape)]
-        return torch.empty_strided(shape, stride, dtype=ref.dtype if dtype is None else dtype, device=q.device)
+        stride = ref.stride()[:len(shape)]
+        return torch.empty_strided(
+            shape, stride, dtype=ref.dtype if dtype is None else dtype, device=q.device,
+        )
 
-    allocate_backward_inputs = disable_recompute or internal_template != 2
-    if use_qk_l2norm_in_kernel and allocate_backward_inputs:
-        q_norm = empty_with_layout(q_logical, dtype=torch.bfloat16)
-        k_norm = empty_with_layout(k_logical, dtype=torch.bfloat16)
-        q_rstd = empty_with_layout(q_logical, shape=q_logical.shape[:-1], dtype=torch.float32)
-        k_rstd = empty_with_layout(k_logical, shape=k_logical.shape[:-1], dtype=torch.float32)
+    def empty_inverse_norm(ref):
+        shape = ref.shape[:-1]
+        if layout == "BNSD":
+            return torch.empty(shape, dtype=HIGH_DTYPE, device=q.device)
+        storage = torch.empty((shape[0], shape[2], shape[1]), dtype=HIGH_DTYPE, device=q.device)
+        return storage.transpose(1, 2)
+
+    persistent = template == TEMPLATE_PERSISTENT
+    save_tokens = not persistent or save_kernel_caches
+    if outputs.norm:
+        q_norm = empty_with_layout(q_logical, dtype=LOW_DTYPE)
+        k_norm = empty_with_layout(k_logical, dtype=LOW_DTYPE)
+        q_rstd = empty_inverse_norm(q_logical)
+        k_rstd = empty_inverse_norm(k_logical)
     else:
-        q_norm, k_norm = (q_logical, k_logical)
-        q_rstd = empty_with_layout(q_logical, shape=q_logical.shape[:-1], dtype=torch.float32)
+        # 固定内核 ABI 接收形状兼容的视图；禁用路径不写入，公开返回值为 None。
+        q_norm, k_norm = q_logical, k_logical
+        q_rstd = empty_inverse_norm(q_logical)
         k_rstd = q_rstd
-    beta_activated = empty_with_layout(beta_logical, shape=beta_logical.shape[:-1], dtype=torch.float32)
+    beta_activated = (empty_with_layout(beta_logical, shape=beta_logical.shape[:-1], dtype=HIGH_DTYPE)
+                      if outputs.beta or (persistent and save_kernel_caches) else beta_logical.squeeze(-1))
     chunk_count = (
-        _tnd_state_chunk_capacity(storage_length, initial_state.shape[0])
-        if layout_qkv == "TND"
+        staged._tnd_state_chunk_capacity(storage_length, initial_state.shape[0])
+        if layout == "TND"
         else (storage_length + CHUNK_SIZE - 1) // CHUNK_SIZE
     )
     chunk_matrix_shape = (physical_batches, n_v, chunk_count, CHUNK_SIZE, CHUNK_SIZE)
     g_cumsum_shape = (physical_batches, n_v, storage_length, dim)
-    Aqk = torch.empty(chunk_matrix_shape, dtype=torch.bfloat16, device=q.device)
-    Akk = torch.empty(chunk_matrix_shape, dtype=torch.bfloat16, device=q.device)
-    w = (
-        empty_with_layout(v_logical, dtype=torch.bfloat16)
-        if allocate_backward_inputs
-        else v_logical
-    )
-    u = (
-        empty_with_layout(v_logical, dtype=torch.bfloat16)
-        if allocate_backward_inputs
-        else v_logical
-    )
-    qg = (
-        empty_with_layout(v_logical, dtype=torch.bfloat16)
-        if disable_recompute
-        else v_logical
-    )
-    kg = (
-        empty_with_layout(v_logical, dtype=torch.bfloat16)
-        if allocate_backward_inputs
-        else v_logical
-    )
-    v_new = (
-        empty_with_layout(v_logical, dtype=torch.bfloat16)
-        if allocate_backward_inputs
-        else v_logical
-    )
-    g_cumsum = (
-        torch.empty(g_cumsum_shape, dtype=torch.float32, device=q.device)
-        if allocate_backward_inputs
-        else torch.as_strided(initial_state, g_cumsum_shape, (0,) * (len(g_cumsum_shape) - 1) + (1,))
-    )
-    state_is_compact = int(layout_qkv == "TND")
-    save_qg = int(disable_recompute)
-    save_g_cumsum = int(disable_recompute or not use_gate_in_kernel)
-    if internal_template == 2 and not return_intermediate_state:
+    def empty_chunk_cache():
+        if layout == "TND":
+            storage = torch.empty((chunk_count, n_v, CHUNK_SIZE, CHUNK_SIZE), dtype=LOW_DTYPE, device=q.device)
+            return storage.permute(1, 0, 2, 3).unsqueeze(0)
+        return torch.empty(chunk_matrix_shape, dtype=LOW_DTYPE, device=q.device)
+
+    # staged 的后续阶段读取 Aqk；persistent 在核内保留递推所需矩阵。
+    if persistent and not outputs.matrices:
+        chunk_matrix_shape = (1, 1, 1, CHUNK_SIZE, CHUNK_SIZE)
+        Aqk = torch.empty(chunk_matrix_shape, dtype=LOW_DTYPE, device=q.device)
+    else:
+        Aqk = empty_chunk_cache()
+    Akk = empty_chunk_cache() if outputs.matrices else Aqk
+    w = empty_with_layout(v_logical, dtype=LOW_DTYPE) if save_tokens else v_logical
+    u = empty_with_layout(v_logical, dtype=LOW_DTYPE) if save_tokens else v_logical
+    qg = empty_with_layout(v_logical, dtype=LOW_DTYPE) if save_kernel_caches else v_logical
+    kg = empty_with_layout(v_logical, dtype=LOW_DTYPE) if save_tokens else v_logical
+    v_new = empty_with_layout(v_logical, dtype=LOW_DTYPE) if save_tokens else v_logical
+    save_g_cumsum = int(save_kernel_caches)
+    if not save_g_cumsum:
+        g_cumsum_shape = (1, 1, 1, dim)
+        g_cumsum = initial_state.view(-1)[:dim].view(g_cumsum_shape)
+    elif layout == "TND":
+        storage = torch.empty((storage_length, n_v, dim), dtype=HIGH_DTYPE, device=q.device)
+        g_cumsum = storage.transpose(0, 1).unsqueeze(0)
+    else:
+        g_cumsum = torch.empty(g_cumsum_shape, dtype=HIGH_DTYPE, device=q.device)
+    state_is_compact = int(layout == "TND")
+    save_qg = int(save_kernel_caches)
+    if persistent and not outputs.chunk_states:
         h = initial_state[:1].unsqueeze(2)
     elif state_is_compact:
-        state_chunks = _tnd_state_chunk_capacity(storage_length, batch)
-        h = torch.empty(
-            (1, n_v, state_chunks, SUPPORTED_HEAD_DIM, SUPPORTED_HEAD_DIM), dtype=torch.float32, device=q.device,
+        state_chunks = staged._tnd_state_chunk_capacity(storage_length, batch)
+        storage = torch.empty(
+            (state_chunks, n_v, SUPPORTED_HEAD_DIM, SUPPORTED_HEAD_DIM),
+            dtype=HIGH_DTYPE,
+            device=q.device,
         )
+        h = storage.permute(1, 0, 2, 3).unsqueeze(0)
     else:
         h = torch.empty(
-            (batch, n_v, (storage_length + CHUNK_SIZE - 1) // CHUNK_SIZE, SUPPORTED_HEAD_DIM, SUPPORTED_HEAD_DIM,),
-            dtype=torch.float32, device=q.device,
+            (batch, n_v, (storage_length + CHUNK_SIZE - 1) // CHUNK_SIZE,
+             SUPPORTED_HEAD_DIM, SUPPORTED_HEAD_DIM),
+            dtype=HIGH_DTYPE,
+            device=q.device,
         )
-    core_num = _device_block_num(q)
-    workspace = allocate_stage1_workspace(1, 1, WORKSPACE_SLOTS, SUPPORTED_HEAD_DIM, ref=q)
-    qk_exchange = allocate_qk_exchange_workspace(active_block_num=core_num, ref=q)
-    final_state = torch.empty(initial_state.shape, dtype=initial_state.dtype, device=initial_state.device)
-    fn = _get_compiled_kernel(internal_template)
-    fn(
-        k_logical, v_logical, q_logical, beta_logical, g_logical, qk_exchange, A_log, dt_bias, kg, workspace.gamma_C,
-        workspace.Q_decayed, u, w, qg, g_cumsum, v_new, h, out_stage, initial_state, final_state, workspace.identity16,
-        q_norm, k_norm, q_rstd.unsqueeze(-1), k_rstd.unsqueeze(-1), beta_activated.unsqueeze(-1), Aqk, Akk, metadata,
-        float(scale), float(-5.0 if lower_bound is None else lower_bound), int(use_qk_l2norm_in_kernel),
-        gate_input_mode, int(use_beta_sigmoid_in_kernel), int(allow_neg_eigval), int(lower_bound is not None),
-        state_is_compact, save_qg, save_g_cumsum, int(return_intermediate_state), core_num,
+
+    workspace = staged.allocate_stage1_workspace(1, 1, WORKSPACE_SLOTS, SUPPORTED_HEAD_DIM, ref=q)
+    qk_exchange = staged.allocate_qk_exchange_workspace(active_block_num=core_num, ref=q)
+    final_state = torch.empty_like(initial_state) if outputs.final_state else initial_state
+    # 编译或启动前，检查实际传入内核的张量视图。
+    q_rstd_buffer = q_rstd.unsqueeze(-1)
+    k_rstd_buffer = k_rstd.unsqueeze(-1)
+    beta_buffer = beta_activated.unsqueeze(-1)
+    q_shape = (physical_batches, n_qk, storage_length, dim)
+    v_shape = (physical_batches, n_v, storage_length, dim)
+    state_shape = (batch, n_v, dim, dim)
+    chunk_state_shape = (physical_batches, n_v, chunk_count, dim, dim)
+    if persistent and not outputs.chunk_states:
+        chunk_state_shape = (1, n_v, 1, dim, dim)
+    buffers = (
+        ("k", k_logical, q_shape, LOW_DTYPE, False),
+        ("v", v_logical, v_shape, LOW_DTYPE, False),
+        ("q", q_logical, q_shape, LOW_DTYPE, False),
+        ("beta", beta_logical, (physical_batches, n_v, storage_length, 1), HIGH_DTYPE, False),
+        ("g", g_logical, v_shape, LOW_DTYPE, False),
+        ("qk_exchange", qk_exchange, (core_num, 2, 2, CHUNK_SIZE), HIGH_DTYPE, True),
+        ("A_log", A_log, (n_v,), HIGH_DTYPE, True),
+        ("dt_bias", dt_bias, (n_v, dim), HIGH_DTYPE, True),
+        ("kg", kg, v_shape, LOW_DTYPE, False),
+        ("gamma_C", workspace.gamma_C, (WORKSPACE_SLOTS * dim, 1), HIGH_DTYPE, True),
+        ("Q_decayed", workspace.Q_decayed, (WORKSPACE_SLOTS * CHUNK_SIZE, dim), LOW_DTYPE, True),
+        ("u", u, v_shape, LOW_DTYPE, False),
+        ("w", w, v_shape, LOW_DTYPE, False),
+        ("qg", qg, v_shape, LOW_DTYPE, False),
+        ("g_cumsum", g_cumsum, g_cumsum_shape, HIGH_DTYPE, False),
+        ("v_new", v_new, v_shape, LOW_DTYPE, False),
+        ("h", h, chunk_state_shape, HIGH_DTYPE, False),
+        ("out_stage", out_stage, (physical_batches, n_v, padded_length, dim), LOW_DTYPE, False),
+        ("initial_state", initial_state, state_shape, HIGH_DTYPE, True),
+        ("final_state", final_state, state_shape, HIGH_DTYPE, True),
+        ("identity16", workspace.identity16, (16, 16), torch.float16, True),
+        ("q_norm", q_norm, q_shape, LOW_DTYPE, False),
+        ("k_norm", k_norm, q_shape, LOW_DTYPE, False),
+        ("q_rstd", q_rstd_buffer, (physical_batches, n_qk, storage_length, 1), HIGH_DTYPE, False),
+        ("k_rstd", k_rstd_buffer, (physical_batches, n_qk, storage_length, 1), HIGH_DTYPE, False),
+        ("beta_activated", beta_buffer, (physical_batches, n_v, storage_length, 1), HIGH_DTYPE, False),
+        ("Aqk", Aqk, chunk_matrix_shape, LOW_DTYPE, False),
+        ("Akk", Akk, chunk_matrix_shape, LOW_DTYPE, False),
     )
-    q_norm_public = (
-        _public_bnsd_tensor(q_norm, layout_qkv)
-        if use_qk_l2norm_in_kernel and disable_recompute
-        else None
+    for name, value, shape, dtype, contiguous in buffers:
+        validate_buffer(name, value, shape, dtype, q.device, contiguous=contiguous)
+        if len(shape) == 4 and name not in ("initial_state", "final_state"):
+            require(value.stride(-1) == 1, f"{name} last stride must be 1")
+    expected_stride = (
+        (n_v * padded_length * dim, padded_length * dim, dim, 1)
+        if layout == "BNSD" else (padded_length * n_v * dim, dim, n_v * dim, 1)
     )
-    k_norm_public = (
-        _public_bnsd_tensor(k_norm, layout_qkv)
-        if use_qk_l2norm_in_kernel and disable_recompute
-        else None
+    for size, actual, expected in zip(out_stage.shape, out_stage.stride(), expected_stride):
+        require(size == 1 or actual == expected, f"out_stage stride incompatible with {layout}")
+    _get_compiled_kernel(template)(
+        k_logical,
+        v_logical,
+        q_logical,
+        beta_logical,
+        g_logical,
+        qk_exchange,
+        A_log,
+        dt_bias,
+        kg,
+        workspace.gamma_C,
+        workspace.Q_decayed,
+        u,
+        w,
+        qg,
+        g_cumsum,
+        v_new,
+        h,
+        out_stage,
+        initial_state,
+        final_state,
+        workspace.identity16,
+        q_norm,
+        k_norm,
+        q_rstd_buffer,
+        k_rstd_buffer,
+        beta_buffer,
+        Aqk,
+        Akk,
+        metadata,
+        float(scale),
+        float(kernel_lower_bound),
+        int(use_qk_l2norm_in_kernel),
+        gate_input_mode,
+        int(use_beta_sigmoid_in_kernel),
+        int(allow_neg_eigval),
+        int(use_gate_in_kernel and lower_bound is not None),
+        state_is_compact,
+        save_qg,
+        save_g_cumsum,
+        int(outputs.chunk_states),
+        int(outputs.matrices),
+        int(outputs.final_state),
+        core_num,
     )
-    q_rstd_public = (
-        _public_bnsd_scalar(q_rstd, layout_qkv)
-        if use_qk_l2norm_in_kernel and disable_recompute
-        else None
-    )
-    k_rstd_public = (
-        _public_bnsd_scalar(k_rstd, layout_qkv)
-        if use_qk_l2norm_in_kernel and disable_recompute
-        else None
-    )
-    beta_public = (
-        _public_bnsd_scalar(beta_activated, layout_qkv)
-        if use_beta_sigmoid_in_kernel and disable_recompute
-        else None
-    )
-    token_outputs = (
-        tuple((_public_bnsd_tensor(value, layout_qkv) for value in (w, u, qg, kg, v_new)))
-        if disable_recompute
-        else (None,) * 5
-    )
-    w_public, u_public, qg_public, kg_public, v_new_public = token_outputs
-    g_cumsum_public = (
-        _public_bnsd_tensor(g_cumsum, layout_qkv) if disable_recompute else None
-    )
-    h_public = _public_chunk_state(h, layout_qkv) if return_intermediate_state else None
+
+    def token_public(value):
+        if layout == "TND":
+            return value[0].transpose(0, 1).contiguous()
+        return value.transpose(1, 2).contiguous() if layout == "BSND" else value
+
+    def chunk_public(value):
+        return value[0].transpose(0, 1).contiguous() if layout == "TND" else value.transpose(1, 2).contiguous()
+
     return (
         out,
-        final_state if output_final_state else None,
-        q_norm_public,
-        k_norm_public,
-        q_rstd_public,
-        k_rstd_public,
-        beta_public,
-        _public_chunk_tensor(Aqk, layout_qkv, CHUNK_SIZE),
-        _public_chunk_tensor(Akk, layout_qkv, CHUNK_SIZE),
-        w_public if disable_recompute else None,
-        u_public if disable_recompute else None,
-        qg_public if disable_recompute else None,
-        kg_public if disable_recompute else None,
-        v_new_public if disable_recompute else None,
-        g_cumsum_public if disable_recompute else None,
-        h_public if return_intermediate_state else None,
+        final_state if outputs.final_state else None,
+        chunk_public(h) if outputs.chunk_states else None,
+        chunk_public(Aqk) if outputs.matrices else None,
+        chunk_public(Akk) if outputs.matrices else None,
+        token_public(w) if outputs.caches else None,
+        token_public(u) if outputs.caches else None,
+        token_public(qg) if outputs.caches else None,
+        token_public(kg) if outputs.caches else None,
+        token_public(v_new) if outputs.caches else None,
+        _public_gate_chunks(g_cumsum, spec, lengths) if outputs.caches else None,
+        staged._public_bnsd_tensor(q_norm, layout) if outputs.norm else None,
+        staged._public_bnsd_scalar(q_rstd, layout) if outputs.norm else None,
+        staged._public_bnsd_tensor(k_norm, layout) if outputs.norm else None,
+        staged._public_bnsd_scalar(k_rstd, layout) if outputs.norm else None,
+        (beta_activated[0].transpose(0, 1).contiguous() if layout == "TND"
+         else beta_activated.transpose(1, 2).contiguous()) if outputs.beta else None,
     )
+
+
+def _public_gate_chunks(values, spec, lengths):
+    """对外提供 FP32 chunk 缓存，内部仍使用 FP32 累加。
+
+    紧凑序列边界不一定按 chunk 对齐，因此使用与内核一致的紧凑槽位基址，
+    不直接重塑拼接后的 token 轴。"""
+    batch, _, heads, length, layout = spec
+    capacity = (
+        staged._tnd_state_chunk_capacity(length, batch)
+        if layout == "TND" else (length + CHUNK_SIZE - 1) // CHUNK_SIZE
+    )
+    chunk_shape = (capacity, heads, CHUNK_SIZE, SUPPORTED_HEAD_DIM)
+    shape = chunk_shape if layout == "TND" else (batch,) + chunk_shape
+    result = torch.zeros(shape, dtype=HIGH_DTYPE, device=values.device)
+    token_start = 0
+    for b, valid in enumerate(lengths):
+        chunks = (valid + CHUNK_SIZE - 1) // CHUNK_SIZE
+        physical = 0 if layout == "TND" else b
+        start = token_start if layout == "TND" else 0
+        sequence = values[physical, :, start:start + valid, :]
+        padding = chunks * CHUNK_SIZE - valid
+        if padding:
+            sequence = torch.nn.functional.pad(sequence, (0, 0, 0, padding))
+        sequence = sequence.reshape(heads, chunks, CHUNK_SIZE, SUPPORTED_HEAD_DIM).transpose(0, 1)
+        if layout == "TND":
+            base = staged._tnd_state_chunk_base(token_start, b)
+            result[base:base + chunks].copy_(sequence)
+            token_start += valid
+        else:
+            result[b, :chunks].copy_(sequence)
+    return result
 
 
 def flash_kda_fwd(
@@ -969,26 +964,35 @@ def flash_kda_fwd(
     v: torch.Tensor,
     g: torch.Tensor,
     beta: torch.Tensor,
-    scale: Optional[float] = SUPPORTED_HEAD_DIM ** (-0.5),
+    metadata: torch.Tensor,
     initial_state: Optional[torch.Tensor] = None,
     A_log: Optional[torch.Tensor] = None,
     dt_bias: Optional[torch.Tensor] = None,
-    lower_bound: Optional[float] = None,
-    layout_qkv: str = "TND",
-    metadata: Optional[torch.Tensor] = None,
+    cu_seqlens: Optional[torch.Tensor] = None,
+    seqused: Optional[torch.Tensor] = None,
+    *,
+    scale: Optional[float] = SUPPORTED_HEAD_DIM ** (-0.5),
+    output_final_state: bool = False,
+    return_intermediate_states: bool = False,
     use_qk_l2norm_in_kernel: bool = True,
     use_gate_in_kernel: bool = True,
     use_beta_sigmoid_in_kernel: bool = True,
-    disable_recompute: bool = True,
-    return_intermediate_state: bool = False,
     allow_neg_eigval: bool = False,
-    output_final_state: bool = False,
-) -> Tuple[torch.Tensor, ...]:
-    """Run training forward using the metadata-selected device template."""
+    disable_recompute: bool = True,
+    lower_bound: Optional[float] = None,
+    layout: str = "TND",
+) -> Tuple[Optional[torch.Tensor], ...]:
+    """按接口约定执行前向，返回固定的 16 个槽位。"""
     return _flash_kda_fwd_impl(
-        q, k, v, g, beta, scale, initial_state, A_log, dt_bias, lower_bound, layout_qkv, metadata,
-        use_qk_l2norm_in_kernel, use_gate_in_kernel, use_beta_sigmoid_in_kernel, disable_recompute,
-        return_intermediate_state, allow_neg_eigval, output_final_state,
+        q, k, v, g, beta, metadata, initial_state, A_log, dt_bias,
+        cu_seqlens=cu_seqlens, seqused=seqused, scale=scale,
+        output_final_state=output_final_state,
+        return_intermediate_states=return_intermediate_states,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        use_gate_in_kernel=use_gate_in_kernel,
+        use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel,
+        allow_neg_eigval=allow_neg_eigval, disable_recompute=disable_recompute,
+        lower_bound=lower_bound, layout=layout,
     )
 
 
@@ -1010,7 +1014,7 @@ def clear_caches():
 
 @export("flash_kda_fwd")
 def export_flash_kda_fwd():
-    """Collect the training forward compile request without running a Provider."""
+    """收集训练前向编译请求，不启动 Provider。"""
     try:
         _get_compiled_kernel()
     finally:
@@ -1018,189 +1022,143 @@ def export_flash_kda_fwd():
 
 
 _GRAPH_LIBRARY = torch.library.Library("cannbotdsl_flash_kda_fwd", "DEF")
+# 保留标量原始类型直到校验结束，避免 bool/float schema 提前转换整数开关或布尔 scale。
 _GRAPH_LIBRARY.define(
-    "flash_kda_fwd(Tensor q, Tensor k, Tensor v, Tensor g, Tensor beta, float? scale, "
-    "Tensor initial_state, Tensor? a_log, Tensor? dt_bias, float? lower_bound, str "
-    "layout_qkv, Tensor metadata, bool use_qk_l2norm_in_kernel=True, bool "
-    "use_gate_in_kernel=True, bool use_beta_sigmoid_in_kernel=True, bool "
-    "disable_recompute=True, bool return_intermediate_state=False, bool "
-    "allow_neg_eigval=False, bool output_final_state=False) -> (Tensor, Tensor?, Tensor?,"
-    " Tensor?, Tensor?, Tensor?, Tensor?, Tensor, Tensor, Tensor?, Tensor?, Tensor?, "
-    "Tensor?, Tensor?, Tensor?, Tensor?)",
+    "flash_kda_fwd(Tensor q, Tensor k, Tensor v, Tensor g, Tensor beta, "
+    "Tensor metadata, Tensor? initial_state=None, Tensor? A_log=None, Tensor? dt_bias=None, "
+    "Tensor? cu_seqlens=None, Tensor? seqused=None, *, "
+    f"Scalar? scale={SUPPORTED_HEAD_DIM ** (-0.5)}, "
+    "Scalar output_final_state=False, Scalar return_intermediate_states=False, "
+    "Scalar use_qk_l2norm_in_kernel=True, Scalar use_gate_in_kernel=True, "
+    "Scalar use_beta_sigmoid_in_kernel=True, Scalar allow_neg_eigval=False, "
+    "Scalar disable_recompute=True, Scalar? lower_bound=None, str layout=\"TND\") "
+    "-> (Tensor, Tensor?, Tensor?, Tensor?, Tensor?, Tensor?, Tensor?, Tensor?, "
+    "Tensor?, Tensor?, Tensor?, Tensor?, Tensor?, Tensor?, Tensor?, Tensor?)"
 )
 
 
 @torch.library.impl(_GRAPH_LIBRARY, "flash_kda_fwd", "Meta")
 def _flash_kda_fwd_meta(
-    q,
-    k,
-    v,
-    g,
-    beta,
-    scale,
-    initial_state,
-    a_log,
-    dt_bias,
-    lower_bound,
-    layout_qkv,
-    metadata,
-    use_qk_l2norm_in_kernel=True,
-    use_gate_in_kernel=True,
-    use_beta_sigmoid_in_kernel=True,
-    disable_recompute=True,
-    return_intermediate_state=False,
-    allow_neg_eigval=False,
-    output_final_state=False,
-):
-    del g, scale, dt_bias, lower_bound, metadata
-    if initial_state.dtype != torch.float32:
-        raise AssertionError("initial_state must be fp32")
-    if use_gate_in_kernel:
-        if a_log is None:
-            raise AssertionError("A_log is required when use_gate_in_kernel=True")
-    if allow_neg_eigval:
-        if not use_beta_sigmoid_in_kernel:
-            raise AssertionError("allow_neg_eigval=True requires use_beta_sigmoid_in_kernel=True")
-    storage_length = (
-        q.shape[0] if layout_qkv == "TND" else q.shape[2 if layout_qkv == "BNSD" else 1]
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    metadata: torch.Tensor,
+    initial_state: Optional[torch.Tensor] = None,
+    A_log: Optional[torch.Tensor] = None,
+    dt_bias: Optional[torch.Tensor] = None,
+    cu_seqlens: Optional[torch.Tensor] = None,
+    seqused: Optional[torch.Tensor] = None,
+    *,
+    scale: Optional[float] = SUPPORTED_HEAD_DIM ** (-0.5),
+    output_final_state: bool = False,
+    return_intermediate_states: bool = False,
+    use_qk_l2norm_in_kernel: bool = True,
+    use_gate_in_kernel: bool = True,
+    use_beta_sigmoid_in_kernel: bool = True,
+    allow_neg_eigval: bool = False,
+    disable_recompute: bool = True,
+    lower_bound: Optional[float] = None,
+    layout: str = "TND",
+) -> Tuple[Optional[torch.Tensor], ...]:
+    spec = validate_inputs(
+        q, k, v, g, beta, initial_state, A_log, dt_bias,
+        metadata=metadata, cu_seqlens=cu_seqlens, seqused=seqused, scale=scale,
+        output_final_state=output_final_state,
+        return_intermediate_states=return_intermediate_states,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        use_gate_in_kernel=use_gate_in_kernel,
+        use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel,
+        allow_neg_eigval=allow_neg_eigval, disable_recompute=disable_recompute,
+        lower_bound=lower_bound, layout=layout,
     )
-    chunk_count = (
-        _tnd_state_chunk_capacity(storage_length, initial_state.shape[0])
-        if layout_qkv == "TND"
-        else (storage_length + CHUNK_SIZE - 1) // CHUNK_SIZE
+    batch, n_qk, n_v, length, layout = spec
+    chunks = (
+        staged._tnd_state_chunk_capacity(length, batch)
+        if layout == "TND" else (length + CHUNK_SIZE - 1) // CHUNK_SIZE
     )
-    if layout_qkv == "TND":
-        q_bnsd_shape = (1, q.shape[1], storage_length, q.shape[2])
-        v_bnsd_shape = (1, v.shape[1], storage_length, v.shape[2])
-        q_public_shape = q.shape
-        v_public_shape = v.shape
-        state_public_shape = (
-            _tnd_state_chunk_capacity(storage_length, initial_state.shape[0]),
-            initial_state.shape[1],
-            SUPPORTED_HEAD_DIM,
-            SUPPORTED_HEAD_DIM,
-        )
-        chunk_matrix_shape = (chunk_count, v.shape[1], CHUNK_SIZE, CHUNK_SIZE)
-    elif layout_qkv == "BNSD":
-        q_bnsd_shape = q.shape
-        v_bnsd_shape = v.shape
-        q_public_shape = q.shape
-        v_public_shape = v.shape
-        state_public_shape = (
-            initial_state.shape[0],
-            initial_state.shape[1],
-            chunk_count,
-            SUPPORTED_HEAD_DIM,
-            SUPPORTED_HEAD_DIM,
-        )
-        chunk_matrix_shape = (
-            q.shape[0],
-            v.shape[1],
-            chunk_count,
-            CHUNK_SIZE,
-            CHUNK_SIZE,
-        )
-    else:
-        q_bnsd_shape = (q.shape[0], q.shape[2], q.shape[1], q.shape[3])
-        v_bnsd_shape = (v.shape[0], v.shape[2], v.shape[1], v.shape[3])
-        q_public_shape = q_bnsd_shape
-        v_public_shape = v_bnsd_shape
-        state_public_shape = (
-            initial_state.shape[0],
-            initial_state.shape[1],
-            chunk_count,
-            SUPPORTED_HEAD_DIM,
-            SUPPORTED_HEAD_DIM,
-        )
-        chunk_matrix_shape = (
-            q.shape[0],
-            v.shape[2],
-            chunk_count,
-            CHUNK_SIZE,
-            CHUNK_SIZE,
-        )
+    chunk_prefix = (chunks, n_v) if layout == "TND" else (batch, chunks, n_v)
+    dim = SUPPORTED_HEAD_DIM
+    norm_shape = (length, n_qk, dim) if layout == "TND" else (batch, n_qk, length, dim)
+    beta_shape = (length, n_v) if layout == "TND" else (batch, length, n_v)
+    state_shape = (batch, n_v, dim, dim)
+    matrix_shape = chunk_prefix + (CHUNK_SIZE, CHUNK_SIZE)
+    outputs = output_conditions(
+        inference=torch.is_inference_mode_enabled(), output_final_state=output_final_state,
+        return_intermediate_states=return_intermediate_states,
+        disable_recompute=disable_recompute,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel,
+    )
+
+    def empty(shape, dtype, enabled=True):
+        return torch.empty(shape, dtype=dtype, device="meta") if enabled else None
+
+    out, _ = _allocate_output(spec, "meta")
     return (
-        torch.empty_like(v, device="meta"),
-        torch.empty_like(initial_state, device="meta") if output_final_state else None,
-        torch.empty(q_public_shape, dtype=torch.bfloat16, device="meta")
-        if use_qk_l2norm_in_kernel and disable_recompute
-        else None,
-        torch.empty(q_public_shape, dtype=torch.bfloat16, device="meta")
-        if use_qk_l2norm_in_kernel and disable_recompute
-        else None,
-        torch.empty(q_public_shape[:-1], dtype=torch.float32, device="meta")
-        if use_qk_l2norm_in_kernel and disable_recompute
-        else None,
-        torch.empty(q_public_shape[:-1], dtype=torch.float32, device="meta")
-        if use_qk_l2norm_in_kernel and disable_recompute
-        else None,
-        torch.empty(v_public_shape[:-1], dtype=torch.float32, device="meta")
-        if use_beta_sigmoid_in_kernel and disable_recompute
-        else None,
-        torch.empty(chunk_matrix_shape, dtype=torch.bfloat16, device="meta"),
-        torch.empty(chunk_matrix_shape, dtype=torch.bfloat16, device="meta"),
-        torch.empty(v_public_shape, dtype=torch.bfloat16, device="meta")
-        if disable_recompute
-        else None,
-        torch.empty(v_public_shape, dtype=torch.bfloat16, device="meta")
-        if disable_recompute
-        else None,
-        torch.empty(v_public_shape, dtype=torch.bfloat16, device="meta")
-        if disable_recompute
-        else None,
-        torch.empty(v_public_shape, dtype=torch.bfloat16, device="meta")
-        if disable_recompute
-        else None,
-        torch.empty(v_public_shape, dtype=torch.bfloat16, device="meta")
-        if disable_recompute
-        else None,
-        torch.empty(v_public_shape, dtype=torch.float32, device="meta")
-        if disable_recompute
-        else None,
-        torch.empty(state_public_shape, dtype=torch.float32, device="meta")
-        if return_intermediate_state
-        else None,
+        out,
+        empty(state_shape, HIGH_DTYPE, outputs.final_state),
+        empty(chunk_prefix + (dim, dim), HIGH_DTYPE, outputs.chunk_states),
+        empty(matrix_shape, LOW_DTYPE, outputs.matrices),  # 因果 QK 矩阵 Aqk
+        empty(matrix_shape, LOW_DTYPE, outputs.matrices),  # 块内逆矩阵 Akk
+        empty(v.shape, LOW_DTYPE, outputs.caches),  # 反向缓存 w
+        empty(v.shape, LOW_DTYPE, outputs.caches),  # 反向缓存 u
+        empty(v.shape, LOW_DTYPE, outputs.caches),  # 门控查询缓存 qg
+        empty(v.shape, LOW_DTYPE, outputs.caches),  # 恢复键缓存 kg
+        empty(v.shape, LOW_DTYPE, outputs.caches),  # 更新值缓存 v_new
+        empty(chunk_prefix + (CHUNK_SIZE, dim), HIGH_DTYPE, outputs.caches),
+        empty(norm_shape, LOW_DTYPE, outputs.norm),
+        empty(norm_shape[:-1], HIGH_DTYPE, outputs.norm),
+        empty(norm_shape, LOW_DTYPE, outputs.norm),
+        empty(norm_shape[:-1], HIGH_DTYPE, outputs.norm),
+        empty(beta_shape, HIGH_DTYPE, outputs.beta),
     )
 
 
 @torch.library.impl(_GRAPH_LIBRARY, "flash_kda_fwd", "PrivateUse1")
 def _flash_kda_fwd_privateuse1(
-    q,
-    k,
-    v,
-    g,
-    beta,
-    scale,
-    initial_state,
-    a_log,
-    dt_bias,
-    lower_bound,
-    layout_qkv,
-    metadata,
-    use_qk_l2norm_in_kernel=True,
-    use_gate_in_kernel=True,
-    use_beta_sigmoid_in_kernel=True,
-    disable_recompute=True,
-    return_intermediate_state=False,
-    allow_neg_eigval=False,
-    output_final_state=False,
-):
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    metadata: torch.Tensor,
+    initial_state: Optional[torch.Tensor] = None,
+    A_log: Optional[torch.Tensor] = None,
+    dt_bias: Optional[torch.Tensor] = None,
+    cu_seqlens: Optional[torch.Tensor] = None,
+    seqused: Optional[torch.Tensor] = None,
+    *,
+    scale: Optional[float] = SUPPORTED_HEAD_DIM ** (-0.5),
+    output_final_state: bool = False,
+    return_intermediate_states: bool = False,
+    use_qk_l2norm_in_kernel: bool = True,
+    use_gate_in_kernel: bool = True,
+    use_beta_sigmoid_in_kernel: bool = True,
+    allow_neg_eigval: bool = False,
+    disable_recompute: bool = True,
+    lower_bound: Optional[float] = None,
+    layout: str = "TND",
+) -> Tuple[Optional[torch.Tensor], ...]:
     return flash_kda_fwd(
-        q, k, v, g, beta, scale, initial_state, a_log, dt_bias, lower_bound, layout_qkv, metadata,
-        use_qk_l2norm_in_kernel, use_gate_in_kernel, use_beta_sigmoid_in_kernel, disable_recompute,
-        return_intermediate_state, allow_neg_eigval, output_final_state,
+        q, k, v, g, beta, metadata, initial_state, A_log, dt_bias,
+        cu_seqlens=cu_seqlens, seqused=seqused, scale=scale,
+        output_final_state=output_final_state,
+        return_intermediate_states=return_intermediate_states,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        use_gate_in_kernel=use_gate_in_kernel,
+        use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel,
+        allow_neg_eigval=allow_neg_eigval, disable_recompute=disable_recompute,
+        lower_bound=lower_bound, layout=layout,
     )
 
 
 flash_kda_fwd_op = torch.ops.cannbotdsl_flash_kda_fwd.flash_kda_fwd
 
 
-# Old network code calls the public host function directly. Under Dynamo
-# (torch.compile, fullgraph) that host body is untraceable, so during
-# tracing the call is substituted with the registered dispatcher op;
-# eager calls keep taking the host path unchanged.
-
-
+# 旧网络代码直接调用公开 host 函数；Dynamo 全图捕获时无法追踪其函数体。
+# 追踪期间替换为已注册的分发算子，即时执行仍走 host 路径。
 @torch._dynamo.substitute_in_graph(flash_kda_fwd, can_constant_fold_through=False)
 def _flash_kda_fwd_graph(
     q: torch.Tensor,
@@ -1208,23 +1166,32 @@ def _flash_kda_fwd_graph(
     v: torch.Tensor,
     g: torch.Tensor,
     beta: torch.Tensor,
-    scale: Optional[float] = SUPPORTED_HEAD_DIM ** (-0.5),
+    metadata: torch.Tensor,
     initial_state: Optional[torch.Tensor] = None,
     A_log: Optional[torch.Tensor] = None,
     dt_bias: Optional[torch.Tensor] = None,
-    lower_bound: Optional[float] = None,
-    layout_qkv: str = "TND",
-    metadata: Optional[torch.Tensor] = None,
+    cu_seqlens: Optional[torch.Tensor] = None,
+    seqused: Optional[torch.Tensor] = None,
+    *,
+    scale: Optional[float] = SUPPORTED_HEAD_DIM ** (-0.5),
+    output_final_state: bool = False,
+    return_intermediate_states: bool = False,
     use_qk_l2norm_in_kernel: bool = True,
     use_gate_in_kernel: bool = True,
     use_beta_sigmoid_in_kernel: bool = True,
-    disable_recompute: bool = True,
-    return_intermediate_state: bool = False,
     allow_neg_eigval: bool = False,
-    output_final_state: bool = False,
-) -> Tuple[torch.Tensor, ...]:
+    disable_recompute: bool = True,
+    lower_bound: Optional[float] = None,
+    layout: str = "TND",
+) -> Tuple[Optional[torch.Tensor], ...]:
     return flash_kda_fwd_op(
-        q, k, v, g, beta, scale, initial_state, A_log, dt_bias, lower_bound, layout_qkv, metadata,
-        use_qk_l2norm_in_kernel, use_gate_in_kernel, use_beta_sigmoid_in_kernel, disable_recompute,
-        return_intermediate_state, allow_neg_eigval, output_final_state,
+        q, k, v, g, beta, metadata, initial_state, A_log, dt_bias,
+        cu_seqlens=cu_seqlens, seqused=seqused, scale=scale,
+        output_final_state=output_final_state,
+        return_intermediate_states=return_intermediate_states,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        use_gate_in_kernel=use_gate_in_kernel,
+        use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel,
+        allow_neg_eigval=allow_neg_eigval, disable_recompute=disable_recompute,
+        lower_bound=lower_bound, layout=layout,
     )
