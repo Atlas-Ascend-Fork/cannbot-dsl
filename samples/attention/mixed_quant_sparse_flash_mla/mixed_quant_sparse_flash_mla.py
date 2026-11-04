@@ -8,6 +8,7 @@
 
 import math
 import threading
+from functools import lru_cache
 from itertools import product
 from types import SimpleNamespace
 import cannbotdsl
@@ -1205,7 +1206,6 @@ class SlotMajorDelayLineGroup:
         self.state.clock[0] = (self.state.clock[0] + 1) % 8
 
 
-@kernel(profile=ProfileSpec(name="mixed_quant_sparse_flash_mla"))
 class MqsmlaKernel:
     """Device attention pipeline; tensor views and launch live in _run_mqsmla."""
 
@@ -1227,6 +1227,7 @@ class MqsmlaKernel:
         self.p_l1 = self.matmul.p_l1
         self.kvcache = Kvcache()
 
+    @jit
     def __call__(
         self,
         out_gm: Tensor,
@@ -3079,6 +3080,78 @@ def construct_workspace(metadata, addr_bytes=0):
     return torch.empty(ws_bytes + addr_bytes, dtype=torch.uint8, device=metadata.device)
 
 
+# Preserve the class launcher's device symbol for existing profiler filters.
+def MqsmlaKernel___call__(
+    out_gm: Tensor,
+    q_gm: Tensor,
+    sinks_gm: Tensor,
+    pa_phys_gm: Tensor,
+    pa_bt_gm: Tensor,
+    ws_gm: Tensor,
+    pa_phys_cmp_gm: Tensor,
+    pa_bt_cmp_gm: Tensor,
+    cmp_idx_gm: Tensor,
+    ori_idx_gm: Tensor,
+    cu_seqlens_q: Tensor,
+    softmax_lse: Tensor,
+    ori_topk_length: Tensor,
+    cmp_topk_length: Tensor,
+    metadata_gm: Tensor,
+    softmax_scale: dtypes.float32,
+    batch_consistency: dtypes.int32,
+    addr_ws_gm: Tensor,
+):
+    # Construct the pipeline inside the device trace, as the class launcher does.
+    op = MqsmlaKernel(N1, N1 // 2, TILE_N, pa_phys_cmp_gm is not None)
+    op(
+        out_gm,
+        q_gm,
+        sinks_gm,
+        pa_phys_gm,
+        pa_bt_gm,
+        ws_gm,
+        pa_phys_cmp_gm,
+        pa_bt_cmp_gm,
+        cmp_idx_gm,
+        ori_idx_gm,
+        cu_seqlens_q,
+        softmax_lse,
+        ori_topk_length,
+        cmp_topk_length,
+        metadata_gm,
+        softmax_scale,
+        batch_consistency,
+        addr_ws_gm,
+    )
+
+
+@lru_cache(maxsize=None)
+def _profiled_mqsmla_kernel(has_cmp, has_ori_length, has_cmp_length, has_lse):
+    # Only present Tensor arguments can be reported. Scratch buffers are internal.
+    inputs = (
+        "q_gm",
+        "sinks_gm",
+        "pa_phys_gm",
+        "pa_bt_gm",
+        "ori_idx_gm",
+        "cu_seqlens_q",
+        "metadata_gm",
+    )
+    if has_cmp:
+        inputs += ("pa_phys_cmp_gm", "pa_bt_cmp_gm", "cmp_idx_gm")
+    if has_ori_length:
+        inputs += ("ori_topk_length",)
+    if has_cmp_length:
+        inputs += ("cmp_topk_length",)
+    outputs = ("out_gm", "softmax_lse") if has_lse else ("out_gm",)
+    return kernel(
+        MqsmlaKernel___call__,
+        profile=ProfileSpec(
+            name="mixed_quant_sparse_flash_mla", inputs=inputs, outputs=outputs
+        ),
+    )
+
+
 @host
 def _run_mqsmla(
     q_gm: Tensor,
@@ -3130,11 +3203,11 @@ def _run_mqsmla(
         )
         if const_expr(cmp_len_gm is not None):
             cmp_len_flat = cmp_len_gm.view(cmp_len_gm.shape[0] * cmp_len_gm.shape[1])
-    op = MqsmlaKernel(
-        tile_cube_m=N1,
-        tile_vec_m=N1 // 2,
-        tile_n=TILE_N,
-        has_cmp=(cmp_kv_gm is not None),
+    op = _profiled_mqsmla_kernel(
+        cmp_kv_gm is not None,
+        ori_len_gm is not None,
+        cmp_len_gm is not None,
+        lse_gm is not None,
     )
     # Each core has two FD staging slots; workspace capacity determines the dynamic launch grid.
     blocks = workspace_gm.shape[0] // WS_BYTES_PER_CORE
