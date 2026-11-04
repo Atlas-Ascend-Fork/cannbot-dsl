@@ -16,7 +16,7 @@
 └──────────────────────────────────────────────────────┘
 ```
 
-这一层是**纯 Python**，可以随意写校验、异常、reshape、padding。`samples/rms_norm/rms_norm.py` 的 `rms_norm()` 是一个完整参考。
+这一层是**纯 Python**，用于输入校验、异常处理、reshape 和 padding。
 
 ## Tensor 要满足什么
 

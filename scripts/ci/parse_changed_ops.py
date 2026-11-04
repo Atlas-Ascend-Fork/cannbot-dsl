@@ -19,8 +19,8 @@ Usage:
         [--config test/test_config.yaml] [--op-list scripts/ci/operator_list.yaml]
 
 Input format of <changed_list> (one file per line):
-    samples/matmul/matmul.py            (git diff --name-only)
-    M\tsamples/matmul/matmul.py         (git diff --name-status)
+    samples/matmul/matmul/matmul.py            (git diff --name-only)
+    M\tsamples/matmul/matmul/matmul.py         (git diff --name-status)
 
 Output (stdout):
     op1;op2;op3   — operators to verify

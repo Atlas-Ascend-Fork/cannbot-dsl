@@ -1,0 +1,898 @@
+{
+  "schema_version": 1,
+  "operators": {
+    "fused_norm_rope_attn_rope_cast_fwd": {
+      "source": "samples/attention/fused_norm_rope_attn_rope_cast_fwd",
+      "test": "test/attention/fused_norm_rope_attn_rope_cast_fwd"
+    },
+    "add": {
+      "source": "samples/vector/add",
+      "test": "test/vector/add"
+    },
+    "attn_epilogue": {
+      "source": "samples/attention/attn_epilogue",
+      "test": "test/attention/attn_epilogue",
+      "native": {
+        "export": "attn_epilogue",
+        "sources": [
+          "@attn_epilogue/source/attn_epilogue.py",
+          "@attn_epilogue/source/attn_epilogue_common.py"
+        ]
+      }
+    },
+    "flash_kda": {
+      "source": "samples/attention/flash_kda",
+      "test": "test/attention/flash_kda",
+      "native": {
+        "export": "flash_kda",
+        "sources": [
+          "@flash_kda/source/flash_kda.py",
+          "@flash_kda/source/flash_kda_metadata.py",
+          "@flash_kda/source/flash_kda_staged.py",
+          "@flash_kda/source/flash_kda_persistent.py"
+        ]
+      }
+    },
+    "flash_kda_fwd": {
+      "source": "samples/attention/flash_kda_fwd",
+      "test": "test/attention/flash_kda_fwd",
+      "native": {
+        "export": "flash_kda_fwd",
+        "sources": [
+          "@flash_kda_fwd/source/flash_kda_fwd.py",
+          "@flash_kda_fwd/source/flash_kda_fwd_metadata.py",
+          "@flash_kda_fwd/source/flash_kda_fwd_staged.py",
+          "@flash_kda_fwd/source/flash_kda_fwd_persistent.py",
+          "@flash_kda_fwd/source/flash_kda_fwd_validation.py"
+        ]
+      }
+    },
+    "flash_kda_cp_preprocess": {
+      "source": "samples/attention/flash_kda_cp_preprocess",
+      "test": "test/attention/flash_kda_cp_preprocess",
+      "native": {
+        "export": "flash_kda_cp_preprocess",
+        "sources": [
+          "@flash_kda_cp_preprocess/source/flash_kda_cp_preprocess.py",
+          "@flash_kda_cp_preprocess/source/flash_kda_cp_preprocess_metadata.py"
+        ]
+      }
+    },
+    "flash_kda_cp_main": {
+      "source": "samples/attention/flash_kda_cp_main",
+      "test": "test/attention/flash_kda_cp_main",
+      "native": {
+        "export": "flash_kda_cp_main",
+        "sources": [
+          "@flash_kda_cp_main/source/flash_kda_cp_main.py",
+          "@flash_kda_cp_main/source/flash_kda_cp_main_metadata.py"
+        ]
+      }
+    },
+    "matmul": {
+      "inventory_path": "matmul",
+      "source": "samples/matmul/matmul",
+      "test": "test/matmul/matmul",
+      "ci_test": "test/matmul"
+    },
+    "batch_matmul": {
+      "source": "samples/matmul/batch_matmul",
+      "test": "test/matmul/batch_matmul"
+    },
+    "fused_matmul": {
+      "source": "samples/matmul/fused_matmul",
+      "test": "test/matmul/fused_matmul"
+    },
+    "dual_level_quant_matmul": {
+      "source": "samples/matmul/dual_level_quant_matmul",
+      "test": "test/matmul/dual_level_quant_matmul"
+    },
+    "quant_matmul": {
+      "source": "samples/matmul/quant_matmul",
+      "test": "test/matmul/quant_matmul"
+    },
+    "grouped_matmul": {
+      "source": "samples/matmul/grouped_matmul",
+      "test": "test/matmul/grouped_matmul"
+    },
+    "qwen_sparse_attn": {
+      "source": "samples/attention/qwen_sparse_attn",
+      "test": "test/attention/qwen_sparse_attn"
+    },
+    "stem_indexer": {
+      "source": "samples/attention/stem_indexer",
+      "test": "test/attention/stem_indexer"
+    },
+    "qsa_indexer": {
+      "source": "samples/attention/qsa_indexer",
+      "test": "test/attention/qsa_indexer"
+    },
+    "indexer_prologue_k": {
+      "source": "samples/attention/indexer_prologue_k",
+      "test": "test/attention/indexer_prologue_k",
+      "native": {
+        "export": "indexer_prologue_k",
+        "sources": [
+          "@indexer_prologue_k/source/indexer_prologue_k.py"
+        ]
+      }
+    },
+    "engram_gate": {
+      "source": "samples/vector/engram_gate",
+      "test": "test/vector/engram_gate",
+      "native": {
+        "export": "engram_gate",
+        "sources": [
+          "@engram_gate/source/engram_gate.py"
+        ]
+      }
+    },
+    "quant_block_sparse_attn": {
+      "source": "samples/attention/quant_block_sparse_attn",
+      "test": "test/attention/quant_block_sparse_attn"
+    },
+    "indexer_prologue_qw": {
+      "source": "samples/attention/indexer_prologue_qw",
+      "test": "test/attention/indexer_prologue_qw",
+      "native": {
+        "export": "indexer_prologue_qw",
+        "sources": [
+          "@indexer_prologue_qw/source/indexer_prologue_qw.py",
+          "@indexer_prologue_qw/source/indexer_prologue_qw_format.py"
+        ]
+      }
+    },
+    "quant_lightning_indexer": {
+      "source": "samples/attention/quant_lightning_indexer",
+      "test": "test/attention/quant_lightning_indexer",
+      "native": {
+        "export": "qli",
+        "sources": [
+          "@quant_lightning_indexer/source/quant_lightning_indexer.py",
+          "@quant_lightning_indexer_metadata/source/quant_lightning_indexer_metadata.py"
+        ]
+      }
+    },
+    "quant_lightning_indexer_metadata": {
+      "source": "samples/attention/quant_lightning_indexer_metadata",
+      "test": "test/attention/quant_lightning_indexer_metadata"
+    },
+    "quant_sparse_lightning_indexer": {
+      "source": "samples/attention/quant_sparse_lightning_indexer",
+      "test": "test/attention/quant_sparse_lightning_indexer",
+      "native": {
+        "export": "qsli",
+        "sources": [
+          "@quant_sparse_lightning_indexer/source/quant_sparse_lightning_indexer.py",
+          "@quant_sparse_lightning_indexer_metadata/source/quant_sparse_lightning_indexer_metadata.py"
+        ]
+      }
+    },
+    "quant_sparse_lightning_indexer_metadata": {
+      "source": "samples/attention/quant_sparse_lightning_indexer_metadata",
+      "test": "test/attention/quant_sparse_lightning_indexer_metadata"
+    },
+    "mixed_quant_sparse_flash_mla": {
+      "source": "samples/attention/mixed_quant_sparse_flash_mla",
+      "test": "test/attention/mixed_quant_sparse_flash_mla",
+      "native": {
+        "export": "mqsmla",
+        "sources": [
+          "@mixed_quant_sparse_flash_mla/source/mixed_quant_sparse_flash_mla.py",
+          "@mixed_quant_sparse_flash_mla/source/mixed_quant_sparse_flash_mla_metadata.py"
+        ]
+      }
+    },
+    "mixed_quant_sparse_flash_mla_metadata": {
+      "inventory_path": "attention/mixed_quant_sparse_flash_mla_metadata",
+      "source": "samples/attention/mixed_quant_sparse_flash_mla",
+      "test": "test/attention/mixed_quant_sparse_flash_mla_metadata"
+    },
+    "block_attn_res_update_rms_norm": {
+      "source": "samples/vector/block_attn_res_update_rms_norm",
+      "test": "test/vector/block_attn_res_update_rms_norm",
+      "native": {
+        "export": "block_attn_res_update_rms_norm",
+        "sources": [
+          "@block_attn_res_update_rms_norm/source/block_attn_res_update_rms_norm.py"
+        ]
+      }
+    },
+    "fused_recurrent_kda_snapshot": {
+      "source": "samples/attention/fused_recurrent_kda_snapshot",
+      "test": "test/attention/fused_recurrent_kda_snapshot",
+      "native": {
+        "export": "fused_recurrent_kda",
+        "sources": [
+          "@fused_recurrent_kda_snapshot/source/fused_recurrent_kda_snapshot.py"
+        ]
+      }
+    },
+    "fused_recurrent_kda_replayssm": {
+      "source": "samples/attention/fused_recurrent_kda_replayssm",
+      "test": "test/attention/fused_recurrent_kda_replayssm",
+      "native": {
+        "export": "fused_recurrent_kda_replayssm",
+        "sources": [
+          "@fused_recurrent_kda_replayssm/source/fused_recurrent_kda_replayssm.py"
+        ]
+      }
+    },
+    "mega_recurrent_kda": {
+      "source": "samples/attention/mega_recurrent_kda",
+      "test": "test/attention/mega_recurrent_kda",
+      "native": {
+        "export": "mega_recurrent_kda",
+        "sources": [
+          "@mega_recurrent_kda/source/mega_recurrent_kda.py"
+        ]
+      }
+    },
+    "mega_recurrent_kda_replayssm": {
+      "source": "samples/attention/mega_recurrent_kda_replayssm",
+      "test": "test/attention/mega_recurrent_kda_replayssm",
+      "native": {
+        "export": "mega_recurrent_kda_replayssm",
+        "sources": [
+          "@mega_recurrent_kda_replayssm/source/mega_recurrent_kda_replayssm.py"
+        ]
+      }
+    },
+    "commit_recurrent_kda_replayssm": {
+      "source": "samples/attention/commit_recurrent_kda_replayssm",
+      "test": "test/attention/commit_recurrent_kda_replayssm",
+      "native": {
+        "export": "commit_recurrent_kda_replayssm",
+        "sources": [
+          "@commit_recurrent_kda_replayssm/source/commit_recurrent_kda_replayssm.py"
+        ]
+      }
+    },
+    "quant_mla_prolog": {
+      "source": "samples/attention/quant_mla_prolog",
+      "test": "test/attention/quant_mla_prolog",
+      "native": {
+        "export": "quant_mla_prolog",
+        "sources": [
+          "@quant_mla_prolog/source/quant_mla_prolog.py"
+        ]
+      }
+    },
+    "mla_prolog": {
+      "source": "samples/attention/mla_prolog",
+      "test": "test/attention/mla_prolog"
+    },
+    "gather_v2": {
+      "source": "samples/vector/gather_v2",
+      "test": "test/vector/gather_v2"
+    },
+    "scatter_elements": {
+      "source": "samples/vector/scatter_elements",
+      "test": "test/vector/scatter_elements"
+    },
+    "moonep": {
+      "source": "samples/mc2/moonep",
+      "test": "test/mc2/moonep"
+    },
+    "sparse_flash_mla": {
+      "source": "samples/attention/sparse_flash_mla",
+      "test": "test/attention/sparse_flash_mla"
+    },
+    "sparse_flash_mla_metadata": {
+      "source": "samples/attention/sparse_flash_mla_metadata"
+    },
+    "dynamic_mx_quant_sr": {
+      "source": "samples/vector/dynamic_mx_quant_sr",
+      "test": "test/vector/dynamic_mx_quant_sr"
+    },
+    "mega_full_index": {
+      "source": "samples/attention/mega_full_index",
+      "test": "test/attention/mega_full_index"
+    },
+    "matmul_streamk": {
+      "source": "samples/matmul/matmul/matmul_streamk.py",
+      "test": "test/matmul/matmul/test_matmul_streamk.py"
+    },
+    "quant_batch_matmul_mxa8w4": {
+      "source": "samples/matmul/quant_matmul/quant_batch_matmul_mxa8w4.py",
+      "test": "test/matmul/quant_matmul/test_quant_batch_matmul_mxa8w4.py"
+    }
+  },
+  "native_exports": [
+    "mixed_quant_sparse_flash_mla",
+    "quant_lightning_indexer",
+    "quant_sparse_lightning_indexer",
+    "attn_epilogue",
+    "indexer_prologue_qw",
+    "indexer_prologue_k",
+    "engram_gate",
+    "block_attn_res_update_rms_norm",
+    "flash_kda",
+    "flash_kda_fwd",
+    "flash_kda_cp_preprocess",
+    "flash_kda_cp_main",
+    "fused_recurrent_kda_snapshot",
+    "fused_recurrent_kda_replayssm",
+    "mega_recurrent_kda",
+    "mega_recurrent_kda_replayssm",
+    "commit_recurrent_kda_replayssm",
+    "quant_mla_prolog"
+  ],
+  "ci": {
+    "skip_all_tests": false,
+    "ignore": [
+      ".pre-commit-config.yaml",
+      "install_deps.sh",
+      "scripts/ci/operator_list.yaml",
+      "scripts/ci/parse_changed_ops.py",
+      "scripts/format_cpp.sh",
+      "scripts/run_codespell.sh",
+      "test/test_config.yaml"
+    ],
+    "inventory": [
+      "fused_norm_rope_attn_rope_cast_fwd",
+      "add",
+      "attn_epilogue",
+      "flash_kda",
+      "flash_kda_fwd",
+      "flash_kda_cp_preprocess",
+      "flash_kda_cp_main",
+      "matmul",
+      "batch_matmul",
+      "fused_matmul",
+      "dual_level_quant_matmul",
+      "quant_matmul",
+      "grouped_matmul",
+      "qwen_sparse_attn",
+      "stem_indexer",
+      "qsa_indexer",
+      "indexer_prologue_k",
+      "engram_gate",
+      "quant_block_sparse_attn",
+      "indexer_prologue_qw",
+      "quant_lightning_indexer",
+      "quant_lightning_indexer_metadata",
+      "quant_sparse_lightning_indexer",
+      "quant_sparse_lightning_indexer_metadata",
+      "mixed_quant_sparse_flash_mla",
+      "mixed_quant_sparse_flash_mla_metadata",
+      "block_attn_res_update_rms_norm",
+      "fused_recurrent_kda_snapshot",
+      "fused_recurrent_kda_replayssm",
+      "mega_recurrent_kda",
+      "mega_recurrent_kda_replayssm",
+      "commit_recurrent_kda_replayssm",
+      "quant_mla_prolog",
+      "mla_prolog",
+      "gather_v2",
+      "scatter_elements",
+      "moonep",
+      "sparse_flash_mla",
+      "sparse_flash_mla_metadata",
+      "dynamic_mx_quant_sr",
+      "mega_full_index"
+    ],
+    "rules": [
+      {
+        "name": "mla_prolog",
+        "enabled": true,
+        "watch": [
+          "@mla_prolog/source",
+          "@mla_prolog/test"
+        ],
+        "tests": [
+          "@mla_prolog/test"
+        ]
+      },
+      {
+        "name": "add",
+        "enabled": true,
+        "watch": [
+          "@add/source",
+          "@add/test"
+        ],
+        "tests": [
+          "@add/test"
+        ]
+      },
+      {
+        "name": "attn_epilogue",
+        "enabled": true,
+        "watch": [
+          "@attn_epilogue/source",
+          "@attn_epilogue/test"
+        ],
+        "tests": [
+          "@attn_epilogue/test"
+        ]
+      },
+      {
+        "name": "flash_kda",
+        "enabled": true,
+        "watch": [
+          "@flash_kda/source",
+          "@flash_kda/test"
+        ],
+        "tests": [
+          "@flash_kda/test"
+        ]
+      },
+      {
+        "name": "flash_kda_fwd",
+        "enabled": true,
+        "watch": [
+          "@flash_kda_fwd/source",
+          "@flash_kda_fwd/test"
+        ],
+        "tests": [
+          "@flash_kda_fwd/test"
+        ]
+      },
+      {
+        "name": "flash_kda_cp_preprocess",
+        "enabled": true,
+        "watch": [
+          "@flash_kda_cp_preprocess/source",
+          "@flash_kda_cp_preprocess/test"
+        ],
+        "tests": [
+          "@flash_kda_cp_preprocess/test"
+        ]
+      },
+      {
+        "name": "flash_kda_cp_main",
+        "enabled": true,
+        "watch": [
+          "@flash_kda_cp_main/source",
+          "@flash_kda_cp_main/test"
+        ],
+        "tests": [
+          "@flash_kda_cp_main/test"
+        ]
+      },
+      {
+        "name": "block_attn_res_update_rms_norm",
+        "enabled": true,
+        "watch": [
+          "@block_attn_res_update_rms_norm/source",
+          "@block_attn_res_update_rms_norm/test"
+        ],
+        "tests": [
+          "@block_attn_res_update_rms_norm/test"
+        ]
+      },
+      {
+        "name": "fused_recurrent_kda_snapshot",
+        "enabled": true,
+        "watch": [
+          "@fused_recurrent_kda_snapshot/source",
+          "@fused_recurrent_kda_snapshot/test"
+        ],
+        "tests": [
+          "@fused_recurrent_kda_snapshot/test"
+        ]
+      },
+      {
+        "name": "fused_recurrent_kda_replayssm",
+        "enabled": true,
+        "watch": [
+          "@fused_recurrent_kda_replayssm/source",
+          "@fused_recurrent_kda_replayssm/test"
+        ],
+        "tests": [
+          "@fused_recurrent_kda_replayssm/test"
+        ]
+      },
+      {
+        "name": "mega_recurrent_kda",
+        "enabled": false,
+        "watch": [
+          "@mega_recurrent_kda/source",
+          "@mega_recurrent_kda/test"
+        ],
+        "tests": [
+          "@mega_recurrent_kda/test"
+        ]
+      },
+      {
+        "name": "mega_recurrent_kda_replayssm",
+        "enabled": false,
+        "watch": [
+          "@mega_recurrent_kda_replayssm/source",
+          "@mega_recurrent_kda_replayssm/test"
+        ],
+        "tests": [
+          "@mega_recurrent_kda_replayssm/test"
+        ]
+      },
+      {
+        "name": "commit_recurrent_kda_replayssm",
+        "enabled": true,
+        "watch": [
+          "@commit_recurrent_kda_replayssm/source",
+          "@commit_recurrent_kda_replayssm/test"
+        ],
+        "tests": [
+          "@commit_recurrent_kda_replayssm/test"
+        ]
+      },
+      {
+        "name": "quant_mla_prolog",
+        "enabled": true,
+        "watch": [
+          "@quant_mla_prolog/source",
+          "@quant_mla_prolog/test"
+        ],
+        "tests": [
+          "@quant_mla_prolog/test"
+        ]
+      },
+      {
+        "name": "matmul_streamk",
+        "enabled": true,
+        "watch": [
+          "@matmul_streamk/source",
+          "@matmul_streamk/test"
+        ],
+        "tests": [
+          "@matmul_streamk/test"
+        ]
+      },
+      {
+        "name": "quant_batch_matmul_mxa8w4",
+        "enabled": true,
+        "watch": [
+          "@quant_batch_matmul_mxa8w4/source",
+          "@quant_batch_matmul_mxa8w4/test"
+        ],
+        "tests": [
+          "@quant_batch_matmul_mxa8w4/test"
+        ]
+      },
+      {
+        "name": "matmul",
+        "enabled": true,
+        "watch": [
+          "@matmul/source",
+          "@matmul/test"
+        ],
+        "tests": [
+          "@matmul/ci_test"
+        ]
+      },
+      {
+        "name": "batch_matmul",
+        "enabled": true,
+        "watch": [
+          "@batch_matmul/source",
+          "@batch_matmul/test"
+        ],
+        "tests": [
+          "@batch_matmul/test"
+        ]
+      },
+      {
+        "name": "fused_matmul",
+        "enabled": true,
+        "watch": [
+          "@fused_matmul/source",
+          "@fused_matmul/test"
+        ],
+        "tests": [
+          "@fused_matmul/test"
+        ]
+      },
+      {
+        "name": "dual_level_quant_matmul",
+        "enabled": true,
+        "watch": [
+          "@dual_level_quant_matmul/source",
+          "@dual_level_quant_matmul/test"
+        ],
+        "tests": [
+          "@dual_level_quant_matmul/test"
+        ]
+      },
+      {
+        "name": "quant_matmul",
+        "enabled": true,
+        "watch": [
+          "@quant_matmul/source",
+          "@quant_matmul/test"
+        ],
+        "tests": [
+          "@quant_matmul/test"
+        ]
+      },
+      {
+        "name": "grouped_matmul",
+        "enabled": true,
+        "watch": [
+          "@grouped_matmul/source",
+          "@grouped_matmul/test"
+        ],
+        "tests": [
+          "@grouped_matmul/test"
+        ]
+      },
+      {
+        "name": "qwen_sparse_attn",
+        "enabled": true,
+        "watch": [
+          "@qwen_sparse_attn/source",
+          "@qwen_sparse_attn/test"
+        ],
+        "tests": [
+          "@qwen_sparse_attn/test"
+        ]
+      },
+      {
+        "name": "stem_indexer",
+        "enabled": true,
+        "watch": [
+          "@stem_indexer/source",
+          "@stem_indexer/test"
+        ],
+        "tests": [
+          "@stem_indexer/test"
+        ]
+      },
+      {
+        "name": "qsa_indexer",
+        "enabled": true,
+        "watch": [
+          "@qsa_indexer/source",
+          "@qsa_indexer/test"
+        ],
+        "tests": [
+          "@qsa_indexer/test"
+        ]
+      },
+      {
+        "name": "indexer_prologue_k",
+        "enabled": true,
+        "watch": [
+          "@indexer_prologue_k/source",
+          "@indexer_prologue_k/test"
+        ],
+        "tests": [
+          "@indexer_prologue_k/test"
+        ]
+      },
+      {
+        "name": "engram_gate",
+        "enabled": true,
+        "watch": [
+          "@engram_gate/source",
+          "@engram_gate/test"
+        ],
+        "tests": [
+          "@engram_gate/test"
+        ]
+      },
+      {
+        "name": "quant_block_sparse_attn",
+        "enabled": true,
+        "watch": [
+          "@quant_block_sparse_attn/source",
+          "@quant_block_sparse_attn/test"
+        ],
+        "tests": [
+          "@quant_block_sparse_attn/test"
+        ]
+      },
+      {
+        "name": "indexer_prologue_qw",
+        "enabled": true,
+        "watch": [
+          "@indexer_prologue_qw/source",
+          "@indexer_prologue_qw/test"
+        ],
+        "tests": [
+          "@indexer_prologue_qw/test"
+        ]
+      },
+      {
+        "name": "gather_v2",
+        "enabled": true,
+        "watch": [
+          "@gather_v2/source",
+          "@gather_v2/test"
+        ],
+        "tests": [
+          "@gather_v2/test"
+        ]
+      },
+      {
+        "name": "scatter_elements",
+        "enabled": true,
+        "watch": [
+          "@scatter_elements/source",
+          "@scatter_elements/test"
+        ],
+        "tests": [
+          "@scatter_elements/test"
+        ]
+      },
+      {
+        "name": "sparse_flash_mla",
+        "enabled": true,
+        "watch": [
+          "@sparse_flash_mla/source",
+          "@sparse_flash_mla_metadata/source",
+          "@sparse_flash_mla/test"
+        ],
+        "tests": [
+          "@sparse_flash_mla/test"
+        ]
+      },
+      {
+        "name": "shared",
+        "enabled": true,
+        "watch": [
+          "build.sh",
+          "install_deps.sh",
+          "test/conftest.py",
+          "scripts",
+          "requirements.txt",
+          ".pre-commit-config.yaml",
+          "catalog"
+        ],
+        "tests": [
+          "all"
+        ]
+      },
+      {
+        "name": "quant_lightning_indexer",
+        "enabled": true,
+        "watch": [
+          "@quant_lightning_indexer/source",
+          "@quant_lightning_indexer/test"
+        ],
+        "tests": [
+          "@quant_lightning_indexer/test"
+        ]
+      },
+      {
+        "name": "quant_lightning_indexer_metadata",
+        "enabled": true,
+        "watch": [
+          "@quant_lightning_indexer_metadata/source",
+          "@quant_lightning_indexer_metadata/test"
+        ],
+        "tests": [
+          "@quant_lightning_indexer_metadata/test",
+          "@quant_lightning_indexer/test"
+        ]
+      },
+      {
+        "name": "quant_sparse_lightning_indexer",
+        "enabled": true,
+        "watch": [
+          "@quant_sparse_lightning_indexer/source",
+          "@quant_sparse_lightning_indexer/test"
+        ],
+        "tests": [
+          "@quant_sparse_lightning_indexer/test"
+        ]
+      },
+      {
+        "name": "quant_sparse_lightning_indexer_metadata",
+        "enabled": true,
+        "watch": [
+          "@quant_sparse_lightning_indexer_metadata/source",
+          "@quant_sparse_lightning_indexer_metadata/test"
+        ],
+        "tests": [
+          "@quant_sparse_lightning_indexer_metadata/test",
+          "@quant_sparse_lightning_indexer/test"
+        ]
+      },
+      {
+        "name": "mixed_quant_sparse_flash_mla",
+        "enabled": true,
+        "watch": [
+          "@mixed_quant_sparse_flash_mla/source",
+          "@mixed_quant_sparse_flash_mla/test"
+        ],
+        "tests": [
+          "@mixed_quant_sparse_flash_mla/test"
+        ]
+      },
+      {
+        "name": "mixed_quant_sparse_flash_mla_metadata",
+        "enabled": true,
+        "watch": [
+          "@mixed_quant_sparse_flash_mla_metadata/source",
+          "@mixed_quant_sparse_flash_mla_metadata/test"
+        ],
+        "tests": [
+          "@mixed_quant_sparse_flash_mla/test",
+          "@mixed_quant_sparse_flash_mla_metadata/test"
+        ]
+      },
+      {
+        "name": "moonep",
+        "enabled": true,
+        "watch": [
+          "@moonep/source",
+          "@moonep/test"
+        ],
+        "tests": [
+          "@moonep/test"
+        ]
+      },
+      {
+        "name": "fused_norm_rope_attn_rope_cast_fwd",
+        "enabled": true,
+        "watch": [
+          "@fused_norm_rope_attn_rope_cast_fwd/source",
+          "@fused_norm_rope_attn_rope_cast_fwd/test"
+        ],
+        "tests": [
+          "@fused_norm_rope_attn_rope_cast_fwd/test"
+        ]
+      },
+      {
+        "name": "dynamic_mx_quant_sr",
+        "enabled": true,
+        "watch": [
+          "@dynamic_mx_quant_sr/source",
+          "@dynamic_mx_quant_sr/test"
+        ],
+        "tests": [
+          "@dynamic_mx_quant_sr/test"
+        ]
+      },
+      {
+        "name": "mega_full_index",
+        "enabled": true,
+        "watch": [
+          "@mega_full_index/source",
+          "@mega_full_index/test"
+        ],
+        "tests": [
+          "@mega_full_index/test"
+        ]
+      },
+      {
+        "name": "ds41_network",
+        "enabled": true,
+        "watch": [
+          "net/ds41/network.json"
+        ],
+        "tests": [
+          "@mixed_quant_sparse_flash_mla/test",
+          "@quant_lightning_indexer/test",
+          "@quant_lightning_indexer_metadata/test",
+          "@quant_sparse_lightning_indexer/test",
+          "@quant_sparse_lightning_indexer_metadata/test",
+          "@indexer_prologue_qw/test",
+          "@indexer_prologue_k/test",
+          "@engram_gate/test",
+          "@attn_epilogue/test"
+        ]
+      },
+      {
+        "name": "k3_network",
+        "enabled": true,
+        "watch": [
+          "net/k3/network.json"
+        ],
+        "tests": [
+          "@block_attn_res_update_rms_norm/test",
+          "@flash_kda/test",
+          "@flash_kda_fwd/test",
+          "@flash_kda_cp_preprocess/test",
+          "@flash_kda_cp_main/test",
+          "@fused_recurrent_kda_snapshot/test",
+          "@fused_recurrent_kda_replayssm/test",
+          "@mega_recurrent_kda/test",
+          "@mega_recurrent_kda_replayssm/test",
+          "@commit_recurrent_kda_replayssm/test",
+          "@quant_mla_prolog/test"
+        ]
+      }
+    ]
+  }
+}

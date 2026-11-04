@@ -1,6 +1,6 @@
 # 源码构建
 
-本文介绍 CANNBot-DSL 源码的环境准备、源码下载、编译安装和测试流程。章节结构与 HCCL 源码构建文档保持一致。本文只介绍宿主机部署方式；本项目当前不提供 Docker 构建方式。
+本文介绍在宿主机上准备环境、下载算子源码、编译安装 Native 算子包及运行测试的方法。
 
 ## 环境准备
 
@@ -12,7 +12,7 @@
 
 - Linux，CPU 架构为 `x86_64` 或 `aarch64`；
 - Python 3.10、3.11 或 3.12；
-- CANNBot-DSL 0.7.x；
+- CANNBot-DSL 0.8.0；
 - CANN Toolkit 开发套件包；
 - `pip` 及仓库 `requirements.txt` 中列出的 Python 依赖；
 - 与目标 NPU 匹配的 PyTorch、`torch_npu`（运行样例和 NPU 测试时需要）。
@@ -60,22 +60,24 @@ cd cannbot-dsl
 本项目提供统一的 Native 算子包构建入口。进入仓库根目录后，可先查看可构建的算子和算子组：
 
 ```bash
-cd net/native_package
-./run-build.sh --list
+bash packaging/native/run-build.sh --list
 ```
 
-构建全部已登记内容：
+配置构建环境并构建全部登记算子：
 
 ```bash
-./run-build.sh
+export PYTHON=/path/to/python3.12
+export CANN_ENV=/path/to/Ascend/ascend-toolkit/set_env.sh
+export CANNBOTDSL_WHEEL=/path/to/cannbot_dsl-0.8.0-cp312-cp312-manylinux_2_28_x86_64.whl
+bash packaging/native/run-build.sh
 ```
 
 也可以指定算子组、算子和目标架构：
 
 ```bash
-./run-build.sh --group ds41
-./run-build.sh --operator mqsmla
-./run-build.sh --group ds41 --target dav-2201
+bash packaging/native/run-build.sh --group ds41
+bash packaging/native/run-build.sh --operator mqsmla
+bash packaging/native/run-build.sh --group ds41 --target dav-2201
 ```
 
 默认目标架构为 `dav-3510`。构建脚本会根据 `operator_groups.toml` 查找 `samples/` 中登记的源码并生成安装包。
@@ -85,10 +87,10 @@ cd net/native_package
 构建成功后，安装输出目录中的 wheel：
 
 ```bash
-python3 -m pip install --force-reinstall output/groups/ds41/wheels/*.whl
+python3 -m pip install --force-reinstall packaging/native/output/groups/ds41/wheels/*.whl
 ```
 
-实际路径以构建日志和 `net/native_package/output/` 中的产物为准。
+实际路径以构建日志和 `packaging/native/output/` 中的产物为准。
 
 ### 卸载
 
@@ -99,12 +101,6 @@ python3 -m pip uninstall <package-name>
 ```
 
 ## 测试
-
-### 单元测试
-
-```bash
-python3 -m pytest net/native_package/test_build.py -v
-```
 
 ### 样例精度测试
 
@@ -130,10 +126,10 @@ bash build.sh --mode=cpu
 
 ### 构建产物
 
-构建缓存和产物位于 `net/native_package/`：
+构建缓存和产物位于 `packaging/native/`：
 
 ```text
-net/native_package/
+packaging/native/
 ├── .build/   # 编译缓存和临时文件
 └── output/   # Native、AICPU 和 wheel 产物
 ```

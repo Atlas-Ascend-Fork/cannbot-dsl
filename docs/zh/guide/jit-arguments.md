@@ -198,7 +198,7 @@ cannbotdsl.clear_compile_cache(clear_disk=True)       # 连磁盘 L2 一起清
 
 ### 在测试中预编译
 
-`test/rms_norm/test_rms_norm.py` 的做法是在用例里显式 `compile` 一次，把编译开销和执行开销分开：
+测试中可以显式 `compile` 一次，把编译开销和执行开销分开：
 
 ```python
 cannbotdsl.compile(

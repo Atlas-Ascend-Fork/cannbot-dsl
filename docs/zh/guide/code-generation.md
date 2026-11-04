@@ -139,7 +139,7 @@ records = get_debug_prints()   # 含标签、dtype、shape、存储位置、bloc
 
 ### 编译期分支选择实现
 
-`samples/rms_norm/rms_norm.py` 的 Host 入口会先判断 UB 能否装下一整行，再决定用哪个 Kernel 类：
+Host 入口可以先判断 UB 能否装下一整行，再决定使用哪个 Kernel 类：
 
 ```python
 @host

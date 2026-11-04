@@ -130,7 +130,7 @@ SIMD + SIMT 混合编程和纯 SIMT 编程都需要 CANN 9.2.0 及以上版本�
 | `from_torch_npu` 改为 `from torch import as_tensor` | 适配 cannbotdsl 0.0.3 时的调整，涉及 flash_attn、flash_kda、matmul、pointnet_sa、rms_norm、voxel_conv 多个样例 |
 | `flash_kda()` 新增**必选**参数 `metadata` | 算子改为「调度与计算解耦」，不再自行生成调度信息、也不再启动 AI CPU。旧调用方式不可用 |
 | `samples/matmul/` 拆成 `matmul/` 与 `quant_matmul/` | 导入路径与测试路径变化 |
-| `flash_kda_metadata` 撤并 | 实现并入 `samples/flash_kda/flash_kda_metadata.py`，不再是独立顶层样例目录 |
+| `flash_kda_metadata` 撤并 | 实现并入 `samples/attention/flash_kda/flash_kda_metadata.py`，不再是独立顶层样例目录 |
 
 升级版本时的建议：先跑一遍自己算子的精度测试，再看 CHANGELOG 里涉及到的接口。
 

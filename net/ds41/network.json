@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "name": "ds41",
+  "operators": [
+    "mixed_quant_sparse_flash_mla",
+    "quant_lightning_indexer",
+    "quant_sparse_lightning_indexer",
+    "indexer_prologue_qw",
+    "indexer_prologue_k",
+    "engram_gate",
+    "attn_epilogue"
+  ]
+}

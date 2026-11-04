@@ -226,11 +226,8 @@ class MixKernel:
 它们的正确用途是：在**纯 AIC 或纯 AIV** 的 kernel 里按核类型做编译期特化，不是在 Mix kernel 里分派。
 :::
 
-正确的组织方式是**把 Cube 侧和 Vector 侧写成两个类（或两组 `@jit` 方法）**，由 kernel 入口按阶段调用，编译器按核类型裁剪。`samples/flash_attn/flash_attn.py` 就是这个结构（`Cube` 与 `Vector` 两个类），比在一个函数体里写 if-else 清晰得多，也避开了上面那个坑。
+正确的组织方式是**把 Cube 侧和 Vector 侧写成两个类（或两组 `@jit` 方法）**，由 kernel 入口按阶段调用，编译器按核类型裁剪。完整示例见 `samples/attention/flash_kda/flash_kda_staged.py` 中的 `StageOneMatmul` 与 `StageOneVector`。
 
-::: info 待核实
-Mix kernel 的入口分派细节（谁负责把两侧代码路由到对应的核）官方文档站没有专门说明。以 `samples/flash_attn/flash_attn.py` 为模板。
-:::
 
 要点：
 

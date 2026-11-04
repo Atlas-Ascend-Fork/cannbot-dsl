@@ -24,3 +24,6 @@ log/
 oat_reports/
 *.log
 codespell_reports/
+# Isolated Native build caches and artifacts.
+packaging/native/.build/
+packaging/native/output/

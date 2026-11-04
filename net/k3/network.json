@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "name": "k3",
+  "operators": [
+    "block_attn_res_update_rms_norm",
+    "flash_kda",
+    "flash_kda_fwd",
+    "flash_kda_cp_preprocess",
+    "flash_kda_cp_main",
+    "fused_recurrent_kda_snapshot",
+    "fused_recurrent_kda_replayssm",
+    "mega_recurrent_kda",
+    "mega_recurrent_kda_replayssm",
+    "commit_recurrent_kda_replayssm",
+    "quant_mla_prolog"
+  ]
+}

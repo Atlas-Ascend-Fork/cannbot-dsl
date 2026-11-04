@@ -11,7 +11,9 @@ cannbot-dsl/
 │   └── project/         # 文档站构建工程
 ├── samples/             # 算子样例、样例导航和 README
 ├── test/                # 与样例对应的测试代码
-├── net/native_package/  # Native 算子包构建工程
+├── catalog/             # 算子源码、测试及 Native 依赖清单
+├── packaging/native/    # Native 算子包构建工程
+├── net/                 # 网络算子分组
 ├── figures/             # 仓库根 README 使用的图片
 ├── build.sh             # CI 环境校验和测试调度入口
 └── requirements.txt     # Python 依赖
@@ -19,11 +21,11 @@ cannbot-dsl/
 
 ## `samples/`
 
-每个子目录对应一个算子或一组紧密相关的实现。阅读样例时，应从该目录的 README 开始；样例性能图片统一放在根目录 `figures/samples/<算子>/` 下。样例总导航位于 [`samples/`](../../../samples/)。
+一级目录按 `attention`、`matmul`、`vector`、`mc2` 分类，二级目录对应一个算子或一组紧密相关的实现。KDA 归入 `attention`；`mc2` 包含通信及通算融合样例。阅读样例时，应从该目录的 README 开始；样例性能图片统一放在根目录 `figures/samples/<算子>/` 下。分类规则和完整算子导航见 [samples/](https://gitcode.com/cann/cannbot-dsl/tree/master/samples)。
 
 ## `test/`
 
-测试目录与 `samples/` 基本对应，用于验证实现的功能和精度。修改样例后，应运行对应的测试文件。
+测试使用 `test/<类别>/<算子>/`，与 `samples/<类别>/<算子>/` 对应，用于验证实现的功能和精度。共享配置、加载器和测试路由位于 `test/` 根目录。修改样例后，应运行对应的测试文件。
 
 ## `docs/`
 

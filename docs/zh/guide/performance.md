@@ -421,11 +421,11 @@ for i in cannbotdsl.range(n, unroll=4):
 | --- | --- |
 | Host 侧 tiling 的完整方法论 | `samples/matmul/matmul/matmul.py` 的 `MatmulTiling` |
 | 分核调度与长尾处理 | `samples/matmul/matmul/matmul_streamk.py` |
-| UB 预算推导 + 多实现分支 | `samples/rms_norm/rms_norm.py` |
-| Cube + Vector 混合流水 | `samples/flash_attn/`、`samples/flash_mla_with_kvcache/` |
-| AI CPU 调度 + 稀疏访问 | `samples/qwen_sparse_attn/`、`samples/qsa_indexer/` |
+| UB 预算推导 + 多实现分支 | `samples/vector/engram_gate/engram_gate.py` |
+| Cube + Vector 混合流水 | `samples/attention/flash_kda/` |
+| AI CPU 调度 + 稀疏访问 | `samples/attention/qwen_sparse_attn/`、`samples/attention/qsa_indexer/` |
 | 量化矩阵乘 | `samples/matmul/quant_matmul/` |
-| 深度软件流水 + 跨核 RingBuffer | `samples/flash_kda/`、`samples/mixed_quant_sparse_flash_mla/` |
+| 深度软件流水 + 跨核 RingBuffer | `samples/attention/flash_kda/`、`samples/attention/mixed_quant_sparse_flash_mla/` |
 
 各样例目录下的 README 带有性能对比图和测试条件，是判断「我的算子算不算快」的参照。
 

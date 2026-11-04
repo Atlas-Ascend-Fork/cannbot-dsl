@@ -255,7 +255,7 @@ config = TileConfig(rows=64, columns=128)
 ┌──────────────────────────────────────────────────────┐
 │ 第 3 层：torch 接口函数（普通 Python）                │
 │   校验 shape/dtype、分配输出、reshape、调用 @host      │
-│   例：samples/rms_norm/rms_norm.py 的 rms_norm()      │
+│   例：普通 Python 函数校验输入并调用 @host      │
 ├──────────────────────────────────────────────────────┤
 │ 第 2 层：Host 侧 tiling + @host 入口                  │
 │   算 tile 大小、选实现、决定 block 数、启动 Kernel     │

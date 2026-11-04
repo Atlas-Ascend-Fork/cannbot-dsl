@@ -25,7 +25,7 @@ const guideSidebar = [
   { text: '源码构建', link: '/zh/install/source-build' },
   { text: '编程模型', link: '/zh/guide/overview' },
   { text: '仓库结构', link: '/zh/guide/repository' },
-  { text: '样例导航', link: '/samples/' }
+  { text: '样例导航', link: 'https://gitcode.com/cann/cannbot-dsl/tree/master/samples' }
 ]
 
 const programmingModelSidebar = [
@@ -1877,7 +1877,7 @@ export default defineConfig({
   rewrites: rewriteReadmes,
   cleanUrls: false,
   // Repository samples and contribution guides live outside the VitePress source tree.
-  ignoreDeadLinks: [/samples/, /test/, /CONTRIBUTION_DOC_en/, /CHANGELOG/, /LICENSE/],
+  ignoreDeadLinks: [/CONTRIBUTION_DOC_en/, /CHANGELOG/, /LICENSE/],
   lastUpdated: true,
   markdown: {
     math: true
@@ -1902,7 +1902,7 @@ export default defineConfig({
       { text: '算子开发指南', items: [
         { text: '源码构建', link: '/zh/install/source-build' },
         { text: '编程模型', link: '/zh/guide/overview' },
-        { text: '样例导航', link: 'https://gitcode.com/cann/cannbot-dsl/blob/master/samples/README.md' }
+        { text: '样例导航', link: 'https://gitcode.com/cann/cannbot-dsl/tree/master/samples' }
       ] },
       { text: 'CANNBot-DSL API', items: [
         { text: '语言', link: '/zh/api/language/' },

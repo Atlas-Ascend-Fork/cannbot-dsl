@@ -15,8 +15,10 @@ import pytest
 
 _samples_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "samples")
 _samples_dir = os.path.abspath(_samples_dir)
-if _samples_dir not in sys.path:
-    sys.path.insert(0, _samples_dir)
+for _category in ("attention", "matmul", "vector", "mc2"):
+    _category_dir = os.path.join(_samples_dir, _category)
+    if _category_dir not in sys.path:
+        sys.path.insert(0, _category_dir)
 
 
 def pytest_configure(config):

@@ -2,10 +2,9 @@
 
 这一节从最小的向量加开始，分五步加到「多核 + tiling + double buffer + torch 接口 + 精度测试」，把前面几节的概念串起来。
 
-::: warning 关于本节代码的验证状态
-Step 1 改写自 [Reg 矢量计算概述](../api/compute/vector/overview.md)的官方示例。文档构建检查用于验证页面生成和站内链接，**不代表 API 示例已通过设备运行验证**。所以请把它当作**结构正确的起点**，而不是保证可运行的代码——第一次跑的时候对照报错逐步调整是正常的。
-
-Step 2 之后的代码按 `samples/rms_norm` 的结构逐步扩展，用于讲解模式；落到具体算子时请以 `samples/` 下对应样例为准，那些代码有配套测试。
+::: info 示例范围
+Step 1 介绍 [Reg 矢量计算](../api/compute/vector/overview.md)，后续步骤介绍分块、归约和 Host 封装。
+完整算子的接口、运行条件和测试方法见 [算子样例](https://gitcode.com/cann/cannbot-dsl/tree/master/samples)。
 :::
 
 ## 准备
@@ -331,7 +330,7 @@ def vec_add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return out
 ```
 
-这一层是**普通 Python**，不受 DSL 约束，可以随意写校验和 reshape。`samples/rms_norm/rms_norm.py` 的 `rms_norm()` 函数是一个更完整的参考（处理任意 rank、推导归一化维度、准备副输出）。
+这一层是**普通 Python**，用于输入校验、形状转换、输出分配和 Host 调用。
 
 这一层的完整讲法——stream 语义、多输出与原地更新、workspace 分配、注册成 torch 自定义算子——在[torch 接口与 stream 语义](./torch-interop.md)。本节先按能跑的最小版本写。
 

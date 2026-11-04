@@ -54,7 +54,7 @@ use_again(value)  # 复用同一 Tensor，不推进读游标
 自动数据同步**不覆盖**：
 
 - **VF 区域内的 UB 地址重叠。** 同一个 VF 里先 `vstore` 到某个 UB 地址、再 `vload` 同一地址，需要按接口约束自己插 [`vmem_bar`](../api/compute/vector/reg_sync/vmem-bar.md)。
-- **需要精确控制某条流水的等待点。** 深度流水的 Cube 算子会用 pipe 级同步显式等某条搬运流水，例如 `samples/flash_attn` 里的写法：
+- **需要精确控制某条流水的等待点。** 深度流水的 Cube 算子会用 pipe 级同步显式等某条搬运流水，例如：
 
 ```python
 from cannbotdsl import PIPE

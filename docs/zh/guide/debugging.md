@@ -142,7 +142,7 @@ python -m pip install -r requirements.txt
 运行单个样例的测试：
 
 ```bash
-python3 -m pytest test/sparse_flash_attention/test_sparse_flash_attention.py -v
+python3 -m pytest test/attention/qwen_sparse_attn/test_qwen_sparse_attn.py -v
 ```
 
 修改一个样例时，优先运行与它直接对应的测试；提交前再按 CI 要求扩大范围。

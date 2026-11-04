@@ -28,82 +28,61 @@ def export_add():
 
 函数体就是普通 Python，所以你可以用循环枚举配置组合——dtype × layout × 页大小 × mask 模式等。配置越全，覆盖越广，但构建时间和包体积也越大。
 
-## 打包工程：`net/native_package`
+## Native 打包工程
 
-仓库提供了一个现成的打包工程，通过 `cannbotdsl.aot.build` 完成 Native 编译与 wheel 打包。**算子源码直接取自 `samples/` 目录，不需要复制到别处。**
+`packaging/native/` 通过 `cannbotdsl.aot.build` 编译登记的算子，并生成 wheel。
+源码位于 `samples/`，路径与辅助模块在 `catalog/operators.json` 中维护。
+例如，`operators` 映射中的一个算子定义为：
 
-### 登记算子
-
-在 `operator_groups.toml` 中登记算子名与源文件名：
-
-```toml
-[operators]
-mqsmla = ["mixed_quant_sparse_flash_mla.py", "mixed_quant_sparse_flash_mla_metadata.py"]
-qli = ["quant_lightning_indexer.py", "quant_lightning_indexer_metadata.py"]
-qsli = ["quant_sparse_lightning_indexer.py", "quant_sparse_lightning_indexer_metadata.py"]
-
-[groups]
-ds41 = ["mqsmla", "qli", "qsli"]
+```json
+{
+  "mixed_quant_sparse_flash_mla": {
+    "source": "samples/attention/mixed_quant_sparse_flash_mla",
+    "native": {
+      "export": "mqsmla",
+      "sources": [
+        "@mixed_quant_sparse_flash_mla/source/mixed_quant_sparse_flash_mla.py",
+        "@mixed_quant_sparse_flash_mla/source/mixed_quant_sparse_flash_mla_metadata.py"
+      ]
+    }
+  }
+}
 ```
 
-规则：
-
-- **算子名必须与源码中的 `@export(...)` 名称一致。**
-- 源文件按**文件名**在 `samples/` 下递归查找，所以文件放在任意子目录都可以。
-- **算子用到的辅助模块必须一并列在它的文件数组里**，例如 `matmul_streamk = ["matmul_streamk.py", "_sample_raw_vf.py", "device_properties.py"]`。漏列会导致 wheel 内缺模块，装载后 import 失败。
-- 采样文件的基名必须唯一：扁平化后文件名即模块名，重名会被构建脚本直接拒绝。
-
-### 构建
-
-在 `net/native_package` 下执行：
+`native.export` 与源码中的 `@export(...)` 名称一致；`native.sources` 列出主模块
+及其辅助模块。`net/<网络>/network.json` 通过算子 ID 选择分组成员。
+在仓库根目录生成构建配置：
 
 ```bash
-./run-build.sh --list                 # 查看可用算子和组
-./run-build.sh                        # 全部已登记算子
-./run-build.sh --group ds41           # 一个组
-./run-build.sh --operator mqsmla      # 单个算子
-./run-build.sh --operator mixed_quant_sparse_flash_mla.py   # 也可以传源文件名
+python3 scripts/ci/sync_catalog.py --write
+python3 scripts/ci/sync_catalog.py --check
 ```
 
-默认目标是 `dav-3510`，可通过 `--target` 切换。
+生成的 `packaging/native/operator_groups.toml` 使用相对 `samples/` 的源码路径。
+同一次构建中的模块使用文件名作为包内模块名，不同来源的同名模块会在编译前报错。
 
-构建前需要准备：
+### 构建与安装
+
+在仓库根目录执行：
 
 ```bash
 export PYTHON=/path/to/python3.12
-export CANN_ENV=/path/to/Ascend/cann/set_env.sh
-export CANNBOTDSL_WHEEL=/path/to/cannbotdsl-0.8.0-cp312-cp312-manylinux_2_28_x86_64.whl
-./run-build.sh --group ds41
+export CANN_ENV=/path/to/Ascend/ascend-toolkit/set_env.sh
+export CANNBOTDSL_WHEEL=/path/to/cannbot_dsl-0.8.0-cp312-cp312-manylinux_2_28_x86_64.whl
+
+bash packaging/native/run-build.sh --list
+bash packaging/native/run-build.sh --group ds41
+bash packaging/native/run-build.sh --operator mqsmla
+python3 -m pip install packaging/native/output/groups/ds41/wheels/*.whl
 ```
 
-`run-build.sh` 会优先选择 `net/` 下修改时间最新的 `cannbotdsl-*.whl`；`CANNBOTDSL_WHEEL` 可以显式指定版本。需要包含 `cannbotdsl.aot.export/build/register_directory` 的 0.8.0 wheel。`--list` / `--help` 不需要 CANN 环境或 wheel。
+默认目标是 `dav-3510`，可通过 `--target dav-2201` 指定其他受支持目标。
+`--list` 和 `--help` 可直接运行。环境配置及产物目录见
+[源码构建](../install/source-build.md)。
 
-### 产物布局
-
-构建按选择类型分别保存，彼此不会覆盖：
-
-```text
-native_package/
-├── .build/
-│   ├── frameworks/<dsl-wheel-sha256>/
-│   ├── groups/ds41/
-│   ├── operators/mqsmla/
-│   └── all/
-└── output/
-    ├── groups/ds41/{native,aicpu,wheels}/
-    ├── operators/mqsmla/{native,aicpu,wheels}/
-    └── all/{native,aicpu,wheels}/
-```
-
-`.build/` 是编译缓存和临时目录，`output/` 只包含当前成功发布的产物。**构建失败时不会替换已有的成功产物。**
-
-生成的算子 wheel 依赖 `cannbotdsl>=0.8.0,<0.9`，导入时通过 `cannbotdsl.aot.register_directory` 注册 Native 资源。
-
-### AICore 与 AICPU 两条路径
-
-- AICore 部分通过 `cannbotdsl.aot` 导出。
-- AICPU metadata 在各自独立的编译目录生成，随 wheel 安装到 `ops/_aicpu/`，运行时优先加载这些预编译文件。
-- 直接运行源码时仍保留原有的 metadata 编译路径。
+wheel 分发名为 `cannbot-arena-net`，Python 包名为 `ops`，依赖 `cannbot-dsl>=0.8.0`。
+导入 `ops` 时通过 `cannbotdsl.aot.register_directory` 注册 Native 资源。
+AICore 使用 AOT 导出；配套 AICPU metadata 资源安装在 `ops/_aicpu/`。
 
 ### 验证二进制覆盖
 
@@ -144,7 +123,7 @@ AOT 的核心工作量不在构建流程，而在**决定导出哪些配置**。
 | 离散且数量有限的配置（dtype、layout、页大小、mask 模式） | 在 `@export` 函数里枚举组合 |
 | 影响代码结构的内层 tile 参数 | 固定成若干档，按档导出 |
 
-仓库里 DS41 的实际做法可以作为参考：默认导出 MQSMLA 的 36 个配置、QLI 和 QSLI 各 18 个配置，覆盖 PA_BBND/TND、`mask_mode=0/3`、因果压缩比 1/2、PA 页大小 64/128；B、T1 和 K 序列长度作为动态轴。`attn_epilogue` 的 `T` 参与编译（tiling 与形状随 `T` 变化），不能声明成动态轴，因此按 28/32 核配额枚举代表性 token 数（`T=1,72,128,256,512,1024,2048,4096,8192`，共 18 个配置）。
+DS41 的静态配置由各算子的 `export_*` 函数定义。QLI、QSLI 等算子枚举布局、掩码、压缩比和分页大小，动态维度通过 TensorSpec 表达；`attn_epilogue` 的 token 数和核配额按静态配置枚举。具体组合以对应导出函数为准。
 
 配置集合也可以外置成 JSON，通过环境变量指定：
 

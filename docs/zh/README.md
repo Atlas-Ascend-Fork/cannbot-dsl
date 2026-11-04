@@ -24,7 +24,7 @@ features:
   - icon: 🧩
     title: 算子样例
     details: 查看典型算子场景的实现、使用方式和精度验证方法。
-    link: ../../samples/
+    link: https://gitcode.com/cann/cannbot-dsl/tree/master/samples
   - icon: 📋
     title: API 参考
     details: 查阅 Host、Kernel 和 AI CPU 接口说明。
@@ -35,7 +35,7 @@ features:
 
 ## 关于 CANNBot-DSL
 
-CANNBot-DSL 提供基于 Ascend NPU 的复杂算子样例、编程模型说明和 API 参考。源码构建见[源码构建](./install/source-build.md)，样例验证见[运行测试](../../test/)。
+CANNBot-DSL 提供基于 Ascend NPU 的复杂算子样例、编程模型说明和 API 参考。源码构建见[源码构建](./install/source-build.md)，样例验证见[运行测试](https://gitcode.com/cann/cannbot-dsl/tree/master/test)。
 
 本站内容由仓库持续构建生成，适合开发和预览使用；版本变更见[更新日志](../../CHANGELOG.md)，授权条款见[许可证](../../LICENSE)。
 
