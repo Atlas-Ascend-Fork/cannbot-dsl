@@ -162,7 +162,9 @@ def normalize_group_list(context, tensors, op_name):
     if any(t.shape[1] != w_elems for t in tensors):
         raise ValueError("多组的行宽 W 必须一致（gate/up/down 同为 H*H'）")
     if context.last_plan_shape is None:
-        raise RuntimeError(f"{op_name} 需要先设置 context.last_plan_shape（输入形状与窗口布局）")
+        raise RuntimeError(
+            f"{op_name} 需要先设置 context.last_plan_shape（输入形状与窗口布局）"
+        )
     return tensors, w_elems
 
 
@@ -485,18 +487,19 @@ def barrier_tail(xfer, ctx, gm_epoch, me, world_size, ub_flag, ub_epoch):
             )
 
 
-def record_transport_event(context):
+def record_transport_event(context, stream=None):
     """各算子 wrapper 发射后记录完成事件（跨流护栏的 fork 点）。
 
     后续跨流调用只等待本事件（上一个我方算子的完成点），而非发起流尾部
     （主流尾部可能排着 dispatch 等非我方工作，等尾部会把双流重叠串行掉）。
     事件对象复用（每步新建 torch.npu.Event() 有 host 分配开销；单线程
-    按序"先等后录"，重录语义安全）。
+    按序"先等后录"，重录语义安全）。stream 缺省取当前流；跨流调用方
+    传入 sync_transport_stream 返回的发起流，保证事件录在算子实际发射的流上。
     """
     ev = context.transport_event
     if ev is None:
         ev = context.transport_event = torch.npu.Event()
-    ev.record(torch.npu.current_stream())
+    ev.record(stream if stream is not None else torch.npu.current_stream())
 
 
 def _get_barrier_program(world_size, me):
@@ -553,18 +556,21 @@ def sync_transport_stream(context):
     - 跨流调用（激活重算等 autograd 场景）：在旧流上记录事件、新流等待——
       事件 fork/join 把调用序列串行化，握手语义保持成立（替代框架侧钉流）。
 
-    该护栏管理权重预取调用；其他算子的流依赖由调用方建立。
+    覆盖 moonep 各算子（plan / prefetch_weight）；dispatch/combine 为 moe_ep
+    原生算子，不在本护栏内——框架侧仍需同流发起或重算回放。返回发起流，
+    供 wrapper 在算子实际发射的流上记录完成事件。
     """
     cur = torch.npu.current_stream()
     ts = context.transport_stream
     if ts is None or ts == cur:
         context.transport_stream = cur
-        return
+        return cur
     # 跨流：等上一个我方算子的完成事件（而非旧流尾部——主流尾部可能排着
     # dispatch 等非我方工作，等尾部会把双流重叠串行掉）
     if context.transport_event is not None:
         cur.wait_event(context.transport_event)
     context.transport_stream = cur
+    return cur
 
 
 def _hccl_comm_name(group, rank):

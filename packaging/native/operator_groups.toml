@@ -26,6 +26,7 @@ mega_recurrent_kda = ["attention/mega_recurrent_kda/mega_recurrent_kda.py"]
 mega_recurrent_kda_replayssm = ["attention/mega_recurrent_kda_replayssm/mega_recurrent_kda_replayssm.py"]
 commit_recurrent_kda_replayssm = ["attention/commit_recurrent_kda_replayssm/commit_recurrent_kda_replayssm.py"]
 quant_mla_prolog = ["attention/quant_mla_prolog/quant_mla_prolog.py"]
+moonep_plan = ["mc2/moonep/moonep_plan.py", "mc2/moonep/moonep_context.py"]
 
 [groups]
 ds41 = ["mqsmla", "qli", "qsli", "indexer_prologue_qw", "indexer_prologue_k", "engram_gate", "attn_epilogue"]

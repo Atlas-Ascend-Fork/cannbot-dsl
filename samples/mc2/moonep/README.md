@@ -1,10 +1,39 @@
-# MoonEP 权重预取
+# MoonEP 算子
 
-`prefetch_weight` 用于专家并行场景中的跨卡权重搬运，将 home rank 的专家权重
-传输到消费 rank 的对称预取槽。配套模块提供通信上下文、显存视图和显存统计。
-设计参考 [MoonEP](https://github.com/MoonshotAI/MoonEP)。
+`moonep_plan` 用于专家并行场景的均衡规划，`prefetch_weight` 用于跨卡权重搬运，
+将 home rank 的专家权重传输到消费 rank 的对称预取槽。配套模块提供通信上下文、
+显存视图和显存统计。设计参考 [MoonEP](https://github.com/MoonshotAI/MoonEP)。
 
-## 接口与调用约定
+## 规划（moonep_plan）
+
+`moonep_plan(context, tokens_per_expert, topk_experts_sk)` 由本 rank 的路由计数
+与 top-k 索引，产出规划五件套（纯张量，跨调用、跨前后向复用）：跨卡交换计数
+后在 demand 矩阵上做 cap 均衡贪心（一卡一源），生成副本清单与虚拟专家投影，
+供 `prefetch_weight` 与 ep dispatch/combine 复用链消费。
+
+```python
+from moonep_context import create_moonep_context
+from moonep_plan import moonep_plan
+
+context = create_moonep_context()
+dst_n, cu_seqlens, experts_to_copy, src_n, vtopk = moonep_plan(
+    context, tokens_per_expert, topk_experts_sk,
+)
+```
+
+| 参数 / 返回 | shape | dtype | 说明 |
+| :--- | :--- | :--- | :--- |
+| `tokens_per_expert` | `[E]` | `torch.int32` | 本 rank 各专家 token 计数 |
+| `topk_experts_sk` | `[S, K]` | `torch.int32` | top-k 专家索引 |
+| `cu_seqlens` | `[2*epn]` | `torch.int32` | 分组 GEMM 分段偏移（本地专家 + 预取槽，均按专家 id 升序） |
+| `experts_to_copy` | `[R, epn]` | `torch.int32` | 各 rank 需预取的远程专家清单，空槽 -1；每行至多一个远程 home rank |
+| `vtopk` | `[N]` | `torch.int32` | 虚拟专家 id（扩展空间 `E' = 2E`），供 ep 复用链路由改写 |
+| `dst_n` / `src_n` | `[N]` | `torch.int32` | 零占位（vtopk-only 快路径不计算） |
+
+形状约束：`E <= 1024`、`R <= 64`、`E % R == 0`；`S*K` 任意规模原生整除
+（分块粒度降档到 N 的因子，无尾补机制）。
+
+## 权重预取（prefetch_weight）
 
 `prefetch_weight(context, experts_to_copy, real_weights, local_weights, epn)`
 按调用者提供的专家清单，把远程 home rank 的专家权重写入本地预取槽。
@@ -14,8 +43,8 @@
 每个目标 rank 的非空槽至多来自同一个 home rank。
 
 通信上下文使用独立 HCCL 通信器，不能与其他占用同一对称堆的算子共用。
-创建权重视图前，调用者须设置 `context.last_plan_shape = (num_tokens, top_k)`；
-该字段及专家清单由调用者准备。
+规划算子调用后自动设置 `context.last_plan_shape`；独立使用预取时调用者
+须自行设置该字段。
 
 ```python
 from moonep_context import create_moonep_context
@@ -36,7 +65,15 @@ prefetch_weight(context, experts_to_copy, real_weights, views, epn)
 ## 验证
 
 需要匹配的 CANN、PyTorch/torch_npu、HCCL 和至少两张支持设备。
-独立验收检查数据正确性及 Buffer 的 `(mem_loc, dtype, layout)` 调用：
+
+规划算子验收（前向 E2E 对 golden，另含布局公式与启动块数约束自检）：
+
+```bash
+python -m torch.distributed.run --nproc_per_node=8 -m pytest \
+    test/mc2/moonep/test_moonep_plan.py -q
+```
+
+预取算子独立验收检查数据正确性及 Buffer 的 `(mem_loc, dtype, layout)` 调用：
 
 ```bash
 python -m torch.distributed.run --nproc_per_node=4 -m pytest \

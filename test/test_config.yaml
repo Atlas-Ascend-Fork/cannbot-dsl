@@ -249,7 +249,6 @@ shared:
     - scripts
     - requirements.txt
     - .pre-commit-config.yaml
-    - catalog
   options:
     - all
 quant_lightning_indexer:

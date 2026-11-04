@@ -272,7 +272,14 @@
     },
     "moonep": {
       "source": "samples/mc2/moonep",
-      "test": "test/mc2/moonep"
+      "test": "test/mc2/moonep",
+      "native": {
+        "export": "moonep_plan",
+        "sources": [
+          "@moonep/source/moonep_plan.py",
+          "@moonep/source/moonep_context.py"
+        ]
+      }
     },
     "sparse_flash_mla": {
       "source": "samples/attention/sparse_flash_mla",
@@ -316,7 +323,8 @@
     "mega_recurrent_kda",
     "mega_recurrent_kda_replayssm",
     "commit_recurrent_kda_replayssm",
-    "quant_mla_prolog"
+    "quant_mla_prolog",
+    "moonep"
   ],
   "ci": {
     "skip_all_tests": false,
@@ -735,8 +743,7 @@
           "test/conftest.py",
           "scripts",
           "requirements.txt",
-          ".pre-commit-config.yaml",
-          "catalog"
+          ".pre-commit-config.yaml"
         ],
         "tests": [
           "all"
