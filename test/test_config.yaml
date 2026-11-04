@@ -324,6 +324,13 @@ mega_full_index:
     - test/attention/mega_full_index
   options:
     - attention/mega_full_index
+mega_reindex:
+  module: true
+  src:
+    - samples/attention/mega_reindex
+    - test/attention/mega_reindex
+  options:
+    - attention/mega_reindex
 ds41_network:
   module: true
   src:

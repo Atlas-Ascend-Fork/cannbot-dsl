@@ -296,6 +296,10 @@
       "source": "samples/attention/mega_full_index",
       "test": "test/attention/mega_full_index"
     },
+    "mega_reindex": {
+      "source": "samples/attention/mega_reindex",
+      "test": "test/attention/mega_reindex"
+    },
     "matmul_streamk": {
       "source": "samples/matmul/matmul/matmul_streamk.py",
       "test": "test/matmul/matmul/test_matmul_streamk.py"
@@ -378,7 +382,8 @@
       "sparse_flash_mla",
       "sparse_flash_mla_metadata",
       "dynamic_mx_quant_sr",
-      "mega_full_index"
+      "mega_full_index",
+      "mega_reindex"
     ],
     "rules": [
       {
@@ -860,6 +865,17 @@
         ],
         "tests": [
           "@mega_full_index/test"
+        ]
+      },
+      {
+        "name": "mega_reindex",
+        "enabled": true,
+        "watch": [
+          "@mega_reindex/source",
+          "@mega_reindex/test"
+        ],
+        "tests": [
+          "@mega_reindex/test"
         ]
       },
       {

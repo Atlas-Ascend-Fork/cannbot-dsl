@@ -48,3 +48,4 @@ operators:
   - attention/sparse_flash_mla_metadata
   - vector/dynamic_mx_quant_sr
   - attention/mega_full_index
+  - attention/mega_reindex
