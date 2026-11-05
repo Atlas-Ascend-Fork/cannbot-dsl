@@ -21,6 +21,7 @@ import cannbotdsl.aot as _aot
 from cannbotdsl import Tensor as _Tensor, dtypes as _dtypes
 import torch as _torch
 import torch_npu as _torch_npu
+from torch.utils.dlpack import from_dlpack as _from_dlpack, to_dlpack as _to_dlpack
 
 import cannbotdsl as dsl
 from cannbotdsl import (
@@ -6467,19 +6468,22 @@ class _Cache:
                                 pack_mode=rr.PackMode.B32_TO_B8,
                             )
                 if dsl.const_expr(self.cache_mode == 0):
-                    cache_rows = kv_cache.view(
-                        (kv_cache.shape[0] * kv_cache.shape[1], self.payload_bytes)
-                    )
+                    cache_rows = kv_cache[
+                        slot // kv_cache.shape[1], None, 0, None
+                    ].view((kv_cache.shape[1], self.payload_bytes))
                     _copy(
-                        tile_slice(cache_rows, (1, self.payload_bytes), (slot, 0)),
+                        tile_slice(
+                            cache_rows,
+                            (1, self.payload_bytes),
+                            (slot % kv_cache.shape[1], 0),
+                        ),
                         payload_rows.next_read(),
                     )
                 else:
                     page = slot // kv_cache.shape[1]
                     row = slot % kv_cache.shape[1]
-                    physical = kv_cache.view(
+                    physical = kv_cache[page, None, 0, None].view(
                         (
-                            kv_cache.shape[0],
                             self.payload_bytes // FRACTAL_BYTES,
                             kv_cache.shape[1],
                             FRACTAL_BYTES,
@@ -6487,7 +6491,7 @@ class _Cache:
                     )
                     ready = payload_rows.next_read()
                     for chunk in range(self.payload_bytes // FRACTAL_BYTES):
-                        destination = physical[page, chunk, row, None].view(
+                        destination = physical[chunk, row, None].view(
                             (1, FRACTAL_BYTES)
                         )
                         _copy(
@@ -7465,15 +7469,16 @@ __all__ = [
 
 
 class WQrQuantMode(_Enum):
-    MXFP8 = 1
-    HIF8 = 2
+    A8W8_MXFP8 = 1
+    A8W8_HIFLOAT8_PER_TENSOR = 2
+    A4W4_HIFLOAT4 = 3
 
 
 class QkvQuantMode(_Enum):
-    NO_QUANT = 0
-    KV_FP8_PER_TOKEN_GROUP = 1
-    Q_KV_FP8 = 2
-    Q_KV_HIF8 = 3
+    A16C16 = 0
+    A16C8_KV_NOPE_FP8_E4M3_PER_TOKEN_GROUP_GROUP_SIZE_128_ROPE_BF16_SCALE_FLOAT_KV_CACHE_LAYOUT_N_NOPE_ROPE_SCALE = 1
+    A8C8_Q_FP8_E4M3_PER_TOKEN_HEAD_KV_FP8_E4M3_PER_TENSOR = 2
+    A8C8_QKV_HIFLOAT8_PER_TENSOR = 3
 
 
 class CacheMode(_Enum):
@@ -7482,15 +7487,14 @@ class CacheMode(_Enum):
 
 
 class RopeMode(_Enum):
-    NONE = 0
-    INTERLEAVE_HALF = 1
-    HALF = 2
+    NO_ROPE = 0
+    ROPE_INTERLEAVE_HALF = 1
+    ROPE_HALF = 2
 
 
 _VALID_PAIRS = {(0, 1), (0, 2), (1, 1), (2, 1), (3, 2)}
 _E4 = _torch.float8_e4m3fn
 _E8 = _torch.float8_e8m0fnu
-_HIF_CARRIERS = (_torch.uint8, _torch.int8)
 _NZ_FORMAT = 29
 _TAIL_PIPELINE_ROW_CHOICES = (4, 8)
 _TAIL_HEAD_ROW_CHOICES = (32, 64)
@@ -7502,12 +7506,16 @@ def _require(condition, message):
 
 
 def _mode_value(name, value, enum_type):
-    if type(value) is enum_type:
-        return value.value
+    if type(value) is not enum_type:
+        raise TypeError(f"{name} must be a {enum_type.__name__} enum")
+    return value.value
+
+
+def _schema_mode_value(name, value, enum_type):
     if type(value) is not int:
-        raise TypeError(f"{name} must be {enum_type.__name__} or int")
+        raise TypeError(f"{name} schema value must be int")
     if value not in tuple(member.value for member in enum_type):
-        raise ValueError(f"{name} has unsupported value {value}")
+        raise ValueError(f"{name} has unsupported schema value {value}")
     return value
 
 
@@ -7518,7 +7526,9 @@ def _validate_modes(w_qr_quant_mode, qkv_quant_mode, cache_mode, rope_mode):
         ("cache_mode", cache_mode, CacheMode),
         ("rope_mode", rope_mode, RopeMode),
     ):
-        _mode_value(name, value, enum_type)
+        _schema_mode_value(name, value, enum_type)
+    if w_qr_quant_mode == WQrQuantMode.A4W4_HIFLOAT4.value:
+        raise NotImplementedError("A4W4_HIFLOAT4 is not implemented")
     _require(
         (qkv_quant_mode, w_qr_quant_mode) in _VALID_PAIRS,
         "unsupported qkv_quant_mode/w_qr_quant_mode combination",
@@ -7526,7 +7536,8 @@ def _validate_modes(w_qr_quant_mode, qkv_quant_mode, cache_mode, rope_mode):
     _require(
         not (
             cache_mode == CacheMode.PA_NZ.value
-            and qkv_quant_mode == QkvQuantMode.KV_FP8_PER_TOKEN_GROUP.value
+            and qkv_quant_mode
+            == QkvQuantMode.A16C8_KV_NOPE_FP8_E4M3_PER_TOKEN_GROUP_GROUP_SIZE_128_ROPE_BF16_SCALE_FLOAT_KV_CACHE_LAYOUT_N_NOPE_ROPE_SCALE.value
         ),
         "qkv_quant_mode=1 does not support PA_NZ",
     )
@@ -7563,7 +7574,9 @@ def _output_specs(T, N, q_lora, Dr, w_qr_quant_mode, qkv_quant_mode, return_qr):
     )
 
 
-def _tensor(name, value, shape, dtype, device, *, weight_is_nz=False):
+def _tensor(
+    name, value, shape, dtype, device, *, weight_is_nz=False, cache_axis0=False
+):
     if not isinstance(value, _torch.Tensor):
         raise TypeError(f"{name} must be a Tensor")
     _require(
@@ -7574,7 +7587,15 @@ def _tensor(name, value, shape, dtype, device, *, weight_is_nz=False):
     if value.dtype not in allowed:
         raise TypeError(f"{name} dtype must be {allowed}, got {value.dtype}")
     _require(value.device == device, f"{name} must be on {device}")
-    _require(value.is_contiguous(), f"{name} must be contiguous")
+    if cache_axis0:
+        width = shape[-1]
+        _require(
+            tuple(value.stride()[1:]) == (width, width, 1)
+            and value.stride(0) >= shape[1] * width,
+            f"{name} only supports non-overlapping axis-0 strides with packed inner axes",
+        )
+    else:
+        _require(value.is_contiguous(), f"{name} must be contiguous")
     if not weight_is_nz:
         # Torch tags ordinary contiguous rank-4 carriers NCHW(0). Both 0/2
         # are linear storage here, unlike a blocked device format such as 29.
@@ -7582,6 +7603,57 @@ def _tensor(name, value, shape, dtype, device, *, weight_is_nz=False):
             _torch_npu.get_npu_format(value) in (0, 2),
             f"{name} must use linear ND storage",
         )
+
+
+def _validate_weight_descale(
+    name, scale, outputs, reduction, device, mode, weight_is_nz
+):
+    if not isinstance(scale, _torch.Tensor):
+        raise TypeError(f"{name} must be a Tensor")
+    if mode != WQrQuantMode.A8W8_MXFP8.value:
+        _tensor(name, scale, (1, outputs), _torch.float32, device)
+        return
+    scale_format = _torch_npu.get_npu_format(scale)
+    _require(
+        scale_format == _NZ_FORMAT if weight_is_nz else scale_format in (0, 2),
+        f"{name} must match weight format: {'FRACTAL_NZ (29)' if weight_is_nz else 'ND'}",
+    )
+    if not weight_is_nz:
+        _tensor(name, scale, (outputs, reduction // 64, 2), _E8, device)
+        return
+    _tensor(
+        name,
+        scale,
+        (reduction // 64, outputs, 2),
+        (_E8, _torch.uint8),
+        device,
+        weight_is_nz=True,
+    )
+    _require(
+        not scale._is_view() and scale.storage_offset() == 0,
+        f"{name} format 29 must be an allocation-root MX scale Tensor",
+    )
+    storage = scale.untyped_storage()
+    elements = outputs * reduction // MX_GROUP_ELEMENTS
+    _require(
+        scale.data_ptr() == storage.data_ptr()
+        and _torch_npu.get_storage_size(scale) == elements
+        and storage.nbytes() == elements,
+        f"{name} format 29 must use MX scale storage (O/16,K/64,16,2)",
+    )
+
+
+def _mx_weight_descale_view(scale):
+    groups, outputs, pair = scale.shape
+    # MX scale NZ has no padding here. DLPack retains the source storage while
+    # exposing its physical bytes through an independent ND descriptor.
+    raw = _from_dlpack(_to_dlpack(scale.view(_torch.uint8)))
+    _require(
+        raw.data_ptr() == scale.data_ptr() and _torch_npu.get_npu_format(raw) in (0, 2),
+        "MX scale DLPack import must provide a zero-copy linear byte view",
+    )
+    scale.record_stream(_torch.npu.current_stream(scale.device))
+    return raw.view(outputs // 16, groups, 16, pair)
 
 
 def _validate_scalars(norm_eps, qr_scale, kvr_scale):
@@ -7690,7 +7762,7 @@ def _validate_inputs(
     )
     weight_is_nz = formats[0] == _NZ_FORMAT
     device = x.device
-    data_dtype = _E4 if w_qr_quant_mode == 1 else _HIF_CARRIERS
+    data_dtype = _E4 if w_qr_quant_mode == 1 else _torch.uint8
     _tensor("x", x, (T, dim), data_dtype, device)
     columns = (q_lora, N * (Dn + Dr), 512 + Dr)
     reductions = (dim, q_lora, dim)
@@ -7717,14 +7789,9 @@ def _validate_inputs(
         columns,
         reductions,
     ):
-        shape = (1, width)
-        if w_qr_quant_mode == 1:
-            shape = (
-                (width // 16, reduction // 64, 16, 2)
-                if weight_is_nz
-                else (width, reduction // 64, 2)
-            )
-        _tensor(name, scale, shape, descale_x_dtype, device)
+        _validate_weight_descale(
+            name, scale, width, reduction, device, w_qr_quant_mode, weight_is_nz
+        )
     _require(
         isinstance(kv_cache, _torch.Tensor) and kv_cache.ndim == 4,
         "kv_cache shape must be (block_number,block_size,1,Dtile)",
@@ -7738,13 +7805,14 @@ def _validate_inputs(
     expected_dtile = 512 + 2 * Dr + 16 if qkv_quant_mode == 1 else 512 + Dr
     cache_dtype = _torch.bfloat16 if qkv_quant_mode == 0 else _E4
     if qkv_quant_mode == 3:
-        cache_dtype = _HIF_CARRIERS
+        cache_dtype = _torch.uint8
     _tensor(
         "kv_cache",
         kv_cache,
         (block_number, block_size, 1, expected_dtile),
         cache_dtype,
         device,
+        cache_axis0=True,
     )
     _require(
         cache_heads == 1 and dtile == expected_dtile, "kv_cache Dtile/heads mismatch"
@@ -7946,7 +8014,14 @@ def _build_fused_program(
         else KV_ELEMENTS + Dr
     )
     kv_cache_bytes_spec = _dsl.TensorSpec(
-        (block_number, block_size, 1, payload_bytes), _dtypes.uint8
+        (block_number, block_size, 1, payload_bytes),
+        _dtypes.uint8,
+        stride=(
+            _dsl.Dim("cache_stride0_bytes", min=1),
+            payload_bytes,
+            payload_bytes,
+            1,
+        ),
     )
     cache_index_spec = _dsl.TensorSpec((T,), _dtypes.int64)
     qa_matmul_fp32_spec = _dsl.TensorSpec((T, q_lora), _dtypes.float32)
@@ -8437,12 +8512,12 @@ def quant_mla_prolog_precheck(
     rope_cos=None,
     *,
     norm_eps=1e-5,
-    w_qr_quant_mode,
-    qkv_quant_mode,
-    cache_mode,
+    w_qr_quant_mode: WQrQuantMode,
+    qkv_quant_mode: QkvQuantMode,
+    cache_mode: CacheMode,
     qr_scale=1.0,
     kvr_scale=1.0,
-    rope_mode=1,
+    rope_mode: RopeMode = RopeMode.ROPE_INTERLEAVE_HALF,
     return_qr=False,
 ):
     """Validate inputs explicitly before execution; do not launch or update Cache.
@@ -8614,9 +8689,9 @@ def _execute_async(
         if qa_splits == 2
         else qa_matmul_fp32
     )
-    if w_qr_quant_mode == WQrQuantMode.MXFP8.value and weight_is_nz:
+    if w_qr_quant_mode == WQrQuantMode.A8W8_MXFP8.value and weight_is_nz:
         descale_wqa, descale_wqb, descale_wkva = (
-            scale.view(_torch.uint8)
+            _mx_weight_descale_view(scale)
             for scale in (descale_wqa, descale_wqb, descale_wkva)
         )
     program = _program(*parameters)
@@ -8713,7 +8788,9 @@ def _fake(
     N = wkb.shape[0]
     Dr = wkva.shape[0] - 512
     q_lora = norm_weight_qa.shape[0]
-    _require(Dr != 0 or rope_mode == RopeMode.NONE.value, "Dr=0 requires rope_mode=0")
+    _require(
+        Dr != 0 or rope_mode == RopeMode.NO_ROPE.value, "Dr=0 requires rope_mode=0"
+    )
     _validate_rope_inputs(rope_sin, rope_cos, T, Dr, rope_mode, x.device, fake=True)
     return tuple(
         x.new_empty(shape, dtype=dtype)
@@ -8760,7 +8837,7 @@ def _execute_graph(
 ):
     # E8M0 blocks auto_functionalized_v2 decomposition in Torch 2.12. Byte views
     # are zero-copy; the shared program still receives the original E8M0 dtype.
-    if w_qr_quant_mode == WQrQuantMode.MXFP8.value:
+    if w_qr_quant_mode == WQrQuantMode.A8W8_MXFP8.value:
         descale_x, descale_wqa, descale_wqb, descale_wkva = (
             value.view(_E8)
             for value in (descale_x, descale_wqa, descale_wqb, descale_wkva)
@@ -8792,14 +8869,14 @@ def _execute_graph(
         return_qr=return_qr,
         core_num=core_num,
     )
-    if w_qr_quant_mode == WQrQuantMode.MXFP8.value:
+    if w_qr_quant_mode == WQrQuantMode.A8W8_MXFP8.value:
         descale_qr = descale_qr.view(_torch.uint8)
     return q, descale_q, qr, descale_qr
 
 
 def _graph_fake(*args, **attrs):
     q, descale_q, qr, descale_qr = _fake(*args, **attrs)
-    if attrs["w_qr_quant_mode"] == WQrQuantMode.MXFP8.value:
+    if attrs["w_qr_quant_mode"] == WQrQuantMode.A8W8_MXFP8.value:
         descale_qr = descale_qr.view(_torch.uint8)
     return q, descale_q, qr, descale_qr
 
@@ -8855,12 +8932,12 @@ def quant_mla_prolog(
     rope_cos: _torch.Tensor | None = None,
     *,
     norm_eps: float = 1e-5,
-    w_qr_quant_mode: WQrQuantMode | int,
-    qkv_quant_mode: QkvQuantMode | int,
-    cache_mode: CacheMode | int,
+    w_qr_quant_mode: WQrQuantMode,
+    qkv_quant_mode: QkvQuantMode,
+    cache_mode: CacheMode,
     qr_scale: float = 1.0,
     kvr_scale: float = 1.0,
-    rope_mode: RopeMode | int = RopeMode.INTERLEAVE_HALF,
+    rope_mode: RopeMode = RopeMode.ROPE_INTERLEAVE_HALF,
     return_qr: bool = False,
 ) -> tuple[_torch.Tensor, _torch.Tensor, _torch.Tensor, _torch.Tensor]:
     if type(return_qr) is not bool:
@@ -8870,21 +8947,31 @@ def quant_mla_prolog(
     qkv_quant_mode = _mode_value("qkv_quant_mode", qkv_quant_mode, QkvQuantMode)
     cache_mode = _mode_value("cache_mode", cache_mode, CacheMode)
     rope_mode = _mode_value("rope_mode", rope_mode, RopeMode)
+    _validate_modes(w_qr_quant_mode, qkv_quant_mode, cache_mode, rope_mode)
     graph_execution = _torch.compiler.is_compiling() or (
         isinstance(x, _torch.Tensor)
         and x.device.type in ("npu", "privateuseone")
         and x.shape[0] != 0
         and _torch.npu.is_current_stream_capturing()
     )
-    if graph_execution and w_qr_quant_mode == WQrQuantMode.MXFP8.value:
-        for name, value in (
-            ("descale_x", descale_x),
-            ("descale_wqa", descale_wqa),
-            ("descale_wqb", descale_wqb),
-            ("descale_wkva", descale_wkva),
+    if graph_execution and w_qr_quant_mode == WQrQuantMode.A8W8_MXFP8.value:
+        if not isinstance(descale_x, _torch.Tensor) or descale_x.dtype != _E8:
+            raise TypeError("descale_x must be an E8M0 Tensor")
+        for name, value, weight in (
+            ("descale_wqa", descale_wqa, wqa),
+            ("descale_wqb", descale_wqb, wqb),
+            ("descale_wkva", descale_wkva, wkva),
         ):
-            if not isinstance(value, _torch.Tensor) or value.dtype != _E8:
-                raise TypeError(f"{name} must be an E8M0 Tensor")
+            if not isinstance(value, _torch.Tensor):
+                raise TypeError(f"{name} must be a Tensor")
+            # FakeTensor cannot query NPU formats; device dispatch validates NZ storage.
+            byte_weight_scale = value.dtype == _torch.uint8 and tuple(value.shape) == (
+                weight.shape[1] // 64,
+                weight.shape[0],
+                2,
+            )
+            if value.dtype != _E8 and not byte_weight_scale:
+                raise TypeError(f"{name} must be E8M0 or a UINT8 NZ weight scale")
         descale_x, descale_wqa, descale_wqb, descale_wkva = (
             value.view(_torch.uint8)
             for value in (descale_x, descale_wqa, descale_wqb, descale_wkva)
@@ -8923,7 +9010,7 @@ def quant_mla_prolog(
         else _torch.ops.cannbotdsl_quant_mla_prolog.quant_mla_prolog.default
     )
     result = dispatch(*args, **attrs)
-    if graph_execution and w_qr_quant_mode == WQrQuantMode.MXFP8.value:
+    if graph_execution and w_qr_quant_mode == WQrQuantMode.A8W8_MXFP8.value:
         return result[0], result[1], result[2], result[3].view(_E8)
     return result
 
@@ -8947,12 +9034,12 @@ def quant_mla_prolog_native(
     rope_cos: _torch.Tensor | None = None,
     *,
     norm_eps: float = 1e-5,
-    w_qr_quant_mode: WQrQuantMode | int,
-    qkv_quant_mode: QkvQuantMode | int,
-    cache_mode: CacheMode | int,
+    w_qr_quant_mode: WQrQuantMode,
+    qkv_quant_mode: QkvQuantMode,
+    cache_mode: CacheMode,
     qr_scale: float = 1.0,
     kvr_scale: float = 1.0,
-    rope_mode: RopeMode | int = RopeMode.INTERLEAVE_HALF,
+    rope_mode: RopeMode = RopeMode.ROPE_INTERLEAVE_HALF,
     return_qr: bool = False,
 ) -> tuple[_torch.Tensor, _torch.Tensor, _torch.Tensor, _torch.Tensor]:
     """Async entry: caller guarantees valid indices and prechecks quant_scale_kv.
@@ -9136,3 +9223,12 @@ def _export_quant_mla_prolog():
     for parameters in sorted(configs):
         with _build_fused_program(*parameters):
             pass
+
+
+for _entry in (quant_mla_prolog, quant_mla_prolog_native, quant_mla_prolog_precheck):
+    _entry.WQrQuantMode = WQrQuantMode
+    _entry.QkvQuantMode = QkvQuantMode
+    _entry.CacheMode = CacheMode
+    _entry.RopeMode = RopeMode
+
+quant_mla_prolog.precheck = quant_mla_prolog_precheck

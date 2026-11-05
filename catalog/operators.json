@@ -260,7 +260,13 @@
     },
     "mla_prolog": {
       "source": "samples/attention/mla_prolog",
-      "test": "test/attention/mla_prolog"
+      "test": "test/attention/mla_prolog",
+      "native": {
+        "export": "mla_prolog",
+        "sources": [
+          "@mla_prolog/source/mla_prolog.py"
+        ]
+      }
     },
     "gather_v2": {
       "source": "samples/vector/gather_v2",
@@ -336,6 +342,7 @@
     "mega_recurrent_kda_replayssm",
     "commit_recurrent_kda_replayssm",
     "quant_mla_prolog",
+    "mla_prolog",
     "moonep"
   ],
   "ci": {

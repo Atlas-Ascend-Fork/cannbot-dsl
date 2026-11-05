@@ -35,7 +35,6 @@ from cannbotdsl.lang.host import host
 from cannbotdsl.lang.jit import jit
 from cannbotdsl.lang.kernel import kernel
 from cannbotdsl.lang.vf import vf
-from cannbotdsl.ops import simt
 from cannbotdsl.ops.arch import get_block_idx, get_block_num, get_subblock_id
 from cannbotdsl.ops.matmul import matmul
 from cannbotdsl.ops.memcpy import copy_options, mem_copy
@@ -113,18 +112,8 @@ def dtile_for(rope_dim):
 
 
 @jit
-def cache_row_view(cache, page_size):
-    return cache.view((cache.shape[0] * page_size, cache.shape[3]))
-
-
-@jit
-def write_row_bsnd(cache_2d, cache_index, payload, token, row_tiler):
-    slot = cache_index[token]
-    if slot >= 0:
-        # 0.8 copies the explicit source domain, not the backing slot capacity.
-        # Dr=0 must write 512 values, not the 576-value maximum payload.
-        valid_payload = reinterpret(payload, layout=make_layout((1, cache_2d.shape[1])))
-        mem_copy(tile_slice(cache_2d, row_tiler, (slot, 0)), valid_payload)
+def cache_row_view(cache, page):
+    return cache[page, None, 0, None].view((cache.shape[1], cache.shape[3]))
 
 
 @jit
@@ -132,17 +121,17 @@ def write_row_panz(cache, cache_index, payload, token):
     slot = cache_index[token]
     if slot >= 0:
         planes = cache.shape[3] // PA_NZ_PLANE_ELEMS
-        physical = cache.view(
-            (cache.shape[0] * planes * cache.shape[1], PA_NZ_PLANE_ELEMS)
-        )
         block = slot // cache.shape[1]
+        physical = cache[block, None, 0, None].view(
+            (planes * cache.shape[1], PA_NZ_PLANE_ELEMS)
+        )
         row = slot % cache.shape[1]
         for plane in cannbotdsl.range(0, planes):
             mem_copy(
                 tile_slice(
                     physical,
                     (1, PA_NZ_PLANE_ELEMS),
-                    ((block * planes + plane) * cache.shape[1] + row, 0),
+                    (plane * cache.shape[1] + row, 0),
                 ),
                 tile_slice(payload, (1, PA_NZ_PLANE_ELEMS), (0, plane)),
             )
@@ -151,8 +140,16 @@ def write_row_panz(cache, cache_index, payload, token):
 @jit
 def write_cache_row(cache, cache_index, payload, token, row_tiler, cache_mode):
     if cache_mode == 0:
-        cache_2d = cache_row_view(cache, cache.shape[1])
-        write_row_bsnd(cache_2d, cache_index, payload, token, row_tiler)
+        slot = cache_index[token]
+        if slot >= 0:
+            cache_2d = cache_row_view(cache, slot // cache.shape[1])
+            valid_payload = reinterpret(
+                payload, layout=make_layout((1, cache.shape[3]))
+            )
+            mem_copy(
+                tile_slice(cache_2d, row_tiler, (slot % cache.shape[1], 0)),
+                valid_payload,
+            )
     else:
         write_row_panz(cache, cache_index, payload, token)
 
@@ -162,18 +159,13 @@ def write_cache_row_group_fp8(cache, cache_index, payload_read, token, rope_dim)
     slot = cache_index[token]
     if slot >= 0:
         dtile = dtile_for(rope_dim)
-        words = dtile // 4
-        cache_words = cache.view(dtype=dtypes.float32).view(
-            (cache.shape[0] * cache.shape[1] * cache.shape[3] // 4,)
+        row_tiler = make_tiler((1, dtile), alignment=(1, DESCALE_BYTES))
+        cache_2d = cache_row_view(cache, slot // cache.shape[1])
+        payload = reinterpret(payload_read, layout=make_layout((1, dtile)))
+        mem_copy(
+            tile_slice(cache_2d, row_tiler, (slot % cache.shape[1], 0)),
+            payload,
         )
-        payload_words = payload_read.reinterpret(
-            dtype=dtypes.float32, layout=make_layout((1, DTILE_MAX // 4)), offset=0
-        )
-        base = slot * words
-        with vf(mode="simt", thread=256):
-            word = simt.thread_idx()[0]
-            if word < words:
-                cache_words[base + word] = payload_words[0, word]
 
 
 CUBE_BN = 96
@@ -1173,17 +1165,17 @@ def write_row_panz_fp8(cache, cache_index, payload_read, token):
     slot = cache_index[token]
     if slot >= 0:
         planes = cache.shape[3] // PA_NZ_FP8_PLANE_ELEMS
-        physical = cache.view(
-            (cache.shape[0] * planes * cache.shape[1], PA_NZ_FP8_PLANE_ELEMS)
-        )
         block = slot // cache.shape[1]
+        physical = cache[block, None, 0, None].view(
+            (planes * cache.shape[1], PA_NZ_FP8_PLANE_ELEMS)
+        )
         row = slot % cache.shape[1]
         for plane in cannbotdsl.range(0, planes):
             mem_copy(
                 tile_slice(
                     physical,
                     (1, PA_NZ_FP8_PLANE_ELEMS),
-                    ((block * planes + plane) * cache.shape[1] + row, 0),
+                    (plane * cache.shape[1] + row, 0),
                 ),
                 tile_slice(payload_read, (1, PA_NZ_FP8_PLANE_ELEMS), (0, plane)),
             )
@@ -1199,8 +1191,12 @@ def write_cache_row_fp8(cache, cache_index, payload_read, token, kvr, cache_mode
             dtype=dtypes.float8_e4m3fn, layout=make_layout((1, kvr)), offset=0
         )
     if cache_mode == 0:
-        cache_2d = cache_row_view(cache, cache.shape[1])
-        write_row_bsnd(cache_2d, cache_index, byte_view, token, row_tiler)
+        slot = cache_index[token]
+        if slot >= 0:
+            cache_2d = cache_row_view(cache, slot // cache.shape[1])
+            mem_copy(
+                tile_slice(cache_2d, row_tiler, (slot % cache.shape[1], 0)), byte_view
+            )
     else:
         write_row_panz_fp8(cache, cache_index, payload_read, token)
 
@@ -1210,17 +1206,17 @@ def write_row_panz_hif8(cache, cache_index, payload_read, token):
     slot = cache_index[token]
     if slot >= 0:
         planes = cache.shape[3] // PA_NZ_FP8_PLANE_ELEMS
-        physical = cache.view(
-            (cache.shape[0] * planes * cache.shape[1], PA_NZ_FP8_PLANE_ELEMS)
-        )
         block = slot // cache.shape[1]
+        physical = cache[block, None, 0, None].view(
+            (planes * cache.shape[1], PA_NZ_FP8_PLANE_ELEMS)
+        )
         row = slot % cache.shape[1]
         for plane in cannbotdsl.range(0, planes):
             mem_copy(
                 tile_slice(
                     physical,
                     (1, PA_NZ_FP8_PLANE_ELEMS),
-                    ((block * planes + plane) * cache.shape[1] + row, 0),
+                    (plane * cache.shape[1] + row, 0),
                 ),
                 tile_slice(payload_read, (1, PA_NZ_FP8_PLANE_ELEMS), (0, plane)),
             )
@@ -1236,8 +1232,12 @@ def write_cache_row_hif8(cache, cache_index, payload_read, token, kvr, cache_mod
             dtype=dtypes.uint8, layout=make_layout((1, kvr)), offset=0
         )
     if cache_mode == 0:
-        cache_2d = cache_row_view(cache, cache.shape[1])
-        write_row_bsnd(cache_2d, cache_index, byte_view, token, row_tiler)
+        slot = cache_index[token]
+        if slot >= 0:
+            cache_2d = cache_row_view(cache, slot // cache.shape[1])
+            mem_copy(
+                tile_slice(cache_2d, row_tiler, (slot % cache.shape[1], 0)), byte_view
+            )
     else:
         write_row_panz_hif8(cache, cache_index, payload_read, token)
 
@@ -5483,7 +5483,11 @@ def build_program(key):
         spec((d["heads"], d["nope"], 512), dtypes.bfloat16),
         spec((1, d["q_lora"]), dtypes.float32),
         spec((1, 512), dtypes.float32),
-        spec((d["blocks"], d["block_size"], 1, cache_last_dim), cache_dtype),
+        spec(
+            (d["blocks"], d["block_size"], 1, cache_last_dim),
+            cache_dtype,
+            stride=(Dim("cache_stride0", min=1), cache_last_dim, cache_last_dim, 1),
+        ),
         spec((d["tokens"],), dtypes.int64),
     )
     if key.qkv_quant_mode in (2, 3):
@@ -5602,16 +5606,16 @@ class CacheMode(Enum):
 
 
 class QkvQuantMode(Enum):
-    NO_QUANT = 0
-    KV_FP8_PER_TOKEN_GROUP = 1
-    Q_KV_FP8 = 2
-    Q_KV_HIF8 = 3
+    A16C16 = 0
+    A16C8_KV_NOPE_FP8_E4M3_PER_TOKEN_GROUP_GROUP_SIZE_128_ROPE_BF16_SCALE_FLOAT_KV_CACHE_LAYOUT_N_NOPE_ROPE_SCALE = 1
+    A8C8_Q_FP8_E4M3_PER_TOKEN_HEAD_KV_FP8_E4M3_PER_TENSOR = 2
+    A8C8_QKV_HIFLOAT8_PER_TENSOR = 3
 
 
 class RopeMode(Enum):
-    NONE = 0
-    INTERLEAVE_HALF = 1
-    HALF = 2
+    NO_ROPE = 0
+    ROPE_INTERLEAVE_HALF = 1
+    ROPE_HALF = 2
 
 
 def _validate_mode_enums(qkv_quant_mode, cache_mode, rope_mode):
@@ -5639,7 +5643,7 @@ def _require(condition, message):
         raise ValueError(message)
 
 
-def _tensor(name, value, shape, dtype, device, *, nz=False):
+def _tensor(name, value, shape, dtype, device, *, nz=False, cache_axis0=False):
     if not isinstance(value, torch.Tensor):
         raise TypeError(f"{name} must be a Tensor")
     _require(
@@ -5649,7 +5653,15 @@ def _tensor(name, value, shape, dtype, device, *, nz=False):
     if value.dtype != dtype:
         raise TypeError(f"{name} dtype must be {dtype}, got {value.dtype}")
     _require(value.device == device, f"{name} must be on {device}")
-    _require(value.is_contiguous(), f"{name} must be contiguous")
+    if cache_axis0:
+        width = shape[-1]
+        _require(
+            tuple(value.stride()[1:]) == (width, width, 1)
+            and value.stride(0) >= shape[1] * width,
+            f"{name} only supports non-overlapping axis-0 strides with packed inner axes",
+        )
+    else:
+        _require(value.is_contiguous(), f"{name} must be contiguous")
     fmt = torch_npu.get_npu_format(value)
     _require(
         fmt == 29 if nz else fmt in (0, 2),
@@ -5780,6 +5792,7 @@ def _validate(
         (blocks, block_size, 1, expected_width),
         cache_dtype,
         device,
+        cache_axis0=True,
     )
     _tensor("cache_index", cache_index, (tokens,), torch.int64, device)
     if qkv_quant_mode in (2, 3):
@@ -6000,11 +6013,11 @@ def mla_prolog_native(
     rope_cos: Optional[torch.Tensor] = None,
     *,
     norm_eps: float = 1e-5,
-    qkv_quant_mode: QkvQuantMode = QkvQuantMode.NO_QUANT,
+    qkv_quant_mode: QkvQuantMode = QkvQuantMode.A16C16,
     cache_mode: CacheMode = CacheMode.PA_BSND,
     qr_scale: float = 1.0,
     kvr_scale: float = 1.0,
-    rope_mode: RopeMode = RopeMode.INTERLEAVE_HALF,
+    rope_mode: RopeMode = RopeMode.ROPE_INTERLEAVE_HALF,
     return_qr: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute MLA Prolog and update kv_cache in place.
@@ -6020,23 +6033,23 @@ def mla_prolog_native(
         norm_weight_kva: FP32 gamma, (512,).
         kv_cache: Mutable Cache; layout selected by cache_mode.
         cache_index: INT64 indices, (T,); negative indices skip Cache writes.
-        quant_scale_kv: FP32 (1,), required only for Q_KV_FP8/Q_KV_HIF8.
+        quant_scale_kv: FP32 (1,), required only for A8C8_Q_FP8_E4M3_PER_TOKEN_HEAD_KV_FP8_E4M3_PER_TENSOR/A8C8_QKV_HIFLOAT8_PER_TENSOR.
         rope_sin: BF16 (T, Dr), paired with rope_cos when RoPE is enabled.
         rope_cos: BF16 (T, Dr), paired with rope_sin.
         norm_eps: Shared positive FP32-representable RMSNorm epsilon.
-        qkv_quant_mode: NO_QUANT; KV_FP8_PER_TOKEN_GROUP (PA_BSND only);
-            Q_KV_FP8 (Q scale per Token/Head); Q_KV_HIF8 (global Q scale).
+        qkv_quant_mode: A16C16; A16C8_KV_NOPE_FP8_E4M3_PER_TOKEN_GROUP_GROUP_SIZE_128_ROPE_BF16_SCALE_FLOAT_KV_CACHE_LAYOUT_N_NOPE_ROPE_SCALE (PA_BSND only);
+            A8C8_Q_FP8_E4M3_PER_TOKEN_HEAD_KV_FP8_E4M3_PER_TENSOR (Q scale per Token/Head); A8C8_QKV_HIFLOAT8_PER_TENSOR (global Q scale).
         cache_mode: PA_BSND or PA_NZ physical Cache addressing.
         qr_scale: Scales QA RMSNorm output before the BF16 CQ cast.
         kvr_scale: Scales normalized Ckv only, never KR.
-        rope_mode: NONE, INTERLEAVE_HALF or HALF; Dr=0 requires NONE.
+        rope_mode: NO_ROPE, ROPE_INTERLEAVE_HALF or ROPE_HALF; Dr=0 requires NO_ROPE.
         return_qr: Whether the fixed qr slot contains the BF16 CQ.
 
     Returns:
         (q, descale_q, qr). Disabled descale_q/qr slots have shape (0,).
         HiF8 q/Cache use uint8 raw-byte carriers, not UINT8 quantization.
         T=0 returns empty outputs without a Kernel launch; Cache is unchanged.
-        Empty descale_q is (0, N, 1) in Q_KV_FP8 and (0,) in other modes.
+        Empty descale_q is (0, N, 1) in A8C8_Q_FP8_E4M3_PER_TOKEN_HEAD_KV_FP8_E4M3_PER_TENSOR and (0,) in other modes.
         No Cache clone, copy-back or extra Cache output is introduced.
     """
     _validate_mode_enums(qkv_quant_mode, cache_mode, rope_mode)
@@ -6429,11 +6442,11 @@ def mla_prolog(
     rope_cos: Optional[torch.Tensor] = None,
     *,
     norm_eps: float = 1e-5,
-    qkv_quant_mode: QkvQuantMode = QkvQuantMode.NO_QUANT,
+    qkv_quant_mode: QkvQuantMode = QkvQuantMode.A16C16,
     cache_mode: CacheMode = CacheMode.PA_BSND,
     qr_scale: float = 1.0,
     kvr_scale: float = 1.0,
-    rope_mode: RopeMode = RopeMode.INTERLEAVE_HALF,
+    rope_mode: RopeMode = RopeMode.ROPE_INTERLEAVE_HALF,
     return_qr: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Public Eager, ACLGraph and torch.compile entry.
@@ -6485,3 +6498,9 @@ def mla_prolog(
 
 # Compatibility name; registration and graph routing stay behind the public API.
 torch_mla_prolog = mla_prolog
+
+
+for _entry in (mla_prolog, mla_prolog_native):
+    _entry.QkvQuantMode = QkvQuantMode
+    _entry.CacheMode = CacheMode
+    _entry.RopeMode = RopeMode

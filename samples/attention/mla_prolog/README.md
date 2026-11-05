@@ -23,12 +23,12 @@
 ## 算子接口
 
 `mla_prolog` 接收BF16激活和权重，支持非量化或量化的Q/Cache输出；不接收量化权重。
-以下为公开Python接口，枚举通过同一个 `mlaprolog` 模块访问。
+以下为公开 Python 调用示例，枚举通过同一个 `mla_prolog` 函数属性访问。
 
 ```python
-import mla_prolog as mlaprolog
+from mla_prolog import mla_prolog
 
-def mla_prolog(
+q, descale_q, qr = mla_prolog(
     x,
     wqa,
     wqb,
@@ -39,18 +39,16 @@ def mla_prolog(
     kv_cache,
     cache_index,
     quant_scale_kv=None,
-    rope_sin=None,
-    rope_cos=None,
-    *,
+    rope_sin=rope_sin,
+    rope_cos=rope_cos,
     norm_eps=1e-5,
-    qkv_quant_mode=mlaprolog.QkvQuantMode.NO_QUANT,
-    cache_mode=mlaprolog.CacheMode.PA_BSND,
+    qkv_quant_mode=mla_prolog.QkvQuantMode.A16C16,
+    cache_mode=mla_prolog.CacheMode.PA_BSND,
     qr_scale=1.0,
     kvr_scale=1.0,
-    rope_mode=mlaprolog.RopeMode.INTERLEAVE_HALF,
+    rope_mode=mla_prolog.RopeMode.ROPE_INTERLEAVE_HALF,
     return_qr=False,
-):
-    ...  # 固定返回 (q, descale_q, qr)，原地更新 kv_cache。
+)
 ```
 
 ### 输入Tensor
@@ -81,14 +79,16 @@ def mla_prolog(
 
 ### 属性与枚举
 
+枚举同时附加到 `mla_prolog` 和 `mla_prolog_native`。`rope_mode` 编码为 0（不旋转）、1（交错配对）、2（前后半区配对）。
+
 | 属性 | 类型与合法值 | 默认值 | 含义 |
 | --- | --- | --- | --- |
 | `norm_eps` | 浮点属性，内核类型FP32；须有限且严格大于0，拒绝bool | `1e-5` | QA和Ckv两路RMSNorm共用epsilon |
-| `qkv_quant_mode` | `mlaprolog.QkvQuantMode` | `NO_QUANT` | 最终Q及Cache的量化模式 |
-| `cache_mode` | `mlaprolog.CacheMode` | `PA_BSND` | Cache内部地址映射 |
+| `qkv_quant_mode` | `mla_prolog.QkvQuantMode` | `A16C16` | 最终Q及Cache的量化模式 |
+| `cache_mode` | `mla_prolog.CacheMode` | `PA_BSND` | Cache内部地址映射 |
 | `qr_scale` | 转FP32后有限，允许正数、0和负数，拒绝bool | `1.0` | QA RMSNorm后、WQB前直接乘传入值；同时影响Q-Nope、Q-RoPE和qr |
 | `kvr_scale` | 转FP32后有限，允许正数、0和负数，拒绝bool | `1.0` | Ckv RMSNorm后直接乘传入值，**不缩放KR** |
-| `rope_mode` | `mlaprolog.RopeMode` | `INTERLEAVE_HALF` | RoPE变换方式 |
+| `rope_mode` | `mla_prolog.RopeMode` | `ROPE_INTERLEAVE_HALF` | RoPE变换方式 |
 | `return_qr` | 严格bool | `False` | 是否写出QA归一化并缩放后的qr，不改变主Q路径 |
 
 公开 Python 入口在进入 Torch dispatcher 前拒绝三个浮点属性的 bool 和非数值类型。
@@ -99,18 +99,18 @@ def mla_prolog(
 
 | 枚举成员 | 内部编码 | 语义 |
 | --- | ---: | --- |
-| `QkvQuantMode.NO_QUANT` | 0 | Q、KV、KR均为BF16 |
-| `QkvQuantMode.KV_FP8_PER_TOKEN_GROUP` | 1 | Q为BF16；KV按token/group动态量化为E4M3FN，group_size=128；KR为BF16 |
-| `QkvQuantMode.Q_KV_FP8` | 2 | Q按token/head动态量化为E4M3FN；KV/KR共用输入per-tensor量化乘子 |
-| `QkvQuantMode.Q_KV_HIF8` | 3 | Q跨全部token/head做全局per-tensor动态量化；KV/KR共用输入量化乘子，编码均为HiF8 |
-| `CacheMode.PA_BSND` | 0 | 按block、token、head、dimension存放 |
-| `CacheMode.PA_NZ` | 1 | 按本算子的PA_NZ分块地址映射存放；mode 1不支持 |
-| `RopeMode.NONE` | 0 | 不做RoPE，Dr=64时Q-Rope与KR直通 |
-| `RopeMode.INTERLEAVE_HALF` | 1 | 从交错偶/奇通道取对，输出为前后半区 |
-| `RopeMode.HALF` | 2 | 从前后半区取对，输出仍为前后半区 |
+| `mla_prolog.QkvQuantMode.A16C16` | 0 | Q、KV、KR均为BF16 |
+| `mla_prolog.QkvQuantMode.A16C8_KV_NOPE_FP8_E4M3_PER_TOKEN_GROUP_GROUP_SIZE_128_ROPE_BF16_SCALE_FLOAT_KV_CACHE_LAYOUT_N_NOPE_ROPE_SCALE` | 1 | Q为BF16；KV按token/group动态量化为E4M3FN，group_size=128；KR为BF16 |
+| `mla_prolog.QkvQuantMode.A8C8_Q_FP8_E4M3_PER_TOKEN_HEAD_KV_FP8_E4M3_PER_TENSOR` | 2 | Q按token/head动态量化为E4M3FN；KV/KR共用输入per-tensor量化乘子 |
+| `mla_prolog.QkvQuantMode.A8C8_QKV_HIFLOAT8_PER_TENSOR` | 3 | Q跨全部token/head做全局per-tensor动态量化；KV/KR共用输入量化乘子，编码均为HiF8 |
+| `mla_prolog.CacheMode.PA_BSND` | 0 | 按block、token、head、dimension存放 |
+| `mla_prolog.CacheMode.PA_NZ` | 1 | 按本算子的PA_NZ分块地址映射存放；mode 1不支持 |
+| `mla_prolog.RopeMode.NO_ROPE` | 0 | 不做RoPE，Dr=64时Q-Rope与KR直通 |
+| `mla_prolog.RopeMode.ROPE_INTERLEAVE_HALF` | 1 | 从交错偶/奇通道取对，输出为前后半区 |
+| `mla_prolog.RopeMode.ROPE_HALF` | 2 | 从前后半区取对，输出仍为前后半区 |
 
 公开Python接口只接收对应枚举成员，不接收上表的裸整数、字符串或bool。
-`Dr=0` 必须显式指定 `RopeMode.NONE`；`Dr=64` 可使用三种RoPE模式。
+`Dr=0` 必须显式指定 `mla_prolog.RopeMode.NO_ROPE`；`Dr=64` 可使用三种RoPE模式。
 未启用RoPE时sin/cos可同时为 `None`；若传入仍须成对满足上表Shape和dtype，但不参与计算。
 
 ### 输出与Cache原地更新
@@ -276,7 +276,7 @@ $$
 (z_{H+j}c_{H+j}+z_js_{H+j})_{j=0}^{H-1}\right].
 $$
 
-`rope_mode=NONE` 时 $\operatorname{RoPE}(z)=z$；$Dr=0$ 时没有位置编码子段，且必须使用NONE。
+`rope_mode=NO_ROPE` 时 $\operatorname{RoPE}(z)=z$；$Dr=0$ 时没有位置编码子段，且必须使用 `NO_ROPE`。
 
 Q的所有head与KR使用同一token的sin/cos。两种模式都包含逐元素cos乘法、sin乘法和加减运算，
 但取对方式不同；不对传入的sin/cos额外计算三角函数。
@@ -433,15 +433,15 @@ $$
 
 ## 统一调用接口与执行方式
 
-整网统一调用 `mlaprolog.mla_prolog(...)`，不需要按执行方式切换函数。
-执行方式、Native二进制加载配置和 `qkv_quant_mode=0/1/2/3` 是三个独立概念。
+整网统一调用 `mla_prolog(...)`，不需要按执行方式切换函数。
+执行方式、Native 二进制加载配置和 `qkv_quant_mode` 枚举选择是三个独立概念。
 
 | 执行方式 | 调用入口 | 当前配置 |
 | --- | --- | --- |
-| Eager | `mlaprolog.mla_prolog` | 检查元信息和属性；仅 mode 2/3 的 `quant_scale_kv` 值检查有 D2H 同步成本 |
-| Native require 部署 | `mlaprolog.mla_prolog` | 设置 `CANNBOTDSL_NATIVE_BINARY_MODE=require`，缺少编译变体应报错，不允许 JIT 回退；可配合Eager或图模式使用 |
-| ACLGraph | 捕获预检后的 `mlaprolog.mla_prolog` | 自动选择异步图入口；源码和已安装 Native require 均可使用 |
-| NPUGraph-EX | `torch.compile(mlaprolog.mla_prolog, backend="npugraph_ex", ...)` | 内部自动选择可入图的原地算子；设备值须在捕获/回放外预检 |
+| Eager | `mla_prolog` | 检查元信息和属性；仅 mode 2/3 的 `quant_scale_kv` 值检查有 D2H 同步成本 |
+| Native require 部署 | `mla_prolog` | 设置 `CANNBOTDSL_NATIVE_BINARY_MODE=require`，缺少编译变体应报错，不允许 JIT 回退；可配合Eager或图模式使用 |
+| ACLGraph | 捕获预检后的 `mla_prolog` | 自动选择异步图入口；源码和已安装 Native require 均可使用 |
+| NPUGraph-EX | `torch.compile(mla_prolog, backend="npugraph_ex", ...)` | 内部自动选择可入图的原地算子；设备值须在捕获/回放外预检 |
 
 `torch.ops.cannbot_dsl_mla_prolog.mla_prolog` 的 schema 使用整数序列化三个枚举，
 `Tensor(a!) kv_cache` 声明原地更新。公开 Python 接口使用 `CacheMode`、
@@ -455,7 +455,7 @@ Fake 注册只描述输出，不提供自动求导。EX 内部注册使用相同
 检查值，并在每次回放前维持合法输入；图 replay 不重新执行 Python 值检查。
 HiF8 Q/Cache 使用 uint8 原始字节载体，DSL 内是真正 HiF8 转换。
 
-整网只需要一个算子模块 import。注册、整数 schema、编译态分派均由模块内部处理。
+整网只需导入算子函数，枚举作为函数属性访问。注册、整数 schema、编译态分派均由模块内部处理。
 `torch_mla_prolog` 是公开函数 `mla_prolog` 的兼容别名，不是另一套实现。
 Eager、Native require部署、ACLGraph、NPUGraph-EX 均使用此公开函数。
 底层异步直调由内部执行链和测试工具使用，不作为整网接入示例。
@@ -468,7 +468,7 @@ Eager、Native require部署、ACLGraph、NPUGraph-EX 均使用此公开函数�
 ```python
 import torch
 import torch_npu
-import mla_prolog as mlaprolog
+from mla_prolog import mla_prolog
 
 torch.npu.set_device(0)  # ASCEND_RT_VISIBLE_DEVICES 映射后的逻辑卡号
 device = torch.device("npu:0")
@@ -493,9 +493,9 @@ inputs = dict(
     rope_cos=torch.ones((T, Dr), dtype=torch.bfloat16).to(device),
 )
 attrs = dict(
-    norm_eps=1e-6, qkv_quant_mode=mlaprolog.QkvQuantMode.NO_QUANT,
-    cache_mode=mlaprolog.CacheMode.PA_BSND, qr_scale=1.0, kvr_scale=1.0,
-    rope_mode=mlaprolog.RopeMode.INTERLEAVE_HALF, return_qr=False,
+    norm_eps=1e-6, qkv_quant_mode=mla_prolog.QkvQuantMode.A16C16,
+    cache_mode=mla_prolog.CacheMode.PA_BSND, qr_scale=1.0, kvr_scale=1.0,
+    rope_mode=mla_prolog.RopeMode.ROPE_INTERLEAVE_HALF, return_qr=False,
 )
 # 如需真实 NZ，三路必须一起转换；不能仅 reshape 成四维。
 # for name in ("wqa", "wqb", "wkva"):
@@ -505,7 +505,7 @@ attrs = dict(
 ### Eager 调用
 
 ```python
-q, descale_q, qr = mlaprolog.mla_prolog(**inputs, **attrs)
+q, descale_q, qr = mla_prolog(**inputs, **attrs)
 torch.npu.synchronize()
 assert q.shape == (T, N, 512 + Dr)
 assert descale_q.shape == qr.shape == (0,)
@@ -543,9 +543,9 @@ export PYTHONPATH="/absolute/deployment-directory${PYTHONPATH:+:$PYTHONPATH}"
 ```
 
 ```python
-import mla_prolog as mlaprolog
+from mla_prolog import mla_prolog
 
-q, descale_q, qr = mlaprolog.mla_prolog(**inputs, **attrs)
+q, descale_q, qr = mla_prolog(**inputs, **attrs)
 torch.npu.synchronize()
 ```
 
@@ -561,11 +561,11 @@ ACLGraph 和 NPUGraph-EX 复用后续示例，仍须图外预检。
 
 ```python
 # 调用方先保证 index 合法；图外调用校验元信息及 quant_scale_kv 并编译/准备，也会写 Cache。
-prepared = mlaprolog.mla_prolog(**inputs, **attrs)
+prepared = mla_prolog(**inputs, **attrs)
 torch.npu.synchronize()
 graph = torch.npu.NPUGraph()
 with torch.npu.graph(graph):
-    graph_outputs = mlaprolog.mla_prolog(**inputs, **attrs)  # 自动走异步图路径
+    graph_outputs = mla_prolog(**inputs, **attrs)  # 自动走异步图路径
 graph.replay()
 torch.npu.synchronize()
 q, descale_q, qr = graph_outputs
@@ -583,10 +583,10 @@ q, descale_q, qr = graph_outputs
 
 ```python
 # 调用方先保证 index 合法；首次 Eager 校验元信息及 quant_scale_kv 并准备编译，会写 Cache。
-mlaprolog.mla_prolog(**inputs, **attrs)
+mla_prolog(**inputs, **attrs)
 torch.npu.synchronize()
 compiled = torch.compile(
-    mlaprolog.mla_prolog,
+    mla_prolog,
     backend="npugraph_ex",
     fullgraph=True,
     dynamic=False,
@@ -596,9 +596,33 @@ q, descale_q, qr = compiled(**inputs, **attrs)
 torch.npu.synchronize()
 ```
 
-也可以编译 `forward` 中调用 `mlaprolog.mla_prolog` 的整网 Module。
+也可以编译 `forward` 中调用 `mla_prolog` 的整网 Module。
 固定权重建议注册为模型 buffer；所有输入地址及存储保持稳定。
 `clone_input=False` 避免后端输入 staging 的 TensorMove；不能省略后再引用无额外搬运结论。
 新数据在图外写入原地址；尤其 index/scale 改变后必须重新预检，不能沿用首次合法性结论。
 只保证本节固定 Shape、固定地址、无梯度推理契约，不宣称动态 Shape 或任意后端兼容。
 后端不可用、图编译失败应报错，不回退为 Eager 或普通 ACLGraph 的“EX 成功”。
+
+### Cache 首轴跨度
+
+`kv_cache` 支持第 0 轴非连续及非零 storage offset；内侧各轴必须紧密连续。
+对 `(BlockNum, BlockSize, 1, Dtile)`，元素 stride 必须为
+`(stride0, Dtile, Dtile, 1)`，且 `stride0 >= BlockSize * Dtile`，不允许页间重叠。
+PA_BSND、PA_NZ 与所有 QKV 量化模式均按实际首轴跨度原地写入，页间空隙保持不变。
+其他输入仍要求连续。
+
+### 官方 wheel 打包入口
+
+从仓库根目录，在已激活 CANN / CANNBotDSL 的环境下执行：
+
+```bash
+python packaging/native/build.py --operator mla_prolog --target dav-3510
+```
+
+打包器复用上述 AOT 导出入口，将源码与 `_native` 一同放入 `ops` 包，
+产物位于 `packaging/native/output/operators/mla_prolog/wheels/`。
+安装后从 `ops.mla_prolog` 导入。同一环境同时使用两个算子时，
+用 `--operators mla_prolog quant_mla_prolog` 联合构建；两个单算子 wheel
+沿用同一分发名，不应依次安装来合并。详见[官方打包说明](../../../packaging/native/README.md)。
+
+HiF8 两方比较将设备输出与普通 Golden 的 HiF8 编码分别解码为 FP32，再按 ULP 规则比较；不再使用普通 Golden 量化前中间值。ULP 公式、门限、特殊值处理及三方比较规则不变。

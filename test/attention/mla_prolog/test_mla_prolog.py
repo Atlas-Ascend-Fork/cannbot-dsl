@@ -7,18 +7,18 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 
 
-"""Four mode cases with self-contained CPU references and v8 comparators.
+"""Four output modes with unified CPU Golden and supplied comparison rules.
 
-The two-way BF16 reference and independent three-way FP32 reference retain
-their separate entry functions. Shared helpers are AST-identical to both
-frozen sources. No reference calls the device operator. Graph audits are
-optional execution modes of the same four cases, not extra collected tests.
+Ordinary outputs preserve public dtypes; high-precision outputs retain FP32
+real values. Three-way comparisons use independent reference copies and
+accept warnings, with branch fallback after whole-output comparisons fail.
 """
 
 from __future__ import annotations
 
 import ast
 from enum import Enum
+from functools import partial
 import hashlib
 import json
 import math
@@ -26,6 +26,7 @@ import os
 from pathlib import Path
 import sys
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -35,11 +36,11 @@ TEST_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(TEST_ROOT))
 from _samples_path import load_sample  # noqa: E402
 
-# CPU reference helpers shared without changing their numerical definitions.
+# Golden: DSL inputs, mathematical computation and output/cache encoding.
+# No comparison or acceptance decisions are made in this section.
 
 _KV_LORA = 512
 _GROUP_SIZE = 128
-_BLOCK_SIZE = 128
 _FP8_MAX = 448.0
 _HIF8_MAX = 32768.0
 _GROUP_AMAX_FLOOR = 1.0e-4
@@ -212,17 +213,21 @@ def _dynamic_descale(maximum, limit):
     return maximum.float() / limit
 
 
-def _dynamic_q(value, mode):
+def _dynamic_q(value, mode, *, high_precision=False):
     # Statistics use FP32 mathematical Query, before public output conversion.
     value = value.float()
     if mode in (0, 1):
-        return value.to(torch.bfloat16), torch.empty(0, dtype=torch.float32)
+        return (value if high_precision else value.to(torch.bfloat16)), torch.empty(
+            0, dtype=torch.float32
+        )
     if mode == 2:
         maximum = value.abs().amax(dim=-1, keepdim=True)
         descale = _dynamic_descale(maximum, _FP8_MAX)
     else:
         maximum = value.abs().amax().reshape(1)
         descale = _dynamic_descale(maximum, _HIF8_MAX)
+    if high_precision:
+        return value, descale
     # Protect genuinely zero inputs only, not a nonzero amax's scale underflow.
     # The safe denominator is internal; returned descale remains exactly zero.
     denominator = torch.where(maximum == 0, torch.ones_like(descale), descale)
@@ -231,7 +236,9 @@ def _dynamic_q(value, mode):
     return (_fp8(normalized) if mode == 2 else _hif8(normalized)), descale
 
 
-def _cache_payload(ckv, kr, mode, quant_scale_kv):
+def _cache_payload(ckv, kr, mode, quant_scale_kv, *, high_precision=False):
+    if high_precision:
+        return torch.cat((ckv, kr), dim=-1).float()
     if mode == 0:
         return torch.cat((ckv, kr), dim=-1).to(torch.bfloat16)
     if mode == 1:
@@ -261,12 +268,12 @@ def _write_cache(cache, index, payload, mode):
     else:
         _require(bytes_per_row % 32 == 0, "PA_NZ payload must be 32-byte aligned")
         physical = raw_cache.reshape(
-            cache.shape[0], bytes_per_row // 32, _BLOCK_SIZE, 32
+            cache.shape[0], bytes_per_row // 32, cache.shape[1], 32
         )
         for token, slot in enumerate(index.tolist()):
             if slot < 0:
                 continue
-            block, row = divmod(slot, _BLOCK_SIZE)
+            block, row = divmod(slot, cache.shape[1])
             physical[block, :, row, :].copy_(raw_rows[token].reshape(-1, 32))
 
 
@@ -275,8 +282,12 @@ def cache_to_logical(cache, cache_mode):
     _tensor("cache", cache)
     _require(isinstance(cache_mode, CacheMode), "cache_mode must be CacheMode")
     _require(
-        cache.ndim == 4 and cache.shape[1:3] == (_BLOCK_SIZE, 1),
-        "cache shape must be (blocks,128,1,width)",
+        cache.ndim == 4
+        and cache.shape[0] > 0
+        and cache.shape[2] == 1
+        and 16 <= cache.shape[1] <= 1024
+        and cache.shape[1] % 16 == 0,
+        "cache shape must be (blocks,block_size,1,width), block_size=16..1024 divisible by 16",
     )
     if cache_mode == CacheMode.PA_BSND:
         return cache
@@ -284,7 +295,7 @@ def cache_to_logical(cache, cache_mode):
     _require(row_bytes % 32 == 0, "PA_NZ row must be 32-byte aligned")
     raw = (
         cache.view(torch.uint8)
-        .reshape(cache.shape[0], row_bytes // 32, _BLOCK_SIZE, 32)
+        .reshape(cache.shape[0], row_bytes // 32, cache.shape[1], 32)
         .permute(0, 2, 1, 3)
         .contiguous()
     )
@@ -313,13 +324,21 @@ def golden_mla_prolog(
     kvr_scale=1.0,
     rope_mode=1,
     return_qr=False,
+    action_type="bm_output",
 ):
     """Return exactly ``(q, descale_q, qr)``; update ``kv_cache`` in place.
 
     All compute inputs are CPU tensors. For NPU tests keep independent CPU
     fixtures, and give the device operator separate NPU copies of those data.
     CPU layout/dtype and numerical limitations are documented in this module.
+    bm_output preserves intermediate BF16 rounding; bm_output_gold keeps FP32
+    intermediates and returns unquantized FP32 Q/QR. Its in-place Cache must
+    be FP32 with logical width 512 + Dr, including mixed-payload mode 1.
     """
+    _require(
+        action_type in ("bm_output", "bm_output_gold"),
+        "action_type must be bm_output or bm_output_gold",
+    )
     _require(isinstance(cache_mode, CacheMode), "cache_mode must be a CacheMode enum")
     _require(
         type(qkv_quant_mode) is int and qkv_quant_mode in (0, 1, 2, 3),
@@ -370,12 +389,19 @@ def golden_mla_prolog(
     _tensor("kv_cache", kv_cache)
     _require(
         kv_cache.ndim == 4 and kv_cache.shape[0] > 0,
-        "kv_cache must have shape (positive_blocks,128,1,width)",
+        "kv_cache must have shape (positive_blocks,block_size,1,width)",
     )
-    width = _KV_LORA + 2 * dr + 16 if qkv_quant_mode == 1 else _KV_LORA + dr
+    high_precision = action_type == "bm_output_gold"
+    width = (
+        _KV_LORA + 2 * dr + 16
+        if qkv_quant_mode == 1 and not high_precision
+        else _KV_LORA + dr
+    )
     _require(
-        tuple(kv_cache.shape[1:]) == (_BLOCK_SIZE, 1, width),
-        f"kv_cache trailing shape must be (128,1,{width})",
+        16 <= kv_cache.shape[1] <= 1024
+        and kv_cache.shape[1] % 16 == 0
+        and tuple(kv_cache.shape[2:]) == (1, width),
+        f"kv_cache trailing shape must be (block_size,1,{width}), block_size=16..1024 divisible by 16",
     )
     cache_dtype = (
         torch.bfloat16
@@ -384,6 +410,9 @@ def golden_mla_prolog(
         if qkv_quant_mode == 3
         else torch.float8_e4m3fn
     )
+    if high_precision:
+        cache_dtype = torch.float32
+    qr_dtype = torch.float32 if high_precision else torch.bfloat16
     _require(
         kv_cache.dtype == cache_dtype,
         f"CPU cache dtype for mode {qkv_quant_mode} must be {cache_dtype}",
@@ -397,11 +426,15 @@ def golden_mla_prolog(
     else:
         _require(quant_scale_kv is None, "mode 0/1 does not take quant_scale_kv")
     if t == 0:
-        q_dtype = cache_dtype if qkv_quant_mode != 1 else torch.bfloat16
+        q_dtype = (
+            torch.float32
+            if high_precision
+            else (cache_dtype if qkv_quant_mode != 1 else torch.bfloat16)
+        )
         return (
             torch.empty((0, n, _KV_LORA + dr), dtype=q_dtype),
             torch.empty(0, dtype=torch.float32),
-            torch.empty((0, q_lora) if return_qr else (0,), dtype=torch.bfloat16),
+            torch.empty((0, q_lora) if return_qr else (0,), dtype=qr_dtype),
         )
     write_index = cache_index[cache_index >= 0]
     _require(
@@ -409,7 +442,7 @@ def golden_mla_prolog(
         "repeated nonnegative cache_index is not allowed",
     )
     _require(
-        bool((write_index < kv_cache.shape[0] * _BLOCK_SIZE).all()),
+        bool((write_index < kv_cache.shape[0] * kv_cache.shape[1]).all()),
         "nonnegative cache_index is outside the cache capacity",
     )
     if quant_scale_kv is not None:
@@ -436,184 +469,42 @@ def golden_mla_prolog(
     _require(
         sys.byteorder == "little", "packed Cache golden requires little-endian CPU"
     )
-    cq_raw = (x.float() @ qa.float().T).to(torch.bfloat16).float()
-    cq = _scale(_rms_norm(cq_raw, norm_weight_qa, norm_eps), qr_scale).to(
-        torch.bfloat16
-    )
-    q_projected = (
-        (cq.float() @ qb.float().T).to(torch.bfloat16).float().reshape(t, n, dn + dr)
-    )
-    q_nope = torch.einsum("tnd,ndk->tnk", q_projected[..., :dn], wkb.float())
-    q_rope = _rope(q_projected[..., dn:], rope_sin, rope_cos, rope_mode)
-    q, descale_q = _dynamic_q(torch.cat((q_nope, q_rope), dim=-1), qkv_quant_mode)
-    kva_raw = (x.float() @ kva.float().T).to(torch.bfloat16).float()
-    ckv = _scale(_rms_norm(kva_raw[:, :_KV_LORA], norm_weight_kva, norm_eps), kvr_scale)
-    kr = _rope(kva_raw[:, _KV_LORA:], rope_sin, rope_cos, rope_mode)
-    payload = _cache_payload(ckv, kr, qkv_quant_mode, quant_scale_kv)
-    qr = cq.to(torch.bfloat16) if return_qr else torch.empty(0, dtype=torch.bfloat16)
-    _write_cache(kv_cache, cache_index, payload, cache_mode)
-    return q, descale_q, qr
-
-
-# Independent FP32 entry: never substitute the BF16 reference for G.
-
-
-@torch.no_grad()
-def math_mla_prolog(
-    x,
-    wqa,
-    wqb,
-    wkva,
-    wkb,
-    norm_weight_qa,
-    norm_weight_kva,
-    kv_cache,
-    cache_index,
-    quant_scale_kv=None,
-    rope_sin=None,
-    rope_cos=None,
-    *,
-    norm_eps=1e-5,
-    qkv_quant_mode=0,
-    cache_mode=CacheMode.PA_BSND,
-    qr_scale=1.0,
-    kvr_scale=1.0,
-    rope_mode=1,
-    return_qr=False,
-):
-    """Return exactly ``(q, descale_q, qr)``; update ``kv_cache`` in place.
-
-    All compute inputs are CPU tensors. For NPU tests keep independent CPU
-    fixtures, and give the device operator separate NPU copies of those data.
-    CPU layout/dtype and numerical limitations are documented in this module.
-    """
-    _require(isinstance(cache_mode, CacheMode), "cache_mode must be a CacheMode enum")
-    _require(
-        type(qkv_quant_mode) is int and qkv_quant_mode in (0, 1, 2, 3),
-        "qkv_quant_mode must be 0/1/2/3",
-    )
-    _require(
-        type(rope_mode) is int and rope_mode in (0, 1, 2), "rope_mode must be 0/1/2"
-    )
-    _require(type(return_qr) is bool, "return_qr must be bool")
-    _require(
-        not (qkv_quant_mode == 1 and cache_mode == CacheMode.PA_NZ),
-        "mode 1 supports PA_BSND only",
-    )
-    norm_eps = _finite_scalar("norm_eps", norm_eps, positive=True)
-    qr_scale = _finite_scalar("qr_scale", qr_scale)
-    kvr_scale = _finite_scalar("kvr_scale", kvr_scale)
-    for name, tensor in (
-        ("x", x),
-        ("wqa", wqa),
-        ("wqb", wqb),
-        ("wkva", wkva),
-        ("wkb", wkb),
-    ):
-        _tensor(name, tensor, torch.bfloat16)
-    _require(x.ndim == 2, "x must have shape (T,dim)")
-    _require(
-        wqa.ndim == wqb.ndim == wkva.ndim and wqa.ndim in (2, 4),
-        "wqa/wqb/wkva must all be ND matrices or all explicit CPU NZ panels",
-    )
-    qa, qb, kva = map(_weight_logical, (wqa, wqb, wkva))
-    t, dim = x.shape
-    q_lora = qa.shape[0]
-    _require(
-        1024 <= dim <= 8192 and dim % 256 == 0, "dim must be 1024..8192, 256 aligned"
-    )
-    _require(q_lora in (640, 1024, 1536, 2048), "unsupported q_lora")
-    _require(wkb.ndim == 3, "wkb must have shape (N,Dn,512)")
-    n, dn, kv_lora = wkb.shape
-    dr = kva.shape[0] - _KV_LORA
-    _require(1 <= n <= 128 and kv_lora == _KV_LORA, "N must be 1..128 and kv_lora=512")
-    _require((dn, dr) in ((128, 64), (192, 64), (256, 0)), "unsupported (Dn,Dr)")
-    _tensor("wqa logical", qa, shape=(q_lora, dim))
-    _tensor("wqb logical", qb, shape=(n * (dn + dr), q_lora))
-    _tensor("wkva logical", kva, shape=(_KV_LORA + dr, dim))
-    _tensor("norm_weight_qa", norm_weight_qa, torch.float32, (q_lora,))
-    _tensor("norm_weight_kva", norm_weight_kva, torch.float32, (_KV_LORA,))
-    _tensor("cache_index", cache_index, torch.int64, (t,))
-    _tensor("kv_cache", kv_cache)
-    _require(
-        kv_cache.ndim == 4 and kv_cache.shape[0] > 0,
-        "kv_cache must have shape (positive_blocks,128,1,width)",
-    )
-    width = _KV_LORA + 2 * dr + 16 if qkv_quant_mode == 1 else _KV_LORA + dr
-    _require(
-        tuple(kv_cache.shape[1:]) == (_BLOCK_SIZE, 1, width),
-        f"kv_cache trailing shape must be (128,1,{width})",
-    )
-    cache_dtype = (
-        torch.bfloat16
-        if qkv_quant_mode == 0
-        else torch.uint8
-        if qkv_quant_mode == 3
-        else torch.float8_e4m3fn
-    )
-    _require(
-        kv_cache.dtype == cache_dtype,
-        f"CPU cache dtype for mode {qkv_quant_mode} must be {cache_dtype}",
-    )
-    _require(dr != 0 or rope_mode == 0, "Dr=0 forces rope_mode=0")
-    if dr and rope_mode:
-        _tensor("rope_sin", rope_sin, torch.bfloat16, (t, dr))
-        _tensor("rope_cos", rope_cos, torch.bfloat16, (t, dr))
-    if qkv_quant_mode in (2, 3):
-        _tensor("quant_scale_kv", quant_scale_kv, torch.float32, (1,))
+    if action_type == "bm_output_gold":
+        cq_raw = x.float() @ qa.float().T
     else:
-        _require(quant_scale_kv is None, "mode 0/1 does not take quant_scale_kv")
-    if t == 0:
-        q_dtype = cache_dtype if qkv_quant_mode != 1 else torch.bfloat16
-        return (
-            torch.empty((0, n, _KV_LORA + dr), dtype=q_dtype),
-            torch.empty(0, dtype=torch.float32),
-            torch.empty((0, q_lora) if return_qr else (0,), dtype=torch.bfloat16),
+        cq_raw = (x.float() @ qa.float().T).to(torch.bfloat16).float()
+    if action_type == "bm_output_gold":
+        cq = _scale(_rms_norm(cq_raw, norm_weight_qa, norm_eps), qr_scale)
+    else:
+        cq = _scale(_rms_norm(cq_raw, norm_weight_qa, norm_eps), qr_scale).to(
+            torch.bfloat16
         )
-    write_index = cache_index[cache_index >= 0]
-    _require(
-        torch.unique(write_index).numel() == write_index.numel(),
-        "repeated nonnegative cache_index is not allowed",
-    )
-    _require(
-        bool((write_index < kv_cache.shape[0] * _BLOCK_SIZE).all()),
-        "nonnegative cache_index is outside the cache capacity",
-    )
-    if quant_scale_kv is not None:
-        _require(
-            bool(torch.isfinite(quant_scale_kv).all()) and quant_scale_kv.item() > 0,
-            "quant_scale_kv must be finite and positive",
+    if action_type == "bm_output_gold":
+        q_projected = (cq @ qb.float().T).reshape(t, n, dn + dr)
+    else:
+        q_projected = (
+            (cq.float() @ qb.float().T)
+            .to(torch.bfloat16)
+            .float()
+            .reshape(t, n, dn + dr)
         )
-    for name, tensor in (
-        ("x", x),
-        ("wqa", qa),
-        ("wqb", qb),
-        ("wkva", kva),
-        ("wkb", wkb),
-        ("norm_weight_qa", norm_weight_qa),
-        ("norm_weight_kva", norm_weight_kva),
-    ):
-        _require(bool(torch.isfinite(tensor).all()), f"{name} contains NaN/Inf")
-    if dr and rope_mode:
-        _require(
-            bool(torch.isfinite(rope_sin).all())
-            and bool(torch.isfinite(rope_cos).all()),
-            "active rope_sin/rope_cos contains NaN/Inf",
-        )
-    _require(
-        sys.byteorder == "little", "packed Cache golden requires little-endian CPU"
-    )
-    cq_raw = x.float() @ qa.float().T
-    cq = _scale(_rms_norm(cq_raw, norm_weight_qa, norm_eps), qr_scale)
-    q_projected = (cq @ qb.float().T).reshape(t, n, dn + dr)
     q_nope = torch.einsum("tnd,ndk->tnk", q_projected[..., :dn], wkb.float())
     q_rope = _rope(q_projected[..., dn:], rope_sin, rope_cos, rope_mode)
-    q, descale_q = _dynamic_q(torch.cat((q_nope, q_rope), dim=-1), qkv_quant_mode)
-    kva_raw = x.float() @ kva.float().T
+    q, descale_q = _dynamic_q(
+        torch.cat((q_nope, q_rope), dim=-1),
+        qkv_quant_mode,
+        high_precision=high_precision,
+    )
+    if action_type == "bm_output_gold":
+        kva_raw = x.float() @ kva.float().T
+    else:
+        kva_raw = (x.float() @ kva.float().T).to(torch.bfloat16).float()
     ckv = _scale(_rms_norm(kva_raw[:, :_KV_LORA], norm_weight_kva, norm_eps), kvr_scale)
     kr = _rope(kva_raw[:, _KV_LORA:], rope_sin, rope_cos, rope_mode)
-    payload = _cache_payload(ckv, kr, qkv_quant_mode, quant_scale_kv)
-    qr = cq.to(torch.bfloat16) if return_qr else torch.empty(0, dtype=torch.bfloat16)
+    payload = _cache_payload(
+        ckv, kr, qkv_quant_mode, quant_scale_kv, high_precision=high_precision
+    )
+    qr = cq.to(qr_dtype) if return_qr else torch.empty(0, dtype=qr_dtype)
     _write_cache(kv_cache, cache_index, payload, cache_mode)
     return q, descale_q, qr
 
@@ -629,53 +520,30 @@ _REFERENCE_HELPERS = dict(
     cache_to_logical=cache_to_logical,
 )
 golden = SimpleNamespace(mla_prolog=golden_mla_prolog, **_REFERENCE_HELPERS)
-math_reference = SimpleNamespace(mla_prolog=math_mla_prolog, **_REFERENCE_HELPERS)
+math_reference = SimpleNamespace(
+    mla_prolog=partial(golden_mla_prolog, action_type="bm_output_gold"),
+    **_REFERENCE_HELPERS,
+)
 
 
+# Comparators: ordinary/high reference adapters, metrics and acceptance.
 def ordinary_cpu(golden, inputs, attrs):
-    """Independent CPU Cast chain. No device values or hardware reduction simulation."""
-    mode = int(attrs["qkv_quant_mode"])
-    x = inputs["x"].float()
-    tokens = len(x)
-    heads, dn, _ = inputs["wkb"].shape
-    dr = inputs["wkva"].shape[0] - 512
-    raw = (x @ inputs["wqa"].float().T).bfloat16().float()
-    cq = (
-        golden._rms_norm(raw, inputs["norm_weight_qa"], attrs["norm_eps"])
-        * attrs["qr_scale"]
-    ).bfloat16()
-    projected = (
-        (cq.float() @ inputs["wqb"].float().T)
-        .bfloat16()
-        .reshape(tokens, heads, dn + dr)
+    """Compatibility adapter using the same ordinary Golden as two-way checks."""
+    copied = dict(inputs, kv_cache=inputs["kv_cache"].clone())
+    output, captured = golden_with_reference(golden, copied, attrs)
+    payload = (
+        golden._cache_payload(
+            *captured["cache_fp"], attrs["qkv_quant_mode"], inputs["quant_scale_kv"]
+        )
+        if len(inputs["x"])
+        else torch.empty(
+            (0, inputs["kv_cache"].shape[-1]), dtype=inputs["kv_cache"].dtype
+        )
     )
-    nope = torch.einsum(
-        "tnd,ndk->tnk", projected[..., :dn].float(), inputs["wkb"].float()
-    )
-    rope = golden._rope(
-        projected[..., dn:].float(),
-        inputs["rope_sin"],
-        inputs["rope_cos"],
-        attrs["rope_mode"],
-    )
-    if mode < 2:
-        nope, rope = nope.bfloat16().float(), rope.bfloat16().float()
-    q, descale = golden._dynamic_q(torch.cat((nope, rope), -1), mode)
-    qr = cq if attrs["return_qr"] else torch.empty(0, dtype=torch.bfloat16)
-    kva = (x @ inputs["wkva"].float().T).bfloat16().float()
-    ckv = (
-        golden._rms_norm(kva[:, :512], inputs["norm_weight_kva"], attrs["norm_eps"])
-        * attrs["kvr_scale"]
-    )
-    kr = golden._rope(
-        kva[:, 512:], inputs["rope_sin"], inputs["rope_cos"], attrs["rope_mode"]
-    )
-    return (q, descale, qr), golden._cache_payload(
-        ckv, kr, mode, inputs["quant_scale_kv"]
-    )
+    return output, payload
 
 
-# Three-way statistics and limits: frozen v8 comparison policy.
+# Three-way statistics and limits agreed for the supplied comparison policy.
 
 
 DEFAULT_CONFIG = dict(
@@ -688,12 +556,17 @@ DEFAULT_CONFIG = dict(
 
 
 def error_metrics(value, golden, config):
+    """Supplied statistics with all special-value switches enabled; isolated copies."""
     if value.shape != golden.shape:
-        raise ValueError(f"shape mismatch: {value.shape} != {golden.shape}")
-    v, g = (
-        value.detach().double().flatten().clone(),
-        golden.detach().double().flatten().clone(),
-    )
+        raise ValueError("shape mismatch")
+    v, g = value.detach().flatten().clone(), golden.detach().flatten().clone()
+    limit = torch.finfo(v.dtype)
+    g[g > limit.max] = torch.inf
+    g[g < limit.min] = -torch.inf
+    g[torch.isinf(g)] = limit.max
+    v[torch.isinf(v)] = limit.max
+    g[torch.isnan(g)] = 0
+    v[torch.isnan(v)] = 0
     special = {}
     for name, predicate in (
         ("nan", torch.isnan),
@@ -701,23 +574,28 @@ def error_metrics(value, golden, config):
         ("ninf", torch.isneginf),
     ):
         special["err_total_" + name] = int((predicate(v) ^ predicate(g)).sum())
-    # Same replacement as the supplied statistics, but on independent clones.
     v[~torch.isfinite(v)] = 1
     g[~torch.isfinite(g)] = 1
     big = g.abs() >= config["small_value"]
-    error = (v - g).abs()
-    rel = error[big] / g[big].abs()
-    big_error = torch.where(big, error, 0.0)
+    vb, gb = v.clone(), g.clone()
+    vb[~big], gb[~big] = 1, 1
+    delta = (vb - gb).abs()
+    relative = delta / gb.abs()
+    vs, gs = v.clone(), g.clone()
+    mask = g.abs() > config["small_value"]
+    vs[mask], gs[mask] = 1, 1
     return dict(
         elements=g.numel(),
         big_elements=int(big.sum()),
         small_elements=int((~big).sum()),
-        max_re=float(rel.max()) if rel.numel() else 0.0,
-        avg_re=float(rel.mean()) if rel.numel() else 0.0,
-        small_bad=int((error[~big] > config["small_value_atol"]).sum()),
-        rmse=float(big_error.square().mean().sqrt()) if g.numel() else 0.0,
-        full_rmse_diagnostic=float(error.square().mean().sqrt()) if g.numel() else 0.0,
-        max_abs_diagnostic=float(error.max()) if g.numel() else 0.0,
+        max_re=float(relative.max()) if g.numel() else 0.0,
+        avg_re=float(relative.sum() / big.sum()) if g.numel() else 0.0,
+        small_bad=int(((vs - gs).abs() > config["small_value_atol"]).sum()),
+        rmse=float(delta.square().mean().sqrt()) if g.numel() else 0.0,
+        full_rmse_diagnostic=float((v - g).square().mean().sqrt())
+        if g.numel()
+        else 0.0,
+        max_abs_diagnostic=float((v - g).abs().max()) if g.numel() else 0.0,
         **special,
     )
 
@@ -733,11 +611,15 @@ def compare_three_way(npu, cpu, cpu_gold, output_dtype, config=None):
         raise ValueError("explicit canonical comparison dtype required")
     if npu.shape != cpu.shape or npu.shape != cpu_gold.shape:
         raise ValueError("all three shapes must match")
+    if output_dtype == "bf16":
+        npu, cpu = npu.float().bfloat16(), cpu.float().bfloat16()
+    elif output_dtype == "float8_e4m3fn":
+        npu, cpu = npu.float(), cpu.float()
     d, b = error_metrics(npu, cpu_gold, cfg), error_metrics(cpu, cpu_gold, cfg)
     floor = {"bf16": 2.0**-8, "fp16": 2.0**-11}.get(output_dtype, 0.0)
     effective = dict(b)
     for k in ("max_re", "avg_re", "rmse"):
-        effective[k] = max(effective[k], floor)
+        effective[k] = float(torch.tensor(effective[k]).maximum(torch.tensor(floor)))
     limits = dict(
         max_re=effective["max_re"] * cfg["max_re_rtol"],
         avg_re=effective["avg_re"] * cfg["avg_re_rtol"],
@@ -769,10 +651,10 @@ def compare_three_way(npu, cpu, cpu_gold, output_dtype, config=None):
 # Two-way dtype-specific comparisons and three-way acceptance.
 
 
-POLICY = "20261021_mla_prolog_v8_threshold_alignment"
+POLICY = "20261103_mla_prolog_supplied_comparison"
 
 
-ADAPTATION = "mla_prolog_two_way_then_three_way_warning_accepted"
+ADAPTATION = "real_domain_three_way_independent_copies_warning_accepted"
 
 
 BM_CMP_STD = {
@@ -806,10 +688,61 @@ def _record(method, elements, failed, allowed, passed, **details):
     )
 
 
+def _first_failed_elements(actual, expected, bad, *, limit=8, **details):
+    """Diagnostic samples in the current segment's flattened index space."""
+    indices = bad.flatten().nonzero().flatten()[:limit].tolist()
+    a, b = actual.flatten(), expected.flatten()
+    return [
+        dict(
+            flat_index=i,
+            actual=a[i].item(),
+            expected=b[i].item(),
+            **{name: values.flatten()[i].item() for name, values in details.items()},
+        )
+        for i in indices
+    ]
+
+
+def e8m0_int8(actual, expected):
+    """Compare E8M0 storage as signed INT8 codes, with zero outlier quota."""
+    _pair(actual, expected)
+    allowed = {torch.uint8, torch.int8}
+    native = getattr(torch, "float8_e8m0fnu", None)
+    if native is not None:
+        allowed.add(native)
+    if actual.dtype not in allowed or expected.dtype not in allowed:
+        raise TypeError("E8M0 requires native dtype or explicit byte carriers")
+    a = actual.contiguous().view(torch.int8).flatten().float()
+    b = expected.contiguous().view(torch.int8).flatten().float()
+    bad = ~torch.isclose(a, b, rtol=0.0, atol=1.0)
+    relative = (a - b).abs() / (
+        torch.maximum(a.abs(), b.abs()).clamp_min((1 / 16384) / 0.005) + 2e-9
+    )
+    hard = float(relative[bad].max()) if bad.any() else 0.0
+    failed = int(bad.sum())
+    return _record(
+        1,
+        a.numel(),
+        failed,
+        0,
+        failed == 0 and hard < 10.0,
+        dtype_rule="E8M0 signed INT8 codes",
+        rtol=0.0,
+        atol=1.0,
+        diff_thd=0.005,
+        pct_thd=0.0,
+        max_diff_thd=10.0,
+        max_bad_relative=hard,
+        first_failed_elements=_first_failed_elements(
+            a, b, bad, relative_error=relative
+        ),
+    )
+
+
 def mixed(actual, expected, *, scale=False):
     """BF16 or FP32 scale isclose, segment quota and relative-error hard limit."""
     _pair(actual, expected)
-    a, b = actual.double().flatten(), expected.double().flatten()
+    a, b = actual.float().flatten(), expected.float().flatten()
     m = a.numel()
     atol, rtol = (0.000025, 0.005) if scale else (0.0001, 1 / 128)
     finite = torch.isfinite(a) & torch.isfinite(b)
@@ -818,12 +751,12 @@ def mixed(actual, expected, *, scale=False):
         | (torch.isposinf(a) & torch.isposinf(b))
         | (torch.isneginf(a) & torch.isneginf(b))
     )
-    # v8 uses FP64 statistics and torch.isclose, without changing Golden.
+    # Mixed-tolerance decisions use FP32 with an integer 0.5% quota.
     close = torch.isclose(a, b, atol=atol, rtol=rtol, equal_nan=True)
     bad = ~close
     finite_bad = finite & bad
-    denominator = torch.maximum(a.abs(), b.abs()).clamp_min((1 / 16384) / 0.005) + 2e-9
-    relative = (a - b).abs() / denominator
+    denominator = torch.maximum(a.abs(), b.abs()).clamp_min((1 / 16384) / 0.005) + 1e-9
+    relative = (a - b).abs() / (denominator + 1e-9)
     hard = float(relative[finite_bad].max()) if finite_bad.any() else 0.0
     af, bf = a[finite], b[finite]
     delta = (af - bf).abs()
@@ -835,7 +768,12 @@ def mixed(actual, expected, *, scale=False):
         m,
         failed,
         allowed,
-        failed <= allowed and hard < 10,
+        failed * 200 <= m
+        and hard < 10
+        and bool(torch.isfinite(relative[finite_bad]).all()),
+        first_failed_elements=_first_failed_elements(
+            a, b, bad, relative_error=relative
+        ),
         dtype_rule="FP32 scale" if scale else "BF16",
         atol=atol,
         rtol=rtol,
@@ -857,76 +795,99 @@ def mixed(actual, expected, *, scale=False):
 
 
 def e4m3fn(actual, expected):
-    """method10, only explicitly typed E4M3FN payloads (never arbitrary uint8)."""
+    """Supplied method10, 0.5% quota, including the index-zero any() behavior."""
     _pair(actual, expected)
     if actual.dtype != torch.float8_e4m3fn or expected.dtype != torch.float8_e4m3fn:
         raise TypeError("method10 requires E4M3FN typed payloads")
     a = actual.contiguous().view(torch.uint8).flatten().to(torch.int16)
     b = expected.contiguous().view(torch.uint8).flatten().to(torch.int16)
-    a = torch.where((a == 127) | (a == 255), 0, a)
-    b = torch.where((b == 127) | (b == 255), 0, b)
-    distance = (a - b).abs()
-    distance = torch.minimum(distance, 256 - distance)
+    a = torch.where((a & 127) == 127, 0, a)
+    b = torch.where((b & 127) == 127, 0, b)
+    delta = (a - b).abs()
+    distance = torch.minimum(delta, 256 - delta)
     signed_zero = ((a == 0) & (b == 128)) | ((a == 128) & (b == 0))
     failed = int((distance > 1).sum())
+    over_two = (distance > 2).nonzero().flatten()
+    entered = bool(over_two.any())
     hard = int(((distance > 2) & ~signed_zero).sum())
-    allowed = a.numel() // 200
+    percent = (
+        float(a.numel() - failed) / float(a.numel()) * 100.0 if a.numel() else 100.0
+    )
     return _record(
         10,
         a.numel(),
         failed,
-        allowed,
-        failed <= allowed and hard == 0,
+        a.numel() // 200,
+        percent >= (1 - 0.005) * 100.0 and (not entered or hard == 0),
         pct_thd=0.005,
+        first_failed_elements=_first_failed_elements(
+            actual.float(),
+            expected.float(),
+            distance > 1,
+            actual_code=actual.contiguous().view(torch.uint8),
+            expected_code=expected.contiguous().view(torch.uint8),
+            code_distance=distance,
+        ),
+        first_hard_failed_elements=_first_failed_elements(
+            actual.float(),
+            expected.float(),
+            (distance > 2) & ~signed_zero,
+            code_distance=distance,
+        ),
         hard_failures=hard,
+        source_hard_check_entered=entered,
+        fulfill_percent=percent,
         signed_zero_pairs=int(signed_zero.sum()),
-        max_code_distance=int(distance.max()) if distance.numel() else 0,
     )
 
 
 def hif8(actual_decoded, reference_fp32, *, diff_thd=0.005):
-    """method6 against pre-Cast FP32 in quantization domain, with SAT."""
+    """Supplied method6: overflow to Inf, matching special values, percent gate."""
     if not 0 <= diff_thd <= 1:
-        raise ValueError("diff_thd must be finite and in [0, 1]")
+        raise ValueError("diff_thd must be in [0, 1]")
     _pair(actual_decoded, reference_fp32)
     if reference_fp32.dtype != torch.float32:
-        raise TypeError("HiF8 reference must be pre-Cast FP32, not quantized bytes")
+        raise TypeError("HiF8 reference must be decoded FP32")
     h = actual_decoded.double().flatten()
-    x = (
-        reference_fp32.double()
-        .flatten()
-        .nan_to_num(nan=0.0, posinf=32768.0, neginf=-32768.0)
-        .clamp(-32768, 32768)
-    )
+    x = reference_fp32.clone().flatten()
+    x = torch.where(x > 32768, float("inf"), x)
+    x = torch.where(x < -32768, -float("inf"), x).double()
     ex = torch.log2(x.abs() + 2.0**-1000).clamp_min(-22)
     exponent = ex.floor()
-    mantissa = torch.zeros_like(exponent)
+    width = torch.zeros_like(exponent)
     for limit, bits in ((15, 1), (7, 2), (3, 3)):
-        mantissa = torch.where(exponent.abs() <= limit, bits, mantissa)
-    sign_h = torch.where(h >= 0, 1, -1)
-    sign_x = torch.where(x >= 0, 1, -1)
+        width = torch.where(exponent.abs() <= limit, bits, width)
+    ulp = (h - x) * torch.pow(2.0, -exponent + width)
+    signed_ex = ex * torch.where(x >= 0, 1, -1)
+    signed_eh = torch.log2(h.abs() + 2.0**-1000) * torch.where(h >= 0, 1, -1)
+    ulp = torch.where(width == 0, signed_eh - signed_ex, ulp)
     ulp = torch.where(
-        mantissa > 0,
-        (h - x) * torch.pow(2.0, -exponent + mantissa),
-        torch.log2(h.abs() + 2.0**-1000) * sign_h - ex * sign_x,
+        torch.isinf(x) | torch.isinf(h), torch.where(x == h, 0.0, float("nan")), ulp
     )
-    ulp = torch.where(x.abs() < 2.0**-23, torch.where(h == 0, 0.0, 1.5), ulp)
-    invalid = ~torch.isfinite(h) | ~torch.isfinite(ulp)
-    failures = invalid | (ulp.abs() > 1)
-    m = h.numel()
-    allowed = m // 1000 + 1 if m > 100 else int(m * diff_thd)
-    valid = ulp[~invalid].abs()
+    ulp = torch.where(
+        torch.isnan(x) | torch.isnan(h),
+        torch.where(torch.isnan(x) & torch.isnan(h), 0.0, float("nan")),
+        ulp,
+    )
+    ulp = torch.where(
+        (x == 0) | (x.abs() < 2.0**-23), torch.where(h == 0, 0.0, 1.5), ulp
+    )
+    bad = (ulp.abs() > 1) | torch.isnan(ulp)
+    m, failed = h.numel(), int(bad.sum())
+    effective = float((m * 0.001 + 1) / m) if m > 100 else diff_thd
+    percent = float(m - failed) / float(m) * 100.0 if m else 100.0
+    errors = ulp[bad].tolist()
     return _record(
         6,
         m,
-        int(failures.sum()),
-        allowed,
-        int(failures.sum()) <= allowed,
-        invalid_ulp=int(invalid.sum()),
-        max_abs_ulp=float(valid.max()) if valid.numel() else None,
-        saturation="SAT",
-        short_segment_pct_thd=diff_thd,
-        effective_fail_fraction=0.001 + 1 / m if m > 100 else diff_thd,
+        failed,
+        m // 1000 + 1 if m > 100 else int(m * diff_thd),
+        percent >= float(1 - effective) / float(1) * 100.0,
+        first_failed_elements=_first_failed_elements(h, x, bad, ulp=ulp),
+        effective_fail_fraction=effective,
+        fulfill_percent=percent,
+        max_error=max(errors) - 1.0 if errors else 0.0,
+        reference_domain="decoded_ordinary_hif8_overflow_to_inf",
     )
 
 
@@ -985,12 +946,6 @@ def compare_numeric_outputs(
     layout = golden.CacheMode[attrs["cache_mode"].name]
     dr = inputs["wkva"].shape[0] - 512
     results = {}
-    if mode == 3 and inputs["x"].shape[0]:
-        q_fp = captured["q_fp"][0]
-        denominator = torch.where(expected[1] == 0, 1.0, expected[1])
-        q_reference = torch.where(expected[1] == 0, 0.0, q_fp / denominator)
-    else:
-        q_reference = torch.empty_like(expected[0], dtype=torch.float32)
     q_sections = (
         (("q_nope", slice(0, 512)), ("q_rope", slice(512, None)))
         if split_diagnostics
@@ -1003,7 +958,9 @@ def compare_numeric_outputs(
             if mode < 2
             else e4m3fn(a, b)
             if mode == 2
-            else hif8(golden.decode_hif8(a.contiguous()), q_reference[..., section])
+            else hif8(
+                golden.decode_hif8(a.contiguous()), golden.decode_hif8(b.contiguous())
+            )
         )
     results["descale_q"] = mixed(actual[1], expected[1], scale=True)
     results["qr"] = mixed(actual[2], expected[2])
@@ -1027,13 +984,6 @@ def compare_numeric_outputs(
         # v8 treats the four group scales as one independent FP32 scale segment.
         results["cache_descale"] = mixed(sa, sb, scale=True)
     else:
-        if mode == 3 and inputs["x"].shape[0]:
-            cache_ref = (
-                torch.cat(captured["cache_fp"], dim=-1)[valid]
-                * inputs["quant_scale_kv"].item()
-            )
-        else:
-            cache_ref = torch.empty_like(b, dtype=torch.float32)
         cache_sections = (
             (("kv", slice(0, 512)), ("kr", slice(512, None)))
             if split_diagnostics
@@ -1046,7 +996,10 @@ def compare_numeric_outputs(
                 if mode == 0
                 else e4m3fn(av, bv)
                 if mode == 2
-                else hif8(golden.decode_hif8(av.contiguous()), cache_ref[..., section])
+                else hif8(
+                    golden.decode_hif8(av.contiguous()),
+                    golden.decode_hif8(bv.contiguous()),
+                )
             )
     return results
 
@@ -1080,15 +1033,15 @@ def three_way(
     cpu_gold,
     dtype,
     *,
-    golden_inf_switch=False,
-    inf_clip_switch=False,
-    nan_toZero_switch=False,
+    golden_inf_switch=True,
+    inf_clip_switch=True,
+    nan_toZero_switch=True,
 ):
-    """v8 numeric rules; preserve this operator's independent CPU reference contract."""
+    """Supplied three-way rules with independent copies and all switches enabled."""
     _pair(device, cpu_gold)
     _pair(ordinary_cpu, cpu_gold)
-    if golden_inf_switch or inf_clip_switch or nan_toZero_switch:
-        raise ValueError("v8 performs no optional Inf clipping or NaN-to-zero")
+    if not (golden_inf_switch and inf_clip_switch and nan_toZero_switch):
+        raise ValueError("all three special-value switches must be enabled")
     dtype_name = {
         torch.bfloat16: "bf16",
         torch.float16: "fp16",
@@ -1106,7 +1059,7 @@ def three_way(
         diagnostic_only=False,
         **result,
         configuration=result["config"],
-        entry="v8/compare_three_way",
+        entry="supplied/compare_three_way_independent_copies",
         input_dtypes=dict(
             device=str(device.dtype),
             cpu=str(ordinary_cpu.dtype),
@@ -1139,131 +1092,252 @@ policy = SimpleNamespace(
 
 
 def load_math_reference(golden):
-    """Return the independent frozen FP32 entry, never the BF16 entry."""
+    """Return the unified Golden configured for unquantized FP32 outputs."""
     verify_reference_integrity()
     return math_reference
 
 
 def fallback_segments(golden, inputs, attrs, actual, after, expected, captured):
-    """D/C/G use the same inputs; G is never the lower-precision two-way reference."""
-    # Retain the call signature, but deliberately rebuild G independently.
-    # A cloned Cache prevents the high-precision reference from changing the
-    # two-way Cache result or any caller-owned tensor.
-    math_reference = load_math_reference(golden)
-    math_inputs = dict(inputs, kv_cache=inputs["kv_cache"].clone())
-    math_attrs = dict(
-        attrs, cache_mode=math_reference.CacheMode[attrs["cache_mode"].name]
-    )
-    expected, captured = policy.golden_with_reference(
-        math_reference, math_inputs, math_attrs
-    )
+    """D/C use their own scales; G is unquantized FP32 from identical BF16 inputs."""
+    high = load_math_reference(golden)
     mode = int(attrs["qkv_quant_mode"])
     layout = golden.CacheMode[attrs["cache_mode"].name]
-    ordinary, payload = ordinary_cpu(golden, inputs, attrs)
-    decode = golden.decode_hif8 if mode == 3 else lambda t: t.float()
-    d, c = decode(actual[0].contiguous()), decode(ordinary[0].contiguous())
-    g = expected[0].float()
-    if mode >= 2:
-        denominator = torch.where(expected[1] == 0, 1.0, expected[1])
-        g = torch.where(expected[1] == 0, 0.0, captured["q_fp"][0] / denominator)
-        if mode == 3:
-            g = g.nan_to_num(nan=0.0, posinf=32768.0, neginf=-32768.0).clamp(
-                -32768, 32768
-            )
-    triples = {}
-    diagnostic_triples = {}
-    qdtype = torch.float32 if mode == 3 else actual[0].dtype
-    triples["q"] = (d, c, g, qdtype)
-    for name, section in (("q_nope", slice(0, 512)), ("q_rope", slice(512, None))):
-        diagnostic_triples[name] = (
-            d[..., section],
-            c[..., section],
-            g[..., section],
-            qdtype,
-        )
-    for name, i in (("descale_q", 1), ("qr", 2)):
-        triples[name] = (
-            actual[i].float(),
-            ordinary[i].float(),
-            expected[i].float(),
-            actual[i].dtype,
-        )
+    dr = expected[0].shape[-1] - 512
+    # Only written slots are compared. The high Cache is an independent FP32 shadow.
+    high_cache = torch.zeros(
+        (*inputs["kv_cache"].shape[:3], 512 + dr), dtype=torch.float32
+    )
+    high_inputs = dict(inputs, kv_cache=high_cache)
+    high_outputs, high_captured = golden_with_reference(high, high_inputs, attrs)
     valid = inputs["cache_index"] >= 0
     hits = inputs["cache_index"][valid]
-    width = after.shape[-1]
-    da = golden.cache_to_logical(after, layout).reshape(-1, width)[hits]
-    ge = golden.cache_to_logical(math_inputs["kv_cache"], layout).reshape(-1, width)[
-        hits
-    ]
-    ca = payload[valid]
-    dr = inputs["wkva"].shape[0] - 512
-    if mode == 1:
-        da, ca, ge = (v.contiguous().view(torch.uint8) for v in (da, ca, ge))
-        for name, start, end, dtype in (
-            ("kv", 0, 512, torch.float8_e4m3fn),
-            ("kr", 512, 512 + 2 * dr, torch.bfloat16),
-        ):
-            triples[name] = (
-                *[
-                    v[:, start:end].contiguous().view(dtype).float()
-                    for v in (da, ca, ge)
-                ],
-                dtype,
-            )
-        triples["cache_descale"] = (
-            *[
-                v[:, 512 + 2 * dr :].contiguous().view(torch.float32)
-                for v in (da, ca, ge)
-            ],
-            torch.float32,
+
+    def query_values(outputs):
+        q, scale, _ = outputs
+        values = golden.decode_hif8(q.contiguous()) if mode == 3 else q.float()
+        return values * scale if mode >= 2 else values
+
+    triples = {
+        "q": (
+            query_values(actual),
+            query_values(expected),
+            high_outputs[0],
+            actual[0].dtype if mode < 2 else torch.float32,
         )
-    else:
-        dv, cv, gv = (decode(v.contiguous()) for v in (da, ca, ge))
-        dtype = torch.float32 if mode == 3 else da.dtype
-        triples["cache"] = (dv, cv, gv, dtype)
-        for name, section in (("kv", slice(0, 512)), ("kr", slice(512, None))):
-            diagnostic_triples[name] = (
-                dv[..., section],
-                cv[..., section],
-                gv[..., section],
-                dtype,
+    }
+    for name, i in (("descale_q", 1), ("qr", 2)):
+        triples[name] = (actual[i], expected[i], high_outputs[i], actual[i].dtype)
+    width = after.shape[-1]
+
+    def cache_rows(cache):
+        return golden.cache_to_logical(cache, layout).reshape(-1, width)[hits]
+
+    da, ca = cache_rows(after), cache_rows(inputs["kv_cache"])
+    ge = golden.cache_to_logical(high_cache, layout).reshape(-1, 512 + dr)[hits]
+    diagnostics = {}
+    for name, section in (("q_nope", slice(0, 512)), ("q_rope", slice(512, None))):
+        diagnostics[name] = tuple(v[..., section] for v in triples["q"][:3]) + (
+            triples["q"][3],
+        )
+    if mode == 1:
+
+        def unpack(rows):
+            raw = rows.contiguous().view(torch.uint8)
+            kv = raw[:, :512].contiguous().view(torch.float8_e4m3fn).float()
+            kr = raw[:, 512 : 512 + 2 * dr].contiguous().view(torch.bfloat16).float()
+            scales = raw[:, 512 + 2 * dr :].contiguous().view(torch.float32)
+            return (
+                (kv.reshape(-1, 4, 128) * scales[..., None]).reshape(-1, 512),
+                kr,
+                scales,
             )
-    required = {"q", "qr", "descale_q"}
-    required.update({"kv", "kr", "cache_descale"} if mode == 1 else {"cache"})
-    if set(triples) != required:
-        raise ValueError("missing or extra three-way segment")
+
+        dk, dr_values, ds = unpack(da)
+        ck, cr, cs = unpack(ca)
+        high_kv = high_captured["cache_fp"][0]
+        gs = (
+            high_kv.reshape(-1, 4, 128).abs().amax(-1).clamp_min(_GROUP_AMAX_FLOOR)
+            / _FP8_MAX
+        )
+        triples["kv"] = (dk, ck, ge[:, :512], torch.float32)
+        triples["kr"] = (dr_values, cr, ge[:, 512:], torch.bfloat16)
+        triples["cache_descale"] = (ds, cs, gs[valid], torch.float32)
+    else:
+
+        def real_cache(rows):
+            values = (
+                golden.decode_hif8(rows.contiguous()) if mode == 3 else rows.float()
+            )
+            return values / inputs["quant_scale_kv"] if mode >= 2 else values
+
+        triples["cache"] = (
+            real_cache(da),
+            real_cache(ca),
+            ge,
+            torch.bfloat16 if mode == 0 else torch.float32,
+        )
+        for name, section in (("kv", slice(0, 512)), ("kr", slice(512, None))):
+            diagnostics[name] = tuple(v[..., section] for v in triples["cache"][:3]) + (
+                triples["cache"][3],
+            )
     records = {name: policy.three_way(*values) for name, values in triples.items()}
     states = {r["status"] for r in records.values()}
+    return dict(
+        status="Failed"
+        if "Failed" in states
+        else "warning"
+        if "warning" in states
+        else "Pass",
+        segments=records,
+        diagnostics={
+            name: policy.three_way(*values) for name, values in diagnostics.items()
+        },
+        diagnostics_affect_acceptance=True,
+        reference="D=device; C=two-way ordinary Golden; G=unquantized FP32; independent comparison copies",
+    ), triples
+
+
+def accept_output_comparisons(direct, fallback, diagnostics, mode):
+    """Try whole outputs first; split homogeneous outputs only after both fail."""
+    required = {"q", "qr", "descale_q"}
+    required.update({"kv", "kr", "cache_descale"} if mode == 1 else {"cache"})
+    if set(direct) != required:
+        raise ValueError("missing or extra two-way output")
+    fallback = fallback or {}
+    three = fallback.get("segments", {})
+    split_three = fallback.get("diagnostics", {})
+    splits = {"q": ("q_nope", "q_rope")}
+    if mode != 1:
+        splits["cache"] = ("kv", "kr")
+
+    def either(two_record, three_record):
+        two = two_record.get("status", "NOT_RUN")
+        triple = three_record.get("status", "NOT_RUN")
+        if two in ("PASS", "EMPTY"):
+            path = "TWO_WAY"
+        elif triple in ("Pass", "warning"):
+            path = "THREE_WAY"
+        elif two == "FAIL" and triple == "Failed":
+            path = "FAIL"
+        else:
+            path = "UNVERIFIED"
+        return dict(two_way=two, three_way=triple, accepted_by=path)
+
+    outputs = {}
+    for name in sorted(required):
+        decision = either(direct[name], three.get(name, {}))
+        if decision["accepted_by"] == "FAIL" and name in splits:
+            branches = {
+                branch: either(diagnostics.get(branch, {}), split_three.get(branch, {}))
+                for branch in splits[name]
+            }
+            states = {item["accepted_by"] for item in branches.values()}
+            decision["branches"] = branches
+            decision["accepted_by"] = (
+                "FAIL"
+                if "FAIL" in states
+                else "UNVERIFIED"
+                if "UNVERIFIED" in states
+                else "SPLIT_FALLBACK"
+            )
+        outputs[name] = decision
+    states = {item["accepted_by"] for item in outputs.values()}
     status = (
-        "Failed" if "Failed" in states else "warning" if "warning" in states else "Pass"
+        "FAIL"
+        if "FAIL" in states
+        else "UNVERIFIED"
+        if "UNVERIFIED" in states
+        else "PASS"
     )
-    return (
-        dict(
-            status=status,
-            segments=records,
-            diagnostics={
-                name: policy.three_way(*values)
-                for name, values in diagnostic_triples.items()
-            },
-            diagnostics_affect_acceptance=True,
-            diagnostics_acceptance_condition="only after the corresponding whole output fails both comparisons",
-            reference="D=device; C=independent single-BF16 CPU chain; G=frozen Golden; quantized Q uses pre-Cast normalized G",
-            hif8_binding=(
-                "decoded numeric domain, FP32 comparison with zero floor; SAT reference retained"
-                if mode == 3
-                else None
-            ),
-        ),
-        triples,
+    category = (
+        "PRECISION_FAIL"
+        if status == "FAIL"
+        else "UNVERIFIED"
+        if status == "UNVERIFIED"
+        else "TWO_WAY_PASS"
+        if states == {"TWO_WAY"}
+        else "THREE_WAY_PASS"
     )
+    return dict(
+        status=status,
+        category=category,
+        outputs=outputs,
+        split_fallback_outputs=[
+            name
+            for name, item in outputs.items()
+            if item["accepted_by"] == "SPLIT_FALLBACK"
+        ],
+    )
+
+
+def compare_outputs(cpu, actual, attrs, outputs, before):
+    expected, captured = policy.golden_with_reference(golden, cpu, attrs)
+    host = tuple(value.cpu() for value in outputs)
+    after = actual["kv_cache"].cpu()
+    for value, reference in zip(host, expected):
+        assert value.shape == reference.shape and value.dtype == reference.dtype
+    direct = policy.compare_outputs(
+        golden,
+        host,
+        expected,
+        after,
+        cpu["kv_cache"],
+        cpu,
+        attrs,
+        captured,
+    )
+    direct_status = policy.precision_status(direct)
+    diagnostics = policy.compare_outputs(
+        golden,
+        host,
+        expected,
+        after,
+        cpu["kv_cache"],
+        cpu,
+        attrs,
+        captured,
+        split_diagnostics=True,
+    )
+    report = dict(
+        two_way=direct, two_way_diagnostics=diagnostics, category="TWO_WAY_PASS"
+    )
+    fallback = None
+    if direct_status == "FAIL":
+        fallback, _ = fallback_segments(
+            golden, cpu, attrs, host, after, expected, captured
+        )
+        report["three_way"] = fallback
+    acceptance = accept_output_comparisons(
+        direct, fallback, diagnostics, int(attrs["qkv_quant_mode"])
+    )
+    report.update(acceptance=acceptance, category=acceptance["category"])
+    assert acceptance["status"] == "PASS", report
+    layout = attrs["cache_mode"]
+    old_bytes = (
+        golden.cache_to_logical(before, layout)
+        .contiguous()
+        .view(torch.uint8)
+        .reshape(before.shape[0] * before.shape[1], -1)
+    )
+    new_bytes = (
+        golden.cache_to_logical(after, layout)
+        .contiguous()
+        .view(torch.uint8)
+        .reshape(before.shape[0] * before.shape[1], -1)
+    )
+    untouched = torch.ones(before.shape[0] * before.shape[1], dtype=torch.bool)
+    untouched[cpu["cache_index"]] = False
+    assert torch.equal(old_bytes[untouched], new_bytes[untouched]), (
+        "Untouched Cache bytes changed"
+    )
+    return report
 
 
 # Freeze numerical definitions, not the formatting or file organization.
-_FROZEN_NUMERIC_AST = "b5ae7ef0d26df9af30c4cca10a509d4cceb1a6cb000f85c64e693338dec9dd51"
+_FROZEN_NUMERIC_AST = "f996203fa3abe20a5b1f6a971029dff64236f8b1c90ff3d6e0eab52cbcf7a81a"
 _FROZEN_NUMERIC_NAMES = (
     "_KV_LORA",
     "_GROUP_SIZE",
-    "_BLOCK_SIZE",
     "_FP8_MAX",
     "_HIF8_MAX",
     "_GROUP_AMAX_FLOOR",
@@ -1287,7 +1361,6 @@ _FROZEN_NUMERIC_NAMES = (
     "_write_cache",
     "cache_to_logical",
     "golden_mla_prolog",
-    "math_mla_prolog",
     "DEFAULT_CONFIG",
     "error_metrics",
     "compare_three_way",
@@ -1296,6 +1369,8 @@ _FROZEN_NUMERIC_NAMES = (
     "BM_CMP_STD",
     "_pair",
     "_record",
+    "_first_failed_elements",
+    "e8m0_int8",
     "mixed",
     "e4m3fn",
     "hif8",
@@ -1304,6 +1379,8 @@ _FROZEN_NUMERIC_NAMES = (
     "precision_status",
     "three_way",
     "acceptance_status",
+    "fallback_segments",
+    "accept_output_comparisons",
 )
 
 
@@ -1326,7 +1403,100 @@ def verify_reference_integrity():
     )
 
 
-# Device fixtures, graph audit and the four public-mode cases.
+# Test fixtures, DSL device execution, graph audit and four public-mode cases.
+# Pair one cache layout with each of the four QKV modes.
+CACHE_LAYOUTS = (
+    (1, 0, 0),  # Contiguous baseline.
+    (2, 0, "page"),  # Page stride and storage offset.
+    (1, 1, 3),  # Unaligned gap and storage offset.
+    (1, 4099, 65),  # Large gap and storage offset.
+)
+
+
+def make_cache_view(cache, factor, gap, offset):
+    page_elements = cache.shape[1] * cache.shape[3]
+    offset = page_elements if offset == "page" else offset
+    stride0 = factor * page_elements + gap
+    count = offset + (cache.shape[0] - 1) * stride0 + page_elements + 67
+    backing = torch.empty(count, dtype=cache.dtype, device=cache.device)
+    backing.view(torch.uint8).fill_(0x5A)
+    view = backing.as_strided(
+        cache.shape, (stride0, cache.shape[3], cache.shape[3], 1), offset
+    )
+    view.copy_(cache)
+    guard = torch.ones(count, dtype=torch.bool)
+    for page in range(cache.shape[0]):
+        begin = offset + page * stride0
+        guard[begin : begin + page_elements] = False
+    before = (
+        backing.cpu().view(torch.uint8).reshape(count, cache.element_size()).clone()
+    )
+    assert view.stride(0) == stride0 and view.storage_offset() == offset
+    return view, backing, before, guard
+
+
+def check_cache_guards(backing, before, guard):
+    after = backing.cpu().view(torch.uint8).reshape(before.shape)
+    assert torch.equal(after[guard], before[guard]), (
+        "Cache write modified backing storage guards"
+    )
+
+
+QKV_MODES = {
+    "A16C16": 0,
+    "A16C8_KV_NOPE_FP8_E4M3_PER_TOKEN_GROUP_GROUP_SIZE_128_ROPE_BF16_SCALE_FLOAT_KV_CACHE_LAYOUT_N_NOPE_ROPE_SCALE": 1,
+    "A8C8_Q_FP8_E4M3_PER_TOKEN_HEAD_KV_FP8_E4M3_PER_TENSOR": 2,
+    "A8C8_QKV_HIFLOAT8_PER_TENSOR": 3,
+}
+ROPE_MODES = {"NO_ROPE": 0, "ROPE_INTERLEAVE_HALF": 1, "ROPE_HALF": 2}
+
+
+def check_enum_contract(module):
+    name = "mla_prolog"
+    operator = getattr(module, name)
+    native = getattr(module, name + "_native")
+    entries = [operator, native]
+    expected = {
+        "QkvQuantMode": QKV_MODES,
+        "CacheMode": {"PA_BSND": 0, "PA_NZ": 1},
+        "RopeMode": ROPE_MODES,
+    }
+    attrs = dict(
+        qkv_quant_mode=operator.QkvQuantMode.A16C16,
+        cache_mode=operator.CacheMode.PA_BSND,
+        rope_mode=operator.RopeMode.ROPE_INTERLEAVE_HALF,
+    )
+    inputs = [None] * 9
+    foreign = Enum("ForeignMode", {"VALUE": 1}).VALUE
+    for entry in entries:
+        for enum_name, members in expected.items():
+            enum = getattr(entry, enum_name)
+            assert enum is getattr(operator, enum_name)
+            assert {
+                key: member.value for key, member in enum.__members__.items()
+            } == members
+        for attr in attrs:
+            for bad in (0, 1, 2, 3, True, 1.0, "1", None, foreign):
+                with pytest.raises(TypeError, match=attr):
+                    entry(*inputs, **dict(attrs, **{attr: bad}))
+    namespace = torch.ops.cannbot_dsl_mla_prolog
+    with (
+        patch.object(torch.compiler, "is_compiling", return_value=False),
+        patch.object(getattr(namespace, name), "default") as dispatch,
+    ):
+        for rope in operator.RopeMode:
+            result = operator(*inputs, **dict(attrs, rope_mode=rope))
+            assert result is dispatch.return_value
+            assert dispatch.call_args.kwargs["rope_mode"] == rope.value
+            assert dispatch.call_args.kwargs["qkv_quant_mode"] == 0
+            assert dispatch.call_args.kwargs["cache_mode"] == 0
+        operator(*inputs, **{k: v for k, v in attrs.items() if k != "rope_mode"})
+        assert dispatch.call_args.kwargs["rope_mode"] == 1
+    module._validate_schema_modes(0, 0, 2)
+    with pytest.raises(ValueError, match="rope_mode"):
+        module._validate_schema_modes(0, 0, 3)
+
+
 op = load_sample("attention/mla_prolog/mla_prolog.py")
 pytestmark = pytest.mark.npu
 CASES = (
@@ -1334,6 +1504,8 @@ CASES = (
     (1, "NZ", "PA_BSND", 192, 64, 2, False),
     (2, "NZ", "PA_NZ", 128, 64, 1, False),
     (3, "ND", "PA_NZ", 256, 0, 0, True),
+    (0, "ND", "PA_BSND", 128, 64, 2, False),
+    (0, "NZ", "PA_BSND", 128, 64, 2, False),
 )
 
 
@@ -1386,9 +1558,9 @@ def make_inputs(case, device):
     )
     public_attrs = dict(
         attrs,
-        qkv_quant_mode=op.QkvQuantMode(mode),
-        cache_mode=op.CacheMode[cache_mode],
-        rope_mode=op.RopeMode(rope_mode),
+        qkv_quant_mode=op.mla_prolog.QkvQuantMode(mode),
+        cache_mode=op.mla_prolog.CacheMode[cache_mode],
+        rope_mode=op.mla_prolog.RopeMode(rope_mode),
     )
     return cpu, actual, attrs, public_attrs
 
@@ -1542,142 +1714,6 @@ def run_entry(actual, attrs, execution, trace_dir):
     return result, replay, audit_trace(trace, execution)
 
 
-def accept_output_comparisons(direct, fallback, diagnostics, mode):
-    """Try whole outputs first; split homogeneous outputs only after both fail."""
-    required = {"q", "qr", "descale_q"}
-    required.update({"kv", "kr", "cache_descale"} if mode == 1 else {"cache"})
-    if set(direct) != required:
-        raise ValueError("missing or extra two-way output")
-    fallback = fallback or {}
-    three = fallback.get("segments", {})
-    split_three = fallback.get("diagnostics", {})
-    splits = {"q": ("q_nope", "q_rope")}
-    if mode != 1:
-        splits["cache"] = ("kv", "kr")
-
-    def either(two_record, three_record):
-        two = two_record.get("status", "NOT_RUN")
-        triple = three_record.get("status", "NOT_RUN")
-        if two in ("PASS", "EMPTY"):
-            path = "TWO_WAY"
-        elif triple in ("Pass", "warning"):
-            path = "THREE_WAY"
-        elif two == "FAIL" and triple == "Failed":
-            path = "FAIL"
-        else:
-            path = "UNVERIFIED"
-        return dict(two_way=two, three_way=triple, accepted_by=path)
-
-    outputs = {}
-    for name in sorted(required):
-        decision = either(direct[name], three.get(name, {}))
-        if decision["accepted_by"] == "FAIL" and name in splits:
-            branches = {
-                branch: either(diagnostics.get(branch, {}), split_three.get(branch, {}))
-                for branch in splits[name]
-            }
-            states = {item["accepted_by"] for item in branches.values()}
-            decision["branches"] = branches
-            decision["accepted_by"] = (
-                "FAIL"
-                if "FAIL" in states
-                else "UNVERIFIED"
-                if "UNVERIFIED" in states
-                else "SPLIT_FALLBACK"
-            )
-        outputs[name] = decision
-    states = {item["accepted_by"] for item in outputs.values()}
-    status = (
-        "FAIL"
-        if "FAIL" in states
-        else "UNVERIFIED"
-        if "UNVERIFIED" in states
-        else "PASS"
-    )
-    category = (
-        "PRECISION_FAIL"
-        if status == "FAIL"
-        else "UNVERIFIED"
-        if status == "UNVERIFIED"
-        else "TWO_WAY_PASS"
-        if states == {"TWO_WAY"}
-        else "THREE_WAY_PASS"
-    )
-    return dict(
-        status=status,
-        category=category,
-        outputs=outputs,
-        split_fallback_outputs=[
-            name
-            for name, item in outputs.items()
-            if item["accepted_by"] == "SPLIT_FALLBACK"
-        ],
-    )
-
-
-def compare_outputs(cpu, actual, attrs, outputs, before):
-    expected, captured = policy.golden_with_reference(golden, cpu, attrs)
-    host = tuple(value.cpu() for value in outputs)
-    after = actual["kv_cache"].cpu()
-    for value, reference in zip(host, expected):
-        assert value.shape == reference.shape and value.dtype == reference.dtype
-    direct = policy.compare_outputs(
-        golden,
-        host,
-        expected,
-        after,
-        cpu["kv_cache"],
-        cpu,
-        attrs,
-        captured,
-    )
-    direct_status = policy.precision_status(direct)
-    diagnostics = policy.compare_outputs(
-        golden,
-        host,
-        expected,
-        after,
-        cpu["kv_cache"],
-        cpu,
-        attrs,
-        captured,
-        split_diagnostics=True,
-    )
-    report = dict(
-        two_way=direct, two_way_diagnostics=diagnostics, category="TWO_WAY_PASS"
-    )
-    fallback = None
-    if direct_status == "FAIL":
-        fallback, _ = fallback_segments(
-            golden, cpu, attrs, host, after, expected, captured
-        )
-        report["three_way"] = fallback
-    acceptance = accept_output_comparisons(
-        direct, fallback, diagnostics, int(attrs["qkv_quant_mode"])
-    )
-    report.update(acceptance=acceptance, category=acceptance["category"])
-    assert acceptance["status"] == "PASS", report
-    layout = attrs["cache_mode"]
-    old_bytes = (
-        golden.cache_to_logical(before, layout)
-        .contiguous()
-        .view(torch.uint8)
-        .reshape(256, -1)
-    )
-    new_bytes = (
-        golden.cache_to_logical(after, layout)
-        .contiguous()
-        .view(torch.uint8)
-        .reshape(256, -1)
-    )
-    untouched = torch.ones(256, dtype=torch.bool)
-    untouched[cpu["cache_index"]] = False
-    assert torch.equal(old_bytes[untouched], new_bytes[untouched]), (
-        "Untouched Cache bytes changed"
-    )
-    return report
-
-
 def check_zero_cache_scale(cpu, actual, attrs, outputs, before):
     """Check zero multiplier directly; the frozen Golden requires positive scales.
 
@@ -1739,15 +1775,27 @@ def check_changed_input_replay(cpu, actual, attrs, replay, original, before):
     )
 
 
-@pytest.mark.parametrize("case", CASES, ids=("mode0", "mode1", "mode2", "mode3"))
+@pytest.fixture(scope="module", autouse=True)
+def enum_contract():
+    check_enum_contract(op)
+
+
+@pytest.mark.parametrize(
+    "case", CASES, ids=("mode0", "mode1", "mode2", "mode3", "half_nd", "half_nz")
+)
 def test_mla_prolog(case):
+    cache_factor, cache_gap, cache_offset = CACHE_LAYOUTS[case[0]]
     if not torch.npu.is_available():
         pytest.skip("Ascend NPU required")
     verify_reference_integrity()
-    torch.set_num_threads(4)
+    # Shared CPU Golden thread setting; override for reproducibility checks.
+    torch.set_num_threads(int(os.environ.get("MLA_PROLOG_CPU_THREADS", "8")))
     device = int(os.environ.get("MLA_PROLOG_DEVICE", "0"))
     torch.npu.set_device(device)
     cpu, actual, attrs, public_attrs = make_inputs(case, torch.device(f"npu:{device}"))
+    actual["kv_cache"], cache_backing, backing_before, guard = make_cache_view(
+        actual["kv_cache"], cache_factor, cache_gap, cache_offset
+    )
     before = cpu["kv_cache"].clone()
     identity = cache_identity(actual["kv_cache"])
     execution = os.environ.get("MLA_PROLOG_EXECUTION", "eager")
@@ -1758,6 +1806,7 @@ def test_mla_prolog(case):
     outputs, replay, audit = run_entry(actual, public_attrs, execution, trace_dir)
     assert cache_identity(actual["kv_cache"]) == identity
     report = compare_outputs(cpu, actual, attrs, outputs, before)
+    check_cache_guards(cache_backing, backing_before, guard)
     if case[0] in (2, 3):
         check_zero_cache_scale(cpu, actual, public_attrs, outputs, before)
         report["zero_cache_scale"] = "PASS"
