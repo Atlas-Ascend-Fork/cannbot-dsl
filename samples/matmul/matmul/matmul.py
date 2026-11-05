@@ -20,7 +20,6 @@ from cannbotdsl.lang.host import host
 
 __all__ = ["matmul"]
 
-import math
 import torch
 from cannbotdsl import make_layout, dtypes, get_mem_size, get_platform_info
 from cannbotdsl.ops.arch import get_block_idx, get_block_num
@@ -99,8 +98,11 @@ class MatmulTiling:
     BASIC_BLOCK_K_256B = 256
     BASIC_BLOCK_K_512B = 512
     L1_SINGLE_SIZE_LIMIT = 48 * 1024
-    MIN_TAIL_BLOCK_SIZE = 4096
     CUBE_BOUND_RATIO = 0.85
+    MIN_COMPUTE_BOUND_TILE_AREA = 32768  # half of L0C (fp32 elems)
+    L0C_DB_MAX_AREA = 32768  # base_m*base_n <= this enables l0c_db=2
+    L0C_DB_MIN_DIM = 128  # relaxed min dim when targeting l0c_db=2
+    MIN_COMPUTE_BOUND_TILE_DIM = 192  # thinner tiles regress
     BALANCE_RATE_EDGE = 0.9
     EPSILON = 1e-9
     MMAD_UNITS_PER_CORE = 8
@@ -196,7 +198,90 @@ class MatmulTiling:
         self._reset_base()
         self._rebalance_block()
         self._cal_l1_tiling()
+        self._refine_balance_compute_bound()
         self._finalize()
+
+    def _refine_balance_compute_bound(self):
+        """Re-pick the best discrete-balance tile for compute-bound shapes.
+
+        The main search accepts on a cube-bound/balance joint ratio, which
+        prefers large tiles even when the shape is compute-bound, and its
+        BALANCE_RATE_EDGE early-stop halts exploration once the rate reaches
+        0.9. For compute-bound shapes the discrete wall (max tiles per core)
+        dominates the cube-bound proxy. Two guards keep the refinement safe:
+          * tile-area floor — the balance rate does not price per-tile
+            overhead, so degenerate fine tiles must be excluded;
+          * operand-reload gate — a thinner tile multiplies the per-tile
+            reload count of one operand (n_t up => A volume, m_t up => B
+            volume); candidates whose total reload volume exceeds 1.15x the
+            searched config are rejected.
+        Memory-bound shapes keep the searched choice. Ties break toward the
+        larger tile (fewer per-tile overheads), then wider base_m.
+        """
+        if getattr(self, "is_memory_bound", False):
+            return
+        l0c_area = self.L0C_SIZE // self.DATA_SIZE_FP32
+
+        def reload_volume(bm, bn):
+            return (
+                ceil_div(self.n, bn) * self.m + ceil_div(self.m, bm) * self.n
+            ) * self.k
+
+        cur_reload = reload_volume(self.base_m, self.base_n)
+        cur_rate = self._get_balance_rate_with_tail(self.base_m, self.base_n)
+        best = (cur_rate, self.base_m * self.base_n, self.base_m, self.base_n)
+        m_cap = min(self.BASIC_BLOCK_256, ceil_align(self.m, self.BASIC_BLOCK_16))
+        n_cap = min(self.BASIC_BLOCK_256, ceil_align(self.n, self.BASIC_BLOCK_16))
+        for bm in range(self.BASIC_BLOCK_16, m_cap + 1, self.BASIC_BLOCK_16):
+            for bn in range(
+                self.BASIC_BLOCK_16, min(n_cap, l0c_area // bm) + 1, self.BASIC_BLOCK_16
+            ):
+                if bm * bn < self.MIN_COMPUTE_BOUND_TILE_AREA:
+                    continue
+                if (
+                    bm < self.MIN_COMPUTE_BOUND_TILE_DIM
+                    or bn < self.MIN_COMPUTE_BOUND_TILE_DIM
+                ):
+                    continue
+                if reload_volume(bm, bn) > cur_reload * 1.15:
+                    continue
+                rate = self._get_balance_rate_with_tail(bm, bn)
+                key = (rate, bm * bn, bm)
+                if key > (best[0], best[1], best[2]):
+                    best = (rate, bm * bn, bm, bn)
+        # L0C double-buffer search: if the best tile area exceeds L0C capacity
+        # for double buffering, search for a smaller tile (area <= 32768,
+        # dims >= 128) with a balance rate within 15% of the best. The
+        # l0c_db=2 fixpipe/MMAD overlap (drain slot 0 while accumulating
+        # slot 1) recovers the smaller-tile cost.
+        if best[1] > self.L0C_DB_MAX_AREA:
+            small_best = None
+            for bm in range(self.L0C_DB_MIN_DIM, m_cap + 1, self.BASIC_BLOCK_16):
+                for bn in range(
+                    self.L0C_DB_MIN_DIM,
+                    min(n_cap, self.L0C_DB_MAX_AREA // bm) + 1,
+                    self.BASIC_BLOCK_16,
+                ):
+                    if bm * bn < self.MIN_COMPUTE_BOUND_TILE_AREA:
+                        continue
+                    if reload_volume(bm, bn) > cur_reload * 1.15:
+                        continue
+                    rate = self._get_balance_rate_with_tail(bm, bn)
+                    if rate >= best[0] * 0.85:
+                        key = (rate, bm * bn, bm)
+                        if small_best is None or key > (
+                            small_best[0],
+                            small_best[1],
+                            small_best[2],
+                        ):
+                            small_best = (rate, bm * bn, bm, bn)
+            if small_best is not None:
+                best = small_best
+
+        if (best[2], best[3]) != (self.base_m, self.base_n):
+            self.base_m, self.base_n = best[2], best[3]
+            self._get_base_k()
+            self._cal_l1_tiling()
 
     def _reset_base(self):
         """Reset the default base tile sizes along M, N and K."""
@@ -262,6 +347,7 @@ class MatmulTiling:
         )
         cube_bound_param_best = (1.0 / base_m_best) + (1.0 / base_n_best)
         is_memory_bound = cube_bound_param_best > self.cube_bound_edge
+        self.is_memory_bound = is_memory_bound
         inner_align_unit = (
             self.BASIC_BLOCK_128 if is_memory_bound else self.BASIC_BLOCK_64
         )
@@ -579,30 +665,18 @@ class MatmulTiling:
         return max_base_block
 
     def _get_balance_rate_with_tail(self, base_m, base_n):
-        """get balance rate with tail for non-batch basic matmul."""
+        """Get balance rate for non-batch basic matmul.
+
+        Matches the kernel's discrete round-robin dispatch: a core processes
+        at most ceil(total_tiles / AIC_NUM) tiles, and tail blocks are NOT
+        split across cores.
+        """
         total_round = ceil_div(self.m, base_m) * ceil_div(self.n, base_n)
-        main_round = ceil_div(total_round, self.AIC_NUM) - 1
-        tail_round_blocks = total_round - self.AIC_NUM * main_round
-        total_tail_split = self.AIC_NUM // tail_round_blocks if tail_round_blocks else 1
+        rounds = max(1, ceil_div(total_round, self.AIC_NUM))
 
         eff_base_m = self.m if self.m <= self.BASIC_BLOCK_16 else base_m
         eff_base_n = self.n if self.n <= self.BASIC_BLOCK_16 else base_n
-        if (
-            main_round == 0
-            or (eff_base_m * eff_base_n) // total_tail_split < self.MIN_TAIL_BLOCK_SIZE
-        ):
-            return (self.m * self.n / self.AIC_NUM) / (
-                (main_round + 1) * eff_base_m * eff_base_n
-            )
-
-        tail_split_sqrt = int(math.sqrt(total_tail_split))
-        offset = (
-            total_tail_split - tail_split_sqrt * tail_split_sqrt
-        ) // tail_split_sqrt + 1
-        tail_round = 1.0 / (tail_split_sqrt * (tail_split_sqrt + offset - 1))
-        return (self.m * self.n / self.AIC_NUM) / (
-            (main_round + tail_round) * eff_base_m * eff_base_n
-        )
+        return (self.m * self.n / self.AIC_NUM) / (rounds * eff_base_m * eff_base_n)
 
     def _get_hbm_bw(self):
         """Estimate per-chip HBM bandwidth in the tiling cost model."""
@@ -634,14 +708,13 @@ class MatmulKernel:
         parameters, and L2 cache control bits consumed by the device kernel.
         """
         self.t = tiling
-        self.m_tiles = ceil_div(tiling.m, tiling.m_l1)
-        self.n_tiles = ceil_div(tiling.n, tiling.n_l1)
+        self.m_total = tiling.m
+        self.n_total = tiling.n
+        self.k_total = tiling.k
+        self.m_tiles = ceil_div(tiling.m, tiling.base_m)
+        self.n_tiles = ceil_div(tiling.n, tiling.base_n)
         self.k_l1_tiles = ceil_div(tiling.k, tiling.k_l1)
         self.k_l0_per_l1 = ceil_div(tiling.k_l1, tiling.base_k)
-        self.main_window = min(WINDOW_LEN, self.m_tiles)
-        self.main_row = self.m_tiles // self.main_window - 1
-        self.tail_window = self.m_tiles - self.main_row * self.main_window
-        self.total_tiles = self.m_tiles * self.n_tiles
         disable_a = tiling.l2_cache_disable in (
             A_L2_CACHE_DISABLE,
             ALL_L2_CACHE_DISABLE,
@@ -652,6 +725,240 @@ class MatmulKernel:
         )
         self.l2_cache_ctl_a = 0 if disable_a else 1
         self.l2_cache_ctl_b = 0 if disable_b else 1
+        self._build_tile_segments()
+        self._decide_tail_split()
+        tiling.used_core_num = min(self.total_tiles, tiling.AIC_NUM)
+
+    def _build_tile_segments(self):
+        """Window-enumeration metadata over the FULL base tile grid.
+
+        The mainline-equivalent schedule enumerates every base tile (full
+        and natural-tail) in slide-window snake order; the flat index space
+        is [0, a_cnt) unsplit blocks followed by the last scheduling round's
+        leftover blocks expanded into m_tc x n_tc pieces.
+        """
+        hm = self.m_tiles
+        hn = self.n_tiles
+        self.seg_a_rows = hm
+        self.seg_a_cols = hn if hn > 0 else 1
+        self.a_window = min(WINDOW_LEN, hm) if hm > 0 else 1
+        self.a_main_row = max(0, hm // self.a_window - 1) if hm > 0 else 0
+        self.a_tail_window = hm - self.a_main_row * self.a_window if hm > 0 else 1
+
+    # Per-core rates for the split cost model: cube ~7.5e12 MAC/s, nd2nz
+    # GM->L1 ~170e9 B/s. Each core is scored as max(mac_time, mte2_time):
+    # the stages pipeline, so the slower one bounds the wall clock.
+    # Splitting multiplies operand re-reads (B is re-read once per m row,
+    # A once per n column), which grows mte2_time; on MTE2-bound shapes
+    # (deep K) that outweighs the MAC balance a work-only model would chase.
+    MAC_RATE = 7.5e12
+    MTE2_BW = 1.7e11
+    TILE_RESTART_FACTOR = 2
+
+    def _window_decode(self, win_idx):
+        """Host mirror of the kernel's slide-window snake decode."""
+        a_cols = self.seg_a_cols
+        row_idx = win_idx // a_cols // self.a_window
+        if row_idx < self.a_main_row:
+            m_row = row_idx * self.a_window + win_idx % self.a_window
+            n_col = (win_idx // self.a_window) % a_cols
+        else:
+            row_idx = self.a_main_row
+            tail_index = win_idx - self.a_main_row * self.a_window * a_cols
+            m_row = self.a_main_row * self.a_window + tail_index % self.a_tail_window
+            n_col = (tail_index // self.a_tail_window) % a_cols
+        if row_idx % 2 != 0:
+            n_col = a_cols - 1 - n_col
+        return m_row, n_col
+
+    def _block_extent(self, m_row, n_col):
+        t = self.t
+        m_ext = t.base_m if m_row < self.m_tiles - 1 else self.m_tail
+        n_ext = t.base_n if n_col < self.n_tiles - 1 else self.n_tail
+        return m_ext, n_ext
+
+    def _sim_round_loads(self, m_tc, n_tc):
+        """Mirror of the round-split enumeration + grid-stride assignment;
+        returns the max per-core max(mac, mte2) workload.
+
+        Each tile additionally costs TILE_RESTART_FACTOR x one k_l1
+        window's MAC time: the L1/MTE2 prefetch pipeline drains at every
+        tile boundary and the first window of the next tile cannot hide it.
+        """
+        t = self.t
+        tail_cnt = m_tc * n_tc
+        total = self.a_cnt + self.tail_blocks * tail_cnt
+        launched = max(1, min(total, t.AIC_NUM))
+        restart = self.TILE_RESTART_FACTOR * (
+            t.base_m * t.base_n * t.k_l1 / self.MAC_RATE
+        )
+        mac_loads = [0.0] * launched
+        mte2_loads = [0.0] * launched
+        for tile_idx in range(total):
+            if tile_idx < self.a_cnt:
+                win_idx, piece = tile_idx, -1
+            else:
+                j = tile_idx - self.a_cnt
+                win_idx, piece = (
+                    self.a_cnt + j // tail_cnt,
+                    j - (j // tail_cnt) * tail_cnt,
+                )
+            m_row, n_col = self._window_decode(win_idx)
+            m_ext, n_ext = self._block_extent(m_row, n_col)
+            if piece >= 0:
+                s_m = (m_ext + m_tc - 1) // m_tc
+                s_n = (n_ext + n_tc - 1) // n_tc
+                m_si, n_si = piece % m_tc, piece // m_tc
+                m_ext = min(m_ext - m_si * s_m, s_m)
+                n_ext = min(n_ext - n_si * s_n, s_n)
+            core = tile_idx % launched
+            mac_loads[core] += m_ext * n_ext * self.k_total / self.MAC_RATE
+            mte2_loads[core] += (m_ext + n_ext) * self.k_total * 2 / self.MTE2_BW
+            mte2_loads[core] += restart
+        return max(max(a, b) for a, b in zip(mac_loads, mte2_loads))
+
+    def _sim_mac_tail(self, m_tc, n_tc):
+        """Cube-path view of one split candidate: returns the max per-core
+        mac workload, the max per-core tile count and the max per-core
+        mte2 data volume (restart excluded).
+
+        Second-stage criterion for _decide_tail_split: the primary model
+        charges the tile-boundary restart inside the mte2 path, so on
+        cube-bound grids a restart-inflated memory estimate can mask the
+        mac-path gain of a beneficial last-round split and reject it --
+        leaving the busiest core a full leftover block while the mainline
+        scheduler halves it. The stage-2 comparison is only consulted
+        when the primary model declines; accepting requires the maximum
+        per-core tile count to stay at or below the baseline (every
+        core's restart charge can only shrink), the memory path to keep
+        up with the cube on both the baseline and the candidate (the
+        mac gain is only real when the cube binds; a memory-bound grid
+        would regress on the split's operand re-reads), and a >=3% mac
+        gain. Over-split candidates that add per-core tiles stay
+        rejected.
+        """
+        t = self.t
+        tail_cnt = m_tc * n_tc
+        total = self.a_cnt + self.tail_blocks * tail_cnt
+        launched = max(1, min(total, t.AIC_NUM))
+        mac_loads = [0.0] * launched
+        mte2_loads = [0.0] * launched
+        tile_counts = [0] * launched
+        for tile_idx in range(total):
+            if tile_idx < self.a_cnt:
+                win_idx, piece = tile_idx, -1
+            else:
+                j = tile_idx - self.a_cnt
+                win_idx, piece = (
+                    self.a_cnt + j // tail_cnt,
+                    j - (j // tail_cnt) * tail_cnt,
+                )
+            m_row, n_col = self._window_decode(win_idx)
+            m_ext, n_ext = self._block_extent(m_row, n_col)
+            if piece >= 0:
+                s_m = (m_ext + m_tc - 1) // m_tc
+                s_n = (n_ext + n_tc - 1) // n_tc
+                m_si, n_si = piece % m_tc, piece // m_tc
+                m_ext = min(m_ext - m_si * s_m, s_m)
+                n_ext = min(n_ext - n_si * s_n, s_n)
+            core = tile_idx % launched
+            mac_loads[core] += m_ext * n_ext * self.k_total / self.MAC_RATE
+            mte2_loads[core] += (m_ext + n_ext) * self.k_total * 2 / self.MTE2_BW
+            tile_counts[core] += 1
+        return max(mac_loads), max(tile_counts), max(mte2_loads)
+
+    def _decide_tail_split(self):
+        """Mainline-equivalent schedule: last-round leftover block split.
+
+        Base grid = ceil(m/base_m) x ceil(n/base_n) tiles enumerated in
+        slide-window snake order. Tiles that complete full grid-stride
+        rounds run unsplit; only the blocks of the LAST scheduling round
+        (base_blocks %% cores leftovers, or all blocks when the grid is
+        smaller than the core count) are each split into m_tc x n_tc
+        sub-pieces so the final round spreads lighter pieces across idle
+        cores -- exactly mainline MatMulV3's mTailCnt x nTailCnt mechanism
+        (Blaze BlockSchedulerMatmulBasic). Pieces partition their parent
+        block, so operand re-read volume is unchanged and the MTE2 command
+        mix keeps full blocks for the unsplit rounds. Candidates are scored
+        with the grid-stride load simulation; a split needs a >=5%
+        predicted win over the unsplit baseline.
+        """
+        t = self.t
+        m_tail = self.m_total - (self.m_tiles - 1) * t.base_m
+        n_tail = self.n_total - (self.n_tiles - 1) * t.base_n
+        self.m_tail, self.n_tail = m_tail, n_tail
+        self.m_sched_full, self.n_sched_full = self.m_tiles - 1, self.n_tiles - 1
+        self.m_split = self.n_split = 1
+        self.m_split_base, self.m_split_rem = m_tail, 0
+        self.n_split_base, self.n_split_rem = n_tail, 0
+        self.m_rows, self.n_cols = self.m_tiles, self.n_tiles
+
+        base_blocks = self.m_tiles * self.n_tiles
+        tail_blocks = base_blocks % t.AIC_NUM
+        self.tail_blocks = tail_blocks
+        self.a_cnt = base_blocks - tail_blocks
+
+        # Split-factor caps from the smallest last-round block extents.
+        min_m, min_n = t.base_m, t.base_n
+        for j in range(tail_blocks):
+            m_row, n_col = self._window_decode(self.a_cnt + j)
+            m_ext, n_ext = self._block_extent(m_row, n_col)
+            min_m = min(min_m, m_ext)
+            min_n = min(min_n, n_ext)
+        m_cap = max(1, min(4, min_m // 16))
+        n_cap = max(1, min(4, min_n // 16))
+
+        base_load = self._sim_round_loads(1, 1)
+        best = (1, 1, base_load)
+        for m_tc in range(1, m_cap + 1):
+            for n_tc in range(1, n_cap + 1):
+                if m_tc == 1 and n_tc == 1:
+                    continue
+                load = self._sim_round_loads(m_tc, n_tc)
+                if load < base_load * 0.95 and load < best[2]:
+                    best = (m_tc, n_tc, load)
+        if best[0] != 1 or best[1] != 1:
+            # Direction tie-break: equal-mac split shapes (equal m_tc x
+            # n_tc products) can metric-tie while the loop's first-found
+            # pick favored the N-major evaluation order; resolve near-ties
+            # (<=0.5%) toward the most balanced factor pair, then M-major.
+            near = [
+                (m, n)
+                for m in range(1, m_cap + 1)
+                for n in range(1, n_cap + 1)
+                if (m, n) != (1, 1) and self._sim_round_loads(m, n) <= best[2] * 1.005
+            ]
+            if near:
+                pick = min(near, key=lambda mn: (abs(mn[0] - mn[1]), -mn[0]))
+                if pick != (best[0], best[1]):
+                    best = (pick[0], pick[1], self._sim_round_loads(*pick))
+        if best[0] == 1 and best[1] == 1 and tail_blocks > 0:
+            # Stage 2 -- cube-path criterion (see _sim_mac_tail): the primary
+            # metric declined, but on cube-bound grids its restart-inflated
+            # mte2 estimate can mask a real mac-path gain. Both directions
+            # are searched (the M cap can be 1 when the last round holds
+            # sub-32-row blocks, leaving N the only splittable axis);
+            # candidates resolve on mac gain, then the balanced M-major
+            # mainline convention.
+            base_mac, base_cnt, base_mte2 = self._sim_mac_tail(1, 1)
+            if base_mte2 < base_mac:
+                stage2 = None
+                for m_tc in range(1, m_cap + 1):
+                    for n_tc in range(1, n_cap + 1):
+                        if m_tc == 1 and n_tc == 1:
+                            continue
+                        cand_mac, cand_cnt, cand_mte2 = self._sim_mac_tail(m_tc, n_tc)
+                        if cand_cnt > base_cnt or cand_mte2 >= cand_mac:
+                            continue
+                        if cand_mac < base_mac * 0.97:
+                            key = (cand_mac, abs(m_tc - n_tc), -m_tc)
+                            if stage2 is None or key < stage2[0]:
+                                stage2 = (key, m_tc, n_tc)
+                if stage2 is not None:
+                    best = (stage2[1], stage2[2], base_load)
+        self.m_tc, self.n_tc = best[0], best[1]
+        self.tail_cnt = self.m_tc * self.n_tc
+        self.total_tiles = self.a_cnt + tail_blocks * self.tail_cnt
 
     # Device kernel entry. It maps output tiles to AIC cores, stages A/B from
     # GM to L1 and then L0A/L0B, performs K-sliced MMAD accumulation in L0C,
@@ -690,33 +997,91 @@ class MatmulKernel:
             depth=t.l0c_db,
         )
 
-        n_tiles = self.n_tiles
-        main_window = self.main_window
-        main_row = self.main_row
-        tail_window = self.tail_window
         total_tiles = self.total_tiles
         k_l1_tiles = self.k_l1_tiles
         k_l0_per_l1 = self.k_l0_per_l1
+        m_full_rows = self.m_sched_full
+        n_full_cols = self.n_sched_full
+        m_split_base = self.m_split_base
+        m_split_rem = self.m_split_rem
+        n_split_base = self.n_split_base
+        n_split_rem = self.n_split_rem
+        m_tail_start = m_full_rows * t.base_m
+        n_tail_start = n_full_cols * t.base_n
+
+        # LPT tile enumeration: windowed heavy grid first, light segments
+        # (tail rows/cols, split pieces) last so grid-stride rounds pair
+        # heavy and light tiles on the same core.
+        a_cnt = self.a_cnt
+        a_cols = self.seg_a_cols
+        a_window = self.a_window
+        a_main_row = self.a_main_row
+        a_tail_window = self.a_tail_window
+        tail_cnt = self.tail_cnt
+        m_tc = self.m_tc
+        n_tc = self.n_tc
 
         block_idx = get_block_idx()
         block_num = get_block_num()
 
         for tile_idx in range(block_idx, total_tiles, block_num):
-            m_idx = 0
-            n_idx = 0
-            row_idx = tile_idx // n_tiles // main_window
-            if row_idx < main_row:
-                m_idx = row_idx * main_window + tile_idx % main_window
-                n_idx = (tile_idx // main_window) % n_tiles
+            last_round = tile_idx >= a_cnt
+            j = tile_idx - a_cnt if last_round else 0
+            win_idx = a_cnt + j // tail_cnt if last_round else tile_idx
+            piece = j - (j // tail_cnt) * tail_cnt if last_round else -1
+            m_row = 0
+            n_col = 0
+            row_idx = win_idx // a_cols // a_window
+            if row_idx < a_main_row:
+                m_row = row_idx * a_window + win_idx % a_window
+                n_col = (win_idx // a_window) % a_cols
             else:
-                row_idx = main_row
-                tail_index = tile_idx - main_row * main_window * n_tiles
-                m_idx = main_row * main_window + tail_index % tail_window
-                n_idx = (tail_index // tail_window) % n_tiles
+                row_idx = a_main_row
+                tail_index = win_idx - a_main_row * a_window * a_cols
+                m_row = a_main_row * a_window + tail_index % a_tail_window
+                n_col = (tail_index // a_tail_window) % a_cols
+            n_col = (a_cols - 1 - n_col) if (row_idx % 2 != 0) else n_col
 
-            n_idx = (n_tiles - 1 - n_idx) if (row_idx % 2 != 0) else n_idx
+            # Runtime tile window: full rows/cols start at tile-multiple
+            # origins; tail pieces start at even-distribution split origins.
+            m_origin = m_row * t.base_m
+            m_extent = t.base_m
+            if m_row >= m_full_rows:
+                m_piece = m_row - m_full_rows
+                m_pre = m_piece if m_piece < m_split_rem else m_split_rem
+                m_origin = m_tail_start + m_piece * m_split_base + m_pre
+                m_extent = m_split_base + (1 if m_piece < m_split_rem else 0)
 
-            gm_c_tile = tile_slice(gm_c, (t.base_m, t.base_n), (m_idx, n_idx))
+            n_origin = n_col * t.base_n
+            n_extent = t.base_n
+            if n_col >= n_full_cols:
+                n_piece = n_col - n_full_cols
+                n_pre = n_piece if n_piece < n_split_rem else n_split_rem
+                n_origin = n_tail_start + n_piece * n_split_base + n_pre
+                n_extent = n_split_base + (1 if n_piece < n_split_rem else 0)
+
+            # Last-round leftover block piece (identity when piece < 0):
+            # subdivide the parent block's window in both dims.
+            act = piece >= 0
+            s_m = (m_extent + m_tc - 1) // m_tc
+            s_n = (n_extent + n_tc - 1) // n_tc
+            m_si = piece % m_tc if act else 0
+            n_si = piece // m_tc if act else 0
+            m_end = m_origin + m_extent
+            n_end = n_origin + n_extent
+            m_org2 = m_origin + m_si * s_m
+            n_org2 = n_origin + n_si * s_n
+            m_origin = m_org2
+            m_extent = min(m_end - m_org2, s_m) if act else m_extent
+            n_origin = n_org2
+            n_extent = min(n_end - n_org2, s_n) if act else n_extent
+
+            # Runtime tile window on GM: split pieces can start at arbitrary
+            # (non tile-multiple) row/column origins, so take per-tile
+            # windows as runtime interval slices of the GM tensors.
+            gm_c_tile = gm_c[
+                m_origin : m_origin + m_extent, n_origin : n_origin + n_extent
+            ]
             l0c_acc = (
                 l0c.next_write()
                 .bare()
@@ -725,23 +1090,34 @@ class MatmulKernel:
                 )
             )
             for k_l1_idx in range(k_l1_tiles):
-                gm_a_tile = tile_slice(gm_a, (t.base_m, t.k_l1), (m_idx, k_l1_idx))
-                gm_b_tile = tile_slice(gm_b, (t.base_n, t.k_l1), (n_idx, k_l1_idx))
+                k_org = k_l1_idx * t.k_l1
+                k_rem = self.k_total - k_org
+                k_act = k_rem if k_rem < t.k_l1 else t.k_l1
+                a_piece = gm_a[m_origin : m_origin + m_extent, k_org : k_org + k_act]
+                b_piece = gm_b[n_origin : n_origin + n_extent, k_org : k_org + k_act]
+                # Declare the tile's TRUE extents ONCE per k_l1 chunk by
+                # slicing the slot view, so one runtime shape drives every
+                # L1->L0 copy, the MMAD and (through the operand chain)
+                # avoids the per-instruction clamp-chain re-materialization
+                # the channel transaction extent would otherwise emit inside
+                # the k_l0 loop (documented tail-block pattern, ops.matmul
+                # docstring).
                 l1_a_tensor = l1_a.next_write()
-                l1_a_tensor = l1_a_tensor[tuple(map(slice, gm_a_tile.shape))]
+                l1_a_tensor = l1_a_tensor[tuple(map(slice, a_piece.shape))]
                 mem_copy(
                     l1_a_tensor,
-                    gm_a_tile,
+                    a_piece,
                     options=copy_options(l2_cache_ctl=self.l2_cache_ctl_a),
                 )
                 l1_b_tensor = l1_b.next_write()
-                l1_b_tensor = l1_b_tensor[tuple(map(slice, gm_b_tile.shape))]
+                l1_b_tensor = l1_b_tensor[tuple(map(slice, b_piece.shape))]
                 mem_copy(
                     l1_b_tensor,
-                    gm_b_tile,
+                    b_piece,
                     options=copy_options(l2_cache_ctl=self.l2_cache_ctl_b),
                 )
-                for k_l0_idx in range(ceil_div(l1_a_tensor.shape[1], t.base_k)):
+                k_l0_total = ceil_div(k_act, t.base_k)
+                for k_l0_idx in range(k_l0_total):
                     l1_a_slice = tile_slice(
                         l1_a_tensor, (t.base_m, t.base_k), (0, k_l0_idx)
                     )
@@ -755,15 +1131,22 @@ class MatmulKernel:
                     l0b_tensor = l0b_tensor.view(make_layout(l1_b_slice.shape))
                     mem_copy(l0b_tensor, l1_b_slice)
                     global_k = k_l1_idx * k_l0_per_l1 + k_l0_idx
+                    is_final = k_l1_idx == k_l1_tiles - 1 and k_l0_idx == k_l0_total - 1
                     c_view = l0c_acc.bare().view(
                         make_layout((l0a_tensor.shape[0], l0b_tensor.shape[0])),
                         dtype=dtypes.float32,
                         data_format="nz",
                     )
-                    dsl_matmul(c_view, l0a_tensor, l0b_tensor, init=(global_k == 0))
+                    dsl_matmul(
+                        c_view,
+                        l0a_tensor,
+                        l0b_tensor,
+                        init=(global_k == 0),
+                        unit_flag=(3 if is_final else 2),
+                    )
             l0c_tensor = l0c_acc
 
-            mem_copy(gm_c_tile, l0c_tensor)
+            mem_copy(gm_c_tile, l0c_tensor, options=copy_options(unit_flag=3))
 
     # JIT wrapper used by the Python interface. The bracket syntax launches the
     # kernel with the number of AIC cores selected by host-side tiling.
