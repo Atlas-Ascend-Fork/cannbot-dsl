@@ -6,10 +6,11 @@
 
 ## 规划（moonep_plan）
 
-`moonep_plan(context, tokens_per_expert, topk_experts_sk)` 由本 rank 的路由计数
-与 top-k 索引，产出规划五件套（纯张量，跨调用、跨前后向复用）：跨卡交换计数
-后在 demand 矩阵上做 cap 均衡贪心（一卡一源），生成副本清单与虚拟专家投影，
-供 `prefetch_weight` 与 ep dispatch/combine 复用链消费。
+`moonep_plan(context, tokens_per_expert, topk_experts_sk)` 根据本 rank 的
+专家 token 计数和 top-k 路由索引完成均衡规划。跨 rank 交换计数后，在 demand
+矩阵上执行 cap 均衡贪心（一卡一源），生成可跨调用、跨前后向复用的规划五件套：
+接收分段、副本清单和虚拟专家 id 投影，供 `prefetch_weight` 及 ep
+dispatch/combine 复用链使用。
 
 ```python
 from moonep_context import create_moonep_context
@@ -30,8 +31,15 @@ dst_n, cu_seqlens, experts_to_copy, src_n, vtopk = moonep_plan(
 | `vtopk` | `[N]` | `torch.int32` | 虚拟专家 id（扩展空间 `E' = 2E`），供 ep 复用链路由改写 |
 | `dst_n` / `src_n` | `[N]` | `torch.int32` | 零占位（vtopk-only 快路径不计算） |
 
+其中 `N = S*K`，`epn = E/R`。
+
 形状约束：`E <= 1024`、`R <= 64`、`E % R == 0`；`S*K` 任意规模原生整除
 （分块粒度降档到 N 的因子，无尾补机制）。
+
+`verify` 缺省为 `False`：plan 返回路径零同步，接收布局不变量
+（`cu_seqlens[-1] == N`）延迟到下一个 moonep 算子尾部校验。调试或验收时
+可传 `verify=True`，plan 返回前同步校验，布局破坏立即报错，避免坏布局被
+下游消费；流水化生产路径会因此引入一次流同步，不应开启。
 
 ## 权重预取（prefetch_weight）
 
@@ -66,12 +74,15 @@ prefetch_weight(context, experts_to_copy, real_weights, views, epn)
 
 需要匹配的 CANN、PyTorch/torch_npu、HCCL 和至少两张支持设备。
 
-规划算子验收（前向 E2E 对 golden，另含布局公式与启动块数约束自检）：
+规划算子验收（前向 E2E 对 golden，另含 Count 阶段 counts 逐 chunk 对拍）：
 
 ```bash
 python -m torch.distributed.run --nproc_per_node=8 -m pytest \
     test/mc2/moonep/test_moonep_plan.py -q
 ```
+
+8 卡为验收标准形态，其他 `>=2` 卡环境也可运行。用例较多时可按 `-k`
+将 E2E、counts 审计和 host 约束用例分批执行，避免超出单任务时限。
 
 预取算子独立验收检查数据正确性及 Buffer 的 `(mem_loc, dtype, layout)` 调用：
 

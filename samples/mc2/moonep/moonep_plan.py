@@ -34,10 +34,6 @@
     阶段2  Assign（bi<bd，按 chunk 切）：快路径经 vgather 查 vid 表；慢路径下标
            压缩后按原顺序处理，段查找二分（O(log R)），只在段边界重定位，
            与逐 token 串行扫描语义逐位等价
-
-约束备忘：通信只在单 block 内；不用 load_bypass；UB 标量点读写只在 vf(simt) 区域；
-大循环用 cannbotdsl.range 动态循环；tile 写出用单行 tile + 运行时坐标
-（多行 2D tile + 运行时首坐标会静默产出垃圾数据，DSL #60）。
 """
 
 import threading
@@ -67,6 +63,7 @@ try:
         full_mask,
         vadd,
         varange,
+        vbitwise_or,
         vdups,
         veqs,
         vgather,
@@ -131,6 +128,7 @@ from moonep_context import (
     READY_OFF,
     busy_wait_flag,
     check_no_shared_elastic_buffer,
+    check_pending_overflow,
     record_transport_event,
     resident_blocks,
     sync_transport_stream,
@@ -141,9 +139,9 @@ _EVENT_ID = 7
 _EPOCH = 0  # 进程内单调调用序号（epoch flag）
 _R = 1  # 组内 rank_size（编译锁内写入，须进编译缓存键）
 
-# 单次启动的 block 数经验上限。融合 kernel 用 global_sync_all 做栅栏，要求
+# 单次启动的 block 数经验上限。融合 kernel 用 global_sync_all 做 grid 级同步屏障，要求
 # 全部 block 同时常驻——实际块数由 `resident_blocks()` 按本机有效 AIV 核数
-# 取 min，不能硬编码 64（56 核机型上 64 块会分时复用，栅栏收不齐挂死）。
+# 取 min，不能硬编码 64（56 核机型上 64 块会分时复用，同步屏障收不齐挂死）。
 _MAX_PLAN_BLOCKS = 64
 # 分块粒度下限（token/块）：再小则每 chunk 的 O(E) 状态重建占比过高
 _CHUNK_MIN = 128
@@ -153,12 +151,25 @@ _I32_LANES = 64  # int32 lanes（Assign 快路径步长）
 _HISTOGRAM_BINS_PER_VL = 128  # uint16 直方图 bins/向量
 _HISTOGRAM_U8_LANES = 256  # uint8 lanes（Count 向量路径步长）
 _HISTOGRAM_MAX_CHUNK = 1 << 16
+# Count 向量路径哨兵：vload_deinterleave(width="b8") 返回 (偶字节, 奇字节) 平面，
+# int32 输入下 low={b0,b2}、group={b1,b3} 交织——b2/b3 全 0 时伪 lane 混过
+# group 过滤，把每值一个"零"灌进 bin 0（实测每 chunk 恰好 +chunk）。
+# 给输入 OR 上 b3=0xFF：伪 lane 的 group 变 0xFF 永不匹配，真 lane 的 group
+# 仍为 b1（= id>>8），直方图逐 lane 掩码将其精确滤除。
+_HISTOGRAM_SENTINEL = -(1 << 24)  # 0xFF<<24 的 int32 有符号表示（b3=0xFF）
 _WARP_SIZE = 32
 _PLAN_INIT_THREADS = _WARP_SIZE
 _XFER_UB_BYTES = 512
 
 _GREEDY_NEG_INF = -(1 << 30)
 _GREEDY_POS_INF = 1 << 30
+
+# 段序 order：0=非服务 rank，1=home，>=2=副本（按创建顺序）。
+_ORDER_UNSERVED = 0
+_ORDER_HOME = 1
+_ORDER_FIRST_REPLICA = 2
+_VID_SLOW = -1  # 慢专家标记（需走 pcnt/ord 段查找）
+_INT32_BYTES = 4  # squeeze 状态字节数 → int32 计数换算
 
 
 # ---------------------------------------------------------------------------
@@ -168,10 +179,9 @@ _GREEDY_POS_INF = 1 << 30
 class _PlanKernel:
     """plan 单 kernel：跨卡交换 → 贪心均衡 → 表生成 → token 落位。
 
-    合并前 6 次独立 launch 的 host 下发成本（每次 ≈90µs + 28µs/参数）
-    只剩一次；阶段间用 global_sync_all() 栅栏，块角色由 block_idx 决定。
+    单 launch 多阶段融合，阶段间用 global_sync_all() 做 grid 级同步屏障，块角色由 block_idx 决定。
 
-    阶段（所有 block 都参与每个栅栏）：
+    阶段（所有 block 都参与每个 grid 级同步屏障）：
       0. Exchange(bi=0) | Count(bi<token_blocks) | GreedyAll(bi=0，UB)
       1. Tables(bi<R) | Pfx(bi<pfx_blocks，按专家切)
       2. Assign(bi<token_blocks，按 chunk 切)
@@ -335,6 +345,19 @@ class _PlanKernel:
                 )
                 mem_copy(ub_topk, tile_slice(gm_topk, (chunk,), (ci,)))
                 with vf(mode="simd"):
+                    bmask = full_mask(32)
+                    sentinel = vdups(
+                        dtypes.int32(_HISTOGRAM_SENTINEL), dtypes.int32, mask=bmask
+                    )
+                    for boff in range_constexpr(0, chunk, _I32_LANES):
+                        bv = vload(ub_topk, boff)
+                        vstore(
+                            ub_topk,
+                            boff,
+                            vbitwise_or(bv, sentinel, mask=bmask),
+                            mask=bmask,
+                        )
+                with vf(mode="simd"):
                     # full_mask 参数为元素位宽（8=uint8, 16=uint16, 32=int32）
                     mask8 = full_mask(8)
                     mask16 = full_mask(16)
@@ -429,7 +452,7 @@ class _PlanKernel:
         ub_rhome = Buffer(MemLoc.UB, dtypes.int32, make_layout((world_size,)))
         ub_expert_total = Buffer(MemLoc.UB, dtypes.int32, make_layout((num_experts,)))
         # cu 与 vid 生命周期重叠（cu 要活到尾部 mem_copy，vid 在其前覆写），
-        # 不能别名复用同一 buffer，否则 vid 会写进 cu（994116a 引入、5ccceaa 复活）
+        # 不能别名复用同一 buffer，否则 vid 会写进 cu
         ub_sizes = Buffer(MemLoc.UB, dtypes.int32, make_layout((2 * epn,)))
         # ctx.rankId 须在 vf scope 外读取（datastruct_ref_load 不允许在 vf 内）
         me_id = dtypes.int32(ctx.rankId)
@@ -439,18 +462,18 @@ class _PlanKernel:
             nt = simt.thread_dim()[0]
             for e in cannbotdsl.range(tid, num_experts, nt):
                 total = dtypes.int32(0)
-                for r in range_constexpr(world_size):
+                for r in cannbotdsl.range(world_size):
                     total = total + ub_demand[dtypes.int64(r), dtypes.int64(e)]
                 ub_expert_total[dtypes.int64(e)] = total
             simt.syncthreads()
             # demand 已全部读出，ub_demand 转置复用为 rem，控制 UB 峰值
             for e in cannbotdsl.range(tid, num_experts, nt):
                 home_rank = e // epn
-                for r in range_constexpr(world_size):
+                for r in cannbotdsl.range(world_size):
                     ub_rem[dtypes.int64(e), dtypes.int64(r)] = dtypes.int32(0)
-                    ub_order[dtypes.int64(e), dtypes.int64(r)] = dtypes.int32(0)
+                    ub_order[dtypes.int64(e), dtypes.int64(r)] = _ORDER_UNSERVED
                 ub_rem[dtypes.int64(e), home_rank] = ub_expert_total[dtypes.int64(e)]
-                ub_order[dtypes.int64(e), home_rank] = dtypes.int32(1)
+                ub_order[dtypes.int64(e), home_rank] = _ORDER_HOME
             simt.syncthreads()
             for r in cannbotdsl.range(tid, world_size, nt):
                 acc = dtypes.int32(0)
@@ -470,11 +493,11 @@ class _PlanKernel:
                     cap = cap + simt.reduce_add(v)
                 cap = cap // world_size
                 for _it in cannbotdsl.range(world_size):
-                    src_r, max_load = self._warp_extreme_min_idx(
+                    src_r, max_load = self._warp_extreme_idx(
                         ub_loads, world_size, lane, True
                     )
                     if max_load > cap:
-                        dst_r, min_load = self._warp_extreme_min_idx(
+                        dst_r, min_load = self._warp_extreme_idx(
                             ub_loads, world_size, lane, False
                         )
                         moved = self._greedy_round_warp(
@@ -499,7 +522,7 @@ class _PlanKernel:
             for e in cannbotdsl.range(tid, num_experts, nt):
                 home_rank = e // epn
                 fast = dtypes.int32(1)
-                for r in range_constexpr(world_size):
+                for r in cannbotdsl.range(world_size):
                     if dtypes.int64(r) != home_rank:
                         if ub_rem[dtypes.int64(e), dtypes.int64(r)] > dtypes.int32(0):
                             fast = dtypes.int32(0)
@@ -508,7 +531,7 @@ class _PlanKernel:
                         home_rank * (2 * epn) + (e % epn)
                     )
                 else:
-                    ub_expert_total[dtypes.int64(e)] = dtypes.int32(-1)
+                    ub_expert_total[dtypes.int64(e)] = _VID_SLOW
             simt.syncthreads()
         mem_copy(gm_rem, ub_rem)
         mem_copy(gm_order, ub_order)
@@ -517,7 +540,7 @@ class _PlanKernel:
         mem_copy(gm_cu, tile_slice(ub_sizes, (2 * epn,), (0,)))
 
     @jit
-    def _warp_extreme_min_idx(self, ub_values, n, lane, maximize):
+    def _warp_extreme_idx(self, ub_values, n, lane, maximize):
         """warp 归约极值，并列取最小下标（maximize=True/False 对应 max/min）。"""
         best = dtypes.int32(_GREEDY_NEG_INF if maximize else _GREEDY_POS_INF)
         idx = dtypes.int32(0)
@@ -585,10 +608,10 @@ class _PlanKernel:
                     if lane == 0:
                         e_best = src_r * epn + e_local
                         if ub_order[dtypes.int64(e_best), dtypes.int64(dst_r)] == (
-                            dtypes.int32(0)
+                            _ORDER_UNSERVED
                         ):
                             n_copy = dtypes.int32(0)
-                            for r in range_constexpr(self._r):
+                            for r in cannbotdsl.range(self._r):
                                 if ub_order[
                                     dtypes.int64(e_best), dtypes.int64(r)
                                 ] > dtypes.int32(0):
@@ -624,7 +647,7 @@ class _PlanKernel:
             rep_cnt = dtypes.int32(0)
             for i in cannbotdsl.range(epn):
                 e = home * epn + i
-                if ub_order[dtypes.int64(e), dtypes.int64(me)] >= dtypes.int32(2):
+                if ub_order[dtypes.int64(e), dtypes.int64(me)] >= _ORDER_FIRST_REPLICA:
                     ub_sizes[dtypes.int64(epn) + rep_cnt] = ub_rem[
                         dtypes.int64(e), dtypes.int64(me)
                     ]
@@ -662,7 +685,7 @@ class _PlanKernel:
             for i in cannbotdsl.range(epn):
                 e = home * epn + i
                 o = simt.l2cache_load(gm_order.ptr((dtypes.int64(e), dtypes.int64(r))))
-                if o >= dtypes.int32(2):
+                if o >= _ORDER_FIRST_REPLICA:
                     ub_jrep_row[dtypes.int64(0), dtypes.int64(i)] = rc
                     ub_etc_row[dtypes.int64(0), rc] = dtypes.int32(e)
                     rc = rc + dtypes.int32(1)
@@ -732,13 +755,13 @@ class _PlanKernel:
             vid = simt.l2cache_load(gm_vid.ptr((dtypes.int64(e),)))
             if vid < dtypes.int32(0):
                 # 段序表先行（偏好序需要 home/副本 host 的段排列）
-                for o in range_constexpr(world_size):
+                for o in cannbotdsl.range(world_size):
                     ord_rank_row[dtypes.int64(0), dtypes.int64(o)] = dtypes.int32(-1)
-                for r in range_constexpr(world_size):
+                for r in cannbotdsl.range(world_size):
                     o = simt.l2cache_load(
                         gm_order.ptr((dtypes.int64(e), dtypes.int64(r)))
                     )
-                    if o >= dtypes.int32(1):
+                    if o >= _ORDER_HOME:
                         ord_rank_row[dtypes.int64(0), dtypes.int64(o - 1)] = (
                             dtypes.int32(r)
                         )
@@ -748,7 +771,7 @@ class _PlanKernel:
                 # 段容量/均衡不变量不变；流量单调不增。
                 acc_p = dtypes.int32(0)
                 seen_me = dtypes.int32(0)
-                for o in range_constexpr(world_size):
+                for o in cannbotdsl.range(world_size):
                     r = ord_rank_row[dtypes.int64(0), dtypes.int64(o)]
                     if r >= dtypes.int32(0) and seen_me == dtypes.int32(0):
                         if r == me:
@@ -757,7 +780,7 @@ class _PlanKernel:
                             acc_p = acc_p + simt.l2cache_load(
                                 gm_dem_by_rank.ptr((dtypes.int64(r), dtypes.int64(e)))
                             )
-                for r in range_constexpr(world_size):
+                for r in cannbotdsl.range(world_size):
                     if seen_me == dtypes.int32(0):
                         if r == me:
                             seen_me = dtypes.int32(1)
@@ -765,7 +788,7 @@ class _PlanKernel:
                             o = simt.l2cache_load(
                                 gm_order.ptr((dtypes.int64(e), dtypes.int64(r)))
                             )
-                            if o == dtypes.int32(0):
+                            if o == _ORDER_UNSERVED:
                                 acc_p = acc_p + simt.l2cache_load(
                                     gm_dem_by_rank.ptr(
                                         (dtypes.int64(r), dtypes.int64(e))
@@ -778,7 +801,7 @@ class _PlanKernel:
                         gm_counts.ptr((dtypes.int64(c), dtypes.int64(e)))
                     )
                 acc_o = dtypes.int32(0)
-                for o in range_constexpr(world_size):
+                for o in cannbotdsl.range(world_size):
                     rnk = ord_rank_row[dtypes.int64(0), dtypes.int64(o)]
                     if rnk >= dtypes.int32(0):
                         acc_o = acc_o + simt.l2cache_load(
@@ -854,8 +877,8 @@ class _PlanKernel:
             vec_sync_all()
         with vf(mode="simt", thread=1):
             if const_expr(vec_end > 0):
-                nslow = ub_nslow[dtypes.int64(0)] // dtypes.int32(
-                    4
+                nslow = (
+                    ub_nslow[dtypes.int64(0)] // _INT32_BYTES
                 )  # squeeze 状态字节数→int32 计数
             else:
                 nslow = dtypes.int32(0)
@@ -933,7 +956,7 @@ def _plan_chunking(num_rows):
     return chunk, num_chunks, token_blocks
 
 
-def _expert_blocks(num_experts):
+def _pfx_block_count(num_experts):
     """Pfx 的 block 数：E 的可整除因子，且不超过本机可常驻核数。"""
     block_count = min(num_experts, resident_blocks(_MAX_PLAN_BLOCKS))
     while block_count > 1 and num_experts % block_count != 0:
@@ -956,7 +979,7 @@ def _plan_blocks(num_rows, num_experts):
     钉住的核数焊死。
     """
     _, num_chunks, token_blocks = _plan_chunking(num_rows)
-    return _PlanBlocks(num_chunks, token_blocks, _expert_blocks(num_experts))
+    return _PlanBlocks(num_chunks, token_blocks, _pfx_block_count(num_experts))
 
 
 @host
@@ -974,8 +997,8 @@ def _moonep_plan_host(
     )
     num_rows = gm_topk.shape[0]  # 本 rank topk 扁平视图，直接作 Cnt/Asg 输入
     blocks = _plan_blocks(num_rows, num_experts)
-    # 单 launch：Exchange/Count/GreedyAll → Tables/Pfx → Assign，两次栅栏；
-    # dem 折入 workspace、输出合并后 program 参数 17→6。
+    # 单 launch：Exchange/Count/GreedyAll → Tables/Pfx → Assign，两次 grid 级同步屏障；
+    # dem 折入 workspace、输出合并。
     _PlanKernel(
         world_size,
         num_experts,
@@ -1070,23 +1093,6 @@ def _zero_placeholder(num_rows):
     return t
 
 
-def _alloc_plan_tables(dims, nc):
-    """plan workspace 分配：dem 与其余中间表打包为一个扁平张量。"""
-    total = _ws_layout(dims.world_size, dims.num_experts, nc)["total"]
-    return torch.zeros(total, dtype=torch.int32, device="npu")
-
-
-def _plan_tables(context, dims, num_rows):
-    """按 dims 单槽缓存的 plan workspace（各 kernel 全量覆写，复用安全）。"""
-    ws = context.plan_workspace
-    if ws is not None and ws[0] == dims:
-        return ws[1]
-    blocks = _plan_blocks(num_rows, dims.num_experts)
-    tables = _alloc_plan_tables(dims, blocks.num_chunks)
-    context.plan_workspace = (dims, tables)
-    return tables
-
-
 def _get_plan_program(num_tokens, top_k, num_experts, world_size):
     """按 (S,K,E,R,块数) 键控的编译产物缓存。
 
@@ -1127,34 +1133,7 @@ def _get_plan_program(num_tokens, top_k, num_experts, world_size):
         return prog
 
 
-def _launch_plan(context, dims, ws, gm_flag, topk_flat, tokens_per_expert, gm_io):
-    """编译产物 lookup + 单 kernel 一次 launch（gm_io 为合并输出）。
-
-    topk_flat 直接是本 rank 的 [N] 视图（Count/Assign 只读本 rank 行），
-    不再先拷进 workspace——那次 copy_ 在 NPU 上是 0.8ms 的慢路径。
-    """
-    _get_plan_program(dims.num_tokens, dims.top_k, dims.num_experts, dims.world_size)(
-        tokens_per_expert,
-        gm_flag,
-        ws,
-        topk_flat,
-        gm_io,
-        context.ctx_tensor,
-    )
-
-
-def _stash_replica_overflow(context, cu_seqlens, num_rows):
-    """暂存溢出检查载荷（plan 返回路径零同步）。
-
-    尾部 D2H（.cpu()/.item()）会把 host 卡到流上全部在飞工作完成，阻塞
-    紧随的 dispatch 发射（多层训练实测 941ms 级 host 阻塞）。
-    不变量检查延迟到 prefetch/reduce 尾部执行（check_pending_overflow，
-    sym_barrier 后微秒级）——无溢出路径语义不变。
-    """
-    context.pending_overflow = (cu_seqlens, num_rows)
-
-
-def moonep_plan(context, tokens_per_expert, topk_experts_sk):
+def moonep_plan(context, tokens_per_expert, topk_experts_sk, *, verify=False):
     """规划入口。返回 (dst_n, cu_seqlens, experts_to_copy, src_n, vtopk)。
 
     vtopk-only 快路径：C kernel 只产出 vtopk/cu_seqlens/experts_to_copy，
@@ -1171,6 +1150,7 @@ def moonep_plan(context, tokens_per_expert, topk_experts_sk):
     返回路径零同步（尾部 D2H 会阻塞紧随的 dispatch 发射）；副本槽溢出
     不变量检测延迟到 prefetch/reduce 尾部执行（写前保护仍即时生效），
     无溢出路径语义不变：链路内算子未报错 ⟹ cu_seqlens[-1] == num_rows。
+    verify=True 时改为立即同步校验（调试/验收口径，见函数体注释）。
     """
 
     if not _HAS_DSL:
@@ -1219,24 +1199,39 @@ def moonep_plan(context, tokens_per_expert, topk_experts_sk):
     _EPOCH += 1
     # _R 的烘焙在 _get_plan_program 锁内（与编译原子）；wrapper 只管 epoch
     gm_flag = _epoch_flag(_EPOCH)  # 预生成值池中的独立标量视图
-    ws = _plan_tables(context, dims, num_rows)
+    # plan workspace 单槽缓存：dem 与中间表打包扁平张量，各 kernel 全量覆写，
+    # 同 shape 复用；shape 变化时按新布局重新分配。
+    ws_entry = context.plan_workspace
+    if ws_entry is None or ws_entry[0] != dims:
+        blocks = _plan_blocks(num_rows, dims.num_experts)
+        ws_total = _ws_layout(dims.world_size, dims.num_experts, blocks.num_chunks)[
+            "total"
+        ]
+        tables = torch.zeros(ws_total, dtype=torch.int32, device="npu")
+        ws_entry = (dims, tables)
+        context.plan_workspace = ws_entry
+    tables = ws_entry[1]
     # Cnt/Asg 只消费本 rank 的行：直接把 [S,K] 展平视图当输入，省掉一次
     # 往 workspace 的整行 copy_（NPU 上该 copy_ 实测是 ~0.8ms 的慢路径）
-    _launch_plan(
-        context,
-        dims,
-        ws,
-        gm_flag,
-        topk_experts_sk.reshape(-1),
+    _get_plan_program(dims.num_tokens, dims.top_k, dims.num_experts, dims.world_size)(
         tokens_per_expert,
+        gm_flag,
+        tables,
+        topk_experts_sk.reshape(-1),
         io,
+        context.ctx_tensor,
     )
     record_transport_event(
         context, stream=cur_stream
     )  # 跨流护栏 fork 点（只等我方算子，不等主流尾部）
     # 溢出检查延迟执行（返回路径零同步，不阻塞 dispatch 发射）
-    _stash_replica_overflow(context, cu_seqlens, num_rows)
+    context.pending_overflow = (cu_seqlens, num_rows)
     context.last_plan_shape = (num_tokens, top_k)  # 供 prefetch/reduce 的调用顺序守卫
+    if verify:
+        # 调试/验收口径：立即同步读回尾值，不变量破坏当场熔断——先于任何
+        # 下游消费算子（消除"坏布局先被消费一次才报警"的窗口）。代价是
+        # 一次流同步（流水线下等待在飞工作），生产路径勿开。
+        check_pending_overflow(context)
     return dst_n, cu_seqlens, experts_to_copy, src_n, vtopk
 
 

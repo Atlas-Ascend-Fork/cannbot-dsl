@@ -1010,7 +1010,7 @@ def test_moonep_plan_blocks_within_core_count(monkeypatch):
         monkeypatch.setattr(mc, "_RESIDENT_BLOCKS", cores)
         for rows in (131072, 8192, 2048):
             chunk, nc, bd = mp._plan_chunking(rows)
-            bdp = mp._expert_blocks(112)
+            bdp = mp._pfx_block_count(112)
             launch = max(bd, bdp, 4)  # 4 = 典型 EP 组规模（≤ 核数）
             assert nc * chunk == rows, f"{cores} 核 rows={rows} 分块不整除"
             assert launch <= cores, (

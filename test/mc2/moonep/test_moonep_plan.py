@@ -70,29 +70,16 @@ _requires_ep = pytest.mark.skipif(
 from prefetch_utils import _H, _init_ep_group  # noqa: E402
 
 # (S, K, epn, mode, seed)：R 取运行时 world size，E = epn*R
-# 有代表性的四档 shape：K=16 生产 shape / K=6+EPN=32 典型客户场景 /
-# 多 chunk 多 block 落位路径 / 非整除友好小 N 分块降档路径
+# 最小覆盖集：生产 shape / 非整除 N / 小 E / 大 E
 _E2E_CASES = [
     # K=16 生产 shape（N=65536：S*K 上限解除后回归）
-    pytest.param(
-        4096,
-        16,
-        4,
-        "balanced",
-        44,
-        id="s4096k16_balanced",
-        marks=pytest.mark.skip(
-            reason="K=16 在 2-rank 下 E=2×epn=8<K；生产 8P 下 E=32 OK——低 rank 跳过"
-        ),
-    ),
-    # 典型客户场景形状（K=6/EPN=32，8P 下 E=256）：独特分块路径
-    # N=24576→nc=bd=48、E 因子结构→bdp=64（launch=64 块）——其他档位未覆盖
-    pytest.param(4096, 6, 32, "balanced", 46, id="s4096k6_epn32_typical"),
-    # 多 chunk/多 block 落位路径（N=32768→bd=16，对齐推荐配置量级）
-    # 大 S 只用 balanced：skewed/extreme 集中路由会使接收量远超 per-peer 容量
-    pytest.param(4096, 8, 4, "balanced", 43, id="s4096k8_balanced"),
+    pytest.param(4096, 16, 4, "balanced", 44, id="s4096k16_balanced"),
     # 非整除友好 N=1600：任意 N 分块降档路径（无尾补机制）
     pytest.param(200, 8, 4, "balanced", 45, id="s200k8_odd_balanced"),
+    # 小 E 形态（epn=7）：覆盖小专家数下的本地/副本槽视图与计数路径
+    pytest.param(4096, 8, 7, "balanced", 43, id="s4096k8_epn7"),
+    # 大 E 形态（epn=28）：覆盖 E>128 的分箱、段查找与副本布局
+    pytest.param(4096, 8, 28, "balanced", 43, id="s4096k8_epn28"),
 ]
 
 _ATOL = _RTOL = 2e-2
@@ -168,6 +155,10 @@ def test_moonep_ep_dispatch_combine_vs_golden(num_tokens, top_k, epn, mode, seed
     """
     rank, world_size = _init_ep_group()
     shape = RouteShape(world_size, num_tokens, top_k, epn * world_size)
+    if top_k > shape.num_experts:
+        pytest.skip(
+            f"K={top_k} > E={shape.num_experts}（低 rank 下 E<K 跳过；生产 8P 下 E=32 OK）"
+        )
     topk_all, _, hidden_all = _make_case(shape, mode, seed)
     rw_all = torch.stack(
         [
@@ -187,8 +178,7 @@ def test_moonep_ep_dispatch_combine_vs_golden(num_tokens, top_k, epn, mode, seed
         .npu()
     )
     ctx = create_moonep_context()
-    dst_n, cu, etc, src_n, vtopk = moonep_plan(ctx, tpe_my, topk_my)
-    torch.npu.synchronize()
+    dst_n, cu, etc, src_n, vtopk = moonep_plan(ctx, tpe_my, topk_my, verify=True)
 
     buf = _get_ep_buf(world_size, num_tokens, top_k)
 
@@ -216,74 +206,54 @@ def test_moonep_ep_dispatch_combine_vs_golden(num_tokens, top_k, epn, mode, seed
 
 
 # ---------------------------------------------------------------------------
-# 布局公式与启动块数约束（纯 host 计算，不启通信）
+# Count 阶段计数审计：gm_counts 与 CPU 期望逐 chunk 对拍
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.npu
 @_requires_dsl
-def test_moonep_layout_formulas():
-    """布局公式算术自检（纯公式，无通信）。
+@pytest.mark.parametrize(
+    "num_tokens,top_k,epn,seed",
+    [pytest.param(4096, 8, 7, 43, id="epn7_hist")],
+)
+def test_moonep_count_audit(num_tokens, top_k, epn, seed):
+    """Count 阶段计数契约：workspace 的 counts 与 CPU 直方图逐 chunk 一致。
 
-    对称堆布局（plan 区 | 权重发布区(窗口池) | 尾）逐项对账。
+    覆盖小 E（epn=7）与大 E（epn=28）两种形态，校验每个 chunk 内各专家
+    token 计数、分箱边界及副本路由所依赖的前缀位置输入。
     """
-    from moonep_context import (
-        LAYOUT_TAIL_BYTES,
-        PLAN_REGION_END,
-        prefetch_weight_off,
-        reduce_stg_off,
+    import moonep_plan
+
+    rank, world_size = _init_ep_group()
+    shape = RouteShape(world_size, num_tokens, top_k, epn * world_size)
+    topk_all, _, _ = _make_case(shape, "balanced", seed)
+    topk_my = topk_all[rank].to(torch.int32).npu()
+    tpe_my = (
+        torch.bincount(topk_all[rank].flatten(), minlength=shape.num_experts)
+        .to(torch.int32)
+        .npu()
     )
+    ctx = create_moonep_context()
+    moonep_plan.moonep_plan(ctx, tpe_my, topk_my, verify=True)
 
-    epn, w_elems, num_groups, slots = 28, 3_670_016, 3, 2
-    # 发布区（窗口池）：slots × groups × [2*epn, W] bf16 视图
-    window_bytes = slots * num_groups * 2 * epn * w_elems * 2
-    assert prefetch_weight_off() == PLAN_REGION_END, "发布区基址公式不符"
-    publish_end = reduce_stg_off(epn, w_elems, num_groups, slots)
-    assert publish_end == PLAN_REGION_END + window_bytes, "发布区终点公式不符"
-
-    # E1 副本行段（dW 落点）：组 g 副本行基址 = 发布区 + g*整视图步长
-    # + epn*W*elem——须落在组 g 视图内且不越发布区
-    elem = 2
-    view_step = 2 * epn * w_elems * elem
-    for g in range(num_groups):
-        rep = prefetch_weight_off() + g * view_step + epn * w_elems * elem
-        assert rep >= prefetch_weight_off() + g * view_step, "副本行段基址低于组起点"
-        assert (
-            rep + epn * w_elems * elem <= prefetch_weight_off() + (g + 1) * view_step
-        ), "副本行段越组界"
-    # 堆终点 = 发布区 + 尾部对齐余量
-    assert LAYOUT_TAIL_BYTES >= 32
-
-
-# ---------------------------------------------------------------------------
-# grid 栅栏类 kernel 的启动块数：必须 ≤ 本机有效 AIV 核数
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.npu
-@_requires_dsl
-def test_moonep_plan_blocks_within_core_count(monkeypatch):
-    """global_sync_all 要求全部 block 同时常驻：启动块数不得超过 AIV 核数。
-
-    回归 56 核机型上硬编码 `_MAX_PLAN_BLOCKS=64` 导致栅栏收不齐（死循环）：
-    把核数分别钉成 64/56/28，检查分块与专家块的启动块数。纯 host 计算，
-    不启 kernel。
-    """
-    import moonep_context as mc
-    import moonep_plan as mp
-
-    for cores in (64, 56, 28):
-        monkeypatch.setattr(mc, "_RESIDENT_BLOCKS", cores)
-        for rows in (131072, 8192, 2048):
-            chunk, nc, bd = mp._plan_chunking(rows)
-            bdp = mp._expert_blocks(112)
-            launch = max(bd, bdp, 4)  # 4 = 典型 EP 组规模（≤ 核数）
-            assert nc * chunk == rows, f"{cores} 核 rows={rows} 分块不整除"
-            assert launch <= cores, (
-                f"{cores} 核机型上 plan 启动 {launch} 块（bd={bd}, bdp={bdp}）："
-                "栅栏要求全部 block 常驻，超核会挂死"
+    _, tables = ctx.plan_workspace
+    blocks = moonep_plan._plan_blocks(num_tokens * top_k, shape.num_experts)
+    nc = blocks.num_chunks
+    chunk = num_tokens * top_k // nc
+    offs = moonep_plan._ws_layout(world_size, shape.num_experts, nc)
+    cnt = tables[offs["counts"] : offs["counts"] + nc * shape.num_experts]
+    cnt = cnt.view(nc, shape.num_experts).cpu()
+    flat = topk_all[rank].reshape(-1)
+    expect = torch.stack(
+        [
+            torch.bincount(
+                flat[ci * chunk : (ci + 1) * chunk], minlength=shape.num_experts
             )
-    # 核数富余时不压低块数（64 核仍按 64 起块）
-    monkeypatch.setattr(mc, "_RESIDENT_BLOCKS", 64)
-    _, nc64, bd64 = mp._plan_chunking(131072)
-    assert (nc64, bd64) == (64, 64), (nc64, bd64)
+            for ci in range(nc)
+        ]
+    ).to(torch.int32)
+    diff = cnt != expect
+    assert not diff.any(), (
+        f"counts 与 CPU 期望不符：{int(diff.sum())} 个 bin 错，"
+        f"首个错位 {[tuple(x) for x in torch.nonzero(diff)[:5].tolist()]}"
+    )

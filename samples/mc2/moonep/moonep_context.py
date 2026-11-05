@@ -9,7 +9,7 @@
 """Communication contexts and symmetric-memory layout for MoonEP weight prefetch.
 
 Resolves torch.distributed process groups into device-side CommContext tensors.
-Provides capacity checks, stream ordering, workspace storage and completion barriers."""
+Provides capacity checks, stream ordering, workspace storage and rank synchronization barriers."""
 
 from __future__ import annotations
 
@@ -50,7 +50,7 @@ MAX_E = 1024  # v1 支持的专家总数上限
 MAX_R = 64  # COMM_MAX_RANK_NUM
 DEM_ALL_OFF = 0  # (MAX_R, MAX_E) int32：各 rank 本地计数交换区（256KB）
 READY_OFF = MAX_R * MAX_E * 4  # (MAX_R,) int32：元数据就绪标志
-BAR_FLAGS_OFF = READY_OFF + MAX_R * 4  # (MAX_R,) int32：自旋 barrier 的 epoch flag
+BAR_FLAGS_OFF = READY_OFF + MAX_R * 4  # (MAX_R,) int32：rank 自旋同步屏障的 epoch flag
 LAYOUT_TAIL_BYTES = 4096  # 区域尾部对齐余量（32B 对齐要求下取整页）
 PLAN_REGION_END = BAR_FLAGS_OFF + MAX_R * 4 + LAYOUT_TAIL_BYTES
 
@@ -93,7 +93,7 @@ def reduce_region_end(
 
 
 _RESIDENT_BLOCKS = None  # 本机有效 AIV 核数（首次查询后缓存）
-_FALLBACK_BLOCKS = 16  # 平台信息不可用时的保守值（小核数机型也不会挂栅栏）
+_FALLBACK_BLOCKS = 16  # 平台信息不可用时的保守值（小核数机型也不会卡死在同步屏障）
 
 
 def _device_ready() -> bool:
@@ -120,10 +120,10 @@ def _vector_core_num(ready: bool) -> int:
 
 
 def resident_blocks(cap: int = 64) -> int:
-    """本机可同时常驻的 AIV block 数（grid 栅栏类 kernel 的硬上限）。
+    """本机可同时常驻的 AIV block 数（含 grid 级同步屏障 kernel 的硬上限）。
 
     `global_sync_all()` 要求**全部 block 同时常驻**：block_dim 超过本机有效
-    AIV 核数（例如 56 核机型上排 64 块）时，调度器只能分时复用，栅栏永远
+    AIV 核数（例如 56 核机型上排 64 块）时，调度器只能分时复用，grid 级同步屏障永远
     收不齐 → 死循环挂死。核数取 `get_platform_info().vector_core_num`
     （设备已初始化时含流的控核配额）；查询报错直接抛出，只有核数为 0 时
     退保守值而不是猜硬件规格。设备未初始化时只读静态 SoC 规格，不触发
@@ -260,7 +260,7 @@ class MoonepContext:
         self.transport_event = None
         # 调用者设置为 (S, K)，用于描述输入形状和窗口布局
         self.last_plan_shape = None
-        # barrier 作用域：EP 子组时由 create_moonep_context(group=...) 设置，缺省 WORLD
+        # rank 同步屏障作用域：EP 子组时由 create_moonep_context(group=...) 设置，缺省 WORLD
         self.group = None
         # 多权重组布局守卫：同一上下文的组数须一致，避免发布区与工作区重叠
         # （内部状态，勿改）
@@ -284,7 +284,7 @@ class MoonepContext:
         # 同一块对称堆上的非拥有句柄，重复 create_weight_view 直接复用（免 HCCL
         # API、免容量校验、免 npu_from_blob 扩展调用）（内部状态，勿改）
         self.weight_views = {}
-        # barrier epoch 张量（复用，避免每步 torch.full 分配）（内部状态，勿改）
+        # rank 同步屏障 epoch 张量（复用，避免每步 torch.full 分配）（内部状态，勿改）
         self.bar_epoch_t = None
 
 
@@ -393,13 +393,13 @@ def busy_wait_flag(view, gm_epoch, event_id, ub_flag=None, ub_epoch=None, exact=
     避免每实例一对 UB 缓冲耗尽 VEC buf_id。
 
     两种匹配语义的分工：
-    - **>=（缺省，barrier / plan ready 必须用）**：容忍"peer 已进入下一轮、
+    - **>=（缺省，rank 同步屏障 / plan ready 必须用）**：容忍"peer 已进入下一轮、
       用 n+1 覆盖了自己槽位"——这两类收齐协议没有"对方已读走本轮 flag"的
       回执，等待方可能读到超前值，改 == 会死锁。
     - **==（exact=True，仅 reduce staging flag）**：WORLD 组对称堆在同进程
       多用例间复用，flag 槽位的**残留数据**（前置 prefetch/多槽用例写入的
       权重编码，bf16 位型当 int32 读数 ~1e9 大正数）在 >= 下被当作"已就位"，
-      recv 首轮即放行、读到在途的旧 staging。reduce 有组间 barrier 充当"读
+      recv 首轮即放行、读到在途的旧 staging。reduce 有组间 rank 同步屏障充当"读
       完成回执"，== 无被下一轮覆盖的死锁风险；残留恰等于当轮 epoch 需 32 位
       巧合，概率可忽略。
     """
@@ -422,14 +422,14 @@ def busy_wait_flag(view, gm_epoch, event_id, ub_flag=None, ub_epoch=None, exact=
 
 
 # ---------------------------------------------------------------------------
-# 对称堆自旋 barrier
+# 对称堆上的 rank 自旋同步屏障
 # ---------------------------------------------------------------------------
 # dist.barrier 落到 HCCL SoleMesh 4B allreduce，高并发通信负载下存在对称
 # 死锁风险（多 rank 永久挂起）。此处用与数据面相同的 put/flag 通道做 rank
 # 对齐：flag 与数据同通道保序，kernel 返回即全组本轮流上工作全部完成，
 # 不经过 HCCL 集合通信路径。
 _BAR_EVENT_ID = 5  # plan=7、reduce=6、barrier=5
-_BAR_EPOCH = 0  # 跨算子共享的单调 barrier epoch（各次调用共用一套 flag）
+_BAR_EPOCH = 0  # 跨算子共享的单调 rank 同步屏障 epoch（各次调用共用一套 flag）
 _BAR_PROGRAMS = {}
 _BAR_LOCK = threading.Lock()
 _BAR_ME = 0  # 组内 rank（编译锁内写入，trace 期烘焙）
@@ -484,9 +484,9 @@ def _barrier_host(gm_epoch, ctx: StructRef[CommContext]):
 
 
 def barrier_tail(xfer, ctx, gm_epoch, me, world_size, ub_flag, ub_epoch):
-    """kernel 内联的 barrier 尾段：flag 广播 + 收齐（与 _MoonepBarrierKernel 同协议）。
+    """kernel 内联的 rank 同步屏障尾段：flag 广播 + 收齐（与 _MoonepBarrierKernel 同协议）。
 
-    供算子 kernel 融合发射使用（省一次独立 barrier launch，~550µs/次的发射器
+    供算子 kernel 融合发射使用（省一次独立 rank 同步屏障 launch，~550µs/次的发射器
     host 开销）。语义与独立 sym_barrier 等价：本 kernel 完成即全组各 peer 的
     epoch flag 到达（flag 与数据同通道保序——peer 的 flag 到达意味着其发往
     本 rank 的数据已落地）。ub_flag/ub_epoch 由调用方在 kernel 入口分配一次
@@ -532,7 +532,7 @@ def record_transport_event(context, stream=None):
 
 
 def _get_barrier_program(world_size, me):
-    """(world_size, me) 键控的 barrier program（烘焙与编译在锁内原子完成）。"""
+    """(world_size, me) 键控的 rank 同步屏障 program（烘焙与编译在锁内原子完成）。"""
     key = (world_size, me)
     with _BAR_LOCK:
         prog = _BAR_PROGRAMS.get(key)
@@ -549,16 +549,16 @@ def _get_barrier_program(world_size, me):
 
 
 def sym_barrier(context, *, sync=True):
-    """对称堆自旋 barrier：替代 dist.barrier（绕开 HCCL SoleMesh 集合通信死锁）。
+    """对称堆上的 rank 自旋同步屏障：替代 dist.barrier（绕开 HCCL SoleMesh 集合通信死锁）。
 
     语义与同流 dist.barrier 等价且更强：返回时全组 rank 本轮此前流上工作全部
     完成（kernel 内自旋收齐各 peer 的 epoch flag，flag 与数据同通道保序）。
     epoch 跨算子单调递增，陈旧 flag 不会提前放行。
 
-    sync=False 为"只发射"形态：仅入队 barrier kernel、不做 host 同步——
+    sync=False 为"只发射"形态：仅入队 rank 同步屏障 kernel、不做 host 同步——
     跨 rank 保序由 kernel 自身的自旋协议保证（后继同流 kernel 在设备序上
     排在它之后），host 立即返回。供 async_finish 路径的组间 staging 复用
-    栅栏使用：staging 覆写的跨 rank 安全是设备序问题，不需要 host 等待。
+    同步屏障使用：staging 覆写的跨 rank 安全是设备序问题，不需要 host 等待。
     """
     global _BAR_EPOCH
     _BAR_EPOCH += 1
@@ -570,9 +570,9 @@ def sym_barrier(context, *, sync=True):
     _get_barrier_program(context.rank_size, context.rank)(gm_epoch, context.ctx_tensor)
     if not sync:
         return
-    # 等待范围为发起流而非整卡：barrier kernel 在发起流上，等本流完成即意味着
+    # 等待范围为发起流而非整卡：rank 同步屏障 kernel 在发起流上，等本流完成即意味着
     # 全组本轮握手收齐。全设备 synchronize 会把无关流上的在飞工作也等进来，
-    # 封死跨层/跨流流水（多层训练里每层 reduce/组间串行都走本 barrier）。
+    # 封死跨层/跨流流水（多层训练里每层 reduce/组间串行都走本 rank 同步屏障）。
     torch.npu.current_stream().synchronize()
 
 
