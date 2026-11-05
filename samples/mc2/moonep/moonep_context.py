@@ -17,6 +17,7 @@ import threading
 import warnings
 
 import torch
+import torch_npu
 
 import cannbotdsl
 from cannbotdsl import dtypes, make_layout
@@ -95,35 +96,63 @@ _RESIDENT_BLOCKS = None  # 本机有效 AIV 核数（首次查询后缓存）
 _FALLBACK_BLOCKS = 16  # 平台信息不可用时的保守值（小核数机型也不会挂栅栏）
 
 
+def _device_ready() -> bool:
+    """torch 侧是否已选定 NPU 设备（不触发惰性初始化）。
+
+    `_npu_getDeviceWithoutSet()` 只读当前设备号：未选设备返回 -1，且不建
+    流、不初始化设备（torch_npu 的 device 上下文管理器就是用它保存现场）。
+    """
+    return torch_npu._C._npu_getDeviceWithoutSet() >= 0
+
+
+def _vector_core_num(ready: bool) -> int:
+    """AIV 核数；设备未就绪时走不碰设备的静态规格查询。
+
+    `get_platform_info()` 缺省会取 torch 当前流以叠管控核配额；torch_npu
+    尚未选设备时，这一步会做设备初始化——卡被占用/不可用时是分钟级重试，
+    被误当成"编译慢"。编译期只需要一个 block 上界，静态 SoC 规格足够：
+    传 `stream=False` 跳过当前流查询（拿不到 handle 时不叠配额），
+    完全不触发 NPU 惰性初始化。
+    """
+    if ready:
+        return int(cannbotdsl.get_platform_info().vector_core_num)
+    return int(cannbotdsl.get_platform_info(stream=False).vector_core_num)
+
+
 def resident_blocks(cap: int = 64) -> int:
     """本机可同时常驻的 AIV block 数（grid 栅栏类 kernel 的硬上限）。
 
     `global_sync_all()` 要求**全部 block 同时常驻**：block_dim 超过本机有效
     AIV 核数（例如 56 核机型上排 64 块）时，调度器只能分时复用，栅栏永远
     收不齐 → 死循环挂死。核数取 `get_platform_info().vector_core_num`
-    （已含流的控核配额），查询失败时退保守值而不是猜硬件规格。
+    （设备已初始化时含流的控核配额）；查询报错直接抛出，只有核数为 0 时
+    退保守值而不是猜硬件规格。设备未初始化时只读静态 SoC 规格，不触发
+    设备初始化；该结果**不缓存**，运行期设备就绪后再按流配额复核，保证
+    实启块数不超过配额。
 
     cap 是"核数再多也不加块"的经验上限（块数收益递减）；返回值 ≤ cap。
-    进程内只查询一次并缓存（含失败时的保守值），保证同一进程内编译期与
-    运行期的 block 数一致——二者不一致会让 kernel 的角色分派与实启块数错位。
+    进程内只在设备已初始化时缓存，保证同一进程内编译期与运行期的 block
+    数一致——二者不一致会让 kernel 的角色分派与实启块数错位（不一致时
+    按新配置重新编译一次，不会用旧网格启动）。
     """
     global _RESIDENT_BLOCKS
-    if _RESIDENT_BLOCKS is None:
-        cores = 0
-        try:
-            cores = int(cannbotdsl.get_platform_info().vector_core_num)
-        except Exception:  # 无 CANN / 设备未就绪：用保守值
-            cores = 0
-        if cores <= 0:
-            warnings.warn(
-                f"无法获取 AIV 核数，block 数退保守值 {_FALLBACK_BLOCKS}"
-                "（使用保守的并行度）",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-            _RESIDENT_BLOCKS = _FALLBACK_BLOCKS
-        else:
-            _RESIDENT_BLOCKS = cores
+    if _RESIDENT_BLOCKS is not None:
+        return min(cap, _RESIDENT_BLOCKS)
+    ready = _device_ready()
+    cores = _vector_core_num(ready)
+    if cores <= 0:
+        warnings.warn(
+            f"无法获取 AIV 核数，block 数退保守值 {_FALLBACK_BLOCKS}"
+            "（使用保守的并行度）",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        _RESIDENT_BLOCKS = _FALLBACK_BLOCKS
+    elif ready:
+        _RESIDENT_BLOCKS = cores
+    else:
+        # 设备未初始化：静态规格不缓存，运行期初始化后再按配额复核
+        return min(cap, cores)
     return min(cap, _RESIDENT_BLOCKS)
 
 

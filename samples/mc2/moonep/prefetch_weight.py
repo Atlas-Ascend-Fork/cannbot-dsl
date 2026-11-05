@@ -79,6 +79,7 @@ from npu_blob import npu_from_blob
 
 _MAX_PUSH_BLOCKS = 64
 _PUSH_EVENT_ID = 4
+_PUSH_GROUPS = 3  # gate/up/down 固定三组，一次 launch 推完
 
 
 def _push_layout(rank_size):
@@ -90,13 +91,12 @@ def _push_layout(rank_size):
 
 @kernel
 class _MoonepPrefetchPushKernel:
-    def __init__(self, rank, rank_size, epn, w_elems, weight_offs, nblk, per_block):
+    def __init__(self, rank, rank_size, epn, w_elems, window_rows, nblk, per_block):
         self._me = int(rank)
         self._r = int(rank_size)
         self._epn = int(epn)
         self._w = int(w_elems)
-        self._offs = tuple(int(o) for o in weight_offs)
-        self._num_g = len(self._offs)
+        self._window_rows = int(window_rows)
         self._nblk = int(nblk)
         self._per_block = int(per_block)
 
@@ -106,21 +106,23 @@ class _MoonepPrefetchPushKernel:
         kr_real1,
         kr_real2,
         gm_etc,
+        off0,
+        off1,
+        off2,
         ktx: StructRef[CommContext],
     ):
         world_size, epn, w_elems, me = self._r, self._epn, self._w, self._me
         reals = (kr_real0, kr_real1, kr_real2)
-        wsyms = []
-        for g in range_constexpr(self._num_g):
-            wsyms.append(
-                SymBuffer(
-                    ktx,
-                    shape=(2 * epn, w_elems),
-                    dtype=dtypes.bfloat16,
-                    rank_size=world_size,
-                    base_offset=self._offs[g],
-                )
-            )
+        # 组视图基址是运行期参数（行号），同一窗口池的所有槽位/组布局共用
+        # 一份编译产物；整窗描述成一棵 SymBuffer，按行号寻址。
+        offs = (off0, off1, off2)
+        wsym = SymBuffer(
+            ktx,
+            shape=(self._window_rows, w_elems),
+            dtype=dtypes.bfloat16,
+            rank_size=world_size,
+            base_offset=prefetch_weight_off(),
+        )
         ub_xfer = Buffer(MemLoc.UB, dtypes.uint8, make_layout((512,)))
         xfer = create_transfer_context(ktx, ub_xfer, role=TransferRole.VEC)
 
@@ -139,12 +141,12 @@ class _MoonepPrefetchPushKernel:
                 for i in cannbotdsl.range(dtypes.int64(epn)):
                     row = dtypes.int64(ub_row[dtypes.int64(0), dtypes.int64(i)])
                     if row >= dtypes.int64(0):
-                        for g in range_constexpr(self._num_g):
+                        for g in range_constexpr(_PUSH_GROUPS):
                             xfer.put(
                                 peer,
-                                tile_slice(wsyms[g], (1, w_elems), (epn + i, 0)).peer(
-                                    peer
-                                ),
+                                tile_slice(
+                                    wsym, (1, w_elems), (offs[g] + epn + i, 0)
+                                ).peer(peer),
                                 tile_slice(reals[g], (1, w_elems), (row, 0)),
                             )
                 xfer.flush(peer)
@@ -189,23 +191,32 @@ class _PushConfig(NamedTuple):
     rank_size: int
     epn: int
     w_elems: int
-    weight_offs: tuple
+    window_rows: int
     nblk: int
     per_block: int
 
 
 def _make_push_host(cfg):
     @host
-    def _push_host(gm_real0, gm_real1, gm_real2, gm_etc, ctx: StructRef[CommContext]):
+    def _push_host(
+        gm_real0,
+        gm_real1,
+        gm_real2,
+        gm_etc,
+        off0: int,
+        off1: int,
+        off2: int,
+        ctx: StructRef[CommContext],
+    ):
         _MoonepPrefetchPushKernel(
             cfg.me,
             cfg.rank_size,
             cfg.epn,
             cfg.w_elems,
-            cfg.weight_offs,
+            cfg.window_rows,
             cfg.nblk,
             cfg.per_block,
-        )[cfg.nblk](gm_real0, gm_real1, gm_real2, gm_etc, ctx)
+        )[cfg.nblk](gm_real0, gm_real1, gm_real2, gm_etc, off0, off1, off2, ctx)
 
     return _push_host
 
@@ -214,9 +225,9 @@ _PUSH_PROGRAMS = {}
 _PUSH_LOCK = threading.Lock()
 
 
-def _get_push_program(epn, w_elems, weight_offs, rank_size, me):
+def _get_push_program(epn, w_elems, window_rows, rank_size, me):
     nblk, per_blk = _push_layout(rank_size)
-    cfg = _PushConfig(me, rank_size, epn, w_elems, tuple(weight_offs), nblk, per_blk)
+    cfg = _PushConfig(me, rank_size, epn, w_elems, int(window_rows), nblk, per_blk)
     with _PUSH_LOCK:
         prog = _PUSH_PROGRAMS.get(cfg)
         if prog is None:
@@ -226,6 +237,9 @@ def _get_push_program(epn, w_elems, weight_offs, rank_size, me):
                 TensorSpec((epn, w_elems), dtypes.bfloat16),
                 TensorSpec((epn, w_elems), dtypes.bfloat16),
                 TensorSpec((rank_size, epn), dtypes.int32),
+                dtypes.int64,
+                dtypes.int64,
+                dtypes.int64,
                 StructRef[CommContext],
             )
             _PUSH_PROGRAMS[cfg] = prog
@@ -288,6 +302,40 @@ def _publish_offsets(context, local_weights):
     return [w.data_ptr() - buf_base for w in local_weights]
 
 
+def _window_rows(context, epn):
+    """发布窗口总行数（slots × groups × 2*epn）——按 context 首次定型的布局。"""
+    slots = context.window_slots or 1
+    groups = context.layout_groups or _PUSH_GROUPS
+    return slots * groups * 2 * epn
+
+
+def _publish_row_offsets(context, publish_offs, epn, w_elems):
+    """发布区字节偏移 → 各组视图在窗口内的起始行号（运行期参数）。
+
+    组基址按整视图（2*epn 行）对齐，行号必为整数；校验落在窗口内且
+    整视图片段不越界。运行期传行号而非字节偏移，kernel 侧只需一次行号
+    加法，并把槽位/组布局从编译键里拿掉——同一窗口池共用一份编译产物。
+    """
+    base = prefetch_weight_off()
+    row_bytes = w_elems * 2  # bf16
+    window_rows = _window_rows(context, epn)
+    rows = []
+    for g, off in enumerate(publish_offs):
+        rel = int(off) - base
+        if rel < 0 or rel % row_bytes != 0:
+            raise ValueError(
+                f"第 {g} 组发布偏移 {rel} 未按行宽 {w_elems} 对齐"
+                "（local_weights 须由 create_weight_view 创建）"
+            )
+        row = rel // row_bytes
+        if row + 2 * epn > window_rows:
+            raise ValueError(
+                f"第 {g} 组发布偏移对应行 {row}，超出窗口 {window_rows} 行"
+            )
+        rows.append(row)
+    return rows
+
+
 def prefetch_weight(
     context, experts_to_copy, real_weights, local_weights, epn, *, async_finish=False
 ):
@@ -297,11 +345,21 @@ def prefetch_weight(
     sync_transport_stream(context)
     sync_transport(context, (rw0, rw1, rw2), (lw0, lw1, lw2), epn)
     publish_offs = _publish_offsets(context, (lw0, lw1, lw2))
-    _get_push_program(epn, w_elems, publish_offs, context.rank_size, context.rank)(
+    row_offs = _publish_row_offsets(context, publish_offs, epn, w_elems)
+    _get_push_program(
+        epn,
+        w_elems,
+        _window_rows(context, epn),
+        context.rank_size,
+        context.rank,
+    )(
         rw0,
         rw1,
         rw2,
         experts_to_copy,
+        row_offs[0],
+        row_offs[1],
+        row_offs[2],
         context.ctx_tensor,
     )
     return finish_op(context, async_finish)
