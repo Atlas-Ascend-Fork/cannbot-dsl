@@ -361,3 +361,17 @@ k3_network:
     - attention/mega_recurrent_kda_replayssm
     - attention/commit_recurrent_kda_replayssm
     - attention/quant_mla_prolog
+flash_attn:
+  module: true
+  src:
+    - samples/attention/flash_attn
+    - test/attention/flash_attn
+  options:
+    - attention/flash_attn
+flash_mla_with_kvcache:
+  module: true
+  src:
+    - samples/attention/flash_mla_with_kvcache
+    - test/attention/flash_mla_with_kvcache
+  options:
+    - attention/flash_mla_with_kvcache

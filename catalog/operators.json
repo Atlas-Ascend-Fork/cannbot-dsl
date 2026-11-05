@@ -307,6 +307,14 @@
     "quant_batch_matmul_mxa8w4": {
       "source": "samples/matmul/quant_matmul/quant_batch_matmul_mxa8w4.py",
       "test": "test/matmul/quant_matmul/test_quant_batch_matmul_mxa8w4.py"
+    },
+    "flash_attn": {
+      "source": "samples/attention/flash_attn",
+      "test": "test/attention/flash_attn"
+    },
+    "flash_mla_with_kvcache": {
+      "source": "samples/attention/flash_mla_with_kvcache",
+      "test": "test/attention/flash_mla_with_kvcache"
     }
   },
   "native_exports": [
@@ -383,7 +391,9 @@
       "sparse_flash_mla_metadata",
       "dynamic_mx_quant_sr",
       "mega_full_index",
-      "mega_reindex"
+      "mega_reindex",
+      "flash_attn",
+      "flash_mla_with_kvcache"
     ],
     "rules": [
       {
@@ -914,6 +924,28 @@
           "@mega_recurrent_kda_replayssm/test",
           "@commit_recurrent_kda_replayssm/test",
           "@quant_mla_prolog/test"
+        ]
+      },
+      {
+        "name": "flash_attn",
+        "enabled": true,
+        "watch": [
+          "@flash_attn/source",
+          "@flash_attn/test"
+        ],
+        "tests": [
+          "@flash_attn/test"
+        ]
+      },
+      {
+        "name": "flash_mla_with_kvcache",
+        "enabled": true,
+        "watch": [
+          "@flash_mla_with_kvcache/source",
+          "@flash_mla_with_kvcache/test"
+        ],
+        "tests": [
+          "@flash_mla_with_kvcache/test"
         ]
       }
     ]
