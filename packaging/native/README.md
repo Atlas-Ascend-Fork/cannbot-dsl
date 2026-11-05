@@ -4,9 +4,17 @@
 [算子清单](../../catalog/README.md)定义源码、辅助模块和 Native 导出，
 [网络清单](../../net/README.md)定义 DS41、K3 等构建分组。
 
+## 构建准备
+
+先按仓库首页完成 CANN 和 CANNBot-DSL 0.8.0 的安装。`run-build.sh` 还需要本地 DSL wheel 文件，用于创建隔离的构建环境；仅通过 pip 安装 DSL 包不会提供该文件。可使用与构建相同的 Python 下载匹配当前 Python 版本和 CPU 架构的 wheel：
+
+```bash
+python3 -m pip download --no-deps --only-binary=:all: cannbot-dsl==0.8.0 -d /path/to/dsl-wheels
+```
+
 ## 构建
 
-需要匹配的 CANN 环境、Python 及 CANNBot-DSL 0.8.0 wheel。在仓库根目录配置：
+在仓库根目录配置 Python、CANN 环境脚本和本地 DSL wheel。以下以 Python 3.12、x86_64 为例，`CANNBOTDSL_WHEEL` 请填写实际下载文件的绝对路径：
 
 ```bash
 export PYTHON=/path/to/python3.12
@@ -25,8 +33,7 @@ bash packaging/native/run-build.sh --operator mqsmla
 bash packaging/native/run-build.sh
 ```
 
-`--list` 和 `--help` 可直接运行。默认目标为 `dav-3510`，使用
-`--target dav-2201` 指定其他受支持目标。
+`--list` 和 `--help` 可直接运行。默认目标为 `dav-3510`。
 
 ## 产物与安装
 
@@ -48,14 +55,24 @@ packaging/native/
 `native/` 保存 AICore 二进制，`aicpu/` 保存配套 AICPU 资源，`wheels/` 保存算子 wheel。
 `--work-root` 指定编译中间目录，`--output-root` 指定发布目录。
 
-例如，安装 DS41 分组的构建产物：
+例如，执行 `bash packaging/native/run-build.sh --group k3` 成功后，在仓库根目录安装 K3 分组的构建产物：
 
 ```bash
-python3 -m pip install packaging/native/output/groups/ds41/wheels/*.whl
+python3 -m pip install --force-reinstall --no-deps packaging/native/output/groups/k3/wheels/*.whl
 ```
+
+构建 `ds41` 分组时，安装路径改为 `packaging/native/output/groups/ds41/wheels/*.whl`；构建全部已登记算子时，改为 `packaging/native/output/all/wheels/*.whl`。单算子产物位于 `packaging/native/output/operators/<算子名>/wheels/`，实际路径以构建日志为准。
 
 wheel 分发名为 `cannbot-arena-net`，Python 包名为 `ops`，依赖
 `cannbot-dsl>=0.8.0`。导入 `ops` 时注册 Native 资源；AICPU 资源位于 `ops/_aicpu/`。
+
+安装后验证包导入与 Native 资源注册：
+
+```bash
+python3 -c 'import ops; print(ops.__file__)'
+```
+
+不要与同样提供 `ops` 的旧分发 `cannbot-arena-net-ops` 混装。算子精度及预编译二进制覆盖需通过对应样例验证。
 
 ## 源码与配置
 

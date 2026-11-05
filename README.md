@@ -9,6 +9,10 @@
 
 ## 🔥 最新动态
 
+> **2026-11-05**
+>
+> - **✅ 支持 Kimi K3 / K3.1**：本仓算子集已覆盖相关算子，包括 [`block_attn_res_update_rms_norm`](samples/vector/block_attn_res_update_rms_norm)、[`flash_kda`](samples/attention/flash_kda)、[`flash_kda_cp_preprocess`](samples/attention/flash_kda_cp_preprocess)、[`flash_kda_cp_main`](samples/attention/flash_kda_cp_main)、[`fused_recurrent_kda`](samples/attention/fused_recurrent_kda_snapshot)、[`fused_recurrent_kda_replayssm`](samples/attention/fused_recurrent_kda_replayssm)、[`mega_recurrent_kda`](samples/attention/mega_recurrent_kda)、[`mega_recurrent_kda_replayssm`](samples/attention/mega_recurrent_kda_replayssm)、[`commit_recurrent_kda_replayssm`](samples/attention/commit_recurrent_kda_replayssm)、[`mla_prolog_bf16`](samples/attention/mla_prolog)、[`quant_mla_prolog`](samples/attention/quant_mla_prolog)。
+
 > **2026-10-30**
 >
 > - **📦 发布 CANNBot-DSL 0.8.0 wheel 包**：`master` 分支配套 `cannbot-dsl==0.8.0`，可直接通过 pip 安装。
@@ -70,6 +74,8 @@ python -m pip install cannbot-dsl==0.8.0
 ```bash
 python -c 'import cannbotdsl; print(cannbotdsl.__version__)'
 ```
+
+接下来编译并安装算子包：将 `samples/` 中已登记的算子编译打包为 Native wheel，再安装生成的 wheel。完整流程见 [Native 打包](packaging/native/README.md)，支持按 `k3`、`ds41` 网络分组或单个算子构建。
 
 ### 3. 运行一个算子
 
