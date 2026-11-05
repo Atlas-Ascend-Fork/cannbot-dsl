@@ -21,6 +21,7 @@ __all__ = ["quant_lightning_indexer_metadata"]
 from functools import lru_cache
 import tempfile
 import torch
+from cannbotdsl import get_platform_info
 from cannbotdsl.aicpu import (
     gm_in as GmIn,
     gm_out as GmOut,
@@ -539,7 +540,9 @@ def build_metadata(
     cu_k=None,
 ):
     groups = q.shape[0] if sparse else batch * max_tasks
-    workers = int(torch.npu.get_device_properties(q.device).cube_core_num)
+    device_index = q.device.index
+    stream = torch.npu.current_stream(device_index)
+    workers = int(get_platform_info(stream=stream).cube_core_num)
     if not 1 <= workers <= LD_RECORD_START:
         raise RuntimeError(
             f"Unsupported Cube core count {workers}; LI metadata supports 1..{LD_RECORD_START}"

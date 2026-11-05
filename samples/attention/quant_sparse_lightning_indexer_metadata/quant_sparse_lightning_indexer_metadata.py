@@ -19,6 +19,7 @@ __all__ = ["quant_sparse_lightning_indexer_metadata"]
 from functools import lru_cache
 import tempfile
 import torch
+from cannbotdsl import get_platform_info
 from cannbotdsl.aicpu import (
     gm_in as GmIn,
     gm_out as GmOut,
@@ -412,7 +413,9 @@ def build_metadata(
     output_idx_offset=None,
 ):
     groups = q.shape[0] if sparse else batch * max_tasks
-    workers = int(torch.npu.get_device_properties(q.device).cube_core_num)
+    device_index = q.device.index
+    stream = torch.npu.current_stream(device_index)
+    workers = int(get_platform_info(stream=stream).cube_core_num)
     if not 1 <= workers <= LD_RECORD_START:
         raise RuntimeError(
             f"Unsupported Cube core count {workers}; LI metadata supports 1..{LD_RECORD_START}"
@@ -502,7 +505,11 @@ def metadata_geometry(
     if device.type != "npu":
         raise ValueError("Metadata sequence inputs must be on NPU")
     if any(
-        x.dtype != torch.int32 or x.ndim != 1 or x.device != device for x in tensors
+        x.dtype != torch.int32
+        or x.ndim != 1
+        or x.device != device
+        or not x.is_contiguous()
+        for x in tensors
     ):
         raise ValueError(
             "Sequence inputs must be one-dimensional int32 tensors on one device"

@@ -32,12 +32,12 @@ import cannbotdsl
 import torch
 from cannbotdsl.aot import export
 
-from cannbotdsl import MemLoc, Tensor, dtypes
+from cannbotdsl import MemLoc, Tensor, dtypes, get_platform_info
 from cannbotdsl.buffer import UB, make_buffer
 from cannbotdsl.lang.jit import jit
 from cannbotdsl.lang.host import host
 from cannbotdsl.lang.kernel import kernel
-from cannbotdsl import TensorSpec
+from cannbotdsl import ProfileSpec, TensorSpec
 from cannbotdsl.lang.vf import vf
 from cannbotdsl.lang.control_flow import range as dsl_range
 from cannbotdsl.lang.constexpr import range_constexpr
@@ -200,21 +200,6 @@ UB_ALIGNMENT_BYTES = 32
 # TopK 阶段的直方图与阈值暂存；避免覆盖仍待选择的缓存分数。
 TOPK_HISTOGRAM_UB_OFFSET = CACHED_HISTOGRAM_UB_OFFSET + QUERY_TILE_ROWS * QK_ROW_BYTES
 TOPK_TARGET_UB_OFFSET = CACHED_VECTOR_UB_OFFSET
-
-
-TOPK_SELECT_TOPK = 512
-
-
-TOPK_SELECT_POOL_CAPACITY = 8192
-
-
-TOPK_SELECT_COMPACT_LIMIT = 4096
-
-
-TOPK_SELECT_GROUP_SIZE = 4096
-
-
-TOPK_SELECT_LOAD_TRUNK = 32768
 
 
 DMA_TOPK_SELECT_TOPK = 512
@@ -390,8 +375,8 @@ def _pa_axis0_storage_rows(
             f"{name} only supports non-contiguous storage on axis 0 in PA_BBND layout"
         )
     stride0 = strides[0]
-    if stride0 < 0:
-        raise ValueError(f"{name} axis-0 stride must be non-negative")
+    if stride0 < int(tensor.shape[1]) * storage_row_elements:
+        raise ValueError(f"{name} axis-0 stride must preserve non-overlapping PA pages")
     if stride0 % storage_row_elements != 0:
         raise ValueError(f"{name} axis-0 stride must preserve complete PA storage rows")
     blocks = int(tensor.shape[0])
@@ -2101,7 +2086,7 @@ class LdTopKSelector(QliRawTopKSelector):
         )
         self.output_idx_stage.next_write()
         self.output_value_bits_stage.next_write()
-        dtypes.int32(self.topk)
+        _output_valid_count = dtypes.int32(self.topk)
         if need_values != 0:
             self._emit_ld_values(
                 trunk_read,
@@ -2769,9 +2754,7 @@ class CandidateLdMergeStage(LdMergeStage):
         self.topk = topk
         self.length = topk * splits
         self.workspace = CandidateQliRawTopKWorkspace(
-            CANDIDATE_LD_TRUNK_LEN,
-            topk,
-            candidate_optimized=candidate_optimized,
+            CANDIDATE_LD_TRUNK_LEN, topk, candidate_optimized=candidate_optimized
         )
         self.selector = CandidateLdTopKSelector(topk, self.workspace, splits)
 
@@ -2859,7 +2842,12 @@ class QliCube:
         avail = avail if avail > 0 else dtypes.int64(0)
         rows_to_copy = avail if avail < self.tile_m else dtypes.int64(self.tile_m)
         mem_copy(
-            tile_slice(self.q_l1.next_write(), (self.tile_m, LOGICAL_D), (0, 0)),
+            reinterpret(
+                self.q_l1.next_write(),
+                dtype=dtypes.uint8,
+                layout=make_layout((self.tile_m, PACKED_D)),
+                data_format="nz",
+            ),
             query[source_row : source_row + rows_to_copy, None],
         )
         mem_copy(
@@ -2946,7 +2934,16 @@ class QliCube:
                 + page_offset
             )
             mem_copy(
-                tile_slice(key_write, (self.copy_rows, LOGICAL_D), (piece, 0)),
+                tile_slice(
+                    reinterpret(
+                        key_write,
+                        dtype=dtypes.uint8,
+                        layout=make_layout((self.key_tile_columns, PACKED_D)),
+                        data_format="nz",
+                    ),
+                    (self.copy_rows, PACKED_D),
+                    (piece, 0),
+                ),
                 key[source_row : source_row + self.copy_rows, None],
                 options=copy_options(l2_cache_ctl=0),
             )
@@ -4319,10 +4316,10 @@ class QliVector:
             rr.vmem_bar("vst_vld")
 
 
-class ExactTopK:
-    """在单 trunk UB 候选池上执行精确 radix TopK，索引和值通过输出张量返回。"""
+class DmaTopKSelectExactTopK:
+    """DMA 候选池复用精确选择工作区，额外提供 VF 内调用接口。"""
 
-    pool_capacity = TOPK_SELECT_POOL_CAPACITY
+    pool_capacity = DMA_TOPK_SELECT_POOL_CAPACITY
 
     # 初始化精确 TopK的配置与缓冲区。
     def __init__(self, original, pool):
@@ -4333,76 +4330,78 @@ class ExactTopK:
         self.histogram = _ub_buffer(pool, MemLoc.UB, (256,), dtypes.uint16)
         self.carrier = _ub_buffer(pool, MemLoc.UB, (64,), dtypes.int32)
 
+    # 在当前 VF 内执行精确 TopK，供筛选流水复用。
+    @jit
+    def select_vf(self, input_values, count, output_indices, output_values, threshold):
+        self.original._find_indices_vf(
+            input_values, count, self.positions, self.histogram, self.carrier, threshold
+        )
+        rr.vmem_bar("vst_vld")
+        mask = rr.update_mask(128, elem_bits=16)[0]
+        for chunk in dsl_range(DMA_TOPK_SELECT_TOPK // 128, unroll=1):
+            positions = rr.vload(self.positions, chunk * 128)
+            rr.vstore(output_indices, chunk * 128, positions, mask)
+            rr.vstore(
+                output_values,
+                chunk * 128,
+                rr.vgather(input_values, positions, mask=mask),
+                mask,
+            )
+        rr.vmem_bar("vst_vld")
+
     # 执行精确 TopK 并提供后续剪枝所需的值或阈值。
     @jit
     def select(self, input_values, count, output_indices, output_values, threshold):
-        self.original._find_indices(
-            input_values,
-            count,
-            self.positions,
-            self.histogram,
-            self.carrier,
-            threshold,
-        )
         with vf(mode="simd"):
-            mask = rr.update_mask(128, elem_bits=16)[0]
-            for chunk in dsl_range(TOPK_SELECT_TOPK // 128, unroll=1):
-                positions = rr.vload(self.positions, chunk * 128)
-                rr.vstore(output_indices, chunk * 128, positions, mask)
-                rr.vstore(
-                    output_values,
-                    chunk * 128,
-                    rr.vgather(input_values, positions, mask=mask),
-                    mask,
-                )
-            rr.vmem_bar("vst_vld")
+            self.select_vf(
+                input_values, count, output_indices, output_values, threshold
+            )
 
 
-class TopKSelectPreprocessor:
+class DmaTopKSelectPreprocessor:
     """Filter to one global candidate pool; exact selection is delegated."""
 
-    # 初始化顺序输入 TopKSelect 预处理的配置与缓冲区。
+    # 初始化伪随机页 DMA TopKSelect 预处理的配置与缓冲区。
     def __init__(self, original, prefetch=False):
         self.prefetch = bool(prefetch)
         pool = _UbPool()
         self.values = _ub_buffer(
-            pool, MemLoc.UB, (TOPK_SELECT_POOL_CAPACITY,), dtypes.uint16
+            pool, MemLoc.UB, (DMA_TOPK_SELECT_POOL_CAPACITY,), dtypes.uint16
         )
         self.global_indices = _ub_buffer(
-            pool, MemLoc.UB, (TOPK_SELECT_POOL_CAPACITY,), dtypes.int32
+            pool, MemLoc.UB, (DMA_TOPK_SELECT_POOL_CAPACITY,), dtypes.int32
         )
-        self.hits_positions = _ub_buffer(
-            pool, MemLoc.UB, (TOPK_SELECT_GROUP_SIZE,), dtypes.uint16
-        )
-        self.topk = ExactTopK(original, pool)
+        self.hits_positions = None
+        self.page_map = _ub_buffer(pool, MemLoc.UB, (1024,), dtypes.int32)
+        self.filter_counts = _ub_buffer(pool, MemLoc.UB, (32,), dtypes.uint32)
+        self.topk = DmaTopKSelectExactTopK(original, pool)
+        self.hits_positions = self.topk.positions
         self.selected_indices = _ub_buffer(
-            pool, MemLoc.UB, (TOPK_SELECT_TOPK,), dtypes.uint16
+            pool, MemLoc.UB, (DMA_TOPK_SELECT_TOPK,), dtypes.uint16
         )
         self.selected_values = _ub_buffer(
-            pool, MemLoc.UB, (TOPK_SELECT_TOPK,), dtypes.uint16
+            pool, MemLoc.UB, (DMA_TOPK_SELECT_TOPK,), dtypes.uint16
         )
         self.selected_global_indices = _ub_buffer(
-            pool, MemLoc.UB, (TOPK_SELECT_TOPK,), dtypes.int32
+            pool, MemLoc.UB, (DMA_TOPK_SELECT_TOPK,), dtypes.int32
         )
         self.threshold = _ub_buffer(pool, MemLoc.UB, (16,), dtypes.uint16)
         self.output_indices = _ub_ring_buffer(
-            pool, MemLoc.UB, (1, TOPK_SELECT_TOPK), dtypes.int32
+            pool, MemLoc.UB, (1, DMA_TOPK_SELECT_TOPK), dtypes.int32
         )
-        self.output_bits = _ub_ring_buffer(
-            pool, MemLoc.UB, (1, TOPK_SELECT_TOPK), dtypes.uint16
-        )
-        assert max(end for _, end in pool.regions) <= CACHED_QK_UB_BYTES
         depth = 2 if self.prefetch else 1
+        input_base = (max((end for _, end in pool.regions)) + 127) // 128 * 128
         self.input_slots = _ub_ring_buffer(
             pool,
             MemLoc.UB,
-            (1, TOPK_SELECT_LOAD_TRUNK),
+            (1, DMA_TOPK_SELECT_GROUP_SIZE),
             dtypes.uint16,
             depth=depth,
-            addr=CACHED_QK_UB_BYTES,
+            addr=input_base,
         )
-        self.ub_end = CACHED_QK_UB_BYTES + depth * TOPK_SELECT_LOAD_TRUNK * 2
-        assert self.ub_end <= 229376
+        self.output_bits = original.output_value_bits_stage
+        self.ub_end = max(end for _, end in pool.regions)
+        assert self.ub_end <= 225280, self.ub_end
 
     # 在当前 VF 内过滤一组输入并压缩相对位置；调用方保留分组和同步边界。
     @jit
@@ -4417,46 +4416,6 @@ class TopKSelectPreprocessor:
                 self.hits_positions, position_base, packed, cursor
             )
         rr.vstore_unalign_post(self.hits_positions, position_base, cursor)
-
-    # 从 GM 加载当前 trunk 到预处理缓冲区。
-    @jit
-    def _load_trunk(self, gm_keys, row, offset, count):
-        slot = self.input_slots.next_write()
-        mem_copy(
-            reinterpret(slot, layout=make_layout((1, count))),
-            gm_keys[row : row + 1, offset : offset + count],
-        )
-
-    # 加载初始候选并记录对应的原始位置。
-    @jit
-    def _seed(self, source, start, count, global_base, target):
-        with vf(mode="simd"):
-            mask16 = rr.update_mask(128, elem_bits=16)[0]
-            for chunk in dsl_range(count // 128, unroll=1):
-                rr.vstore(
-                    self.values,
-                    target + chunk * 128,
-                    rr.vload(source, start + chunk * 128),
-                    mask16,
-                )
-            mask32 = rr.update_mask(64, elem_bits=32)[0]
-            for chunk in dsl_range(count // 64, unroll=1):
-                rr.vstore(
-                    self.global_indices,
-                    target + chunk * 64,
-                    rr.varange(global_base + chunk * 64, dtypes.int32),
-                    mask32,
-                )
-            rr.vmem_bar("vst_vld")
-
-    # 比较阈值并压缩命中元素，记录命中数量。
-    @jit
-    def _filter(self, source, start, count):
-        with vf(mode="simd"):
-            full = rr.update_mask(128, elem_bits=16)[0]
-            threshold = rr.vdup(rr.vload(self.threshold, 0), mask=full)
-            self._filter_group_vf(source, start, count, threshold, 0)
-            rr.vmem_bar("vst_vld")
 
     # 将筛选命中值及其原始位置追加到候选池。
     @jit
@@ -4499,251 +4458,6 @@ class TopKSelectPreprocessor:
                 )
             rr.vmem_bar("vst_vld")
 
-    # 对候选池执行精确 TopK 收缩并更新阈值。
-    @jit
-    def compact(self, count):
-        self.topk.select(
-            self.values,
-            count,
-            self.selected_indices,
-            self.selected_values,
-            self.threshold,
-        )
-        with vf(mode="simd"):
-            mask32 = rr.update_mask(64, elem_bits=32)[0]
-            for chunk in dsl_range(TOPK_SELECT_TOPK // 64, unroll=1):
-                positions = rr.vunpack(
-                    rr.vload(self.selected_indices, chunk * 64),
-                    dtypes.uint32,
-                    part="lower",
-                )
-                rr.vstore(
-                    self.selected_global_indices,
-                    chunk * 64,
-                    rr.vgather(self.global_indices, positions, mask=mask32),
-                    mask32,
-                )
-            rr.vmem_bar("vst_vld")
-        with vf(mode="simd"):
-            mask16 = rr.update_mask(128, elem_bits=16)[0]
-            for chunk in dsl_range(TOPK_SELECT_TOPK // 128, unroll=1):
-                rr.vstore(
-                    self.values,
-                    chunk * 128,
-                    rr.vload(self.selected_values, chunk * 128),
-                    mask16,
-                )
-            mask32 = rr.update_mask(64, elem_bits=32)[0]
-            for chunk in dsl_range(TOPK_SELECT_TOPK // 64, unroll=1):
-                rr.vstore(
-                    self.global_indices,
-                    chunk * 64,
-                    rr.vload(self.selected_global_indices, chunk * 64),
-                    mask32,
-                )
-            rr.vmem_bar("vst_vld")
-
-    # 遍历输入并过滤候选，控制候选池容量。
-    @jit
-    def preprocess(self, gm_keys, length, row):
-        pool_used_elements = dtypes.int64(0)
-        group_number = dtypes.int64(0)
-        if self.prefetch:
-            self._load_trunk(gm_keys, row, 0, min(length, TOPK_SELECT_LOAD_TRUNK))
-        for trunk in dsl_range(
-            (length + TOPK_SELECT_LOAD_TRUNK - 1) // TOPK_SELECT_LOAD_TRUNK, unroll=1
-        ):
-            offset = trunk * TOPK_SELECT_LOAD_TRUNK
-            count = length - offset
-            if count > TOPK_SELECT_LOAD_TRUNK:
-                count = dtypes.int64(TOPK_SELECT_LOAD_TRUNK)
-            if not self.prefetch:
-                self._load_trunk(gm_keys, row, offset, count)
-            source = self.input_slots.next_read()
-            if self.prefetch:
-                next_offset = offset + TOPK_SELECT_LOAD_TRUNK
-                if next_offset < length:
-                    next_count = length - next_offset
-                    if next_count > TOPK_SELECT_LOAD_TRUNK:
-                        next_count = dtypes.int64(TOPK_SELECT_LOAD_TRUNK)
-                    # Start next transfer before the current trunk's Vector work.
-                    self._load_trunk(gm_keys, row, next_offset, next_count)
-            for group in dsl_range(
-                (count + TOPK_SELECT_GROUP_SIZE - 1) // TOPK_SELECT_GROUP_SIZE, unroll=1
-            ):
-                start = group * TOPK_SELECT_GROUP_SIZE
-                group_count = count - start
-                if group_count > TOPK_SELECT_GROUP_SIZE:
-                    group_count = dtypes.int64(TOPK_SELECT_GROUP_SIZE)
-                if group_number < 2:
-                    self._seed(
-                        source, start, group_count, offset + start, pool_used_elements
-                    )
-                    pool_used_elements += group_count
-                    if group_number == 1:
-                        self.compact(pool_used_elements)
-                        pool_used_elements = dtypes.int64(TOPK_SELECT_TOPK)
-                else:
-                    self._filter(source, start, group_count)
-                    vec_sync_notify(PIPE.V, PIPE.S, 6)
-                    vec_sync_wait(PIPE.V, PIPE.S, 6)
-                    selected_count = dtypes.int64(get_squeeze_status()) // 2
-                    self._append(
-                        source,
-                        start,
-                        offset + start,
-                        selected_count,
-                        pool_used_elements,
-                    )
-                    pool_used_elements += (
-                        (selected_count + POOL_ALIGNMENT_ELEMENTS - 1)
-                        // POOL_ALIGNMENT_ELEMENTS
-                    ) * POOL_ALIGNMENT_ELEMENTS
-                    if (
-                        pool_used_elements > TOPK_SELECT_COMPACT_LIMIT
-                        and offset + start + group_count < length
-                    ):
-                        self.compact(pool_used_elements)
-                        pool_used_elements = dtypes.int64(TOPK_SELECT_TOPK)
-                group_number += 1
-        return pool_used_elements
-
-    # 将候选池局部索引映射为原始输入索引并写出。
-    @jit
-    def write_indices(self, local_indices, gm_indices, index_base):
-        out = self.output_indices.next_write()
-        with vf(mode="simd"):
-            mask = rr.update_mask(64, elem_bits=32)[0]
-            for chunk in dsl_range(TOPK_SELECT_TOPK // 64, unroll=1):
-                positions = rr.vunpack(
-                    rr.vload(local_indices, chunk * 64), dtypes.uint32, part="lower"
-                )
-                indices = rr.vgather(self.global_indices, positions, mask=mask)
-                rr.vstore(
-                    out, chunk * 64, rr.vadds(indices, index_base, mask=mask), mask
-                )
-            rr.vmem_bar("vst_vld")
-        mem_copy(gm_indices, self.output_indices.next_read())
-
-    # 选择单行 TopK 的适用路径并写出结果。
-    @jit
-    def select_row(
-        self,
-        gm_keys,
-        workspace_row,
-        length,
-        gm_indices,
-        gm_bits,
-        index_base,
-        need_values,
-    ):
-        candidate_count = self.preprocess(gm_keys, length, workspace_row)
-        self.topk.select(
-            self.values,
-            candidate_count,
-            self.selected_indices,
-            self.selected_values,
-            self.threshold,
-        )
-        self.write_indices(self.selected_indices, gm_indices, index_base)
-        if need_values != 0:
-            out = self.output_bits.next_write()
-            with vf(mode="simd"):
-                mask = rr.update_mask(128, elem_bits=16)[0]
-                for chunk in dsl_range(TOPK_SELECT_TOPK // 128, unroll=1):
-                    keys = rr.vload(self.selected_values, chunk * 128)
-                    positive = rr.vges(keys, 32768, mask=mask)
-                    bits = rr.vselect(
-                        rr.vbitwise_xor(
-                            keys, rr.vdups(0x8000, dtypes.uint16, mask=mask), mask=mask
-                        ),
-                        rr.vbitwise_xor(
-                            keys, rr.vdups(0xFFFF, dtypes.uint16, mask=mask), mask=mask
-                        ),
-                        cond_mask=positive,
-                    )
-                    rr.vstore(out, chunk * 128, bits, mask)
-                rr.vmem_bar("vst_vld")
-            mem_copy(gm_bits, self.output_bits.next_read())
-
-
-class DmaTopKSelectExactTopK(ExactTopK):
-    """DMA 候选池复用精确选择工作区，额外提供 VF 内调用接口。"""
-
-    pool_capacity = DMA_TOPK_SELECT_POOL_CAPACITY
-
-    # 在当前 VF 内执行精确 TopK，供筛选流水复用。
-    @jit
-    def select_vf(self, input_values, count, output_indices, output_values, threshold):
-        self.original._find_indices_vf(
-            input_values, count, self.positions, self.histogram, self.carrier, threshold
-        )
-        rr.vmem_bar("vst_vld")
-        mask = rr.update_mask(128, elem_bits=16)[0]
-        for chunk in dsl_range(DMA_TOPK_SELECT_TOPK // 128, unroll=1):
-            positions = rr.vload(self.positions, chunk * 128)
-            rr.vstore(output_indices, chunk * 128, positions, mask)
-            rr.vstore(
-                output_values,
-                chunk * 128,
-                rr.vgather(input_values, positions, mask=mask),
-                mask,
-            )
-        rr.vmem_bar("vst_vld")
-
-    # 执行精确 TopK 并提供后续剪枝所需的值或阈值。
-    @jit
-    def select(self, input_values, count, output_indices, output_values, threshold):
-        with vf(mode="simd"):
-            self.select_vf(
-                input_values, count, output_indices, output_values, threshold
-            )
-
-
-class DmaTopKSelectPreprocessor(TopKSelectPreprocessor):
-    """Filter to one global candidate pool; exact selection is delegated."""
-
-    # 初始化伪随机页 DMA TopKSelect 预处理的配置与缓冲区。
-    def __init__(self, original, prefetch=False):
-        self.prefetch = bool(prefetch)
-        pool = _UbPool()
-        self.values = _ub_buffer(
-            pool, MemLoc.UB, (DMA_TOPK_SELECT_POOL_CAPACITY,), dtypes.uint16
-        )
-        self.global_indices = _ub_buffer(
-            pool, MemLoc.UB, (DMA_TOPK_SELECT_POOL_CAPACITY,), dtypes.int32
-        )
-        self.hits_positions = None
-        self.page_map = _ub_buffer(pool, MemLoc.UB, (256,), dtypes.int32)
-        self.filter_counts = _ub_buffer(pool, MemLoc.UB, (32,), dtypes.uint32)
-        self.topk = DmaTopKSelectExactTopK(original, pool)
-        self.hits_positions = self.topk.positions
-        self.selected_indices = _ub_buffer(
-            pool, MemLoc.UB, (DMA_TOPK_SELECT_TOPK,), dtypes.uint16
-        )
-        self.selected_values = _ub_buffer(
-            pool, MemLoc.UB, (DMA_TOPK_SELECT_TOPK,), dtypes.uint16
-        )
-        self.selected_global_indices = _ub_buffer(
-            pool, MemLoc.UB, (DMA_TOPK_SELECT_TOPK,), dtypes.int32
-        )
-        self.threshold = _ub_buffer(pool, MemLoc.UB, (16,), dtypes.uint16)
-        self.output_indices = _ub_ring_buffer(
-            pool, MemLoc.UB, (1, DMA_TOPK_SELECT_TOPK), dtypes.int32
-        )
-        depth = 2 if self.prefetch else 1
-        input_base = (max((end for _, end in pool.regions)) + 127) // 128 * 128
-        self.input_slots = _ub_ring_buffer(
-            pool,
-            MemLoc.UB,
-            (1, DMA_TOPK_SELECT_GROUP_SIZE),
-            dtypes.uint16,
-            depth=depth,
-            addr=input_base,
-        )
-        self.ub_end = input_base + depth * DMA_TOPK_SELECT_GROUP_SIZE * 2
-        assert self.ub_end <= 221184, self.ub_end
-
     # 将逻辑页号映射到伪随机访问的物理页号。
     @jit
     def _physical_page(self, logical_page, length, seed0, seed1):
@@ -4769,12 +4483,19 @@ class DmaTopKSelectPreprocessor(TopKSelectPreprocessor):
                     value = dtypes.uint32(logical_page)
                     if logical_page >= 2:
                         value = dtypes.uint32(logical_page - 1)
-                    value = (value * dtypes.uint32(65537) + seed0) % size
+                    if num_pages > 256:
+                        value = (value + seed0) % size
+                    else:
+                        value = (value * dtypes.uint32(65537) + seed0) % size
                     if value <= seed1:
                         value = seed1 - value
                     else:
                         value = size + seed1 - value
-                    page = (value * dtypes.uint32(65521) + seed1) % size
+                    page = dtypes.uint32(0)
+                    if num_pages > 256:
+                        page = (value + seed1) % size
+                    else:
+                        page = (value * dtypes.uint32(65521) + seed1) % size
                     start = dtypes.int64(page) * DMA_TOPK_SELECT_PAGE_SIZE
                     count = dtypes.int64(DMA_TOPK_SELECT_PAGE_SIZE)
         return (start, count)
@@ -4812,63 +4533,68 @@ class DmaTopKSelectPreprocessor(TopKSelectPreprocessor):
 
     # 初始化伪随机页访问映射。
     @jit
+    def _page_offsets_vf(self, logical, length, num_pages, seed0, seed1, mask):
+        offsets = rr.vmuls(logical, DMA_TOPK_SELECT_PAGE_SIZE, mask=mask)
+        if num_pages > 2:
+            value = rr.vselect(
+                logical,
+                rr.vadds(logical, 4294967295, mask=mask),
+                cond_mask=rr.veqs(logical, 0, mask=mask),
+            )
+            if num_pages > 256:
+                value = rr.vadds(value, seed0, mask=mask)
+            else:
+                value = rr.vadds(rr.vmuls(value, 65537, mask=mask), seed0, mask=mask)
+            value = self._mod_pages_vf(value, dtypes.uint32(num_pages - 2), mask)
+            pivot = rr.vdups(seed1, dtypes.uint32, mask=mask)
+            reflected = rr.vsub(pivot, value, mask=mask)
+            value = rr.vselect(
+                reflected,
+                rr.vadds(reflected, dtypes.uint32(num_pages - 2), mask=mask),
+                cond_mask=rr.vge(pivot, value, mask=mask),
+            )
+            if num_pages > 256:
+                value = rr.vadds(value, seed1, mask=mask)
+            else:
+                value = rr.vadds(rr.vmuls(value, 65521, mask=mask), seed1, mask=mask)
+            value = self._mod_pages_vf(value, dtypes.uint32(num_pages - 2), mask)
+            offsets = rr.vmuls(value, DMA_TOPK_SELECT_PAGE_SIZE, mask=mask)
+            offsets = rr.vselect(
+                rr.vdups(
+                    dtypes.uint32(
+                        (length - DMA_TOPK_SELECT_PAGE_SIZE + 127) // 128 * 128
+                    ),
+                    dtypes.uint32,
+                    mask=mask,
+                ),
+                offsets,
+                cond_mask=rr.veqs(logical, 1, mask=mask),
+            )
+            offsets = rr.vselect(
+                rr.vdups(
+                    dtypes.uint32((num_pages - 2) * DMA_TOPK_SELECT_PAGE_SIZE),
+                    dtypes.uint32,
+                    mask=mask,
+                ),
+                offsets,
+                cond_mask=rr.veqs(logical, dtypes.uint32(num_pages - 1), mask=mask),
+            )
+        return offsets
+
+    @jit
     def _init_page_map(self, length, seed0, seed1):
         num_pages = (
             length + DMA_TOPK_SELECT_PAGE_SIZE - 1
         ) // DMA_TOPK_SELECT_PAGE_SIZE
         with vf(mode="simd"):
-            for chunk in dsl_range((num_pages + 63) // 64, unroll=1):
-                mask = rr.update_mask(num_pages - chunk * 64, elem_bits=32)[0]
+            for chunk in dsl_range((min(num_pages, 1024) + 63) // 64, unroll=1):
+                mask = rr.update_mask(min(num_pages, 1024) - chunk * 64, elem_bits=32)[
+                    0
+                ]
                 logical = rr.varange(chunk * 64, dtypes.uint32)
-                offsets = rr.vmuls(logical, DMA_TOPK_SELECT_PAGE_SIZE, mask=mask)
-                if num_pages > 2:
-                    value = rr.vselect(
-                        logical,
-                        rr.vadds(logical, 4294967295, mask=mask),
-                        cond_mask=rr.veqs(logical, 0, mask=mask),
-                    )
-                    value = rr.vadds(
-                        rr.vmuls(value, 65537, mask=mask), seed0, mask=mask
-                    )
-                    value = self._mod_pages_vf(
-                        value, dtypes.uint32(num_pages - 2), mask
-                    )
-                    pivot = rr.vdups(seed1, dtypes.uint32, mask=mask)
-                    reflected = rr.vsub(pivot, value, mask=mask)
-                    value = rr.vselect(
-                        reflected,
-                        rr.vadds(reflected, dtypes.uint32(num_pages - 2), mask=mask),
-                        cond_mask=rr.vge(pivot, value, mask=mask),
-                    )
-                    value = rr.vadds(
-                        rr.vmuls(value, 65521, mask=mask), seed1, mask=mask
-                    )
-                    value = self._mod_pages_vf(
-                        value, dtypes.uint32(num_pages - 2), mask
-                    )
-                    offsets = rr.vmuls(value, DMA_TOPK_SELECT_PAGE_SIZE, mask=mask)
-                    offsets = rr.vselect(
-                        rr.vdups(
-                            dtypes.uint32(
-                                (length - DMA_TOPK_SELECT_PAGE_SIZE + 127) // 128 * 128
-                            ),
-                            dtypes.uint32,
-                            mask=mask,
-                        ),
-                        offsets,
-                        cond_mask=rr.veqs(logical, 1, mask=mask),
-                    )
-                    offsets = rr.vselect(
-                        rr.vdups(
-                            dtypes.uint32((num_pages - 2) * DMA_TOPK_SELECT_PAGE_SIZE),
-                            dtypes.uint32,
-                            mask=mask,
-                        ),
-                        offsets,
-                        cond_mask=rr.veqs(
-                            logical, dtypes.uint32(num_pages - 1), mask=mask
-                        ),
-                    )
+                offsets = self._page_offsets_vf(
+                    logical, length, num_pages, seed0, seed1, mask
+                )
                 rr.vstore(
                     self.page_map,
                     chunk * 64,
@@ -4890,7 +4616,13 @@ class DmaTopKSelectPreprocessor(TopKSelectPreprocessor):
         for page in dsl_range(page_limit, unroll=1):
             logical_page = logical_begin + page
             if logical_page < num_pages:
-                offset = dtypes.int64(self.page_map[logical_page])
+                offset = dtypes.int64(0)
+                if logical_page < 1024:
+                    offset = dtypes.int64(self.page_map[logical_page])
+                else:
+                    offset, _page_count = self._physical_page(
+                        logical_page, length, seed0, seed1
+                    )
                 count = dtypes.int64(DMA_TOPK_SELECT_PAGE_SIZE)
                 if logical_page == 1:
                     count = (
@@ -4998,7 +4730,9 @@ class DmaTopKSelectPreprocessor(TopKSelectPreprocessor):
 
     # 完成候选池最终选择，并恢复原始输入索引。
     @jit
-    def finish_indices(self, count, gm_indices, index_base):
+    def finish_indices(
+        self, count, gm_indices, index_base, gm_bits, need_values, length, seed0, seed1
+    ):
         out = self.output_indices.next_write()
         with vf(mode="simd"):
             self.topk.original._find_indices_vf(
@@ -5027,14 +4761,45 @@ class DmaTopKSelectPreprocessor(TopKSelectPreprocessor):
                     rr.vdups(DMA_TOPK_SELECT_PAGE_SIZE - 1, dtypes.int32, mask=mask32),
                     mask=mask32,
                 )
-                physical = rr.vadd(
-                    rr.vgather(self.page_map, page, mask=mask32), within, mask=mask32
-                )
+                num_pages = (
+                    length + DMA_TOPK_SELECT_PAGE_SIZE - 1
+                ) // DMA_TOPK_SELECT_PAGE_SIZE
+                page_offset = rr.vdups(0, dtypes.int32, mask=mask32)
+                if num_pages <= 1024:
+                    page_offset = rr.vgather(self.page_map, page, mask=mask32)
+                else:
+                    page_offset = rr.vreinterpret(
+                        self._page_offsets_vf(
+                            page, length, num_pages, seed0, seed1, mask32
+                        ),
+                        dtypes.int32,
+                    )
+                physical = rr.vadd(page_offset, within, mask=mask32)
                 rr.vstore(
                     out, chunk * 64, rr.vadds(physical, index_base, mask=mask32), mask32
                 )
             rr.vmem_bar("vst_vld")
         mem_copy(gm_indices, self.output_indices.next_read())
+        if need_values != 0:
+            out = self.output_bits.next_write()
+            with vf(mode="simd"):
+                mask = rr.update_mask(128, elem_bits=16)[0]
+                for chunk in dsl_range(DMA_TOPK_SELECT_TOPK // 128, unroll=1):
+                    positions = rr.vload(self.topk.positions, chunk * 128)
+                    keys = rr.vgather(self.values, positions, mask=mask)
+                    positive = rr.vges(keys, 32768, mask=mask)
+                    bits = rr.vselect(
+                        rr.vbitwise_xor(
+                            keys, rr.vdups(0x8000, dtypes.uint16, mask=mask), mask=mask
+                        ),
+                        rr.vbitwise_xor(
+                            keys, rr.vdups(0xFFFF, dtypes.uint16, mask=mask), mask=mask
+                        ),
+                        cond_mask=positive,
+                    )
+                    rr.vstore(out, chunk * 128, bits, mask)
+                rr.vmem_bar("vst_vld")
+            mem_copy(gm_bits, self.output_bits.next_read())
 
     # 在同一个 VF 内完成一批四组阈值过滤。
     @jit
@@ -5126,7 +4891,7 @@ class DmaTopKSelectPreprocessor(TopKSelectPreprocessor):
             ):
                 self.compact(pool_used_elements)
                 pool_used_elements = dtypes.int64(DMA_TOPK_SELECT_TOPK)
-        return pool_used_elements
+        return pool_used_elements, seed0, seed1
 
     # 将候选池局部索引映射为原始输入索引并写出。
     @jit
@@ -5149,9 +4914,27 @@ class DmaTopKSelectPreprocessor(TopKSelectPreprocessor):
 
     # 选择单行 TopK 的适用路径并写出结果。
     @jit
-    def select_row(self, gm_keys, workspace_row, length, gm_indices, index_base):
-        candidate_count = self.preprocess(gm_keys, length, workspace_row)
-        self.finish_indices(candidate_count, gm_indices, index_base)
+    def select_row(
+        self,
+        gm_keys,
+        workspace_row,
+        length,
+        gm_indices,
+        gm_bits,
+        index_base,
+        need_values,
+    ):
+        candidate_count, seed0, seed1 = self.preprocess(gm_keys, length, workspace_row)
+        self.finish_indices(
+            candidate_count,
+            gm_indices,
+            index_base,
+            gm_bits,
+            need_values,
+            length,
+            seed0,
+            seed1,
+        )
 
 
 class StreamingLdTopK:
@@ -5513,11 +5296,11 @@ class QliFusedKernel:
         self.candidate_topk_count = int(candidate_topk)
         self.mask_mode = int(mask_mode)
         self.cmp_ratio = int(cmp_ratio)
-        self.has_cu_seqlens_q = bool(has_cu_seqlens_q)
-        self.has_seqused_q = bool(has_seqused_q)
-        self.has_seqused_k = bool(has_seqused_k)
+        self.has_cu_seqlens_q = has_cu_seqlens_q
+        self.has_seqused_q = has_seqused_q
+        self.has_seqused_k = has_seqused_k
         self.has_cmp_residual_k = self.mask_mode == 3 and self.cmp_ratio != 1
-        self.has_block_table = bool(has_block_table)
+        self.has_block_table = has_block_table
         self.qk_slot0 = _ub_buffer(
             self.ub_pool,
             MemLoc.UB,
@@ -5611,7 +5394,6 @@ class QliFusedKernel:
         # the final LD merge. Keep exact local TopK; whole-row TopKSelect remains.
         self.topkselect_enabled = self.cache_enabled and self.n1 == 32
         if self.topkselect_enabled:
-            self.topkselect = TopKSelectPreprocessor(self.topk, prefetch=True)
             self.dma_topkselect = DmaTopKSelectPreprocessor(self.topk, prefetch=True)
         self.topk.hist_slot0 = self.hist_slot0
         self.topk.hist_slot1 = self.hist_slot1
@@ -6160,12 +5942,19 @@ class QliFusedKernel:
                     rr.vmem_bar("vst_vld")
         topk_rows = dtypes.int32(self.query_rows // 2)
         for row_in_subblock in dsl_range(topk_rows, unroll=1):
-            if owner_cv and self.metadata[LD_RECORD_START, 0] != 0:
-                vec_sync_all()
             local_row = dtypes.int32(
                 get_subblock_id() * (self.query_rows // 2) + row_in_subblock
             )
-            public_row = dtypes.int64(public_row_base) + dtypes.int64(local_row)
+            if owner_cv and (
+                self.metadata[LD_RECORD_START, 0] != 0
+                or (
+                    local_row == task_active_count
+                    and row_in_subblock != 0
+                    and self.return_values
+                )
+            ):
+                vec_sync_all()
+            public_row = dtypes.int64(local_row)
             workspace_row = workspace_task_idx * self.query_rows + local_row
             valid_s2 = actual_s2
             if self.mask_mode == 3:
@@ -6199,7 +5988,9 @@ class QliFusedKernel:
                         ),
                         make_layout((weights.shape[0], 1), stride=(1, 1)),
                     )
-                    output_offset = offsets[public_row, 0]
+                    output_offset = offsets[
+                        dtypes.int64(public_row_base) + public_row, 0
+                    ]
                 if self.streaming_mode:
                     if cache_task == 2:
                         self.topk._select_row_byte(
@@ -6237,11 +6028,13 @@ class QliFusedKernel:
                         self.topkselect_enabled
                         and row_ld == 0
                         and (cache_task == 0)
-                        and (task_need_values == 0)
                         and (valid_s2 >= 32768)
-                        and (valid_s2 <= 131072)
                     ):
-                        if not owner_cv or row_in_subblock == 0:
+                        if (
+                            not owner_cv
+                            or row_in_subblock == 0
+                            or (self.mask_mode == 3 and valid_s2 == 32768)
+                        ):
                             vec_sync_all()
                         if is_aiv():
                             self.dma_topkselect.select_row(
@@ -6253,30 +6046,14 @@ class QliFusedKernel:
                                     (1, self.topk_count),
                                     (public_row, 0),
                                 ),
+                                tile_slice(
+                                    sparse_value_bits,
+                                    (1, self.topk_count),
+                                    (public_row, 0),
+                                ),
                                 dtypes.int32(tile_begin * TILE_N) + output_offset,
+                                task_need_values,
                             )
-                    elif (
-                        self.topkselect_enabled
-                        and row_ld == 0
-                        and (cache_task == 0)
-                        and (valid_s2 >= 32768)
-                        and (valid_s2 <= 131072)
-                    ):
-                        if not owner_cv or row_in_subblock == 0:
-                            vec_sync_all()
-                        self.topkselect.select_row(
-                            key_out,
-                            workspace_row,
-                            dtypes.int64(valid_s2),
-                            tile_slice(
-                                sparse_indices, (1, self.topk_count), (public_row, 0)
-                            ),
-                            tile_slice(
-                                sparse_value_bits, (1, self.topk_count), (public_row, 0)
-                            ),
-                            dtypes.int32(tile_begin * TILE_N) + output_offset,
-                            task_need_values,
-                        )
                     elif self.cache_enabled and cache_task:
                         self.topk._select_row_cached_ub(
                             tile_slice(
@@ -6316,11 +6093,13 @@ class QliFusedKernel:
                     self.topkselect_enabled
                     and row_ld == 0
                     and (cache_task == 0)
-                    and (task_need_values == 0)
                     and (valid_s2 >= 32768)
-                    and (valid_s2 <= 131072)
                 ):
-                    if not owner_cv or row_in_subblock == 0:
+                    if (
+                        not owner_cv
+                        or row_in_subblock == 0
+                        or (self.mask_mode == 3 and valid_s2 == 32768)
+                    ):
                         vec_sync_all()
                     if is_aiv():
                         self.dma_topkselect.select_row(
@@ -6330,30 +6109,12 @@ class QliFusedKernel:
                             tile_slice(
                                 sparse_indices, (1, self.topk_count), (public_row, 0)
                             ),
+                            tile_slice(
+                                sparse_value_bits, (1, self.topk_count), (public_row, 0)
+                            ),
                             dtypes.int32(tile_begin * TILE_N) + output_offset,
+                            task_need_values,
                         )
-                elif (
-                    self.topkselect_enabled
-                    and row_ld == 0
-                    and (cache_task == 0)
-                    and (valid_s2 >= 32768)
-                    and (valid_s2 <= 131072)
-                ):
-                    if not owner_cv or row_in_subblock == 0:
-                        vec_sync_all()
-                    self.topkselect.select_row(
-                        key_out,
-                        workspace_row,
-                        dtypes.int64(valid_s2),
-                        tile_slice(
-                            sparse_indices, (1, self.topk_count), (public_row, 0)
-                        ),
-                        tile_slice(
-                            sparse_value_bits, (1, self.topk_count), (public_row, 0)
-                        ),
-                        dtypes.int32(tile_begin * TILE_N) + output_offset,
-                        task_need_values,
-                    )
                 elif self.cache_enabled and cache_task:
                     self.topk._select_row_cached_ub(
                         tile_slice(
@@ -6666,7 +6427,7 @@ class QliFusedKernel:
             local_row = dtypes.int32(
                 get_subblock_id() * (self.query_rows // 2) + row_in_subblock
             )
-            public_row = dtypes.int64(public_row_base) + dtypes.int64(local_row)
+            public_row = dtypes.int64(local_row)
             if local_row < task_span_count:
                 self.topk.store_empty_row(
                     tile_slice(
@@ -6708,39 +6469,15 @@ class QliFusedKernel:
         worker_count,
         total_q,
         batch_count,
-        final_idx_address,
-        final_bits_address,
-        final_candidate_address,
-        final_candidate_bits_address,
+        final_indices,
+        final_bits,
+        final_candidates,
+        final_candidate_bits,
     ):
         # Only whole query tiles beyond effective Q are omitted from ASC-style
         # compute groups. The last active tile already initializes its own tail.
-        indices = make_tensor(
-            make_pointer(dtypes.int32, dtypes.int64(final_idx_address), MemLoc.GM),
-            make_layout((total_q, self.topk_count), stride=(self.topk_count, 1)),
-        )
-        bits = make_tensor(
-            make_pointer(dtypes.uint16, dtypes.int64(final_bits_address), MemLoc.GM),
-            make_layout((total_q, self.topk_count), stride=(self.topk_count, 1)),
-        )
-        candidates = make_tensor(
-            make_pointer(
-                dtypes.int32, dtypes.int64(final_candidate_address), MemLoc.GM
-            ),
-            make_layout(
-                (total_q, self.candidate_topk_count),
-                stride=(self.candidate_topk_count, 1),
-            ),
-        )
-        candidate_bits = make_tensor(
-            make_pointer(
-                dtypes.uint16, dtypes.int64(final_candidate_bits_address), MemLoc.GM
-            ),
-            make_layout(
-                (total_q, self.candidate_topk_count),
-                stride=(self.candidate_topk_count, 1),
-            ),
-        )
+        indices, bits = final_indices, final_bits
+        candidates, candidate_bits = final_candidates, final_candidate_bits
         for batch_idx in dsl_range(batch_count, unroll=1):
             begin = dtypes.int64(0)
             end = dtypes.int64(total_q)
@@ -6754,10 +6491,10 @@ class QliFusedKernel:
             offset = first_padding + worker * self.query_rows
             while offset < end - begin:
                 self._store_empty_rows(
-                    indices,
-                    bits,
-                    candidates,
-                    candidate_bits,
+                    _offset_view(indices, (begin + offset, 0)),
+                    _offset_view(bits, (begin + offset, 0)),
+                    _offset_view(candidates, (begin + offset, 0)),
+                    _offset_view(candidate_bits, (begin + offset, 0)),
                     candidate_length,
                     begin + offset,
                     dtypes.int32(min(self.query_rows, end - begin - offset)),
@@ -6798,10 +6535,10 @@ class QliFusedKernel:
         partial_bits_address,
         partial_candidate_address,
         partial_candidate_bits_address,
-        final_idx_address,
-        final_bits_address,
-        final_candidate_address,
-        final_candidate_bits_address,
+        final_indices,
+        final_bits,
+        final_candidates,
+        final_candidate_bits,
     ):
         previous_owner = dtypes.int32(-1)
         worker = dtypes.int64(get_block_idx())
@@ -6873,67 +6610,58 @@ class QliFusedKernel:
                         tile_begin > 0
                         or tile_end < (dtypes.int64(visible) + TILE_N - 1) // TILE_N
                     )
-                    delta = workspace_cursor * self.query_rows - dtypes.int64(
-                        public_row
+                    row_indices = tile_slice(
+                        _offset_view(final_indices, (public_row, 0)),
+                        (self.query_rows, self.topk_count),
+                        (0, 0),
                     )
-                    idx_address = dtypes.int64(
-                        (
-                            dtypes.int64(partial_idx_address)
-                            + delta * self.topk_count * 4
-                            if row_ld
-                            else final_idx_address
+                    row_bits = tile_slice(
+                        _offset_view(final_bits, (public_row, 0)),
+                        (self.query_rows, self.topk_count),
+                        (0, 0),
+                    )
+                    row_candidates = tile_slice(
+                        _offset_view(final_candidates, (public_row, 0)),
+                        (self.query_rows, self.candidate_topk_count),
+                        (0, 0),
+                    )
+                    row_candidate_bits = tile_slice(
+                        _offset_view(final_candidate_bits, (public_row, 0)),
+                        (self.query_rows, self.candidate_topk_count),
+                        (0, 0),
+                    )
+                    if row_ld:
+                        row_indices = tile_slice(
+                            _offset_view(
+                                sparse_indices, (workspace_cursor * self.query_rows, 0)
+                            ),
+                            (self.query_rows, self.topk_count),
+                            (0, 0),
                         )
-                    )
-                    bits_address = dtypes.int64(
-                        (
-                            dtypes.int64(partial_bits_address)
-                            + delta * self.topk_count * 2
-                            if row_ld
-                            else final_bits_address
+                        row_bits = tile_slice(
+                            _offset_view(
+                                sparse_value_bits,
+                                (workspace_cursor * self.query_rows, 0),
+                            ),
+                            (self.query_rows, self.topk_count),
+                            (0, 0),
                         )
-                    )
-                    candidate_address = dtypes.int64(
-                        (
-                            dtypes.int64(partial_candidate_address)
-                            + delta * self.candidate_topk_count * 4
-                            if row_ld
-                            else final_candidate_address
+                        row_candidates = tile_slice(
+                            _offset_view(
+                                candidate_indices,
+                                (workspace_cursor * self.query_rows, 0),
+                            ),
+                            (self.query_rows, self.candidate_topk_count),
+                            (0, 0),
                         )
-                    )
-                    candidate_bits_address = dtypes.int64(
-                        (
-                            dtypes.int64(partial_candidate_bits_address)
-                            + delta * self.candidate_topk_count * 2
-                            if row_ld
-                            else final_candidate_bits_address
+                        row_candidate_bits = tile_slice(
+                            _offset_view(
+                                candidate_value_bits,
+                                (workspace_cursor * self.query_rows, 0),
+                            ),
+                            (self.query_rows, self.candidate_topk_count),
+                            (0, 0),
                         )
-                    )
-                    row_indices = make_tensor(
-                        make_pointer(dtypes.int32, idx_address, MemLoc.GM),
-                        make_layout(
-                            (total_q, self.topk_count), stride=(self.topk_count, 1)
-                        ),
-                    )
-                    row_bits = make_tensor(
-                        make_pointer(dtypes.uint16, bits_address, MemLoc.GM),
-                        make_layout(
-                            (total_q, self.topk_count), stride=(self.topk_count, 1)
-                        ),
-                    )
-                    row_candidates = make_tensor(
-                        make_pointer(dtypes.int32, candidate_address, MemLoc.GM),
-                        make_layout(
-                            (total_q, self.candidate_topk_count),
-                            stride=(self.candidate_topk_count, 1),
-                        ),
-                    )
-                    row_candidate_bits = make_tensor(
-                        make_pointer(dtypes.uint16, candidate_bits_address, MemLoc.GM),
-                        make_layout(
-                            (total_q, self.candidate_topk_count),
-                            stride=(self.candidate_topk_count, 1),
-                        ),
-                    )
                     self._compute_task(
                         query,
                         key,
@@ -6978,46 +6706,6 @@ class QliFusedKernel:
                     # FD tasks cover active rows only. The first partial owner
                     # initializes inactive public rows directly in the final output.
                     if row_ld and tile_begin == 0:
-                        final_indices = make_tensor(
-                            make_pointer(
-                                dtypes.int32, dtypes.int64(final_idx_address), MemLoc.GM
-                            ),
-                            make_layout(
-                                (total_q, self.topk_count), stride=(self.topk_count, 1)
-                            ),
-                        )
-                        final_bits = make_tensor(
-                            make_pointer(
-                                dtypes.uint16,
-                                dtypes.int64(final_bits_address),
-                                MemLoc.GM,
-                            ),
-                            make_layout(
-                                (total_q, self.topk_count), stride=(self.topk_count, 1)
-                            ),
-                        )
-                        final_candidates = make_tensor(
-                            make_pointer(
-                                dtypes.int32,
-                                dtypes.int64(final_candidate_address),
-                                MemLoc.GM,
-                            ),
-                            make_layout(
-                                (total_q, self.candidate_topk_count),
-                                stride=(self.candidate_topk_count, 1),
-                            ),
-                        )
-                        final_candidate_bits = make_tensor(
-                            make_pointer(
-                                dtypes.uint16,
-                                dtypes.int64(final_candidate_bits_address),
-                                MemLoc.GM,
-                            ),
-                            make_layout(
-                                (total_q, self.candidate_topk_count),
-                                stride=(self.candidate_topk_count, 1),
-                            ),
-                        )
                         for local in range_constexpr(self.query_rows // 2):
                             r = dtypes.int32(
                                 get_subblock_id() * (self.query_rows // 2) + local
@@ -7068,10 +6756,10 @@ class QliFusedKernel:
                 worker_count,
                 total_q,
                 batch_count,
-                final_idx_address,
-                final_bits_address,
-                final_candidate_address,
-                final_candidate_bits_address,
+                final_indices,
+                final_bits,
+                final_candidates,
+                final_candidate_bits,
             )
 
 
@@ -7085,10 +6773,6 @@ def _build_compiled_fused_runner(
     candidate_topk,
     mask_mode,
     cmp_ratio,
-    has_cu_seqlens_q,
-    has_seqused_q,
-    has_seqused_k,
-    has_block_table,
     pa_block_size,
     split_count,
     n1=32,
@@ -7097,8 +6781,8 @@ def _build_compiled_fused_runner(
     tnd_layout=False,
 ):
     """Compile the dynamic TensorSpec contract using the standard DSL entry."""
-    N1 = int(n1)
-    TILE_M = N1 * int(query_tile_rows)
+    query_head_count = int(n1)
+    TILE_M = query_head_count * int(query_tile_rows)
     has_cmp_residual_k = int(mask_mode) == 3 and int(cmp_ratio) != 1
     topk = int(topk)
     candidate_enabled = bool(candidate_enabled)
@@ -7107,13 +6791,36 @@ def _build_compiled_fused_runner(
     cmp_ratio = int(cmp_ratio)
 
     # 执行融合设备内核，按 metadata 调度完整任务和 LD 分片。
-    @kernel
+    @kernel(
+        profile=ProfileSpec(
+            name="QuantLightningIndexer",
+            op_type="QuantLightningIndexer",
+            inputs=(
+                "query_data",
+                "profile_key",
+                "weights",
+                "query_scale_data",
+                "profile_key_scale",
+                "cu_seqlens_q",
+                "seqused_q",
+                "seqused_k",
+                "cmp_residual_k",
+                "block_table",
+            ),
+            outputs=("final_sparse_indices_data", "profile_sparse_values")
+            + (
+                ("final_candidate_indices_data", "profile_candidate_length")
+                if candidate_enabled
+                else ()
+            ),
+        )
+    )
     def Quant_lightning_indexer(
-        query_address,
-        key_address,
+        query_data: Tensor,
+        key_data: Tensor,
         weights: Tensor,
-        query_scale,
-        key_scale_address,
+        query_scale_data: Tensor,
+        key_scale_data: Tensor,
         key_stride0,
         key_dequant_scale_stride0,
         cu_seqlens_q: Tensor,
@@ -7137,21 +6844,20 @@ def _build_compiled_fused_runner(
         scale_rows,
         metadata: Tensor,
         task_count,
-        final_sparse_indices_address,
-        final_sparse_bits_address,
-        final_candidate_indices_address,
-        final_candidate_bits_address,
+        final_sparse_indices_data: Tensor,
+        final_sparse_values_data: Tensor,
+        final_candidate_indices_data: Tensor,
+        final_candidate_bits_data: Tensor,
         return_values,
         merge_workers,
         output_offset_address,
+        profile_key: Tensor,
+        profile_key_scale: Tensor,
+        profile_sparse_values: Tensor,
+        profile_candidate_length: Tensor,
     ):
         ld_enabled = metadata[LD_RECORD_START, 0] != 0
-        final_sparse_indices = make_tensor(
-            make_pointer(
-                dtypes.int32, dtypes.int64(final_sparse_indices_address), MemLoc.GM
-            ),
-            make_layout((total_q, topk), stride=(topk, 1)),
-        )
+        final_sparse_indices = final_sparse_indices_data.view(total_q, topk)
         sparse_indices = make_tensor(
             make_pointer(dtypes.int32, dtypes.int64(sparse_indices_address), MemLoc.GM),
             make_layout((64 * query_tile_rows, topk), stride=(topk, 1)),
@@ -7162,24 +6868,13 @@ def _build_compiled_fused_runner(
             ),
             make_layout((64 * query_tile_rows, topk), stride=(topk, 1)),
         )
-        final_sparse_bits = make_tensor(
-            make_pointer(
-                dtypes.uint16, dtypes.int64(final_sparse_bits_address), MemLoc.GM
-            ),
-            make_layout((total_q, topk), stride=(topk, 1)),
+        final_sparse_bits = final_sparse_values_data.view(total_q, topk).view(
+            dtype=dtypes.uint16
         )
-        final_candidate_indices = make_tensor(
-            make_pointer(
-                dtypes.int32, dtypes.int64(final_candidate_indices_address), MemLoc.GM
-            ),
-            make_layout((total_q, candidate_topk), stride=(candidate_topk, 1)),
+        final_candidate_indices = final_candidate_indices_data.view(
+            total_q, candidate_topk
         )
-        final_candidate_bits = make_tensor(
-            make_pointer(
-                dtypes.uint16, dtypes.int64(final_candidate_bits_address), MemLoc.GM
-            ),
-            make_layout((total_q, candidate_topk), stride=(candidate_topk, 1)),
-        )
+        final_candidate_bits = final_candidate_bits_data
         candidate_indices = make_tensor(
             make_pointer(
                 dtypes.int32, dtypes.int64(candidate_indices_address), MemLoc.GM
@@ -7196,38 +6891,22 @@ def _build_compiled_fused_runner(
                 (64 * query_tile_rows, candidate_topk), stride=(candidate_topk, 1)
             ),
         )
-        query = make_tensor(
-            make_pointer(dtypes.fp4x2_e2m1, dtypes.int64(query_address), MemLoc.GM),
-            make_layout((total_q * N1, LOGICAL_D), stride=(LOGICAL_D, 1)),
-        )
-        key = make_tensor(
-            make_pointer(dtypes.fp4x2_e2m1, dtypes.int64(key_address), MemLoc.GM),
-            make_layout(
-                (key_rows, LOGICAL_D),
-                stride=(key_stride0 * 2 if tnd_layout else LOGICAL_D, 1),
-            ),
-        )
-        key_scale = make_tensor(
-            make_pointer(
-                dtypes.float8_e8m0, dtypes.int64(key_scale_address), MemLoc.GM
-            ),
-            make_layout(
-                (scale_rows, 2, 2),
-                stride=(key_dequant_scale_stride0 if tnd_layout else 4, 2, 1),
-            ),
-        )
+        query = query_data.flatten(0, 1)
+        query_scale = query_scale_data.flatten(0, 1)
+        key = key_data
+        key_scale = key_scale_data
         QliFusedKernel(
             topk,
             candidate_enabled,
             candidate_topk,
             mask_mode,
             cmp_ratio,
-            has_cu_seqlens_q,
-            has_seqused_q,
-            has_seqused_k,
-            has_block_table,
+            cu_seqlens_q.shape[0] > 0,
+            seqused_q.shape[0] > 0,
+            seqused_k.shape[0] > 0,
+            block_table.shape[0] > 0,
             pa_block_size,
-            N1,
+            query_head_count,
             query_tile_rows,
             metadata,
             output_offset_address,
@@ -7266,10 +6945,10 @@ def _build_compiled_fused_runner(
             sparse_value_bits_address,
             candidate_indices_address,
             candidate_value_bits_address,
-            final_sparse_indices_address,
-            final_sparse_bits_address,
-            final_candidate_indices_address,
-            final_candidate_bits_address,
+            final_sparse_indices,
+            final_sparse_bits,
+            final_candidate_indices,
+            final_candidate_bits,
         )
         if ld_enabled:
             global_sync_all()
@@ -7285,7 +6964,7 @@ def _build_compiled_fused_runner(
                     worker_count * 2,
                     cu_seqlens_q,
                     query_tile_rows,
-                    has_cu_seqlens_q,
+                    cu_seqlens_q.shape[0] > 0,
                     output_offset_address,
                 )
             else:
@@ -7299,7 +6978,7 @@ def _build_compiled_fused_runner(
                     worker_count * 2,
                     cu_seqlens_q,
                     query_tile_rows,
-                    has_cu_seqlens_q,
+                    cu_seqlens_q.shape[0] > 0,
                     output_offset_address,
                     return_values,
                 )
@@ -7319,17 +6998,17 @@ def _build_compiled_fused_runner(
                     worker_count * 2,
                     cu_seqlens_q,
                     query_tile_rows,
-                    has_cu_seqlens_q,
+                    cu_seqlens_q.shape[0] > 0,
                 )
 
     # 绑定张量形状与工作区，启动融合设备内核。
     @host
     def run_fused_cv(
-        query_address,
-        key_address,
+        query_data: Tensor,
+        key_data: Tensor,
         weights: Tensor,
-        query_scale,
-        key_scale_address,
+        query_scale_data: Tensor,
+        key_scale_data: Tensor,
         key_stride0,
         key_dequant_scale_stride0,
         cu_seqlens_q: Tensor,
@@ -7353,20 +7032,24 @@ def _build_compiled_fused_runner(
         scale_rows,
         metadata: Tensor,
         task_count,
-        final_sparse_indices_address,
-        final_sparse_bits_address,
-        final_candidate_indices_address,
-        final_candidate_bits_address,
+        final_sparse_indices_data: Tensor,
+        final_sparse_values_data: Tensor,
+        final_candidate_indices_data: Tensor,
+        final_candidate_bits_data: Tensor,
         return_values,
         merge_workers,
         output_offset_address,
+        profile_key: Tensor,
+        profile_key_scale: Tensor,
+        profile_sparse_values: Tensor,
+        profile_candidate_length: Tensor,
     ):
         Quant_lightning_indexer[worker_count](
-            query_address,
-            key_address,
+            query_data,
+            key_data,
             weights,
-            query_scale,
-            key_scale_address,
+            query_scale_data,
+            key_scale_data,
             key_stride0,
             key_dequant_scale_stride0,
             cu_seqlens_q,
@@ -7390,13 +7073,17 @@ def _build_compiled_fused_runner(
             scale_rows,
             metadata,
             task_count,
-            final_sparse_indices_address,
-            final_sparse_bits_address,
-            final_candidate_indices_address,
-            final_candidate_bits_address,
+            final_sparse_indices_data,
+            final_sparse_values_data,
+            final_candidate_indices_data,
+            final_candidate_bits_data,
             return_values,
             merge_workers,
             output_offset_address,
+            profile_key,
+            profile_key_scale,
+            profile_sparse_values,
+            profile_candidate_length,
         )
 
     query_rows_dim = cannbotdsl.Dim("T1")
@@ -7404,40 +7091,27 @@ def _build_compiled_fused_runner(
     block_table_width_dim = cannbotdsl.Dim("MAX_BLOCKS")
     token_capacity_dim = cannbotdsl.Dim("S2_PAD")
     candidate_capacity_dim = cannbotdsl.Dim("CANDIDATE_PAD")
-    cannbotdsl.Dim("SPARSE_WIDTH")
+    _sparse_width = cannbotdsl.Dim("SPARSE_WIDTH")
     candidate_width = cannbotdsl.Dim("CANDIDATE_WIDTH")
     partial_rows = cannbotdsl.Dim("PARTIAL_ROWS")
-    cannbotdsl.Dim("METADATA_TASKS")
+    _metadata_tasks = cannbotdsl.Dim("METADATA_TASKS")
     workspace_rows = cannbotdsl.Dim(
-        "WORKSPACE_ROWS", min=1, max=MAX_CUBE_WORKERS * (TILE_M // N1)
+        "WORKSPACE_ROWS", min=1, max=MAX_CUBE_WORKERS * (TILE_M // query_head_count)
     )
     fake = TensorSpec
     dummy_i32_spec = fake((1,), dtypes.int32)
-    # TND 可同时省略 used_q/used_k；此时 CU 长度直接绑定动态轴，
-    # 避免 B 只以 B+1 派生表达式出现而被编译器拒绝。
-    cu_length_dim = batch_dim + 1
-    if tnd_layout and not (has_seqused_q or has_seqused_k or has_cmp_residual_k):
-        cu_length_dim = cannbotdsl.Dim("CU_LENGTH")
-    cu_spec = (
-        fake((cu_length_dim,), dtypes.int32) if has_cu_seqlens_q else dummy_i32_spec
-    )
-    seqused_q_spec = (
-        fake((batch_dim,), dtypes.int32) if has_seqused_q else dummy_i32_spec
-    )
-    seqused_k_spec = (
-        fake((batch_dim,), dtypes.int32) if has_seqused_k else dummy_i32_spec
-    )
+    cu_spec = fake((cannbotdsl.Dim("CU_LENGTH", min=0),), dtypes.int32)
+    seqused_q_spec = fake((cannbotdsl.Dim("SEQUSED_Q_LENGTH", min=0),), dtypes.int32)
+    seqused_k_spec = fake((cannbotdsl.Dim("SEQUSED_K_LENGTH", min=0),), dtypes.int32)
     residual_spec = (
         fake((batch_dim,), dtypes.int32) if has_cmp_residual_k else dummy_i32_spec
     )
-    block_table_spec = (
-        (
-            fake((cu_length_dim,), dtypes.int32)
-            if tnd_layout
-            else fake((batch_dim, block_table_width_dim), dtypes.int32)
-        )
-        if has_block_table
-        else fake((1, 1), dtypes.int32)
+    block_table_rows = cannbotdsl.Dim("BLOCK_TABLE_ROWS", min=0)
+    block_table_spec = fake(
+        (block_table_rows,)
+        if tnd_layout
+        else (block_table_rows, block_table_width_dim),
+        dtypes.int32,
     )
     candidate_key_spec = (
         fake(
@@ -7456,13 +7130,45 @@ def _build_compiled_fused_runner(
         else fake((1, candidate_width), dtypes.int32)
     )
 
+    # Public views retain the original tensor shapes for profiling.
+    key_profile_rows = cannbotdsl.Dim("PROFILE_KEY_ROWS")
+    key_profile_stride = cannbotdsl.Dim("PROFILE_KEY_STRIDE")
+    scale_profile_stride = cannbotdsl.Dim("PROFILE_SCALE_STRIDE")
+    key_profile_shape = (
+        (key_profile_rows, N2, PACKED_D)
+        if tnd_layout
+        else (key_profile_rows, pa_block_size, N2, PACKED_D)
+    )
+    key_profile_strides = (
+        (key_profile_stride, PACKED_D, 1)
+        if tnd_layout
+        else (key_profile_stride, PACKED_D, PACKED_D, 1)
+    )
+    scale_profile_shape = (
+        (key_profile_rows, N2, 2, 2)
+        if tnd_layout
+        else (key_profile_rows, pa_block_size, N2, 2, 2)
+    )
+    scale_profile_strides = (
+        (scale_profile_stride, 4, 2, 1)
+        if tnd_layout
+        else (scale_profile_stride, 4, 4, 2, 1)
+    )
     compiled = cannbotdsl.compile(
         run_fused_cv,
-        dtypes.int64,
-        dtypes.int64,
-        fake((query_rows_dim, N1), dtypes.float32),
-        fake((query_rows_dim * N1, 2, 2), dtypes.float8_e8m0),
-        dtypes.int64,
+        fake((query_rows_dim, query_head_count, PACKED_D), dtypes.uint8),
+        fake(
+            (cannbotdsl.Dim("KEY_STORAGE_ROWS"), PACKED_D),
+            dtypes.uint8,
+            stride=(cannbotdsl.Dim("KEY_STORAGE_STRIDE"), 1),
+        ),
+        fake((query_rows_dim, query_head_count), dtypes.float32),
+        fake((query_rows_dim, query_head_count, 2, 2), dtypes.float8_e8m0),
+        fake(
+            (cannbotdsl.Dim("SCALE_STORAGE_ROWS"), 2, 2),
+            dtypes.float8_e8m0,
+            stride=(cannbotdsl.Dim("SCALE_STORAGE_STRIDE"), 2, 1),
+        ),
         dtypes.int64,
         dtypes.int64,
         cu_spec,
@@ -7486,13 +7192,17 @@ def _build_compiled_fused_runner(
         dtypes.int64,
         fake((METADATA_ROWS, METADATA_FIELDS), dtypes.int32),
         dtypes.int64,
+        fake((query_rows_dim, N2, topk), dtypes.int32),
+        fake((query_rows_dim, N2, topk), dtypes.bfloat16),
+        fake((query_rows_dim, N2, candidate_topk), dtypes.int32),
+        fake((query_rows_dim, candidate_topk), dtypes.uint16),
         dtypes.int64,
         dtypes.int64,
         dtypes.int64,
-        dtypes.int64,
-        dtypes.int64,
-        dtypes.int64,
-        dtypes.int64,
+        fake(key_profile_shape, dtypes.uint8, stride=key_profile_strides),
+        fake(scale_profile_shape, dtypes.float8_e8m0, stride=scale_profile_strides),
+        fake((cannbotdsl.Dim("PROFILE_VALUE_ROWS", min=0), N2, topk), dtypes.bfloat16),
+        fake((query_rows_dim, N2), dtypes.int32),
     )
     return compiled
 
@@ -7508,11 +7218,12 @@ def clear_caches():
 def _get_compiled_fused_runner(*config):
     """Cache the dynamic QLI executable, independently of B/T/S2."""
     # DSL native policy is process-wide; never compile a missing runtime binary.
-    cache_key = tuple(config)
+    # Legacy optional-input flags do not specialize the executable.
+    cache_key = tuple(config[:5]) + tuple(config[9:])
     with _COMPILED_KERNEL_LOCK:
         compiled = _COMPILED_KERNEL.get(cache_key)
         if compiled is None:
-            compiled = _build_compiled_fused_runner(*config)
+            compiled = _build_compiled_fused_runner(*cache_key)
             _COMPILED_KERNEL[cache_key] = compiled
         return compiled
 
@@ -7823,18 +7534,18 @@ def quant_lightning_indexer(
     if tokens_pad <= 0:
         raise ValueError("K storage must expose at least one PA page")
     # Optional xlsx tensors remain optional at the public boundary.  One
-    # uninitialized carrier is sufficient because the JIT specialization
-    # compiles out every load when the corresponding tensor is absent.
+    # uninitialized carrier is sufficient because zero-length dynamic axes
+    # guard every load at runtime when the corresponding tensor is absent.
     dummy_i32 = torch.empty((1,), dtype=torch.int32, device=query.device)
     dummy_table = torch.empty((1, 1), dtype=torch.int32, device=query.device)
-    cu_kernel = cu_seqlens_q if has_cu_seqlens_q else dummy_i32
-    seqused_q_kernel = seqused_q if has_seqused_q else dummy_i32
-    seqused_k_kernel = seqused_k if has_seqused_k else dummy_i32
+    cu_kernel = cu_seqlens_q if has_cu_seqlens_q else dummy_i32[:0]
+    seqused_q_kernel = seqused_q if has_seqused_q else dummy_i32[:0]
+    seqused_k_kernel = seqused_k if has_seqused_k else dummy_i32[:0]
     cmp_residual_kernel = cmp_residual_k if has_cmp_residual_k else dummy_i32
     block_table_kernel = (
         (cu_seqlens_k if tnd_layout else block_table)
         if has_block_table
-        else dummy_table
+        else (dummy_i32[:0] if tnd_layout else dummy_table[:0])
     )
 
     max_query_length = int(max_seqlen_q) if int(max_seqlen_q) > 0 else t
@@ -7853,7 +7564,9 @@ def quant_lightning_indexer(
     if metadata.device != q.device:
         raise ValueError("Metadata must be on the same device as q")
     metadata = metadata.view(METADATA_ROWS, METADATA_FIELDS)
-    worker_count = int(torch.npu.get_device_properties(q.device).cube_core_num)
+    device_index = q.device.index
+    stream = torch.npu.current_stream(device_index)
+    worker_count = int(get_platform_info(stream=stream).cube_core_num)
     if not 1 <= worker_count <= LD_RECORD_START:
         raise RuntimeError(
             f"Unsupported Cube core count {worker_count}; LI metadata supports 1..{LD_RECORD_START}"
@@ -7908,10 +7621,6 @@ def quant_lightning_indexer(
     )
 
     # GM aliases describe native packed formats without device copies.
-    query_address = query.data_ptr()
-    query_scale_storage = query_dequant_scale.reshape(t * query_heads, 2, 2).view(
-        torch.float8_e8m0fnu
-    )
 
     final_sparse_indices = torch.empty(
         (t, int(topk)), dtype=torch.int32, device=query.device
@@ -7951,11 +7660,13 @@ def quant_lightning_indexer(
         ),
         tnd_layout,
     )(
-        query_address,
-        key_storage.data_ptr(),
+        query,
+        key_storage.view(int(key_storage.shape[0]), PACKED_D),
         weights,
-        query_scale_storage,
-        key_dequant_scale_storage.data_ptr(),
+        query_dequant_scale.view(torch.float8_e8m0fnu),
+        key_dequant_scale_storage.view(
+            int(key_dequant_scale_storage.shape[0]), 2, 2
+        ).view(torch.float8_e8m0fnu),
         key_stride0,
         key_dequant_scale_stride0,
         cu_kernel,
@@ -7979,13 +7690,17 @@ def quant_lightning_indexer(
         key_dequant_scale_storage.shape[0],
         metadata,
         metadata.shape[0],
-        final_sparse_indices.data_ptr(),
-        final_sparse_values.view(torch.uint16).data_ptr(),
-        final_candidate_indices.data_ptr(),
-        final_candidate_bits.data_ptr(),
+        final_sparse_indices.view(t, N2, int(topk)),
+        final_sparse_values.view(t, N2, int(topk)),
+        final_candidate_indices.view(t, N2, kernel_candidate_count),
+        final_candidate_bits,
         int(return_value),
         min(64, t),
         0 if output_idx_offset is None else output_idx_offset.data_ptr(),
+        key,
+        key_dequant_scale.view(torch.float8_e8m0fnu),
+        final_sparse_values[: t if return_value else 0].view(-1, N2, int(topk)),
+        candidate_length_1d[:t].view(t, N2),
     )
 
     sparse_indices_2d, sparse_values_2d = final_sparse_indices, final_sparse_values
@@ -8034,10 +7749,6 @@ def export_qli():
             mask_mode=mask,
             cmp_ratio=ratio,
             pa_block_size=page,
-            has_seqused_q=has_q,
-            has_seqused_k=has_k,
-            has_cu_seqlens_q=has_cu,
-            has_block_table=has_table,
             tnd_layout=tnd,
         )
         for enabled in (False, True)
@@ -8045,10 +7756,6 @@ def export_qli():
         for ratio in ((1, 2) if mask == 3 else (1,))
         for tnd in (False, True)
         for page in ((TILE_N,) if tnd else (64, 128))
-        for has_q in (False, True)
-        for has_cu in (False, True)
-        for has_k in (False, True)
-        for has_table in (False, True)
     ]
     profile_path = os.environ.get("CANNBOTDSL_DS41_PROFILES")
     if profile_path:
@@ -8062,11 +7769,18 @@ def export_qli():
             if unknown:
                 raise ValueError(f"Unknown export profile fields: {sorted(unknown)}")
             config = dict(defaults, **profile)
-            # cmp_ratio is unused without the causal mask; export one binary.
+            # Optional-input presence is dynamic; cmp_ratio is unused without the causal mask.
             identity = tuple(
                 (name, value)
                 for name, value in config.items()
-                if name != "cmp_ratio" or config["mask_mode"] == 3
+                if name
+                not in (
+                    "has_cu_seqlens_q",
+                    "has_seqused_q",
+                    "has_seqused_k",
+                    "has_block_table",
+                )
+                and (name != "cmp_ratio" or config["mask_mode"] == 3)
             )
             if identity in exported:
                 continue
@@ -8118,7 +7832,12 @@ class QliTndCube(QliCube):
         # Tile windows pin the full NZ frame while the dynamic source slice
         # keeps the copy height clamped to the available key rows.
         mem_copy(
-            tile_slice(key_write, (QK_COLUMNS, LOGICAL_D), (0, 0)),
+            reinterpret(
+                key_write,
+                dtype=dtypes.uint8,
+                layout=make_layout((QK_COLUMNS, PACKED_D)),
+                data_format="nz",
+            ),
             key[source_row : source_row + count, None],
         )
         mem_copy(

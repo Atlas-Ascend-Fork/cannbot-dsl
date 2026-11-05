@@ -29,7 +29,7 @@ import cannbotdsl
 import torch
 from cannbotdsl.aot import export
 
-from cannbotdsl import MemLoc, ProfileSpec, Tensor, dtypes
+from cannbotdsl import MemLoc, ProfileSpec, Tensor, dtypes, get_platform_info
 from cannbotdsl.buffer import Buffer
 from cannbotdsl.lang.control_flow import range as dsl_range
 from cannbotdsl.lang.constexpr import range_constexpr, const_expr
@@ -106,17 +106,16 @@ LD_RECORD_START = 36
 
 
 @jit
-def _copy_pa_row(packed_ub, block_idx, key, key_address, address):
+def _copy_pa_row(packed_ub, block_idx, key, key_storage, address):
     destination = tile_view(packed_ub, (1, PACKED_BLOCK_BYTES), (block_idx, 0))
-    source = make_tensor(
-        make_pointer(dtypes.uint8, dtypes.int64(key_address + address), MemLoc.GM),
-        make_layout((1, PACKED_BLOCK_BYTES), stride=(PACKED_BLOCK_BYTES, 1)),
+    source = key_storage[address : address + PACKED_BLOCK_BYTES,].view(
+        1, PACKED_BLOCK_BYTES
     )
     mem_copy(destination, source)
 
 
 @jit
-def _copy_pa_pair(packed_ub, pair, key, key_address, first, second):
+def _copy_pa_pair(packed_ub, pair, key, key_storage, first, second):
     gap = second - first
     pair_ok = (
         (1 if gap - PACKED_BLOCK_BYTES <= MAX_COPY_SOURCE_GAP_BYTES else 0)
@@ -124,10 +123,7 @@ def _copy_pa_pair(packed_ub, pair, key, key_address, first, second):
         else 0
     )
     if pair_ok != 0:
-        source = make_tensor(
-            make_pointer(dtypes.uint8, dtypes.int64(key_address + first), MemLoc.GM),
-            make_layout((gap + PACKED_BLOCK_BYTES,), stride=(1,)),
-        )
+        source = key_storage[first : first + gap + PACKED_BLOCK_BYTES,]
         first_source = source[0:PACKED_BLOCK_BYTES,].view(1, PACKED_BLOCK_BYTES)
         second_source = source[gap : gap + PACKED_BLOCK_BYTES,].view(
             1, PACKED_BLOCK_BYTES
@@ -137,8 +133,8 @@ def _copy_pa_pair(packed_ub, pair, key, key_address, first, second):
             (first_source, second_source),
         )
     else:
-        _copy_pa_row(packed_ub, pair * 2, key, key_address, first)
-        _copy_pa_row(packed_ub, pair * 2 + 1, key, key_address, second)
+        _copy_pa_row(packed_ub, pair * 2, key, key_storage, first)
+        _copy_pa_row(packed_ub, pair * 2 + 1, key, key_storage, second)
 
 
 @jit
@@ -176,8 +172,8 @@ def _validate_pa_dim0_stride(tensor: torch.Tensor, name: str) -> int:
             f"{name} only supports non-contiguous storage on axis 0; "
             f"expected inner strides {expected_inner}, got {strides[1:]}"
         )
-    if strides[0] <= 0:
-        raise ValueError(f"{name} axis-0 stride must be positive")
+    if strides[0] < expected[-1]:
+        raise ValueError(f"{name} axis-0 stride must be positive and non-overlapping")
     return strides[0]
 
 
@@ -418,6 +414,7 @@ class LdTopKSelector(QsliRawTopKSelector):
         valid_length,
         output_offset=0,
         preloaded=False,
+        write_output=True,
     ):
         if not preloaded:
             mem_copy(
@@ -500,12 +497,12 @@ class LdTopKSelector(QsliRawTopKSelector):
                 positions16 = rr.vload(self.workspace.tmp_idx, chunk * 64)
                 keys = rr.vgather(current_trunk, positions16, mask=mask16)
                 value_bits = rr.vgather(self.ld_bits, positions16, mask=mask16)
-                rr.vlts(
+                _valid_rank32 = rr.vlts(
                     rr.varange(chunk * 64, dtypes.uint32),
                     output_valid_count,
                     mask=mask32,
                 )
-                rr.vlts(
+                _valid_rank16 = rr.vlts(
                     rr.varange(chunk * 64, dtypes.uint16),
                     output_valid_count,
                     mask=mask16,
@@ -549,8 +546,9 @@ class LdTopKSelector(QsliRawTopKSelector):
                 rr.vstore(output_idx_stage, chunk * 64, indices, mask32)
                 rr.vstore(out_value_bits, chunk * 64, value_bits, mask16)
             rr.vmem_bar("vst_vld")
-        mem_copy(gm_sparse_indices, output_idx_stage)
-        mem_copy(gm_selected_value_bits, out_value_bits)
+        if write_output:
+            mem_copy(gm_sparse_indices, output_idx_stage)
+            mem_copy(gm_selected_value_bits, out_value_bits)
 
 
 class LdMergeStage:
@@ -610,11 +608,21 @@ class LdMergeStage:
                     vec_sync_wait(PIPE.V, PIPE.MTE2, 5)
                     if first > 0:
                         if const_expr(self.topk % 16 != 0):
-                            for element in dsl_range(self.topk, unroll=1):
-                                self.selector.ld_indices[0, element] = indices[
-                                    row, element
-                                ]
-                                self.selector.ld_bits[0, element] = bits[row, element]
+                            # Carry remains in UB until the final merge round.
+                            mem_copy(
+                                reinterpret(
+                                    self.selector.ld_indices,
+                                    layout=make_layout((1, self.topk)),
+                                ),
+                                self.selector.output_idx_stage,
+                            )
+                            mem_copy(
+                                reinterpret(
+                                    self.selector.ld_bits,
+                                    layout=make_layout((1, self.topk)),
+                                ),
+                                self.selector.output_value_bits_stage,
+                            )
                         else:
                             mem_copy(
                                 reinterpret(
@@ -678,6 +686,9 @@ class LdMergeStage:
                         (count + carry) * self.topk,
                         offset,
                         True,
+                        first + count == part_count
+                        if const_expr(self.topk % 16 != 0)
+                        else True,
                     )
                     vec_sync_notify(PIPE.MTE3, PIPE.MTE2, 5)
                     vec_sync_wait(PIPE.MTE3, PIPE.MTE2, 5)
@@ -830,7 +841,15 @@ class QsliCube:
         self.scale_b = None
 
     def load_query(self, query, query_scale):
-        mem_copy(self.q_l1.next_write(), query)
+        mem_copy(
+            reinterpret(
+                self.q_l1.next_write(),
+                dtype=dtypes.uint8,
+                layout=make_layout((TILE_M, PACKED_D)),
+                data_format="nz",
+            ),
+            query,
+        )
         mem_copy(
             self.q_scale_l1.permute(1, 0),
             query_scale.flatten(1, 2),
@@ -1306,7 +1325,7 @@ class QsliVector0:
                 if has_block_table:
                     physical = dtypes.int64(block_table[batch_idx, page])
                 address = physical * key.stride[0] + within_page * PACKED_BLOCK_BYTES
-                _copy_pa_row(packed_ub, block_idx, key, self.key_address, address)
+                _copy_pa_row(packed_ub, block_idx, key, self.key_storage, address)
         else:
             for pair in range(CANDIDATE_BLOCKS_PER_AIV // 2):
                 addresses = []
@@ -1329,7 +1348,7 @@ class QsliVector0:
                     )
                     addresses.append(address)
                 _copy_pa_pair(
-                    packed_ub, pair, key, self.key_address, addresses[0], addresses[1]
+                    packed_ub, pair, key, self.key_storage, addresses[0], addresses[1]
                 )
         vec_sync_notify(PIPE.MTE2, PIPE.MTE3, 2)
         vec_sync_wait(PIPE.MTE2, PIPE.MTE3, 2)
@@ -1362,7 +1381,7 @@ class QsliVector0:
             + dtypes.int64(candidate_tile) % STAGING_DEPTH
         ) * TILE_N + dtypes.int64(half) * (TILE_N // 2)
         first_candidate = dtypes.int64(candidate_tile) * CANDIDATE_BLOCKS_PER_AIV
-        dtypes.int64(candidate_block_length)
+        _valid_blocks = dtypes.int64(candidate_block_length)
         if slot == 0:
             vec_sync_wait(PIPE.MTE3, PIPE.MTE2, 2)
         else:
@@ -1371,7 +1390,7 @@ class QsliVector0:
             for block_idx in range(CANDIDATE_BLOCKS_PER_AIV):
                 pos = first_candidate + block_idx
                 address = dtypes.int64(self.physical_blocks[0, pos])
-                _copy_pa_row(packed_ub, block_idx, key, self.key_address, address)
+                _copy_pa_row(packed_ub, block_idx, key, self.key_storage, address)
         else:
             for pair in range(CANDIDATE_BLOCKS_PER_AIV // 2):
                 packed_pair = self.physical_blocks.reinterpret(
@@ -1379,7 +1398,7 @@ class QsliVector0:
                 )[0, first_candidate // 2 + pair]
                 first = dtypes.int64(dtypes.uint32(packed_pair))
                 second = dtypes.int64(packed_pair // 4294967296)
-                _copy_pa_pair(packed_ub, pair, key, self.key_address, first, second)
+                _copy_pa_pair(packed_ub, pair, key, self.key_storage, first, second)
         vec_sync_notify(PIPE.MTE2, PIPE.MTE3, 2)
         vec_sync_wait(PIPE.MTE2, PIPE.MTE3, 2)
         _publish_packed_k(packed_ub, staging_key, staging_scale, staging_row)
@@ -1411,7 +1430,7 @@ class QsliVector0:
             + dtypes.int64(candidate_tile) % STAGING_DEPTH
         ) * TILE_N + dtypes.int64(half) * (TILE_N // 2)
         first_candidate = dtypes.int64(candidate_tile) * CANDIDATE_BLOCKS_PER_AIV
-        dtypes.int64(candidate_block_length)
+        _valid_blocks = dtypes.int64(candidate_block_length)
         if slot == 0:
             vec_sync_wait(PIPE.MTE3, PIPE.MTE2, 2)
         else:
@@ -1422,7 +1441,7 @@ class QsliVector0:
                 address = self.physical_blocks.reinterpret(
                     dtypes.int64, make_layout((1, CANDIDATE_CAPACITY // 2))
                 )[0, pos]
-                _copy_pa_row(packed_ub, block_idx, key, self.key_address, address)
+                _copy_pa_row(packed_ub, block_idx, key, self.key_storage, address)
         else:
             for pair in range(CANDIDATE_BLOCKS_PER_AIV // 2):
                 first = self.physical_blocks.reinterpret(
@@ -1431,7 +1450,7 @@ class QsliVector0:
                 second = self.physical_blocks.reinterpret(
                     dtypes.int64, make_layout((1, CANDIDATE_CAPACITY // 2))
                 )[0, first_candidate + pair * 2 + 1]
-                _copy_pa_pair(packed_ub, pair, key, self.key_address, first, second)
+                _copy_pa_pair(packed_ub, pair, key, self.key_storage, first, second)
         vec_sync_notify(PIPE.MTE2, PIPE.MTE3, 2)
         vec_sync_wait(PIPE.MTE2, PIPE.MTE3, 2)
         _publish_packed_k(packed_ub, staging_key, staging_scale, staging_row)
@@ -1732,7 +1751,7 @@ class QsliVector1:
 class QsliPositionMapper:
     """Map compact TopK positions back to sparse logical token indices."""
 
-    def __init__(self, topk, candidate_capacity):
+    def __init__(self, topk, candidate_capacity, output_ub):
         self.topk = int(topk)
         self.candidate_capacity = int(candidate_capacity)
         self.count_ub = Buffer(MemLoc.UB, dtypes.int32, make_layout((8,)))
@@ -1746,11 +1765,8 @@ class QsliPositionMapper:
                 (ceil_div(self.candidate_capacity, 64) * 64 + 64,)
             ),
         )
-        self.output_ub = Buffer(
-            MemLoc.UB,
-            dtypes.int32,
-            make_layout((1, self.topk)),
-        )
+        # Map selected positions in place after each chunk has been loaded.
+        self.output_ub = output_ub
 
     @jit
     def count_visible(
@@ -2027,11 +2043,11 @@ class QsliFusedKernel:
         self.topk_count = int(topk)
         self.mask_mode = int(mask_mode)
         self.cmp_ratio = int(cmp_ratio)
-        self.has_cu = bool(has_cu)
-        self.has_seqused_q = bool(has_seqused_q)
-        self.has_seqused_k = bool(has_seqused_k)
+        self.has_cu = has_cu
+        self.has_seqused_q = has_seqused_q
+        self.has_seqused_k = has_seqused_k
         self.has_residual = self.mask_mode == 3 and self.cmp_ratio != 1
-        self.has_block_table = bool(has_block_table)
+        self.has_block_table = has_block_table
         self.has_output_offset = bool(has_output_offset)
         # Explicit per-slot credits protect both BF16 destinations. The current
         # Channel split-N path does not support FP32-to-BF16 narrowing.
@@ -2048,14 +2064,16 @@ class QsliFusedKernel:
             self.topk.output_idx_stage,
             self.topk.output_value_bits_stage,
         )
-        self.position_mapper = QsliPositionMapper(self.topk_count, candidate_capacity)
+        self.position_mapper = QsliPositionMapper(
+            self.topk_count, candidate_capacity, self.topk.output_idx_stage
+        )
 
     @jit
     def __call__(
         self,
         query: Tensor,
         key: Tensor,
-        key_address,
+        key_storage,
         weights: Tensor,
         query_scale: Tensor,
         candidate_block_indices: Tensor,
@@ -2083,13 +2101,14 @@ class QsliFusedKernel:
         return_values,
         partial_idx_address,
         partial_bits_address,
-        final_idx_address,
-        final_bits_address,
+        final_indices,
+        final_bits,
         batch_consistency,
     ):
         self.vector0.batch_consistency = batch_consistency
-        self.vector0.key_address = key_address
+        self.vector0.key_storage = key_storage
         self.vector1.key_workspace_address = key_workspace_address
+        partial_indices, partial_bits = sparse_indices, sparse_value_bits
         worker_idx = dtypes.int64(get_block_idx())
         subblock_idx = dtypes.int64(get_subblock_id())
         workspace_cursor = dtypes.int64(metadata[worker_idx, 7])
@@ -2165,26 +2184,20 @@ class QsliFusedKernel:
                     output_row = dtypes.int64(
                         (workspace_cursor if row_ld else query_row)
                     )
-                    idx_address = dtypes.int64(
-                        (partial_idx_address if row_ld else final_idx_address)
+                    sparse_indices = tile_view(
+                        final_indices, (1, self.topk_count), (query_row, 0)
                     )
-                    bits_address = dtypes.int64(
-                        (partial_bits_address if row_ld else final_bits_address)
+                    sparse_value_bits = tile_view(
+                        final_bits, (1, self.topk_count), (query_row, 0)
                     )
-                    sparse_indices = make_tensor(
-                        make_pointer(dtypes.int32, idx_address, MemLoc.GM),
-                        make_layout(
-                            (max(query_rows, 64), self.topk_count),
-                            stride=(self.topk_count, 1),
-                        ),
-                    )
-                    sparse_value_bits = make_tensor(
-                        make_pointer(dtypes.uint16, bits_address, MemLoc.GM),
-                        make_layout(
-                            (max(query_rows, 64), self.topk_count),
-                            stride=(self.topk_count, 1),
-                        ),
-                    )
+                    if row_ld:
+                        sparse_indices = tile_view(
+                            partial_indices, (1, self.topk_count), (workspace_cursor, 0)
+                        )
+                        sparse_value_bits = tile_view(
+                            partial_bits, (1, self.topk_count), (workspace_cursor, 0)
+                        )
+                    output_row = dtypes.int64(0)
                     if subblock_idx == dtypes.int64(0):
                         self.output_writer.initialize(
                             sparse_indices, sparse_value_bits, output_row
@@ -2223,7 +2236,7 @@ class QsliFusedKernel:
                         # Candidate-derived valid_count remains an AIV TopK guard.
                         if valid_s2 > dtypes.int32(0):
                             self.cube.load_query(
-                                tile_view(query, (N1, LOGICAL_D), (query_row, 0)),
+                                tile_view(query, (N1, PACKED_D), (query_row, 0)),
                                 tile_view(query_scale, (N1, 2, 2), (query_row, 0, 0)),
                             )
                             self.vector1.load_weights(weights, query_row)
@@ -2446,10 +2459,6 @@ def _build_compiled_fused_runner(
     candidate_capacity,
     mask_mode,
     cmp_ratio,
-    has_cu,
-    has_seqused_q,
-    has_seqused_k,
-    has_block_table,
     has_output_offset,
     pa_block_size,
     splits,
@@ -2459,15 +2468,31 @@ def _build_compiled_fused_runner(
 
     @kernel(
         profile=ProfileSpec(
-            name="QuantSparseLightningIndexer", op_type="QuantSparseLightningIndexer"
+            name="QuantSparseLightningIndexer",
+            op_type="QuantSparseLightningIndexer",
+            inputs=(
+                "query_data",
+                "key",
+                "weights",
+                "query_scale_data",
+                "candidate_block_indices",
+                "candidate_block_length",
+                "cu_seqlens_q",
+                "seqused_q",
+                "block_table",
+                "seqused_k",
+                "cmp_residual_k",
+                "output_idx_offset",
+            ),
+            outputs=("final_sparse_indices_data", "profile_sparse_values"),
         )
     )
     def QuantSparseLightningIndexer(
-        query_address,
+        query_data: Tensor,
         key,
-        key_address,
+        key_storage: Tensor,
         weights: Tensor,
-        query_scale: Tensor,
+        query_scale_data: Tensor,
         candidate_block_indices,
         candidate_block_length: Tensor,
         cu_seqlens_q: Tensor,
@@ -2490,30 +2515,21 @@ def _build_compiled_fused_runner(
         batch_count,
         logical_k_capacity,
         metadata: Tensor,
-        final_sparse_indices_address,
-        final_sparse_bits_address,
+        final_sparse_indices_data: Tensor,
+        final_sparse_values_data: Tensor,
         return_values,
         merge_workers,
         output_offset_address,
         batch_consistency,
+        profile_sparse_values: Tensor,
     ):
         ld_enabled = metadata[LD_RECORD_START, 0] != 0
-        final_sparse_indices = make_tensor(
-            make_pointer(
-                dtypes.int32, dtypes.int64(final_sparse_indices_address), MemLoc.GM
-            ),
-            make_layout((query_rows, topk), stride=(topk, 1)),
+        final_sparse_indices = final_sparse_indices_data.view(query_rows, topk)
+        final_sparse_bits = final_sparse_values_data.view(query_rows, topk).view(
+            dtype=dtypes.uint16
         )
-        final_sparse_bits = make_tensor(
-            make_pointer(
-                dtypes.uint16, dtypes.int64(final_sparse_bits_address), MemLoc.GM
-            ),
-            make_layout((query_rows, topk), stride=(topk, 1)),
-        )
-        query = make_tensor(
-            make_pointer(dtypes.fp4x2_e2m1, dtypes.int64(query_address), MemLoc.GM),
-            make_layout((query_rows * N1, LOGICAL_D), stride=(LOGICAL_D, 1)),
-        )
+        query = query_data.flatten(0, 1)
+        query_scale = query_scale_data.flatten(0, 1)
         index_pointer = make_pointer(
             dtypes.int32, dtypes.int64(sparse_indices_address), MemLoc.GM
         )
@@ -2538,17 +2554,17 @@ def _build_compiled_fused_runner(
             candidate_capacity,
             mask_mode,
             cmp_ratio,
-            has_cu,
-            has_seqused_q,
-            has_seqused_k,
-            has_block_table,
+            cu_seqlens_q.shape[0] > 0,
+            seqused_q.shape[0] > 0,
+            seqused_k.shape[0] > 0,
+            block_table.shape[0] > 0,
             has_output_offset,
             pa_block_size,
             splits,
         )(
             query,
             key,
-            key_address,
+            key_storage,
             weights,
             query_scale,
             candidate_block_indices,
@@ -2576,8 +2592,8 @@ def _build_compiled_fused_runner(
             return_values,
             sparse_indices_address,
             sparse_value_address,
-            final_sparse_indices_address,
-            final_sparse_bits_address,
+            final_sparse_indices,
+            final_sparse_bits,
             batch_consistency,
         )
         if ld_enabled:
@@ -2593,17 +2609,17 @@ def _build_compiled_fused_runner(
                 worker_count * 2,
                 cu_seqlens_q,
                 1,
-                has_cu,
+                cu_seqlens_q.shape[0] > 0,
                 output_offset_address,
             )
 
     @host
     def run_fused(
-        query_address,
+        query_data: Tensor,
         key,
-        key_address,
+        key_storage: Tensor,
         weights: Tensor,
-        query_scale: Tensor,
+        query_scale_data: Tensor,
         candidate_block_indices,
         candidate_block_length: Tensor,
         cu_seqlens_q: Tensor,
@@ -2626,19 +2642,20 @@ def _build_compiled_fused_runner(
         batch_count,
         logical_k_capacity,
         metadata: Tensor,
-        final_sparse_indices_address,
-        final_sparse_bits_address,
+        final_sparse_indices_data: Tensor,
+        final_sparse_values_data: Tensor,
         return_values,
         merge_workers,
         output_offset_address,
         batch_consistency,
+        profile_sparse_values: Tensor,
     ):
         QuantSparseLightningIndexer[worker_count](
-            query_address,
+            query_data,
             key,
-            key_address,
+            key_storage,
             weights,
-            query_scale,
+            query_scale_data,
             candidate_block_indices,
             candidate_block_length,
             cu_seqlens_q,
@@ -2661,12 +2678,13 @@ def _build_compiled_fused_runner(
             batch_count,
             logical_k_capacity,
             metadata,
-            final_sparse_indices_address,
-            final_sparse_bits_address,
+            final_sparse_indices_data,
+            final_sparse_values_data,
             return_values,
             merge_workers,
             output_offset_address,
             batch_consistency,
+            profile_sparse_values,
         )
 
     query_rows_dim = cannbotdsl.Dim("T1")
@@ -2679,25 +2697,17 @@ def _build_compiled_fused_runner(
     key_stride_dim = cannbotdsl.Dim("K_S0")
     fake = cannbotdsl.TensorSpec
     dummy_spec = fake((query_rows_dim, N2), dtypes.int32)
-    # With only cu present, B has no direct slot from which DSL can bind it.
-    cu_shape = (
-        (batch_dim + 1,)
-        if has_seqused_q or has_seqused_k or has_block_table
-        else (cannbotdsl.Dim("B_PLUS_1"),)
+    cu_spec = fake((cannbotdsl.Dim("CU_LENGTH", min=0),), dtypes.int32)
+    seqused_q_spec = fake((cannbotdsl.Dim("SEQUSED_Q_LENGTH", min=0),), dtypes.int32)
+    block_table_spec = fake(
+        (cannbotdsl.Dim("BLOCK_TABLE_ROWS", min=0), block_table_width_dim), dtypes.int32
     )
-    cu_spec = fake(cu_shape, dtypes.int32) if has_cu else dummy_spec
-    seqused_q_spec = fake((batch_dim,), dtypes.int32) if has_seqused_q else dummy_spec
-    block_table_spec = (
-        fake((batch_dim, block_table_width_dim), dtypes.int32)
-        if has_block_table
-        else dummy_spec
-    )
-    seqused_k_spec = fake((batch_dim,), dtypes.int32) if has_seqused_k else dummy_spec
+    seqused_k_spec = fake((cannbotdsl.Dim("SEQUSED_K_LENGTH", min=0),), dtypes.int32)
     residual_spec = fake((batch_dim,), dtypes.int32) if has_residual else dummy_spec
     offset_spec = fake((query_rows_dim, N2), dtypes.int32)
     compiled = cannbotdsl.compile(
         run_fused,
-        dtypes.int64,
+        fake((query_rows_dim, N1, PACKED_D), dtypes.uint8),
         fake(
             (
                 physical_blocks_dim,
@@ -2707,9 +2717,9 @@ def _build_compiled_fused_runner(
             dtypes.uint8,
             stride=(key_stride_dim, PACKED_BLOCK_BYTES, 1),
         ),
-        dtypes.int64,
+        fake((cannbotdsl.Dim("K_STORAGE_BYTES"),), dtypes.uint8),
         fake((query_rows_dim, N1), dtypes.float32),
-        fake((query_rows_dim * N1, 2, 2), dtypes.float8_e8m0),
+        fake((query_rows_dim, N1, 2, 2), dtypes.float8_e8m0),
         fake((query_rows_dim, N2, candidate_capacity), dtypes.int32),
         fake((query_rows_dim, N2), dtypes.int32),
         cu_spec,
@@ -2741,12 +2751,13 @@ def _build_compiled_fused_runner(
         dtypes.int64,
         dtypes.int64,
         fake((METADATA_ROWS, METADATA_FIELDS), dtypes.int32),
-        dtypes.int64,
-        dtypes.int64,
+        fake((query_rows_dim, N2, topk), dtypes.int32),
+        fake((query_rows_dim, N2, topk), dtypes.bfloat16),
         dtypes.int64,
         dtypes.int64,
         dtypes.int64,
         dtypes.int32,
+        fake((cannbotdsl.Dim("PROFILE_VALUE_ROWS", min=0), N2, topk), dtypes.bfloat16),
     )
     return compiled
 
@@ -2762,11 +2773,12 @@ def clear_caches():
 def _get_compiled_fused_runner(*config):
     """Cache the dynamic QSLI executable; shape axes remain dynamic."""
     # DSL native policy is process-wide; never compile a missing runtime binary.
-    cache_key = tuple(config)
+    # Legacy optional-input flags do not specialize the executable.
+    cache_key = tuple(config[:5]) + tuple(config[9:])
     with _COMPILED_KERNEL_LOCK:
         compiled = _COMPILED_KERNEL.get(cache_key)
         if compiled is None:
-            compiled = _build_compiled_fused_runner(*config)
+            compiled = _build_compiled_fused_runner(*cache_key)
             _COMPILED_KERNEL[cache_key] = compiled
         return compiled
 
@@ -3014,6 +3026,25 @@ def quant_sparse_lightning_indexer(
     _validate_candidate_inputs(
         candidate_block_indices, candidate_block_length, query_rows
     )
+    for name, tensor in (
+        ("q", q),
+        ("k", k),
+        ("w", w),
+        ("descale_q", descale_q),
+        ("candidate_block_indices", candidate_block_indices),
+        ("candidate_block_length", candidate_block_length),
+        ("cu_seqlens_q", cu_seqlens_q),
+        ("seqused_q", seqused_q),
+        ("seqused_k", seqused_k),
+        ("cmp_residual_k", cmp_residual_k),
+        ("block_table", block_table),
+        ("output_idx_offset", output_idx_offset),
+    ):
+        if tensor is not None:
+            if tensor.device != q.device:
+                raise ValueError(f"{name} must share q's device")
+            if name != "k" and not tensor.is_contiguous():
+                raise ValueError(f"{name} must be contiguous")
     candidate_length_2d = candidate_block_length.reshape(query_rows, N2)
 
     batch, logical_k_capacity = _validate_pa_sequences(
@@ -3051,7 +3082,9 @@ def quant_sparse_lightning_indexer(
         raise ValueError("Metadata must be on the same device as q")
     metadata = metadata.view(METADATA_ROWS, METADATA_FIELDS)
     tokens = full_tokens
-    worker_count = int(torch.npu.get_device_properties(q.device).cube_core_num)
+    device_index = q.device.index
+    stream = torch.npu.current_stream(device_index)
+    worker_count = int(get_platform_info(stream=stream).cube_core_num)
     if not 1 <= worker_count <= LD_RECORD_START:
         raise RuntimeError(
             f"Unsupported Cube core count {worker_count}; LI metadata supports 1..{LD_RECORD_START}"
@@ -3087,16 +3120,15 @@ def quant_sparse_lightning_indexer(
     )
 
     # Optional inputs use an existing int32 tensor as an ABI placeholder.
-    # Their constexpr flags remove every dummy access from generated device code.
+    # Zero-length dynamic axes guard every dummy access at runtime.
     int32_dummy = candidate_length_2d
-    cu_npu = cu_seqlens_q if cu_seqlens_q is not None else int32_dummy
-    seqused_q_npu = seqused_q if seqused_q is not None else int32_dummy
-    block_table_npu = block_table if block_table is not None else int32_dummy
-    seqused_k_npu = seqused_k if seqused_k is not None else int32_dummy
+    cu_npu = cu_seqlens_q if cu_seqlens_q is not None else int32_dummy.reshape(-1)[:0]
+    seqused_q_npu = seqused_q if seqused_q is not None else int32_dummy.reshape(-1)[:0]
+    block_table_npu = block_table if block_table is not None else int32_dummy[:0]
+    seqused_k_npu = seqused_k if seqused_k is not None else int32_dummy.reshape(-1)[:0]
     residual_npu = cmp_residual_k if cmp_residual_k is not None else int32_dummy
     offset_npu = output_idx_offset if output_idx_offset is not None else int32_dummy
 
-    query_scale_bytes = descale_q.view(torch.uint8)
     final_sparse_indices = torch.empty(
         (query_rows, int(topk)), dtype=torch.int32, device=q.device
     )
@@ -3117,11 +3149,18 @@ def quant_sparse_lightning_indexer(
         pa_block_size,
         split_count,
     )(
-        q.data_ptr(),
+        q,
         k,
-        k.data_ptr(),
+        torch.as_strided(
+            k,
+            (
+                (int(k.shape[0]) - 1) * int(k.stride(0))
+                + int(k.shape[1]) * PACKED_BLOCK_BYTES,
+            ),
+            (1,),
+        ),
         w,
-        query_scale_bytes.reshape(query_rows * N1, 2, 2).view(torch.float8_e8m0fnu),
+        descale_q.view(torch.float8_e8m0fnu),
         candidate_block_indices,
         candidate_length_2d,
         cu_npu,
@@ -3144,12 +3183,15 @@ def quant_sparse_lightning_indexer(
         batch,
         logical_k_capacity,
         metadata,
-        final_sparse_indices.data_ptr(),
-        final_sparse_values.view(torch.uint16).data_ptr(),
+        final_sparse_indices.view(query_rows, N2, int(topk)),
+        final_sparse_values.view(query_rows, N2, int(topk)),
         int(return_value),
         min(worker_count * 2, query_rows),
         0 if output_idx_offset is None else output_idx_offset.data_ptr(),
         int(_batch_consistency_enabled()),
+        final_sparse_values[: query_rows if return_value else 0].view(
+            -1, N2, int(topk)
+        ),
     )
     sparse_indices, sparse_values = final_sparse_indices, final_sparse_values
     sparse_indices = sparse_indices.view(query_rows, N2, int(topk))
@@ -3187,21 +3229,12 @@ def export_qsli():
             pa_block_size=page,
             has_output_offset=offset,
             layout_k=layout,
-            has_cu=has_cu,
-            has_seqused_q=has_seqused_q,
-            has_seqused_k=has_seqused_k,
-            has_block_table=has_block_table,
         )
         for mask in (0, 3)
         for ratio in (1, 2)
         for layout in ("PA_BBND", "TND")
         for page in ((64, 128) if layout == "PA_BBND" else (0,))
         for offset in (False, True)
-        for has_cu in ((False, True) if layout == "PA_BBND" else (True,))
-        for has_seqused_q in (False, True)
-        for has_seqused_k in (False, True)
-        # TND uses this runner position for its mandatory cu_seqlens_k.
-        for has_block_table in ((False, True) if layout == "PA_BBND" else (True,))
     ]
     profile_path = os.environ.get("CANNBOTDSL_DS41_PROFILES")
     if profile_path:
@@ -3216,11 +3249,13 @@ def export_qsli():
             if unknown:
                 raise ValueError(f"Unknown export profile fields: {sorted(unknown)}")
             config = dict(defaults, **profile)
-            # cmp_ratio is unused without the causal mask; export one binary.
+            # Optional-input presence is dynamic; cmp_ratio is unused without the causal mask.
             identity = tuple(
                 (name, value)
                 for name, value in config.items()
-                if name != "cmp_ratio" or config["mask_mode"] == 3
+                if name
+                not in ("has_cu", "has_seqused_q", "has_seqused_k", "has_block_table")
+                and (name != "cmp_ratio" or config["mask_mode"] == 3)
             )
             if identity in exported:
                 continue
@@ -3268,29 +3303,29 @@ class QsliTndGather(QsliVector0):
 
     @jit
     def _copy_block(self, packed_ub, block_idx, key, key_scale, source_row, count):
-        key_source = make_tensor(
-            make_pointer(
-                dtypes.uint8,
-                dtypes.int64(self.key_address + source_row * key.stride[0]),
-                MemLoc.GM,
-            ),
-            make_layout((count, 64), stride=(key.stride[0], 1)),
-        )
-        scale_source = make_tensor(
-            make_pointer(
-                dtypes.uint8,
-                dtypes.int64(self.key_scale_address + source_row * key_scale.stride[0]),
-                MemLoc.GM,
-            ),
-            make_layout((count, 4), stride=(key_scale.stride[0], 1)),
-        )
+        key_source = key[source_row : source_row + count, None]
+        scale_source = key_scale[source_row : source_row + count, None]
         key_target = tile_view(packed_ub, (1, 512), (block_idx, 0)).view(8, 64)
         scale_target = packed_ub[
             block_idx : block_idx + 1, 512:PACKED_BLOCK_BYTES
         ].view(8, 4)
         if count == 8:
-            mem_copy(key_target, key_source)
-            mem_copy(scale_target, scale_source)
+            if key.stride[0] == PACKED_D and key_scale.stride[0] == 4:
+                key_flat = key.view(key.shape[0] * PACKED_D)
+                scale_flat = key_scale.view(key_scale.shape[0] * 4)
+                mem_copy(
+                    key_target.view(1, 512),
+                    key_flat[source_row * PACKED_D : (source_row + 8) * PACKED_D,].view(
+                        1, 512
+                    ),
+                )
+                mem_copy(
+                    scale_target.view(1, 32),
+                    scale_flat[source_row * 4 : (source_row + 8) * 4,].view(1, 32),
+                )
+            else:
+                mem_copy(key_target, key_source)
+                mem_copy(scale_target, scale_source)
         else:
             mem_copy(
                 key_target,
@@ -3422,9 +3457,9 @@ class QsliTndFusedKernel:
         self.topk_count = int(topk)
         self.mask_mode = int(mask_mode)
         self.cmp_ratio = int(cmp_ratio)
-        self.has_cu = bool(has_cu)
-        self.has_seqused_q = bool(has_seqused_q)
-        self.has_seqused_k = bool(has_seqused_k)
+        self.has_cu = has_cu
+        self.has_seqused_q = has_seqused_q
+        self.has_seqused_k = has_seqused_k
         self.has_residual = self.mask_mode == 3 and self.cmp_ratio != 1
         self.has_cu_k = bool(has_cu_k)
         self.has_output_offset = bool(has_output_offset)
@@ -3441,16 +3476,16 @@ class QsliTndFusedKernel:
             self.topk.output_idx_stage,
             self.topk.output_value_bits_stage,
         )
-        self.position_mapper = QsliPositionMapper(self.topk_count, candidate_capacity)
+        self.position_mapper = QsliPositionMapper(
+            self.topk_count, candidate_capacity, self.topk.output_idx_stage
+        )
 
     @jit
     def __call__(
         self,
         query: Tensor,
         key: Tensor,
-        key_address,
         key_scale: Tensor,
-        key_scale_address,
         weights: Tensor,
         query_scale: Tensor,
         candidate_block_indices: Tensor,
@@ -3478,12 +3513,11 @@ class QsliTndFusedKernel:
         return_values,
         partial_idx_address,
         partial_bits_address,
-        final_idx_address,
-        final_bits_address,
+        final_indices,
+        final_bits,
     ):
-        self.vector0.key_address = key_address
-        self.vector0.key_scale_address = key_scale_address
         self.vector1.key_workspace_address = key_workspace_address
+        partial_indices, partial_bits = sparse_indices, sparse_value_bits
         worker_idx = dtypes.int64(get_block_idx())
         subblock_idx = dtypes.int64(get_subblock_id())
         workspace_cursor = dtypes.int64(metadata[worker_idx, 7])
@@ -3561,26 +3595,20 @@ class QsliTndFusedKernel:
                     output_row = dtypes.int64(
                         (workspace_cursor if row_ld else query_row)
                     )
-                    idx_address = dtypes.int64(
-                        (partial_idx_address if row_ld else final_idx_address)
+                    sparse_indices = tile_view(
+                        final_indices, (1, self.topk_count), (query_row, 0)
                     )
-                    bits_address = dtypes.int64(
-                        (partial_bits_address if row_ld else final_bits_address)
+                    sparse_value_bits = tile_view(
+                        final_bits, (1, self.topk_count), (query_row, 0)
                     )
-                    sparse_indices = make_tensor(
-                        make_pointer(dtypes.int32, idx_address, MemLoc.GM),
-                        make_layout(
-                            (max(query_rows, 64), self.topk_count),
-                            stride=(self.topk_count, 1),
-                        ),
-                    )
-                    sparse_value_bits = make_tensor(
-                        make_pointer(dtypes.uint16, bits_address, MemLoc.GM),
-                        make_layout(
-                            (max(query_rows, 64), self.topk_count),
-                            stride=(self.topk_count, 1),
-                        ),
-                    )
+                    if row_ld:
+                        sparse_indices = tile_view(
+                            partial_indices, (1, self.topk_count), (workspace_cursor, 0)
+                        )
+                        sparse_value_bits = tile_view(
+                            partial_bits, (1, self.topk_count), (workspace_cursor, 0)
+                        )
+                    output_row = dtypes.int64(0)
                     if subblock_idx == dtypes.int64(0):
                         self.output_writer.initialize(
                             sparse_indices, sparse_value_bits, output_row
@@ -3615,7 +3643,7 @@ class QsliTndFusedKernel:
 
                         if valid_s2 > dtypes.int32(0):
                             self.cube.load_query(
-                                tile_view(query, (N1, LOGICAL_D), (query_row, 0)),
+                                tile_view(query, (N1, PACKED_D), (query_row, 0)),
                                 tile_view(query_scale, (N1, 2, 2), (query_row, 0, 0)),
                             )
                             self.vector1.load_weights(weights, query_row)
@@ -3818,10 +3846,6 @@ def _build_tnd_compiled_fused_runner(
     candidate_capacity,
     mask_mode,
     cmp_ratio,
-    has_cu,
-    has_seqused_q,
-    has_seqused_k,
-    has_cu_k,
     has_output_offset,
     pa_block_size,
     splits,
@@ -3831,17 +3855,32 @@ def _build_tnd_compiled_fused_runner(
 
     @kernel(
         profile=ProfileSpec(
-            name="QuantSparseLightningIndexer", op_type="QuantSparseLightningIndexer"
+            name="QuantSparseLightningIndexer",
+            op_type="QuantSparseLightningIndexer",
+            inputs=(
+                "query_data",
+                "profile_key",
+                "profile_key_scale",
+                "weights",
+                "query_scale_data",
+                "candidate_block_indices",
+                "candidate_block_length",
+                "cu_seqlens_q",
+                "seqused_q",
+                "cu_seqlens_k",
+                "seqused_k",
+                "cmp_residual_k",
+                "output_idx_offset",
+            ),
+            outputs=("final_sparse_indices_data", "profile_sparse_values"),
         )
     )
     def QuantSparseLightningIndexer(
-        query_address,
+        query_data: Tensor,
         key,
-        key_address,
         key_scale,
-        key_scale_address,
         weights: Tensor,
-        query_scale: Tensor,
+        query_scale_data: Tensor,
         candidate_block_indices,
         candidate_block_length: Tensor,
         cu_seqlens_q: Tensor,
@@ -3864,29 +3903,22 @@ def _build_tnd_compiled_fused_runner(
         batch_count,
         logical_k_capacity,
         metadata: Tensor,
-        final_sparse_indices_address,
-        final_sparse_bits_address,
+        final_sparse_indices_data: Tensor,
+        final_sparse_values_data: Tensor,
         return_values,
         merge_workers,
         output_offset_address,
+        profile_key: Tensor,
+        profile_key_scale: Tensor,
+        profile_sparse_values: Tensor,
     ):
         ld_enabled = metadata[LD_RECORD_START, 0] != 0
-        final_sparse_indices = make_tensor(
-            make_pointer(
-                dtypes.int32, dtypes.int64(final_sparse_indices_address), MemLoc.GM
-            ),
-            make_layout((query_rows, topk), stride=(topk, 1)),
+        final_sparse_indices = final_sparse_indices_data.view(query_rows, topk)
+        final_sparse_bits = final_sparse_values_data.view(query_rows, topk).view(
+            dtype=dtypes.uint16
         )
-        final_sparse_bits = make_tensor(
-            make_pointer(
-                dtypes.uint16, dtypes.int64(final_sparse_bits_address), MemLoc.GM
-            ),
-            make_layout((query_rows, topk), stride=(topk, 1)),
-        )
-        query = make_tensor(
-            make_pointer(dtypes.fp4x2_e2m1, dtypes.int64(query_address), MemLoc.GM),
-            make_layout((query_rows * N1, LOGICAL_D), stride=(LOGICAL_D, 1)),
-        )
+        query = query_data.flatten(0, 1)
+        query_scale = query_scale_data.flatten(0, 1)
         index_pointer = make_pointer(
             dtypes.int32, dtypes.int64(sparse_indices_address), MemLoc.GM
         )
@@ -3911,19 +3943,17 @@ def _build_tnd_compiled_fused_runner(
             candidate_capacity,
             mask_mode,
             cmp_ratio,
-            has_cu,
-            has_seqused_q,
-            has_seqused_k,
-            has_cu_k,
+            cu_seqlens_q.shape[0] > 0,
+            seqused_q.shape[0] > 0,
+            seqused_k.shape[0] > 0,
+            True,
             has_output_offset,
             pa_block_size,
             splits,
         )(
             query,
             key,
-            key_address,
             key_scale,
-            key_scale_address,
             weights,
             query_scale,
             candidate_block_indices,
@@ -3951,8 +3981,8 @@ def _build_tnd_compiled_fused_runner(
             return_values,
             sparse_indices_address,
             sparse_value_address,
-            final_sparse_indices_address,
-            final_sparse_bits_address,
+            final_sparse_indices,
+            final_sparse_bits,
         )
         if ld_enabled:
             global_sync_all()
@@ -3967,19 +3997,17 @@ def _build_tnd_compiled_fused_runner(
                 worker_count * 2,
                 cu_seqlens_q,
                 1,
-                has_cu,
+                cu_seqlens_q.shape[0] > 0,
                 output_offset_address,
             )
 
     @host
     def run_fused(
-        query_address,
+        query_data: Tensor,
         key,
-        key_address,
         key_scale,
-        key_scale_address,
         weights: Tensor,
-        query_scale: Tensor,
+        query_scale_data: Tensor,
         candidate_block_indices,
         candidate_block_length: Tensor,
         cu_seqlens_q: Tensor,
@@ -4002,20 +4030,21 @@ def _build_tnd_compiled_fused_runner(
         batch_count,
         logical_k_capacity,
         metadata: Tensor,
-        final_sparse_indices_address,
-        final_sparse_bits_address,
+        final_sparse_indices_data: Tensor,
+        final_sparse_values_data: Tensor,
         return_values,
         merge_workers,
         output_offset_address,
+        profile_key: Tensor,
+        profile_key_scale: Tensor,
+        profile_sparse_values: Tensor,
     ):
         QuantSparseLightningIndexer[worker_count](
-            query_address,
+            query_data,
             key,
-            key_address,
             key_scale,
-            key_scale_address,
             weights,
-            query_scale,
+            query_scale_data,
             candidate_block_indices,
             candidate_block_length,
             cu_seqlens_q,
@@ -4038,11 +4067,14 @@ def _build_tnd_compiled_fused_runner(
             batch_count,
             logical_k_capacity,
             metadata,
-            final_sparse_indices_address,
-            final_sparse_bits_address,
+            final_sparse_indices_data,
+            final_sparse_values_data,
             return_values,
             merge_workers,
             output_offset_address,
+            profile_key,
+            profile_key_scale,
+            profile_sparse_values,
         )
 
     query_rows_dim = cannbotdsl.Dim("T1")
@@ -4056,25 +4088,23 @@ def _build_tnd_compiled_fused_runner(
     scale_stride_dim = cannbotdsl.Dim("KS_S0")
     fake = cannbotdsl.TensorSpec
     dummy_spec = fake((query_rows_dim, N2), dtypes.int32)
-    cu_spec = fake((boundary_dim,), dtypes.int32) if has_cu else dummy_spec
-    seqused_q_spec = fake((batch_dim,), dtypes.int32) if has_seqused_q else dummy_spec
+    cu_spec = fake((boundary_dim,), dtypes.int32)
+    seqused_q_spec = fake((cannbotdsl.Dim("SEQUSED_Q_LENGTH", min=0),), dtypes.int32)
     cu_seqlens_k_spec = fake((boundary_dim,), dtypes.int32)
-    seqused_k_spec = fake((batch_dim,), dtypes.int32) if has_seqused_k else dummy_spec
+    seqused_k_spec = fake((cannbotdsl.Dim("SEQUSED_K_LENGTH", min=0),), dtypes.int32)
     residual_spec = fake((batch_dim,), dtypes.int32) if has_residual else dummy_spec
     offset_spec = fake((query_rows_dim, N2), dtypes.int32)
     compiled = cannbotdsl.compile(
         run_fused,
-        dtypes.int64,
+        fake((query_rows_dim, N1, PACKED_D), dtypes.uint8),
         fake(
-            (key_rows_dim, 1, PACKED_D),
+            (key_rows_dim, PACKED_D),
             dtypes.uint8,
-            stride=(key_stride_dim, PACKED_D, 1),
+            stride=(key_stride_dim, 1),
         ),
-        dtypes.int64,
-        fake((key_rows_dim, 1, 2, 2), dtypes.uint8, stride=(scale_stride_dim, 4, 2, 1)),
-        dtypes.int64,
+        fake((key_rows_dim, 4), dtypes.uint8, stride=(scale_stride_dim, 1)),
         fake((query_rows_dim, N1), dtypes.float32),
-        fake((query_rows_dim * N1, 2, 2), dtypes.float8_e8m0),
+        fake((query_rows_dim, N1, 2, 2), dtypes.float8_e8m0),
         fake((query_rows_dim, N2, candidate_capacity), dtypes.int32),
         fake((query_rows_dim, N2), dtypes.int32),
         cu_spec,
@@ -4106,11 +4136,18 @@ def _build_tnd_compiled_fused_runner(
         dtypes.int64,
         dtypes.int64,
         fake((METADATA_ROWS, METADATA_FIELDS), dtypes.int32),
+        fake((query_rows_dim, N2, topk), dtypes.int32),
+        fake((query_rows_dim, N2, topk), dtypes.bfloat16),
         dtypes.int64,
         dtypes.int64,
         dtypes.int64,
-        dtypes.int64,
-        dtypes.int64,
+        fake(
+            (key_rows_dim, 1, PACKED_D),
+            dtypes.uint8,
+            stride=(key_stride_dim, PACKED_D, 1),
+        ),
+        fake((key_rows_dim, 1, 2, 2), dtypes.uint8, stride=(scale_stride_dim, 4, 2, 1)),
+        fake((cannbotdsl.Dim("PROFILE_VALUE_ROWS", min=0), N2, topk), dtypes.bfloat16),
     )
     return compiled
 
@@ -4126,11 +4163,12 @@ def clear_tnd_caches():
 def _get_tnd_compiled_fused_runner(*config):
     """Cache the dynamic QSLI executable; shape axes remain dynamic."""
     # DSL native policy is process-wide; never compile a missing runtime binary.
-    cache_key = tuple(config)
+    # Legacy optional-input flags do not specialize the executable.
+    cache_key = tuple(config[:5]) + tuple(config[9:])
     with _TND_COMPILED_KERNEL_LOCK:
         compiled = _TND_COMPILED_KERNEL.get(cache_key)
         if compiled is None:
-            compiled = _build_tnd_compiled_fused_runner(*config)
+            compiled = _build_tnd_compiled_fused_runner(*cache_key)
             _TND_COMPILED_KERNEL[cache_key] = compiled
         return compiled
 
@@ -4318,7 +4356,9 @@ def _run_tnd(
         )
     metadata = metadata.view(METADATA_ROWS, METADATA_FIELDS)
     tokens = full_tokens
-    worker_count = int(torch.npu.get_device_properties(q.device).cube_core_num)
+    device_index = q.device.index
+    stream = torch.npu.current_stream(device_index)
+    worker_count = int(get_platform_info(stream=stream).cube_core_num)
     if not 1 <= worker_count <= LD_RECORD_START:
         raise RuntimeError(
             f"Unsupported Cube core count {worker_count}; LI metadata supports 1..{LD_RECORD_START}"
@@ -4354,16 +4394,15 @@ def _run_tnd(
     )
 
     # Optional inputs use an existing int32 tensor as an ABI placeholder.
-    # Their constexpr flags remove every dummy access from generated device code.
+    # Zero-length dynamic axes guard every dummy access at runtime.
     int32_dummy = candidate_length_2d
-    cu_npu = cu_seqlens_q if cu_seqlens_q is not None else int32_dummy
-    seqused_q_npu = seqused_q if seqused_q is not None else int32_dummy
+    cu_npu = cu_seqlens_q if cu_seqlens_q is not None else int32_dummy.reshape(-1)[:0]
+    seqused_q_npu = seqused_q if seqused_q is not None else int32_dummy.reshape(-1)[:0]
     cu_k_npu = cu_seqlens_k
-    seqused_k_npu = seqused_k if seqused_k is not None else int32_dummy
+    seqused_k_npu = seqused_k if seqused_k is not None else int32_dummy.reshape(-1)[:0]
     residual_npu = cmp_residual_k if cmp_residual_k is not None else int32_dummy
     offset_npu = output_idx_offset if output_idx_offset is not None else int32_dummy
 
-    query_scale_bytes = descale_q.view(torch.uint8)
     final_sparse_indices = torch.full(
         (query_rows, int(topk)), -1, dtype=torch.int32, device=q.device
     )
@@ -4384,13 +4423,11 @@ def _run_tnd(
         pa_block_size,
         split_count,
     )(
-        q.data_ptr(),
-        k,
-        k.data_ptr(),
-        descale_k.view(torch.uint8),
-        descale_k.data_ptr(),
+        q,
+        k.view(int(k.shape[0]), PACKED_D),
+        descale_k.view(int(descale_k.shape[0]), 4).view(torch.uint8),
         w,
-        query_scale_bytes.reshape(query_rows * N1, 2, 2).view(torch.float8_e8m0fnu),
+        descale_q.view(torch.float8_e8m0fnu),
         candidate_block_indices,
         candidate_length_2d,
         cu_npu,
@@ -4413,11 +4450,16 @@ def _run_tnd(
         batch,
         logical_k_capacity,
         metadata,
-        final_sparse_indices.data_ptr(),
-        final_sparse_values.view(torch.uint16).data_ptr(),
+        final_sparse_indices.view(query_rows, N2, int(topk)),
+        final_sparse_values.view(query_rows, N2, int(topk)),
         int(return_value),
         min(worker_count * 2, query_rows),
         0 if output_idx_offset is None else output_idx_offset.data_ptr(),
+        k,
+        descale_k.view(torch.uint8),
+        final_sparse_values[: query_rows if return_value else 0].view(
+            -1, N2, int(topk)
+        ),
     )
     sparse_indices, sparse_values = final_sparse_indices, final_sparse_values
     sparse_indices = sparse_indices.view(query_rows, N2, int(topk))
