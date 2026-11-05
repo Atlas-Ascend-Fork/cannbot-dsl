@@ -49,6 +49,7 @@ Attention、MLA、KDA，以及专属索引、前后处理和 KV Cache 算子。
 - [grouped_matmul](matmul/grouped_matmul/README.md)
 - [matmul](matmul/matmul/README.md)
 - [quant_matmul](matmul/quant_matmul/README.md)
+- [weight_quant_batchmatmul](matmul/weight_quant_batchmatmul/README.md)
 
 ### vector
 

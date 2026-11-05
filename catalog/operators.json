@@ -314,6 +314,14 @@
       "source": "samples/matmul/quant_matmul/quant_batch_matmul_mxa8w4.py",
       "test": "test/matmul/quant_matmul/test_quant_batch_matmul_mxa8w4.py"
     },
+    "quant_batch_matmul_inplace_add": {
+      "source": "samples/matmul/quant_matmul/quant_batch_matmul_inplace_add.py",
+      "test": "test/matmul/quant_matmul/test_quant_batch_matmul_inplace_add.py"
+    },
+    "weight_quant_batchmatmul": {
+      "source": "samples/matmul/weight_quant_batchmatmul",
+      "test": "test/matmul/weight_quant_batchmatmul"
+    },
     "flash_attn": {
       "source": "samples/attention/flash_attn",
       "test": "test/attention/flash_attn"
@@ -369,6 +377,7 @@
       "fused_matmul",
       "dual_level_quant_matmul",
       "quant_matmul",
+      "weight_quant_batchmatmul",
       "grouped_matmul",
       "qwen_sparse_attn",
       "stem_indexer",
@@ -580,6 +589,17 @@
         ]
       },
       {
+        "name": "quant_batch_matmul_inplace_add",
+        "enabled": true,
+        "watch": [
+          "@quant_batch_matmul_inplace_add/source",
+          "@quant_batch_matmul_inplace_add/test"
+        ],
+        "tests": [
+          "@quant_batch_matmul_inplace_add/test"
+        ]
+      },
+      {
         "name": "matmul",
         "enabled": true,
         "watch": [
@@ -632,6 +652,17 @@
         ],
         "tests": [
           "@quant_matmul/test"
+        ]
+      },
+      {
+        "name": "weight_quant_batchmatmul",
+        "enabled": true,
+        "watch": [
+          "@weight_quant_batchmatmul/source",
+          "@weight_quant_batchmatmul/test"
+        ],
+        "tests": [
+          "@weight_quant_batchmatmul/test"
         ]
       },
       {

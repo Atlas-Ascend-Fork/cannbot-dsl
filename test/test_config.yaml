@@ -127,6 +127,13 @@ quant_batch_matmul_mxa8w4:
     - test/matmul/quant_matmul/test_quant_batch_matmul_mxa8w4.py
   options:
     - matmul/quant_matmul/test_quant_batch_matmul_mxa8w4.py
+quant_batch_matmul_inplace_add:
+  module: true
+  src:
+    - samples/matmul/quant_matmul/quant_batch_matmul_inplace_add.py
+    - test/matmul/quant_matmul/test_quant_batch_matmul_inplace_add.py
+  options:
+    - matmul/quant_matmul/test_quant_batch_matmul_inplace_add.py
 matmul:
   module: true
   src:
@@ -162,6 +169,13 @@ quant_matmul:
     - test/matmul/quant_matmul
   options:
     - matmul/quant_matmul
+weight_quant_batchmatmul:
+  module: true
+  src:
+    - samples/matmul/weight_quant_batchmatmul
+    - test/matmul/weight_quant_batchmatmul
+  options:
+    - matmul/weight_quant_batchmatmul
 grouped_matmul:
   module: true
   src:

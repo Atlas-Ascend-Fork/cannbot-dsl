@@ -296,3 +296,102 @@ SWAT tiling solver）在 100 形状（方形/常规/瘦长/尾块 × M 扫描/�
 最高 2.28x，尾块形状（K 非 256 倍数）1.07-1.38x。
 
 ![quant_batch_matmul_mxa8w4_perf_compare](../../../figures/quant_batch_matmul_mxa8w4.png)
+
+# QuantBatchMatmul InplaceAdd MX
+
+基于 CANNBot-DSL 实现的 MX 全量化矩阵乘**原地累加**算子，面向 micro-batch
+训练梯度累加场景，输出恒 float32，面向 Ascend NPU。x1/x2 支持
+`float8_e4m3fn` 与 `float8_e5m2` 的全部 4 种组合。
+
+## 算子介绍
+
+计算公式：
+
+$$
+Y_{out}[M,N] = Y_{in}[M,N] + Dequant(X_1)[M,K] @ Dequant(X_2)[K,N]
+$$
+
+X1/X2 沿 K 轴每 32 个数据使用一个 E8M0 Scale，相邻两个 Scale 组成一个
+pair，因此 Scale 的分组轴长度为 `ceil(K / 64)`，最后一维为 2。
+
+| 特性与约束 | 说明 |
+| :--- | :--- |
+| 数据类型 | x1/x2 为 float8_e4m3fn / float8_e5m2（4 组合全支持）；y 恒 float32 |
+| Scale | ScaleA/ScaleB 为 float8_e8m0fnu 三维 paired-scale Tensor |
+| transpose | 固定 transA=T / transB=F：x1 为逻辑 (M,K) 的物理 (K,M) 存储，x2 为 (K,N)，其他布局拒绝 |
+| 原地累加 | `y += dequant_mm(x1, x2)`：L0C 结果经 FIXPIPE 原子累加（`SetAtomicAdd<float>`）写入 y，返回 y 本身（同一 storage） |
+| 输入 | 二维 x1/x2 与 y、三维 Scale Tensor |
+| 尾块 | 支持 M/N/K 非基本块整数倍（已验证 2051/3998/4093 类尾块与 K<64 半满组）；末轮再切分按尾块余量封顶，极小尾块（余量 1~2）安全 |
+| 多核并行 | 自适应滑动窗口蛇形调度 + 末轮块再切分 |
+| Buffer | 按 L1 容量选择数据 2/3/4 Buffer；L0A/L0B 双缓冲；L0C 容量足够时双缓冲 |
+| UnitFlag | 中间 MMAD 使用 UnitFlag 2，最终 MMAD 与 FixPipe 使用 UnitFlag 3 |
+| L2 cache | 按矩阵复用情况自适应开关；原子累加出口 l2_cache_ctl=1 |
+| 支持架构 | NPU ARCH 3510（Ascend 950PR / Ascend 950DT） |
+
+算子由 Host 侧 tiling 推导 baseM/baseN/baseK、L1/L0 切分与 Buffer 参数，
+Device Kernel 采用 K 三级窗口（scaleKL1 ⊇ kL1 ⊇ baseK）流水线，数据流为
+GM -> L1（MTE2）-> L0A/L0B（MTE1 + MX Scale 联动）-> MMAD -> L0C -> GM
+（FIXPIPE 原子累加）。实现详见 `quant_batch_matmul_inplace_add.py`。
+
+## 快速开始
+
+```python
+import torch
+import torch_npu
+
+from quant_batch_matmul_inplace_add import quant_batch_matmul_inplace_add
+
+M, K, N = 256, 256, 256
+
+x1 = torch.randn(M, K).to(torch.float8_e4m3fn).T.contiguous().npu()  # (K, M) transA=T
+x2 = torch.randn(K, N).to(torch.float8_e4m3fn).npu()                 # (K, N) transB=F
+
+# [ceil(K / 64), M, 2] 为 ScaleAND，[ceil(K / 64), N, 2] 为 ScaleBND。
+scale_a = torch.full(((K + 63) // 64, M, 2), 127, dtype=torch.uint8).npu()
+scale_b = torch.full(((K + 63) // 64, N, 2), 127, dtype=torch.uint8).npu()
+scale_a = scale_a.view(torch.float8_e8m0fnu)
+scale_b = scale_b.view(torch.float8_e8m0fnu)
+
+y = torch.zeros(M, N, dtype=torch.float32).npu()
+y = quant_batch_matmul_inplace_add(x1, x2, scale_a, scale_b, y)  # y += dequant_mm(x1, x2)
+```
+
+`quant_batch_matmul_inplace_add()` 输入/输出说明：
+
+| 参数 | shape | dtype | 说明 |
+| :--- | :---: | :---: | :--- |
+| `x1` | (K, M) | float8_e4m3fn / float8_e5m2 | A，左矩阵；逻辑 (M,K) 的 transA=T 物理存储 |
+| `x2` | (K, N) | float8_e4m3fn / float8_e5m2 | B，右矩阵；transB=F |
+| `x1_scale` | (ceil(K / 64), M, 2) | float8_e8m0fnu | A 的 ScaleA（ScaleAND） |
+| `x2_scale` | (ceil(K / 64), N, 2) | float8_e8m0fnu | B 的 ScaleB（ScaleBND） |
+| `y` | (M, N) | float32 | 原地累加的输入与输出 |
+| `group_sizes` | - | - | kw-only；None（默认）或 `[1, 1, 32]`（MX 规范值），其他值拒绝（与主线 aclnn 行为一致） |
+| `x1_dtype` / `x2_dtype` / `x1_scale_dtype` / `x2_scale_dtype` | - | - | kw-only；bitcast 提示，uint8/int8 传输视图传入时指定真实 dtype（同主线 `npu_add_quant_matmul_`） |
+| 返回值 | (M, N) | float32 | 更新后的 y（同一 storage） |
+
+与主线 `torch.ops.npu.npu_add_quant_matmul_`（aclnnQuantBatchMatmulInplaceAdd）
+入参对齐说明：`x1_scale`/`x2_scale` 必填——主线同样拒绝 null scale（aclnn 161001）；
+`group_sizes=None` 等价 MX 规范值；dtype 覆盖参数语义与主线 Bitcast 一致。参数顺序
+为 DSL 惯例（y 在末位），主线为 `(y, x1, x2, x2_scale, *, x1_scale=..., ...)`。
+
+## 精度测试
+
+测试代码位于 `test/matmul/quant_matmul/test_quant_batch_matmul_inplace_add.py`，
+87 个用例（4 组 dtype × 对齐/尾块 Shape × 3 种 y 初值，含非法输入拒绝、主线入参
+对齐（group_sizes/dtype 覆盖/null scale）与尾块切分回归，CPU golden
+独立实现，容差 atol=rtol=1e-3），
+pytest 驱动：
+
+```bash
+pytest test/matmul/quant_matmul/test_quant_batch_matmul_inplace_add.py -v
+```
+
+## 性能数据
+
+本 Sample 与 built-in `npu_add_quant_matmul_`（aclnnQuantBatchMatmulInplaceAdd）
+在 13 例复测用例（对齐/非对齐 Shape、micro-batch 瘦矩阵、尾块与 E5M2
+组合）上的性能对比结果如下，图示 DSL 更优的 10 例（最高 1.24×）。使用
+msprof 采集 AI Core Kernel Task Duration，每个 Shape 独立进程预热 3 次
+后重复 15 次取最小值；图中不包含编译、Launch、同步和输入构造时间。
+
+![quant_batch_matmul_inplace_add_perf_compare](../../../docs/figures/quant_batch_matmul_inplace_add.png)

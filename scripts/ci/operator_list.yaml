@@ -19,6 +19,7 @@ operators:
   - matmul/fused_matmul
   - matmul/dual_level_quant_matmul
   - matmul/quant_matmul
+  - matmul/weight_quant_batchmatmul
   - matmul/grouped_matmul
   - attention/qwen_sparse_attn
   - attention/stem_indexer

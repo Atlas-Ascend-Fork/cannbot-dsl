@@ -141,6 +141,8 @@ python3 -m pytest test/attention/flash_kda/test_flash_kda.py -v
 | [matmul/quant_matmul](samples/matmul/quant_matmul) | `npu_quant_matmul()` | MXFP8 / MXFP4 全量化矩阵乘（`quant_batch_matmul_mx.py`） |
 | [matmul/quant_matmul](samples/matmul/quant_matmul) | `npu_quant_matmul()` | per-tensor（TT）量化矩阵乘，支持 HiFloat8 / INT8 / FP8（`quant_batch_matmul_hif8_tt.py`） |
 | [matmul/quant_matmul](samples/matmul/quant_matmul) | `matmul_mix_quant()` | MXA8W4：MXFP8 激活 × MXFP4 权重（`quant_batch_matmul_mxa8w4.py`） |
+| [matmul/quant_matmul](samples/matmul/quant_matmul) | `quant_batch_matmul_inplace_add()` | MX 全量化矩阵乘原地累加（`y += dequant_mm(x1, x2)`），输出恒 FP32（`quant_batch_matmul_inplace_add.py`） |
+| [matmul/weight_quant_batchmatmul](samples/matmul/weight_quant_batchmatmul) | `npu_weight_quant_batchmatmul()` | A16W4 权重量化矩阵乘：FP16 激活 × MXFP4 权重（E2M1 + E8M0 per-32-group scale），WeightNZ 布局 |
 | [grouped_matmul](samples/matmul/grouped_matmul) | `group_matmul()` | 分组矩阵乘，支持 M 轴 / K 轴分组 |
 | [flash_attn](samples/attention/flash_attn) | `flash_attn()`、`flash_attn_metadata()` | Flash Attention，支持 GQA、变长序列和分页 KV cache |
 | [flash_mla_with_kvcache](samples/attention/flash_mla_with_kvcache) | `flash_mla_with_kvcache()`、`flash_mla_with_kvcache_metadata()` | Flash MLA 推理，Query 为 TND、KV 为分页 cache |
