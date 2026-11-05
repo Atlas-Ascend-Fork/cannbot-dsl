@@ -2,6 +2,10 @@
 
 - [源码构建](../install/source-build.md)
 - [编程模型概览](overview.md)
+- 快速入门
+  - [Add 算子样例（SIMD）](add-simd.md)
+  - [GatherV2 算子样例（SIMT）](gather-v2-simt.md)
+  - [第一个 Cube 算子与第一个 Mix 算子](cube-and-mix.md)
 - [语言机制](introduction.md)
   - [硬件与执行模型](hardware-model.md)
   - [代码生成](code-generation.md)
@@ -14,7 +18,6 @@
   - [数据类型与量化](data-types.md)
   - [同步、Cache 与跨核交接](synchronization.md)
 - [动手实践](first-operator.md)
-  - [第一个 Cube 算子与第一个 Mix 算子](cube-and-mix.md)
   - [AI CPU 与调度计划](aicpu.md)
   - [融合算子的设计方法论](fusion-design.md)
 - [工程化与附录](compiler-options.md)

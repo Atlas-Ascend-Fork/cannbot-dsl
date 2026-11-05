@@ -31,6 +31,15 @@ const guideSidebar = [
 const programmingModelSidebar = [
   { text: '编程模型概览', link: '/zh/guide/overview' },
   {
+    text: '快速入门',
+    collapsed: false,
+    items: [
+      { text: 'Add 算子样例（SIMD）', link: '/zh/guide/add-simd' },
+      { text: 'GatherV2 算子样例（SIMT）', link: '/zh/guide/gather-v2-simt' },
+      { text: '第一个 Cube 算子与第一个 Mix 算子', link: '/zh/guide/cube-and-mix' }
+    ]
+  },
+  {
     text: '语言机制',
     collapsed: false,
     items: [
@@ -58,7 +67,6 @@ const programmingModelSidebar = [
     collapsed: false,
     items: [
       { text: '写出第一个算子', link: '/zh/guide/first-operator' },
-      { text: '第一个 Cube 算子与第一个 Mix 算子', link: '/zh/guide/cube-and-mix' },
       { text: 'AI CPU 与调度计划', link: '/zh/guide/aicpu' },
       { text: '融合算子的设计方法论', link: '/zh/guide/fusion-design' }
     ]
@@ -3002,6 +3010,7 @@ export default defineConfig({
       { text: '算子开发指南', items: [
         { text: '源码构建', link: '/zh/install/source-build' },
         { text: '编程模型', link: '/zh/guide/overview' },
+        { text: '快速入门', link: '/zh/guide/add-simd' },
         { text: '样例导航', link: 'https://gitcode.com/cann/cannbot-dsl/tree/master/samples' }
       ] },
       { text: 'CANNBot-DSL API', items: [
