@@ -79,6 +79,1105 @@ const programmingModelSidebar = [
   }
 ]
 
+const simtSidebar = {
+  "text": "SIMT 接口",
+  "collapsed": true,
+  "items": [
+    {
+      "text": "线程信息",
+      "collapsed": true,
+      "items": [
+        {
+          "text": "thread_idx",
+          "link": "/zh/api/simt/thread/thread-idx"
+        },
+        {
+          "text": "thread_dim",
+          "link": "/zh/api/simt/thread/thread-dim"
+        },
+        {
+          "text": "block_idx",
+          "link": "/zh/api/simt/thread/block-idx"
+        },
+        {
+          "text": "grid_dim",
+          "link": "/zh/api/simt/thread/grid-dim"
+        }
+      ]
+    },
+    {
+      "text": "同步与内存栅栏",
+      "collapsed": true,
+      "items": [
+        {
+          "text": "syncthreads",
+          "link": "/zh/api/simt/synchronization/syncthreads"
+        },
+        {
+          "text": "threadfence",
+          "link": "/zh/api/simt/synchronization/threadfence"
+        },
+        {
+          "text": "threadfence_block",
+          "link": "/zh/api/simt/synchronization/threadfence-block"
+        }
+      ]
+    },
+    {
+      "text": "原子操作",
+      "collapsed": true,
+      "items": [
+        {
+          "text": "atomic_add",
+          "link": "/zh/api/simt/atomic/atomic-add"
+        },
+        {
+          "text": "vatomic_add",
+          "link": "/zh/api/simt/atomic/vatomic-add"
+        },
+        {
+          "text": "atomic_sub",
+          "link": "/zh/api/simt/atomic/atomic-sub"
+        },
+        {
+          "text": "vatomic_sub",
+          "link": "/zh/api/simt/atomic/vatomic-sub"
+        },
+        {
+          "text": "atomic_exch",
+          "link": "/zh/api/simt/atomic/atomic-exch"
+        },
+        {
+          "text": "vatomic_exch",
+          "link": "/zh/api/simt/atomic/vatomic-exch"
+        },
+        {
+          "text": "atomic_max",
+          "link": "/zh/api/simt/atomic/atomic-max"
+        },
+        {
+          "text": "vatomic_max",
+          "link": "/zh/api/simt/atomic/vatomic-max"
+        },
+        {
+          "text": "atomic_min",
+          "link": "/zh/api/simt/atomic/atomic-min"
+        },
+        {
+          "text": "vatomic_min",
+          "link": "/zh/api/simt/atomic/vatomic-min"
+        },
+        {
+          "text": "atomic_cas",
+          "link": "/zh/api/simt/atomic/atomic-cas"
+        },
+        {
+          "text": "vatomic_cas",
+          "link": "/zh/api/simt/atomic/vatomic-cas"
+        },
+        {
+          "text": "atomic_and",
+          "link": "/zh/api/simt/atomic/atomic-and"
+        },
+        {
+          "text": "vatomic_and",
+          "link": "/zh/api/simt/atomic/vatomic-and"
+        },
+        {
+          "text": "atomic_or",
+          "link": "/zh/api/simt/atomic/atomic-or"
+        },
+        {
+          "text": "vatomic_or",
+          "link": "/zh/api/simt/atomic/vatomic-or"
+        },
+        {
+          "text": "atomic_xor",
+          "link": "/zh/api/simt/atomic/atomic-xor"
+        },
+        {
+          "text": "vatomic_xor",
+          "link": "/zh/api/simt/atomic/vatomic-xor"
+        },
+        {
+          "text": "atomic_inc",
+          "link": "/zh/api/simt/atomic/atomic-inc"
+        },
+        {
+          "text": "vatomic_inc",
+          "link": "/zh/api/simt/atomic/vatomic-inc"
+        },
+        {
+          "text": "atomic_dec",
+          "link": "/zh/api/simt/atomic/atomic-dec"
+        },
+        {
+          "text": "vatomic_dec",
+          "link": "/zh/api/simt/atomic/vatomic-dec"
+        }
+      ]
+    },
+    {
+      "text": "Warp 函数",
+      "collapsed": true,
+      "items": [
+        {
+          "text": "Warp Vote类函数",
+          "collapsed": true,
+          "items": [
+            {
+              "text": "all",
+              "link": "/zh/api/simt/warp/vote/all"
+            },
+            {
+              "text": "any",
+              "link": "/zh/api/simt/warp/vote/any"
+            },
+            {
+              "text": "ballot",
+              "link": "/zh/api/simt/warp/vote/ballot"
+            },
+            {
+              "text": "activemask",
+              "link": "/zh/api/simt/warp/vote/activemask"
+            }
+          ]
+        },
+        {
+          "text": "Warp Shfl类函数",
+          "collapsed": true,
+          "items": [
+            {
+              "text": "shfl",
+              "link": "/zh/api/simt/warp/shuffle/shfl"
+            },
+            {
+              "text": "shfl_up",
+              "link": "/zh/api/simt/warp/shuffle/shfl-up"
+            },
+            {
+              "text": "shfl_down",
+              "link": "/zh/api/simt/warp/shuffle/shfl-down"
+            },
+            {
+              "text": "shfl_xor",
+              "link": "/zh/api/simt/warp/shuffle/shfl-xor"
+            }
+          ]
+        },
+        {
+          "text": "Warp Reduce类函数",
+          "collapsed": true,
+          "items": [
+            {
+              "text": "reduce_add",
+              "link": "/zh/api/simt/warp/reduce/reduce-add"
+            },
+            {
+              "text": "reduce_max",
+              "link": "/zh/api/simt/warp/reduce/reduce-max"
+            },
+            {
+              "text": "reduce_min",
+              "link": "/zh/api/simt/warp/reduce/reduce-min"
+            }
+          ]
+        },
+        {
+          "text": "Lane ID类函数",
+          "collapsed": true,
+          "items": [
+            {
+              "text": "lane_idx",
+              "link": "/zh/api/simt/warp/lane-id/lane-idx"
+            },
+            {
+              "text": "lanemask_eq",
+              "link": "/zh/api/simt/warp/lane-id/lanemask-eq"
+            },
+            {
+              "text": "lanemask_le",
+              "link": "/zh/api/simt/warp/lane-id/lanemask-le"
+            },
+            {
+              "text": "lanemask_lt",
+              "link": "/zh/api/simt/warp/lane-id/lanemask-lt"
+            },
+            {
+              "text": "lanemask_ge",
+              "link": "/zh/api/simt/warp/lane-id/lanemask-ge"
+            },
+            {
+              "text": "lanemask_gt",
+              "link": "/zh/api/simt/warp/lane-id/lanemask-gt"
+            }
+          ]
+        },
+        {
+          "text": "warp_size",
+          "link": "/zh/api/simt/warp/warp-size"
+        }
+      ]
+    },
+    {
+      "text": "数学函数",
+      "collapsed": true,
+      "items": [
+        {
+          "text": "基础算术",
+          "collapsed": true,
+          "items": [
+            {
+              "text": "add",
+              "link": "/zh/api/simt/math/arithmetic/add"
+            },
+            {
+              "text": "vadd",
+              "link": "/zh/api/simt/math/arithmetic/vadd"
+            },
+            {
+              "text": "sub",
+              "link": "/zh/api/simt/math/arithmetic/sub"
+            },
+            {
+              "text": "vsub",
+              "link": "/zh/api/simt/math/arithmetic/vsub"
+            },
+            {
+              "text": "mul",
+              "link": "/zh/api/simt/math/arithmetic/mul"
+            },
+            {
+              "text": "vmul",
+              "link": "/zh/api/simt/math/arithmetic/vmul"
+            },
+            {
+              "text": "div",
+              "link": "/zh/api/simt/math/arithmetic/div"
+            },
+            {
+              "text": "vdiv",
+              "link": "/zh/api/simt/math/arithmetic/vdiv"
+            },
+            {
+              "text": "neg",
+              "link": "/zh/api/simt/math/arithmetic/neg"
+            },
+            {
+              "text": "vneg",
+              "link": "/zh/api/simt/math/arithmetic/vneg"
+            },
+            {
+              "text": "abs",
+              "link": "/zh/api/simt/math/arithmetic/abs"
+            },
+            {
+              "text": "vabs",
+              "link": "/zh/api/simt/math/arithmetic/vabs"
+            },
+            {
+              "text": "fma",
+              "link": "/zh/api/simt/math/arithmetic/fma"
+            },
+            {
+              "text": "vfma",
+              "link": "/zh/api/simt/math/arithmetic/vfma"
+            },
+            {
+              "text": "fma_relu",
+              "link": "/zh/api/simt/math/arithmetic/fma-relu"
+            },
+            {
+              "text": "vfma_relu",
+              "link": "/zh/api/simt/math/arithmetic/vfma-relu"
+            },
+            {
+              "text": "fdivide",
+              "link": "/zh/api/simt/math/arithmetic/fdivide"
+            },
+            {
+              "text": "min",
+              "link": "/zh/api/simt/math/arithmetic/min"
+            },
+            {
+              "text": "max",
+              "link": "/zh/api/simt/math/arithmetic/max"
+            },
+            {
+              "text": "vmax",
+              "link": "/zh/api/simt/math/arithmetic/vmax"
+            },
+            {
+              "text": "fmin",
+              "link": "/zh/api/simt/math/arithmetic/fmin"
+            },
+            {
+              "text": "vfmin",
+              "link": "/zh/api/simt/math/arithmetic/vfmin"
+            },
+            {
+              "text": "fmax",
+              "link": "/zh/api/simt/math/arithmetic/fmax"
+            },
+            {
+              "text": "vmax_nan",
+              "link": "/zh/api/simt/math/arithmetic/vmax-nan"
+            },
+            {
+              "text": "vmin_nan",
+              "link": "/zh/api/simt/math/arithmetic/vmin-nan"
+            },
+            {
+              "text": "vcmadd",
+              "link": "/zh/api/simt/math/arithmetic/vcmadd"
+            },
+            {
+              "text": "fdim",
+              "link": "/zh/api/simt/math/arithmetic/fdim"
+            }
+          ]
+        },
+        {
+          "text": "比较与判断",
+          "collapsed": true,
+          "items": [
+            {
+              "text": "eq",
+              "link": "/zh/api/simt/math/comparison/eq"
+            },
+            {
+              "text": "veq",
+              "link": "/zh/api/simt/math/comparison/veq"
+            },
+            {
+              "text": "veq_mask",
+              "link": "/zh/api/simt/math/comparison/veq-mask"
+            },
+            {
+              "text": "vequ",
+              "link": "/zh/api/simt/math/comparison/vequ"
+            },
+            {
+              "text": "vequ_mask",
+              "link": "/zh/api/simt/math/comparison/vequ-mask"
+            },
+            {
+              "text": "vbeq",
+              "link": "/zh/api/simt/math/comparison/vbeq"
+            },
+            {
+              "text": "vbeq_mask",
+              "link": "/zh/api/simt/math/comparison/vbeq-mask"
+            },
+            {
+              "text": "ne",
+              "link": "/zh/api/simt/math/comparison/ne"
+            },
+            {
+              "text": "vne",
+              "link": "/zh/api/simt/math/comparison/vne"
+            },
+            {
+              "text": "vne_mask",
+              "link": "/zh/api/simt/math/comparison/vne-mask"
+            },
+            {
+              "text": "vneu",
+              "link": "/zh/api/simt/math/comparison/vneu"
+            },
+            {
+              "text": "vneu_mask",
+              "link": "/zh/api/simt/math/comparison/vneu-mask"
+            },
+            {
+              "text": "vbne",
+              "link": "/zh/api/simt/math/comparison/vbne"
+            },
+            {
+              "text": "vbne_mask",
+              "link": "/zh/api/simt/math/comparison/vbne-mask"
+            },
+            {
+              "text": "le",
+              "link": "/zh/api/simt/math/comparison/le"
+            },
+            {
+              "text": "vle",
+              "link": "/zh/api/simt/math/comparison/vle"
+            },
+            {
+              "text": "vle_mask",
+              "link": "/zh/api/simt/math/comparison/vle-mask"
+            },
+            {
+              "text": "vleu",
+              "link": "/zh/api/simt/math/comparison/vleu"
+            },
+            {
+              "text": "vleu_mask",
+              "link": "/zh/api/simt/math/comparison/vleu-mask"
+            },
+            {
+              "text": "vble",
+              "link": "/zh/api/simt/math/comparison/vble"
+            },
+            {
+              "text": "vble_mask",
+              "link": "/zh/api/simt/math/comparison/vble-mask"
+            },
+            {
+              "text": "ge",
+              "link": "/zh/api/simt/math/comparison/ge"
+            },
+            {
+              "text": "vge",
+              "link": "/zh/api/simt/math/comparison/vge"
+            },
+            {
+              "text": "vge_mask",
+              "link": "/zh/api/simt/math/comparison/vge-mask"
+            },
+            {
+              "text": "vgeu",
+              "link": "/zh/api/simt/math/comparison/vgeu"
+            },
+            {
+              "text": "vgeu_mask",
+              "link": "/zh/api/simt/math/comparison/vgeu-mask"
+            },
+            {
+              "text": "vbge",
+              "link": "/zh/api/simt/math/comparison/vbge"
+            },
+            {
+              "text": "vbge_mask",
+              "link": "/zh/api/simt/math/comparison/vbge-mask"
+            },
+            {
+              "text": "lt",
+              "link": "/zh/api/simt/math/comparison/lt"
+            },
+            {
+              "text": "vlt",
+              "link": "/zh/api/simt/math/comparison/vlt"
+            },
+            {
+              "text": "vlt_mask",
+              "link": "/zh/api/simt/math/comparison/vlt-mask"
+            },
+            {
+              "text": "vltu",
+              "link": "/zh/api/simt/math/comparison/vltu"
+            },
+            {
+              "text": "vltu_mask",
+              "link": "/zh/api/simt/math/comparison/vltu-mask"
+            },
+            {
+              "text": "vblt",
+              "link": "/zh/api/simt/math/comparison/vblt"
+            },
+            {
+              "text": "vblt_mask",
+              "link": "/zh/api/simt/math/comparison/vblt-mask"
+            },
+            {
+              "text": "gt",
+              "link": "/zh/api/simt/math/comparison/gt"
+            },
+            {
+              "text": "vgt",
+              "link": "/zh/api/simt/math/comparison/vgt"
+            },
+            {
+              "text": "vgt_mask",
+              "link": "/zh/api/simt/math/comparison/vgt-mask"
+            },
+            {
+              "text": "vgtu",
+              "link": "/zh/api/simt/math/comparison/vgtu"
+            },
+            {
+              "text": "vgtu_mask",
+              "link": "/zh/api/simt/math/comparison/vgtu-mask"
+            },
+            {
+              "text": "vbgt",
+              "link": "/zh/api/simt/math/comparison/vbgt"
+            },
+            {
+              "text": "vbgt_mask",
+              "link": "/zh/api/simt/math/comparison/vbgt-mask"
+            },
+            {
+              "text": "isfinite",
+              "link": "/zh/api/simt/math/comparison/isfinite"
+            },
+            {
+              "text": "isnan",
+              "link": "/zh/api/simt/math/comparison/isnan"
+            },
+            {
+              "text": "visnan",
+              "link": "/zh/api/simt/math/comparison/visnan"
+            },
+            {
+              "text": "isinf",
+              "link": "/zh/api/simt/math/comparison/isinf"
+            }
+          ]
+        },
+        {
+          "text": "指数、对数与幂",
+          "collapsed": true,
+          "items": [
+            {
+              "text": "sqrt",
+              "link": "/zh/api/simt/math/exponential/sqrt"
+            },
+            {
+              "text": "vsqrt",
+              "link": "/zh/api/simt/math/exponential/vsqrt"
+            },
+            {
+              "text": "rsqrt",
+              "link": "/zh/api/simt/math/exponential/rsqrt"
+            },
+            {
+              "text": "vrsqrt",
+              "link": "/zh/api/simt/math/exponential/vrsqrt"
+            },
+            {
+              "text": "cbrt",
+              "link": "/zh/api/simt/math/exponential/cbrt"
+            },
+            {
+              "text": "rcbrt",
+              "link": "/zh/api/simt/math/exponential/rcbrt"
+            },
+            {
+              "text": "rcp",
+              "link": "/zh/api/simt/math/exponential/rcp"
+            },
+            {
+              "text": "vrcp",
+              "link": "/zh/api/simt/math/exponential/vrcp"
+            },
+            {
+              "text": "exp",
+              "link": "/zh/api/simt/math/exponential/exp"
+            },
+            {
+              "text": "vexp",
+              "link": "/zh/api/simt/math/exponential/vexp"
+            },
+            {
+              "text": "exp2",
+              "link": "/zh/api/simt/math/exponential/exp2"
+            },
+            {
+              "text": "vexp2",
+              "link": "/zh/api/simt/math/exponential/vexp2"
+            },
+            {
+              "text": "exp10",
+              "link": "/zh/api/simt/math/exponential/exp10"
+            },
+            {
+              "text": "vexp10",
+              "link": "/zh/api/simt/math/exponential/vexp10"
+            },
+            {
+              "text": "expm1",
+              "link": "/zh/api/simt/math/exponential/expm1"
+            },
+            {
+              "text": "log",
+              "link": "/zh/api/simt/math/exponential/log"
+            },
+            {
+              "text": "vlog",
+              "link": "/zh/api/simt/math/exponential/vlog"
+            },
+            {
+              "text": "log2",
+              "link": "/zh/api/simt/math/exponential/log2"
+            },
+            {
+              "text": "vlog2",
+              "link": "/zh/api/simt/math/exponential/vlog2"
+            },
+            {
+              "text": "log10",
+              "link": "/zh/api/simt/math/exponential/log10"
+            },
+            {
+              "text": "vlog10",
+              "link": "/zh/api/simt/math/exponential/vlog10"
+            },
+            {
+              "text": "log1p",
+              "link": "/zh/api/simt/math/exponential/log1p"
+            },
+            {
+              "text": "pow",
+              "link": "/zh/api/simt/math/exponential/pow"
+            }
+          ]
+        },
+        {
+          "text": "三角与双曲函数",
+          "collapsed": true,
+          "items": [
+            {
+              "text": "sin",
+              "link": "/zh/api/simt/math/trigonometric/sin"
+            },
+            {
+              "text": "vsin",
+              "link": "/zh/api/simt/math/trigonometric/vsin"
+            },
+            {
+              "text": "cos",
+              "link": "/zh/api/simt/math/trigonometric/cos"
+            },
+            {
+              "text": "vcos",
+              "link": "/zh/api/simt/math/trigonometric/vcos"
+            },
+            {
+              "text": "tan",
+              "link": "/zh/api/simt/math/trigonometric/tan"
+            },
+            {
+              "text": "vtan",
+              "link": "/zh/api/simt/math/trigonometric/vtan"
+            },
+            {
+              "text": "asin",
+              "link": "/zh/api/simt/math/trigonometric/asin"
+            },
+            {
+              "text": "acos",
+              "link": "/zh/api/simt/math/trigonometric/acos"
+            },
+            {
+              "text": "atan",
+              "link": "/zh/api/simt/math/trigonometric/atan"
+            },
+            {
+              "text": "atan2",
+              "link": "/zh/api/simt/math/trigonometric/atan2"
+            },
+            {
+              "text": "sinh",
+              "link": "/zh/api/simt/math/trigonometric/sinh"
+            },
+            {
+              "text": "cosh",
+              "link": "/zh/api/simt/math/trigonometric/cosh"
+            },
+            {
+              "text": "tanh",
+              "link": "/zh/api/simt/math/trigonometric/tanh"
+            },
+            {
+              "text": "vtanh",
+              "link": "/zh/api/simt/math/trigonometric/vtanh"
+            },
+            {
+              "text": "asinh",
+              "link": "/zh/api/simt/math/trigonometric/asinh"
+            },
+            {
+              "text": "acosh",
+              "link": "/zh/api/simt/math/trigonometric/acosh"
+            },
+            {
+              "text": "atanh",
+              "link": "/zh/api/simt/math/trigonometric/atanh"
+            },
+            {
+              "text": "sinpi",
+              "link": "/zh/api/simt/math/trigonometric/sinpi"
+            },
+            {
+              "text": "cospi",
+              "link": "/zh/api/simt/math/trigonometric/cospi"
+            },
+            {
+              "text": "tanpi",
+              "link": "/zh/api/simt/math/trigonometric/tanpi"
+            },
+            {
+              "text": "sincos",
+              "link": "/zh/api/simt/math/trigonometric/sincos"
+            },
+            {
+              "text": "sincospi",
+              "link": "/zh/api/simt/math/trigonometric/sincospi"
+            }
+          ]
+        },
+        {
+          "text": "取整函数",
+          "collapsed": true,
+          "items": [
+            {
+              "text": "floor",
+              "link": "/zh/api/simt/math/rounding/floor"
+            },
+            {
+              "text": "vfloor",
+              "link": "/zh/api/simt/math/rounding/vfloor"
+            },
+            {
+              "text": "ceil",
+              "link": "/zh/api/simt/math/rounding/ceil"
+            },
+            {
+              "text": "vceil",
+              "link": "/zh/api/simt/math/rounding/vceil"
+            },
+            {
+              "text": "trunc",
+              "link": "/zh/api/simt/math/rounding/trunc"
+            },
+            {
+              "text": "vtrunc",
+              "link": "/zh/api/simt/math/rounding/vtrunc"
+            },
+            {
+              "text": "round",
+              "link": "/zh/api/simt/math/rounding/round"
+            },
+            {
+              "text": "rint",
+              "link": "/zh/api/simt/math/rounding/rint"
+            },
+            {
+              "text": "vrint",
+              "link": "/zh/api/simt/math/rounding/vrint"
+            },
+            {
+              "text": "nearbyint",
+              "link": "/zh/api/simt/math/rounding/nearbyint"
+            },
+            {
+              "text": "lround",
+              "link": "/zh/api/simt/math/rounding/lround"
+            },
+            {
+              "text": "llround",
+              "link": "/zh/api/simt/math/rounding/llround"
+            },
+            {
+              "text": "lrint",
+              "link": "/zh/api/simt/math/rounding/lrint"
+            },
+            {
+              "text": "llrint",
+              "link": "/zh/api/simt/math/rounding/llrint"
+            }
+          ]
+        },
+        {
+          "text": "浮点数操作",
+          "collapsed": true,
+          "items": [
+            {
+              "text": "modf",
+              "link": "/zh/api/simt/math/decomposition/modf"
+            },
+            {
+              "text": "frexp",
+              "link": "/zh/api/simt/math/decomposition/frexp"
+            },
+            {
+              "text": "ldexp",
+              "link": "/zh/api/simt/math/decomposition/ldexp"
+            },
+            {
+              "text": "logb",
+              "link": "/zh/api/simt/math/decomposition/logb"
+            },
+            {
+              "text": "ilogb",
+              "link": "/zh/api/simt/math/decomposition/ilogb"
+            },
+            {
+              "text": "scalbn",
+              "link": "/zh/api/simt/math/decomposition/scalbn"
+            },
+            {
+              "text": "scalbln",
+              "link": "/zh/api/simt/math/decomposition/scalbln"
+            },
+            {
+              "text": "nan",
+              "link": "/zh/api/simt/math/decomposition/nan"
+            },
+            {
+              "text": "copysign",
+              "link": "/zh/api/simt/math/decomposition/copysign"
+            },
+            {
+              "text": "nextafter",
+              "link": "/zh/api/simt/math/decomposition/nextafter"
+            }
+          ]
+        },
+        {
+          "text": "余数计算",
+          "collapsed": true,
+          "items": [
+            {
+              "text": "fmod",
+              "link": "/zh/api/simt/math/remainder/fmod"
+            },
+            {
+              "text": "remainder",
+              "link": "/zh/api/simt/math/remainder/remainder"
+            },
+            {
+              "text": "remquo",
+              "link": "/zh/api/simt/math/remainder/remquo"
+            }
+          ]
+        },
+        {
+          "text": "特殊数学函数",
+          "collapsed": true,
+          "items": [
+            {
+              "text": "hypot",
+              "link": "/zh/api/simt/math/special/hypot"
+            },
+            {
+              "text": "rhypot",
+              "link": "/zh/api/simt/math/special/rhypot"
+            },
+            {
+              "text": "norm",
+              "link": "/zh/api/simt/math/special/norm"
+            },
+            {
+              "text": "rnorm",
+              "link": "/zh/api/simt/math/special/rnorm"
+            },
+            {
+              "text": "norm3",
+              "link": "/zh/api/simt/math/special/norm3"
+            },
+            {
+              "text": "rnorm3",
+              "link": "/zh/api/simt/math/special/rnorm3"
+            },
+            {
+              "text": "norm4",
+              "link": "/zh/api/simt/math/special/norm4"
+            },
+            {
+              "text": "rnorm4",
+              "link": "/zh/api/simt/math/special/rnorm4"
+            },
+            {
+              "text": "erf",
+              "link": "/zh/api/simt/math/special/erf"
+            },
+            {
+              "text": "erfc",
+              "link": "/zh/api/simt/math/special/erfc"
+            },
+            {
+              "text": "erfinv",
+              "link": "/zh/api/simt/math/special/erfinv"
+            },
+            {
+              "text": "erfcinv",
+              "link": "/zh/api/simt/math/special/erfcinv"
+            },
+            {
+              "text": "erfcx",
+              "link": "/zh/api/simt/math/special/erfcx"
+            },
+            {
+              "text": "tgamma",
+              "link": "/zh/api/simt/math/special/tgamma"
+            },
+            {
+              "text": "lgamma",
+              "link": "/zh/api/simt/math/special/lgamma"
+            },
+            {
+              "text": "normcdf",
+              "link": "/zh/api/simt/math/special/normcdf"
+            },
+            {
+              "text": "normcdfinv",
+              "link": "/zh/api/simt/math/special/normcdfinv"
+            },
+            {
+              "text": "cyl_bessel_i0",
+              "link": "/zh/api/simt/math/special/cyl-bessel-i0"
+            },
+            {
+              "text": "cyl_bessel_i1",
+              "link": "/zh/api/simt/math/special/cyl-bessel-i1"
+            },
+            {
+              "text": "j0",
+              "link": "/zh/api/simt/math/special/j0"
+            },
+            {
+              "text": "j1",
+              "link": "/zh/api/simt/math/special/j1"
+            },
+            {
+              "text": "jn",
+              "link": "/zh/api/simt/math/special/jn"
+            },
+            {
+              "text": "y0",
+              "link": "/zh/api/simt/math/special/y0"
+            },
+            {
+              "text": "y1",
+              "link": "/zh/api/simt/math/special/y1"
+            },
+            {
+              "text": "yn",
+              "link": "/zh/api/simt/math/special/yn"
+            }
+          ]
+        },
+        {
+          "text": "整数与位操作",
+          "collapsed": true,
+          "items": [
+            {
+              "text": "hadd",
+              "link": "/zh/api/simt/math/integer/hadd"
+            },
+            {
+              "text": "hradd",
+              "link": "/zh/api/simt/math/integer/hradd"
+            },
+            {
+              "text": "mulhi",
+              "link": "/zh/api/simt/math/integer/mulhi"
+            },
+            {
+              "text": "mul24",
+              "link": "/zh/api/simt/math/integer/mul24"
+            },
+            {
+              "text": "mul_cast",
+              "link": "/zh/api/simt/math/integer/mul-cast"
+            },
+            {
+              "text": "brev",
+              "link": "/zh/api/simt/math/integer/brev"
+            },
+            {
+              "text": "clz",
+              "link": "/zh/api/simt/math/integer/clz"
+            },
+            {
+              "text": "ffs",
+              "link": "/zh/api/simt/math/integer/ffs"
+            },
+            {
+              "text": "popc",
+              "link": "/zh/api/simt/math/integer/popc"
+            },
+            {
+              "text": "byte_perm",
+              "link": "/zh/api/simt/math/integer/byte-perm"
+            },
+            {
+              "text": "sad",
+              "link": "/zh/api/simt/math/integer/sad"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "text": "类型转换",
+      "collapsed": true,
+      "items": [
+        {
+          "text": "RoundingMode",
+          "link": "/zh/api/simt/conversion/roundingmode"
+        },
+        {
+          "text": "cast",
+          "link": "/zh/api/simt/conversion/cast"
+        },
+        {
+          "text": "vcast",
+          "link": "/zh/api/simt/conversion/vcast"
+        },
+        {
+          "text": "bitcast",
+          "link": "/zh/api/simt/conversion/bitcast"
+        },
+        {
+          "text": "vbitcast",
+          "link": "/zh/api/simt/conversion/vbitcast"
+        },
+        {
+          "text": "make_short_vector",
+          "link": "/zh/api/simt/conversion/make-short-vector"
+        },
+        {
+          "text": "vpack_high",
+          "link": "/zh/api/simt/conversion/vpack-high"
+        },
+        {
+          "text": "vpack_low",
+          "link": "/zh/api/simt/conversion/vpack-low"
+        }
+      ]
+    },
+    {
+      "text": "访存与缓存控制",
+      "collapsed": true,
+      "items": [
+        {
+          "text": "l2cache_load",
+          "link": "/zh/api/simt/memory/l2cache-load"
+        },
+        {
+          "text": "l2cache_store",
+          "link": "/zh/api/simt/memory/l2cache-store"
+        },
+        {
+          "text": "l2cache_vload",
+          "link": "/zh/api/simt/memory/l2cache-vload"
+        },
+        {
+          "text": "l2cache_vstore",
+          "link": "/zh/api/simt/memory/l2cache-vstore"
+        },
+        {
+          "text": "dcci_single",
+          "link": "/zh/api/simt/memory/dcci-single"
+        },
+        {
+          "text": "dcci_entire_out",
+          "link": "/zh/api/simt/memory/dcci-entire-out"
+        },
+        {
+          "text": "nop",
+          "link": "/zh/api/simt/memory/nop"
+        }
+      ]
+    }
+  ]
+}
+
 const apiSidebar = [
   {
     "text": "API 文档",
@@ -1696,7 +2795,7 @@ const normalizeApiSidebar = (sidebar: any[]) => {
   const find = (list: any[], suffix: string) => list.find((item: any) => item.link?.endsWith(suffix))
   const remove = (list: any[], item: any) => list.filter((candidate: any) => candidate !== item)
   const withCleanLabels = (item: any): any => {
-    const cleaned = typeof item.text === 'string'
+    const cleaned = typeof item.text === 'string' && item.text !== 'SIMT 接口'
       ? item.text.replace(/ 接口$/, '').replace(/^操作$/, '计算').replace(/^张量操作$/, '张量计算').replace(/^原子操作$/, '原子计算')
       : item.text
     const overviewLabel = typeof item.link === 'string' && /\/overview\/?$/.test(item.link) && typeof cleaned === 'string' && !/简介|概览/.test(cleaned)
@@ -1860,6 +2959,7 @@ const normalizeApiSidebar = (sidebar: any[]) => {
     debug,
     find(items, '/compilation'),
     find(items, '/aicpu'),
+    simtSidebar,
   ].filter(Boolean).map(withCleanLabels).map(orderForReading)
   return [{ ...removeParentLinks(root), items: ordered.map(removeParentLinks) }]
 }
@@ -1912,7 +3012,8 @@ export default defineConfig({
         { text: '设备执行', link: '/zh/api/execution/' },
         { text: '调试', link: '/zh/api/debug/' },
         { text: '编译与发布', link: '/zh/api/compilation/' },
-        { text: 'AI CPU', link: '/zh/api/aicpu/' }
+        { text: 'AI CPU', link: '/zh/api/aicpu/' },
+        { text: 'SIMT 接口', link: '/zh/api/simt/' }
       ] },
       { text: '语言 / Language', items: [
         { text: '简体中文', link: '/zh/' },

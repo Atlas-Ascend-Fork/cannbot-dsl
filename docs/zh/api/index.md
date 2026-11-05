@@ -1,6 +1,6 @@
 # CANNBot-DSL API 参考
 
-CANNBot-DSL API 参考按语言、数据结构、数据搬运、计算、设备执行、调试、编译发布和 AI CPU 组织。
+CANNBot-DSL API 参考按语言、数据结构、数据搬运、计算、设备执行、调试、编译发布、AI CPU 和 SIMT 接口 组织。
 
 | 主题 | 适合查找的内容 |
 | --- | --- |
@@ -12,3 +12,4 @@ CANNBot-DSL API 参考按语言、数据结构、数据搬运、计算、设备�
 | [调试](./debug/index.md) | Kernel 调试接口 |
 | [编译与发布](./compilation/index.md) | Host 参数规格、JIT/AOT 编译、Native 发布和 ACLNN 工程接入 |
 | [AI CPU](./aicpu/index.md) | AI CPU Kernel 的声明、参数、编译、验证和启动 |
+| [SIMT 接口](./simt/index.md) | 线程、同步、原子、Warp、数学、短向量、类型转换与访存 |

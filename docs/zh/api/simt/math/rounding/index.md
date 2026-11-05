@@ -1,0 +1,16 @@
+# 取整函数
+
+- [floor](./floor.md)
+- [vfloor](./vfloor.md)
+- [ceil](./ceil.md)
+- [vceil](./vceil.md)
+- [trunc](./trunc.md)
+- [vtrunc](./vtrunc.md)
+- [round](./round.md)
+- [rint](./rint.md)
+- [vrint](./vrint.md)
+- [nearbyint](./nearbyint.md)
+- [lround](./lround.md)
+- [llround](./llround.md)
+- [lrint](./lrint.md)
+- [llrint](./llrint.md)

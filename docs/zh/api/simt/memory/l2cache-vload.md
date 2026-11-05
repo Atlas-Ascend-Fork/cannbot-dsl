@@ -1,0 +1,78 @@
+# simt.l2cache_vload
+
+## 产品支持情况
+
+- Ascend 950PR&950DT系列产品：支持
+
+## 功能说明
+
+经L2 Cache读取ptr指向的数据；未命中时从GM获取并缓存到L2 Cache，不填入Data Cache。
+
+## 函数原型
+
+```python
+simt.l2cache_vload(ptr, *, dtype) -> 短向量
+```
+
+## 参数说明
+
+| 参数 | 输入/输出 | 说明 |
+| --- | --- | --- |
+| ptr | 输入 | 由`tensor.ptr(...)`获取的GM指针，元素类型为`int8`、`uint8`、`int16`、`uint16`、`int32`、`uint32`、`int64`、`uint64`、`float16`、`bfloat16`、`float32`，必须与短向量分量类型相同。 |
+| dtype | 输入 | 必填的目标短向量类型：整数`int8/uint8`、`int16/uint16`、`int32/uint32`、`int64/uint64`的2或4分量类型，`float32x2`、`float32x4`、`float16x2`、`bfloat16x2`。 |
+
+## 返回值说明
+
+返回dtype对应的短向量，不修改目标内存。
+
+## 约束说明
+
+- UB和通用地址空间指针被拒绝。
+- ptr元素必须与短向量分量一致，所有分量须连续、在界内，起始地址按向量ABI对齐。调用者需保证元素类型与边界正确，`dtype`参数不执行数值转换。
+- L2/GM的一致性不等于各核Data Cache已失效。与普通缓存访问混用且数据被其他核或原子更新后，读取方需要适当DCCI维护；写入与标志传递还应配合同步及内存栅栏。
+
+## 调用示例
+
+经L2 Cache读取连续元素组成短向量，并打印各分量。
+
+```python
+import torch
+import torch_npu
+from cannbotdsl import simt, dtypes, dim3
+from cannbotdsl.lang.host import host
+from cannbotdsl.lang.kernel import kernel
+from cannbotdsl.lang.vf import vf
+from cannbotdsl.tensor import Tensor
+
+
+@kernel
+def demo(src: Tensor, dst: Tensor):
+    with vf(mode='simt'):
+        x = simt.l2cache_vload(src.ptr(0), dtype=dtypes.float16x2)
+        dst[0] = x.x
+        dst[1] = x.y
+
+
+@host
+def run(src, dst):
+    demo[dim3(1), dim3(1)](src, dst)
+
+
+def main():
+    src = torch.tensor([3, 7], device='npu', dtype=torch.float16)
+    dst = torch.zeros(2, device='npu', dtype=torch.float16)
+    run(src, dst)
+    torch.npu.synchronize()
+    assert dst.cpu().tolist() == [3, 7]
+    print(dst.cpu().tolist())
+
+
+if __name__ == "__main__":
+    main()
+```
+
+预期结果：
+
+```text
+[3.0, 7.0]
+```
