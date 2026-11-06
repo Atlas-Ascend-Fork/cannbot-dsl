@@ -391,6 +391,13 @@ flash_attn:
     - test/attention/flash_attn
   options:
     - attention/flash_attn
+flash_attn_fp8_fullquant:
+  module: true
+  src:
+    - samples/attention/flash_attn_fp8_fullquant
+    - test/attention/flash_attn_fp8_fullquant
+  options:
+    - attention/flash_attn_fp8_fullquant
 flash_mla_with_kvcache:
   module: true
   src:

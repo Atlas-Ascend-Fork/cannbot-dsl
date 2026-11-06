@@ -151,6 +151,7 @@ python3 -m pytest test/attention/flash_kda/test_flash_kda.py -v
 | [matmul/weight_quant_batchmatmul](samples/matmul/weight_quant_batchmatmul) | `npu_weight_quant_batchmatmul()` | A16W4 权重量化矩阵乘：FP16 激活 × MXFP4 权重（E2M1 + E8M0 per-32-group scale），WeightNZ 布局 |
 | [grouped_matmul](samples/matmul/grouped_matmul) | `group_matmul()` | 分组矩阵乘，支持 M 轴 / K 轴分组 |
 | [flash_attn](samples/attention/flash_attn) | `flash_attn()`、`flash_attn_metadata()` | Flash Attention，支持 GQA、变长序列和分页 KV cache |
+| [flash_attn_fp8_fullquant](samples/attention/flash_attn_fp8_fullquant) | `flash_attn_fp8_fullquant()` | FP8 全量化 Attention，支持 GQA、变长序列和分页 KV cache |
 | [flash_mla_with_kvcache](samples/attention/flash_mla_with_kvcache) | `flash_mla_with_kvcache()`、`flash_mla_with_kvcache_metadata()` | Flash MLA 推理，Query 为 TND、KV 为分页 cache |
 | [qwen_sparse_attn](samples/attention/qwen_sparse_attn) | `qwen_sparse_attn()` | 固定 `block_size=128` 的分块稀疏注意力，含 AICPU metadata 规划 |
 | [quant_block_sparse_attn](samples/attention/quant_block_sparse_attn) | `quant_block_sparse_attn()`、`quant_block_sparse_attn_metadata()` | FP8 量化块稀疏注意力，面向分页 prefill |

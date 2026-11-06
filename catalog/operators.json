@@ -363,6 +363,10 @@
     "flash_mla_with_kvcache": {
       "source": "samples/attention/flash_mla_with_kvcache",
       "test": "test/attention/flash_mla_with_kvcache"
+    },
+    "flash_attn_fp8_fullquant": {
+      "source": "samples/attention/flash_attn_fp8_fullquant",
+      "test": "test/attention/flash_attn_fp8_fullquant"
     }
   },
   "native_exports": [
@@ -446,6 +450,7 @@
       "mega_reindex",
       "mega_mla",
       "flash_attn",
+      "flash_attn_fp8_fullquant",
       "flash_mla_with_kvcache"
     ],
     "rules": [
@@ -1023,6 +1028,17 @@
         ],
         "tests": [
           "@flash_attn/test"
+        ]
+      },
+      {
+        "name": "flash_attn_fp8_fullquant",
+        "enabled": true,
+        "watch": [
+          "@flash_attn_fp8_fullquant/source",
+          "@flash_attn_fp8_fullquant/test"
+        ],
+        "tests": [
+          "@flash_attn_fp8_fullquant/test"
         ]
       },
       {

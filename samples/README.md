@@ -12,6 +12,7 @@ Attention、MLA、KDA，以及专属索引、前后处理和 KV Cache 算子。
 - [attn_epilogue](attention/attn_epilogue/README.md)
 - [commit_recurrent_kda_replayssm](attention/commit_recurrent_kda_replayssm/README.md)
 - [flash_attn](attention/flash_attn/README.md)
+- [flash_attn_fp8_fullquant](attention/flash_attn_fp8_fullquant/README.md)
 - [flash_mla_with_kvcache](attention/flash_mla_with_kvcache/README.md)
 - [flash_kda](attention/flash_kda/README.md)
 - [flash_kda_cp_main](attention/flash_kda_cp_main/README.md)
