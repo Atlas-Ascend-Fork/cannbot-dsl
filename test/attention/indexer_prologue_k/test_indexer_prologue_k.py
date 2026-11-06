@@ -8,12 +8,10 @@
 
 import inspect
 import math
-import random
 
 import pytest
 import torch
 
-import cannbotdsl
 from _samples_path import load_sample
 
 
@@ -49,9 +47,7 @@ def test_public_argument_order_and_parameter_kinds():
 
 def _make_rope(t, dr, generator):
     positions = torch.arange(t, dtype=torch.float32).unsqueeze(1)
-    frequencies = 1.0 / (
-        40000.0 ** (torch.arange(0, dr, 2, dtype=torch.float32) / dr)
-    )
+    frequencies = 1.0 / (40000.0 ** (torch.arange(0, dr, 2, dtype=torch.float32) / dr))
     base = (positions * frequencies.unsqueeze(0)).repeat_interleave(2, dim=-1)
     # Deliberately keep adjacent coefficients distinct: the current reference
     # applies sin/cos elementwise even though model-produced values commonly
@@ -75,8 +71,7 @@ def _make_inputs(
     generator = torch.Generator(device="cpu").manual_seed(seed)
     latent = torch.randn(t, h, generator=generator).to(torch.bfloat16)
     wk = (
-        torch.randn(d, h, generator=generator, dtype=torch.float32)
-        / math.sqrt(h)
+        torch.randn(d, h, generator=generator, dtype=torch.float32) / math.sqrt(h)
     ).to(torch.bfloat16)
     norm_weight = torch.randn(d, generator=generator, dtype=torch.float32)
     rope_sin, rope_cos = _make_rope(t, dr, generator)
@@ -91,9 +86,7 @@ def _make_inputs(
             1,
             combined_block_size * (value_bytes + scale_bytes),
         )
-    k_cache = torch.randint(
-        0, 256, cache_shape, generator=generator, dtype=torch.uint8
-    )
+    k_cache = torch.randint(0, 256, cache_shape, generator=generator, dtype=torch.uint8)
     k_scale_cache = None
     if storage_mode == 0 and with_scale_cache:
         k_scale_cache = torch.randint(
@@ -159,9 +152,7 @@ def _golden(
 ):
     # The updated reference publishes BF16 matmul output before RMSNorm.
     key_fp32 = torch.matmul(latent, wk.T).float()
-    inverse_rms = torch.rsqrt(
-        key_fp32.square().mean(dim=-1, keepdim=True) + norm_eps
-    )
+    inverse_rms = torch.rsqrt(key_fp32.square().mean(dim=-1, keepdim=True) + norm_eps)
     key = (key_fp32 * inverse_rms * norm_weight).to(torch.bfloat16)
 
     dr = rope_sin.shape[-1]
@@ -169,12 +160,8 @@ def _golden(
     even = tail[:, 0::2]
     odd = tail[:, 1::2]
     rotated = torch.empty_like(tail)
-    rotated[:, 0::2] = (
-        even * rope_cos[:, 0::2] - odd * rope_sin[:, 0::2]
-    )
-    rotated[:, 1::2] = (
-        odd * rope_cos[:, 1::2] + even * rope_sin[:, 1::2]
-    )
+    rotated[:, 0::2] = even * rope_cos[:, 0::2] - odd * rope_sin[:, 0::2]
+    rotated[:, 1::2] = odd * rope_cos[:, 1::2] + even * rope_sin[:, 1::2]
     key[:, -dr:] = rotated.to(torch.bfloat16)
 
     packed_data, packed_scale = _pack_mxfp4(key)
@@ -231,17 +218,13 @@ def _is_acceptable_quantization_tie(
     for their respective intermediate. Scale bytes and non-data cache regions
     remain bit-exact.
     """
-    max_mismatched_bytes = max(
-        1, math.ceil(total_rows * index_head_dim / 1_000_000)
-    )
+    max_mismatched_bytes = max(1, math.ceil(total_rows * index_head_dim / 1_000_000))
     if mismatch.shape[0] > max_mismatched_bytes:
         return False
 
     value_bytes = index_head_dim // 2
     data_region_bytes = (
-        value_bytes
-        if storage_mode == 0
-        else combined_block_size * value_bytes
+        value_bytes if storage_mode == 0 else combined_block_size * value_bytes
     )
     for coordinate in mismatch:
         index = tuple(coordinate.tolist())
@@ -313,9 +296,7 @@ def _run_case(
         storage_mode,
         combined_block_size,
     )
-    wk_npu = torch_npu.npu_format_cast(
-        wk.npu(), torch_npu.Format.FRACTAL_NZ
-    )
+    wk_npu = torch_npu.npu_format_cast(wk.npu(), torch_npu.Format.FRACTAL_NZ)
 
     def make_cache_view(tensor):
         if block_axis_step == 1 and block_axis_start == 0:
@@ -336,9 +317,7 @@ def _run_case(
         scale_npu, scale_backing = None, None
     else:
         scale_npu, scale_backing = make_cache_view(scale)
-    optional_args = (
-        {} if scale_npu is None else {"k_scale_cache": scale_npu}
-    )
+    optional_args = {} if scale_npu is None else {"k_scale_cache": scale_npu}
     actual = indexer_prologue_k(
         latent.npu(),
         wk_npu,
@@ -426,15 +405,61 @@ def test_indexer_prologue_k_npu(storage_mode, group_size, with_scale):
 
 
 @pytest.mark.npu
+def test_indexer_prologue_k_projection_tail_no_oob_npu(monkeypatch):
+    torch_npu = pytest.importorskip("torch_npu")
+    t, h, d, dr = 1, 512, 128, 64
+    guard_rows = 16
+    inputs = _make_inputs(t, h, d, dr, 2, 64, 0, -1, True, 20261001)
+    latent, wk, norm_weight, rope_sin, rope_cos, k_cache, cache_index, scale = inputs
+    wk_npu = torch_npu.npu_format_cast(wk.npu(), torch_npu.Format.FRACTAL_NZ)
+    allocated = {}
+
+    class GuardedTorch:
+        def __getattr__(self, name):
+            return getattr(torch, name)
+
+        def empty(self, size, *args, **kwargs):
+            shape = tuple(size)
+            if (
+                len(shape) == 2
+                and shape[1] == d
+                and kwargs.get("dtype") == torch.bfloat16
+                and t <= shape[0] <= t + guard_rows
+            ):
+                backing = torch.empty((shape[0] + guard_rows, d), *args, **kwargs)
+                backing.view(torch.int16).fill_(0x7FFF)
+                allocated["rows"] = shape[0]
+                allocated["backing"] = backing
+                return backing[: shape[0]]
+            return torch.empty(size, *args, **kwargs)
+
+    monkeypatch.setattr(_module, "torch", GuardedTorch())
+    indexer_prologue_k(
+        latent.npu(),
+        wk_npu,
+        norm_weight.npu(),
+        rope_sin.npu(),
+        rope_cos.npu(),
+        k_cache.npu(),
+        k_scale_cache=scale.npu(),
+        cache_index=cache_index.npu(),
+        storage_mode=0,
+        norm_eps=1e-6,
+    )
+    torch_npu.npu.synchronize()
+    backing = allocated["backing"].cpu()
+    guard = backing[allocated["rows"] :].view(torch.int16)
+    assert bool((guard == 0x7FFF).all())
+
+
+@pytest.mark.npu
 @pytest.mark.parametrize(
     "storage_mode,group_size,with_scale",
     [
         pytest.param(0, -1, True, id="mode0_with_scale"),
     ],
 )
-def test_indexer_prologue_k_duplicate_indices_npu(
-    storage_mode, group_size, with_scale
-):
+def test_indexer_prologue_k_duplicate_indices_npu(storage_mode, group_size, with_scale):
     _run_case(
         8,
         512,
