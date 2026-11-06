@@ -223,6 +223,8 @@ def test_ds41_selection():
         "indexer_prologue_k",
         "engram_gate",
         "attn_epilogue",
+        "mega_mla",
+        "mega_full_index",
     } <= set(operators)
     assert groups["ds41"] == [
         "mqsmla",
@@ -232,6 +234,8 @@ def test_ds41_selection():
         "indexer_prologue_k",
         "engram_gate",
         "attn_epilogue",
+        "mega_mla",
+        "mega_full_index",
     ]
     assert builder.choose_operators(
         builder.parse_args(["--group", "ds41"]), operators, groups

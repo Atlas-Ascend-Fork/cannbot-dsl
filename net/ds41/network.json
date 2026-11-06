@@ -8,6 +8,8 @@
     "indexer_prologue_qw",
     "indexer_prologue_k",
     "engram_gate",
-    "attn_epilogue"
+    "attn_epilogue",
+    "mega_mla",
+    "mega_full_index"
   ]
 }

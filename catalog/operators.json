@@ -300,7 +300,15 @@
     },
     "mega_full_index": {
       "source": "samples/attention/mega_full_index",
-      "test": "test/attention/mega_full_index"
+      "test": "test/attention/mega_full_index",
+      "native": {
+        "export": "mega_full_index",
+        "sources": [
+          "@mega_full_index/source/mega_full_index.py",
+          "@mega_full_index/source/prologue.py",
+          "@mega_full_index/source/qli.py"
+        ]
+      }
     },
     "mega_reindex": {
       "source": "samples/attention/mega_reindex",
@@ -313,6 +321,32 @@
     "quant_batch_matmul_mxa8w4": {
       "source": "samples/matmul/quant_matmul/quant_batch_matmul_mxa8w4.py",
       "test": "test/matmul/quant_matmul/test_quant_batch_matmul_mxa8w4.py"
+    },
+    "mega_mla": {
+      "source": "samples/attention/mega_mla",
+      "test": "test/attention/mega_mla",
+      "native": {
+        "export": "mega_mla",
+        "sources": [
+          "@mega_mla/source/mega_mla_native.py",
+          "@mega_mla/source/attention_geometry.py",
+          "@mega_mla/source/attention_inputs.py",
+          "@mega_mla/source/attention_matmul.py",
+          "@mega_mla/source/mega_mla.py",
+          "@mega_mla/source/mega_mla_kernel.py",
+          "@mega_mla/source/attention_pipeline.py",
+          "@mega_mla/source/attention_sequence_filter.py",
+          "@mega_mla/source/attention_sequence_inputs.py",
+          "@mega_mla/source/attention_workspace.py",
+          "@mega_mla/source/cache_decode.py",
+          "@mega_mla/source/compressed_cache_gather.py",
+          "@mega_mla/source/dual_cache_vector_attention.py",
+          "@mega_mla/source/mxfp8_matmul.py",
+          "@mega_mla/source/paged_cache.py",
+          "@mega_mla/source/qkv_projection.py",
+          "@mega_mla/source/rotary_position_embedding.py"
+        ]
+      }
     },
     "quant_batch_matmul_inplace_add": {
       "source": "samples/matmul/quant_matmul/quant_batch_matmul_inplace_add.py",
@@ -351,7 +385,9 @@
     "commit_recurrent_kda_replayssm",
     "quant_mla_prolog",
     "mla_prolog_v4",
-    "moonep"
+    "moonep",
+    "mega_mla",
+    "mega_full_index"
   ],
   "ci": {
     "skip_all_tests": false,
@@ -408,6 +444,7 @@
       "dynamic_mx_quant_sr",
       "mega_full_index",
       "mega_reindex",
+      "mega_mla",
       "flash_attn",
       "flash_mla_with_kvcache"
     ],
@@ -941,7 +978,9 @@
           "@indexer_prologue_qw/test",
           "@indexer_prologue_k/test",
           "@engram_gate/test",
-          "@attn_epilogue/test"
+          "@attn_epilogue/test",
+          "@mega_mla/test",
+          "@mega_full_index/test"
         ]
       },
       {
@@ -962,6 +1001,17 @@
           "@mega_recurrent_kda_replayssm/test",
           "@commit_recurrent_kda_replayssm/test",
           "@quant_mla_prolog/test"
+        ]
+      },
+      {
+        "name": "mega_mla",
+        "enabled": true,
+        "watch": [
+          "@mega_mla/source",
+          "@mega_mla/test"
+        ],
+        "tests": [
+          "@mega_mla/test"
         ]
       },
       {

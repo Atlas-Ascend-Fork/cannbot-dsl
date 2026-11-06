@@ -22,6 +22,7 @@ Attention、MLA、KDA，以及专属索引、前后处理和 KV Cache 算子。
 - [fused_recurrent_kda_snapshot](attention/fused_recurrent_kda_snapshot/README.md)
 - [indexer_prologue_k](attention/indexer_prologue_k/README.md)
 - [indexer_prologue_qw](attention/indexer_prologue_qw/README.md)
+- [mega_mla](attention/mega_mla/README.md)
 - [mega_full_index](attention/mega_full_index/README.md)
 - [mega_recurrent_kda](attention/mega_recurrent_kda/README.md)
 - [mega_recurrent_kda_replayssm](attention/mega_recurrent_kda_replayssm/README.md)

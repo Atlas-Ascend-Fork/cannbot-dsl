@@ -50,5 +50,6 @@ operators:
   - vector/dynamic_mx_quant_sr
   - attention/mega_full_index
   - attention/mega_reindex
+  - attention/mega_mla
   - attention/flash_attn
   - attention/flash_mla_with_kvcache
