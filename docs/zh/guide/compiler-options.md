@@ -46,6 +46,8 @@ python my_op.py
 
 `.asc` 文件就是最终交给毕昇编译器的 AscendC 源码——循环展成了什么样、同步插在哪里、tile 常量固化成了多少，全部可读。这是验证「显式 DSL 的承诺是否兑现」最硬的证据。
 
+归档会在`CANNBOTDSL_DUMP_DIR/asc/`下按算子身份、参数shape和dtype保存各个编译变体，避免同名入口互相覆盖。根目录的`<function>.asc`仍只保留最近一次源码。目录规则、元数据及算子包构建注意事项见[AscendC源码归档](./ascendc-dump.md)。
+
 想直接打到终端而不落盘：
 
 | 变量 | 作用 |

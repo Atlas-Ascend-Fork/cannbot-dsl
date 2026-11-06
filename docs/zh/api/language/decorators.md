@@ -116,6 +116,16 @@ def add(x, y, out):
 
 类装饰器记录构造参数，并在设备函数构建时执行 `__init__`。构造参数用于传递编译期配置，运行时参数应通过 Kernel 入口方法传入。
 
+### Profiling 名称与类型
+
+未配置 profiling 名称时，框架根据实际 Kernel 入口自动补齐 `name` 和 `op_type`。
+普通函数使用函数名；类形式使用“类名 + 下划线 + 方法名”，例如
+`AddKernel___call__`。
+
+可以通过 `@cb.kernel(profile=cb.ProfileSpec(...))` 显式配置名称、逻辑类型和 Tensor
+参数角色。默认补齐、字段独立回退、多入口及性能工具展示规则，见
+[Profiling 名称与类型](./profiling.md)。
+
 ## `@datastruct`
 
 `@datastruct` 用于声明一组具有名称和类型的字段。此类对象可以在普通 Python 中创建，也可以作为 DSL 程序或 Kernel 的参数。

@@ -7,3 +7,4 @@
 - [装饰器](./decorators.md)
 - [控制流](./control-flow/index.md)
 - [启动 Kernel](./launch.md)
+- [Profiling 名称与类型](./profiling.md)

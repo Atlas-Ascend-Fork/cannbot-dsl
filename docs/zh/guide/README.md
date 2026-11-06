@@ -23,6 +23,7 @@
 - [工程化与附录](compiler-options.md)
   - [高性能算子编写指南](performance.md)
   - [调试与精度验证](debugging.md)
+  - [AscendC源码归档](ascendc-dump.md)
   - [AOT 与 Native 算子包](aot-packaging.md)
   - [当前限制、迁移与常见问题](limitations.md)
   - [概念对照、命名速查与术语表](appendix.md)

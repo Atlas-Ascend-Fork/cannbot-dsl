@@ -237,6 +237,12 @@ Host 侧的构图、编译和运行错误由 `CANNBotError` 及 `DiagnosticCode`
 3. 检查 Scalar 对 GM 的读写是否需要 `dcci_*` / `dci`，或改用 `load_bypass` / `vec_store_bypass` / `cube_store_bypass`。
 4. 检查多核写入的 GM 地址是否对齐到 Cache Line。
 
+## 设备周期打点与源码归档
+
+[print_time_stamp](../api/debug/print_time_stamp.md)在Kernel标量代码中记录周期、PC和核信息。`marker_id`只标识代码位置；多核归属及原生二进制落盘、解析方法见接口文档。打点不会自动等待全部流水完成，不能把标量推进时间直接当作异步计算完成时间。
+
+[AscendC源码归档](./ascendc-dump.md)在编译阶段按算子、shape和dtype保存源码及元数据。它不采集运行时Tensor内容；其`CANNBOTDSL_DUMP_DIR`也不是timestamp原生二进制的保存配置。
+
 ## 性能分析
 
 ### 用 msprof 采集
@@ -266,7 +272,9 @@ dt = (time.perf_counter() - t0) / 100
 
 ### DSL 内置的 profiling 入口
 
-Host API 提供 `ProfileSpec` 和 `profiler.report_tensor_info` 用于配置 profiling 与报告张量信息，见 [Host API](../api/compilation/host/index.md)。
+通过 `@kernel(profile=cannbotdsl.ProfileSpec(...))` 配置上报名称、逻辑类型及 Tensor 参数角色；
+未提供配置时，框架自动补齐名称并推导默认 Tensor 角色。具体规则见
+[Profiling 名称与类型](../api/language/profiling.md)。
 
 设备侧可以用 [`get_system_cycle()`](../api/execution/device/get-system-cycle.md) 读周期数，给关键代码段做粗粒度计时。注意这会引入标量指令，别放在最内层循环里。
 

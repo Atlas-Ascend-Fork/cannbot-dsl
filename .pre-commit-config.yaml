@@ -41,7 +41,7 @@ repos:
         entry: bash scripts/run_codespell.sh
         args: [
             "-L",
-            "CANN,cann,ascend,Ascend,tbe,EnQue,CopyIn,nd2nz,ND,NZ,NNAL,nnal,ASCEND,ArchType,AND,ND,nd,te,copyin,alog,wIh,dout,indexs,inH,padD,outWeight,vor,invokable,VALU,LastR,nin,COO,registe,CLen,REGIST,fo,subtile,rIn,IndexT,ot,iput,datas",
+            "CANN,cann,ascend,Ascend,tbe,EnQue,CopyIn,nd2nz,ND,NZ,NNAL,nnal,ASCEND,ArchType,AND,ND,nd,te,copyin,alog,wIh,dout,indexs,inH,padD,outWeight,vor,invokable,VALU,LastR,nin,COO,registe,CLen,REGIST,fo,subtile,rIn,IndexT,ot,iput,datas,inouts",
           ]
   - repo: https://gitcode.com/HiAgent/compliance
     rev: v1.0.6

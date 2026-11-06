@@ -80,6 +80,7 @@ const programmingModelSidebar = [
       { text: '编译选项与产物观察', link: '/zh/guide/compiler-options' },
       { text: '高性能算子编写指南', link: '/zh/guide/performance' },
       { text: '调试与精度验证', link: '/zh/guide/debugging' },
+      { text: 'AscendC源码归档', link: '/zh/guide/ascendc-dump' },
       { text: 'AOT 与 Native 算子包', link: '/zh/guide/aot-packaging' },
       { text: '当前限制、迁移与常见问题', link: '/zh/guide/limitations' },
       { text: '概念对照、命名速查与术语表', link: '/zh/guide/appendix' }
@@ -1302,6 +1303,10 @@ const apiSidebar = [
           {
             "text": "Kernel 启动配置",
             "link": "/zh/api/language/launch"
+          },
+          {
+            "text": "Profiling 名称与类型",
+            "link": "/zh/api/language/profiling"
           }
         ],
         "collapsed": true
@@ -2417,8 +2422,20 @@ const apiSidebar = [
             "link": "/zh/api/debug",
             "items": [
               {
+                "text": "dump_tensor",
+                "link": "/zh/api/debug/dump_tensor"
+              },
+              {
+                "text": "dump_reg",
+                "link": "/zh/api/debug/dump_reg"
+              },
+              {
                 "text": "print",
                 "link": "/zh/api/debug/print"
+              },
+              {
+                "text": "print_time_stamp",
+                "link": "/zh/api/debug/print_time_stamp"
               }
             ],
             "collapsed": true
@@ -2890,6 +2907,7 @@ const normalizeApiSidebar = (sidebar: any[]) => {
       find(languageItems, '/language/decorators'),
       controlFlow,
       find(languageItems, '/language/launch'),
+      find(languageItems, '/language/profiling'),
     ].filter(Boolean)
   }
 

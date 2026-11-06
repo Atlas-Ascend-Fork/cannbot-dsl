@@ -22,3 +22,10 @@
 | TensorList | DSL 的 Tensor 列表参数类型；Host 侧传入真实 Tensor 的 list 或 tuple，提前编译时使用 TensorListSpec 描述。 |
 | 逻辑核（block） | Kernel启动时配置的逻辑执行单元，通过逻辑核索引划分数据；在Mix 1:2模式下，每个逻辑核组合包含一个Cube Core和两个Vector Core。 |
 | 子核（subblock） | 一个逻辑核组合中参与执行的同类核心实例，可通过子核索引区分。 |
+| AIC、AIV | 分别指执行Cube计算和Vector计算的核类型；不是设备编号。 |
+| MIX | AIC和AIV协同执行同一混合Kernel的模式。 |
+| VF（Vector Function） | 在核函数中调用的矢量函数；timestamp打点应安排在VF之外的标量代码中。 |
+| PC（Program Counter） | 程序计数器。timestamp中的PC在SDK打点实现内部采样，不直接等同于用户源码行号。 |
+| 设备周期计数（cycle） | 设备系统计数器的计数值。时间换算需要对应芯片的计数频率，不能直接使用计算核工作频率。 |
+| 打点编号（marker_id） | 用户用于标识源码位置的编号，对应原生日志中的descId；不表示核编号。 |
+| 核索引（coreIndex） | CANN原生诊断缓冲使用的核索引，与核类型共同标识输出来源，不保证等于逻辑block索引。 |
