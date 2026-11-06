@@ -477,7 +477,7 @@ python packaging/native/build.py --operator quant_mla_prolog --target dav-3510
 打包器复用上述 AOT 导出入口，将源码与 `_native` 一同放入 `ops` 包，
 产物位于 `packaging/native/output/operators/quant_mla_prolog/wheels/`。
 安装后从 `ops.quant_mla_prolog` 导入。同一环境同时使用两个算子时，
-用 `--operators mla_prolog quant_mla_prolog` 联合构建；两个单算子 wheel
+用 `--operators mla_prolog_v4 quant_mla_prolog` 联合构建；两个单算子 wheel
 沿用同一分发名，不应依次安装来合并。详见[官方打包说明](../../../packaging/native/README.md)。
 
 HiF8 两方比较将设备输出与普通 Golden 的 HiF8 编码分别解码为 FP32，再按 ULP 规则比较；不再使用普通 Golden 量化前中间值。ULP 公式、门限、特殊值处理及三方比较规则不变。

@@ -41,7 +41,7 @@ operators:
   - attention/mega_recurrent_kda_replayssm
   - attention/commit_recurrent_kda_replayssm
   - attention/quant_mla_prolog
-  - attention/mla_prolog
+  - attention/mla_prolog_v4
   - vector/gather_v2
   - vector/scatter_elements
   - mc2/moonep

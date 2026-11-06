@@ -15,13 +15,13 @@ ignore:
   - scripts/format_cpp.sh
   - scripts/run_codespell.sh
   - test/test_config.yaml
-mla_prolog:
+mla_prolog_v4:
   module: true
   src:
-    - samples/attention/mla_prolog
-    - test/attention/mla_prolog
+    - samples/attention/mla_prolog_v4
+    - test/attention/mla_prolog_v4
   options:
-    - attention/mla_prolog
+    - attention/mla_prolog_v4
 add:
   module: true
   src:

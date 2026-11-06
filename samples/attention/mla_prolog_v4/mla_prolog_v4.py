@@ -84,9 +84,9 @@ __all__ = [
     "CacheMode",
     "QkvQuantMode",
     "RopeMode",
-    "mla_prolog",
-    "torch_mla_prolog",
-    "export_mla_prolog",
+    "mla_prolog_v2",
+    "torch_mla_prolog_v2",
+    "export_mla_prolog_v4",
 ]
 
 # Source imports have no bundled resources; wheels register them on the same import.
@@ -5988,8 +5988,8 @@ def _validate_quant_scale_value(quant_scale_kv):
     """
     if torch.npu.is_current_stream_capturing():
         raise RuntimeError(
-            "checked Torch mla_prolog does not support graph capture; "
-            "validate inputs before capture and use the public mla_prolog entry"
+            "checked Torch mla_prolog_v2 does not support graph capture; "
+            "validate inputs before capture and use the public mla_prolog_v2 entry"
         )
     if quant_scale_kv is not None:
         scale = quant_scale_kv.detach().cpu().item()
@@ -5998,7 +5998,7 @@ def _validate_quant_scale_value(quant_scale_kv):
 
 
 # Direct Python entry: fixed (q, descale_q, qr) slots; kv_cache is mutated in place.
-def mla_prolog_native(
+def mla_prolog_v2_native(
     x: torch.Tensor,
     wqa: torch.Tensor,
     wqb: torch.Tensor,
@@ -6169,8 +6169,8 @@ def _export_keys():
 
 
 # Native export uses the same compilation factory as direct and Torch execution.
-@export("mla_prolog")
-def export_mla_prolog():
+@export("mla_prolog_v4")
+def export_mla_prolog_v4():
     for key in _export_keys():
         program = build_program(key)
         program.close()
@@ -6191,7 +6191,7 @@ _LIBRARY = None
 
 
 _TORCH_SCHEMA = (
-    "mla_prolog("
+    "mla_prolog_v2("
     "Tensor x, "
     "Tensor wqa, "
     "Tensor wqb, "
@@ -6228,7 +6228,7 @@ def _validate_schema_modes(qkv_quant_mode, cache_mode, rope_mode):
             raise ValueError(f"{name} has unsupported schema value {value}")
 
 
-def mla_prolog_npu(
+def mla_prolog_v2_npu(
     x: torch.Tensor,
     wqa: torch.Tensor,
     wqb: torch.Tensor,
@@ -6274,7 +6274,7 @@ def mla_prolog_npu(
         return_qr,
     )
     _validate_quant_scale_value(quant_scale_kv)
-    return mla_prolog_native(
+    return mla_prolog_v2_native(
         x,
         wqa,
         wqb,
@@ -6299,7 +6299,7 @@ def mla_prolog_npu(
 
 # Fake tensors describe outputs only, without a device launch. Disabled outputs and
 # empty descale use shape (0,).
-def mla_prolog_fake(
+def mla_prolog_v2_fake(
     x: torch.Tensor,
     wqa: torch.Tensor,
     wqb: torch.Tensor,
@@ -6347,7 +6347,7 @@ def mla_prolog_fake(
     )
 
 
-def _mla_prolog_graph_npu(
+def _mla_prolog_v2_graph_npu(
     x,
     wqa,
     wqb,
@@ -6371,7 +6371,7 @@ def _mla_prolog_graph_npu(
 ):
     """Graph dispatch requires device values validated outside capture/replay."""
     _validate_schema_modes(qkv_quant_mode, cache_mode, rope_mode)
-    return mla_prolog_native(
+    return mla_prolog_v2_native(
         x,
         wqa,
         wqb,
@@ -6397,37 +6397,37 @@ def _mla_prolog_graph_npu(
 def _register_torch():
     global _LIBRARY
     schemas = (
-        ("mla_prolog", _TORCH_SCHEMA, mla_prolog_npu),
+        ("mla_prolog_v2", _TORCH_SCHEMA, mla_prolog_v2_npu),
         (
-            "_mla_prolog_graph",
-            _TORCH_SCHEMA.replace("mla_prolog(", "_mla_prolog_graph(", 1),
-            _mla_prolog_graph_npu,
+            "_mla_prolog_v2_graph",
+            _TORCH_SCHEMA.replace("mla_prolog_v2(", "_mla_prolog_v2_graph(", 1),
+            _mla_prolog_v2_graph_npu,
         ),
     )
-    existing = getattr(torch.ops.cannbot_dsl_mla_prolog, "mla_prolog", None)
+    existing = getattr(torch.ops.cannbot_dsl_mla_prolog_v4, "mla_prolog_v2", None)
     if existing is not None:
         for name, schema, _ in schemas:
-            registered = getattr(torch.ops.cannbot_dsl_mla_prolog, name, None)
-            expected = torch._C.parse_schema("cannbot_dsl_mla_prolog::" + schema)
+            registered = getattr(torch.ops.cannbot_dsl_mla_prolog_v4, name, None)
+            expected = torch._C.parse_schema("cannbot_dsl_mla_prolog_v4::" + schema)
             if registered is None or str(registered.default._schema) != str(expected):
                 raise RuntimeError(
-                    "mla_prolog is already registered with another schema"
+                    "mla_prolog_v2 is already registered with another schema"
                 )
         return
     # Native discovery reimports this file under a temporary module name. Keep the
     # first registration alive and do not register the same Torch schema twice.
-    _LIBRARY = torch.library.Library("cannbot_dsl_mla_prolog", "FRAGMENT")
+    _LIBRARY = torch.library.Library("cannbot_dsl_mla_prolog_v4", "FRAGMENT")
     for name, schema, implementation in schemas:
         _LIBRARY.define(schema)
         impl(_LIBRARY, name, "PrivateUse1")(implementation)
-        torch.library.register_fake("cannbot_dsl_mla_prolog::" + name)(mla_prolog_fake)
+        torch.library.register_fake("cannbot_dsl_mla_prolog_v4::" + name)(mla_prolog_v2_fake)
 
 
 _register_torch()
 
 
 # Checked Eager entry. Preserve enum validation before entering the dispatcher.
-def mla_prolog(
+def mla_prolog_v2(
     x: torch.Tensor,
     wqa: torch.Tensor,
     wqb: torch.Tensor,
@@ -6464,14 +6464,14 @@ def mla_prolog(
     # Torch's float schema coerces bool, so check Python types before dispatch.
     _validate_scalar_types(norm_eps, qr_scale, kvr_scale)
     dispatch = (
-        torch.ops.cannbot_dsl_mla_prolog._mla_prolog_graph.default
+        torch.ops.cannbot_dsl_mla_prolog_v4._mla_prolog_v2_graph.default
         if torch.compiler.is_compiling()
         or (
             isinstance(x, torch.Tensor)
             and x.device.type in ("npu", "privateuseone")
             and torch.npu.is_current_stream_capturing()
         )
-        else torch.ops.cannbot_dsl_mla_prolog.mla_prolog.default
+        else torch.ops.cannbot_dsl_mla_prolog_v4.mla_prolog_v2.default
     )
     return dispatch(
         x,
@@ -6497,10 +6497,10 @@ def mla_prolog(
 
 
 # Compatibility name; registration and graph routing stay behind the public API.
-torch_mla_prolog = mla_prolog
+torch_mla_prolog_v2 = mla_prolog_v2
 
 
-for _entry in (mla_prolog, mla_prolog_native):
+for _entry in (mla_prolog_v2, mla_prolog_v2_native):
     _entry.QkvQuantMode = QkvQuantMode
     _entry.CacheMode = CacheMode
     _entry.RopeMode = RopeMode

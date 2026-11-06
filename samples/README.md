@@ -26,7 +26,7 @@ Attention、MLA、KDA，以及专属索引、前后处理和 KV Cache 算子。
 - [mega_recurrent_kda](attention/mega_recurrent_kda/README.md)
 - [mega_recurrent_kda_replayssm](attention/mega_recurrent_kda_replayssm/README.md)
 - [mixed_quant_sparse_flash_mla](attention/mixed_quant_sparse_flash_mla/README.md)
-- [mla_prolog](attention/mla_prolog/README.md)
+- [mla_prolog_v4](attention/mla_prolog_v4/README.md)
 - [qsa_indexer](attention/qsa_indexer/README.md)
 - [quant_block_sparse_attn](attention/quant_block_sparse_attn/README.md)
 - [quant_lightning_indexer](attention/quant_lightning_indexer/README.md)

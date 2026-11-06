@@ -1452,7 +1452,7 @@ ROPE_MODES = {"NO_ROPE": 0, "ROPE_INTERLEAVE_HALF": 1, "ROPE_HALF": 2}
 
 
 def check_enum_contract(module):
-    name = "mla_prolog"
+    name = "mla_prolog_v2"
     operator = getattr(module, name)
     native = getattr(module, name + "_native")
     entries = [operator, native]
@@ -1479,7 +1479,7 @@ def check_enum_contract(module):
             for bad in (0, 1, 2, 3, True, 1.0, "1", None, foreign):
                 with pytest.raises(TypeError, match=attr):
                     entry(*inputs, **dict(attrs, **{attr: bad}))
-    namespace = torch.ops.cannbot_dsl_mla_prolog
+    namespace = torch.ops.cannbot_dsl_mla_prolog_v4
     with (
         patch.object(torch.compiler, "is_compiling", return_value=False),
         patch.object(getattr(namespace, name), "default") as dispatch,
@@ -1497,7 +1497,7 @@ def check_enum_contract(module):
         module._validate_schema_modes(0, 0, 3)
 
 
-op = load_sample("attention/mla_prolog/mla_prolog.py")
+op = load_sample("attention/mla_prolog_v4/mla_prolog_v4.py")
 pytestmark = pytest.mark.npu
 CASES = (
     (0, "ND", "PA_BSND", 128, 64, 1, True),
@@ -1558,9 +1558,9 @@ def make_inputs(case, device):
     )
     public_attrs = dict(
         attrs,
-        qkv_quant_mode=op.mla_prolog.QkvQuantMode(mode),
-        cache_mode=op.mla_prolog.CacheMode[cache_mode],
-        rope_mode=op.mla_prolog.RopeMode(rope_mode),
+        qkv_quant_mode=op.mla_prolog_v2.QkvQuantMode(mode),
+        cache_mode=op.mla_prolog_v2.CacheMode[cache_mode],
+        rope_mode=op.mla_prolog_v2.RopeMode(rope_mode),
     )
     return cpu, actual, attrs, public_attrs
 
@@ -1650,7 +1650,7 @@ def audit_trace(trace, execution):
 
 def run_entry(actual, attrs, execution, trace_dir):
     # Preflight and compilation are outside capture; replay must not read values to CPU.
-    result = op.mla_prolog(**actual, **attrs)
+    result = op.mla_prolog_v2(**actual, **attrs)
     torch.npu.synchronize()
     if execution == "eager":
         assert trace_dir is None, "Trace audit requires aclgraph or npugraph-ex"
@@ -1660,7 +1660,7 @@ def run_entry(actual, attrs, execution, trace_dir):
 
         def capture_and_replay():
             with torch.npu.graph(graph):
-                output = op.mla_prolog(**actual, **attrs)
+                output = op.mla_prolog_v2(**actual, **attrs)
             with torch.profiler.record_function("MLAP_REPLAY"):
                 graph.replay()
             return output
@@ -1671,7 +1671,7 @@ def run_entry(actual, attrs, execution, trace_dir):
     elif execution == "npugraph-ex":
         torch.compiler.reset()
         compiled = torch.compile(
-            op.mla_prolog,
+            op.mla_prolog_v2,
             backend="npugraph_ex",
             fullgraph=True,
             dynamic=False,
@@ -1728,7 +1728,7 @@ def check_zero_cache_scale(cpu, actual, attrs, outputs, before):
     zero_inputs = dict(
         actual, quant_scale_kv=torch.zeros_like(actual["quant_scale_kv"])
     )
-    zero_outputs = op.mla_prolog(**zero_inputs, **attrs)
+    zero_outputs = op.mla_prolog_v2(**zero_inputs, **attrs)
     torch.npu.synchronize()
     assert cache_identity(actual["kv_cache"]) == identity
     assert all(
@@ -1763,7 +1763,7 @@ def check_changed_input_replay(cpu, actual, attrs, replay, original, before):
     observed = [value.cpu().contiguous().view(torch.uint8).clone() for value in updated]
     cache = actual["kv_cache"].cpu().view(torch.uint8).clone()
     actual["kv_cache"].copy_(before.to(actual["x"].device))
-    expected = op.mla_prolog(**actual, **attrs)
+    expected = op.mla_prolog_v2(**actual, **attrs)
     torch.npu.synchronize()
     assert not torch.equal(original_q, observed[0]), "Replay reused stale Q"
     assert all(
@@ -1783,7 +1783,7 @@ def enum_contract():
 @pytest.mark.parametrize(
     "case", CASES, ids=("mode0", "mode1", "mode2", "mode3", "half_nd", "half_nz")
 )
-def test_mla_prolog(case):
+def test_mla_prolog_v2(case):
     cache_factor, cache_gap, cache_offset = CACHE_LAYOUTS[case[0]]
     if not torch.npu.is_available():
         pytest.skip("Ascend NPU required")

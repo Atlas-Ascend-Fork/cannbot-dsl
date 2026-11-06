@@ -258,13 +258,13 @@
         ]
       }
     },
-    "mla_prolog": {
-      "source": "samples/attention/mla_prolog",
-      "test": "test/attention/mla_prolog",
+    "mla_prolog_v4": {
+      "source": "samples/attention/mla_prolog_v4",
+      "test": "test/attention/mla_prolog_v4",
       "native": {
-        "export": "mla_prolog",
+        "export": "mla_prolog_v4",
         "sources": [
-          "@mla_prolog/source/mla_prolog.py"
+          "@mla_prolog_v4/source/mla_prolog_v4.py"
         ]
       }
     },
@@ -350,7 +350,7 @@
     "mega_recurrent_kda_replayssm",
     "commit_recurrent_kda_replayssm",
     "quant_mla_prolog",
-    "mla_prolog",
+    "mla_prolog_v4",
     "moonep"
   ],
   "ci": {
@@ -399,7 +399,7 @@
       "mega_recurrent_kda_replayssm",
       "commit_recurrent_kda_replayssm",
       "quant_mla_prolog",
-      "mla_prolog",
+      "mla_prolog_v4",
       "gather_v2",
       "scatter_elements",
       "moonep",
@@ -413,14 +413,14 @@
     ],
     "rules": [
       {
-        "name": "mla_prolog",
+        "name": "mla_prolog_v4",
         "enabled": true,
         "watch": [
-          "@mla_prolog/source",
-          "@mla_prolog/test"
+          "@mla_prolog_v4/source",
+          "@mla_prolog_v4/test"
         ],
         "tests": [
-          "@mla_prolog/test"
+          "@mla_prolog_v4/test"
         ]
       },
       {
