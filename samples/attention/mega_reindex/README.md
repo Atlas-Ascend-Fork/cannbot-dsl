@@ -247,7 +247,7 @@ scale 参数使用 `torch.float8_e8m0fnu`，权重预处理函数直接返回 E8
 为兼容原始 patch，同时接受同字节编码的 UINT8 输入；内部仅使用 dtype view，
 不做数值转换，不改变量化编码、形状和计算公式。
 
-NPU CI 通过既有 `test_deployment.py` 调用 smoke、PA 和多 batch 脚本，
+NPU CI 通过既有 `test_mega_reindex_deployment.py` 调用 smoke、PA 和多 batch 脚本，
 并验证非恒等 RoPE、不同 stream 核配额和 Graph 重放的结果一致性。
 
 

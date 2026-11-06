@@ -44,6 +44,7 @@ def _require_npu():
 
 def _check_shape(t: int) -> None:
     from ipqw_verify import check_shape
+
     check_shape(t)
 
 

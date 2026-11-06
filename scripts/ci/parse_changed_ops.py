@@ -108,7 +108,7 @@ def load_operator_list(op_list_path):
 
 
 def load_ignored_paths(config_path):
-    """Load exact paths that do not affect the operator test scope."""
+    """Load files and directory subtrees excluded from operator test routing."""
     with open(config_path, encoding="utf-8") as f:
         desc = yaml.safe_load(f)
 
@@ -253,10 +253,13 @@ def collect_related_ops(routing, changed_list_path):
             line = normalize_line(line)
             if not line or line.startswith("#"):
                 continue
-            if Path(line) in routing.ignored_paths:
-                logger.info("ignored metadata file: %s", line)
-                continue
             path = Path(line)
+            if any(
+                ignored == path or ignored in path.parents
+                for ignored in routing.ignored_paths
+            ):
+                logger.info("ignored test routing path: %s", line)
+                continue
             if not path.exists():
                 logger.info("deleted file, skip: %s", line)
                 continue

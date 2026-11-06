@@ -84,9 +84,9 @@ OMP_NUM_THREADS=8 OPENBLAS_NUM_THREADS=8 pytest test/attention/indexer_prologue_
 | `test_golden.py` | CPU 参考计算、输出约定和量化误差检查器 |
 | `test_vf_math.py` | Vector 量化数学、舍入边界与极端数值 |
 | `test_kernel_compile.py` | 调度计划、资源约束和两个模板的编译 |
-| `test_deployment.py` | NPU 部署矩阵、尾块、RoPE/scale、多 seed、重复性和超长 x |
+| `test_indexer_prologue_qw_deployment.py` | NPU 部署矩阵、尾块、RoPE/scale、多 seed、重复性和超长 x |
 
-原 `test_npu_precision.py` 的全部用例已并入 `test_deployment.py`。
+原 `test_npu_precision.py` 的全部用例已并入 `test_indexer_prologue_qw_deployment.py`。
 原 `golden.py`、`shapes.py`、`verify.py` 已合并为测试目录中的 `ipqw_verify.py`，
 参考计算、部署矩阵及精度判断各维护一份，pytest 直接复用。
 只需精度回归时运行 pytest；需要性能或 JSON 报告时运行 `ipqw_verify.py`，无需为相同精度矩阵再跑两遍。

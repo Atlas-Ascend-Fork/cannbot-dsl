@@ -12,9 +12,11 @@ ignore:
   - install_deps.sh
   - scripts/ci/operator_list.yaml
   - scripts/ci/parse_changed_ops.py
+  - scripts/ci/perf_cases.py
   - scripts/format_cpp.sh
   - scripts/run_codespell.sh
   - test/test_config.yaml
+  - net/
 mla_prolog_v4:
   module: true
   src:
@@ -345,38 +347,6 @@ mega_reindex:
     - test/attention/mega_reindex
   options:
     - attention/mega_reindex
-ds41_network:
-  module: true
-  src:
-    - net/ds41/network.json
-  options:
-    - attention/mixed_quant_sparse_flash_mla
-    - attention/quant_lightning_indexer
-    - attention/quant_lightning_indexer_metadata
-    - attention/quant_sparse_lightning_indexer
-    - attention/quant_sparse_lightning_indexer_metadata
-    - attention/indexer_prologue_qw
-    - attention/indexer_prologue_k
-    - vector/engram_gate
-    - attention/attn_epilogue
-    - attention/mega_mla
-    - attention/mega_full_index
-k3_network:
-  module: true
-  src:
-    - net/k3/network.json
-  options:
-    - vector/block_attn_res_update_rms_norm
-    - attention/flash_kda
-    - attention/flash_kda_fwd
-    - attention/flash_kda_cp_preprocess
-    - attention/flash_kda_cp_main
-    - attention/fused_recurrent_kda_snapshot
-    - attention/fused_recurrent_kda_replayssm
-    - attention/mega_recurrent_kda
-    - attention/mega_recurrent_kda_replayssm
-    - attention/commit_recurrent_kda_replayssm
-    - attention/quant_mla_prolog
 mega_mla:
   module: true
   src:

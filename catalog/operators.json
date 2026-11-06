@@ -400,6 +400,7 @@
       "install_deps.sh",
       "scripts/ci/operator_list.yaml",
       "scripts/ci/parse_changed_ops.py",
+      "scripts/ci/perf_cases.py",
       "scripts/format_cpp.sh",
       "scripts/run_codespell.sh",
       "test/test_config.yaml"

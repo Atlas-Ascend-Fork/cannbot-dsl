@@ -72,10 +72,10 @@ def pytest_configure(config):
     Path(path).with_suffix(".session.json").unlink(missing_ok=True)
 
 
-def _synchronize():
+def _synchronize(devices=None):
     import torch_npu
 
-    for device in range(torch_npu.npu.device_count()):
+    for device in devices if devices is not None else [torch_npu.npu.current_device()]:
         torch_npu.npu.synchronize(device)
 
 
@@ -224,23 +224,23 @@ def pytest_pyfunc_call(pyfuncitem):
     excluded = state.get("exclusion")
 
     def invoke(kernel_call, phase, index):
-        _synchronize()
+        _synchronize(kernel_call.devices)
         start_ns = time.time_ns()
         status = "FAILED"
         ranges = markers.start(
             "cann-ci-perf:{}:{}:{}".format(case_key, phase, index), kernel_call.devices
         )
         try:
-            _synchronize()
+            _synchronize(kernel_call.devices)
             result = original(
                 kernel_call.program, *kernel_call.args, **kernel_call.kwargs
             )
-            _synchronize()
+            _synchronize(kernel_call.devices)
             status = "PASSED"
             return result
         finally:
             markers.end(ranges)
-            _synchronize()
+            _synchronize(kernel_call.devices)
             samples.append(
                 {
                     "phase": phase,
