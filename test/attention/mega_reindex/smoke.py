@@ -67,6 +67,13 @@ seqused_q = torch.tensor([S], dtype=torch.int32, device="npu")
 seqused_k = torch.tensor([KV_S], dtype=torch.int32, device="npu")
 
 front_workspace = FrontWorkspace(T, p["x"].device)
+# Detect a Cube store that writes rows beyond the logical weights projection.
+w_raw = front_workspace.w_raw
+guard_elements = 16 * w_raw.shape[1]
+# 113.0 is an arbitrary sentinel that FP32 represents exactly.
+w_raw_backing = w_raw.new_full((w_raw.numel() + guard_elements,), 113.0)
+front_workspace.w_raw = w_raw_backing[: w_raw.numel()].view_as(w_raw)
+w_raw_guard = w_raw_backing[w_raw.numel() :]
 tail_workspace = MegaReindexTailWorkspace(T, KV_S, p["x"].device, topk=TOPK)
 
 compile_start = time.perf_counter()
@@ -102,6 +109,7 @@ scrub = torch.ones(200 * 1024 * 1024 // 4, dtype=torch.float32, device="npu")
 torch.sum(scrub)
 program(*args)
 torch.npu.synchronize()
+assert bool((w_raw_guard.cpu() == 113.0).all()), "weights_proj wrote beyond w_raw"
 indices = tail_workspace.indices.cpu()
 torch.sum(scrub)
 program(*args)

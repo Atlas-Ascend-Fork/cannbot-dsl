@@ -537,10 +537,16 @@ class SpareNzWeightPhase(MatmulKernel):
                     l0b_tensor = l0b.next_read()
                     global_k = k_l1_idx * k_l0_per_l1 + k_l0_idx
                     dsl_matmul(l0c_acc, l0a_tensor, l0b_tensor, init=(global_k == 0))
-            l0c_tensor = l0c_acc
-
-            gm_c_tile = tile_slice(gm_c, (t.base_m, t.base_n), (m_idx, n_idx))
-            mem_copy(gm_c_tile, l0c_tensor)
+            # Fixpipe stores the source extent. Trim the L0C tile to the
+            # logical output so a partial M tile cannot overwrite adjacent GM.
+            m_start = m_idx * t.base_m
+            n_start = n_idx * t.base_n
+            current_m = min(t.base_m, t.m - m_start)
+            current_n = min(t.base_n, t.n - n_start)
+            gm_c_tile = gm_c[
+                m_start : m_start + current_m, n_start : n_start + current_n
+            ]
+            mem_copy(gm_c_tile, l0c_acc[:current_m, :current_n])
 
 
 class FrontPhases:
