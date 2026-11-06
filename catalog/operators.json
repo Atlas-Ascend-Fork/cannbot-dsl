@@ -20,6 +20,10 @@
         ]
       }
     },
+    "attn_prologue": {
+      "source": "samples/attention/attn_prologue",
+      "test": "test/attention/attn_prologue"
+    },
     "flash_kda": {
       "source": "samples/attention/flash_kda",
       "test": "test/attention/flash_kda",
@@ -409,6 +413,7 @@
       "fused_norm_rope_attn_rope_cast_fwd",
       "add",
       "attn_epilogue",
+      "attn_prologue",
       "flash_kda",
       "flash_kda_fwd",
       "flash_kda_cp_preprocess",
@@ -486,6 +491,17 @@
         ],
         "tests": [
           "@attn_epilogue/test"
+        ]
+      },
+      {
+        "name": "attn_prologue",
+        "enabled": true,
+        "watch": [
+          "@attn_prologue/source",
+          "@attn_prologue/test"
+        ],
+        "tests": [
+          "@attn_prologue/test"
         ]
       },
       {

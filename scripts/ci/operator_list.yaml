@@ -10,6 +10,7 @@ operators:
   - attention/fused_norm_rope_attn_rope_cast_fwd
   - vector/add
   - attention/attn_epilogue
+  - attention/attn_prologue
   - attention/flash_kda
   - attention/flash_kda_fwd
   - attention/flash_kda_cp_preprocess

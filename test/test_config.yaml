@@ -38,6 +38,13 @@ attn_epilogue:
     - test/attention/attn_epilogue
   options:
     - attention/attn_epilogue
+attn_prologue:
+  module: true
+  src:
+    - samples/attention/attn_prologue
+    - test/attention/attn_prologue
+  options:
+    - attention/attn_prologue
 flash_kda:
   module: true
   src:
