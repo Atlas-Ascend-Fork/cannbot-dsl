@@ -1,240 +1,235 @@
 # attn_epilogue
 
-基于 CANNBot-DSL 的 attention 输出投影融合算子，将 inverse RoPE、两次 OCP MXFP8
-激活量化和两级矩阵乘融合，面向 Ascend 950PR/950DT（ARCH 3510）。
+Ascend 950PR/950DT（ARCH 3510）上的本地 attention 输出投影：将 inverse RoPE、
+两次 MXFP8 激活量化和两级 Matmul 融合为一个设备 kernel。实现集中在
+[attn_epilogue.py](attn_epilogue.py)，不包含通信或 AllReduce。
 
-## 算子介绍
-
-提供单卡完整投影接口，中间工作区由算子内部管理：
-
-| 接口 | 实现文件 | 使用场景 |
-| :--- | :--- | :--- |
-| `attn_epilogue` | [attn_epilogue.py](attn_epilogue.py) | 单卡完整计算，不做 TP 切分，不需要通信参数 |
-
-固定网络维度为 `NG=8`、`F=4096`、`O_LORA=1024`、`DIM=5120`。
-每个 token 有 64 个 attention head，每个 head 为 512 维；连续 8 个 head 合为一组，
-共 8 组。令 `Q` 表示沿最后一维、每 32 个元素一组的 OCP MXFP8 量化：
-
-```text
-A[t, g, :] = BF16(inverse_rope(O[t, g, :]))
-Y[t, g, :] = BF16(MXMatmul(Q(A[t, g, :]), WoA[g].T))
-Out[t, :]  = BF16(MXMatmul(Q(concat_groups(Y[t, :, :])), WoB.T))
-```
-
-`WoA` 的逻辑 shape 为 `[8, 1024, 4096]`，`WoB` 为 `[5120, 8192]`。
-两级 matmul 的权重均由调用方提前量化，接口不接收 BF16 权重。
-
-inverse RoPE 仅作用于每个 head 的最后 64 维，前 448 维原样保留。
-尾部按相邻偶数/奇数元素配对，计算 `even' = even*cos + odd*sin`、
-`odd' = odd*cos - even*sin`，在 FP32 中计算后舍入为 BF16。
-
-不包含 attention 主体、bias、残差加法或归一化；当前提供前向接口，不提供反向实现。
-
-## 接口与参数
-
-### 不做 TP 切分：attn_epilogue
+## 接口
 
 ```python
 from samples.attention.attn_epilogue.attn_epilogue import attn_epilogue
 
-o_proj = attn_epilogue(
-    o, woa, wob, descale_woa, descale_wob, rope_sin, rope_cos,
-)
+out = attn_epilogue(o, woa, wob, descale_woa, descale_wob, rope_sin, rope_cos)
 ```
 
-此接口在输入所在设备上执行完整投影，支持任意 `T >= 1`（受设备内存限制），返回 BF16 `[T,5120]`。
+支持任意 `T >= 1`，受设备内存限制；普通执行返回具有独立存储的 BF16 `[T,5120]`。
+NG 表示本算子处理的本地分组数；算子只计算这些分组的输出投影，不执行跨卡通信或结果聚合。
 
-### 参数说明
+| 场景 | 输入 o | 第二级 K |
+| :--- | :--- | ---: |
+| NG=8 | `[T,64,512]` | 8192 |
+| NG=2 | `[T,16,512]` | 2048 |
+| NG=1 | `[T,8,512]` | 1024 |
 
-`T` 是输入的有效 token 数，固定 `N=64, D=512, ng=8, o_lora=1024, dim=5120`。
-所有张量均须连续且位于同一 NPU。
+每组含 8 个 head，固定 `F=4096`、`O_LORA=1024`、`DIM=5120`。
 
-| 参数 | shape | dtype / 类型 | 布局与说明 |
+| 参数 | ND 权重时的逻辑 shape | NZ 权重时的逻辑 shape | dtype |
 | :--- | :--- | :--- | :--- |
-| `o` | `[T,64,512]` | `torch.bfloat16` | ND，token/head/dim 顺序 |
-| `woa` | `[8,1024,4096]` | `torch.float8_e4m3fn` | ND，量化后的第一级权重，不转置 |
-| `wob` | `[5120,8192]` | `torch.float8_e4m3fn` | 本版要求 ND，不转置；暂不支持 FRACTAL_NZ |
-| `descale_woa` | `[8,1024,64,2]` | `torch.float8_e8m0fnu` | ND，第一级权重的 E8M0 scale |
-| `descale_wob` | `[5120,128,2]` | `torch.float8_e8m0fnu` | ND，第二级权重的 E8M0 scale；不支持 NZ scale |
-| `rope_sin`、`rope_cos` | `[T,64]` | `torch.float32` | ND，当前 token 的位置表，按相邻元素重复 `[s0,s0,s1,s1,...]`，cos 同理 |
-| 返回值 `o_proj` | `[T,5120]` | `torch.bfloat16` | ND，输入 token 的投影结果，无对外 padding |
+| `o` | `[T,NG*8,512]` | 同左 | BF16 |
+| `woa` | `[NG,1024,4096]` | `[NG,4096,1024]` | FP8 E4M3FN |
+| `wob` | `[5120,NG*1024]` | `[NG*1024,5120]` | FP8 E4M3FN |
+| `descale_woa` | `[NG,1024,64,2]` | `[NG,64,1024,2]` | FP8 E8M0FNU |
+| `descale_wob` | `[5120,NG*16,2]` | `[NG*16,5120,2]` | FP8 E8M0FNU |
+| `rope_sin`、`rope_cos` | `[T,64]` | 同左 | FP32 |
 
-E8M0 scale 的最后两维将每 32 个元素对应的 scale 打包为 `[K/64, 2]`。
-若权重文件以 uint8 保存 scale，使用 `.view(torch.float8_e8m0fnu)` 恢复类型，
-不能用数值转换代替位模式解释。接口不接受 BF16 原始权重，也不在 forward 中重新量化权重。
+两级权重可以分别选择 ND/NZ，scale 始终为 ND。NZ 指通过
+`torch_npu.npu_format_cast(weight_kn,29)` 生成的私有张量，保留逻辑 `(K,N)` 轴；
+不是显式增加打包维度的普通 ND 张量。所有输入须连续、位于同一 NPU，并符合表中的形状和类型。
 
-### 使用约束
+入口仅检查激活的有效维度，用权重逻辑轴识别布局，不逐项扫描张量的 dtype、device、stride
+或私有格式。调用方应在加载权重时保证这些契约，不能依赖入口发现全部错误输入。
+若从 uint8 文件加载 scale，使用 `.view(torch.float8_e8m0fnu)` 恢复位模式，不能做数值转换。
 
-- 支持任意 `T >= 1`（受设备内存限制），权重及 scale 须为连续 ND 布局，不支持 NZ 输入。
-- 返回结果拥有独立的输出存储。普通执行时，内部工作区按设备、当前 stream 和 T 缓存复用；
-  跨 stream 的输入输出依赖由网络建立。
-- 图捕获前先预热相同规格。图内工作区使用图内存池，与普通执行和其他图隔离。
-- 上游输出如为 `[head,T,dim]`，应先 permute 为 `[T,head,dim]` 并连续化，不能直接 reshape。
-- 首次调用包含编译和分配开销，应先预热。
+## 计算与调度
 
-## 快速开始
+inverse RoPE 仅处理每个 head 的最后 64 维，前 448 维保持原值。尾部按相邻元素配对，
+在 FP32 中计算 `even'=even*cos+odd*sin`、`odd'=odd*cos-even*sin`，再舍入为 BF16。
+sin/cos 表按 `[s0,s0,s1,s1,...]` 重复。MX 量化沿 K 每 32 个元素使用一个 E8M0 scale。
 
-由平台预置 CANN、PyTorch、torch_npu 和 DSL wheel，见[依赖检查脚本](../../../install_deps.sh)。
-使用 CANNBot-DSL 0.8.0。本实现通过 `@host`、`cannbotdsl.compile`
-及显式片上存储绑定组织计算。
-
-```bash
-source ${install_path}/ascend-toolkit/set_env.sh
+```text
+A   = BF16(inverse_rope(o))
+Y_g = BF16(MXMatmul(Q32(A_g), WoA_g.T))
+out = BF16(MXMatmul(Q32(concat_groups(Y_g)), WoB.T))
 ```
 
-下面的完整示例调用 `attn_epilogue`。权重量化仅在初始化时执行；实际网络可直接加载量化权重与 scale。
+MM1 在 FP32 中累加，并在 QuantY 前先舍入为 BF16。FP32 tile 通过 Fixpipe 直接交付配对
+AIV，省去 BF16 中间 Y 的 GM 缓冲。内部只保留 Aq、A-scale、Yq、Y-scale 四个字节工作区。
 
-安装依赖并加载 CANN 环境，将以下代码保存到仓库根目录的 `attn_epilogue_example.py`。
-示例的随机权重、输入和位置表在网络中应替换为实际数据。
+实现使用 DSL 0.8 的显式 layout、RingBuffer 和 copy_options，并显式开启 MX Matmul。
+与上游相同，构造接口的 layout / shape 差异在导入时识别一次，不在 forward 中反复检查。
+Fixpipe 按完整 tile 的两个半帧交付 AIV，每个 AIV 独立裁剪有效行；空分片仍消费接收槽，
+完成所有权交接，但不写入 GM。尾块不依赖按 T 或平台枚举的配置。
+
+M/N/K tiling 根据 T、矩阵维度、当前 stream 核配额及 ARCH 3510 的 L0/L1/UB 容量推导，
+没有按 T 或设备名称列举配置。MM1 的 N 分块对齐完整 MX scale 字节对；满足生产者覆盖条件时，
+QuantA 和 MM1 按 K slab 流水。Cube 缓冲复用和 QuantY → MM2 的数据/scale 就绪依赖保留显式同步。
+
+编译缓存命中后直接复用 handle，不再重复计算 tiling。普通执行的工作区按设备、stream、T、NG
+缓存，图捕获使用图内存池；跨 stream 的依赖由调用方建立。首次调用包含编译开销，应先预热。
+当前提供前向实现，不提供反向。
+
+## ND 权重预转换为私有 NZ
+
+转换只在初始化时执行，不能放进被测 forward。按字节转换可避免部分 CANN 版本对 FP8/E8M0
+设备转置的限制，且不会改变量化值。
 
 ```python
 import torch
 import torch_npu
 
-from samples.attention.attn_epilogue.attn_epilogue import attn_epilogue
+
+def weight_to_nz(weight):
+    """Preserve quantized bytes while converting logical (N,K) to private NZ (K,N)."""
+    kn = weight.view(torch.uint8).cpu().transpose(-2, -1).contiguous()
+    return torch_npu.npu_format_cast(kn.npu().view(torch.float8_e4m3fn), 29)
 
 
-def main():
-    torch.npu.set_device(0)
-    device = torch.device("npu", 0)
-    T = 72
-
-    torch.manual_seed(2026)
-    wa = (torch.randn(8, 1024, 4096) * 0.3).to(torch.bfloat16).to(device)
-    wb = (torch.randn(5120, 8192) * 0.2).to(torch.bfloat16).to(device)
-    woa, sa = torch_npu.npu_dynamic_mx_quant(wa.reshape(8192, 4096), dst_type=292)
-    wob, sb = torch_npu.npu_dynamic_mx_quant(wb, dst_type=292)
-    woa = woa.reshape(8, 1024, 4096)
-    descale_woa = sa.view(torch.float8_e8m0fnu).reshape(8, 1024, 64, 2)
-    descale_wob = sb.view(torch.float8_e8m0fnu)
-
-    torch.manual_seed(2027)
-    o = (torch.randn(T, 64, 512) * 0.3).to(torch.bfloat16).to(device)
-    positions = torch.arange(T, dtype=torch.float32)
-    inv_freq = 10000.0 ** (-torch.arange(0, 64, 2, dtype=torch.float32) / 64)
-    angles = torch.outer(positions, inv_freq)
-    cos = angles.cos().repeat_interleave(2, dim=-1).to(device)
-    sin = angles.sin().repeat_interleave(2, dim=-1).to(device)
-
-    o_proj = attn_epilogue(o, woa, wob, descale_woa, descale_wob, sin, cos)
-    torch.npu.synchronize()
-    print(f"{tuple(o_proj.shape)}, {o_proj.dtype}")
-
-
-if __name__ == "__main__":
-    main()
+wa_nz = weight_to_nz(wa_nd)
+wb_nz = weight_to_nz(wb_nd)
+sa_kn = sa_nd.view(torch.uint8).cpu().permute(0, 2, 1, 3).contiguous().npu()
+sb_kn = sb_nd.view(torch.uint8).cpu().permute(1, 0, 2).contiguous().npu()
+out = attn_epilogue(o, wa_nz, wb_nz,
+    sa_kn.view(torch.float8_e8m0fnu), sb_kn.view(torch.float8_e8m0fnu), sin, cos)
 ```
 
-从仓库根目录执行，选择可用设备：
+## 图模式
 
-```bash
-ASCEND_RT_VISIBLE_DEVICES=0 OMP_NUM_THREADS=4 python3 attn_epilogue_example.py
+支持 `torch.npu.NPUGraph`，也支持 `torch.compile` 的 `npugraph_ex` 后端。
+模型中建议将量化权重及 scale 注册为固定的 buffer，保留其私有 NZ 存储：
+
+```python
+class Projection(torch.nn.Module):
+    """Keep quantized weights as fixed graph parameters."""
+
+    def __init__(self, woa, wob, sa, sb):
+        """Retain the initialized NPU tensors without converting their formats."""
+        super().__init__()
+        for name, value in zip(("woa", "wob", "sa", "sb"), (woa, wob, sa, sb)):
+            self.register_buffer(name, value)
+
+    def forward(self, o, sin, cos):
+        """Project the current activations with the fixed quantized weights."""
+        return attn_epilogue(o, self.woa, self.wob, self.sa, self.sb, sin, cos)
+
+
+model = torch.compile(
+    Projection(woa, wob, descale_woa, descale_wob).eval(),
+    backend="npugraph_ex", fullgraph=True, dynamic=False,
+)
+out = model(o, rope_sin, rope_cos)
 ```
 
-## 精度验证
+同一模型跨 T 使用时可设 `dynamic=True`；已验证 T=3、7、16、17 之间的切换。
+图回放的输出缓冲遵循后端的静态复用语义；跨回放保留结果时，先用 `out.clone()` 保存。
 
-从仓库根目录执行。默认先做接口检查和一个单卡代表用例：
+若直接编译七参数函数，并把私有 NZ 权重作为调用实参，使用后端的 `clone_input=False`：
+
+```python
+compiled_op = torch.compile(
+    attn_epilogue, backend="npugraph_ex", fullgraph=True, dynamic=False,
+    options={"clone_input": False},
+)
+out = compiled_op(o, woa, wob, descale_woa, descale_wob, rope_sin, rope_cos)
+```
+
+此时使用固定输入缓冲区更新数据，保持 NZ 权重的存储地址不变；替换权重存储后重新建图。
+当前 torch_npu 后端默认克隆用户输入时可能把私有 NZ 转为 ND，随后尝试不支持的 FP8
+私有格式复制。该过程位于算子外部；上述 buffer 参数方式和禁用输入克隆方式均已验证。
+ND 实参可使用后端默认配置。算子不修改全局格式开关，也不在 forward 中重新打包权重。
+
+## 测试
+
+仓内仅保留 [test_attn_epilogue.py](../../../test/attention/attn_epilogue/test_attn_epilogue.py)：
+6 个 NPU 精度用例覆盖三种 NG 和 ND/NZ、尾块、NPUGraph 和一个 npugraph_ex 回归，另有 2 个 Meta 用例。
+不包含性能采集、大 T 扫描、外部 `cann_ops_*` 依赖或全量编译任务，不修改公共 CI 配置。
 
 ```bash
+# 使用仓库公共 marker 选择 CPU / NPU 阶段。
 python3 -m pytest -q test/attention/attn_epilogue -m 'not npu'
-ASCEND_RT_VISIBLE_DEVICES=0 OMP_NUM_THREADS=4 python3 -m pytest -q 'test/attention/attn_epilogue/test_attn_epilogue.py::test_public_tp1[72]'
+ASCEND_RT_VISIBLE_DEVICES=0 OMP_NUM_THREADS=4 \
+  python3 -m pytest -q test/attention/attn_epilogue -m npu
 ```
 
-执行完整单卡回归：
+要求匹配的 CANN、torch_npu 及 DSL 0.8.0；NZ 路径使用 `TensorSpec(storage_format="nz")`。
+本次 0.8.0 适配在 950DT 上验证，使用 CANN 9.3.0、torch 2.12.0+cpu、torch_npu 2.12.0.post2。
+950PR 的历史验证记录使用 DSL 0.7.1。
+完整精度、压力、性能和原始 profiling 由仓外开发验证脚本维护，线上 CI 不收集这些脚本。
 
-```bash
-ASCEND_RT_VISIBLE_DEVICES=0 OMP_NUM_THREADS=4 python3 -m pytest -q test/attention/attn_epilogue/test_attn_epilogue.py
-```
+## 性能对比（DSL 0.8.0）
 
-参考结果由 torch_npu 原生量化和矩阵乘构造，使用 `rtol=0, atol=0` 比较，另检查工作区复用、
-输出独立性及图重放。
+2026-11-02 在 Ascend950DT 上完成 16 个代表点复测，使用包含片上容量约束修正的实现、
+CANN 9.3.0、DSL 0.8.0、torch 2.12.0+cpu、torch_npu 2.12.0.post2，设备为
+32 AIC / 64 AIV、128 MiB L2。本次未重新执行下面历史记录中的 576 点全量扫描。
 
-### 验证结果
+表中耗时为设备 kernel 时长中位数，单位为微秒；原生链路取五个 kernel 的时长之和。
 
-当前测试见 [test_attn_epilogue.py](../../../test/attention/attn_epilogue/test_attn_epilogue.py)，
-覆盖接口契约、T 分块边界及 padding、零值与极小值输入，并检查第一级激活量化和
-中间 Y 量化的 payload/scale。最终 BF16 输出使用 `rtol=0, atol=0` 与原生参考比较。
-测试还检查同一输入的输出一致性、交替输入的图重放、工作区复用及返回结果的独立存储。
+| 场景 | 权重布局 | T | 原生链路（µs） | 融合算子（µs） | 加速比 |
+| :--- | :--- | ---: | ---: | ---: | ---: |
+| NG=8 | ND | 1 | 48.178 | 29.924 | 1.610× |
+| NG=8 | ND | 72 | 56.465 | 41.449 | 1.362× |
+| NG=8 | ND | 128 | 66.463 | 49.918 | 1.331× |
+| NG=8 | ND | 256 | 87.355 | 73.464 | 1.189× |
+| NG=8 | NZ | 1 | 45.078 | 28.239 | 1.596× |
+| NG=8 | NZ | 72 | 55.338 | 40.445 | 1.368× |
+| NG=8 | NZ | 128 | 63.409 | 49.397 | 1.284× |
+| NG=8 | NZ | 256 | 96.873 | 73.363 | 1.320× |
+| NG=2 | ND | 1 | 35.511 | 19.578 | 1.814× |
+| NG=2 | ND | 16 | 37.096 | 21.400 | 1.733× |
+| NG=2 | NZ | 1 | 29.942 | 18.431 | 1.625× |
+| NG=2 | NZ | 16 | 31.898 | 21.635 | 1.474× |
+| NG=1 | ND | 1 | 30.793 | 14.036 | 2.194× |
+| NG=1 | ND | 16 | 34.368 | 17.791 | 1.932× |
+| NG=1 | NZ | 1 | 26.480 | 13.266 | 1.996× |
+| NG=1 | NZ | 16 | 30.030 | 16.925 | 1.774× |
 
-单卡验证环境为 Ascend 950DT，32 Cube / 64 Vector，`cannbotdsl 0.7.0`、
-`torch 2.12.0+cpu`、`torch_npu 2.12.0`，加载 CANN 9.2.0 环境。
-融合算子与小算子使用相同输入和量化权重，独立进程间核对输入哈希一致。
+原生五 kernel 链路与融合单 kernel 使用相同输入、相同 ND/NZ 权重，交错进行图回放；
+每点每侧 48 个样本，调用前在同流读取 256 MiB 缓冲区进行软件 L2 驱逐。
+计时排除驱逐、编译、输入恢复和主机调度；加速比为原生中位数 / 融合中位数。
+该口径不表示端到端请求时延。16 点全部获得收益，加速比为 1.189–2.194×，
+普通执行及每点 16 个图捕获输出均与原生参考逐位一致。
 
-| 验证项 | 覆盖范围 | 结果 |
-| :--- | :--- | :--- |
-| 最终输出与小算子参考对比 | `T=1,72,128,256` | BF16 逐位一致，最大绝对误差 0，差异位模式数 0 |
-| 扩展 T 范围（超过 256） | `T=257,512,1000,1024,2048,4096,8192` | 每例 10 次预热 + 16 次图捕获调用 + 6 次重放，输出均与参考逐位一致 |
-| 同输入普通执行 | 每个 T 检查 2 次，共 8 次 | 输出逐位一致 |
-| 同输入图重放 | 每个 T 检查 4 次，共 16 次 | 输出逐位一致 |
-| 交替输入图重放 | 每个 T 检查 4 次，共 16 次 | 均与各自参考逐位一致，无前次输入残留 |
+## 性能对比（DSL 0.7.1 历史全量结果）
 
-以上是已测用例的结果，不表示穷举了所有 `T` 或所有输入值；扩展 T 的验证使用
-`python test/attention/attn_epilogue/test_attn_epilogue.py --tokens <T>`，口径与上表一致。
+以下为 2026-10-26 在 Ascend950DT_9582 上的实测结果，测量代码对应提交
+`d97f4acd2114237d900d2087565efad68fed3b62`。设备为 32 AIC / 64 AIV、128 MiB L2，
+软件环境为 CANN 9.3.0（V100R001C12B140）、DSL 0.7.1、torch 2.12.0+cpu、
+torch_npu 2.12.0.post2。
 
-## 性能验证
+本节保留此前 DSL 0.7.1 的 576 点测量记录，不将其作为 DSL 0.8.0 的新测结果。
 
-单卡入口可用现有测试脚本采集，无需额外 benchmark 实现：
+原生链路依次执行 inverse RoPE、第一次 MX 量化、第一级 Matmul、第二次 MX 量化、
+第二级 Matmul。原生与融合使用相同输入、量化权重及 ND/NZ 布局，交错进行图重放；
+每点每侧采集 48 个样本。每次调用前同流读取 256 MiB 缓冲区进行 ReduceSum 软件 L2 驱逐，
+软件驱逐不等同于硬件 cache invalidate。
 
-```bash
-ASCEND_RT_VISIBLE_DEVICES=0 OMP_NUM_THREADS=4 msprof --ai-core=off --l2=off --task-time=on --application='python3 test/attention/attn_epilogue/test_attn_epilogue.py --mode public --tokens 72' --output=profile_attn_epilogue
-```
+原生耗时取五个 kernel 的设备时长之和，融合耗时取单个 kernel 的设备时长，均统计中位数；
+加速比为原生中位数 / 融合中位数。计时不包含输入恢复、L2 驱逐、权重预处理、编译、
+内存分配、Python 调度及核间调度间隙，不表示端到端请求时延。
 
-脚本先预热并校验精度，随后每次调用前使用 256 MiB FP32 张量的 ReduceSum 驱逐 L2。
-统计图重放中最后 96 次 `attn_epilogue` 对应融合 kernel 的 `Task Duration(us)` 中位数，
-不包含 ReduceSum、编译、分配或 Python 调度耗时。性能比较必须使用相同输入、核配额、
-设备与清 L2 条件；此脚本测量融合算子，不是小算子拼接基线。
+| 场景 | 权重布局 | T 范围 | 点数 | 加速比范围 | 加速比几何平均 |
+| :--- | :--- | :--- | ---: | ---: | ---: |
+| NG=8 | ND | 1–256 | 256 | 1.149–1.577× | 1.284× |
+| NG=8 | NZ | 1–256 | 256 | 1.213–1.440× | 1.297× |
+| NG=2 | ND | 1–16 | 16 | 1.618–1.860× | 1.697× |
+| NG=2 | NZ | 1–16 | 16 | 1.412–1.620× | 1.491× |
+| NG=1 | ND | 1–16 | 16 | 1.772–2.208× | 1.891× |
+| NG=1 | NZ | 1–16 | 16 | 1.472–1.763× | 1.591× |
 
-### 性能结果
+576 个点全部快于对应原生链路；每点均核对普通执行及 16 个图捕获输出，BF16 位模式全部一致。
 
-下表与上述四个 T 的精度回归使用同一环境。每种实现、每个 T 采集 32 次，
-取设备耗时中位数；融合与小算子分别采集 profiling，每次调用前均用 256 MiB FP32
-缓冲区的 ReduceSum 驱逐 L2，并通过流水记录核对同流驱逐操作。
-权重量化在初始化时完成，不计入两侧耗时。
+## Native 安装包
 
-小算子基线依次执行 inverse RoPE、`npu_dynamic_mx_quant`、
-`npu_transpose_quant_batchmatmul`、第二次 `npu_dynamic_mx_quant` 和 `npu_quant_matmul`。
-基线耗时按每次调用对应的五个 kernel 的 `Task Duration(us)` 求和，再取中位数；
-融合耗时为 `attn_epilogue` 对应单个融合 kernel 的耗时中位数。两侧均不包含清 L2、编译、
-内存分配与 Python 调度耗时，不应将该指标理解为端到端请求时延。
-
-| T | 小算子拼接（µs） | 融合算子（µs） | 耗时降低 | 加速比 |
-|---:|---:|---:|---:|---:|
-| 1 | 42.065 | 34.064 | 19.02% | 1.235× |
-| 72 | 53.905 | 44.677 | 17.12% | 1.207× |
-| 128 | 63.078 | 52.330 | 17.04% | 1.205× |
-| 256 | 84.233 | 75.684 | 10.15% | 1.113× |
-
-耗时降低为 `(小算子耗时 - 融合耗时) / 小算子耗时`，加速比为
-`小算子耗时 / 融合耗时`。实际性能随软件版本、设备核配额和运行状态变化，
-应在目标环境按相同清 L2 条件重新测量。
-
-上面的仓内命令采集 96 次融合 kernel，而上述对比每例采集 32 次；
-仓内命令不包含小算子基线，不能仅凭该命令复现对比表的基线列。
-
-## 安装包调用
-
-源码示例与测试直接加载本仓库 sample。需要部署安装包时，使用共享
-[Native 构建工程](../../../packaging/native/README.md)，注册名为 `attn_epilogue`，所属组为
-`ds41`：
-
-```bash
-export PYTHON=/path/to/python3.12
-export CANN_ENV=/path/to/Ascend/cann/set_env.sh
-source "$CANN_ENV"
-export CANNBOTDSL_WHEEL=/path/to/cannbot_dsl-0.8.0-cp312-cp312-manylinux_2_28_x86_64.whl
-bash packaging/native/run-build.sh --operator attn_epilogue
-"$PYTHON" -m pip install --no-deps --force-reinstall \
-  packaging/native/output/operators/attn_epilogue/wheels/*.whl
-```
-
-`T` 参与编译（tiling 与算子形状随 `T` 变化），默认按 28/32 核配额导出
-`T=1,72,128,256,512,1024,2048,4096,8192` 共 18 个配置；未被枚举的 `T` 会回退 JIT。
-可通过 `CANNBOTDSL_DS41_PROFILES` 的 `attn_epilogue` 键覆盖默认集合：
+使用共享 [Native 构建工程](../../../packaging/native/README.md)，目录清单只需包含
+`attn_epilogue.py`，注册名仍为 `attn_epilogue`。默认导出 28/32 核、ND/NZ 两类布局：
+NG=8 的 `T=1,72,128,256,512,1024,2048,4096,8192`，以及 NG=2/1 的 `T=1,16`，共 52 个配置。
+未命中的规格回退 JIT。可用 `CANNBOTDSL_DS41_PROFILES` 覆盖默认集合：
 
 ```json
-{"attn_epilogue": [{"block_num": 32, "tokens": [72, 256, 1024]}]}
+{"attn_epilogue":[{"block_num":32,"ng":2,"weight_format":"nz","tokens":[1,7,16]}]}
 ```
 
-安装后可设置 `CANNBOTDSL_NATIVE_BINARY_MODE=require` 验证二进制覆盖是否完整，
-未命中时立即报错；`CANNBOTDSL_NATIVE_BINARY_REPORT=/path/to/native-report.json`
-可保存命中记录。
+混合格式可用 `first_nz`、`second_nz` 独立指定。安装后用
+`CANNBOTDSL_NATIVE_BINARY_MODE=require` 检查二进制覆盖，用
+`CANNBOTDSL_NATIVE_BINARY_REPORT=/path/to/report.json` 保存命中记录。
+本次重构调整了内部 ABI，已有包应使用当前源码重新构建。
+安装包依赖范围同步为 `cannbot-dsl>=0.8.0,<0.9`；旧版 Native 资源应使用 0.8.0 重新生成。

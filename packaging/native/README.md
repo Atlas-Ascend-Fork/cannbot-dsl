@@ -64,7 +64,7 @@ python3 -m pip install --force-reinstall --no-deps packaging/native/output/group
 构建 `ds41` 分组时，安装路径改为 `packaging/native/output/groups/ds41/wheels/*.whl`；构建全部已登记算子时，改为 `packaging/native/output/all/wheels/*.whl`。单算子产物位于 `packaging/native/output/operators/<算子名>/wheels/`，实际路径以构建日志为准。
 
 wheel 分发名为 `cannbot-arena-net`，Python 包名为 `ops`，依赖
-`cannbot-dsl>=0.8.0`。导入 `ops` 时注册 Native 资源；AICPU 资源位于 `ops/_aicpu/`。
+`cannbot-dsl>=0.8.0,<0.9`。导入 `ops` 时注册 Native 资源；AICPU 资源位于 `ops/_aicpu/`。
 
 安装后验证包导入与 Native 资源注册：
 
@@ -94,3 +94,19 @@ python3 scripts/ci/sync_catalog.py --check
 
 运行时设置 `CANNBOTDSL_NATIVE_BINARY_MODE=require` 可要求命中 Native 二进制；
 `CANNBOTDSL_NATIVE_BINARY_REPORT=/path/to/report.json` 可记录命中信息。
+
+## attn_epilogue 静态配置
+
+`attn_epilogue` 的实现与导出集中在 `attn_epilogue.py`，无需 common 模块。
+默认导出 28/32 核、ND/NZ 两种权重布局：NG=8 的
+`T=1,72,128,256,512,1024,2048,4096,8192`，以及 NG=2/1 的 `T=1,16`，共 52 个配置。
+两级混合布局可通过 `first_nz`、`second_nz` 独立指定。
+
+例如，profiles.json 中的配置可写为：
+
+```json
+{"attn_epilogue":[{"block_num":32,"ng":2,"weight_format":"nz","tokens":[1,7,16]}]}
+```
+
+当前安装包依赖 DSL 0.8.0 系列。实现使用 RingBuffer、显式 layout 和 copy_options，
+已有 Native 资源应使用当前源码及相同版本的 DSL 重新构建。

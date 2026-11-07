@@ -11,7 +11,7 @@
 mqsmla = ["attention/mixed_quant_sparse_flash_mla/mixed_quant_sparse_flash_mla.py", "attention/mixed_quant_sparse_flash_mla/mixed_quant_sparse_flash_mla_metadata.py"]
 qli = ["attention/quant_lightning_indexer/quant_lightning_indexer.py", "attention/quant_lightning_indexer_metadata/quant_lightning_indexer_metadata.py"]
 qsli = ["attention/quant_sparse_lightning_indexer/quant_sparse_lightning_indexer.py", "attention/quant_sparse_lightning_indexer_metadata/quant_sparse_lightning_indexer_metadata.py"]
-attn_epilogue = ["attention/attn_epilogue/attn_epilogue.py", "attention/attn_epilogue/attn_epilogue_common.py"]
+attn_epilogue = ["attention/attn_epilogue/attn_epilogue.py"]
 indexer_prologue_qw = ["attention/indexer_prologue_qw/indexer_prologue_qw.py", "attention/indexer_prologue_qw/indexer_prologue_qw_format.py"]
 indexer_prologue_k = ["attention/indexer_prologue_k/indexer_prologue_k.py"]
 engram_gate = ["vector/engram_gate/engram_gate.py"]
