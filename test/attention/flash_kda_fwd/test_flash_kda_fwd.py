@@ -855,14 +855,14 @@ def _run_dynamic_forward(inputs, case, template, *, whitebox):
     attrs = dict(batch_size=len(case.lengths), nheads_qk=case.nk, nheads_v=case.nv,
                  seqlens=sum(case.lengths) if case.layout == "TND" else inputs.q.shape[2], layout=case.layout)
 
-    def make_metadata(training):
+    def make_metadata(producer, *, training):
         if template == "auto":
-            return _DYNAMIC_METADATA.flash_kda_fwd_metadata(cu_seqlens, enable_grad=training, **attrs)
-        return _DYNAMIC_METADATA._build_flash_kda_fwd_metadata(
+            return producer.flash_kda_fwd_metadata(cu_seqlens, enable_grad=training, **attrs)
+        return producer._build_flash_kda_fwd_metadata(
             cu_seqlens=cu_seqlens, enable_grad=training, template=template, **attrs,
         )
 
-    metadata = make_metadata(True)
+    metadata = make_metadata(_DYNAMIC_METADATA, training=True)
     if whitebox:
         schedule = _assert_schedule_covers_logical_chunks(metadata, case)
         if (
@@ -874,25 +874,26 @@ def _run_dynamic_forward(inputs, case, template, *, whitebox):
         q, k, v, g, beta, inputs.scale_value, initial_state, inputs.a_log.npu(), inputs.dt_bias.npu(),
         inputs.lower_bound, case.layout, metadata,
     )
+    kw = dict(initial_state=initial_state, A_log=args[7], dt_bias=args[8], scale=inputs.scale_value,
+              lower_bound=inputs.lower_bound, layout=case.layout, cu_seqlens=cu_seqlens, output_final_state=True)
     # Each operator generates its own scheduling metadata.
     # CPU FP32 and saved-cache references remain independent of this cross-check.
     compatible_baseline = _BASELINE_METADATA.ABI_VERSION == _DYNAMIC_METADATA.ABI_VERSION
     if compatible_baseline:
-        inference_metadata = _BASELINE_METADATA.flash_kda_metadata(
-            q, v, initial_state, case.layout, cu_seqlens, template=template,
-        )
-        baseline_args = (*args[:-1], inference_metadata)
-        baseline_output, baseline_state = _BASELINE_KDA.flash_kda(*baseline_args)
+        with torch.inference_mode():
+            inference_metadata = make_metadata(_BASELINE_METADATA, training=False)
+            baseline_output, baseline_state, _ = _BASELINE_KDA.flash_kda(
+                q, k, v, g, beta, metadata=inference_metadata, **kw,
+            )
     before = [value.cpu().clone() for value in args if isinstance(value, torch.Tensor)]
-    kw = dict(initial_state=initial_state, A_log=args[7], dt_bias=args[8], scale=inputs.scale_value,
-              lower_bound=inputs.lower_bound, layout=case.layout, cu_seqlens=cu_seqlens, output_final_state=True)
     out = _DYNAMIC_KDA.flash_kda_fwd(q, k, v, g, beta, metadata=metadata, **kw)
     (output, state, chunk_states, aqk, akk, w, u, qg, kg, v_new, g_cumsum,
      q_norm, q_rstd, k_norm, k_rstd, beta_active) = out
     assert chunk_states is None
     with torch.inference_mode():
         inference = _DYNAMIC_KDA.flash_kda_fwd(
-            q, k, v, g, beta, metadata=make_metadata(False), return_intermediate_states=True, **kw,
+            q, k, v, g, beta, metadata=make_metadata(_DYNAMIC_METADATA, training=False),
+            return_intermediate_states=True, **kw,
         )
     assert len(inference) == 16 and all(value is None for value in inference[3:])
     # Padding rows are unspecified. Check only defined token values.

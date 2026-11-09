@@ -47,6 +47,10 @@ def load_asset(name):
     return module
 
 
+def input_tensor(inputs, name):
+    return inputs[load_asset("inputs").INPUT_NAMES.index(name)]
+
+
 @lru_cache(None)
 def dut_modules():
     root = Path(os.environ.get("KDA_SOURCE_ROOT", Path(__file__).resolve().parents[3]))
@@ -87,10 +91,16 @@ def reference(inputs, c, kind):
 def produce(inputs, c):
     """Use the scalar metadata interface specified in the detailed design."""
     _, producer, _ = dut_modules()
-    cu = inputs[8] if c["cu_seqlens_value"] is not None else None
+    cu = (
+        input_tensor(inputs, "cu_seqlens").to("npu")
+        if c["cu_seqlens_value"] is not None
+        else None
+    )
     return producer.flash_kda_fwd_metadata(
         cu,
-        inputs[9] if c["seqused_value"] is not None else None,
+        input_tensor(inputs, "seqused").to("npu")
+        if c["seqused_value"] is not None
+        else None,
         batch_size=c["batch_size"],
         nheads_qk=c["nheads_qk"],
         nheads_v=c["nheads_v"],
@@ -135,7 +145,8 @@ def mode(c):
 def call_kwargs(inputs, c, meta=None):
     kw = dict(zip(load_asset("inputs").INPUT_NAMES, inputs))
     kw.update(c["kwargs"])
-    kw["layout"] = c["layout"]
+    if not c["omit_layout"]:
+        kw["layout"] = c["layout"]
     if c["initial_state_mode"] == "omit":
         kw.pop("initial_state")
     elif c["initial_state_mode"] == "none":
@@ -145,10 +156,11 @@ def call_kwargs(inputs, c, meta=None):
         kw.pop("dt_bias")
     elif c["dt_bias_mode"] == "none":
         kw["dt_bias"] = None
-    kw["cu_seqlens"] = inputs[8] if c["cu_seqlens_value"] is not None else None
-    kw["seqused"] = inputs[9] if c["seqused_value"] is not None else None
+    kw["cu_seqlens"] = kw["cu_seqlens"] if c["cu_seqlens_value"] is not None else None
+    kw["seqused"] = kw["seqused"] if c["seqused_value"] is not None else None
     kw.update(c.get("ignored", {}))
-    kw["metadata"] = meta
+    if meta is not None:
+        kw["metadata"] = meta
     return kw
 
 
@@ -164,7 +176,7 @@ def unchanged(before, after):
 def invoke(inputs, c, md=None, *, meta=False):
     with mode(c):
         if md is None:
-            md = produce(inputs, c)
+            md = input_tensor(inputs, "metadata")
         if (
             not meta
             and c["test"].get("relation", {}).get("overrides", {}).get("inference")
@@ -363,7 +375,10 @@ def negative(inputs, c):
                 key: c[key]
                 for key in ("batch_size", "nheads_qk", "nheads_v", "seqlens", "layout")
             }
-            params.update(cu_seqlens=inputs[8], enable_grad=not c["inference"])
+            params.update(
+                cu_seqlens=input_tensor(inputs, "cu_seqlens"),
+                enable_grad=not c["inference"],
+            )
             del params[field]
             reject_call(
                 lambda: producer.flash_kda_fwd_metadata(**params),
@@ -430,19 +445,19 @@ def metadata_case_stream(ref, test):
 def metadata_negative(inputs, c):
     bc = c
     main, _, _ = dut_modules()
-    cores = main._device_block_num(inputs[0])
+    cores = main._device_block_num(input_tensor(inputs, "q"))
     h, rs = load_asset("inputs").metadata_baseline(c, cores)
     md = torch.tensor(
         load_asset("inputs").encode_metadata(h, rs),
         dtype=torch.int32,
-        device=inputs[0].device,
+        device=input_tensor(inputs, "q").device,
     )
     good, _ = invoke(inputs, bc, md)
     assert_golden(inputs, bc, good)
     damaged = torch.tensor(
         load_asset("inputs").mutate_metadata(c, cores),
         dtype=torch.int32,
-        device=inputs[0].device,
+        device=input_tensor(inputs, "q").device,
     )
     patterns = c["test"]["error_patterns"]
     with mode(c), guard(static=False):
@@ -460,7 +475,7 @@ def metadata_negative(inputs, c):
 def meta_case(inputs, c):
     bc = c
     tensors = [torch.empty_like(x, device="meta") for x in inputs]
-    md = torch.empty(164, dtype=torch.int32, device="meta")
+    md = tensors[5]
     kw = call_kwargs(tensors, bc, md)
     if c["suite"] == "meta_negative":
         kw, objects, reasons = load_asset("inputs").mutate(kw, c)
@@ -535,7 +550,11 @@ def check_relations(inputs, c, out, md):
     other["kwargs"].update(test.get("operator_overrides", {}))
 
     def run(cc, xx=None, metadata=None, compare=True):
-        xx = xx if xx is not None else [x.to(inputs[0].device) for x in make(cc)]
+        if xx is None:
+            xx = [x.to(input_tensor(inputs, "q").device) for x in make(cc)]
+        elif metadata is None:
+            with mode(cc):
+                metadata = produce(xx, cc)
         result, _ = invoke(xx, cc, metadata)
         assert_golden(xx, cc, result)
         if compare and test.get("exact", False):
@@ -562,7 +581,7 @@ def check_relations(inputs, c, out, md):
             for i in range(5):
                 xx[i] = xx[i].narrow(axis, start, length).contiguous()
             if last_state is not None:
-                xx[5] = last_state
+                xx[6] = last_state
                 cc["initial_state_mode"] = "random"
             result = run(cc, xx, compare=False)
             sections.append(result[0])
@@ -592,7 +611,7 @@ def check_relations(inputs, c, out, md):
             result = run(other, inputs, md, compare=False)
             same_main(out, result, c, other)
         other["seed"] = test["changed_seed"]
-        changed = [x.to(inputs[0].device) for x in make(other)]
+        changed = [x.to(input_tensor(inputs, "q").device) for x in make(other)]
         changed[3:] = inputs[3:]
         run(other, changed, md, compare=False)
     else:
@@ -746,8 +765,6 @@ def check_buffer(inputs, c, md):
             value = torch.zeros(test["value"], dtype=value.dtype, device=value.device)
         elif change == "dtype":
             value = value.to(getattr(torch, test["value"]))
-        elif change == "device":
-            value = value.to(test["value"])
         elif change == "stride":
             # The caller checks strides after validate_buffer returns. Mutate the
             # actual Tensor so those checks see the injected layout as well.
@@ -860,7 +877,7 @@ def check_buffer(inputs, c, md):
 
 def check_output_stride(inputs, c):
     with mode(c):
-        metadata = produce(inputs, c)
+        metadata = input_tensor(inputs, "metadata")
         kwargs = call_kwargs(inputs, c, metadata)
         op = torch.ops.cannbotdsl_flash_kda_fwd.flash_kda_fwd
         actual = op(**kwargs)[0]
@@ -878,7 +895,10 @@ def check_output_stride(inputs, c):
             meta=meta.stride(),
         )
         for label, out in (("NPU", actual), ("Meta", meta)):
-            if out.shape != inputs[2].shape or out.dtype != inputs[2].dtype:
+            if (
+                out.shape != input_tensor(inputs, "v").shape
+                or out.dtype != input_tensor(inputs, "v").dtype
+            ):
                 raise AssertionError(
                     f"{label} out shape/dtype: {out.shape}/{out.dtype}"
                 )
@@ -933,7 +953,7 @@ _CACHE = {}
 
 def execute_performance(inputs, c):
     key = (
-        inputs[0].device,
+        input_tensor(inputs, "q").device,
         tuple(x.data_ptr() for x in inputs),
         repr(c["kwargs"]),
         c["inference"],
@@ -945,10 +965,12 @@ def execute_performance(inputs, c):
             _CACHE.clear()
             torch.npu.synchronize()
             start = time.perf_counter_ns()
-            md = produce(inputs, c)
+            produce(
+                inputs, c
+            )  # Time metadata production separately from the supplied DUT input.
             torch.npu.synchronize()
             metadata_us = (time.perf_counter_ns() - start) / 1000
-            kw = call_kwargs(inputs, c, md)
+            kw = call_kwargs(inputs, c)
             for _ in range(c["test"]["warmup_count"] - 1):
                 dut_call(kw)
             out = dut_call(kw)
@@ -1009,12 +1031,13 @@ def flash_kda_fwd(
     v: torch.Tensor,
     g: torch.Tensor,
     beta: torch.Tensor,
+    metadata: torch.Tensor,
     initial_state: Optional[torch.Tensor] = None,
     A_log: Optional[torch.Tensor] = None,
     dt_bias: Optional[torch.Tensor] = None,
-    *,
     cu_seqlens: Optional[torch.Tensor] = None,
     seqused: Optional[torch.Tensor] = None,
+    *,
     scale: Optional[float] = None,
     output_final_state: bool = False,
     return_intermediate_states: bool = False,
@@ -1042,7 +1065,19 @@ def flash_kda_fwd(
     testcase_name: str = "",
 ):
     attributes = locals()
-    inputs = [q, k, v, g, beta, initial_state, A_log, dt_bias, cu_seqlens, seqused]
+    inputs = [
+        q,
+        k,
+        v,
+        g,
+        beta,
+        metadata,
+        initial_state,
+        A_log,
+        dt_bias,
+        cu_seqlens,
+        seqused,
+    ]
     c = load_asset("inputs").configuration(inputs, attributes)
     if c["pending"]:
         raise RuntimeError("PENDING_EXPECTATION: " + c["pending"])

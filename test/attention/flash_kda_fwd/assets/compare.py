@@ -11,7 +11,7 @@ import torch
 
 from kda_ttk_ops import load_asset
 
-SLOTS = [0, 1, 2, 11, 12, 13, 14, 15, 10]
+SLOTS = range(16)
 
 
 def empty():
@@ -158,7 +158,7 @@ def pack(outputs, c):
             continue
         if slot == 1:
             parts = [value.flatten()]
-        elif slot in (2, 10):
+        elif slot in (2, 3, 4, 10):
             parts = []
             start = 0
             for b, n in enumerate(c["valid_lengths"]):
@@ -168,10 +168,15 @@ def pack(outputs, c):
                     if c["layout"] == "TND"
                     else value[b, :count]
                 )
-                if slot == 10:
+                if slot in (3, 4, 10):
                     for ci, block in enumerate(v):
                         valid = min(64, n - ci * 64)
-                        parts.append(block[:, :valid].flatten())
+                        active = (
+                            block[:, :valid, :valid]
+                            if slot in (3, 4)
+                            else block[:, :valid]
+                        )
+                        parts.append(active.flatten())
                 else:
                     parts.append(v.flatten())
                 start += n

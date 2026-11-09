@@ -15,8 +15,6 @@ import torch
 import torch.nn.functional as F
 from kda_ttk_ops import load_asset
 
-SLOTS = [0, 1, 2, 11, 12, 13, 14, 15, 10]
-
 
 def effective(c):
     return load_asset("inputs").effective(c)
@@ -57,7 +55,7 @@ class _StageOneGolden:
     K_decayed_beta: torch.Tensor
     K_decayed: torch.Tensor
     Q_decayed: torch.Tensor
-    T: torch.Tensor
+    inverse: torch.Tensor
     U_pre: torch.Tensor
     W: torch.Tensor
     Mqk: torch.Tensor
@@ -204,10 +202,10 @@ def _stage1_cpu(K, V, Q, beta_brc, g, *, scale_value) -> _StageOneGolden:
     T = _reference_lower_matmul(beta * K_i, K_i, cumulative_decay, diagonal=-1)
 
     identity = torch.eye(CHUNK_SIZE, dtype=torch.float32, device=K.device)
-    diag_beta = torch.diag_embed(beta.squeeze(-1))
-    M = torch.linalg.solve_triangular(
-        identity + T, diag_beta, upper=False, unitriangular=True
+    inverse = torch.linalg.solve_triangular(
+        identity + T, identity.expand_as(T), upper=False, unitriangular=True
     )
+    M = inverse * beta.transpose(-1, -2)
     U_pre = M @ V_i
     W = M @ K_decayed
     Mqk = _reference_lower_matmul(Q_i * scale_value, K_i, cumulative_decay, diagonal=0)
@@ -218,7 +216,7 @@ def _stage1_cpu(K, V, Q, beta_brc, g, *, scale_value) -> _StageOneGolden:
         K_decayed_beta,
         K_decayed,
         Q_decayed,
-        T,
+        inverse,
         U_pre,
         W,
         Mqk,
@@ -227,7 +225,9 @@ def _stage1_cpu(K, V, Q, beta_brc, g, *, scale_value) -> _StageOneGolden:
     )
 
 
-def _stage1_npu(K, V, Q, beta_brc, g, *, scale_value) -> _StageOneGolden:
+def _stage1_npu(
+    K, V, Q, beta_brc, g, *, scale_value, safe_diagonal=True
+) -> _StageOneGolden:
     """Stage1 NPU-oriented golden：显式 batch/head/chunk 循环 + bf16/fp16 交接。"""
     if V.shape[1] != K.shape[1]:
         rep = V.shape[1] // K.shape[1]
@@ -244,7 +244,7 @@ def _stage1_npu(K, V, Q, beta_brc, g, *, scale_value) -> _StageOneGolden:
     K_decayed_beta = torch.empty_like(K_i)
     K_decayed = torch.empty_like(K_i)
     Q_decayed = torch.empty_like(K_i)
-    T_out = torch.empty(
+    inverse_out = torch.empty(
         batch,
         heads,
         chunks,
@@ -255,7 +255,7 @@ def _stage1_npu(K, V, Q, beta_brc, g, *, scale_value) -> _StageOneGolden:
     )
     U_pre = torch.empty_like(K_i)
     W = torch.empty_like(K_i)
-    Mqk = torch.empty_like(T_out)
+    Mqk = torch.empty_like(inverse_out)
     K_restored = torch.empty_like(K_i)
     gamma_C = torch.empty(
         batch, heads, chunks, dim, 1, dtype=torch.float32, device=K.device
@@ -282,6 +282,7 @@ def _stage1_npu(K, V, Q, beta_brc, g, *, scale_value) -> _StageOneGolden:
                         g_cumsum,
                         diagonal=-1,
                         cast_operand=_to_bf16_to_fp32,
+                        safe_diagonal=safe_diagonal,
                     )
                     * beta_c
                 )
@@ -292,6 +293,7 @@ def _stage1_npu(K, V, Q, beta_brc, g, *, scale_value) -> _StageOneGolden:
                         g_cumsum,
                         diagonal=0,
                         cast_operand=_to_bf16_to_fp32,
+                        safe_diagonal=safe_diagonal,
                     )
                 )
 
@@ -313,7 +315,7 @@ def _stage1_npu(K, V, Q, beta_brc, g, *, scale_value) -> _StageOneGolden:
                 K_decayed[b, h, c] = K_decayed_c
                 K_decayed_beta[b, h, c] = K_decayed_beta_c
                 Q_decayed[b, h, c] = Q_decayed_c
-                T_out[b, h, c] = T
+                inverse_out[b, h, c] = resident_inv
                 U_pre[b, h, c] = U_pre_c
                 W[b, h, c] = -workspace_w
                 Mqk[b, h, c] = Mqk_c
@@ -324,7 +326,7 @@ def _stage1_npu(K, V, Q, beta_brc, g, *, scale_value) -> _StageOneGolden:
         K_decayed_beta,
         K_decayed,
         Q_decayed,
-        T_out,
+        inverse_out,
         U_pre,
         W,
         Mqk,
@@ -444,7 +446,7 @@ def _chain_cpu(inputs: KdaInputs) -> _ChainGolden:
     return _ChainGolden(stage1=s1, stage2=s2, stage3=s3)
 
 
-def _chain_npu(inputs: KdaInputs) -> _ChainGolden:
+def _chain_npu(inputs: KdaInputs, *, safe_diagonal=True) -> _ChainGolden:
     s1 = _stage1_npu(
         inputs.K,
         inputs.V,
@@ -452,6 +454,7 @@ def _chain_npu(inputs: KdaInputs) -> _ChainGolden:
         inputs.beta_brc,
         inputs.g,
         scale_value=inputs.scale_value,
+        safe_diagonal=safe_diagonal,
     )
     s2 = _stage2_npu(s1, inputs.initial_state)
     s3 = _stage3_npu(s1, s2)
@@ -464,10 +467,11 @@ def empty():
 
 def reference(inputs, c, kind):
     f = effective(c)
-    q, k, v, g, beta, state, a, bias = [x.detach().cpu() for x in inputs[:8]]
+    q, k, v, g, beta = [x.detach().cpu() for x in inputs[:5]]
+    state, a, bias = [x.detach().cpu() for x in inputs[6:9]]
     # Raw input values/dtypes are preserved. Only npu_chunk models device casts.
     lists = [list(sequences(x, c)) for x in (q, k, v, g, beta)]
-    result = [[] for _ in SLOTS]
+    result = [[] for _ in range(16)]
     for b, n in enumerate(c["valid_lengths"]):
         qi, ki, vi, gi, bi = [xs[b].float() for xs in lists]
         qr = (qi.square().sum(-1) + 1e-6).rsqrt()
@@ -491,7 +495,7 @@ def reference(inputs, c, kind):
             bi = bi.sigmoid() * (2 if f["allow_neg_eigval"] else 1)
         if not c["inference"] and f["disable_recompute"]:
             for chunk in gi.split(CHUNK_SIZE, dim=2):
-                result[8].append(chunk.cumsum(dim=2).flatten())
+                result[10].append(chunk.cumsum(dim=2).flatten())
         beta_activation = bi
         h0 = (
             state[b : b + 1].transpose(-1, -2)
@@ -506,30 +510,81 @@ def reference(inputs, c, kind):
             beta_brc=F.pad(bi.unsqueeze(-1), (0, 0, 0, pad)),
             g=F.pad(gi, (0, 0, 0, pad)),
             initial_state=h0,
-            scale_value=f.get("scale") or 128**-0.5,
+            scale_value=qi.size(-1) ** -0.5 if f["scale"] is None else f["scale"],
             A_log=a,
             dt_bias=bias,
         )
-        chain = (_chain_cpu if kind == "cpu_chunk" else _chain_npu)(args)
+        if kind == "cpu_chunk":
+            chain = _chain_cpu(args)
+        else:
+            # The native bounded-gate reference uses a shared 16-row origin.
+            # Unbounded/preprocessed gates need causal differences to avoid
+            # overflow in the unused upper triangle before it is masked.
+            bounded_gate = f["use_gate_in_kernel"] and f["lower_bound"] is not None
+            chain = _chain_npu(args, safe_diagonal=not bounded_gate)
         result[0].append(chain.stage3.output[:, :, :n].flatten())
         if f["output_final_state"]:
             result[1].append(chain.stage2.S.transpose(-1, -2).flatten())
         if c["inference"] and f["return_intermediate_states"]:
             result[2].append(chain.stage2.H[0].permute(1, 0, 3, 2).flatten())
+        if not c["inference"]:
+            stage = chain.stage1
+            for slot, matrix in ((3, stage.Mqk), (4, stage.inverse)):
+                for ci in range(matrix.size(2)):
+                    valid = min(CHUNK_SIZE, n - ci * CHUNK_SIZE)
+                    result[slot].append(matrix[0, :, ci, :valid, :valid].flatten())
+            if f["disable_recompute"]:
+                q_heads = _chunk_major(args.Q).repeat_interleave(
+                    vi.size(1) // qi.size(1), dim=1
+                )
+                # Match the existing _saved_golden reference: BF16 normalized Q
+                # and BF16 public qg. Keep the cpu_chunk formula in FP32.
+                if kind == "npu_chunk":
+                    q_heads = _to_bf16_to_fp32(q_heads)
+                qg = stage.Gamma * q_heads
+                if kind == "npu_chunk":
+                    qg = _to_bf16_to_fp32(qg)
+                for slot, cache in enumerate(
+                    (stage.W, stage.U_pre, qg, stage.K_restored, chain.stage2.U), 5
+                ):
+                    result[slot].append(cache.flatten(2, 3)[:, :, :n].flatten())
         if not c["inference"] and f["use_qk_l2norm_in_kernel"]:
             for j, x in zip(
-                (3, 4, 5, 6), (qi.bfloat16().float(), qr, ki.bfloat16().float(), kr)
+                (11, 12, 13, 14), (qi.bfloat16().float(), qr, ki.bfloat16().float(), kr)
             ):
                 result[j].append(x.flatten())
         if not c["inference"] and f["use_beta_sigmoid_in_kernel"]:
-            result[7].append(beta_activation.transpose(1, 2).flatten())
+            result[15].append(beta_activation.transpose(1, 2).flatten())
     return [torch.cat(parts) if parts else empty() for parts in result]
 
 
 def golden(
-    q, k, v, g, beta, initial_state, A_log, dt_bias, cu_seqlens, seqused, **kwargs
+    q,
+    k,
+    v,
+    g,
+    beta,
+    metadata,
+    initial_state,
+    A_log,
+    dt_bias,
+    cu_seqlens,
+    seqused,
+    **kwargs,
 ):
-    inputs = [q, k, v, g, beta, initial_state, A_log, dt_bias, cu_seqlens, seqused]
+    inputs = [
+        q,
+        k,
+        v,
+        g,
+        beta,
+        metadata,
+        initial_state,
+        A_log,
+        dt_bias,
+        cu_seqlens,
+        seqused,
+    ]
     c = load_asset("inputs").configuration(inputs, kwargs)
     if c["pending"]:
         raise RuntimeError(c["pending"])
@@ -560,6 +615,7 @@ class CpuSimulation:
         v,
         g,
         beta,
+        metadata,
         initial_state,
         A_log,
         dt_bias,
@@ -567,8 +623,22 @@ class CpuSimulation:
         seqused,
         **kwargs,
     ):
-        inputs = [q, k, v, g, beta, initial_state, A_log, dt_bias, cu_seqlens, seqused]
+        inputs = [
+            q,
+            k,
+            v,
+            g,
+            beta,
+            metadata,
+            initial_state,
+            A_log,
+            dt_bias,
+            cu_seqlens,
+            seqused,
+        ]
         c = load_asset("inputs").configuration(inputs, kwargs)
+        if c["suite"] != "accuracy":
+            return golden(*inputs, **kwargs)
         return reference(inputs, c, "npu_chunk") + [torch.ones(1, dtype=torch.bool)]
 
 

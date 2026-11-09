@@ -18,6 +18,7 @@ INPUT_NAMES = (
     "v",
     "g",
     "beta",
+    "metadata",
     "initial_state",
     "A_log",
     "dt_bias",
@@ -39,7 +40,7 @@ OPERATOR_DEFAULTS = {
 
 def configuration(inputs, attributes):
     """Use TTK's supplied tensors/attributes; never reopen a CSV or inspect its ID."""
-    q, _, v, g, beta, state = inputs[:6]
+    q, _, v, g, beta, _, state = inputs[:7]
     layout = attributes.get("layout", "TND")
     packed = layout == "TND"
     batch = state.shape[0] if packed else q.shape[0]
@@ -56,6 +57,7 @@ def configuration(inputs, attributes):
     c = dict(
         id=attributes.get("testcase_name", ""),
         layout=layout,
+        omit_layout="layout" in omitted,
         batch_size=batch,
         nheads_qk=q.shape[head_axis],
         nheads_v=v.shape[head_axis],
@@ -176,19 +178,49 @@ def make(c):
     values = [to_layout(x, c["layout"], lengths) for x in (q, k, v, g, beta)]
     cu = c["cu_seqlens_value"] or [0] + list(torch.tensor(lengths).cumsum(0).tolist())
     used = c["seqused_value"] or lengths
-    return values + [
+    inputs = values + [
+        None,
         state,
         a,
         bias,
         torch.tensor(cu, dtype=torch.int32),
         torch.tensor(used, dtype=torch.int32),
     ]
+    # Generate the same ABI4 tensor used by a real caller, before DUT execution.
+    from kda_ttk_ops import mode, produce
+
+    with mode(c):
+        inputs[5] = produce(inputs, c).cpu()
+    return inputs
 
 
 def customize_inputs(
-    q, k, v, g, beta, initial_state, A_log, dt_bias, cu_seqlens, seqused, **kwargs
+    q,
+    k,
+    v,
+    g,
+    beta,
+    metadata,
+    initial_state,
+    A_log,
+    dt_bias,
+    cu_seqlens,
+    seqused,
+    **kwargs,
 ):
-    inputs = [q, k, v, g, beta, initial_state, A_log, dt_bias, cu_seqlens, seqused]
+    inputs = [
+        q,
+        k,
+        v,
+        g,
+        beta,
+        metadata,
+        initial_state,
+        A_log,
+        dt_bias,
+        cu_seqlens,
+        seqused,
+    ]
     c = configuration(inputs, kwargs)
     for name, target, value in zip(INPUT_NAMES, inputs, make(c)):
         if target.shape != value.shape or target.dtype != value.dtype:
@@ -232,7 +264,6 @@ def mutate(kw, c):
         "axis": ["shape", "dimension", "head", "维", "形状"],
         "shape": ["shape", "rank", "header", "short", "维", "形状"],
         "noncontiguous": ["contiguous", "stride", "连续"],
-        "device": ["device", "NPU", "设备"],
         "all_cpu": ["device", "NPU", "设备"],
         "empty": ["positive", "head", "size", "length", "正", "尺寸"],
         "gqa": ["head", "GQA", "divis", "头"],
@@ -277,20 +308,6 @@ def mutate(kw, c):
             )
     elif op == "noncontiguous":
         kw[name] = noncontiguous(kw[name])
-    elif op == "device":
-        if value == "npu:1" and (
-            not hasattr(torch, "npu") or torch.npu.device_count() < 2
-        ):
-            raise RuntimeError("NOT_APPLICABLE: requires two NPU devices")
-        if value == "npu:1":
-            # Construct the wrong-device input through host memory. A direct
-            # NPU0->NPU1 copy tests P2P support instead of argument validation.
-            host = kw[name].detach().cpu()
-            with torch.npu.device(value):
-                kw[name] = host.to(value)
-                torch.npu.synchronize()
-        else:
-            kw[name] = kw[name].to(value)
     elif op == "all_cpu":
         kw = {k: v.cpu() if isinstance(v, torch.Tensor) else v for k, v in kw.items()}
     elif op in ("empty", "gqa"):

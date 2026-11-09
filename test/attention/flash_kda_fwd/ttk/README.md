@@ -4,6 +4,10 @@
 
 CPU 参考计算复用了本仓库[原生前向测试](../test_flash_kda_fwd.py)中的分块、低精度舍入和三阶段递推函数。`golden.py` 将这些计算适配到公开接口，并通过 `FlashKdaFwdTestSpec` 向 TTK 提供预期输出。版权声明保留在源码中，许可证见[仓库根目录](../../../../LICENSE)。
 
+标杆定义沿用 `1fb3670` 中原生前向测试的 `_stage1_npu()` 和 `_saved_golden()`：`cpu_chunk` 的 qg 使用 FP32 归一化 Q 和 FP32 乘法；`npu_chunk` 的 qg 使用转存 BF16 的归一化 Q，乘以 FP32 衰减因子后再转存 BF16。这是既有 CPU 低精度模拟的定义，不是 TTK 要求复制被测实现的内部 cast；不能根据失败结果任意增加舍入。接口要求 qg 输出 BF16，FP32 数学参考不随模拟参考修改。当前 L2 结论仅表示相对这套 CPU 模拟标杆的误差检查，不能称为独立 GPU 标杆验收。
+
+有界 gate（`use_gate_in_kernel=True` 且 `lower_bound` 非 None）的低精度参考沿用原生 `_reference_lower_matmul()` 的每 16 行公共参考点，包括对角块；有效下界 `[-5, 0)` 将块内正指数限制在 75 以内。无界 gate 和预处理 g 保留逐行因果差分，避免未使用的上三角指数溢出后乘零产生 NaN。两条路径在实数运算下等价，但 BF16 乘法操作数的舍入不同，不能将安全逐行路径无条件替换原有有界 gate 标杆。FP32 数学参考继续使用原来的安全计算。
+
 ## 文件组织
 
 | 文件 | 职责 |
@@ -15,16 +19,16 @@ CPU 参考计算复用了本仓库[原生前向测试](../test_flash_kda_fwd.py)
 
 | CSV | 设计章节 | 条目数 |
 |---|---|---:|
-| `ttk_cases_stc.csv` | 功能，包括 Meta 输出协议及 F31 的 NPU/Meta stride 对照 | 152 |
-| `ttk_cases_invalid.csv` | 异常拦截、合法反例与恢复 | 290 |
+| `ttk_cases_stc.csv` | 功能，包括 Meta 输出协议及 F31 的 NPU/Meta stride 对照 | 154 |
+| `ttk_cases_invalid.csv` | 异常拦截、合法反例与恢复 | 267 |
 | `ttk_cases_generalized.csv` | 泛化 | 70 |
 | `ttk_cases_profiling.csv` | 性能 | 25 |
 
-共 537 条。10 条长度内容用例同时检查 metadata 生产和前向消费；常规回归为 512 条，性能单独运行。有效核数等于 ABI 的全部 32 个核槽时，两条“有效核数以外存在任务”场景不适用，不能伪造核数来执行。metadata 使用标量接口：`cu_seqlens、seqused、*、batch_size、nheads_qk、nheads_v、seqlens、headdim_qk、headdim_v、enable_grad、layout`。TND 必须提供 cu_seqlens，seqlens 在三种布局下都必须显式提供。
+共 516 条。10 条长度内容用例同时检查 metadata 生产和前向消费；常规回归为 491 条，性能单独运行。有效核数等于 ABI 的全部 32 个核槽时，两条“有效核数以外存在任务”场景不适用，不能伪造核数来执行。此前确认删除的 24 条错误用例不在本清单中。本次 metadata 调用按详设使用标量接口：`cu_seqlens、seqused、*、batch_size、nheads_qk、nheads_v、seqlens、headdim_qk、headdim_v、enable_grad、layout`。TND 必须提供 cu_seqlens，seqlens 在三种布局下都必须显式提供。
 
 ## 参数与检查
 
-张量顺序与被测函数保持一致：`q, k, v, g, beta, initial_state, A_log, dt_bias, cu_seqlens, seqused`。公开属性沿用 `layout`、`lower_bound`、`return_intermediate_states` 。三个融合开关默认 True，输入为原始 q/k、g 和 beta logits，A_log 必传。lower_bound 默认 None，使用 softplus，有效数值下界使用有界 sigmoid。metadata 在测试的实际训推上下文中生成，模式由 `torch.is_inference_mode_enabled()` 决定，`no_grad()` 单独验证。
+张量顺序与被测函数保持一致：`q, k, v, g, beta, metadata, initial_state, A_log, dt_bias, cu_seqlens, seqused`。公开属性沿用 `layout`、`lower_bound`、`return_intermediate_states` 。三个融合开关默认 True，输入为原始 q/k、g 和 beta logits，A_log 必传。lower_bound 默认 None，使用 softplus，有效数值下界使用有界 sigmoid。输入插件在用例指定的训推上下文中生成 INT32 metadata 并填入 CSV 的第六项，真实前向直接消费该项，模式由 `torch.is_inference_mode_enabled()` 决定，`no_grad()` 单独验证。
 
 CSV 的 shape、dtype、算子属性直接进入 TTK。`valid_lengths`、`initial_state_mode`、`dt_bias_mode`、`seed` 等属性控制输入；`omitted_attributes` 指定需要从真实调用中省略的可选参数。`test_config` 仅描述额外检查，是 JSON 字符串属性，包含变更对象、方式、值、错误信息或对照操作。普通精度用例不需要该属性。用例名称仅用于结果和日志，不用于选择测试行为；运行时不回读 CSV 或按编号查表。
 
@@ -35,9 +39,11 @@ CSV 的 shape、dtype、算子属性直接进入 TTK。`valid_lengths`、`initia
 - 主调用直接进入 TTK 原生 L2 比较；功能对照、分段状态衔接和异常恢复中的额外调用使用相同官方比较器，逐槽指标、dtype、基准和失败原因记录为 `l2_reference_check`。主输出、末态、chunk 状态不再使用 `5e-3 allclose` 验收。有限值与详设专项容差独立记录为 `numerical_contract_check`：q/k norm 为 `atol=rtol=1e-3`，rstd/Beta 激活为 `1e-6`。空返回槽标记为 `NOT_APPLICABLE`，不计作数值验收。
 - 正例按位置传入六个必填 Tensor，第六项为 `metadata`。原始固定 16 项返回检查 Tensor/None、shape、dtype；五个训练 token 缓存跟随输入布局，BNSD 按 `[B,Nv,S,D]`、BSND 按 `[B,S,Nv,D]`、TND 按 `[T,Nv,D]` 验证；仅比较有效 token、chunk 和已定义缓存。训推主结果及输入不变性使用精确比较。
 - 异常用例逐条核对异常类型、报错对象、原因及拦截边界，再用合法输入验证恢复。漏传 Python 签名中的必填参数（如 `q`、`metadata` 或 metadata 入口的 `seqlens`）应抛 `TypeError`；显式传入 `None` 的必需张量、非法 shape 或取值按接口约定抛 `ValueError`。
-- 真实设备路径阻塞读取 metadata 和给定的 cu_seqlens/seqused。非法长度必须在主计算缓冲区分配前抛出 ValueError，恢复合法长度后再检查数值。双设备异常需要两张 NPU。
+- 真实设备路径阻塞读取 metadata 和给定的 cu_seqlens/seqused。非法长度必须在主计算缓冲区分配前抛出 ValueError，恢复合法长度后再检查数值。不校验混合设备，不包含 CPU/NPU 混放、跨 NPU 或缓冲区设备不一致用例；保留全 CPU 执行限制检查。
 
-精度用例向 TTK 返回九个有效区输出（对应原始槽 `0,1,2,11,12,13,14,15,10`），另附一个 bool 功能契约结果。前九项按实际浮点 dtype 做 L2，第十项由 `binary_equal` 校验；数值和契约指标分开保留，契约失败不遮蔽主结果 L2。槽 10 g_cumsum 的公开 dtype 为 FP32，逐序列逐 chunk 检查有效 token 的前缀和。异常/Meta 等契约用例仅在所有检查完成后返回 bool 成功标记；恢复调用的 L2 指标查看对应事件记录。bool 通过不计作数值 L2 通过。各用例按 TestSpec 的配置执行 L2 比较，并记录逐槽指标。
+精度用例按公开接口顺序向 TTK 返回全部 16 槽的有效区，另附一个 bool 功能契约结果。启用的浮点槽按实际 dtype 做 L2；Aqk/Akk 仅比较有效行和有效列，五个 token 缓存仅比较有效 token。第十七项由 `binary_equal` 校验；数值和契约指标分开保留，契约失败不遮蔽主结果 L2。槽 10 g_cumsum 的公开 dtype 为 FP32，逐序列逐 chunk 检查有效 token 的前缀和。异常/Meta 等契约用例仅在所有检查完成后返回 bool 成功标记；恢复调用的 L2 指标查看对应事件记录。bool 通过不计作数值 L2 通过。L2 接入后的算子验收需重新执行，历史回归不作为新版本的 L2 结论。
+
+F06-005 显式传入 `scale=0.0`，默认缩放仅在 scale 为 None 时生效。F01-007 使用两条长度不同的紧凑序列，省略前向入口的 layout，与显式 TND 对照。
 
 ## 环境与执行
 
@@ -85,4 +91,4 @@ python -m ttk e2e -i ttk_cases_profiling.csv --plugin ../assets/golden.py \
   -o /path/to/feature-work/ttk/performance.csv
 ```
 
-性能用例在 CSV 中显式配置 10 次预热、50 次采样。metadata 在 TTK 排除的预热阶段生成；AICore 中位数、最小值从 TTK profiler 记录汇总，metadata、Host 校验、调用及同步耗时分别记录。`KDA_EVIDENCE_DIR` 未设置时检查信息写入日志。结果、dump、验证报告及开发脚本均保存在特性开发目录，不提交到仓库。
+性能用例在 CSV 中显式配置 10 次预热、50 次采样。性能用例在输入准备阶段填入 metadata，并在 TTK 排除的预热阶段单独计时一次 metadata 生产调用；AICore 中位数、最小值从 TTK profiler 记录汇总，metadata、Host 校验、调用及同步耗时分别记录。`KDA_EVIDENCE_DIR` 未设置时检查信息写入日志。结果、dump、验证报告及开发脚本均保存在特性开发目录，不提交到仓库。
