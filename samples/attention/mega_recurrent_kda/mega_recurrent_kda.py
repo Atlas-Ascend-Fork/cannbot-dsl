@@ -2937,7 +2937,7 @@ def _validate_mega_hidden(hidden_states, beta_weight):
     if n not in (6, 12, 24):
         raise ValueError("TP4/8/16 requires N=24/12/6")
     tp = 96 // n
-    if h != 7168 or b % tp or (not tp <= b <= (512 if n == 6 else 32 * tp)):
+    if h != 7168 or b % tp or (not tp <= b <= 32 * tp):
         raise ValueError("requires S8,H7168; extended TP4/8/16 model_batch=1..32")
     if hidden_states.dtype != torch.bfloat16 or not hidden_states.is_contiguous():
         raise ValueError("hidden_states must be contiguous BF16")
