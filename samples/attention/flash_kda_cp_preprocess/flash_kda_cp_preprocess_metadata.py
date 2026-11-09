@@ -39,8 +39,8 @@ MAX_AIC_CORES = 32
 WORKSPACE_SLOTS = 861
 CHUNK_SIZE = 64
 # Keep the exact FlashKDA stage12w fixed record layout.  CP preprocess reuses
-# the stage2 task partition for its per-head summary pass (split zero of each
-# head), so no CP-only fields are appended to the shared ABI.
+# the stage2 partition for its per-head summary rows, so no CP-only fields
+# are appended to the shared ABI.
 ROUND_FIXED_WORDS = 133
 ROUND_WORDS_PER_BATCH = 9
 
@@ -379,6 +379,23 @@ def _choose_chunk_group(a, group):
         a.workspace_slots,
         a.max_chunk_group,
     )
+    if group.count == 1:
+        # Align complete head/chunk tasks with the available core wave without
+        # adding metadata rounds or exceeding the existing workspace budget.
+        divisor = a.core_num
+        remainder = a.value_heads % divisor
+        while remainder != 0:
+            previous = divisor
+            divisor = remainder
+            remainder = previous % remainder
+        chunk_unit = a.core_num // divisor
+        aligned_size = group.size // chunk_unit * chunk_unit
+        if aligned_size > 0:
+            remaining = group.remaining_chunks[0]
+            original_rounds = (remaining + group.size - 1) // group.size
+            aligned_rounds = (remaining + aligned_size - 1) // aligned_size
+            if aligned_rounds == original_rounds:
+                group.size = aligned_size
     for active_idx in range(0, group.count):
         group.chunks_per_batch[active_idx] = min(group.remaining_chunks[active_idx], group.size)
 

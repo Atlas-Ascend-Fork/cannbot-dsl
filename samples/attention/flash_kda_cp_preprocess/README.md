@@ -1,7 +1,5 @@
 # flash_kda_cp_preprocess
 
-依赖版本：CANNBot-DSL 0.8.0。
-
 ## 产品支持情况
 
 - Ascend 950：支持。
@@ -120,9 +118,8 @@ flash_kda_cp_preprocess.flash_kda_cp_preprocess.flash_kda_cp_preprocess(
 
 ### 递推精度
 
-rank 内摘要始终使用 FP32 状态和 FP32 MMAD：`H_c=H_{c-1}P_c+b_c` 的
-`transition`、`state_ext` 以及逐 chunk 的局部矩阵乘均以 FP32 累积。输入和公共中间
-张量接口使用 BF16，递推计算使用 FP32。
+局部仿射矩阵与 rank 摘要的矩阵乘操作数、累加和存储均为 FP32。
+`transition`、`state_ext`、`decay` 使用 FP32；`qg`、`kg`、`u`、`w`、`mqk` 使用 BF16。
 
 ### metadata 入参
 
@@ -141,7 +138,7 @@ metadata 算子只读取 `q/v` 的属性，不读取它们的数值；TND 下会
 
 metadata 记录每条逻辑序列实际消费的 chunk 数；中间量的统一容量可用同一模块导出的 `chunk_capacity_upper_bound` 计算：BNSD/BSND 传入 `(B, S)`，TND 传入 `(B, T)`，结果分别为上述布局对应的 `C`。
 
-`flash_kda_cp_preprocess_metadata` 与 `flash_kda_cp_main_metadata` 共享同一个 FlashKDA stage12w metadata ABI 和 AICPU 编译对象；两者返回的 metadata 可直接分别供对应主算子消费。
+两个 CP metadata 入口沿用 FlashKDA stage12w ABI，在设备侧生成调度记录；各脚本独立管理 AICPU 编译与缓存。分别调用对应入口生成 preprocess 和 main 的 metadata，主算子不在 Host 读回调度结果。
 
 ## 返回值说明
 
@@ -205,12 +202,13 @@ python -m pytest -q test/attention/flash_kda_cp_preprocess/test_flash_kda_cp_pre
 
 ## 性能
 
-测试在 Ascend 950、CANN 9.2.0 上用 `msprof --task-time=l1` 采集，形状为 `B=1, Nqk=32, Nv=32, S=8192, D=128`，覆盖 BNSD、BSND、TND 三种布局；rank 内摘要使用 FP32 递推。
+测量环境：Ascend 950 PR、CANN 9.2.0，32 AIC / 64 AIV。
+下表为独立 kernel 的 Task Duration，单位为 μs；四轮交错对照，每组预热 3 次、采样 8 次，取组中位数的中位数。
+每次预热和采样前完成 1 GiB 软件 L2 驱逐并同步；驱逐、metadata、Host 和外部 prefix scan 不计入耗时。
 
-metadata 在采样循环前生成一次，`Task Duration` 只统计 AICore kernel `flash_kda_cp_preprocess_kernel`。每种布局预热 2 次后连续采样 12 次，表中为 12 次采样的中位数。
-
-| Layout | Task Duration 中位数 (us) |
-|:---|--:|
-| BNSD | 2842.1 |
-| BSND | 2960.0 |
-| TND | 2949.8 |
+| 布局 | B | S | Nv=Nqk | D | 耗时（μs） |
+|:---|--:|--:|--:|--:|--:|
+| BSND | 1 | 16384 | 6 | 128 | 1042.894 |
+| BSND | 1 | 16384 | 12 | 128 | 1967.678 |
+| BSND | 1 | 1024 | 96 | 128 | 1008.822 |
+| BNSD | 1 | 577 | 5 | 128 | 62.447 |

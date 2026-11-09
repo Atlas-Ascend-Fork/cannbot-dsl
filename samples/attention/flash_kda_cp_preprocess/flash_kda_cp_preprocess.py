@@ -30,12 +30,13 @@ from cannbotdsl import (
 )
 from cannbotdsl.buffer import Buffer
 from cannbotdsl.lang import vf
-from cannbotdsl.lang.constexpr import const_expr
+from cannbotdsl.lang.constexpr import const_expr, range_constexpr
 from cannbotdsl.lang.control_flow import range as dsl_range
 from cannbotdsl.lang.host import host
 from cannbotdsl.lang.jit import jit
 from cannbotdsl.lang.kernel import kernel
 from cannbotdsl.ops import reg as reg_ops
+from cannbotdsl.ops import scalar as scalar_ops
 from cannbotdsl.ops.arch import get_block_idx, get_block_num, get_subblock_id
 from cannbotdsl.ops.matmul import matmul
 from cannbotdsl.ops.memcpy import copy_options, mem_copy
@@ -56,6 +57,10 @@ from cannbotdsl.ops.reg import (
     vload_broadcast,
     vload_unpack,
     vmem_bar,
+    vpack,
+    vreinterpret,
+    vreinterpret_lanes,
+    vstore_strided,
     vmul,
     vmuls,
     vreduce_sum,
@@ -125,22 +130,6 @@ def cast_tile(dst, src):
                 _cast_vector_row(dst, src, row)
 
 
-@jit
-def prefix_sum_rows(dst, src):
-    """Inclusive f32 prefix along rows, with the original sequential add order."""
-    rows, cols = dst.shape
-    src_stride = src.physical_stride[0]
-    dst_stride = dst.physical_stride[0]
-    with vf(mode="simd"):
-        for col in range(0, cols, 64):
-            mask, _ = reg_ops.update_mask(cols - col, elem_bits=32)
-            prefix = reg_ops.vload(src, col)
-            reg_ops.vstore(dst, col, prefix, mask)
-            for row in range(1, rows):
-                row_value = reg_ops.vload(src, row * src_stride + col)
-                prefix = reg_ops.vadd(prefix, row_value, mask=mask)
-                reg_ops.vstore(dst, row * dst_stride + col, prefix, mask)
-
 
 @jit
 def nd2nz_tile(dst, src, elem_bits: int = 16):
@@ -167,6 +156,10 @@ LOW_DTYPE = torch.bfloat16
 HIGH_DTYPE = torch.float32
 SUMMARY_MTE2_TO_V_EVENT_ID = 0
 SUMMARY_RANK_PHI_READY_FLAG_ID = 10
+SUMMARY_ZERO_READY_FLAG_ID = 12
+SUMMARY_ZERO_RELEASE_FLAG_ID = 13
+SUMMARY_ZERO_CONSUMED_FLAG_ID = 14
+SUMMARY_ZERO_RECYCLE_FLAG_ID = 15
 
 
 @dataclasses.dataclass(frozen=True)
@@ -255,6 +248,10 @@ class _SummaryInputs:
     decay: object = None
     u: object = None
     w: object = None
+    phi: object = None
+    guard: object = None
+    zero_status: object = None
+    enable_zero: object = True
 
 
 @dataclasses.dataclass(frozen=True)
@@ -271,6 +268,8 @@ class _SummarySchedule:
     group_count: object = None
     item_start: object = None
     item_end: object = None
+    splits: object = 1
+    workspace_base: object = 0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -291,18 +290,8 @@ class _SequenceShape:
 
 
 @dataclasses.dataclass(frozen=True)
-class _PhiDestination:
-    phi: object = None
-    rank: object = None
-    transition: object = None
-
-
-@dataclasses.dataclass(frozen=True)
 class _PhiPublication:
     half: object = None
-    write_transition: object = None
-    publish_phi: object = None
-    initialize_rank: object = None
     state: object = None
 
 
@@ -313,6 +302,9 @@ class _SummaryWorkspace:
     w: object = None
     kg: object = None
     phi_ub: object = None
+    direct_phi_ub: object = None
+    cached_phi: object = None
+    cached_initial_phi: object = None
     phi: object = None
     initial_phi: object = None
     u: object = None
@@ -320,7 +312,6 @@ class _SummaryWorkspace:
     psi: object = None
     loaded_phi: object = None
     loaded_psi: object = None
-    psi_ub: object = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -332,6 +323,9 @@ class _SummaryChunk:
     group_end: object = None
     first: object = None
     last: object = None
+    row_index: object = 0
+    cached_phi: object = False
+    skip_phi: object = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -386,24 +380,15 @@ class _Stage1Constants(NamedTuple):
 _STAGE1_CONSTANTS_CACHE: dict[tuple[str, int | None, torch.dtype], _Stage1Constants] = {}
 
 
-def _empty_like_device(
-    shape: tuple[int, ...],
-    *,
-    ref: torch.Tensor,
-    dtype: torch.dtype = torch.float32,
-) -> torch.Tensor:
-    return torch.empty(shape, dtype=dtype, device=ref.device)
-
-
 def allocate_qk_exchange_workspace(
     *,
     active_block_num: int,
     ref: torch.Tensor,
 ) -> torch.Tensor:
-    """Allocate one pair of fp32 Q/K half-exchange tiles per physical block."""
+    """Allocate one pair of bf16 Q/K half-exchange tiles per physical block."""
     if not (active_block_num > 0):
         raise ValueError("active_block_num must be positive")
-    return _empty_like_device((active_block_num, 2, CHUNK_SIZE, D_HALF), ref=ref, dtype=HIGH_DTYPE)
+    return torch.empty((active_block_num, 2, CHUNK_SIZE, D_HALF), dtype=LOW_DTYPE, device=ref.device)
 
 
 def _resolved_device_key(ref: torch.Tensor) -> tuple[str, int | None]:
@@ -446,6 +431,9 @@ def _stream_identity(ref: torch.Tensor) -> tuple[str, int | None, int | None]:
 @dataclasses.dataclass
 class _CPExecutionEntry:
     qk_exchange: torch.Tensor
+    summary_phi: torch.Tensor
+    summary_guard: torch.Tensor
+    summary_zero_status: torch.Tensor
     launch_lock: threading.Lock = dataclasses.field(default_factory=threading.Lock)
 
 
@@ -466,7 +454,10 @@ class _CPExecutionCache:
                     qk_exchange=allocate_qk_exchange_workspace(
                         active_block_num=block_num,
                         ref=ref,
-                    )
+                    ),
+                    summary_phi=torch.empty((1, WORKSPACE_SLOTS, SUPPORTED_HEAD_DIM, SUPPORTED_HEAD_DIM), dtype=torch.float32, device=ref.device),
+                    summary_guard=torch.empty((WORKSPACE_SLOTS, 2, 1, 8), dtype=torch.int32, device=ref.device),
+                    summary_zero_status=torch.empty((block_num, 2, 1, 8), dtype=torch.int32, device=ref.device),
                 )
             self._entries[key] = cached
             while len(self._entries) > self._max_entries:
@@ -492,6 +483,12 @@ NEUMANN_DIAG_BLOCK_NUM = 4
 NEUMANN_FRACTAL_ELEMS = 256  # 一个 16x16 块的元素数。
 
 
+def _pack_score_bf16(value, mask):
+    converted = vcast(value, dtypes.bfloat16, mask=mask)
+    packed = vpack(vreinterpret_lanes(converted, dtypes.uint32), dtypes.uint16)
+    return vreinterpret(packed, dtypes.bfloat16)
+
+
 class StageOneMatmul:
     """StageOne Cube 侧矩阵乘计算。"""
 
@@ -510,6 +507,9 @@ class StageOneMatmul:
         self.l0a_db = RingBuffer(MemLoc.L0A, dtypes.bfloat16, make_layout((CHUNK_SIZE, head_dim)), depth=2)
         self.l0b_db = RingBuffer(MemLoc.L0B, dtypes.bfloat16, make_layout((CHUNK_SIZE, head_dim)), depth=2)
         self.l0c_db = RingBuffer(MemLoc.L0C, dtypes.float32, make_layout((CHUNK_SIZE, head_dim)), depth=2)
+        self.l1_shared_score_cache = RingBuffer(
+            MemLoc.L1, dtypes.bfloat16, make_layout((11 * NEUMANN_BLOCK_SIZE, SUPPORTED_HEAD_DIM)), depth=1,
+        ).next_write()
         self.per_d_left_k_l0a = RingBuffer(MemLoc.L0A, dtypes.bfloat16, make_layout((NEUMANN_BLOCK_SIZE, head_dim)), depth=1).next_write()
         self.per_d_left_q_l0a = RingBuffer(MemLoc.L0A, dtypes.bfloat16, make_layout((NEUMANN_BLOCK_SIZE, head_dim)), depth=1).next_write()
         self.per_d_l0b_db = RingBuffer(MemLoc.L0B, dtypes.bfloat16, make_layout((NEUMANN_BLOCK_SIZE, head_dim)), depth=2)
@@ -558,15 +558,7 @@ class StageOneMatmul:
         """Mqk = Q_decayed @ K_inv^T，消费 mm_kkt 保留的 K_inv slot。"""
         matmul(self.l0c_db.next_write(), self.l0a_db.next_read(), k_inv_l0b, init=True)
 
-    def load_per_d_left_k(self, l1_channel):
-        mem_copy(self.per_d_left_k_l0a, l1_channel.next_read())
 
-    def load_per_d_left_q(self, l1_channel):
-        mem_copy(self.per_d_left_q_l0a, l1_channel.next_read())
-
-    def load_per_d_right_k(self, l1_channel):
-        mem_copy(self.per_d_l0b_db.next_write(), l1_channel.next_read())
-        return self.per_d_l0b_db.next_read()
 
     def mm_per_d_kkt(self, row_block: int, col_block: int, right_k):
         kkt_tile = tile_slice(self.raw_l0c_main, (NEUMANN_BLOCK_SIZE, NEUMANN_BLOCK_SIZE), (row_block, col_block))
@@ -1047,6 +1039,27 @@ class StageOneMatmul:
         l0c_write = self.l0c_db.next_write()
         matmul(l0c_write, l0a_resident[0:CHUNK_SIZE, 0:CHUNK_SIZE], l0b_beta, init=True)
 
+    @jit
+    def compute_shared_per_d_scores(self, vector, k, q, gate):
+        for panel_idx in range_constexpr(2):
+            vector.pack_shared_score_panel(q, k, gate, panel_idx)
+            rows = (7 + 4 * panel_idx) * NEUMANN_BLOCK_SIZE
+            destination = self.l1_shared_score_cache[:rows, :SUPPORTED_HEAD_DIM].partition(dim=1, part_id=vector.subblock_idx)
+            mem_copy(destination, vector.ub_shared_score_nz[:rows, :D_HALF])
+            for panel_half in range_constexpr(2):
+                row_block = 2 * panel_idx + panel_half
+                left_k = tile_slice(self.l1_shared_score_cache, (NEUMANN_BLOCK_SIZE, SUPPORTED_HEAD_DIM), (2 * panel_half, 0))
+                left_q = tile_slice(self.l1_shared_score_cache, (NEUMANN_BLOCK_SIZE, SUPPORTED_HEAD_DIM), (2 * panel_half + 1, 0))
+                mem_copy(self.per_d_left_k_l0a, left_k)
+                mem_copy(self.per_d_left_q_l0a, left_q)
+                for col_block in range_constexpr(row_block + 1):
+                    right_tile = 4 + panel_half * (2 * panel_idx + 1) + col_block
+                    right_source = tile_slice(self.l1_shared_score_cache, (NEUMANN_BLOCK_SIZE, SUPPORTED_HEAD_DIM), (right_tile, 0))
+                    mem_copy(self.per_d_l0b_db.next_write(), right_source)
+                    right = self.per_d_l0b_db.next_read()
+                    self.mm_per_d_kkt(row_block, col_block, right)
+                    self.mm_per_d_mqk(row_block, col_block, right)
+
 
 class StageOneVector:
     """Vector 侧标量、mask、搬运和状态更新封装。"""
@@ -1057,9 +1070,8 @@ class StageOneVector:
         self.subblock_idx = subblock_idx
         self.ub_q = RingBuffer(MemLoc.UB, dtypes.bfloat16, make_layout((CHUNK_SIZE, SUPPORTED_HEAD_DIM)), depth=1).next_write()
         self.ub_k = RingBuffer(MemLoc.UB, dtypes.bfloat16, make_layout((CHUNK_SIZE, SUPPORTED_HEAD_DIM)), depth=1).next_write()
-        self.ub_qk_exchange = Buffer(MemLoc.UB, dtypes.float32, make_layout((CHUNK_SIZE, D_HALF)))
         self.ub_g_raw = RingBuffer(MemLoc.UB, dtypes.bfloat16, make_layout((CHUNK_SIZE, D_HALF)), depth=1).next_write()
-        self.ub_gate_activated = RingBuffer(MemLoc.UB, dtypes.float32, make_layout((CHUNK_SIZE, D_HALF)), depth=1).next_write()
+        self.ub_neg_exp_alpha = Buffer(MemLoc.UB, dtypes.float32, make_layout((D_HALF,)))
         self.ub_dt_bias = RingBuffer(MemLoc.UB, dtypes.float32, make_layout((D_HALF,)), depth=1).next_write()
         self.ub_alpha = RingBuffer(MemLoc.UB, dtypes.float32, make_layout((1,)), depth=1).next_write()
         self.ub_beta_raw = RingBuffer(MemLoc.UB, dtypes.bfloat16, make_layout((CHUNK_SIZE, 1)), depth=1).next_write()
@@ -1079,14 +1091,48 @@ class StageOneVector:
         self.ub_raw_k = [Buffer(MemLoc.UB, dtypes.bfloat16, make_layout((CHUNK_SIZE, D_HALF))) for _ in range(2)]
         self.ub_kkt = RingBuffer(MemLoc.UB, dtypes.float32, make_layout((HALF_CHUNK_SIZE, CHUNK_SIZE)), depth=1).next_write()
         self.ub_kkt_nz = RingBuffer(MemLoc.UB, dtypes.float16, make_layout((HALF_CHUNK_SIZE, CHUNK_SIZE)), depth=1, data_format='nz', physical_layout=make_layout(((CHUNK_SIZE + 15) // 16, (HALF_CHUNK_SIZE + 15) // 16, 16, 16), stride=((HALF_CHUNK_SIZE + 15) // 16 * 256 + 16, 256, 16, 1))).next_write()
-        self.ub_per_d_nd = RingBuffer(MemLoc.UB, dtypes.bfloat16, make_layout((NEUMANN_BLOCK_SIZE, D_HALF)), depth=2)
-        self.ub_per_d_nz = RingBuffer(MemLoc.UB, dtypes.bfloat16, make_layout((NEUMANN_BLOCK_SIZE, D_HALF)), depth=2, data_format='nz', physical_layout=make_layout(((D_HALF + 15) // 16, (NEUMANN_BLOCK_SIZE + 15) // 16, 16, 16), stride=((NEUMANN_BLOCK_SIZE + 15) // 16 * 256 + 16, 256, 16, 1)))
-        # One FIFO carries target-scoped left K/Q and column-scoped right K.
-        # Its three original L1 slots let AIV prepare left Q while AIC consumes
-        # the first right K; Cube keeps left K/Q resident in distinct L0A roots.
-        self.l1_per_d_operand = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((NEUMANN_BLOCK_SIZE, self.head_dim)), depth=3)
+        self.ub_shared_score_nz = RingBuffer(
+            MemLoc.UB, dtypes.bfloat16, make_layout((11 * NEUMANN_BLOCK_SIZE, D_HALF)), depth=1,
+            physical_layout=make_layout((4, 11, 16, 16), stride=(11 * 256 + 16, 256, 16, 1)), data_format="nz",
+        ).next_write()
         self.l1_v_beta = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((CHUNK_SIZE, self.head_dim)), depth=1).next_write()
         self.l1_K_decayed_beta_for_W = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((CHUNK_SIZE, self.head_dim)), depth=1).next_write()
+
+    def store_shared_score_operand16(self, value, tile, row, mask):
+        vstore_strided(self.ub_shared_score_nz, (tile * NEUMANN_BLOCK_SIZE + row) * 16, value, mask,
+                       block_stride=self.ub_shared_score_nz.physical_stride[0] // 16)
+
+    @jit
+    def pack_shared_score_panel(self, q, k, gate, panel_idx: int):
+        with vf(mode="simd"):
+            mask, _ = update_mask(D_HALF, elem_bits=32)
+            low_mask, _ = update_mask(D_HALF, elem_bits=16)
+            for panel_half in range_constexpr(2):
+                row_block = 2 * panel_idx + panel_half
+                reference = vload(gate, row_block * NEUMANN_BLOCK_SIZE * D_HALF)
+                for row in dsl_range(0, NEUMANN_BLOCK_SIZE, 1, unroll=2):
+                    offset = (row_block * NEUMANN_BLOCK_SIZE + row) * D_HALF
+                    q_value = vcast(vload_unpack(q, offset, unpack_mode=UnpackMode.B16_TO_B32), dtypes.float32, mask=mask)
+                    k_value = vcast(vload_unpack(k, offset, unpack_mode=UnpackMode.B16_TO_B32), dtypes.float32, mask=mask)
+                    current_gate = vload(gate, offset)
+                    delta = vsub(current_gate, reference, mask=mask)
+                    factor = vexp(delta, mask=mask)
+                    self.store_shared_score_operand16(_pack_score_bf16(vmul(k_value, factor, mask=mask), mask), 2 * panel_half, row, low_mask)
+                    self.store_shared_score_operand16(
+                        _pack_score_bf16(vmuls(vmul(q_value, factor, mask=mask), self.scale_value, mask=mask), mask),
+                        2 * panel_half + 1, row, low_mask,
+                    )
+                for col_block in range_constexpr(row_block + 1):
+                    for row in dsl_range(0, NEUMANN_BLOCK_SIZE, 1, unroll=2):
+                        offset = (col_block * NEUMANN_BLOCK_SIZE + row) * D_HALF
+                        k_value = vcast(vload_unpack(k, offset, unpack_mode=UnpackMode.B16_TO_B32), dtypes.float32, mask=mask)
+                        current_gate = vload(gate, offset)
+                        delta = vsub(reference, current_gate, mask=mask)
+                        factor = vexp(delta, mask=mask)
+                        right_tile = 4 + panel_half * (2 * panel_idx + 1) + col_block
+                        self.store_shared_score_operand16(
+                            _pack_score_bf16(vmul(k_value, factor, mask=mask), mask), right_tile, row, low_mask,
+                        )
 
     @staticmethod
     @jit
@@ -1094,7 +1140,7 @@ class StageOneVector:
         """Publish this AIV's normalized Q/K half before unrelated V work."""
         vec_sync_notify(PIPE.V, PIPE.MTE3, QK_V_TO_MTE3_EVENT_ID)
         vec_sync_wait(PIPE.V, PIPE.MTE3, QK_V_TO_MTE3_EVENT_ID)
-        mem_copy(q_to_k.flatten(), outgoing_half.flatten())
+        mem_copy(q_to_k.flatten().reshape((CHUNK_SIZE, D_HALF)), outgoing_half)
         vec_sync_all()
         vec_sync_block_arrive(PIPE.MTE3, QK_PUBLISH_FLAG_ID, mode=1)
 
@@ -1220,57 +1266,70 @@ class StageOneVector:
     def finish_normalized_qk_exchange(self, q_to_k, k_to_q):
         """Receive the peer half and return local normalized K/Q halves."""
         if self.subblock_idx == 0:
-            self.consume_normalized_qk_half(k_to_q, self.ub_qk_exchange)
-            cast_tile(self.ub_k_bf16, self.ub_qk_exchange)
+            self.consume_normalized_qk_half(k_to_q, self.ub_k_bf16)
         else:
-            self.consume_normalized_qk_half(q_to_k, self.ub_qk_exchange)
-            cast_tile(self.ub_q_bf16, self.ub_qk_exchange)
+            self.consume_normalized_qk_half(q_to_k, self.ub_q_bf16)
         return self.ub_k_bf16, self.ub_q_bf16
 
     @jit
-    def activate_raw_gate(self, gm_g, gate, location):
-        """Apply the source gate formula to one D half, then take its cumsum."""
-        g_chunk = tile_slice(
-            gm_g[location.batch, location.head, None, None], (CHUNK_SIZE, D_HALF), (location.chunk, self.subblock_idx)
-        )
-        bias_half = tile_slice(gate.bias[location.head, None], (D_HALF,), (self.subblock_idx,))
-        alpha = tile_slice(gate.alpha, (1,), (location.head,))
-        mem_copy(self.ub_g_raw, g_chunk)
+    def load_gate_invariants(self, gate, head):
+        bias_half = tile_slice(gate.bias[head, None], (D_HALF,), (self.subblock_idx,))
+        alpha = tile_slice(gate.alpha, (1,), (head,))
         mem_copy(self.ub_dt_bias, bias_half)
         mem_copy(self.ub_alpha, alpha)
         vec_sync_notify(PIPE.MTE2, PIPE.V, MTE2_TO_V_EVENT_ID)
         vec_sync_wait(PIPE.MTE2, PIPE.V, MTE2_TO_V_EVENT_ID)
-        rows_to_activate = CHUNK_SIZE
-        if location.valid_rows < CHUNK_SIZE:
-            with vf(mode="simd"):
-                lane_mask, _ = update_mask(D_HALF, elem_bits=32)
-                zero = vdups(0.0, dtypes.float32, mask=lane_mask)
-                for row in dsl_range(location.valid_rows, CHUNK_SIZE, 1, unroll=4):
-                    vstore(self.ub_gate_activated, row * D_HALF, zero, lane_mask)
-                vmem_bar("vst_vld")
-            rows_to_activate = location.valid_rows
+        with vf(mode="simd"):
+            lane_mask, _ = update_mask(D_HALF, elem_bits=32)
+            alpha_value = vload_broadcast(self.ub_alpha, 0)
+            alpha_exp = vexp(alpha_value, mask=lane_mask)
+            neg_exp_a = vmuls(alpha_exp, -1.0, mask=lane_mask)
+            vstore(self.ub_neg_exp_alpha, 0, neg_exp_a, lane_mask)
+            vmem_bar("vst_vld")
+
+
+    @jit
+    def issue_raw_gate(self, gm_g, location):
+        g_chunk = tile_slice(
+            gm_g[location.batch, location.head, None, None], (CHUNK_SIZE, D_HALF), (location.chunk, self.subblock_idx)
+        )
+        mem_copy(self.ub_g_raw, g_chunk)
+        vec_sync_notify(PIPE.MTE2, PIPE.V, GATE_MTE2_TO_V_EVENT_ID)
+
+
+    @jit
+    def activate_issued_gate(self, gate, location):
+        """Activate and accumulate a prefetched gate using cached head constants."""
+        vec_sync_wait(PIPE.MTE2, PIPE.V, GATE_MTE2_TO_V_EVENT_ID)
         with vf(mode="simd"):
             lane_mask, _ = update_mask(D_HALF, elem_bits=32)
             bound = vdups(gate.lower_bound, dtypes.float32, mask=lane_mask)
             one = vdups(1.0, dtypes.float32, mask=lane_mask)
-            alpha = vload_broadcast(self.ub_alpha, 0)
-            alpha_exp = vexp(alpha, mask=lane_mask)
-            neg_exp_a = vmuls(alpha_exp, -1.0, mask=lane_mask)
-            for row in dsl_range(0, rows_to_activate, 1, unroll=4):
+            neg_exp_a = vload(self.ub_neg_exp_alpha, 0)
+            dt_bias = vload(self.ub_dt_bias, 0)
+            raw_first = vcast(vload_unpack(self.ub_g_raw, 0, unpack_mode=UnpackMode.B16_TO_B32), dtypes.float32, mask=lane_mask)
+            first_input = vadd(raw_first, dt_bias, mask=lane_mask)
+            first_logit = vmul(neg_exp_a, first_input, mask=lane_mask)
+            first_exp = vexp(first_logit, mask=lane_mask)
+            first_denominator = vadd(one, first_exp, mask=lane_mask)
+            prefix = vdiv(bound, first_denominator, mask=lane_mask)
+            vstore(self.ub_g_cumsum, 0, prefix, lane_mask)
+            for row in dsl_range(1, location.valid_rows, 1, unroll=4):
                 offset = row * D_HALF
                 raw_g_packed = vload_unpack(self.ub_g_raw, offset, unpack_mode=UnpackMode.B16_TO_B32)
                 raw_g = vcast(raw_g_packed, dtypes.float32, mask=lane_mask)
-                dt_bias = vload(self.ub_dt_bias, 0)
                 gate_input = vadd(raw_g, dt_bias, mask=lane_mask)
                 gate_logit = vmul(neg_exp_a, gate_input, mask=lane_mask)
                 gate_exp = vexp(gate_logit, mask=lane_mask)
                 denominator = vadd(one, gate_exp, mask=lane_mask)
-                gate = vdiv(bound, denominator, mask=lane_mask)
-                vstore(self.ub_gate_activated, offset, gate, lane_mask)
+                activated = vdiv(bound, denominator, mask=lane_mask)
+                prefix = vadd(prefix, activated, mask=lane_mask)
+                vstore(self.ub_g_cumsum, offset, prefix, lane_mask)
+            for row in dsl_range(location.valid_rows, CHUNK_SIZE, 1, unroll=4):
+                vstore(self.ub_g_cumsum, row * D_HALF, prefix, lane_mask)
             vmem_bar("vst_vld")
-        vec_sync_all()
-        prefix_sum_rows(self.ub_g_cumsum, self.ub_gate_activated)
         return self.ub_g_cumsum
+
 
     @jit
     def activate_raw_beta(self, gm_beta, location):
@@ -1414,92 +1473,23 @@ class StageOneVector:
         gamma_C_gm = tile_slice(decay_chunk, (1, D_HALF), (0, self.subblock_idx))
         mem_copy(gamma_C_gm, gamma_c_slot)
 
-    @jit
-    def build_per_d_left_k(self, normalized_k_dhalf, gate_cumsum_dhalf, row_block: int, left_k_l1_operand):
-        k_read = tile_slice(normalized_k_dhalf, (NEUMANN_BLOCK_SIZE, D_HALF), (row_block, 0))
-        ref_offset = row_block * NEUMANN_BLOCK_SIZE * D_HALF
 
-        nd_write = self.ub_per_d_nd.next_write()
-        with vf(mode="simd"):
-            mask, _ = update_mask(D_HALF, elem_bits=32)
-            ref = vload(gate_cumsum_dhalf, ref_offset)
-            for row in dsl_range(0, NEUMANN_BLOCK_SIZE, 1, unroll=2):
-                offset = row * D_HALF
-                g_offset = ((row_block * NEUMANN_BLOCK_SIZE) + row) * D_HALF
-                k_packed = vload_unpack(k_read, offset, unpack_mode=UnpackMode.B16_TO_B32)
-                k_value = vcast(k_packed, dtypes.float32, mask=mask)
-                gate_cumsum = vload(gate_cumsum_dhalf, g_offset)
-                gate_delta = vsub(gate_cumsum, ref, mask=mask)
-                gate_factor = vexp(gate_delta, mask=mask)
-                weighted_k = vmul(k_value, gate_factor, mask=mask)
-                weighted_k_bf16 = vcast(weighted_k, dtypes.bfloat16, mask=mask)
-                vstore_pack(nd_write, offset, weighted_k_bf16, mask, pack_mode="b32_to_b16")
-        nd_read = self.ub_per_d_nd.next_read()
-        self._write_per_d_full_d_handoff(left_k_l1_operand, nd_read)
-
-    @jit
-    def build_per_d_left_q(self, normalized_q_dhalf, gate_cumsum_dhalf, row_block: int, left_q_l1_operand):
-        q_read = tile_slice(normalized_q_dhalf, (NEUMANN_BLOCK_SIZE, D_HALF), (row_block, 0))
-        ref_offset = row_block * NEUMANN_BLOCK_SIZE * D_HALF
-        nd_write = self.ub_per_d_nd.next_write()
-        with vf(mode="simd"):
-            mask, _ = update_mask(D_HALF, elem_bits=32)
-            ref = vload(gate_cumsum_dhalf, ref_offset)
-            for row in dsl_range(0, NEUMANN_BLOCK_SIZE, 1, unroll=2):
-                offset = row * D_HALF
-                g_offset = ((row_block * NEUMANN_BLOCK_SIZE) + row) * D_HALF
-                q_packed = vload_unpack(q_read, offset, unpack_mode=UnpackMode.B16_TO_B32)
-                q_value = vcast(q_packed, dtypes.float32, mask=mask)
-                gate_cumsum = vload(gate_cumsum_dhalf, g_offset)
-                gate_delta = vsub(gate_cumsum, ref, mask=mask)
-                gate_factor = vexp(gate_delta, mask=mask)
-                gated_q = vmul(q_value, gate_factor, mask=mask)
-                scaled_q = vmuls(gated_q, self.scale_value, mask=mask)
-                scaled_q_bf16 = vcast(scaled_q, dtypes.bfloat16, mask=mask)
-                vstore_pack(nd_write, offset, scaled_q_bf16, mask, pack_mode="b32_to_b16")
-        nd_read = self.ub_per_d_nd.next_read()
-        self._write_per_d_full_d_handoff(left_q_l1_operand, nd_read)
-
-    @jit
-    def build_per_d_right(
-        self, normalized_k_dhalf, gate_cumsum_dhalf, row_block: int, col_block: int, right_k_l1_operand
-    ):
-        k_read = tile_slice(normalized_k_dhalf, (NEUMANN_BLOCK_SIZE, D_HALF), (col_block, 0))
-        ref_offset = row_block * NEUMANN_BLOCK_SIZE * D_HALF
-
-        nd_write = self.ub_per_d_nd.next_write()
-        with vf(mode="simd"):
-            mask, _ = update_mask(D_HALF, elem_bits=32)
-            ref = vload(gate_cumsum_dhalf, ref_offset)
-            for row in dsl_range(0, NEUMANN_BLOCK_SIZE, 1, unroll=2):
-                offset = row * D_HALF
-                g_offset = ((col_block * NEUMANN_BLOCK_SIZE) + row) * D_HALF
-                k_packed = vload_unpack(k_read, offset, unpack_mode=UnpackMode.B16_TO_B32)
-                k_value = vcast(k_packed, dtypes.float32, mask=mask)
-                gate_cumsum = vload(gate_cumsum_dhalf, g_offset)
-                gate_delta = vsub(ref, gate_cumsum, mask=mask)
-                gate_factor = vexp(gate_delta, mask=mask)
-                restored_k = vmul(k_value, gate_factor, mask=mask)
-                restored_k_bf16 = vcast(restored_k, dtypes.bfloat16, mask=mask)
-                vstore_pack(nd_write, offset, restored_k_bf16, mask, pack_mode="b32_to_b16")
-        nd_read = self.ub_per_d_nd.next_read()
-        self._write_per_d_full_d_handoff(right_k_l1_operand, nd_read)
 
     @jit
     def _normalize_and_publish_q(self, q_slot, q_to_k):
         vec_sync_wait(PIPE.MTE2, PIPE.V, MTE2_TO_V_EVENT_ID)
         self.normalize_full_d_bf16(q_slot)
         mem_copy(self.ub_q_bf16, reinterpret(q_slot, offset=0, layout=make_layout((CHUNK_SIZE, D_HALF), stride=(SUPPORTED_HEAD_DIM, 1))))
-        cast_tile(self.ub_qk_exchange, reinterpret(q_slot, offset=D_HALF * 2, layout=make_layout((CHUNK_SIZE, D_HALF), stride=(SUPPORTED_HEAD_DIM, 1))))
-        self.publish_normalized_qk_half(q_to_k, self.ub_qk_exchange)
+        outgoing_half = reinterpret(q_slot, offset=D_HALF * 2, layout=make_layout((CHUNK_SIZE, D_HALF), stride=(SUPPORTED_HEAD_DIM, 1)))
+        self.publish_normalized_qk_half(q_to_k, outgoing_half)
 
     @jit
     def _normalize_and_publish_k(self, k_slot, k_to_q):
         vec_sync_wait(PIPE.MTE2, PIPE.V, MTE2_TO_V_SUBBLOCK1_EVENT_ID)
         self.normalize_full_d_bf16(k_slot)
         mem_copy(self.ub_k_bf16, reinterpret(k_slot, offset=D_HALF * 2, layout=make_layout((CHUNK_SIZE, D_HALF), stride=(SUPPORTED_HEAD_DIM, 1))))
-        cast_tile(self.ub_qk_exchange, k_slot)
-        self.publish_normalized_qk_half(k_to_q, self.ub_qk_exchange)
+        outgoing_half = reinterpret(k_slot, layout=make_layout((CHUNK_SIZE, D_HALF), stride=(SUPPORTED_HEAD_DIM, 1)))
+        self.publish_normalized_qk_half(k_to_q, outgoing_half)
 
     @jit
     def _load_tail_bf16_tensor(self, source, channel, *, cols: int, ready_event: int):
@@ -1565,10 +1555,6 @@ class StageOneVector:
                 vstore_pack(bf16_write, off, mqk_bf16, row_mask, pack_mode="b32_to_b16")
         mem_copy(gm_tile, self.ub_mqk_bf16)
 
-    @jit
-    def _write_per_d_full_d_handoff(self, full_channel, nd_slot):
-        nd2nz_tile(self.ub_per_d_nz.next_write(), nd_slot)
-        mem_copy(full_channel.next_write().partition(dim=1, part_id=self.subblock_idx), self.ub_per_d_nz.next_read())
 
     def _store_dhalf_nz_ub_to_full_l1(self, l1_dst, ub_nz_src):
         mem_copy(l1_dst.partition(dim=1, part_id=self.subblock_idx), ub_nz_src)
@@ -1601,76 +1587,12 @@ def _prepare_stage1_delayed(runtime, gm_V, location):
     runtime.matmul.compose_odd_even_lower32_to64_accum_full64(neumann_scratch, packed_inverse)
 
 
-@jit
-def _compute_stage1_products_first_half(matmul_ops, vector, normalized_k_dhalf, normalized_q_dhalf, gate_cumsum_dhalf):
-    vector.build_per_d_left_k(normalized_k_dhalf, gate_cumsum_dhalf, 0, vector.l1_per_d_operand)
-    matmul_ops.load_per_d_left_k(vector.l1_per_d_operand)
-    vector.build_per_d_right(normalized_k_dhalf, gate_cumsum_dhalf, 0, 0, vector.l1_per_d_operand)
-    right_k = matmul_ops.load_per_d_right_k(vector.l1_per_d_operand)
-    matmul_ops.mm_per_d_kkt(0, 0, right_k)
-    vector.build_per_d_left_q(normalized_q_dhalf, gate_cumsum_dhalf, 0, vector.l1_per_d_operand)
-    matmul_ops.load_per_d_left_q(vector.l1_per_d_operand)
-    matmul_ops.mm_per_d_mqk(0, 0, right_k)
 
-    vector.build_per_d_left_k(normalized_k_dhalf, gate_cumsum_dhalf, 1, vector.l1_per_d_operand)
-    matmul_ops.load_per_d_left_k(vector.l1_per_d_operand)
-    vector.build_per_d_right(normalized_k_dhalf, gate_cumsum_dhalf, 1, 0, vector.l1_per_d_operand)
-    right_k = matmul_ops.load_per_d_right_k(vector.l1_per_d_operand)
-    matmul_ops.mm_per_d_kkt(1, 0, right_k)
-    vector.build_per_d_left_q(normalized_q_dhalf, gate_cumsum_dhalf, 1, vector.l1_per_d_operand)
-    matmul_ops.load_per_d_left_q(vector.l1_per_d_operand)
-    matmul_ops.mm_per_d_mqk(1, 0, right_k)
-    vector.build_per_d_right(normalized_k_dhalf, gate_cumsum_dhalf, 1, 1, vector.l1_per_d_operand)
-    right_k = matmul_ops.load_per_d_right_k(vector.l1_per_d_operand)
-    matmul_ops.mm_per_d_kkt(1, 1, right_k)
-    matmul_ops.mm_per_d_mqk(1, 1, right_k)
-
-
-@jit
-def _compute_stage1_products_second_half(matmul_ops, vector, normalized_k_dhalf, normalized_q_dhalf, gate_cumsum_dhalf):
-    vector.build_per_d_left_k(normalized_k_dhalf, gate_cumsum_dhalf, 2, vector.l1_per_d_operand)
-    matmul_ops.load_per_d_left_k(vector.l1_per_d_operand)
-    vector.build_per_d_right(normalized_k_dhalf, gate_cumsum_dhalf, 2, 0, vector.l1_per_d_operand)
-    right_k = matmul_ops.load_per_d_right_k(vector.l1_per_d_operand)
-    matmul_ops.mm_per_d_kkt(2, 0, right_k)
-    vector.build_per_d_left_q(normalized_q_dhalf, gate_cumsum_dhalf, 2, vector.l1_per_d_operand)
-    matmul_ops.load_per_d_left_q(vector.l1_per_d_operand)
-    matmul_ops.mm_per_d_mqk(2, 0, right_k)
-    vector.build_per_d_right(normalized_k_dhalf, gate_cumsum_dhalf, 2, 1, vector.l1_per_d_operand)
-    right_k = matmul_ops.load_per_d_right_k(vector.l1_per_d_operand)
-    matmul_ops.mm_per_d_kkt(2, 1, right_k)
-    matmul_ops.mm_per_d_mqk(2, 1, right_k)
-    vector.build_per_d_right(normalized_k_dhalf, gate_cumsum_dhalf, 2, 2, vector.l1_per_d_operand)
-    right_k = matmul_ops.load_per_d_right_k(vector.l1_per_d_operand)
-    matmul_ops.mm_per_d_kkt(2, 2, right_k)
-    matmul_ops.mm_per_d_mqk(2, 2, right_k)
-
-    vector.build_per_d_left_k(normalized_k_dhalf, gate_cumsum_dhalf, 3, vector.l1_per_d_operand)
-    matmul_ops.load_per_d_left_k(vector.l1_per_d_operand)
-    vector.build_per_d_right(normalized_k_dhalf, gate_cumsum_dhalf, 3, 0, vector.l1_per_d_operand)
-    right_k = matmul_ops.load_per_d_right_k(vector.l1_per_d_operand)
-    matmul_ops.mm_per_d_kkt(3, 0, right_k)
-    vector.build_per_d_left_q(normalized_q_dhalf, gate_cumsum_dhalf, 3, vector.l1_per_d_operand)
-    matmul_ops.load_per_d_left_q(vector.l1_per_d_operand)
-    matmul_ops.mm_per_d_mqk(3, 0, right_k)
-    vector.build_per_d_right(normalized_k_dhalf, gate_cumsum_dhalf, 3, 1, vector.l1_per_d_operand)
-    right_k = matmul_ops.load_per_d_right_k(vector.l1_per_d_operand)
-    matmul_ops.mm_per_d_kkt(3, 1, right_k)
-    matmul_ops.mm_per_d_mqk(3, 1, right_k)
-    vector.build_per_d_right(normalized_k_dhalf, gate_cumsum_dhalf, 3, 2, vector.l1_per_d_operand)
-    right_k = matmul_ops.load_per_d_right_k(vector.l1_per_d_operand)
-    matmul_ops.mm_per_d_kkt(3, 2, right_k)
-    matmul_ops.mm_per_d_mqk(3, 2, right_k)
-    vector.build_per_d_right(normalized_k_dhalf, gate_cumsum_dhalf, 3, 3, vector.l1_per_d_operand)
-    right_k = matmul_ops.load_per_d_right_k(vector.l1_per_d_operand)
-    matmul_ops.mm_per_d_kkt(3, 3, right_k)
-    matmul_ops.mm_per_d_mqk(3, 3, right_k)
 
 
 @jit
 def _compute_stage1_products(matmul_ops, vector, normalized_k_dhalf, normalized_q_dhalf, gate_cumsum_dhalf):
-    _compute_stage1_products_first_half(matmul_ops, vector, normalized_k_dhalf, normalized_q_dhalf, gate_cumsum_dhalf)
-    _compute_stage1_products_second_half(matmul_ops, vector, normalized_k_dhalf, normalized_q_dhalf, gate_cumsum_dhalf)
+    matmul_ops.compute_shared_per_d_scores(vector, normalized_k_dhalf, normalized_q_dhalf, gate_cumsum_dhalf)
 
 
 @jit
@@ -1690,25 +1612,30 @@ def _publish_stage1_delayed(runtime, outputs, location):
 
 
 @jit
-def _allocate_summary_workspace(head_dim):
+def _allocate_summary_workspace(head_dim, row_count):
     kg_l1 = RingBuffer(MemLoc.L1, dtypes.float32, make_layout((CHUNK_SIZE, head_dim)), depth=1).next_write()
     u_l1 = RingBuffer(MemLoc.L1, dtypes.float32, make_layout((CHUNK_SIZE, head_dim)), depth=1).next_write()
     w_l1 = RingBuffer(MemLoc.L1, dtypes.float32, make_layout((CHUNK_SIZE, head_dim)), depth=1).next_write()
     phi_l1 = RingBuffer(MemLoc.L1, dtypes.float32, make_layout((head_dim, head_dim)), depth=1).next_write()
+    cached_phi_l1 = RingBuffer(MemLoc.L1, dtypes.float32, make_layout((head_dim, head_dim)), depth=1).next_write()
+    cached_initial_phi_l1 = Buffer(MemLoc.L1, dtypes.float32, make_layout((head_dim, head_dim)))
     initial_rank_phi_l1 = Buffer(MemLoc.L1, dtypes.float32, make_layout((head_dim, head_dim)))
     recurrent_rank_phi_l1 = RingBuffer(MemLoc.L1, dtypes.float32, make_layout((head_dim, head_dim)), depth=1).next_write()
     rank_psi_l1 = RingBuffer(MemLoc.L1, dtypes.float32, make_layout((head_dim, head_dim)), depth=1).next_write()
-    loaded_rank_phi_l1 = RingBuffer(MemLoc.L1, dtypes.float32, make_layout((head_dim, head_dim)), depth=1).next_write()
-    loaded_rank_psi_l1 = RingBuffer(MemLoc.L1, dtypes.float32, make_layout((head_dim, head_dim)), depth=1).next_write()
-    stage_two_matmul = StageTwoMatmul(head_dim=head_dim)
+    # The resumed summary is consumed before its first recurrent result replaces it.
+    loaded_rank_phi_l1 = recurrent_rank_phi_l1
+    loaded_rank_psi_l1 = rank_psi_l1
+    stage_two_matmul = StageTwoMatmul(head_dim=head_dim, row_count=row_count)
     phi_ub = RingBuffer(MemLoc.UB, dtypes.float32, make_layout((head_dim // 2, head_dim)), depth=1).next_write()
-    psi_ub = RingBuffer(MemLoc.UB, dtypes.float32, make_layout((head_dim // 2, head_dim)), depth=1).next_write()
+    direct_phi_ub = RingBuffer(MemLoc.UB, dtypes.float32, make_layout((head_dim // 2, head_dim)), depth=1).next_write()
     stage_two_vector = StageTwoVector(head_dim=head_dim)
 
     return _SummaryWorkspace(
         kg=kg_l1,
         u=u_l1,
         w=w_l1,
+        cached_phi=cached_phi_l1,
+        cached_initial_phi=cached_initial_phi_l1,
         phi=phi_l1,
         initial_phi=initial_rank_phi_l1,
         recurrent_phi=recurrent_rank_phi_l1,
@@ -1717,94 +1644,83 @@ def _allocate_summary_workspace(head_dim):
         loaded_psi=loaded_rank_psi_l1,
         matmul=stage_two_matmul,
         phi_ub=phi_ub,
-        psi_ub=psi_ub,
+        direct_phi_ub=direct_phi_ub,
         vector=stage_two_vector,
     )
 
 
 @jit
-def _prepare_summary_phi(workspace, decay_tile, gm_transition, chunk):
+def _prepare_direct_summary_phi(workspace, decay, gm_transition, chunk):
     workspace.matmul.compute_chunk_product(workspace.w, workspace.kg, workspace.matmul.l0c_phi)
-    workspace.matmul.store_summary_to_ub(workspace.phi_ub, workspace.matmul.l0c_phi)
+    workspace.matmul.store_summary_to_ub(workspace.direct_phi_ub, workspace.matmul.l0c_phi)
+    workspace.vector.add_decay_half(workspace.direct_phi_ub, decay, chunk.subblock)
+    first = chunk.index == chunk.group_start
+    last = chunk.index + 1 == chunk.group_end
+    if chunk.group_start == 0 and first and last:
+        workspace.vector._publish_static_half(
+            workspace.direct_phi_ub, gm_transition, _PhiPublication(half=chunk.subblock, state=chunk.state)
+        )
+    else:
+        nz = workspace.vector.direct_phi_nz
+        nd2nz_tile(nz, workspace.direct_phi_ub, 32)
+        if chunk.group_start == 0 and first:
+            mem_copy(workspace.initial_phi.partition(dim=0, part_id=chunk.subblock), nz)
+            vec_sync_block_arrive(PIPE.MTE3, SUMMARY_RANK_PHI_READY_FLAG_ID, mode=2)
+        else:
+            mem_copy(workspace.phi.partition(dim=0, part_id=chunk.subblock), nz)
+    return first, last
+
+
+@jit
+def _prepare_summary_phi(workspace, cached_phi, gm_transition, chunk):
     is_group_first = chunk.index == chunk.group_start
     is_group_last = chunk.index + 1 == chunk.group_end
     if chunk.group_start == 0 and is_group_first and is_group_last:
-        workspace.vector.add_decay_and_publish_phi(
-            workspace.phi_ub,
-            decay_tile,
-            _PhiDestination(phi=workspace.phi, rank=workspace.initial_phi, transition=gm_transition),
-            _PhiPublication(
-                half=chunk.subblock, write_transition=True, publish_phi=False, initialize_rank=False, state=chunk.state
-            ),
-        )
+        half = tile_slice(cached_phi, (SUPPORTED_HEAD_DIM // 2, SUPPORTED_HEAD_DIM), (chunk.subblock, 0))
+        local_phi = workspace.vector.phi_out_ub
+        mem_copy(local_phi, half)
+        transition = _state_head_tile(gm_transition, chunk.state)
+        transition_half = tile_slice(transition, (SUPPORTED_HEAD_DIM // 2, SUPPORTED_HEAD_DIM), (chunk.subblock, 0))
+        mem_copy(transition_half, local_phi)
     elif chunk.group_start == 0 and is_group_first:
-        workspace.vector.add_decay_and_publish_phi(
-            workspace.phi_ub,
-            decay_tile,
-            _PhiDestination(phi=workspace.phi, rank=workspace.initial_phi, transition=gm_transition),
-            _PhiPublication(
-                half=chunk.subblock, write_transition=False, publish_phi=False, initialize_rank=True, state=chunk.state
-            ),
-        )
-        vec_sync_block_arrive(PIPE.MTE3, SUMMARY_RANK_PHI_READY_FLAG_ID, mode=2)
+        workspace.matmul.load_summary(workspace.initial_phi, cached_phi)
     else:
-        workspace.vector.add_decay_and_publish_phi(
-            workspace.phi_ub,
-            decay_tile,
-            _PhiDestination(phi=workspace.phi, rank=workspace.initial_phi, transition=gm_transition),
-            _PhiPublication(
-                half=chunk.subblock, write_transition=False, publish_phi=True, initialize_rank=False, state=chunk.state
-            ),
-        )
+        workspace.matmul.load_summary(workspace.phi, cached_phi)
 
     return is_group_first, is_group_last
 
 
 @jit
 def _compose_summary_chunk(workspace, chunk):
-    workspace.matmul.compute_chunk_product(workspace.u, workspace.kg, workspace.matmul.l0c_psi)
+    workspace.matmul.compute_chunk_product(
+        workspace.u, workspace.kg, workspace.matmul.l0c_psi, row_index=chunk.row_index, partial=True
+    )
+    if chunk.group_start > 0 or not chunk.first:
+        workspace.matmul.load_rank_phi(workspace.phi)
     if chunk.group_start > 0 and chunk.first:
-        workspace.matmul.compute_rank_product(workspace.loaded_phi, workspace.phi, workspace.matmul.l0c_phi, init=True)
-        workspace.matmul.compute_rank_product(workspace.loaded_psi, workspace.phi, workspace.matmul.l0c_psi, init=False)
+        workspace.matmul.compute_rank_pair(workspace.loaded_phi, workspace.loaded_psi, row_index=chunk.row_index, skip_phi=chunk.skip_phi)
     elif chunk.group_start > 0 or not chunk.first:
         if chunk.group_start == 0 and chunk.index == chunk.group_start + 1:
-            cube_sync_block_wait(PIPE.S, SUMMARY_RANK_PHI_READY_FLAG_ID, mode=2)
-            workspace.matmul.compute_rank_product(
-                workspace.initial_phi, workspace.phi, workspace.matmul.l0c_phi, init=True
-            )
+            if const_expr(not chunk.cached_phi):
+                cube_sync_block_wait(PIPE.S, SUMMARY_RANK_PHI_READY_FLAG_ID, mode=2)
+            workspace.matmul.compute_rank_pair(workspace.initial_phi, workspace.psi, row_index=chunk.row_index, skip_phi=chunk.skip_phi)
         else:
-            workspace.matmul.compute_rank_product(
-                workspace.recurrent_phi, workspace.phi, workspace.matmul.l0c_phi, init=True
-            )
-        workspace.matmul.compute_rank_product(workspace.psi, workspace.phi, workspace.matmul.l0c_psi, init=False)
+            workspace.matmul.compute_rank_pair(workspace.recurrent_phi, workspace.psi, row_index=chunk.row_index, skip_phi=chunk.skip_phi)
 
 
 @jit
 def _store_summary_chunk(workspace, gm_state_ext, chunk, transition_tile):
     if chunk.group_start > 0 or not chunk.first:
         if not chunk.last:
-            workspace.matmul.store_summary_to_l1(workspace.recurrent_phi, workspace.matmul.l0c_phi)
+            if not chunk.skip_phi:
+                workspace.matmul.store_summary_to_l1(workspace.recurrent_phi, workspace.matmul.l0c_rank_phi, chunk.row_index)
         else:
-            mem_copy(transition_tile, workspace.matmul.l0c_phi)
-    elif chunk.last:
-        pass
-
-    if chunk.group_start == 0 and chunk.first:
-        if not chunk.last:
-            workspace.matmul.store_summary_to_l1(workspace.psi, workspace.matmul.l0c_psi)
-        else:
-            workspace.matmul.store_summary_to_ub(workspace.psi_ub, workspace.matmul.l0c_psi)
-            workspace.vector.write_crosscore_matrix_to_gm(
-                workspace.psi_ub, gm_state_ext, subblock_idx=chunk.subblock, state_index=chunk.state
-            )
+            workspace.matmul.store_summary_to_gm(transition_tile, workspace.matmul.l0c_rank_phi, chunk.row_index)
+    if not chunk.last:
+        workspace.matmul.store_summary_to_l1(workspace.psi, workspace.matmul.l0c_psi, chunk.row_index)
     else:
-        if not chunk.last:
-            workspace.matmul.store_summary_to_l1(workspace.psi, workspace.matmul.l0c_psi)
-        else:
-            workspace.matmul.store_summary_to_ub(workspace.psi_ub, workspace.matmul.l0c_psi)
-            workspace.vector.write_crosscore_matrix_to_gm(
-                workspace.psi_ub, gm_state_ext, subblock_idx=chunk.subblock, state_index=chunk.state
-            )
+        state_tile = _state_head_tile(gm_state_ext, chunk.state)
+        workspace.matmul.store_summary_to_gm(state_tile, workspace.matmul.l0c_psi, chunk.row_index)
 
 
 @jit
@@ -1867,7 +1783,60 @@ def _run_stage1_round(inputs, outputs, resources, gm_metadata, schedule):
 
 
 @jit
-def _run_summary_round(head_dim, inputs, outputs, gm_metadata, schedule):
+def _load_summary_product_operands(workspace, inputs, sequence, schedule, task):
+    head = (task - schedule.item_start) // schedule.group_count
+    chunk = schedule.group_start + (task - schedule.item_start) % schedule.group_count
+    valid_rows = min(CHUNK_SIZE, sequence.length - chunk * CHUNK_SIZE)
+    kg_tile = _sequence_head_chunk_tile(inputs.kg, sequence.storage_batch, head, chunk)
+    w_tile = _sequence_head_chunk_tile(inputs.w, sequence.storage_batch, head, chunk)
+    subblock = get_subblock_id()
+    workspace.vector.load_chunk_operand(kg_tile, workspace.kg, subblock_idx=subblock, valid_rows=valid_rows)
+    workspace.vector.load_chunk_operand(w_tile, workspace.w, subblock_idx=subblock, valid_rows=valid_rows)
+
+
+@jit
+def _run_summary_products_round(inputs, gm_phi, gm_guard, gm_metadata, schedule, workspace):
+    subblock = get_subblock_id()
+    for active_idx in range(schedule.batch_count):
+        prefix_start = gm_metadata[schedule.task_prefix_base + active_idx]
+        prefix_end = gm_metadata[schedule.task_prefix_base + active_idx + 1]
+        task_start = max(schedule.core_start, prefix_start)
+        task_end = min(schedule.core_end, prefix_end)
+        logical_batch = gm_metadata[schedule.batch_base + active_idx]
+        storage_batch = gm_metadata[schedule.storage_base + active_idx]
+        token_start = gm_metadata[schedule.token_base + active_idx]
+        seq_len = dtypes.int64(gm_metadata[schedule.length_base + active_idx])
+        group_start = gm_metadata[schedule.chunk_start_base + active_idx]
+        group_count = gm_metadata[schedule.chunk_count_base + active_idx]
+        token_stop = token_start + seq_len
+        local_kg = inputs.kg[storage_batch, None, token_start:token_stop, None]
+        local_w = inputs.w[storage_batch, None, token_start:token_stop, None]
+        product_inputs = _SummaryInputs(kg=local_kg, w=local_w)
+        product_sequence = _SummarySequence(storage_batch=0, length=seq_len)
+        product_schedule = _SummarySchedule(group_start=group_start, group_count=group_count, item_start=prefix_start)
+        if task_start < task_end:
+            _load_summary_product_operands(workspace, product_inputs, product_sequence, product_schedule, task_start)
+        for task in range(task_start, task_end):
+            head = (task - prefix_start) // group_count
+            chunk = group_start + (task - prefix_start) % group_count
+            decay = tile_slice(inputs.decay[logical_batch, head, None, None], (1, SUPPORTED_HEAD_DIM), (chunk, 0))
+            workspace.matmul.compute_chunk_product(workspace.w, workspace.kg, workspace.matmul.l0c_phi)
+            if task + 1 < task_end:
+                _load_summary_product_operands(workspace, product_inputs, product_sequence, product_schedule, task + 1)
+            workspace.matmul.store_summary_to_ub(workspace.phi_ub, workspace.matmul.l0c_phi)
+            workspace.vector.add_decay_and_publish_phi(
+                workspace.phi_ub, decay, gm_phi, _PhiPublication(half=subblock, state=task),
+            )
+            if group_count >= 32 and inputs.enable_zero:
+                guard = tile_slice(gm_guard[task, subblock, None, None], (1, 8), (0, 0))
+                workspace.vector.publish_phi_guard(guard)
+    cube_sync_all()
+    vec_sync_all()
+
+
+@jit
+def _run_summary_round(head_dim, inputs, outputs, gm_metadata, schedule, shared_workspace):
+    workspace_base = 0
     for active_batch_idx in range(0, schedule.batch_count):
         prefix_start = gm_metadata[schedule.task_prefix_base + active_batch_idx]
         prefix_end = gm_metadata[schedule.task_prefix_base + active_batch_idx + 1]
@@ -1890,28 +1859,59 @@ def _run_summary_round(head_dim, inputs, outputs, gm_metadata, schedule):
         group_start = gm_metadata[schedule.chunk_start_base + active_batch_idx]
         group_count = gm_metadata[schedule.chunk_count_base + active_batch_idx]
         token_stop = token_start + valid_seq_len
-        summary_start = (task_start + dv_splits_num - 1) // dv_splits_num
-        summary_end = (task_end + dv_splits_num - 1) // dv_splits_num
-        if summary_start < summary_end:
-            _run_cp_prepare_summary_body(
-                head_dim,
-                _SummaryInputs(
-                    kg=inputs.kg[storage_batch, None, token_start:token_stop, None],
-                    decay=inputs.decay,
-                    u=inputs.u[storage_batch, None, token_start:token_stop, None],
-                    w=inputs.w[storage_batch, None, token_start:token_stop, None],
-                ),
-                outputs,
+        summary_inputs = _SummaryInputs(
+            kg=inputs.kg[storage_batch, None, token_start:token_stop, None],
+            decay=inputs.decay,
+            u=inputs.u[storage_batch, None, token_start:token_stop, None],
+            w=inputs.w[storage_batch, None, token_start:token_stop, None],
+            phi=inputs.phi,
+            guard=inputs.guard,
+            zero_status=inputs.zero_status,
+            enable_zero=inputs.enable_zero,
+        )
+        summary_schedule = _SummarySchedule(
+            head_base=0, head_count=schedule.heads, group_start=group_start,
+            group_count=group_count, item_start=task_start, item_end=task_end,
+            workspace_base=workspace_base,
+        )
+        sequence = _SummarySequence(storage_batch=0, logical_batch=logical_batch, length=valid_seq_len)
+        if group_count > 1 and dv_splits_num == 8:
+            _run_summary_partition(head_dim, summary_inputs, outputs, summary_schedule, sequence, 8, shared_workspace)
+        elif group_count > 1 and dv_splits_num == 4:
+            _run_summary_partition(head_dim, summary_inputs, outputs, summary_schedule, sequence, 4, shared_workspace)
+        elif group_count > 1 and dv_splits_num == 2:
+            _run_summary_partition(head_dim, summary_inputs, outputs, summary_schedule, sequence, 2, shared_workspace)
+        else:
+            summary_start = (task_start + dv_splits_num - 1) // dv_splits_num
+            summary_end = (task_end + dv_splits_num - 1) // dv_splits_num
+            _run_summary_partition(
+                head_dim, summary_inputs, outputs,
                 _SummarySchedule(
-                    head_base=0,
-                    head_count=schedule.heads,
-                    group_start=group_start,
-                    group_count=group_count,
-                    item_start=summary_start,
-                    item_end=summary_end,
+                    head_base=0, head_count=schedule.heads, group_start=group_start,
+                    group_count=group_count, item_start=summary_start, item_end=summary_end,
+                    workspace_base=workspace_base,
                 ),
-                _SummarySequence(storage_batch=0, logical_batch=logical_batch, length=valid_seq_len),
+                sequence, 1, shared_workspace,
             )
+        workspace_base += schedule.heads * group_count
+
+
+@jit
+def _run_summary_partition(head_dim, inputs, outputs, schedule, sequence, splits: int, shared_workspace):
+    cube_sync_all()
+    vec_sync_all()
+    _run_cp_prepare_summary_body(
+        head_dim, inputs, outputs,
+        _SummarySchedule(
+            head_base=schedule.head_base, head_count=schedule.head_count,
+            group_start=schedule.group_start, group_count=schedule.group_count,
+            item_start=schedule.item_start, item_end=schedule.item_end, splits=splits,
+            workspace_base=schedule.workspace_base,
+        ),
+        sequence, shared_workspace,
+    )
+    cube_sync_all()
+    vec_sync_all()
 
 
 @jit
@@ -1955,8 +1955,8 @@ def _decode_summary_round(gm_metadata, stage1_core_ranges_base, active_batch_num
     stage2_core_start = gm_metadata[stage2_core_range_word]
     stage2_core_end = gm_metadata[stage2_core_range_word + 1]
     # Reuse the shared Stage2 partition for the CP affine summary.
-    # Stage2 assigns ``head * dv_splits + split`` tasks; split zero
-    # is the unique owner of each complete head summary.
+    # Stage2 assigns ``head * dv_splits + split`` tasks; each split owns
+    # output rows, while a single-chunk summary keeps one complete owner.
     return dv_splits_base, stage2_task_prefix_base, stage2_core_start, stage2_core_end
 
 
@@ -1990,14 +1990,14 @@ def _publish_stage1_previous(runtime, inputs, outputs, schedule, task_indices, r
 
 @jit
 def _run_stage1_current(runtime, inputs, outputs, resources, location):
+    runtime.vector.issue_raw_gate(inputs.g, location)
     q_to_k_exchange, k_to_q_exchange = runtime.vector.prepare_normalized_qk_local_half(
         inputs,
         resources.exchange,
         location,
         runtime.block,
     )
-    gate_cumsum_dhalf = runtime.vector.activate_raw_gate(
-        inputs.g,
+    gate_cumsum_dhalf = runtime.vector.activate_issued_gate(
         resources.gate,
         location,
     )
@@ -2047,7 +2047,12 @@ def _run_stage1_tasks(runtime, inputs, outputs, resources, schedule):
     valid_row_counts = Array(dtypes.int64, 2)
     pipeline_tick = 0
     issued_task_count = 0
+    cached_gate_head = -1
     for task_index in range(schedule.tasks.start, schedule.tasks.end):
+        batch, head, chunk, parity = _stage1_task_coordinates(task_index, inputs, schedule)
+        if head != cached_gate_head:
+            runtime.vector.load_gate_invariants(resources.gate, head)
+            cached_gate_head = head
         if pipeline_tick >= 1 and pipeline_tick - 1 < issued_task_count:
             _prepare_stage1_previous(runtime, inputs, schedule, task_indices, valid_row_counts, (pipeline_tick - 1) % 2)
         _issue_stage1_task(runtime, inputs, outputs, resources, _StageOneTask(schedule, task_index, task_indices, valid_row_counts, pipeline_tick % 2))
@@ -2084,37 +2089,82 @@ def _run_stage1_body(inputs, outputs, resources, schedule):
 class StageTwoMatmul:
     """FP32 chunk products and rank-local affine recurrence on Cube."""
 
-    def __init__(self, *, head_dim: int):
+    def __init__(self, *, head_dim: int, row_count: int, shared=None):
         self.head_dim = head_dim
+        self.row_count = row_count
+        if shared is not None:
+            self.l0a = shared.l0a
+            self.l0b = shared.l0b
+            self.l0a_chunk = shared.l0a_chunk
+            self.l0b_chunk = shared.l0b_chunk
+            self.l0c_phi = shared.l0c_phi
+            self.l0c_rank_phi = reinterpret(shared.l0c_phi, layout=make_layout((row_count, head_dim)), data_format="nz")
+            self.l0c_psi = reinterpret(shared.l0c_psi, layout=make_layout((row_count, head_dim)), data_format="nz")
+            return
         # Chunk products and recurrent products share FP32 storage and dtype.
         self.l0a = RingBuffer(MemLoc.L0A, dtypes.float32, make_layout((head_dim, head_dim)), depth=1).next_write()
         self.l0b = RingBuffer(MemLoc.L0B, dtypes.float32, make_layout((head_dim, head_dim)), depth=1).next_write()
         self.l0a_chunk = reinterpret(self.l0a, layout=make_layout((CHUNK_SIZE, head_dim)), data_format="zn")
         self.l0b_chunk = reinterpret(self.l0b, layout=make_layout((CHUNK_SIZE, head_dim)), data_format="zn")
         self.l0c_phi = RingBuffer(MemLoc.L0C, dtypes.float32, make_layout((head_dim, head_dim)), depth=1).next_write()
-        self.l0c_psi = RingBuffer(MemLoc.L0C, dtypes.float32, make_layout((head_dim, head_dim)), depth=1).next_write()
+        self.l0c_rank_phi = reinterpret(self.l0c_phi, layout=make_layout((row_count, head_dim)), data_format="nz")
+        self.l0c_psi = RingBuffer(MemLoc.L0C, dtypes.float32, make_layout((row_count, head_dim)), depth=1).next_write()
 
-    @staticmethod
-    def store_summary_to_l1(l1_dst, l0c_src):
-        mem_copy(l1_dst, l0c_src)
+    def store_summary_to_l1(self, l1_dst, l0c_src, row_index):
+        dst = tile_slice(l1_dst, (self.row_count, self.head_dim), (row_index, 0))
+        mem_copy(dst, l0c_src)
 
-    def compute_chunk_product(self, lhs_l1, kg_l1, l0c_dst):
+    def compute_chunk_product(self, lhs_l1, kg_l1, l0c_dst, *, row_index=0, partial: bool = False):
         """Compute ``lhs.T @ kg`` from FP32 [64, D] operands."""
-        mem_copy(self.l0a_chunk, lhs_l1)
         mem_copy(self.l0b_chunk, kg_l1)
-        matmul(l0c_dst, self.l0a_chunk.permute(1, 0), self.l0b_chunk, init=True)
+        if partial:
+            source = tile_slice(lhs_l1, (CHUNK_SIZE, self.row_count), (0, row_index))
+            left = reinterpret(self.l0a, layout=make_layout((CHUNK_SIZE, self.row_count)), data_format="zn")
+            mem_copy(left, source)
+            matmul(l0c_dst, left.permute(1, 0), self.l0b_chunk, init=True)
+        else:
+            mem_copy(self.l0a_chunk, lhs_l1)
+            matmul(l0c_dst, self.l0a_chunk.permute(1, 0), self.l0b_chunk, init=True)
 
-    def compute_rank_product(self, rank_l1, phi_l1, l0c_dst, *, init: bool):
-        """Compute ``rank @ phi`` with FP32 operands and accumulation."""
-        mem_copy(self.l0a, rank_l1)
+    def load_rank_phi(self, phi_l1):
+        """Keep the current transition operand for both affine products."""
         mem_copy(self.l0b, phi_l1.permute(1, 0))
-        matmul(l0c_dst, self.l0a, self.l0b, init=init)
+
+    def compute_rank_product(self, rank_l1, l0c_dst, *, init: bool, row_index):
+        """Compute ``rank @ phi`` with FP32 operands and accumulation."""
+        source = tile_slice(rank_l1, (self.row_count, self.head_dim), (row_index, 0))
+        left = reinterpret(self.l0a, layout=make_layout((self.row_count, self.head_dim)), data_format="nz")
+        mem_copy(left, source)
+        matmul(l0c_dst, left, self.l0b, init=init)
+
+    @jit
+    def compute_rank_pair(self, phi_l1, psi_l1, *, row_index, skip_phi=False):
+        if self.row_count <= self.head_dim // 2:
+            phi_source = tile_slice(phi_l1, (self.row_count, self.head_dim), (row_index, 0))
+            psi_source = tile_slice(psi_l1, (self.row_count, self.head_dim), (row_index, 0))
+            phi_left = reinterpret(self.l0a, layout=make_layout((self.row_count, self.head_dim)), data_format="nz")
+            psi_left = reinterpret(self.l0a, offset=self.head_dim * self.head_dim * 4 // 2,
+                                   layout=make_layout((self.row_count, self.head_dim)), data_format="nz")
+            if not skip_phi:
+                mem_copy(phi_left, phi_source)
+            mem_copy(psi_left, psi_source)
+            if not skip_phi:
+                matmul(self.l0c_rank_phi, phi_left, self.l0b, init=True)
+            matmul(self.l0c_psi, psi_left, self.l0b, init=False)
+        else:
+            self.compute_rank_product(phi_l1, self.l0c_rank_phi, init=True, row_index=row_index)
+            self.compute_rank_product(psi_l1, self.l0c_psi, init=False, row_index=row_index)
+
+    def store_summary_to_gm(self, gm_dst, l0c_src, row_index):
+        dst = tile_slice(gm_dst, (self.row_count, self.head_dim), (row_index, 0))
+        mem_copy(dst, l0c_src)
 
     def store_summary_to_ub(self, output_ub, l0c_src):
         mem_copy(output_ub, l0c_src.partition(dim=0))
 
     def load_summary(self, l1_dst, gm_src):
-        mem_copy(l1_dst, gm_src)
+        destination = reinterpret(l1_dst, layout=make_layout((self.head_dim, self.head_dim)), data_format="nz")
+        mem_copy(destination, gm_src)
 
 
 class StageTwoVector:
@@ -2125,63 +2175,145 @@ class StageTwoVector:
         self.half_dk = head_dim // 2
         self.gamma_ub = RingBuffer(MemLoc.UB, dtypes.float32, make_layout((1, self.half_dk)), depth=1).next_write()
         self.phi_out_ub = RingBuffer(MemLoc.UB, dtypes.float32, make_layout((self.half_dk, head_dim)), depth=1).next_write()
-        self.phi_nz_ub = RingBuffer(MemLoc.UB, dtypes.float32, make_layout((self.half_dk, head_dim)), depth=1, data_format='nz').next_write()
+        self.direct_phi_nz = RingBuffer(MemLoc.UB, dtypes.float32, make_layout((self.half_dk, head_dim)), depth=1, data_format="nz").next_write()
         self.operand_bf16_ub = RingBuffer(MemLoc.UB, dtypes.bfloat16, make_layout((HALF_CHUNK_SIZE, head_dim)), depth=1).next_write()
-        self.operand_fp32_ub = RingBuffer(MemLoc.UB, dtypes.float32, make_layout((HALF_CHUNK_SIZE, head_dim)), depth=1).next_write()
         self.operand_nz_ub = RingBuffer(MemLoc.UB, dtypes.float32, make_layout((HALF_CHUNK_SIZE, head_dim)), depth=1, data_format='nz').next_write()
+        # Only split summaries are checked: at most D/2 rows, partitioned over two AIVs.
+        self.zero_check_ub = Buffer(MemLoc.UB, dtypes.float32, make_layout((head_dim // 4, head_dim)))
+        self.guard_ub = RingBuffer(MemLoc.UB, dtypes.int32, make_layout((1, 8)), depth=1).next_write()
+
+    @jit
+    def publish_phi_guard(self, destination):
+        source = self.phi_out_ub
+        status = self.guard_ub
+        with vf(mode="simd"):
+            mask = full_mask()
+            zero = vdups(0.0, dtypes.float32, mask=mask)
+            one = vdups(1.0, dtypes.float32, mask=mask)
+            bad = vdups(0.0, dtypes.float32, mask=mask)
+            seen0 = vdups(0.0, dtypes.float32, mask=mask)
+            seen1 = vdups(0.0, dtypes.float32, mask=mask)
+            for row in range(self.half_dk):
+                x = vload(source, row * self.head_dim)
+                y = vload(source, row * self.head_dim + self.half_dk)
+                ok0 = reg_ops.compare.vlts(reg_ops.vabs(x, mask=mask), 4294967296.0, mask=mask)
+                ok1 = reg_ops.compare.vlts(reg_ops.vabs(y, mask=mask), 4294967296.0, mask=mask)
+                bad = vadd(bad, vselect_raw(zero, one, cond_mask=ok0), mask=mask)
+                bad = vadd(bad, vselect_raw(zero, one, cond_mask=ok1), mask=mask)
+                sign0 = reg_ops.compare.vges(vreinterpret(x, dtypes.int32), 0, mask=mask)
+                sign1 = reg_ops.compare.vges(vreinterpret(y, dtypes.int32), 0, mask=mask)
+                seen0 = reg_ops.vmax(seen0, vselect_raw(one, zero, cond_mask=sign0), mask=mask)
+                seen1 = reg_ops.vmax(seen1, vselect_raw(one, zero, cond_mask=sign1), mask=mask)
+            bad = vadd(bad, vsub(one, seen0, mask=mask), mask=mask)
+            bad = vadd(bad, vsub(one, seen1, mask=mask), mask=mask)
+            count = vcast(vreduce_sum(bad, mask=mask), dtypes.int32, mask=mask)
+            lanes, _ = update_mask(8, elem_bits=32)
+            vstore(status, 0, vdups(0, dtypes.int32, mask=lanes), lanes)
+            vmem_bar("vst_vst")
+            reg_ops.vstore_first(status, 0, count)
+            vmem_bar("vst_vld")
+        mem_copy(destination, status)
+
+    @jit
+    def publish_zero_guard(self, source, destination, row_count: int):
+        status = self.guard_ub
+        with vf(mode="simd"):
+            mask = full_mask()
+            zero = vdups(0.0, dtypes.float32, mask=mask)
+            one = vdups(1.0, dtypes.float32, mask=mask)
+            bad = vdups(0.0, dtypes.float32, mask=mask)
+            for row in range(row_count):
+                x = vreinterpret(vload(source, row * self.head_dim), dtypes.int32)
+                y = vreinterpret(vload(source, row * self.head_dim + self.half_dk), dtypes.int32)
+                bad = vadd(bad, vselect_raw(one, zero, cond_mask=reg_ops.compare.vnes(x, 0, mask=mask)), mask=mask)
+                bad = vadd(bad, vselect_raw(one, zero, cond_mask=reg_ops.compare.vnes(y, 0, mask=mask)), mask=mask)
+            count = vcast(vreduce_sum(bad, mask=mask), dtypes.int32, mask=mask)
+            lanes, _ = update_mask(8, elem_bits=32)
+            vstore(status, 0, vdups(0, dtypes.int32, mask=lanes), lanes)
+            vmem_bar("vst_vst")
+            reg_ops.vstore_first(status, 0, count)
+            vmem_bar("vst_vld")
+        mem_copy(destination, status)
+
+    @jit
+    def promote_chunk_operand_to_nz(self, source):
+        destination = self.operand_nz_ub
+        dst_stride = destination.physical_stride[0]
+        with vf(mode="simd"):
+            mask, _ = update_mask(VL, elem_bits=32)
+            for row in dsl_range(0, HALF_CHUNK_SIZE, 1, unroll=4):
+                for col in range(0, self.head_dim, VL):
+                    packed = vload_unpack(source, row * self.head_dim + col, unpack_mode=UnpackMode.B16_TO_B32)
+                    value = vcast(packed, dtypes.float32, mask=mask)
+                    offset = row * 8 + (col // 8) * dst_stride
+                    reg_ops.vstore_strided(destination, offset, value, mask, block_stride=dst_stride // 8, repeat_stride=0)
 
     @jit
     def load_chunk_operand(self, gm_tile, operand_l1, *, subblock_idx: int, valid_rows):
         """Promote each fixed 32-row half to FP32 and zero its invalid rows."""
         operand_bf16 = self.operand_bf16_ub
-        with vf(mode="simd"):
-            row_mask = full_mask(elem_bits=16)
-            zero = vdups(0.0, dtypes.bfloat16, mask=row_mask)
-            for row in range(HALF_CHUNK_SIZE):
-                vstore(operand_bf16, row * self.head_dim, zero, row_mask)
-            vmem_bar("vst_vld")
+        if valid_rows < CHUNK_SIZE:
+            with vf(mode="simd"):
+                row_mask = full_mask(elem_bits=16)
+                zero = vdups(0.0, dtypes.bfloat16, mask=row_mask)
+                for row in range(HALF_CHUNK_SIZE):
+                    vstore(operand_bf16, row * self.head_dim, zero, row_mask)
+                vmem_bar("vst_vld")
         if valid_rows > subblock_idx * HALF_CHUNK_SIZE:
             operand_half = tile_slice(gm_tile, (HALF_CHUNK_SIZE, self.head_dim), (subblock_idx, 0))
             mem_copy(operand_bf16, operand_half)
-        cast_tile(self.operand_fp32_ub, operand_bf16)
-        nd2nz_tile(self.operand_nz_ub, self.operand_fp32_ub, 32)
+        self.promote_chunk_operand_to_nz(operand_bf16)
         mem_copy(operand_l1.partition(dim=0, part_id=subblock_idx), self.operand_nz_ub)
 
     @jit
-    def write_crosscore_matrix_to_gm(self, source_ub, gm_matrix, *, subblock_idx: int, state_index: int):
-        if subblock_idx == 0:
-            self._write_static_half_to_gm(source_ub, gm_matrix, half_index=0, state_index=state_index)
+    def add_decay_half(self, phi_ub, decay, half):
+        if half == 0:
+            self._add_decay_static_half(phi_ub, decay, half_index=0)
         else:
-            self._write_static_half_to_gm(source_ub, gm_matrix, half_index=1, state_index=state_index)
+            self._add_decay_static_half(phi_ub, decay, half_index=1)
 
     @jit
     def add_decay_and_publish_phi(self, phi_ub, decay_tile, destination, publication):
         if publication.half == 0:
-            self._add_decay_static_half(phi_ub, decay_tile, half_index=0)
-            self._publish_static_half(
-                phi_ub,
-                destination,
-                _PhiPublication(
-                    half=0,
-                    write_transition=publication.write_transition,
-                    publish_phi=publication.publish_phi,
-                    initialize_rank=publication.initialize_rank,
-                    state=publication.state,
-                ),
-            )
+            self._materialize_and_publish_decay_phi(phi_ub, decay_tile, destination, _PhiPublication(half=0, state=publication.state))
         else:
-            self._add_decay_static_half(phi_ub, decay_tile, half_index=1)
-            self._publish_static_half(
-                phi_ub,
-                destination,
-                _PhiPublication(
-                    half=1,
-                    write_transition=publication.write_transition,
-                    publish_phi=publication.publish_phi,
-                    initialize_rank=publication.initialize_rank,
-                    state=publication.state,
-                ),
-            )
+            self._materialize_and_publish_decay_phi(phi_ub, decay_tile, destination, _PhiPublication(half=1, state=publication.state))
+
+    @jit
+    def _materialize_and_publish_decay_phi(self, phi_ub, decay, destination, publication):
+        """Add the diagonal while copying the Cube result into the GM source."""
+        gamma_half = tile_slice(decay, (1, self.half_dk), (0, publication.half))
+        gamma_slot = self.gamma_ub
+        mem_copy(gamma_slot, gamma_half)
+        vec_sync_notify(PIPE.MTE2, PIPE.V, SUMMARY_MTE2_TO_V_EVENT_ID)
+        vec_sync_wait(PIPE.MTE2, PIPE.V, SUMMARY_MTE2_TO_V_EVENT_ID)
+        output = self.phi_out_ub
+        with vf(mode="simd"):
+            mask = full_mask()
+            for local_row in range(self.half_dk):
+                row_offset = local_row * self.head_dim
+                first = vload(phi_ub, row_offset)
+                second = vload(phi_ub, row_offset + self.half_dk)
+                if const_expr(publication.half == 0):
+                    original = first
+                else:
+                    original = second
+                decay_value = vload_broadcast(gamma_slot, local_row)
+                incremented = vadd(original, decay_value, mask=mask)
+                through_diagonal, _ = update_mask(local_row + 1, elem_bits=32)
+                before_diagonal, _ = update_mask(local_row, elem_bits=32)
+                changed_prefix = vselect_raw(incremented, original, cond_mask=through_diagonal)
+                diagonal_only = vselect_raw(original, changed_prefix, cond_mask=before_diagonal)
+                if const_expr(publication.half == 0):
+                    first = diagonal_only
+                else:
+                    second = diagonal_only
+                vstore(output, row_offset, first, mask)
+                vstore(output, row_offset + self.half_dk, second, mask)
+            vmem_bar("vst_vld")
+        matrix = _state_head_tile(destination, publication.state)
+        half = tile_slice(matrix, (self.half_dk, self.head_dim), (publication.half, 0))
+        mem_copy(half, output)
 
     @jit
     def _add_decay_static_half(self, phi_ub, gamma_full, *, half_index: int):
@@ -2207,7 +2339,7 @@ class StageTwoVector:
 
     @jit
     def _copy_crosscore_to_output_ub(self, phi_ub):
-        """Materialize a CrossCore slab before the single-chunk GM write."""
+        """Materialize a CrossCore slab for the GM publication."""
         phi_out_slot = self.phi_out_ub
         with vf(mode="simd"):
             lane_mask, _ = update_mask(32, elem_bits=32)
@@ -2221,31 +2353,16 @@ class StageTwoVector:
         return phi_out_slot
 
     @jit
-    def _write_static_half_to_gm(self, source_ub, gm_matrix, *, half_index: int, state_index: int):
-        local_phi = self._copy_crosscore_to_output_ub(source_ub)
-        matrix_full = _state_head_tile(gm_matrix, state_index)
-        matrix_half = tile_slice(matrix_full, (self.half_dk, self.head_dim), (half_index, 0))
-        mem_copy(matrix_half, local_phi)
-
-    @jit
     def _publish_static_half(self, phi_ub, destination, publication):
         """Publish one compile-time-sized 128x64 half of Phi."""
-        if const_expr(publication.write_transition):
-            phi_out_slot = self._copy_crosscore_to_output_ub(phi_ub)
-            transition_full = _state_head_tile(destination.transition, publication.state)
-            transition_half = tile_slice(transition_full, (self.half_dk, self.head_dim), (publication.half, 0))
-            mem_copy(transition_half, phi_out_slot)
-        else:
-            phi_nz_slot = self.phi_nz_ub
-            nd2nz_tile(phi_nz_slot, phi_ub, 32)
-            if const_expr(publication.publish_phi):
-                mem_copy(destination.phi.partition(dim=0, part_id=publication.half), phi_nz_slot)
-            if const_expr(publication.initialize_rank):
-                mem_copy(destination.rank.partition(dim=0, part_id=publication.half), phi_nz_slot)
+        phi_out_slot = self._copy_crosscore_to_output_ub(phi_ub)
+        matrix = _state_head_tile(destination, publication.state)
+        half = tile_slice(matrix, (self.half_dk, self.head_dim), (publication.half, 0))
+        mem_copy(half, phi_out_slot)
 
 
 @jit
-def _run_cp_prepare_summary_body(head_dim, inputs, outputs, schedule, sequence):
+def _run_cp_prepare_summary_body(head_dim, inputs, outputs, schedule, sequence, shared_workspace):
     if schedule.item_start < schedule.item_end:
         _run_cp_prepare_summary_active_body(
             head_dim,
@@ -2253,17 +2370,28 @@ def _run_cp_prepare_summary_body(head_dim, inputs, outputs, schedule, sequence):
             outputs,
             schedule,
             sequence,
+            shared_workspace,
         )
 
 
 @jit
-def _run_cp_prepare_summary_active_body(head_dim, inputs, outputs, schedule, sequence):
+def _run_cp_prepare_summary_active_body(head_dim, inputs, outputs, schedule, sequence, shared_workspace):
     subblock_idx = get_subblock_id()
 
-    workspace = _allocate_summary_workspace(head_dim)
+    workspace = dataclasses.replace(
+        shared_workspace,
+        matmul=StageTwoMatmul(head_dim=head_dim, row_count=head_dim // schedule.splits, shared=shared_workspace.matmul),
+    )
+
+    if const_expr(schedule.splits > 1):
+        workspace = dataclasses.replace(
+            workspace, phi=shared_workspace.cached_phi, initial_phi=shared_workspace.cached_initial_phi,
+        )
 
     group_end = schedule.group_start + schedule.group_count
-    for local_head_idx in range(schedule.item_start, schedule.item_end):
+    for task_index in range(schedule.item_start, schedule.item_end):
+        local_head_idx = task_index // schedule.splits
+        row_index = task_index % schedule.splits
         head_idx = schedule.head_base + local_head_idx
         state_index = sequence.logical_batch * schedule.head_count + head_idx
         transition_tile = tile_slice(
@@ -2276,35 +2404,71 @@ def _run_cp_prepare_summary_active_body(head_dim, inputs, outputs, schedule, seq
             workspace.matmul.load_summary(workspace.loaded_phi, transition_tile)
             workspace.matmul.load_summary(workspace.loaded_psi, state_ext_tile)
 
+        known_zero = 0
+        slot = 0
         for chunk_id in range(schedule.group_start, group_end):
             kg_tile = _sequence_head_chunk_tile(inputs.kg, sequence.storage_batch, head_idx, chunk_id)
             u_tile = _sequence_head_chunk_tile(inputs.u, sequence.storage_batch, head_idx, chunk_id)
-            w_tile = _sequence_head_chunk_tile(inputs.w, sequence.storage_batch, head_idx, chunk_id)
-            decay_tile = tile_slice(
-                inputs.decay[sequence.logical_batch, head_idx, None, None], (1, head_dim), (chunk_id, 0)
-            )
             valid_rows = min(CHUNK_SIZE, sequence.length - chunk_id * CHUNK_SIZE)
             workspace.vector.load_chunk_operand(kg_tile, workspace.kg, subblock_idx=subblock_idx, valid_rows=valid_rows)
             workspace.vector.load_chunk_operand(u_tile, workspace.u, subblock_idx=subblock_idx, valid_rows=valid_rows)
-            workspace.vector.load_chunk_operand(w_tile, workspace.w, subblock_idx=subblock_idx, valid_rows=valid_rows)
 
-            is_group_first, is_group_last = _prepare_summary_phi(
-                workspace,
-                decay_tile,
-                outputs.transition,
-                _SummaryChunk(
-                    subblock=subblock_idx,
-                    state=state_index,
-                    group_start=schedule.group_start,
-                    index=chunk_id,
-                    group_end=group_end,
-                ),
+            chunk = _SummaryChunk(
+                subblock=subblock_idx, state=state_index,
+                group_start=schedule.group_start, index=chunk_id, group_end=group_end,
             )
+            if const_expr(schedule.splits > 1):
+                slot = schedule.workspace_base + head_idx * schedule.group_count + chunk_id - schedule.group_start
+                cached_phi = tile_slice(inputs.phi[0, slot, None, None], (head_dim, head_dim), (0, 0))
+                is_group_first, is_group_last = _prepare_summary_phi(workspace, cached_phi, outputs.transition, chunk)
+            else:
+                w_tile = _sequence_head_chunk_tile(inputs.w, sequence.storage_batch, head_idx, chunk_id)
+                decay_tile = tile_slice(inputs.decay[sequence.logical_batch, head_idx, None, None], (1, head_dim), (chunk_id, 0))
+                workspace.vector.load_chunk_operand(w_tile, workspace.w, subblock_idx=subblock_idx, valid_rows=valid_rows)
+                is_group_first, is_group_last = _prepare_direct_summary_phi(workspace, decay_tile, outputs.transition, chunk)
 
+            skip_phi = 0
+            if const_expr(schedule.splits > 1):
+                if schedule.group_count >= 32 and inputs.enable_zero and known_zero != 0 and not is_group_last:
+                    safe0 = scalar_ops.load_bypass(inputs.guard.ptr((slot, 0, 0, 0)))
+                    safe1 = scalar_ops.load_bypass(inputs.guard.ptr((slot, 1, 0, 0)))
+                    if safe0 == 0 and safe1 == 0:
+                        skip_phi = 1
+                    else:
+                        known_zero = 0
             _compose_summary_chunk(
                 workspace,
-                _SummaryChunk(group_start=schedule.group_start, index=chunk_id, first=is_group_first),
+                _SummaryChunk(
+                    group_start=schedule.group_start, index=chunk_id, first=is_group_first,
+                    row_index=row_index, cached_phi=schedule.splits > 1, skip_phi=skip_phi,
+                ),
             )
+            if const_expr(schedule.splits > 1):
+                offset = chunk_id - schedule.group_start
+                if schedule.group_count >= 32 and inputs.enable_zero and skip_phi == 0 and not is_group_last:
+                    if offset == 31 or offset == 63 or (schedule.group_start > 0 and is_group_first):
+                        check = reinterpret(workspace.vector.zero_check_ub,
+                                            layout=make_layout((head_dim // schedule.splits // 2, head_dim)))
+                        workspace.matmul.store_summary_to_ub(check, workspace.matmul.l0c_rank_phi)
+                        block = get_block_idx()
+                        status = tile_slice(inputs.zero_status[block, subblock_idx, None, None], (1, 8), (0, 0))
+                        workspace.vector.publish_zero_guard(check, status, head_dim // schedule.splits // 2)
+                        vec_sync_block_arrive(PIPE.MTE3, SUMMARY_ZERO_READY_FLAG_ID, mode=2)
+                        cube_sync_block_wait(PIPE.S, SUMMARY_ZERO_READY_FLAG_ID, mode=2)
+                        cube_sync_block_arrive(PIPE.MTE3, SUMMARY_ZERO_RELEASE_FLAG_ID, mode=2)
+                        vec_sync_block_wait(PIPE.S, SUMMARY_ZERO_RELEASE_FLAG_ID, mode=2)
+                        zero0 = scalar_ops.load_bypass(inputs.zero_status.ptr((block, 0, 0, 0)))
+                        zero1 = scalar_ops.load_bypass(inputs.zero_status.ptr((block, 1, 0, 0)))
+                        known_zero = 0
+                        if zero0 == 0 and zero1 == 0:
+                            known_zero = 1
+                        # Complete every scalar read before either AIV reuses the slot.
+                        cube_sync_all()
+                        vec_sync_all()
+                        vec_sync_block_arrive(PIPE.MTE3, SUMMARY_ZERO_CONSUMED_FLAG_ID, mode=2)
+                        cube_sync_block_wait(PIPE.S, SUMMARY_ZERO_CONSUMED_FLAG_ID, mode=2)
+                        cube_sync_block_arrive(PIPE.MTE3, SUMMARY_ZERO_RECYCLE_FLAG_ID, mode=2)
+                        vec_sync_block_wait(PIPE.S, SUMMARY_ZERO_RECYCLE_FLAG_ID, mode=2)
 
             _store_summary_chunk(
                 workspace,
@@ -2315,6 +2479,8 @@ def _run_cp_prepare_summary_active_body(head_dim, inputs, outputs, schedule, seq
                     group_start=schedule.group_start,
                     first=is_group_first,
                     last=is_group_last,
+                    row_index=row_index,
+                    skip_phi=skip_phi,
                 ),
                 transition_tile,
             )
@@ -2333,6 +2499,7 @@ _STAGE_BOUNDARY_AIC_AIV_FLAG_OFFSET = 8
 QK_PUBLISH_FLAG_ID = 10
 QK_CONSUME_FLAG_ID = 11
 MTE2_TO_V_EVENT_ID = 0
+GATE_MTE2_TO_V_EVENT_ID = 5
 TAIL_V_TO_MTE2_EVENT_ID = 0
 MTE2_TO_V_V_STAGING_EVENT_ID = 1
 MTE2_TO_V_SUBBLOCK1_EVENT_ID = 4
@@ -2344,7 +2511,9 @@ def _rewind_buffers():
     onchip_rewind(reset_sync_id=False)
 
 
-def _stage_boundary_reset(flag_id: int):
+@jit
+def _stage_boundary_reset(flag_id: int, *, local_only=False):
+    """Join the local pair; join the grid when consumers change ownership."""
     cube_sync_all()
     vec_sync_all()
 
@@ -2355,8 +2524,9 @@ def _stage_boundary_reset(flag_id: int):
     vec_sync_block_arrive(PIPE.MTE3, aiv_ready_flag_id, mode=2)
     cube_sync_block_wait(PIPE.S, aiv_ready_flag_id, mode=2)
 
-    cube_sync_block_arrive(PIPE.FIXPIPE, aic_ready_flag_id, mode=0)
-    cube_sync_block_wait(PIPE.S, aic_ready_flag_id, mode=0)
+    if not local_only:
+        cube_sync_block_arrive(PIPE.FIXPIPE, aic_ready_flag_id, mode=0)
+        cube_sync_block_wait(PIPE.S, aic_ready_flag_id, mode=0)
 
     cube_sync_block_arrive(PIPE.MTE3, aic_aiv_ready_flag_id, mode=2)
     vec_sync_block_wait(PIPE.S, aic_aiv_ready_flag_id, mode=2)
@@ -2406,6 +2576,9 @@ class FlashKdaCpPreprocessKernel:
         gm_transition: Tensor,
         gm_state_ext: Tensor,
         gm_identity16: Tensor,
+        gm_summary_phi: Tensor,
+        gm_summary_guard: Tensor,
+        gm_summary_zero_status: Tensor,
         gm_metadata: Tensor,
         bn_total: int,
         seq_len: int,
@@ -2467,15 +2640,36 @@ class FlashKdaCpPreprocessKernel:
                         core_end=stage1_core_end,
                     ),
                 )
-                _stage_boundary_reset(STAGE1_BOUNDARY_FLAG_ID)
+                has_summary_products = (
+                    gm_metadata[stage1_core_ranges_base + MAX_AIC_CORES * 2] > 1
+                    and gm_metadata[chunk_start_base - 1] > 1
+                )
+                _stage_boundary_reset(STAGE1_BOUNDARY_FLAG_ID, local_only=has_summary_products)
 
                 dv_splits_base, stage2_task_prefix_base, stage2_core_start, stage2_core_end = _decode_summary_round(
                     gm_metadata, stage1_core_ranges_base, active_batch_num, block_idx
                 )
 
+                onchip_rewind(reset_sync_id=True)
+                summary_workspace = _allocate_summary_workspace(self.head_dim, self.head_dim)
+                if has_summary_products:
+                    _run_summary_products_round(
+                        _SummaryInputs(kg=gm_k_restored, w=gm_w, decay=gm_gamma, enable_zero=lower_bound < 0.0),
+                        gm_summary_phi, gm_summary_guard, gm_metadata,
+                        _RoundSchedule(
+                            heads=metadata_value_heads, batch_count=active_batch_num,
+                            batch_base=batch_idx_base, storage_base=storage_batch_idx_base,
+                            token_base=token_start_base, length_base=valid_seq_len_base,
+                            chunk_start_base=chunk_start_base, chunk_count_base=chunk_num_base,
+                            task_prefix_base=stage1_task_prefix_base, core_start=stage1_core_start, core_end=stage1_core_end,
+                        ),
+                        summary_workspace,
+                    )
+                    _stage_boundary_reset(STAGE2_BOUNDARY_FLAG_ID)
                 _run_summary_round(
                     self.head_dim,
-                    _SummaryInputs(kg=gm_k_restored, u=gm_U, w=gm_w, decay=gm_gamma),
+                    _SummaryInputs(kg=gm_k_restored, u=gm_U, w=gm_w, decay=gm_gamma, phi=gm_summary_phi,
+                                   guard=gm_summary_guard, zero_status=gm_summary_zero_status, enable_zero=lower_bound < 0.0),
                     _SummaryOutputs(transition=gm_transition, state=gm_state_ext),
                     gm_metadata,
                     _RoundSchedule(
@@ -2492,6 +2686,7 @@ class FlashKdaCpPreprocessKernel:
                         core_start=stage2_core_start,
                         core_end=stage2_core_end,
                     ),
+                    summary_workspace,
                 )
                 has_next_group = round_idx + 1 < round_num
                 if has_next_group:
@@ -2527,6 +2722,9 @@ class FlashKDACPPreprocess:
         transition: Tensor,
         state_ext: Tensor,
         identity16: Tensor,
+        summary_phi: Tensor,
+        summary_guard: Tensor,
+        summary_zero_status: Tensor,
         metadata: Tensor,
         bn_total: int,
         seq_len: int,
@@ -2553,6 +2751,9 @@ class FlashKDACPPreprocess:
             transition,
             state_ext,
             identity16,
+            summary_phi,
+            summary_guard,
+            summary_zero_status,
             metadata,
             bn_total,
             seq_len,
@@ -2654,7 +2855,7 @@ def _compile_cp_preprocess_kernel():
             "BNSD",
             "g",
         ),
-        fake((core_num, 2, CHUNK_SIZE, D_HALF), dtypes.float32),
+        fake((core_num, 2, CHUNK_SIZE, D_HALF), dtypes.bfloat16),
         fake((value_heads,), dtypes.float32),
         fake((value_heads, SUPPORTED_HEAD_DIM), dtypes.float32),
         _cp_sequence_tensor_spec(
@@ -2686,6 +2887,9 @@ def _compile_cp_preprocess_kernel():
         fake((batch, value_heads, SUPPORTED_HEAD_DIM, SUPPORTED_HEAD_DIM), dtypes.float32),
         fake((batch, value_heads, SUPPORTED_HEAD_DIM, SUPPORTED_HEAD_DIM), dtypes.float32),
         fake((NEUMANN_BLOCK_SIZE, NEUMANN_BLOCK_SIZE), dtypes.float16),
+        fake((1, WORKSPACE_SLOTS, SUPPORTED_HEAD_DIM, SUPPORTED_HEAD_DIM), dtypes.float32),
+        fake((WORKSPACE_SLOTS, 2, 1, 8), dtypes.int32),
+        fake((core_num, 2, 1, 8), dtypes.int32),
         fake((metadata_capacity,), dtypes.int32),
         dtypes.int64,
         dtypes.int64,
@@ -2960,6 +3164,9 @@ def flash_kda_cp_preprocess(
             transition,
             state_ext,
             constants.identity16,
+            execution.summary_phi,
+            execution.summary_guard,
+            execution.summary_zero_status,
             metadata,
             bn_total,
             seq_len,
