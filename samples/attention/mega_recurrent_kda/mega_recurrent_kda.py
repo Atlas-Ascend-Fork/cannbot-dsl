@@ -2150,7 +2150,8 @@ def _validate_mega_indices(device, batch_size, seq_len, index_tensors):
         "conv_state_indices": (batch_size,),
         "ssm_state_indices": (batch_size * seq_len,),
         "conv_num_accepted_tokens": (batch_size,),
-        "num_accepted_tokens": (batch_size, ), }
+        "num_accepted_tokens": (batch_size,),
+    }
     for name, tensor in index_tensors:
         expected_shape = expected.get(name)
         if expected_shape is None:
