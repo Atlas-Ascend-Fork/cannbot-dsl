@@ -370,6 +370,16 @@
     "flash_attn_fp8_fullquant": {
       "source": "samples/attention/flash_attn_fp8_fullquant",
       "test": "test/attention/flash_attn_fp8_fullquant"
+    },
+    "mega_compressor": {
+      "source": "samples/attention/mega_compressor",
+      "test": "test/attention/mega_compressor",
+      "native": {
+        "export": "mega_compressor",
+        "sources": [
+          "@mega_compressor/source/mega_compressor.py"
+        ]
+      }
     }
   },
   "native_exports": [
@@ -394,7 +404,8 @@
     "mla_prolog_v4",
     "moonep",
     "mega_mla",
-    "mega_full_index"
+    "mega_full_index",
+    "mega_compressor"
   ],
   "ci": {
     "skip_all_tests": false,
@@ -456,7 +467,8 @@
       "mega_mla",
       "flash_attn",
       "flash_attn_fp8_fullquant",
-      "flash_mla_with_kvcache"
+      "flash_mla_with_kvcache",
+      "mega_compressor"
     ],
     "rules": [
       {
@@ -1001,7 +1013,8 @@
           "@engram_gate/test",
           "@attn_epilogue/test",
           "@mega_mla/test",
-          "@mega_full_index/test"
+          "@mega_full_index/test",
+          "@mega_compressor/test"
         ]
       },
       {
@@ -1066,6 +1079,17 @@
         ],
         "tests": [
           "@flash_mla_with_kvcache/test"
+        ]
+      },
+      {
+        "name": "mega_compressor",
+        "enabled": true,
+        "watch": [
+          "@mega_compressor/source",
+          "@mega_compressor/test"
+        ],
+        "tests": [
+          "@mega_compressor/test"
         ]
       }
     ]

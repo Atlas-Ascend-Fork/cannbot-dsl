@@ -55,3 +55,4 @@ operators:
   - attention/flash_attn
   - attention/flash_attn_fp8_fullquant
   - attention/flash_mla_with_kvcache
+  - attention/mega_compressor

@@ -275,7 +275,7 @@ Native 命中验证需独立执行。单独运行 metadata 测试可使用：
 
 ## 性能
 
-使用 Ascend950DT_9582、CANN 9.2.0、CANNBotDSL / OpKit 0.7.0 和 msprof。
+使用 Ascend 950DT、CANN 9.2.0、CANNBotDSL / OpKit 0.7.0 和 msprof。
 运行时查询为 32 Cube / 64 Vector 核，profiler 实际 `Block Num=32`。
 
 固定场景如下：B 为 batch 数，S1 为每个 batch 的 Query 长度，S2/S2C 为原始/压缩

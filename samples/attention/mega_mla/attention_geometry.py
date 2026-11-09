@@ -116,7 +116,7 @@ COMPRESSED_PREDECODE_MIN_ROWS = 4096
 COMPRESSED_DECODE_STRATEGIES = ("auto", "predecode", "indexed")
 
 # Conservative switch points from matched full-mega msprof sweeps on
-# Ascend950DT_9574. Key: (T, H, Kc, grid, P, Kw).
+# Ascend 950DT. Key: (T, H, Kc, grid, P, Kw).
 # Values are the minimum cache rows selecting indexed, inclusive. These
 # are measured operating points, not claimed exact hardware crossovers.
 # See README.md for the public cache-decode strategy contract.

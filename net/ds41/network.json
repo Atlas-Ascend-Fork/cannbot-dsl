@@ -10,6 +10,7 @@
     "engram_gate",
     "attn_epilogue",
     "mega_mla",
-    "mega_full_index"
+    "mega_full_index",
+    "mega_compressor"
   ]
 }

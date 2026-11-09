@@ -226,7 +226,7 @@ PYTHON="$SR_PYTHON" CI_TEST_WORKERS=16 bash scripts/ci/run_tests.sh --ops=dynami
 
 ### 测试环境与计时口径
 
-设备为 Ascend950DT_9574（56 个可用 AIV），CANN `9.2.0`、CANNBot-DSL `0.8.0`，
+设备为 Ascend 950DT（56 个可用 AIV），CANN `9.2.0`、CANNBot-DSL `0.8.0`，
 Python `3.12.14`、PyTorch `2.10.0+cpu`、torch_npu `2.10.0`、ml_dtypes `0.6.0`。
 输入使用 CPU `torch.randn * 7` 后转换到源 dtype，输入 seed 为 `20260920`，框架 RNG seed 为 `0`。
 各配置独立串行运行，复用输入，不显式清 L2。
