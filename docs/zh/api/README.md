@@ -78,7 +78,6 @@ API 页面按语言、数据结构、数据搬运、计算、设备执行、调�
     - [Array 简介](data-structures/array/overview.md)
     - [Array 构造函数](data-structures/array/Array.md)
 - [数据搬运](data-movement/index.md)
-  - [CopyOptions](data-movement/copy-options-type.md)
   - [copy_options](data-movement/copy-options.md)
   - [mem_copy](data-movement/mem-copy.md)
 - [计算](compute/index.md)

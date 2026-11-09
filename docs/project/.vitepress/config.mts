@@ -1727,10 +1727,6 @@ const apiSidebar = [
             "link": "/zh/api/data-movement",
             "items": [
               {
-                "text": "CopyOptions",
-                "link": "/zh/api/data-movement/copy-options-type"
-              },
-              {
                 "text": "copy_options",
                 "link": "/zh/api/data-movement/copy-options"
               },
