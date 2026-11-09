@@ -1,7 +1,5 @@
 # flash_kda_cp_main
 
-依赖版本：CANNBot-DSL 0.8.0。
-
 ## 产品支持情况
 
 - Ascend 950：支持。
@@ -28,7 +26,7 @@ $$
 S_c=S_{c-1}\operatorname{diag}(\mathrm{decay}_c)+\Delta_c^{\top}k^g_c.
 $$
 
-这里状态的存储形状为 `[D, D]`，`D = 128`。主算子直接消费预处理施加过 mask 的 `mqk`，不再生成 mask；最后一个不足 64 行的 chunk 只写有效行。`local_initial_state` 由外部 CP prefix scan 用预处理的 `(transition, state_ext)` 与全局初始状态合成，本接口从它开始递推。
+这里状态的存储形状为 `[D, D]`，`D = 128`。主算子使用已施加下三角 mask 的 `mqk`；最后一个不足 64 行的 chunk 只写有效行。`local_initial_state` 由外部 CP prefix scan 用预处理的 `(transition, state_ext)` 与全局初始状态合成，本接口从它开始递推。
 
 ## 函数原型
 
@@ -83,7 +81,7 @@ metadata 算子读取 `cu_seqlens` 边界值；对于 `qg` 和 `local_initial_st
 
 metadata 记录每条逻辑序列实际消费的 chunk 数；`decay` 和 `mqk` 的 chunk 轴按同一模块导出的 `chunk_capacity_upper_bound(B, S)`（稠密）或 `chunk_capacity_upper_bound(B, T)`（TND）申请，容量为上文定义的 `C`。
 
-主算子的 metadata wrapper 与 CP preprocess 使用同一个共享 CP ABI 和 AICPU 编译对象。主算子跳过共享 ABI 中为预处理调度保留的字段。
+两个 CP metadata 入口使用一致的调度 ABI，分别生成对应算子的调度信息。
 
 ## 返回值说明
 
@@ -103,7 +101,6 @@ BSND 最终 `out` 的逻辑形状为 `[B, S, Nv, D]`，通过内部 BNSD 存储�
 - 所有输入张量（包括 `metadata`）必须连续、位于同一 NPU，且满足参数表中的 dtype 和 shape。
 - metadata 和主算子必须使用相同的当前 stream 有效核数；内核的全栅栏同步依赖此约定。
 - 外部 CP prefix scan 负责把预处理的 `(transition, state_ext)` 与全局初始状态合成为 `local_initial_state`。
-- 完整 chunk 使用双行 BF16 向量快路径；不足 64 行的尾块执行有效行清零和掩码拷贝。
 
 ## 调用示例
 
@@ -141,12 +138,13 @@ python -m pytest -q test/attention/flash_kda_cp_main/test_flash_kda_cp_main.py
 
 ## 性能
 
-测试在 Ascend 950、CANN 9.2.0 上用 `msprof --task-time=l1` 采集，形状为 `B=1, Nqk=32, Nv=32, S=8192, D=128`，覆盖 BNSD、BSND、TND 三种布局。
+测量环境：Ascend 950 PR、CANN 9.2.0，32 AIC / 64 AIV。
+下表为独立 kernel 的 Task Duration，单位为 μs；四轮交错对照，每组预热 3 次、采样 8 次，取组中位数的中位数。
+每次预热和采样前完成 1 GiB 软件 L2 驱逐并同步；驱逐、metadata、Host 和外部 prefix scan 不计入耗时。
 
-metadata 在采样循环前生成一次，`Task Duration` 只统计 AICore kernel `flash_kda_cp_kernel`。每种布局预热 2 次后连续采样 12 次，表中为 12 次采样的中位数。
-
-| Layout | Task Duration 中位数 (us) |
-|:---|--:|
-| BNSD | 280.5 |
-| BSND | 280.2 |
-| TND | 282.5 |
+| 布局 | B | S | Nv | D | 耗时（μs） |
+|:---|--:|--:|--:|--:|--:|
+| BSND | 1 | 16384 | 6 | 128 | 286.374 |
+| BSND | 1 | 16384 | 12 | 128 | 346.141 |
+| BSND | 1 | 1024 | 96 | 128 | 188.779 |
+| BNSD | 1 | 577 | 5 | 128 | 15.231 |

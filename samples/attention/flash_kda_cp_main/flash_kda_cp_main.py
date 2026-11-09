@@ -14,7 +14,6 @@ import dataclasses
 import os
 import threading
 from collections import OrderedDict
-from functools import lru_cache
 from typing import Optional
 
 import cannbotdsl
@@ -46,6 +45,8 @@ from cannbotdsl.ops.reg import (
     vstore_pack,
 )
 from cannbotdsl.ops.sync import (
+    cube_fill_l1_zero,
+    cube_sync_pipe,
     cube_sync_all,
     cube_sync_block_arrive,
     cube_sync_block_wait,
@@ -57,14 +58,9 @@ from cannbotdsl.ops.sync import (
 from cannbotdsl.ring_buffer import RingBuffer
 from cannbotdsl.tensor import idx2crd, reinterpret, tile_slice
 
-try:
-    from cannbotdsl import aot
-except ImportError:  # pragma: no cover - compatibility with pre-0.7 hosts
-    aot = None
+from cannbotdsl import aot
 
 os.environ.setdefault("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")
-
-compile_cache = getattr(aot, "compile_cache", lru_cache(maxsize=1))
 
 
 @jit
@@ -142,6 +138,7 @@ class _ChunkPosition:
     head: object
     dv_index: object
     subblock: object
+    dense_u: object
 
 
 def _o_head_chunk_tile(gm_output, position, chunk_idx, dv_base, valid_rows=CHUNK_SIZE):
@@ -245,13 +242,17 @@ class Matmul:
     def load_state(self, state_l1):
         mem_copy(self.l0b_state, reinterpret(state_l1.next_read(), layout=make_layout((self.dv_base, SUPPORTED_HEAD_DIM)), data_format="nz"))
 
-    def compute_w_state(self, w_l1):
+    def prefetch_wq_operands(self, w_l1, q_decayed_l1):
         mem_copy(self.l0a_chunk.next_write(), w_l1.next_read())
-        matmul(self.l0c_u, self.l0a_chunk.next_read(), self.l0b_state, init=True)
-
-    def compute_q_state(self, q_decayed_l1):
         mem_copy(self.l0a_chunk.next_write(), q_decayed_l1.next_read())
-        matmul(self.l0c_o, self.l0a_chunk.next_read(), self.l0b_state, init=True)
+
+    def compute_wq_state(self, w_l1, q_l1, prefetch_wq):
+        if const_expr(not prefetch_wq):
+            self.prefetch_wq_operands(w_l1, q_l1)
+        w_operand = self.l0a_chunk.next_read()
+        q_operand = self.l0a_chunk.next_read()
+        matmul(self.l0c_u, w_operand, self.l0b_state, init=True)
+        matmul(self.l0c_o, q_operand, self.l0b_state, init=True)
 
     def load_k_restored_operand(self, k_restored_l1):
         mem_copy(self.l0b_kr, k_restored_l1.next_read())
@@ -272,9 +273,10 @@ class Matmul:
     def store_u_delta(self, ub):
         mem_copy(ub, self.l0c_u.partition(dim=0))
 
-    def store_output(self, gm_tile):
-        """FIXPIPE 按目的 GM Access.actual_rows 写入逻辑尾块。"""
-        mem_copy(gm_tile, self.l0c_o, options=copy_options(l2_cache_ctl=_L2_CACHE_DISABLE))
+    def store_output(self, gm_tile, valid_rows):
+        """Bound both FIXPIPE operands to the live sequence rows."""
+        source = _valid_rows_view(self.l0c_o, valid_rows, self.dv_base)
+        mem_copy(gm_tile, source, options=copy_options(l2_cache_ctl=_L2_CACHE_DISABLE))
 
     def store_state_delta(self, ub):
         mem_copy(ub, self.l0c_state.partition(dim=1))
@@ -292,10 +294,11 @@ class Matmul:
     def _load_padded_chunk(self, channel, gm_tile, valid_rows, *, l2_cache_ctl=0):
         slot = channel.next_write()
         if valid_rows < CHUNK_SIZE:
-            for col_block in range(gm_tile.shape[1] // 16):
-                gm_col = tile_slice(gm_tile, (CHUNK_SIZE, 16), (0, col_block))
-                l1_col = tile_slice(slot, (CHUNK_SIZE, 16), (0, col_block))
-                mem_copy(l1_col, _valid_rows_view(gm_col, valid_rows, 16), options=copy_options(l2_cache_ctl=l2_cache_ctl))
+            cube_fill_l1_zero(slot, repeat=slot.shape[0] * slot.shape[1] // 16)
+            cube_sync_pipe(PIPE.MTE2)
+            destination = _valid_rows_view(slot, valid_rows, gm_tile.shape[1])
+            source = _valid_rows_view(gm_tile, valid_rows, gm_tile.shape[1])
+            mem_copy(destination, source, options=copy_options(l2_cache_ctl=l2_cache_ctl))
         else:
             mem_copy(slot, gm_tile, options=copy_options(l2_cache_ctl=l2_cache_ctl))
 
@@ -322,7 +325,7 @@ class Vector:
         self.u_nz = RingBuffer(MemLoc.UB, dtypes.bfloat16, make_layout((u_row_block, dv_base)), depth=1, data_format='nz', physical_layout=make_layout(((dv_base + 15) // 16, (u_row_block + 15) // 16, 16, 16), stride=((u_row_block + 15) // 16 * 256 + 16, 256, 16, 1))).next_write()
         self.state_in = RingBuffer(MemLoc.UB, dtypes.float32, make_layout((self.dv_base, self.half_dk)), depth=1).next_write()
         self.state_out = RingBuffer(MemLoc.UB, dtypes.float32, make_layout((self.dv_base, self.half_dk)), depth=1).next_write()
-        self.u_in = RingBuffer(MemLoc.UB, dtypes.bfloat16, make_layout((u_row_block, dv_base)), depth=2)
+        self.u_in = RingBuffer(MemLoc.UB, dtypes.bfloat16, make_layout((u_row_block, SUPPORTED_HEAD_DIM)), depth=2)
 
     def load_gamma_row(self, gamma_ub, gamma_row, subblock_idx):
         """Load one row of ``decay[B,N,C,D]`` as the column consumed by VF."""
@@ -360,17 +363,48 @@ class Vector:
                 vstore(ub_state, base, state_next, mask)
 
     @jit
-    def issue_u_rows(self, gm_u_tile, subblock_idx, valid_rows):
-        row_start = subblock_idx * self.u_row_block
+    def issue_u_rows(self, gm_u_tile, position, valid_rows):
+        row_start = position.subblock * self.u_row_block
         if row_start < valid_rows:
-            rows = valid_rows - row_start
-            if rows > self.u_row_block:
-                rows = self.u_row_block
-            gm_u_rows = tile_slice(gm_u_tile, (self.u_row_block, self.dv_base), (subblock_idx, 0))
-            mem_copy(_valid_rows_view(reinterpret(self.u_in.next_write(), layout=make_layout((self.u_row_block, self.dv_base))), rows, self.dv_base), _valid_rows_view(gm_u_rows, rows, self.dv_base))
+            rows = min(valid_rows - row_start, self.u_row_block)
+            gm_rows = tile_slice(gm_u_tile, (self.u_row_block, SUPPORTED_HEAD_DIM), (position.subblock, 0))
+            if const_expr(self.dv_base == 32):
+                if position.dense_u:
+                    destination = self.u_in.next_write()
+                    mem_copy(destination, _valid_rows_view(gm_rows, rows, SUPPORTED_HEAD_DIM))
+                else:
+                    source = tile_slice(gm_rows, (self.u_row_block, self.dv_base), (0, position.dv_index))
+                    destination = reinterpret(self.u_in.next_write(), layout=make_layout((self.u_row_block, self.dv_base)))
+                    mem_copy(destination, _valid_rows_view(source, rows, self.dv_base))
+            else:
+                source = tile_slice(gm_rows, (self.u_row_block, self.dv_base), (0, position.dv_index))
+                destination = reinterpret(self.u_in.next_write(), layout=make_layout((self.u_row_block, self.dv_base)))
+                mem_copy(_valid_rows_view(destination, rows, self.dv_base), _valid_rows_view(source, rows, self.dv_base))
 
     @jit
-    def finish_u_delta_to_l1(self, u_l1, tmp_u_delta, subblock_idx, valid_rows):
+    def _read_u_rows(self, position, rows):
+        selected = self.u_in.next_read()
+        if const_expr(self.dv_base == 32):
+            if position.dense_u:
+                words = reinterpret(selected, dtype=dtypes.uint16)
+                with vf(mode="simd"):
+                    full_mask, _ = update_mask(128, elem_bits=16)
+                    lane = reg_ops.varange(0, dtypes.uint16)
+                    row = reg_ops.vshr(lane, self.dv_base.bit_length() - 1, mask=full_mask)
+                    column = reg_ops.vsub(lane, reg_ops.vshl(row, self.dv_base.bit_length() - 1, mask=full_mask), mask=full_mask)
+                    pattern = vadd(reg_ops.vshl(row, 7, mask=full_mask), column, mask=full_mask)
+                    for base in dsl_range(0, rows * self.dv_base, 128, unroll=2):
+                        mask, _ = update_mask(rows * self.dv_base - base, elem_bits=16)
+                        source_base = base // self.dv_base * SUPPORTED_HEAD_DIM + position.dv_index * self.dv_base
+                        index = reg_ops.vadds(pattern, source_base, mask=full_mask)
+                        packed = reg_ops.vgather(words, index, mask=mask)
+                        vstore(words, base, packed, mask)
+                    vmem_bar("vst_vld")
+        return reinterpret(selected, layout=make_layout((self.u_row_block, self.dv_base)))
+
+    @jit
+    def finish_u_delta_to_l1(self, u_l1, tmp_u_delta, position, valid_rows):
+        subblock_idx = position.subblock
         u_l1_rows = tile_slice(reinterpret(u_l1.next_write(), layout=make_layout((CHUNK_SIZE, self.dv_base)), data_format="nz"), (self.u_row_block, self.dv_base), (subblock_idx, 0))
 
         delta = tmp_u_delta
@@ -381,7 +415,7 @@ class Vector:
         if rows > self.u_row_block:
             rows = self.u_row_block
         if rows == self.u_row_block:
-            u_in_read = reinterpret(self.u_in.next_read(), layout=make_layout((self.u_row_block, self.dv_base)))
+            u_in_read = self._read_u_rows(position, self.u_row_block)
             with vf(mode="simd"):
                 mask, _ = update_mask(VL, elem_bits=32)
                 for base in range(0, self.u_row_block * self.dv_base, 2 * VL):
@@ -406,7 +440,7 @@ class Vector:
                     vstore(self.tmp_u_bf16, row * self.dv_base, zero, bf16_mask)
                 vmem_bar("vst_vld")
         if rows > 0 and rows < self.u_row_block:
-            u_tail_read = reinterpret(self.u_in.next_read(), layout=make_layout((self.u_row_block, self.dv_base)))
+            u_tail_read = self._read_u_rows(position, rows)
             with vf(mode="simd"):
                 for row in dsl_range(0, rows, 1, unroll=2):
                     for col in range(0, self.dv_base, VL):
@@ -518,7 +552,7 @@ class _Resources:
 
 
 @jit
-def _initialize_recurrence(tensors, work, resources, position):
+def _initialize_recurrence(tensors, work, resources, position, prefetch_wq):
     write_state_ref = tensors.state.state_out[position.logical_batch, position.head, None, None]
     first_valid_rows = CHUNK_SIZE
     if work.group_start + work.group_count == work.chunks_total:
@@ -539,9 +573,10 @@ def _initialize_recurrence(tensors, work, resources, position):
     first_u_tile_full = _sequence_head_chunk_tile(
         tensors.sequence.u, position.storage_batch, position.head, work.group_start
     )
-    first_u_tile = tile_slice(first_u_tile_full, (CHUNK_SIZE, resources.matmul.dv_base), (0, position.dv_index))
     resources.matmul.load_k_cumdecay(resources.w_l1, first_w_chunk, first_valid_rows)
     resources.matmul.load_q_decayed(resources.q_l1, first_q_chunk, first_valid_rows)
+    if const_expr(prefetch_wq):
+        resources.matmul.prefetch_wq_operands(resources.w_l1, resources.q_l1)
     resources.matmul.load_k_restored(resources.k_restored_l1, first_k_restored_chunk, first_valid_rows)
     resources.matmul.load_mqk(resources.mqk_l1, first_mqk_tile, first_valid_rows)
     if work.group_start == 0:
@@ -556,11 +591,11 @@ def _initialize_recurrence(tensors, work, resources, position):
         )
         resources.vector.load_initial_state_and_write_l1(first_state_rows, resources.state_l1, position.subblock)
     resources.vector.load_gamma_row(resources.gamma_ub, first_decay_row, position.subblock)
-    resources.vector.issue_u_rows(first_u_tile, position.subblock, first_valid_rows)
+    resources.vector.issue_u_rows(first_u_tile_full, position, first_valid_rows)
 
 
 @jit
-def _run_chunks(tensors, work, resources, position):
+def _run_chunks(tensors, work, resources, position, prefetch_wq):
     write_state_ref = tensors.state.state_out[position.logical_batch, position.head, None, None]
     for chunk_id in range(0, work.group_count):
         k = work.group_start + chunk_id
@@ -572,8 +607,7 @@ def _run_chunks(tensors, work, resources, position):
             next_valid_rows = work.seq_len - (k + 1) * CHUNK_SIZE
         o_chunk = _o_head_chunk_tile(tensors.sequence.output, position, k, resources.matmul.dv_base, valid_rows)
         resources.matmul.load_state(resources.state_l1)
-        resources.matmul.compute_w_state(resources.w_l1)
-        resources.matmul.compute_q_state(resources.q_l1)
+        resources.matmul.compute_wq_state(resources.w_l1, resources.q_l1, prefetch_wq)
         resources.matmul.load_k_restored_operand(resources.k_restored_l1)
         resources.matmul.load_mqk_operand(resources.mqk_l1)
         if chunk_id + 1 < work.group_count:
@@ -587,11 +621,10 @@ def _run_chunks(tensors, work, resources, position):
             next_u_tile_full = _sequence_head_chunk_tile(
                 tensors.sequence.u, position.storage_batch, position.head, k + 1
             )
-            next_u_tile = tile_slice(next_u_tile_full, (CHUNK_SIZE, resources.matmul.dv_base), (0, position.dv_index))
-            resources.vector.issue_u_rows(next_u_tile, position.subblock, next_valid_rows)
+            resources.vector.issue_u_rows(next_u_tile_full, position, next_valid_rows)
         resources.matmul.store_u_delta(resources.tmp_u_delta)
 
-        resources.vector.finish_u_delta_to_l1(resources.u_l1, resources.tmp_u_delta, position.subblock, valid_rows)
+        resources.vector.finish_u_delta_to_l1(resources.u_l1, resources.tmp_u_delta, position, valid_rows)
 
         u_slot = resources.u_l1.next_read()
         resources.matmul.update_state(u_slot)
@@ -599,13 +632,15 @@ def _run_chunks(tensors, work, resources, position):
 
         resources.matmul.accumulate_mqk_u(u_slot)
         if chunk_id + 1 < work.group_count:
+            if const_expr(prefetch_wq):
+                resources.matmul.prefetch_wq_operands(resources.w_l1, resources.q_l1)
             next_k_restored_chunk = _sequence_head_chunk_tile(
                 tensors.sequence.kg, position.storage_batch, position.head, k + 1
             )
             next_mqk_tile = _chunk_matrix_tile(tensors.state.mqk, position.logical_batch, position.head, k + 1)
             resources.matmul.load_k_restored(resources.k_restored_l1, next_k_restored_chunk, next_valid_rows)
             resources.matmul.load_mqk(resources.mqk_l1, next_mqk_tile, next_valid_rows)
-        resources.matmul.store_output(o_chunk)
+        resources.matmul.store_output(o_chunk, valid_rows)
 
         resources.vector.scale_and_add_delta(resources.tmp_delta, resources.gamma_ub)
         if chunk_id + 1 < work.group_count:
@@ -626,9 +661,15 @@ def _run_flash_kda_cp_body(tensors, work, partition, shared_resources):
     if block_idx < partition.logical_core_num:
         for item in range(partition.item_start, partition.item_end):
             head_id, dv_idx = idx2crd(item, [partition.head_count, num_dv_base])
-            position = _ChunkPosition(0, work.logical_batch, head_id, dv_idx, subblock_idx)
-            _initialize_recurrence(tensors, work, resources, position)
-            _run_chunks(tensors, work, resources, position)
+            position = _ChunkPosition(0, work.logical_batch, head_id, dv_idx, subblock_idx,
+                                      tensors.sequence.u.physical_stride[2] == SUPPORTED_HEAD_DIM)
+            # Amortize the lookahead setup across a long continuous recurrence.
+            if work.group_count >= 64:
+                _initialize_recurrence(tensors, work, resources, position, True)
+                _run_chunks(tensors, work, resources, position, True)
+            else:
+                _initialize_recurrence(tensors, work, resources, position, False)
+                _run_chunks(tensors, work, resources, position, False)
 
 
 # mode=0 below is a whole-grid barrier.  The launch must fit in one resident
@@ -684,6 +725,8 @@ class _RoundSchedule:
     core_start: object
     core_end: object
     logical_core_num: object
+    tail_chunk_start_base: object
+    tail_chunk_num_base: object
 
 
 @jit
@@ -708,7 +751,9 @@ def _run_flash_kda_cp_round(tensors, schedule, dv_base, shared_resources):
         token_start = tensors.metadata[schedule.token_start_base + active_batch_idx]
         seq_len = dtypes.int64(tensors.metadata[schedule.valid_seq_len_base + active_batch_idx])
         group_start = tensors.metadata[schedule.chunk_start_base + active_batch_idx]
-        group_count = tensors.metadata[schedule.chunk_num_base + active_batch_idx]
+        group_end = (tensors.metadata[schedule.tail_chunk_start_base + active_batch_idx]
+                     + tensors.metadata[schedule.tail_chunk_num_base + active_batch_idx])
+        group_count = group_end - group_start
         chunks_total = (seq_len + (CHUNK_SIZE - 1)) // CHUNK_SIZE
         token_stop = token_start + seq_len
 
@@ -742,6 +787,81 @@ def _run_flash_kda_cp_dynamic(tensors, schedule, dv_splits_num):
     else:
         _rewind_split_branch()
         _run_flash_kda_cp_round(tensors, schedule, 16, shared_resources)
+
+
+@jit
+def _decode_main_round(gm_metadata, round_idx, head_count, block_idx, block_num):
+    record = gm_metadata[HEADER_WORDS + round_idx]
+    batches = gm_metadata[record + 1]
+    batch_base = record + 2
+    storage_base = batch_base + batches
+    token_base = storage_base + batches
+    length_base = token_base + batches
+    chunk_start_base = length_base + batches + 1
+    chunk_num_base = chunk_start_base + batches
+    reserved_prefix_base = chunk_num_base + batches
+    reserved_ranges_base = reserved_prefix_base + batches + 1
+    splits_base = reserved_ranges_base + MAX_AIC_CORES * 2
+    task_prefix_base = splits_base + batches
+    ranges_base = task_prefix_base + batches + 1
+    return _RoundSchedule(
+        head_count=head_count, active_batch_num=batches,
+        batch_idx_base=batch_base, storage_batch_idx_base=storage_base,
+        token_start_base=token_base, valid_seq_len_base=length_base,
+        chunk_start_base=chunk_start_base, chunk_num_base=chunk_num_base,
+        task_prefix_base=task_prefix_base,
+        core_start=gm_metadata[ranges_base + block_idx * 2],
+        core_end=gm_metadata[ranges_base + block_idx * 2 + 1],
+        logical_core_num=block_num,
+        tail_chunk_start_base=chunk_start_base, tail_chunk_num_base=chunk_num_base,
+    ), gm_metadata[splits_base]
+
+
+@jit
+def _same_main_round_partition(gm_metadata, first, following, previous_start, previous_count):
+    """Require identical ownership on every core before dropping a grid boundary."""
+    compatible = 0
+    if first.active_batch_num == following.active_batch_num:
+        compatible = 1
+        count = first.active_batch_num
+        for batch in range(count):
+            if (gm_metadata[first.batch_idx_base + batch] != gm_metadata[following.batch_idx_base + batch]
+                or gm_metadata[first.storage_batch_idx_base + batch] != gm_metadata[following.storage_batch_idx_base + batch]
+                or gm_metadata[first.token_start_base + batch] != gm_metadata[following.token_start_base + batch]
+                or gm_metadata[first.valid_seq_len_base + batch] != gm_metadata[following.valid_seq_len_base + batch]
+                or gm_metadata[first.task_prefix_base - count + batch] != gm_metadata[following.task_prefix_base - count + batch]
+                or gm_metadata[following.chunk_start_base + batch] != gm_metadata[previous_start + batch] + gm_metadata[previous_count + batch]):
+                compatible = 0
+        for prefix in range(count + 1):
+            if gm_metadata[first.task_prefix_base + prefix] != gm_metadata[following.task_prefix_base + prefix]:
+                compatible = 0
+        first_ranges = first.task_prefix_base + count + 1
+        following_ranges = following.task_prefix_base + count + 1
+        # All blocks inspect the complete partition, so they make the same
+        # decision even when some blocks own no work in either round.
+        for entry in range(MAX_AIC_CORES * 2):
+            if gm_metadata[first_ranges + entry] != gm_metadata[following_ranges + entry]:
+                compatible = 0
+    return compatible
+
+
+@jit
+def _extend_main_round(gm_metadata, schedule, round_idx, round_num, block_idx):
+    next_round = round_idx + 1
+    tail_start_base = schedule.chunk_start_base
+    tail_num_base = schedule.chunk_num_base
+    for following_idx in range(round_idx + 1, round_num):
+        if following_idx == next_round:
+            following, _ = _decode_main_round(
+                gm_metadata, following_idx, schedule.head_count, block_idx, schedule.logical_core_num,
+            )
+            if _same_main_round_partition(
+                gm_metadata, schedule, following, tail_start_base, tail_num_base,
+            ):
+                tail_start_base = following.chunk_start_base
+                tail_num_base = following.chunk_num_base
+                next_round = following_idx + 1
+    return next_round, tail_start_base, tail_num_base
 
 
 @kernel(
@@ -791,43 +911,21 @@ class FlashKdaCpKernel:
             and metadata_batch * metadata_value_heads == bn_total
         ):
             round_num = gm_metadata[HEADER_ROUND_COUNT]
+            next_round = 0
             for round_idx in range(0, round_num):
-                record = gm_metadata[HEADER_WORDS + round_idx]
-                active_batch_num = gm_metadata[record + 1]
-                batch_idx_base = record + 2
-                storage_batch_idx_base = batch_idx_base + active_batch_num
-                token_start_base = storage_batch_idx_base + active_batch_num
-                valid_seq_len_base = token_start_base + active_batch_num
-                group_num_index = valid_seq_len_base + active_batch_num
-                chunk_start_base = group_num_index + 1
-                chunk_num_base = chunk_start_base + active_batch_num
-                # Skip preprocess scheduling fields reserved by the shared CP metadata ABI.
-                reserved_task_prefix_base = chunk_num_base + active_batch_num
-                reserved_core_ranges_base = reserved_task_prefix_base + active_batch_num + 1
-                dv_splits_base = reserved_core_ranges_base + MAX_AIC_CORES * 2
-                task_prefix_base = dv_splits_base + active_batch_num
-                core_ranges_base = task_prefix_base + active_batch_num + 1
-                core_range_word = core_ranges_base + block_idx * 2
-                core_start = gm_metadata[core_range_word]
-                core_end = gm_metadata[core_range_word + 1]
-                dv_splits_num = gm_metadata[dv_splits_base]
-                schedule = _RoundSchedule(
-                    head_count=metadata_value_heads,
-                    active_batch_num=active_batch_num,
-                    batch_idx_base=batch_idx_base,
-                    storage_batch_idx_base=storage_batch_idx_base,
-                    token_start_base=token_start_base,
-                    valid_seq_len_base=valid_seq_len_base,
-                    chunk_start_base=chunk_start_base,
-                    chunk_num_base=chunk_num_base,
-                    task_prefix_base=task_prefix_base,
-                    core_start=core_start,
-                    core_end=core_end,
-                    logical_core_num=block_num,
-                )
-                _run_flash_kda_cp_dynamic(tensors, schedule, dv_splits_num)
-                if round_idx + 1 < round_num:
-                    _round_boundary_reset(ROUND_BOUNDARY_FLAG_ID)
+                if round_idx == next_round:
+                    schedule, dv_splits_num = _decode_main_round(
+                        gm_metadata, round_idx, metadata_value_heads, block_idx, block_num,
+                    )
+                    next_round, tail_start_base, tail_num_base = _extend_main_round(
+                        gm_metadata, schedule, round_idx, round_num, block_idx,
+                    )
+                    schedule = dataclasses.replace(
+                        schedule, tail_chunk_start_base=tail_start_base, tail_chunk_num_base=tail_num_base,
+                    )
+                    _run_flash_kda_cp_dynamic(tensors, schedule, dv_splits_num)
+                    if next_round < round_num:
+                        _round_boundary_reset(ROUND_BOUNDARY_FLAG_ID)
 
 
 # Retain the historical exported kernel name for existing callers.
@@ -901,7 +999,7 @@ def _cp_sequence_tensor_spec(dtype, shape, prefix):
     return cannbotdsl.TensorSpec(shape, dtype, stride=strides)
 
 
-@compile_cache
+@aot.compile_cache
 def _compile_cp_main_kernel():
     physical_batch = cannbotdsl.Dim("P")
     batch = cannbotdsl.Dim("B")
@@ -1191,12 +1289,10 @@ HEADER_VALUE_HEADS = 6
 HEADER_WORDS = 9
 STATUS_OK = 0
 
-if aot is not None and hasattr(aot, "export"):
-
-    @aot.export("flash_kda_cp_main")
-    def export_flash_kda_cp_main():
-        """Export the dynamic CP main AICore binary."""
-        _compile_cp_main_kernel()
+@aot.export("flash_kda_cp_main")
+def export_flash_kda_cp_main():
+    """Export the dynamic CP main AICore binary."""
+    _compile_cp_main_kernel()
 
 
 __all__ = ["flash_kda_cp_main", "FlashKdaCpKernel", "flash_kda_cp_kernel", "clear_execution_cache"]
