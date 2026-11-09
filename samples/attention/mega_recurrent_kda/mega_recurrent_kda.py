@@ -2046,6 +2046,11 @@ class _GridSchedule:
 
 
 def _pack_conv_weights(conv1d_weight: torch.Tensor, num_heads: int) -> torch.Tensor:
+    """Pack supported layouts into contiguous [QKV, head, tap, channel] order.
+
+    Canonical weights are reused; head-shared and tap-major weights are
+    materialized on each call so updates to the input are always observed.
+    """
     if tuple(conv1d_weight.shape) == (3, num_heads, CONV_KERNEL, TILE):
         return conv1d_weight
     if tuple(conv1d_weight.shape) == (3, CONV_KERNEL, TILE):
