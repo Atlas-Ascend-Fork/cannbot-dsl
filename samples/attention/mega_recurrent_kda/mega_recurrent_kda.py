@@ -2139,9 +2139,9 @@ def _validate_mega_states(call, shape):
     if tuple(dt_bias.shape) != (num_heads, TILE) or dt_bias.dtype != torch.float32:
         raise ValueError("dt_bias must be FP32 [N,128]")
     state_tensors = (conv_state, recurrent_state, a_log, dt_bias)
-    if any((tensor.device != hidden_states.device for tensor in state_tensors)):
+    if any(tensor.device != hidden_states.device for tensor in state_tensors):
         raise ValueError("all inputs must share one device")
-    if any((not tensor.is_contiguous() for tensor in (a_log, dt_bias))):
+    if any(not tensor.is_contiguous() for tensor in (a_log, dt_bias)):
         raise ValueError("A_log and dt_bias must be contiguous")
 
 
