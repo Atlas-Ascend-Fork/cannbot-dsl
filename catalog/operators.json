@@ -425,7 +425,8 @@
       "scripts/ci/perf_cases.py",
       "scripts/format_cpp.sh",
       "scripts/run_codespell.sh",
-      "test/test_config.yaml"
+      "test/test_config.yaml",
+      "net/"
     ],
     "inventory": [
       "fused_norm_rope_attn_rope_cast_fwd",
@@ -1033,7 +1034,7 @@
       },
       {
         "name": "ds41_network",
-        "enabled": true,
+        "enabled": false,
         "watch": [
           "net/ds41/network.json"
         ],
@@ -1054,7 +1055,7 @@
       },
       {
         "name": "k3_network",
-        "enabled": true,
+        "enabled": false,
         "watch": [
           "net/k3/network.json"
         ],

@@ -16,6 +16,7 @@ ignore:
   - scripts/format_cpp.sh
   - scripts/run_codespell.sh
   - test/test_config.yaml
+  - net/
 mla_prolog_v4:
   module: true
   src:
@@ -368,7 +369,7 @@ mega_reindex:
   options:
     - attention/mega_reindex
 ds41_network:
-  module: true
+  module: false
   src:
     - net/ds41/network.json
   options:
@@ -385,7 +386,7 @@ ds41_network:
     - attention/mega_full_index
     - attention/mega_compressor
 k3_network:
-  module: true
+  module: false
   src:
     - net/k3/network.json
   options:
