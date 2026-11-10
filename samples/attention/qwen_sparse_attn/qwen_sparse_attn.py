@@ -13,6 +13,8 @@
 不支持的选项会被明确拒绝。
 """
 
+from cannbotdsl import from_tensor
+
 __all__ = [
     "QuantMode",
     "SparseMode",
@@ -39,7 +41,6 @@ from cannbotdsl import (
     jit,
     matmul,
     mem_copy,
-    reinterpret,
     tile_slice,
     vec_sync_all,
     vf,
@@ -98,7 +99,7 @@ class QueryTail:
 
     @jit
     def clear_q_tail(self, dst):
-        strides = dst.physical_stride
+        strides = dst.physical_layout.stride
         rows_per_nz_block = strides[1] // strides[2]
         block_stride = strides[0] // (strides[2] // strides[3])
         with vf(mode="simd"):
@@ -119,7 +120,7 @@ class QueryTail:
 
     @jit
     def scatter(self, dst, src, row0):
-        strides = dst.physical_stride
+        strides = dst.physical_layout.stride
         rows_per_nz_block = strides[1] // strides[2]
         block_stride = strides[0] // (strides[2] // strides[3])
         with vf(mode="simd"):
@@ -205,7 +206,7 @@ class Fp8QueryTail:
         self.q_bytes = Buffer(
             MemLoc.UB, dtypes.int8, make_layout((16, dim)), data_format="nz"
         )
-        self.q = reinterpret(self.q_bytes, dtype=dtypes.float8_e4m3fn)
+        self.q = from_tensor(self.q_bytes, dtype=dtypes.float8_e4m3fn)
 
     @jit
     def clear(self):
@@ -222,7 +223,7 @@ class Fp8QueryTail:
 
     @jit
     def scatter(self, src, row):
-        strides = self.q_bytes.physical_stride
+        strides = self.q_bytes.physical_layout.stride
         rows_per_nz_block = strides[1] // strides[2]
         block_stride = strides[0] // (strides[2] // strides[3])
         with vf(mode="simd"):
@@ -255,11 +256,11 @@ class Fp8QueryTail:
         for row in range(active_rows):
             g_idx = g_chunk_idx * 32 + logical_row_base + row
             n1_idx = n2_idx * group + g_idx
-            row_write = reinterpret(
+            row_write = from_tensor(
                 self.row_bytes.next_write(), dtype=dtypes.float8_e4m3fn
             )
             mem_copy(row_write, _bf16_row_tnd(q, t_idx, n1_idx, self.dim))
-            row_read = reinterpret(
+            row_read = from_tensor(
                 self.row_bytes.next_read(), dtype=dtypes.float8_e4m3fn
             )
             self.scatter(row_read, row)
@@ -287,14 +288,14 @@ class Fp8QueryTail:
             q_slot = packed_row // group
             g_idx = packed_row % group
             if q_slot < q_token_num:
-                row_write = reinterpret(
+                row_write = from_tensor(
                     self.row_bytes.next_write(), dtype=dtypes.float8_e4m3fn
                 )
                 mem_copy(
                     row_write,
                     _bf16_row_tnd(q, q_idx + q_slot, n2_idx * group + g_idx, self.dim),
                 )
-                row_read = reinterpret(
+                row_read = from_tensor(
                     self.row_bytes.next_read(), dtype=dtypes.float8_e4m3fn
                 )
                 self.scatter(row_read, row)
@@ -380,7 +381,7 @@ class QwenSparseAttnBlock128Vector:
             full, _ = rr.update_mask(64, elem_bits=32)
             full16, _ = rr.update_mask(128, elem_bits=16)
             for row in range(active_rows):
-                row_offset = row * p.physical_stride[0]
+                row_offset = row * p.physical_layout.stride[0]
                 row_max = rr.vload_broadcast(max_buf, row * 8)
                 first_half = rr.vexp_sub(rr.vload(p, row_offset), row_max, mask=full)
                 second_half = rr.vexp_sub(
@@ -440,7 +441,7 @@ class QwenSparseAttnBlock128Vector:
     @jit
     def _softmax_fold_loop_fp8(self, p, probability, max_buf, sum_dst, active_rows):
         """FP8 P 物化版本的 fold loop；运行和仍保持未缩放 FP32。"""
-        strides = probability.physical_stride
+        strides = probability.physical_layout.stride
         rows_per_nz_block = strides[1] // strides[2]
         block_stride = strides[0] // (strides[2] // strides[3])
         with vf(mode="simd"):
@@ -448,7 +449,7 @@ class QwenSparseAttnBlock128Vector:
             full8, _ = rr.update_mask(256, elem_bits=8)
             store8, _ = rr.update_mask(128, elem_bits=8)
             for row in range(active_rows):
-                row_offset = row * p.physical_stride[0]
+                row_offset = row * p.physical_layout.stride[0]
                 row_max = rr.vload_broadcast(max_buf, row * 8)
                 first_half = rr.vexp_sub(rr.vload(p, row_offset), row_max, mask=full)
                 second_half = rr.vexp_sub(
@@ -524,7 +525,7 @@ class QwenSparseAttnBlock128Vector:
             for row in range(active_rows):
                 for half in range(2):
                     off = row * self.dim + part_idx * 128 + half * 64
-                    part = rr.vload(pv, row * pv.physical_stride[0] + half * 64)
+                    part = rr.vload(pv, row * pv.physical_layout.stride[0] + half * 64)
                     rr.vstore(self.u, off, part, full)
 
     @jit
@@ -541,7 +542,7 @@ class QwenSparseAttnBlock128Vector:
                 alpha = rr.vload_broadcast(alpha_ready, row * 8)
                 for half in range(2):
                     off = row * self.dim + part_idx * 128 + half * 64
-                    part = rr.vload(pv, row * pv.physical_stride[0] + half * 64)
+                    part = rr.vload(pv, row * pv.physical_layout.stride[0] + half * 64)
                     updated = rr.vmadd(rr.vload(self.u, off), alpha, part, mask=full)
                     rr.vstore(self.u, off, updated, full)
 
@@ -617,7 +618,7 @@ class QwenSparseAttnBlock128Vector:
 
     def _pass_a_row(self, p, scale, max_dst, row, full):
         """缩放并应用 mask，同时把当前行最大值写入指定状态。"""
-        row_offset = row * p.physical_stride[0]
+        row_offset = row * p.physical_layout.stride[0]
         full16, _ = rr.update_mask(128, elem_bits=16)
         raw_first_half = rr.vcast(
             rr.vload(p, row_offset),
@@ -666,7 +667,7 @@ class QwenSparseAttnBlock128Vector:
         rr.vstore_first(max_dst, row * 8, row_max)
 
     def _pass_a_row_fp8(self, p, scale, max_dst, row, full):
-        row_offset = row * p.physical_stride[0]
+        row_offset = row * p.physical_layout.stride[0]
         first_half = rr.vmuls(rr.vload(p, row_offset), scale, mask=full)
         second_half = rr.vmuls(rr.vload(p, row_offset + 64), scale, mask=full)
         first_half = self.apply_mask(first_half, row * 128, full)
@@ -682,7 +683,7 @@ class QwenSparseAttnBlock128Vector:
     def _store_probability_row(
         self, probability, first_half, second_half, row, full, full16
     ):
-        strides = probability.physical_stride
+        strides = probability.physical_layout.stride
         rows_per_nz_block = strides[1] // strides[2]
         block_stride = strides[0] // (strides[2] // strides[3])
         first_half = rr.vcast(
@@ -843,7 +844,7 @@ class QwenSparseAttnBlock128:
                 self.vec.load_mask(attn_mask, val_col)
                 self.vec.expand_mask(first_row - logical_row_base, row_num)
         scores = self.scores.next_read()
-        probability = reinterpret(
+        probability = from_tensor(
             self.vec.p_storage.next_write(), dtype=self.vec.p_dtype
         )
         if const_expr(self.fp8):
@@ -868,7 +869,7 @@ class QwenSparseAttnBlock128:
                     scale,
                     active_rows,
                 )
-        probability_ready = reinterpret(
+        probability_ready = from_tensor(
             self.vec.p_storage.next_read(), dtype=self.vec.p_dtype
         )
         mem_copy(

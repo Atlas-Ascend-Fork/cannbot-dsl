@@ -17,6 +17,8 @@ MX scale ABI: x1Scale uses ScaleAND[M,G,2], x2Scale uses ScaleBND[G,N,2],
 where G=ceil(K/64). Transpose is represented by stride metadata.
 """
 
+from cannbotdsl import from_tensor
+
 import os
 
 
@@ -1197,8 +1199,6 @@ class Mxfp8MatmulKernel:
 
 def _as_zn_view(slot):
     """Keep the original contiguous logical ZN layout on the same NZ storage."""
-    return slot.reinterpret(
-        slot.dtype,
-        make_layout((slot.shape[1], slot.shape[0])),
-        data_format="zn",
+    return from_tensor(
+        slot, slot.dtype, make_layout((slot.shape[1], slot.shape[0])), data_format="zn"
     )

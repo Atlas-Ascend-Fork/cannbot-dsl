@@ -18,6 +18,7 @@ No-LD records write directly to public outputs.
 """
 
 from __future__ import annotations
+from cannbotdsl import from_tensor
 
 __all__ = ["quant_sparse_lightning_indexer"]
 
@@ -56,12 +57,11 @@ from cannbotdsl.tensor import (
     make_pointer,
     make_tensor,
     make_layout,
-    reinterpret,
 )
 
 from cannbotdsl import onchip_rewind
 from cannbotdsl.ring_buffer import RingBuffer
-from cannbotdsl.ops.memcpy import copy_options, pad
+from cannbotdsl.ops.memcpy import copy_options
 
 
 TILE_M = 32
@@ -418,11 +418,11 @@ class LdTopKSelector(QsliRawTopKSelector):
     ):
         if not preloaded:
             mem_copy(
-                reinterpret(self.ld_indices, layout=make_layout((1, valid_length))),
+                from_tensor(self.ld_indices, layout=make_layout((1, valid_length))),
                 partial_indices[0:1, 0:valid_length],
             )
             mem_copy(
-                reinterpret(self.ld_bits, layout=make_layout((1, valid_length))),
+                from_tensor(self.ld_bits, layout=make_layout((1, valid_length))),
                 partial_bits[0:1, 0:valid_length],
             )
         current_trunk = self.workspace.merge_key
@@ -610,14 +610,14 @@ class LdMergeStage:
                         if const_expr(self.topk % 16 != 0):
                             # Carry remains in UB until the final merge round.
                             mem_copy(
-                                reinterpret(
+                                from_tensor(
                                     self.selector.ld_indices,
                                     layout=make_layout((1, self.topk)),
                                 ),
                                 self.selector.output_idx_stage,
                             )
                             mem_copy(
-                                reinterpret(
+                                from_tensor(
                                     self.selector.ld_bits,
                                     layout=make_layout((1, self.topk)),
                                 ),
@@ -625,14 +625,14 @@ class LdMergeStage:
                             )
                         else:
                             mem_copy(
-                                reinterpret(
+                                from_tensor(
                                     self.selector.ld_indices,
                                     layout=make_layout((1, self.topk)),
                                 ),
                                 tile_view(indices, (1, self.topk), (row, 0)),
                             )
                             mem_copy(
-                                reinterpret(
+                                from_tensor(
                                     self.selector.ld_bits,
                                     layout=make_layout((1, self.topk)),
                                 ),
@@ -842,7 +842,7 @@ class QsliCube:
 
     def load_query(self, query, query_scale):
         mem_copy(
-            reinterpret(
+            from_tensor(
                 self.q_l1.next_write(),
                 dtype=dtypes.uint8,
                 layout=make_layout((TILE_M, PACKED_D)),
@@ -1393,8 +1393,10 @@ class QsliVector0:
                 _copy_pa_row(packed_ub, block_idx, key, self.key_storage, address)
         else:
             for pair in range(CANDIDATE_BLOCKS_PER_AIV // 2):
-                packed_pair = self.physical_blocks.reinterpret(
-                    dtypes.uint64, make_layout((1, CANDIDATE_CAPACITY // 2))
+                packed_pair = from_tensor(
+                    self.physical_blocks,
+                    dtypes.uint64,
+                    make_layout((1, CANDIDATE_CAPACITY // 2)),
                 )[0, first_candidate // 2 + pair]
                 first = dtypes.int64(dtypes.uint32(packed_pair))
                 second = dtypes.int64(packed_pair // 4294967296)
@@ -1438,17 +1440,23 @@ class QsliVector0:
         if self.batch_consistency != 0:
             for block_idx in range(CANDIDATE_BLOCKS_PER_AIV):
                 pos = first_candidate + block_idx
-                address = self.physical_blocks.reinterpret(
-                    dtypes.int64, make_layout((1, CANDIDATE_CAPACITY // 2))
+                address = from_tensor(
+                    self.physical_blocks,
+                    dtypes.int64,
+                    make_layout((1, CANDIDATE_CAPACITY // 2)),
                 )[0, pos]
                 _copy_pa_row(packed_ub, block_idx, key, self.key_storage, address)
         else:
             for pair in range(CANDIDATE_BLOCKS_PER_AIV // 2):
-                first = self.physical_blocks.reinterpret(
-                    dtypes.int64, make_layout((1, CANDIDATE_CAPACITY // 2))
+                first = from_tensor(
+                    self.physical_blocks,
+                    dtypes.int64,
+                    make_layout((1, CANDIDATE_CAPACITY // 2)),
                 )[0, first_candidate + pair * 2]
-                second = self.physical_blocks.reinterpret(
-                    dtypes.int64, make_layout((1, CANDIDATE_CAPACITY // 2))
+                second = from_tensor(
+                    self.physical_blocks,
+                    dtypes.int64,
+                    make_layout((1, CANDIDATE_CAPACITY // 2)),
                 )[0, first_candidate + pair * 2 + 1]
                 _copy_pa_pair(packed_ub, pair, key, self.key_storage, first, second)
         vec_sync_notify(PIPE.MTE2, PIPE.MTE3, 2)
@@ -1741,7 +1749,7 @@ class QsliVector1:
         vec_sync_intra_wait(PIPE.MTE2, 7)
         if subblock_idx == dtypes.int64(0):
             mem_copy(
-                reinterpret(self.key_ub, layout=make_layout((1, self.tokens))),
+                from_tensor(self.key_ub, layout=make_layout((1, self.tokens))),
                 tile_view(key_workspace, (1, self.tokens), (worker_idx, 0)),
             )
             vec_sync_notify(PIPE.MTE2, PIPE.V, 0)
@@ -3329,12 +3337,12 @@ class QsliTndGather(QsliVector0):
         else:
             mem_copy(
                 key_target,
-                pad(key_source, (0, 0, 0, 8 - count), mode="replicate"),
+                key_source.pad((0, 0, 0, 8 - count), mode="replicate"),
                 options=copy_options(engine="nddma"),
             )
             mem_copy(
                 scale_target,
-                pad(scale_source, (0, 0, 0, 8 - count), mode="replicate"),
+                scale_source.pad((0, 0, 0, 8 - count), mode="replicate"),
                 options=copy_options(engine="nddma"),
             )
 

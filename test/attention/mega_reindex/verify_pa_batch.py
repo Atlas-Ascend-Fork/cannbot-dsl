@@ -18,6 +18,7 @@ s = source.read_text().split("compile_start = ")[0]
 ns = {"__package__": "attention.mega_reindex", "__file__": str(source)}
 exec(compile(s, str(source), "exec"), ns)
 prepare = ns["prepare_mega_reindex"]
+MAX_CUBE_CORES = ns["MAX_CUBE_CORES"]
 p = ns["p"]
 x = p["x"][:6].repeat(2, 1)
 rope = p["rope"][:6].repeat(2, 1, 1)
@@ -87,7 +88,7 @@ stream = torch.npu.Stream()
 with torch.npu.stream(stream):
     previous = torch.npu.get_stream_limit(stream)
     try:
-        for quota in (28, 8, 2, 32):
+        for quota in (MAX_CUBE_CORES, 8, 2, MAX_CUBE_CORES):
             torch.npu.set_stream_limit(stream, cube_num=quota, vector_num=2 * quota)
             for workspace in (tw, pw):
                 for name, tensor in vars(workspace).items():
@@ -104,7 +105,7 @@ with torch.npu.stream(stream):
             assert torch.equal(tw.indices.cpu(), pw.indices.cpu())
             for name, expected in reference.items():
                 assert torch.equal(getattr(pw, name).cpu(), expected), (quota, name)
-            if quota == 28:
+            if quota == MAX_CUBE_CORES:
                 graph = torch.npu.NPUGraph()
                 with torch.npu.graph(graph, stream=stream):
                     pa(*paargs)

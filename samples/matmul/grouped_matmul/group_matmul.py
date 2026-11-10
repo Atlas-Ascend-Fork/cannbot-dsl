@@ -36,6 +36,8 @@ Key properties:
     copy engine zero-pads tails.
 """
 
+from cannbotdsl import from_tensor
+
 __all__ = ["group_matmul"]
 
 import dataclasses
@@ -52,11 +54,7 @@ from cannbotdsl.lang.jit import jit
 from cannbotdsl.lang.kernel import kernel
 from cannbotdsl.ops.matmul import matmul
 from cannbotdsl.ops.memcpy import copy_options, mem_copy
-from cannbotdsl.tensor import (
-    tile_slice,
-    permute,
-    ceil_div,
-)
+from cannbotdsl.tensor import tile_slice, ceil_div
 
 
 # ============================================================================
@@ -635,8 +633,12 @@ class BlockMmad:
             b_panel = b_src[None, n_start : n_start + n_extent]
         # M/N and the physical accumulator pitch stay fixed for this entire
         # reduction. Bind them once; only the operand views advance along K.
-        accumulator = self.l0c.next_write(bare=True).view(
-            make_layout((m_extent, n_extent)), dtype=dtypes.float32, data_format="nz"
+        accumulator_raw = self.l0c.next_write()
+        accumulator = from_tensor(
+            accumulator_raw,
+            layout=make_layout((m_extent, n_extent)),
+            dtype=dtypes.float32,
+            data_format="nz",
         )
         for k_l1_idx in range(k_l1_tiles):
             k_start = k_l1_idx * k_l1
@@ -698,8 +700,14 @@ class BlockMmad:
                 l0a_tensor = self._load_l0a_block(l1_a_slice)
                 l0b_tensor = self._load_l0b_block(l1_b_slice)
                 is_final_k = k_l1_idx == k_l1_tiles - 1 and k_l0_idx == k_l0_per_l1 - 1
+                result = from_tensor(
+                    accumulator_raw,
+                    layout=make_layout((l0a_tensor.shape[0], l0b_tensor.shape[0])),
+                    dtype=dtypes.float32,
+                    data_format="nz",
+                )
                 matmul(
-                    accumulator.bare(),
+                    result,
                     l0a_tensor,
                     l0b_tensor,
                     init=is_first_k_block,
@@ -716,8 +724,8 @@ class BlockMmad:
         source view; the L0A slot is bound to the source's actual extent.
         """
         source = l1_a_slice.permute(1, 0) if self.t.trans_a else l1_a_slice
-        l0a_tensor = self.l0a.next_write(bare=True)
-        l0a_tensor = l0a_tensor.view(make_layout(source.shape))
+        l0a_tensor = self.l0a.next_write()
+        l0a_tensor = from_tensor(l0a_tensor, layout=make_layout(source.shape))
         mem_copy(l0a_tensor, source)
         return l0a_tensor
 
@@ -729,8 +737,8 @@ class BlockMmad:
         source view; the L0B slot is bound to the source's actual extent.
         """
         source = l1_b_slice if self.t.trans_b else l1_b_slice.permute(1, 0)
-        l0b_tensor = self.l0b.next_write(bare=True)
-        l0b_tensor = l0b_tensor.view(make_layout(source.shape))
+        l0b_tensor = self.l0b.next_write()
+        l0b_tensor = from_tensor(l0b_tensor, layout=make_layout(source.shape))
         mem_copy(l0b_tensor, source)
         return l0b_tensor
 
@@ -809,7 +817,7 @@ class GmmKernel:
             # Layout normalization, driven purely by the transpose flags:
             # after this block both operands are in their logical layouts
             # (x: [M,K]; weight: [..,K,N])
-            a_elem = permute(x_elem, (1, 0)) if const_expr(t.trans_a) else x_elem
+            a_elem = x_elem.permute((1, 0)) if const_expr(t.trans_a) else x_elem
             x_m = x_elem.shape[-2]
             x_k = x_elem.shape[-1]
             if const_expr(t.trans_b):

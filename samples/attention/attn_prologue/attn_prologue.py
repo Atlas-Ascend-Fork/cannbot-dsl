@@ -15,6 +15,7 @@ FixPipe 使用补齐的物理尾块，公开输出和 cache 更新仍使用逻�
 """
 
 from __future__ import annotations
+from cannbotdsl import from_tensor
 
 import ctypes
 import dataclasses
@@ -45,7 +46,6 @@ from cannbotdsl import (
     matmul,
     mem_copy,
     range_constexpr,
-    reinterpret,
     tile_slice,
     vf,
 )
@@ -1373,7 +1373,7 @@ class AttnPrologueKernel:
                 )
                 held_x.append(l1_x[reduction_tile_idx].next_read())
             for scale_tile_idx in range_constexpr(nk // tiling.scale_k_tiles):
-                activation_scale_slot = reinterpret(
+                activation_scale_slot = from_tensor(
                     l1_sx[scale_tile_idx].next_write(),
                     dtype=FLOAT8_E8M0,
                     layout=make_layout(
@@ -1401,7 +1401,7 @@ class AttnPrologueKernel:
                     ).flatten(1, 2),
                 )
                 held_s.append(
-                    reinterpret(
+                    from_tensor(
                         l1_sx[scale_tile_idx].next_read(),
                         dtype=FLOAT8_E8M0,
                         layout=make_layout(
@@ -1494,7 +1494,7 @@ class AttnPrologueKernel:
                 )
             for u in range_constexpr(min(W_BUF, nk)):
                 reduction_tile_idx = pair * W_BUF + u
-                weight_l1_tile = l1_w[u].next_read().reinterpret(dtypes.float8_e4m3fn)
+                weight_l1_tile = from_tensor(l1_w[u].next_read(), dtypes.float8_e4m3fn)
                 weight_scale_tile = l1_sw.next_read()
                 mem_copy(
                     l0b.next_write(),
@@ -1512,7 +1512,7 @@ class AttnPrologueKernel:
         )
         mem_copy(
             ws_tile,
-            reinterpret(
+            from_tensor(
                 l0c,
                 layout=make_layout(ws_tile.shape),
                 physical_layout=l0c.physical_layout,
@@ -1531,7 +1531,9 @@ class AttnPrologueKernel:
                     value = rr.vadd(
                         value,
                         rr.vload(
-                            src, part * src.physical_stride[0] + feature_vector_idx * VL
+                            src,
+                            part * src.physical_layout.stride[0]
+                            + feature_vector_idx * VL,
                         ),
                         mask=mask,
                     )
@@ -1541,7 +1543,7 @@ class AttnPrologueKernel:
     def _load_b_panel(self, dst, gm_weight, n_group, k_panel):
         tiling = self.tiling
         panel_bytes = PANEL_OUTPUT_TILES * tiling.bn_b * tiling.bk_b
-        raw_dst = reinterpret(
+        raw_dst = from_tensor(
             dst, layout=make_layout((1, panel_bytes)), data_format="nd"
         )
         mem_copy(
@@ -1711,7 +1713,7 @@ class AttnPrologueKernel:
             )
             held_x.append(l1_x[k].next_read())
         for sk in range_constexpr(nk // tiling.scale_k_tiles):
-            qr_scale_slot = reinterpret(
+            qr_scale_slot = from_tensor(
                 l1_sx[sk].next_write(),
                 dtype=FLOAT8_E8M0,
                 layout=make_layout(
@@ -1735,7 +1737,7 @@ class AttnPrologueKernel:
                 ).flatten(1, 2),
             )
             held_s.append(
-                reinterpret(
+                from_tensor(
                     l1_sx[sk].next_read(),
                     dtype=FLOAT8_E8M0,
                     layout=make_layout(
@@ -1750,10 +1752,9 @@ class AttnPrologueKernel:
         for head in range(group, tiling.head_count, groups):
             for panel in range_constexpr(panels_per_head * nk):
                 head_scale = l1_head_scale[panel % nk].next_read()
-                wide_w = (
-                    l1_b_wide[panel % RESIDENT_K_WINDOWS]
-                    .next_read()
-                    .reinterpret(dtypes.float8_e4m3fn)
+                wide_w = from_tensor(
+                    l1_b_wide[panel % RESIDENT_K_WINDOWS].next_read(),
+                    dtypes.float8_e4m3fn,
                 )
                 self._b_panel_l0_reuse(
                     wide_w,
@@ -1800,7 +1801,7 @@ class AttnPrologueKernel:
                     # 行数对半分给两个 Vector 核。
                     mem_copy(
                         qb_accumulator_slot,
-                        reinterpret(
+                        from_tensor(
                             tile_slice(
                                 l0c,
                                 (
@@ -2204,7 +2205,7 @@ class AttnPrologueKernel:
                 tile_slice(
                     gm_dqr2d, (token_tile_rows, tiling.qr_groups), (token_tile_idx, 0)
                 ),
-                reinterpret(
+                from_tensor(
                     ub_scale.next_read(),
                     layout=make_layout(
                         (token_tile_rows, tiling.qr_groups),
@@ -2550,7 +2551,7 @@ class AttnPrologueKernel:
         )
         mem_copy(
             ws_tile,
-            reinterpret(
+            from_tensor(
                 accumulator,
                 layout=make_layout(ws_tile.shape),
                 physical_layout=accumulator.physical_layout,
@@ -2584,7 +2585,7 @@ class AttnPrologueKernel:
         )
         groups_l0 = reduction_tile_cols // MX_PAIR_WIDTH
         sa_layout = make_layout((token_tile_rows, tiling.k_l1_x_a1 // MX_GROUP))
-        w_ready = l1_b.next_read().reinterpret(dtype=FLOAT8_E4M3FN)
+        w_ready = from_tensor(l1_b.next_read(), dtype=FLOAT8_E4M3FN)
         s_ready = l1_sb.next_read()
         if const_expr(tiling.a1_window):
             mem_copy(
@@ -2592,7 +2593,7 @@ class AttnPrologueKernel:
                 tile_slice(gm_a, (token_tile_rows, k_l1), (m, kw)),
             )
             mem_copy(
-                reinterpret(
+                from_tensor(
                     l1_sa.next_write(),
                     dtype=FLOAT8_E8M0,
                     layout=sa_layout,
@@ -2605,11 +2606,8 @@ class AttnPrologueKernel:
                 ).flatten(1, 2),
             )
             a_ready = l1_a.next_read()
-            sa_ready = reinterpret(
-                l1_sa.next_read(),
-                dtype=FLOAT8_E8M0,
-                layout=sa_layout,
-                data_format="zn",
+            sa_ready = from_tensor(
+                l1_sa.next_read(), dtype=FLOAT8_E8M0, layout=sa_layout, data_format="zn"
             )
         for kl0 in range(k_l1 // reduction_tile_cols):
             kb = kw * (k_l1 // reduction_tile_cols) + kl0
@@ -2632,7 +2630,7 @@ class AttnPrologueKernel:
                     tile_slice(gm_a, (token_tile_rows, reduction_tile_cols), (m, kb)),
                 )
                 mem_copy(
-                    reinterpret(
+                    from_tensor(
                         l1_sa.next_write(),
                         dtype=FLOAT8_E8M0,
                         layout=sa_layout,
@@ -2646,7 +2644,7 @@ class AttnPrologueKernel:
                     l0a.next_write(),
                     l1_a.next_read(),
                     copy_options(
-                        mx_scale=reinterpret(
+                        mx_scale=from_tensor(
                             l1_sa.next_read(),
                             dtype=FLOAT8_E8M0,
                             layout=sa_layout,
@@ -2861,7 +2859,7 @@ class AttnPrologueKernel:
                 tile_slice(
                     gm_dqr2d, (token_tile_rows, tiling.qr_groups), (token_tile_idx, 0)
                 ),
-                reinterpret(
+                from_tensor(
                     ub_scale.next_read(),
                     layout=make_layout(
                         (token_tile_rows, tiling.qr_groups),
@@ -2950,11 +2948,13 @@ class AttnPrologueKernel:
             for token_row in cannbotdsl.range(rows):
                 for feature_vector_idx in range(width // VL):
                     dst_feature_offset = (
-                        token_row * dst.physical_stride[0] + feature_vector_idx * VL
+                        token_row * dst.physical_layout.stride[0]
+                        + feature_vector_idx * VL
                     )
                     partial_values = rr.vload(
                         src,
-                        token_row * src.physical_stride[0] + feature_vector_idx * VL,
+                        token_row * src.physical_layout.stride[0]
+                        + feature_vector_idx * VL,
                     )
                     if const_expr(not first):
                         partial_values = rr.vadd(
@@ -2971,11 +2971,13 @@ class AttnPrologueKernel:
             for token_row in cannbotdsl.range(rows):
                 for feature_vector_idx in range(width // VL):
                     dst_feature_offset = (
-                        token_row * dst.physical_stride[0] + feature_vector_idx * VL
+                        token_row * dst.physical_layout.stride[0]
+                        + feature_vector_idx * VL
                     )
                     partial_values = rr.vload(
                         src,
-                        token_row * src.physical_stride[0] + feature_vector_idx * VL,
+                        token_row * src.physical_layout.stride[0]
+                        + feature_vector_idx * VL,
                     )
                     # 2. 初始化部分和，或对下一个部分和执行补偿求和。
                     if const_expr(first):
@@ -3011,8 +3013,8 @@ class AttnPrologueKernel:
         rank = tiling.rank_size
         inv_rank = 1.0 / rank
         # 按物理 UB 行跨度寻址，包含 FixPipe 插入的填充。
-        src_pitch = ub_qa.physical_stride[0]
-        qr_pitch = ub_qr.physical_stride[0]
+        src_pitch = ub_qa.physical_layout.stride[0]
+        qr_pitch = ub_qr.physical_layout.stride[0]
         with vf(mode="simd"):
             full = rr.full_mask()
             group_mask = rr.update_mask(MX_GROUP, elem_bits=32)[0]
@@ -3074,7 +3076,7 @@ class AttnPrologueKernel:
                     )
                     rr.vstore_first(
                         ub_exp,
-                        token_row * ub_exp.physical_stride[0] + rank_group_idx,
+                        token_row * ub_exp.physical_layout.stride[0] + rank_group_idx,
                         rr.vadds(shared_exponent, E8M0_BIAS, mask=group_mask),
                     )
 
@@ -3114,8 +3116,8 @@ class AttnPrologueKernel:
     def _pack_scale(self, ub_exp, ub_scale, rows):
         """将 int32 指数打包为 E8M0 字节，并使用对齐的向量写入。独立的 VF 区域读取 _quantize_qr 写出的指数；B32_TO_B8 直接保留低字节，不执行数值转换。"""
         tiling = self.tiling
-        exp_pitch = ub_exp.physical_stride[0]
-        scale_pitch = ub_scale.physical_stride[0]
+        exp_pitch = ub_exp.physical_layout.stride[0]
+        scale_pitch = ub_scale.physical_layout.stride[0]
         with vf(mode="simd"):
             # 1. 读取 int32 编码指数；2. 将低字节打包写出。
             for token_row in cannbotdsl.range(rows):
@@ -3152,7 +3154,7 @@ class AttnPrologueKernel:
         head_width, rope_width = tiling.head_size, tiling.rope_width
         rope_half_width = rope_width // 2
         inv_head = 1.0 / head_width
-        src_pitch = ub_kv.physical_stride[0]
+        src_pitch = ub_kv.physical_layout.stride[0]
         with vf(mode="simd"):
             full = rr.full_mask()
             m_half = rr.update_mask(rope_half_width, elem_bits=32)[0]
@@ -3254,7 +3256,7 @@ class AttnPrologueKernel:
             even = rr.vmul(rr.vmul(even, g_even, mask=mask), rstd, mask=mask)
             odd = rr.vmul(rr.vmul(odd, g_odd, mask=mask), rstd, mask=mask)
         # RoPE 表按补齐后的物理行跨度寻址。
-        pitch = ub_sin.physical_stride[0]
+        pitch = ub_sin.physical_layout.stride[0]
         cos_first_half = rr.vload(ub_cos, table_row * pitch)
         sin_first_half = rr.vload(ub_sin, table_row * pitch)
         sin_second_half = rr.vload(ub_sin, table_row * pitch + rope_half_width)
@@ -3440,7 +3442,7 @@ class AttnPrologueKernel:
                     tile_slice(gm_qr, (token_tile_rows, rank), (owner, 0)),
                 )
                 mem_copy(
-                    reinterpret(
+                    from_tensor(
                         l1_sa.next_write(),
                         dtype=FLOAT8_E8M0,
                         layout=make_layout((token_tile_rows, rank // MX_GROUP)),
@@ -3453,7 +3455,7 @@ class AttnPrologueKernel:
                     ).flatten(1, 2),
                 )
                 a_ready = l1_a.next_read()
-                sa_ready = reinterpret(
+                sa_ready = from_tensor(
                     l1_sa.next_read(),
                     dtype=FLOAT8_E8M0,
                     layout=make_layout((token_tile_rows, rank // MX_GROUP)),
@@ -3825,7 +3827,7 @@ class AttnPrologueKernel:
             tiling.k_l1_b,
         )
         k_tiles = tiling.rank_size // reduction_tile_cols
-        w_ready = l1_b.next_read().reinterpret(dtype=FLOAT8_E4M3FN)
+        w_ready = from_tensor(l1_b.next_read(), dtype=FLOAT8_E4M3FN)
         s_ready = l1_sb.next_read()
         for kl0 in range(k_l1 // reduction_tile_cols):
             kb = kw * (k_l1 // reduction_tile_cols) + kl0
@@ -3845,7 +3847,7 @@ class AttnPrologueKernel:
                     ),
                 )
                 mem_copy(
-                    reinterpret(
+                    from_tensor(
                         l1_sa.next_write(),
                         dtype=FLOAT8_E8M0,
                         layout=make_layout((token_tile_rows, scale_l0)),
@@ -3865,7 +3867,7 @@ class AttnPrologueKernel:
                     l0a.next_write(),
                     l1_a.next_read(),
                     copy_options(
-                        mx_scale=reinterpret(
+                        mx_scale=from_tensor(
                             l1_sa.next_read(),
                             dtype=FLOAT8_E8M0,
                             layout=make_layout((token_tile_rows, scale_l0)),
@@ -4012,8 +4014,8 @@ class AttnPrologueKernel:
     def _finish_q_plain(self, ub_acc, ub_out, rows):
         """对 head 中不涉及 RoPE 的三个四分块直接转换为 BF16。"""
         feature_cols = self.tiling.b_cols
-        src_pitch = ub_acc.physical_stride[0]
-        out_pitch = ub_out.physical_stride[0]
+        src_pitch = ub_acc.physical_layout.stride[0]
+        out_pitch = ub_out.physical_layout.stride[0]
         with vf(mode="simd"):
             # 1. 读取 Q 向量；2. 舍入并打包为 BF16。
             full = rr.full_mask()
@@ -4044,8 +4046,8 @@ class AttnPrologueKernel:
         rope_half_width = rope_width // 2
         # head 较窄时，最后一个特征向量的宽度可能小于 VL。
         tail = min(VL, feature_cols)
-        src_pitch = ub_acc.physical_stride[0]
-        out_pitch = ub_out.physical_stride[0]
+        src_pitch = ub_acc.physical_layout.stride[0]
+        out_pitch = ub_out.physical_layout.stride[0]
         if const_expr(
             not tiling.l1_reuse
             and tiling.template == "split_k"

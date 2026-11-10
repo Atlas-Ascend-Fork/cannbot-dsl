@@ -11,6 +11,7 @@
 """Packed-QKV decode with a read-only checkpoint and Mega-compatible replay records."""
 
 from __future__ import annotations
+from cannbotdsl import from_tensor
 
 import math
 import threading
@@ -54,7 +55,7 @@ from cannbotdsl.ops.reg import (
 )
 from cannbotdsl.ops.sync import onchip_rewind
 from cannbotdsl.ring_buffer import RingBuffer
-from cannbotdsl.tensor import idx2crd, reinterpret, tile_slice
+from cannbotdsl.tensor import idx2crd, tile_slice
 
 TILE = SUPPORTED_HEAD_DIM = 128
 VL = 64
@@ -166,7 +167,7 @@ class FusedRecurrentKDAReplaySSMVector:
         mem_copy(self.dt_bias, dt_bias_gm)
 
     def load_state(self, state_gm, active_rows: int):
-        self.state_tensor = reinterpret(self.state.next_write(), offset=0, layout=make_layout((active_rows, TILE)))
+        self.state_tensor = from_tensor(self.state.next_write(), offset=0, layout=make_layout((active_rows, TILE)))
         mem_copy(self.state_tensor, state_gm, options=copy_options(l2_cache_ctl=2))
 
     def prefetch_inputs(self, raw_key_gm, raw_query_gm, raw_g_gm, value_gm, raw_beta_gm, active_rows: int):
@@ -174,7 +175,7 @@ class FusedRecurrentKDAReplaySSMVector:
         mem_copy(self.raw_key.next_write(), raw_key_gm)
         mem_copy(self.raw_g.next_write(), raw_g_gm)
         mem_copy(tile_slice(self.raw_beta.next_write(), (1, 1), (0, 0)), raw_beta_gm)
-        mem_copy(reinterpret(self.value.next_write(), offset=0, layout=make_layout((1, active_rows))), value_gm)
+        mem_copy(from_tensor(self.value.next_write(), offset=0, layout=make_layout((1, active_rows))), value_gm)
 
     @jit
     def normalize_qk(self, scale_value: float):
@@ -383,7 +384,7 @@ class FusedRecurrentKDAReplaySSMVector:
     @jit
     def publish_replay_u(self, replay_u_gm, active_rows: int):
         """Publish each lane's disjoint FP16 U rows."""
-        mem_copy(replay_u_gm, reinterpret(self.replay_u.next_read(), offset=0, layout=make_layout((1, active_rows))))
+        mem_copy(replay_u_gm, from_tensor(self.replay_u.next_read(), offset=0, layout=make_layout((1, active_rows))))
 
     @jit
     def store_output(self, out_gm, active_rows: int):
@@ -394,7 +395,7 @@ class FusedRecurrentKDAReplaySSMVector:
                 mask, _ = update_mask(active_rows - offset, elem_bits=32)
                 value = vcast(vload(self.out, offset), dtypes.bfloat16, mask=mask)
                 vstore_pack(output, offset, value, mask, pack_mode=PackMode.B32_TO_B16)
-        mem_copy(out_gm, reinterpret(output, offset=0, layout=make_layout((1, active_rows))))
+        mem_copy(out_gm, from_tensor(output, offset=0, layout=make_layout((1, active_rows))))
 
 
 @jit

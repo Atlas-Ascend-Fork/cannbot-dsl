@@ -13,6 +13,7 @@ S1/S6/S8 decode and S8192 prefill. Static preparation stays outside execution.
 """
 
 from __future__ import annotations
+from cannbotdsl import from_tensor
 
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -47,7 +48,7 @@ from cannbotdsl.ops.sync import (
     vec_sync_block_wait,
     vec_sync_block_arrive,
 )
-from cannbotdsl.tensor import ceil_div, make_layout, tile_slice, reinterpret
+from cannbotdsl.tensor import ceil_div, make_layout, tile_slice
 
 
 # ---- General kernels ----
@@ -2186,7 +2187,7 @@ class _DecodeKernel:
                     for ni in range_constexpr(chunks):
                         weight_slot = self.w_chunks[ni].next_write()
                         mem_copy(
-                            reinterpret(
+                            from_tensor(
                                 weight_slot,
                                 layout=make_layout((1, p.n * p.k)),
                                 data_format="nd",
@@ -2523,7 +2524,7 @@ class PrefillKernel:
     def _write_direct(self, mi, ni):
         p = self.p
         if const_expr(self.grouped_acc):
-            acc = reinterpret(
+            acc = from_tensor(
                 self.acc[mi],
                 layout=make_layout((p.ml0, p.nl0)),
                 offset=ni * p.ml0 * p.nl0 * 4,
@@ -2702,7 +2703,7 @@ class PrefillKernel:
                     )
                     b = self.b_l0.next_read()
                     if const_expr(self.grouped_acc):
-                        acc = reinterpret(
+                        acc = from_tensor(
                             self.acc[mi],
                             layout=make_layout((p.ml0, p.nl0)),
                             offset=ni * p.ml0 * p.nl0 * 4,

@@ -9,6 +9,8 @@
 # fmt: off
 
 """FlashKDA CP main public operator."""
+from cannbotdsl import from_tensor
+from cannbotdsl.ops.memcpy import cube_fill_l1_zero
 
 import dataclasses
 import os
@@ -44,19 +46,9 @@ from cannbotdsl.ops.reg import (
     vstore,
     vstore_pack,
 )
-from cannbotdsl.ops.sync import (
-    cube_fill_l1_zero,
-    cube_sync_pipe,
-    cube_sync_all,
-    cube_sync_block_arrive,
-    cube_sync_block_wait,
-    onchip_rewind,
-    vec_sync_all,
-    vec_sync_block_arrive,
-    vec_sync_block_wait,
-)
+from cannbotdsl.ops.sync import cube_sync_pipe, cube_sync_all, cube_sync_block_arrive, cube_sync_block_wait, onchip_rewind, vec_sync_all, vec_sync_block_arrive, vec_sync_block_wait
 from cannbotdsl.ring_buffer import RingBuffer
-from cannbotdsl.tensor import idx2crd, reinterpret, tile_slice
+from cannbotdsl.tensor import idx2crd, tile_slice
 
 from cannbotdsl import aot
 
@@ -67,8 +59,8 @@ os.environ.setdefault("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")
 def cast_tile(dst, src):
     """Convert a 2D f32/f16/bf16 tile while preserving physical row strides."""
     rows, cols = dst.shape
-    src_stride = src.physical_stride[0]
-    dst_stride = dst.physical_stride[0]
+    src_stride = src.physical_layout.stride[0]
+    dst_stride = dst.physical_layout.stride[0]
     with vf(mode="simd"):
         for row in range(rows):
             if const_expr(isinstance(cols, int) and cols == 1):
@@ -97,8 +89,8 @@ def cast_tile(dst, src):
 def nd2nz_tile(dst, src, elem_bits: int = 16):
     """Move a row-major tile into the NZ layout with raw vector stores."""
     rows, cols = src.shape
-    src_stride = src.physical_stride[0]
-    dst_stride = dst.physical_stride[0]
+    src_stride = src.physical_layout.stride[0]
+    dst_stride = dst.physical_layout.stride[0]
     n0 = 256 // elem_bits
     block_stride = dst_stride * elem_bits // 256
     with vf(mode="simd"):
@@ -217,14 +209,14 @@ class Matmul:
         self.dv_base = dv_base
         if shared is not None:
             self.l0a_chunk = shared.l0a_chunk
-            self.l0a_kr_t = reinterpret(shared.l0a_kr_t, layout=make_layout((CHUNK_SIZE, dv_base)), data_format="zn")
+            self.l0a_kr_t = from_tensor(shared.l0a_kr_t, layout=make_layout((CHUNK_SIZE, dv_base)), data_format="zn")
             self.l0a_mqk = shared.l0a_mqk
-            self.l0b_u = reinterpret(shared.l0b_u, layout=make_layout((CHUNK_SIZE, dv_base)), data_format="zn")
-            self.l0b_state = reinterpret(shared.l0b_state, layout=make_layout((dv_base, SUPPORTED_HEAD_DIM)), data_format="nz")
+            self.l0b_u = from_tensor(shared.l0b_u, layout=make_layout((CHUNK_SIZE, dv_base)), data_format="zn")
+            self.l0b_state = from_tensor(shared.l0b_state, layout=make_layout((dv_base, SUPPORTED_HEAD_DIM)), data_format="nz")
             self.l0b_kr = shared.l0b_kr
-            self.l0c_u = reinterpret(shared.l0c_u, layout=make_layout((CHUNK_SIZE, dv_base)), data_format="nz")
-            self.l0c_o = reinterpret(shared.l0c_o, layout=make_layout((CHUNK_SIZE, dv_base)), data_format="nz")
-            self.l0c_state = reinterpret(shared.l0c_state, layout=make_layout((dv_base, SUPPORTED_HEAD_DIM)), data_format="nz")
+            self.l0c_u = from_tensor(shared.l0c_u, layout=make_layout((CHUNK_SIZE, dv_base)), data_format="nz")
+            self.l0c_o = from_tensor(shared.l0c_o, layout=make_layout((CHUNK_SIZE, dv_base)), data_format="nz")
+            self.l0c_state = from_tensor(shared.l0c_state, layout=make_layout((dv_base, SUPPORTED_HEAD_DIM)), data_format="nz")
             return
         self.l0a_chunk = RingBuffer(MemLoc.L0A, dtypes.bfloat16, make_layout((CHUNK_SIZE, SUPPORTED_HEAD_DIM)), depth=2)
         self.l0a_kr_t = RingBuffer(MemLoc.L0A, dtypes.bfloat16, make_layout((dv_base, CHUNK_SIZE)), depth=1).next_write().permute(1, 0)
@@ -240,7 +232,7 @@ class Matmul:
         self._load_padded_chunk(q_decayed_l1, gm_tile, valid_rows)
 
     def load_state(self, state_l1):
-        mem_copy(self.l0b_state, reinterpret(state_l1.next_read(), layout=make_layout((self.dv_base, SUPPORTED_HEAD_DIM)), data_format="nz"))
+        mem_copy(self.l0b_state, from_tensor(state_l1.next_read(), layout=make_layout((self.dv_base, SUPPORTED_HEAD_DIM)), data_format="nz"))
 
     def prefetch_wq_operands(self, w_l1, q_decayed_l1):
         mem_copy(self.l0a_chunk.next_write(), w_l1.next_read())
@@ -261,12 +253,12 @@ class Matmul:
         mem_copy(self.l0a_mqk, mqk_l1.next_read())
 
     def update_state(self, u_slot):
-        u_src = reinterpret(u_slot, offset=0, layout=make_layout((CHUNK_SIZE, self.dv_base)))
+        u_src = from_tensor(u_slot, offset=0, layout=make_layout((CHUNK_SIZE, self.dv_base)))
         mem_copy(self.l0a_kr_t, u_src)
         matmul(self.l0c_state, self.l0a_kr_t.permute(1, 0), self.l0b_kr, init=True)
 
     def accumulate_mqk_u(self, u_slot):
-        u_tile = reinterpret(u_slot, offset=0, layout=make_layout((CHUNK_SIZE, self.dv_base)))
+        u_tile = from_tensor(u_slot, offset=0, layout=make_layout((CHUNK_SIZE, self.dv_base)))
         mem_copy(self.l0b_u, u_tile)
         matmul(self.l0c_o, self.l0a_mqk, self.l0b_u, init=False)
 
@@ -309,13 +301,13 @@ class Vector:
         self.u_row_block = u_row_block
         self.half_dk = D_HALF
         if shared is not None:
-            self.ub_state_fp32 = reinterpret(shared.ub_state_fp32, layout=make_layout((dv_base, D_HALF)))
-            self.tmp_u_bf16 = reinterpret(shared.tmp_u_bf16, layout=make_layout((u_row_block, dv_base)))
-            self.state_nd = reinterpret(shared.state_nd, layout=make_layout((dv_base, D_HALF)))
-            self.state_nz = reinterpret(shared.state_nz, layout=make_layout((dv_base, D_HALF)), data_format="nz", physical_layout=make_layout(((D_HALF+15)//16, (dv_base+15)//16, 16, 16), stride=(((dv_base+15)//16*256+16),256,16,1)))
-            self.u_nz = reinterpret(shared.u_nz, layout=make_layout((u_row_block, dv_base)), data_format="nz", physical_layout=make_layout(((dv_base+15)//16, (u_row_block+15)//16, 16, 16), stride=(((u_row_block+15)//16*256+16),256,16,1)))
-            self.state_in = reinterpret(shared.state_in, layout=make_layout((dv_base, D_HALF)))
-            self.state_out = reinterpret(shared.state_out, layout=make_layout((dv_base, D_HALF)))
+            self.ub_state_fp32 = from_tensor(shared.ub_state_fp32, layout=make_layout((dv_base, D_HALF)))
+            self.tmp_u_bf16 = from_tensor(shared.tmp_u_bf16, layout=make_layout((u_row_block, dv_base)))
+            self.state_nd = from_tensor(shared.state_nd, layout=make_layout((dv_base, D_HALF)))
+            self.state_nz = from_tensor(shared.state_nz, layout=make_layout((dv_base, D_HALF)), data_format="nz", physical_layout=make_layout(((D_HALF+15)//16, (dv_base+15)//16, 16, 16), stride=(((dv_base+15)//16*256+16),256,16,1)))
+            self.u_nz = from_tensor(shared.u_nz, layout=make_layout((u_row_block, dv_base)), data_format="nz", physical_layout=make_layout(((dv_base+15)//16, (u_row_block+15)//16, 16, 16), stride=(((u_row_block+15)//16*256+16),256,16,1)))
+            self.state_in = from_tensor(shared.state_in, layout=make_layout((dv_base, D_HALF)))
+            self.state_out = from_tensor(shared.state_out, layout=make_layout((dv_base, D_HALF)))
             self.u_in = shared.u_in
             return
         self.ub_state_fp32 = Buffer(MemLoc.UB, dtypes.float32, make_layout((self.dv_base, self.half_dk)))
@@ -374,11 +366,11 @@ class Vector:
                     mem_copy(destination, _valid_rows_view(gm_rows, rows, SUPPORTED_HEAD_DIM))
                 else:
                     source = tile_slice(gm_rows, (self.u_row_block, self.dv_base), (0, position.dv_index))
-                    destination = reinterpret(self.u_in.next_write(), layout=make_layout((self.u_row_block, self.dv_base)))
+                    destination = from_tensor(self.u_in.next_write(), layout=make_layout((self.u_row_block, self.dv_base)))
                     mem_copy(destination, _valid_rows_view(source, rows, self.dv_base))
             else:
                 source = tile_slice(gm_rows, (self.u_row_block, self.dv_base), (0, position.dv_index))
-                destination = reinterpret(self.u_in.next_write(), layout=make_layout((self.u_row_block, self.dv_base)))
+                destination = from_tensor(self.u_in.next_write(), layout=make_layout((self.u_row_block, self.dv_base)))
                 mem_copy(_valid_rows_view(destination, rows, self.dv_base), _valid_rows_view(source, rows, self.dv_base))
 
     @jit
@@ -386,7 +378,7 @@ class Vector:
         selected = self.u_in.next_read()
         if const_expr(self.dv_base == 32):
             if position.dense_u:
-                words = reinterpret(selected, dtype=dtypes.uint16)
+                words = from_tensor(selected, dtype=dtypes.uint16)
                 with vf(mode="simd"):
                     full_mask, _ = update_mask(128, elem_bits=16)
                     lane = reg_ops.varange(0, dtypes.uint16)
@@ -400,12 +392,12 @@ class Vector:
                         packed = reg_ops.vgather(words, index, mask=mask)
                         vstore(words, base, packed, mask)
                     vmem_bar("vst_vld")
-        return reinterpret(selected, layout=make_layout((self.u_row_block, self.dv_base)))
+        return from_tensor(selected, layout=make_layout((self.u_row_block, self.dv_base)))
 
     @jit
     def finish_u_delta_to_l1(self, u_l1, tmp_u_delta, position, valid_rows):
         subblock_idx = position.subblock
-        u_l1_rows = tile_slice(reinterpret(u_l1.next_write(), layout=make_layout((CHUNK_SIZE, self.dv_base)), data_format="nz"), (self.u_row_block, self.dv_base), (subblock_idx, 0))
+        u_l1_rows = tile_slice(from_tensor(u_l1.next_write(), layout=make_layout((CHUNK_SIZE, self.dv_base)), data_format="nz"), (self.u_row_block, self.dv_base), (subblock_idx, 0))
 
         delta = tmp_u_delta
         row_start = subblock_idx * self.u_row_block
@@ -474,7 +466,7 @@ class Vector:
         nz_slot = self.state_nz
         nd2nz_tile(nz_slot, nd_read)
         nz_read = self.state_nz
-        slot = reinterpret(state_l1.next_write(), layout=make_layout((self.dv_base, SUPPORTED_HEAD_DIM)), data_format="nz")
+        slot = from_tensor(state_l1.next_write(), layout=make_layout((self.dv_base, SUPPORTED_HEAD_DIM)), data_format="nz")
         state_l1_rows = tile_slice(slot, (self.dv_base, self.half_dk), (0, subblock_idx))
         mem_copy(state_l1_rows, nz_read)
 
@@ -534,8 +526,8 @@ class _Resources:
             self.u_l1 = shared.u_l1
             self.gamma_ub = shared.gamma_ub
             self.matmul = Matmul(dv_base=dv_base, shared=shared.matmul)
-            self.tmp_delta = reinterpret(shared.tmp_delta, layout=make_layout((dv_base, D_HALF)))
-            self.tmp_u_delta = reinterpret(shared.tmp_u_delta, layout=make_layout((CHUNK_SIZE // 2, dv_base)))
+            self.tmp_delta = from_tensor(shared.tmp_delta, layout=make_layout((dv_base, D_HALF)))
+            self.tmp_u_delta = from_tensor(shared.tmp_u_delta, layout=make_layout((CHUNK_SIZE // 2, dv_base)))
             self.vector = Vector(u_row_block=CHUNK_SIZE // 2, dv_base=dv_base, shared=shared.vector)
             return
         self.q_l1 = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((CHUNK_SIZE, SUPPORTED_HEAD_DIM)), depth=2)
@@ -662,7 +654,7 @@ def _run_flash_kda_cp_body(tensors, work, partition, shared_resources):
         for item in range(partition.item_start, partition.item_end):
             head_id, dv_idx = idx2crd(item, [partition.head_count, num_dv_base])
             position = _ChunkPosition(0, work.logical_batch, head_id, dv_idx, subblock_idx,
-                                      tensors.sequence.u.physical_stride[2] == SUPPORTED_HEAD_DIM)
+                                      tensors.sequence.u.physical_layout.stride[2] == SUPPORTED_HEAD_DIM)
             # Amortize the lookahead setup across a long continuous recurrence.
             if work.group_count >= 64:
                 _initialize_recurrence(tensors, work, resources, position, True)

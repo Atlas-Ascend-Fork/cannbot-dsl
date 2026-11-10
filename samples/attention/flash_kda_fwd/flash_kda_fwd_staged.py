@@ -1,3 +1,5 @@
+from cannbotdsl import from_tensor
+from cannbotdsl.ops.memcpy import cube_fill_l1_zero
 # Copyright (c) 2026 Huawei Technologies Co., Ltd.
 # This program is free software, you can redistribute it and/or modify it under the terms and conditions of
 # CANN Open Software License Agreement Version 2.0 (the "License").
@@ -57,21 +59,9 @@ from cannbotdsl.ops.reg import (
     vsub,
 )
 from cannbotdsl.ops.reg import vselect as vselect_raw
-from cannbotdsl.ops.sync import (
-    cube_fill_l1_zero,
-    cube_sync_all,
-    cube_sync_block_arrive,
-    cube_sync_block_wait,
-    cube_sync_pipe,
-    onchip_rewind,
-    vec_sync_all,
-    vec_sync_block_arrive,
-    vec_sync_block_wait,
-    vec_sync_notify,
-    vec_sync_wait,
-)
+from cannbotdsl.ops.sync import cube_sync_all, cube_sync_block_arrive, cube_sync_block_wait, cube_sync_pipe, onchip_rewind, vec_sync_all, vec_sync_block_arrive, vec_sync_block_wait, vec_sync_notify, vec_sync_wait
 from cannbotdsl.ring_buffer import RingBuffer
-from cannbotdsl.tensor import idx2crd, reinterpret, tile_slice
+from cannbotdsl.tensor import idx2crd, tile_slice
 from cannbotdsl import Array
 import torch
 
@@ -345,20 +335,8 @@ class StageOneMatmul:
         score_alias0 = self.raw_l0b_db.next_write()
         self.raw_l0b_db.next_write()  # 推进双缓冲写指针，当前阶段不使用第二个别名。
         self.shared_rhs_cache = self.per_d_shared_right_cache + (
-            reinterpret(
-                score_alias0,
-                layout=make_layout((NEUMANN_BLOCK_SIZE, SUPPORTED_HEAD_DIM)),
-                offset=0,
-                data_format="nz",
-                dtype=dtypes.bfloat16,
-            ),
-            reinterpret(
-                score_alias0,
-                layout=make_layout((NEUMANN_BLOCK_SIZE, SUPPORTED_HEAD_DIM)),
-                offset=NEUMANN_BLOCK_SIZE * SUPPORTED_HEAD_DIM * 2,
-                data_format="nz",
-                dtype=dtypes.bfloat16,
-            ),
+            from_tensor(score_alias0, layout=make_layout((NEUMANN_BLOCK_SIZE, SUPPORTED_HEAD_DIM)), offset=0, data_format="nz", dtype=dtypes.bfloat16),
+            from_tensor(score_alias0, layout=make_layout((NEUMANN_BLOCK_SIZE, SUPPORTED_HEAD_DIM)), offset=NEUMANN_BLOCK_SIZE * SUPPORTED_HEAD_DIM * 2, data_format="nz", dtype=dtypes.bfloat16),
         )
 
     @staticmethod
@@ -426,11 +404,11 @@ class StageOneMatmul:
 
     def mm_per_d_kkt(self, row_block: int, col_block: int, right, init=True):
         kkt_tile = tile_slice(self.raw_l0c_main, (NEUMANN_BLOCK_SIZE, NEUMANN_BLOCK_SIZE), (row_block, col_block))
-        matmul(kkt_tile.reinterpret(layout=make_layout((NEUMANN_BLOCK_SIZE, NEUMANN_BLOCK_SIZE)), data_format="nz"), self.per_d_left_k_l0a, right, init=init)
+        matmul(from_tensor(kkt_tile, layout=make_layout((NEUMANN_BLOCK_SIZE, NEUMANN_BLOCK_SIZE)), data_format="nz"), self.per_d_left_k_l0a, right, init=init)
 
     def mm_per_d_mqk(self, row_block: int, col_block: int, right, init=True):
         mqk_tile = tile_slice(self.raw_l0c_aux, (NEUMANN_BLOCK_SIZE, NEUMANN_BLOCK_SIZE), (row_block, col_block))
-        matmul(mqk_tile.reinterpret(layout=make_layout((NEUMANN_BLOCK_SIZE, NEUMANN_BLOCK_SIZE)), data_format="nz"), self.per_d_left_q_l0a, right, init=init)
+        matmul(from_tensor(mqk_tile, layout=make_layout((NEUMANN_BLOCK_SIZE, NEUMANN_BLOCK_SIZE)), data_format="nz"), self.per_d_left_q_l0a, right, init=init)
 
     @jit
     def mm_safe_diagonal_tile(
@@ -716,10 +694,10 @@ class StageOneMatmul:
         self.store_l0c_to_gm(_valid_rows_view(u_pre_part, valid_rows, SUPPORTED_HEAD_DIM))
 
     def _raw_l0a_block(self, l0a_slot, row_block: int, col_block: int):
-        return reinterpret(l0a_slot, layout=make_layout((NEUMANN_BLOCK_SIZE, NEUMANN_BLOCK_SIZE)), offset=self.l0_matrix_block_offset_elems(row_block, col_block) * 2, physical_layout=nz_layout(NEUMANN_BLOCK_SIZE, NEUMANN_BLOCK_SIZE, l0a_slot.physical_layout.stride))
+        return from_tensor(l0a_slot, layout=make_layout((NEUMANN_BLOCK_SIZE, NEUMANN_BLOCK_SIZE)), offset=self.l0_matrix_block_offset_elems(row_block, col_block) * 2, physical_layout=nz_layout(NEUMANN_BLOCK_SIZE, NEUMANN_BLOCK_SIZE, l0a_slot.physical_layout.stride))
 
     def _raw_l0b_block(self, l0b_slot, row_block: int, col_block: int):
-        return reinterpret(l0b_slot, layout=make_layout((NEUMANN_BLOCK_SIZE, NEUMANN_BLOCK_SIZE)), offset=self.l0_matrix_block_offset_elems(row_block, col_block) * 2, physical_layout=nz_layout(NEUMANN_BLOCK_SIZE, NEUMANN_BLOCK_SIZE, l0b_slot.physical_layout.stride))
+        return from_tensor(l0b_slot, layout=make_layout((NEUMANN_BLOCK_SIZE, NEUMANN_BLOCK_SIZE)), offset=self.l0_matrix_block_offset_elems(row_block, col_block) * 2, physical_layout=nz_layout(NEUMANN_BLOCK_SIZE, NEUMANN_BLOCK_SIZE, l0b_slot.physical_layout.stride))
 
     def _load_l1_block_to_l0a_block(
         self, l1_block, l0a_slot, row_block: int, col_block: int,
@@ -757,14 +735,14 @@ class StageOneMatmul:
             l0_offset = self.l0_matrix_block_offset_elems(
                 (dst_row + row_offset) // NEUMANN_BLOCK_SIZE, dst_col // NEUMANN_BLOCK_SIZE,
             )
-            l1_tile = reinterpret(l1_matrix, layout=make_layout((NEUMANN_BLOCK_SIZE, HALF_CHUNK_SIZE)), offset=l1_offset * 2, physical_layout=nz_layout(NEUMANN_BLOCK_SIZE, HALF_CHUNK_SIZE, l1_matrix.physical_layout.stride))
+            l1_tile = from_tensor(l1_matrix, layout=make_layout((NEUMANN_BLOCK_SIZE, HALF_CHUNK_SIZE)), offset=l1_offset * 2, physical_layout=nz_layout(NEUMANN_BLOCK_SIZE, HALF_CHUNK_SIZE, l1_matrix.physical_layout.stride))
             if const_expr(transpose):
                 mem_copy(
-                    reinterpret(l0b_slot, layout=make_layout((HALF_CHUNK_SIZE, NEUMANN_BLOCK_SIZE)), offset=l0_offset * 2, data_format="nz"),
+                    from_tensor(l0b_slot, layout=make_layout((HALF_CHUNK_SIZE, NEUMANN_BLOCK_SIZE)), offset=l0_offset * 2, data_format="nz"),
                     (l1_tile).permute(1, 0,),
                 )
             else:
-                l0_tile = reinterpret(l0b_slot, layout=make_layout((NEUMANN_BLOCK_SIZE, HALF_CHUNK_SIZE)), offset=l0_offset * 2, physical_layout=nz_layout(NEUMANN_BLOCK_SIZE, HALF_CHUNK_SIZE, l0b_slot.physical_layout.stride))
+                l0_tile = from_tensor(l0b_slot, layout=make_layout((NEUMANN_BLOCK_SIZE, HALF_CHUNK_SIZE)), offset=l0_offset * 2, physical_layout=nz_layout(NEUMANN_BLOCK_SIZE, HALF_CHUNK_SIZE, l0b_slot.physical_layout.stride))
                 mem_copy(l0_tile, l1_tile)
 
     def _load_packed32_block_to_full64_l0a(
@@ -787,8 +765,8 @@ class StageOneMatmul:
                 (dst_row + row_offset) // NEUMANN_BLOCK_SIZE, dst_col // NEUMANN_BLOCK_SIZE,
             )
             l0_offset -= 6 * NEUMANN_FRACTAL_ELEMS
-            l0_tile = reinterpret(l0a_slot, layout=make_layout((NEUMANN_BLOCK_SIZE, HALF_CHUNK_SIZE)), offset=l0_offset * 2, physical_layout=nz_layout(NEUMANN_BLOCK_SIZE, HALF_CHUNK_SIZE, l0a_slot.physical_layout.stride))
-            l1_tile = reinterpret(l1_matrix, layout=make_layout((NEUMANN_BLOCK_SIZE, HALF_CHUNK_SIZE)), offset=l1_offset * 2, physical_layout=nz_layout(NEUMANN_BLOCK_SIZE, HALF_CHUNK_SIZE, l1_matrix.physical_layout.stride))
+            l0_tile = from_tensor(l0a_slot, layout=make_layout((NEUMANN_BLOCK_SIZE, HALF_CHUNK_SIZE)), offset=l0_offset * 2, physical_layout=nz_layout(NEUMANN_BLOCK_SIZE, HALF_CHUNK_SIZE, l0a_slot.physical_layout.stride))
+            l1_tile = from_tensor(l1_matrix, layout=make_layout((NEUMANN_BLOCK_SIZE, HALF_CHUNK_SIZE)), offset=l1_offset * 2, physical_layout=nz_layout(NEUMANN_BLOCK_SIZE, HALF_CHUNK_SIZE, l1_matrix.physical_layout.stride))
             if const_expr(transpose):
                 mem_copy(l0_tile, (l1_tile).permute(1, 0))
             else:
@@ -815,7 +793,7 @@ class StageOneMatmul:
         ):
             # 3510 L0A 的 16x16 单块地址仍需补偿一个 full64 M span。
             dst_offset = (dst_block - (NEUMANN_DIAG_BLOCK_NUM - 1)) * NEUMANN_FRACTAL_ELEMS
-            l0_tile = reinterpret(l0a_slot, layout=make_layout((NEUMANN_BLOCK_SIZE, NEUMANN_BLOCK_SIZE)), offset=dst_offset * 2, physical_layout=nz_layout(NEUMANN_BLOCK_SIZE, NEUMANN_BLOCK_SIZE, l0a_slot.physical_layout.stride))
+            l0_tile = from_tensor(l0a_slot, layout=make_layout((NEUMANN_BLOCK_SIZE, NEUMANN_BLOCK_SIZE)), offset=dst_offset * 2, physical_layout=nz_layout(NEUMANN_BLOCK_SIZE, NEUMANN_BLOCK_SIZE, l0a_slot.physical_layout.stride))
             l1_tile = tile_slice(l1_matrix, (NEUMANN_BLOCK_SIZE, NEUMANN_BLOCK_SIZE), (src_row_block, src_col_block))
             mem_copy(l0_tile, l1_tile)
 
@@ -2291,10 +2269,10 @@ class StageTwoMatmul:
             ).next_write()
         else:
             self.l0a_chunk = shared.l0a_chunk
-            self.l0a_kr_t = reinterpret(shared.l0a_kr_t, layout=make_layout((dv_base, CHUNK_SIZE)), data_format="nz")
+            self.l0a_kr_t = from_tensor(shared.l0a_kr_t, layout=make_layout((dv_base, CHUNK_SIZE)), data_format="nz")
             self.l0a_mqk = shared.l0a_mqk
-            self.l0b_u = reinterpret(shared.l0b_u, layout=make_layout((dv_base, CHUNK_SIZE)), data_format="nz")
-            self.l0b_state = reinterpret(shared.l0b_state, layout=make_layout((dv_base, SUPPORTED_HEAD_DIM)), data_format="nz")
+            self.l0b_u = from_tensor(shared.l0b_u, layout=make_layout((dv_base, CHUNK_SIZE)), data_format="nz")
+            self.l0b_state = from_tensor(shared.l0b_state, layout=make_layout((dv_base, SUPPORTED_HEAD_DIM)), data_format="nz")
             self.l0b_kr = shared.l0b_kr
             self.l0c_u = shared.l0c_u
             self.l0c_o = shared.l0c_o
@@ -2316,7 +2294,7 @@ class StageTwoMatmul:
     def load_state(self, state_l1):
         mem_copy(
             self.l0b_state,
-            reinterpret(state_l1.next_read(), layout=make_layout((self.dv_base, SUPPORTED_HEAD_DIM)), data_format="nz"),
+            from_tensor(state_l1.next_read(), layout=make_layout((self.dv_base, SUPPORTED_HEAD_DIM)), data_format="nz"),
         )
 
     def compute_w_state(self, w_l1):
@@ -2372,7 +2350,7 @@ class StageTwoMatmul:
     def store_state_delta(self, ub):
         mem_copy(
             ub,
-            (reinterpret(self.l0c_state, layout=make_layout((self.dv_base, SUPPORTED_HEAD_DIM)), data_format="nz")).partition(dim=1),
+            (from_tensor(self.l0c_state, layout=make_layout((self.dv_base, SUPPORTED_HEAD_DIM)), data_format="nz")).partition(dim=1),
         )
 
     @jit
@@ -2405,7 +2383,7 @@ class StageTwoMatmul:
         write_operand = self.l0a_kr_t
         mem_copy(write_operand, source.permute(1, 0))
         matmul(
-            reinterpret(self.l0c_state, layout=make_layout((self.dv_base, SUPPORTED_HEAD_DIM)), data_format="nz"), operand,
+            from_tensor(self.l0c_state, layout=make_layout((self.dv_base, SUPPORTED_HEAD_DIM)), data_format="nz"), operand,
             self._k_restored_operand(CHUNK_SIZE), init=True,
         )
 
@@ -2574,10 +2552,10 @@ class StageTwoVector:
         cast_tile(nd_slot, ub_state)
         nd_read = self.state_nd
         # 按当前 DV 高度重新打包共享槽位，避免切片保留最大高度的 N1 步长。
-        nz_slot = reinterpret(self.state_nz, layout=make_layout((self.dv_base, self.half_dk)), data_format="nz", physical_layout=nz_layout(self.dv_base, self.half_dk))
+        nz_slot = from_tensor(self.state_nz, layout=make_layout((self.dv_base, self.half_dk)), data_format="nz", physical_layout=nz_layout(self.dv_base, self.half_dk))
         nd2nz_tile(nz_slot, nd_read)
-        nz_read = reinterpret(self.state_nz, layout=make_layout((self.dv_base, self.half_dk)), data_format="nz", physical_layout=nz_layout(self.dv_base, self.half_dk))
-        slot = reinterpret(state_l1.next_write(), layout=make_layout((self.dv_base, SUPPORTED_HEAD_DIM)), data_format="nz")
+        nz_read = from_tensor(self.state_nz, layout=make_layout((self.dv_base, self.half_dk)), data_format="nz", physical_layout=nz_layout(self.dv_base, self.half_dk))
+        slot = from_tensor(state_l1.next_write(), layout=make_layout((self.dv_base, SUPPORTED_HEAD_DIM)), data_format="nz")
         state_l1_rows = tile_slice(slot, (self.dv_base, self.half_dk), (0, subblock_idx))
         mem_copy(state_l1_rows, nz_read)
 

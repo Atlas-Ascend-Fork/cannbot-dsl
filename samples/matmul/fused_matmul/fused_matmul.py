@@ -12,6 +12,8 @@ Host tiling selects the compute tile and buffer depths. The kernel uses a
 Cube-only path for matmul/Bias/ReLU, or a Cube/Vector path for GELU/Mul.
 """
 
+from cannbotdsl import from_tensor
+
 import os
 import sys
 
@@ -33,10 +35,10 @@ from cannbotdsl.ops.arch import (
     set_ctrl,
 )
 from cannbotdsl.ops.matmul import matmul
-from cannbotdsl.ops.memcpy import copy_options, mem_copy, relu
+from cannbotdsl.ops.memcpy import copy_options, mem_copy
 from cannbotdsl.ops.sync import cube_sync_all
 from cannbotdsl.ring_buffer import RingBuffer
-from cannbotdsl.tensor import reinterpret, tile_slice
+from cannbotdsl.tensor import tile_slice
 
 __all__ = ["fused_matmul"]
 
@@ -292,15 +294,17 @@ class FusedMatmulKernel:
             m_idx * tiling.base_m : m_idx * tiling.base_m + actual_m,
             n_idx * tiling.base_n : n_idx * tiling.base_n + actual_n,
         ]
-        l0c_slot = l0c.next_write(bare=True).view(make_layout(gm_c_tile.shape))
+        l0c_slot = from_tensor(l0c.next_write(), layout=make_layout(gm_c_tile.shape))
         if const_expr(tiling.has_bias):
-            bias_l1_view = reinterpret(
+            bias_l1_view = from_tensor(
                 bias_l1.next_write(), layout=make_layout((actual_n,))
             )
             mem_copy(bias_l1_view, tile_slice(gm_add, (tiling.base_n,), (n_idx,)))
             # Bias and MMAD must cover the same valid N columns.
             bias_full = bias_l1.next_read()
-            bias_src = bias_bt.next_write(bare=True).view(make_layout((actual_n,)))
+            bias_src = from_tensor(
+                bias_bt.next_write(), layout=make_layout((actual_n,))
+            )
             mem_copy(bias_src, bias_full[: gm_c_tile.shape[1],])
         else:
             bias_src = l0c_slot  # Unused on the non-Bias path.
@@ -335,11 +339,11 @@ class FusedMatmulKernel:
                         max(0, tiling.k - global_k_l0_idx * tiling.base_k),
                     )
                 )
-                l0a_tensor = l0a.next_write(bare=True).view(
-                    make_layout((gm_c_tile.shape[0], actual_k))
+                l0a_tensor = from_tensor(
+                    l0a.next_write(), layout=make_layout((gm_c_tile.shape[0], actual_k))
                 )
-                l0b_tensor = l0b.next_write(bare=True).view(
-                    make_layout((gm_c_tile.shape[1], actual_k))
+                l0b_tensor = from_tensor(
+                    l0b.next_write(), layout=make_layout((gm_c_tile.shape[1], actual_k))
                 )
                 mem_copy(l0a_tensor, l1_a_slice[: gm_c_tile.shape[0], :actual_k])
                 mem_copy(l0b_tensor, l1_b_slice[: gm_c_tile.shape[1], :actual_k])
@@ -371,7 +375,7 @@ class FusedMatmulKernel:
             )
         else:
             if const_expr(self.act_mode == ACT_RELU):
-                mem_copy(gm_c_tile, relu(l0c_view), copy_options(unit_flag=3))
+                mem_copy(gm_c_tile, l0c_view.relu(), copy_options(unit_flag=3))
             else:
                 mem_copy(gm_c_tile, l0c_view, copy_options(unit_flag=3))
 
@@ -408,24 +412,24 @@ class FusedMatmulKernel:
             )
             subblock_m_offset = subblock_id * first_subblock_rows
             if const_expr(self.has_add):
-                add_ub_view = reinterpret(
+                add_ub_view = from_tensor(
                     add_ub.next_write(), layout=make_layout((actual_n,))
                 )
                 mem_copy(add_ub_view, tile_slice(gm_add, (tiling.base_n,), (n_idx,)))
             if const_expr(self.has_mul):
-                mul_ub_view = reinterpret(
+                mul_ub_view = from_tensor(
                     mul_ub.next_write(), layout=make_layout((actual_n,))
                 )
                 mem_copy(mul_ub_view, tile_slice(gm_mul, (tiling.base_n,), (n_idx,)))
             cv_slot = cv_ub.next_read()
-            cv_view = reinterpret(
+            cv_view = from_tensor(
                 cv_slot,
                 layout=make_layout(
                     (subblock_rows, actual_n), stride=(tiling.base_n, 1)
                 ),
             )
             # Forward traversal packs outputs into the already-consumed FP32 prefix.
-            out_slot = reinterpret(
+            out_slot = from_tensor(
                 cv_slot,
                 dtype=self.out_dtype,
                 layout=make_layout((tiling.tile_vec_m, tiling.base_n)),
@@ -439,8 +443,8 @@ class FusedMatmulKernel:
                 mul_slot = mul_ub.next_read()
             else:
                 mul_slot = out_slot
-            src_stride = cv_view.physical_stride[0]
-            dst_stride = out_slot.physical_stride[0]
+            src_stride = cv_view.physical_layout.stride[0]
+            dst_stride = out_slot.physical_layout.stride[0]
             with vf(mode="simd"):
                 one = reg.vdups(1.0, dtypes.float32)
                 for row in range(subblock_rows):
@@ -500,7 +504,7 @@ class FusedMatmulKernel:
                     output_m_start : output_m_start + subblock_rows,
                     n_start : n_start + actual_n,
                 ]
-                output_ub_view = reinterpret(
+                output_ub_view = from_tensor(
                     out_slot,
                     layout=make_layout(
                         (subblock_rows, actual_n), stride=(tiling.base_n, 1)

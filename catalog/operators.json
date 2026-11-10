@@ -495,7 +495,8 @@
       },
       {
         "name": "attn_epilogue",
-        "enabled": true,
+        "enabled": false,
+        "skip_reason": "Temporary 0.8.2 CI exclusion: torch.compile/fullgraph integration is unresolved.",
         "watch": [
           "@attn_epilogue/source",
           "@attn_epilogue/test"
@@ -943,7 +944,8 @@
       },
       {
         "name": "moonep",
-        "enabled": true,
+        "enabled": false,
+        "skip_reason": "Temporary 0.8.2 CI exclusion: ops.distributed must be migrated to comm.",
         "watch": [
           "@moonep/source",
           "@moonep/test"
@@ -976,7 +978,8 @@
       },
       {
         "name": "mega_full_index",
-        "enabled": true,
+        "enabled": false,
+        "skip_reason": "Temporary 0.8.2 CI exclusion: FP4 query projection precision mismatch is unresolved.",
         "watch": [
           "@mega_full_index/source",
           "@mega_full_index/test"

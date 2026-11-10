@@ -23,6 +23,8 @@ Optizations adopted from matmul.py:
 Formula:  C[M,N] = A[M,K] @ B[K,N]   (fp16/bf16 inputs, fp32 accumulator)
 """
 
+from cannbotdsl import from_tensor
+
 __all__ = ["matmul_streamk"]
 
 import gc
@@ -99,8 +101,8 @@ def _global_sync():
 def _cast_tile_cols(dst, src, row):
     """Convert one tile row in 64-element column chunks."""
     cols = dst.shape[1]
-    src_stride = src.physical_stride[0]
-    dst_stride = dst.physical_stride[0]
+    src_stride = src.physical_layout.stride[0]
+    dst_stride = dst.physical_layout.stride[0]
     for col in range(0, cols, 64):
         mask, _ = rr.update_mask(cols - col, elem_bits=32)
         if const_expr(src.dtype == dtypes.float32):
@@ -128,8 +130,8 @@ def _cast_tile_cols(dst, src, row):
 def cast_tile(dst, src):
     """Convert a 2D f32/f16/bf16 tile, honoring each operand's row stride."""
     rows, cols = dst.shape
-    src_stride = src.physical_stride[0]
-    dst_stride = dst.physical_stride[0]
+    src_stride = src.physical_layout.stride[0]
+    dst_stride = dst.physical_layout.stride[0]
     with vf():
         for row in range(rows):
             if const_expr(isinstance(cols, int) and cols == 1):
@@ -408,16 +410,19 @@ class MatmulStreamK:
                 1, 0
             )
             # M/N stay fixed across K sub-blocks; only K can have a new tail.
-            a_input = self.l0a.next_write(bare=True).view(
-                make_layout((a_slot.shape[0], a_source.shape[1]))
+            a_input = from_tensor(
+                self.l0a.next_write(),
+                layout=make_layout((a_slot.shape[0], a_source.shape[1])),
             )
             mem_copy(a_input, a_source)
-            b_input = self.l0b.next_write(bare=True).view(
-                make_layout((b_slot.shape[1], b_source.shape[1]))
+            b_input = from_tensor(
+                self.l0b.next_write(),
+                layout=make_layout((b_slot.shape[1], b_source.shape[1])),
             )
             mem_copy(b_input, b_source)
-            c_view = accumulator.bare().view(
-                make_layout((a_input.shape[0], b_input.shape[0])),
+            c_view = from_tensor(
+                accumulator,
+                layout=make_layout((a_input.shape[0], b_input.shape[0])),
                 dtype=float32,
                 data_format="nz",
             )
@@ -462,10 +467,11 @@ class MatmulStreamK:
         a_panel = a_gm[m_start : m_start + m_count, None]
         b_panel = b_gm[None, n_start : n_start + n_count]
         output_tile = out_gm[m_start : m_start + m_count, n_start : n_start + n_count]
-        accumulator = (
-            self.l0c.next_write()
-            .bare()
-            .view(make_layout(output_tile.shape), dtype=float32, data_format="nz")
+        accumulator = from_tensor(
+            self.l0c.next_write(),
+            layout=make_layout(output_tile.shape),
+            dtype=float32,
+            data_format="nz",
         )
         for sk in range(self.slab_tiles):
             k_start = sk * self.slab_k
@@ -517,10 +523,11 @@ class MatmulStreamK:
             n_count = min(self.tile_n, self.n - n_start)
             a_panel = a_gm[m_start : m_start + m_count, None]
             b_panel = b_gm[None, n_start : n_start + n_count]
-            accumulator = (
-                self.l0c.next_write()
-                .bare()
-                .view(make_layout((m_count, n_count)), dtype=float32, data_format="nz")
+            accumulator = from_tensor(
+                self.l0c.next_write(),
+                layout=make_layout((m_count, n_count)),
+                dtype=float32,
+                data_format="nz",
             )
             for s in range(self.slabs_per):
                 sk = slab_start + s
@@ -556,8 +563,11 @@ class MatmulStreamK:
             # instead of one narrow burst per row (notably N=1). Reduction
             # and the final store still use the live output M/N domain.
             workspace_n = _ceil_div(n_count, 16) * 16
-            workspace_result = accumulator.bare().view(
-                make_layout((m_count, workspace_n)), dtype=float32, data_format="nz"
+            workspace_result = from_tensor(
+                accumulator,
+                layout=make_layout((m_count, workspace_n)),
+                dtype=float32,
+                data_format="nz",
             )
             ws_dst = ws_gm[ws_start : ws_start + m_count, :workspace_n]
             mem_copy(ws_dst, workspace_result)
@@ -573,7 +583,7 @@ class MatmulStreamK:
     @jit
     def _reduce_partial_sums(self, stage, acc):
         rows, cols = acc.shape
-        acc_stride = acc.physical_stride[0]
+        acc_stride = acc.physical_layout.stride[0]
         slab_stride = self.reduce_m * self.tile_n
         with vf():
             for row in range(rows):

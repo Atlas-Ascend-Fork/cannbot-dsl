@@ -8,8 +8,10 @@
 
 """Shared pytest configuration and markers for CANNBotDSL tests."""
 
+import json
 import os
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -19,6 +21,56 @@ for _category in ("attention", "matmul", "vector", "mc2"):
     _category_dir = os.path.join(_samples_dir, _category)
     if _category_dir not in sys.path:
         sys.path.insert(0, _category_dir)
+
+
+def _ci_exclusions():
+    # run_tests.sh sets these for CI precision and performance respectively.
+    # Manual diagnostics keep the original tests available without these flags.
+    if not (
+        os.environ.get("CI_CASE_RESULTS") or os.environ.get("CI_PERF_ENTRY_REPORT")
+    ):
+        return ()
+    root = Path(__file__).resolve().parents[1]
+    catalog = json.loads((root / "catalog/operators.json").read_text(encoding="utf-8"))
+    excluded = []
+    for rule in catalog["ci"]["rules"]:
+        reason = rule.get("skip_reason")
+        if rule["enabled"] or not reason:
+            continue
+        for reference in rule["tests"]:
+            if reference.startswith("@"):
+                operator, field, *suffix = reference[1:].split("/")
+                target = root / catalog["operators"][operator][field] / Path(*suffix)
+            else:
+                target = root / reference
+            target = target.resolve()
+            target.relative_to(root / "test")
+            excluded.append((rule["name"], target, reason))
+    return tuple(excluded)
+
+
+_CI_EXCLUSIONS = _ci_exclusions()
+
+
+class _TemporarilySkippedModule(pytest.Module):
+    def collect(self):
+        # Skip before import, including missing SDK communication modules.
+        pytest.skip(self._ci_skip_reason, allow_module_level=True)
+
+
+def pytest_pycollect_makemodule(module_path, parent):
+    path = module_path.resolve()
+    for _, target, reason in _CI_EXCLUSIONS:
+        if path == target or target in path.parents:
+            module = _TemporarilySkippedModule.from_parent(parent, path=module_path)
+            module._ci_skip_reason = reason
+            return module
+
+
+def pytest_report_header(config):
+    return [
+        f"Temporary CI exclusion {name}: {reason}" for name, _, reason in _CI_EXCLUSIONS
+    ]
 
 
 def pytest_configure(config):

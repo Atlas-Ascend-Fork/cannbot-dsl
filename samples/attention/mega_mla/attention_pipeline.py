@@ -174,7 +174,7 @@ class _SmallKAttentionVector:
     @jit
     def _mask_invalid_kv_positions(self, qk_ub, idx_ub):
         with vf(mode="simd"):
-            stride = qk_ub.physical_stride[0]
+            stride = qk_ub.physical_layout.stride[0]
             for col in range(0, self.tile_n, 64):
                 lanes, _ = rr.update_mask(64, elem_bits=32)
                 idx = rr.vload(idx_ub, col)
@@ -224,7 +224,7 @@ class _SmallKAttentionVector:
         with vf(mode="simd"):
             lanes, _ = rr.update_mask(64, elem_bits=32)
             rowmask, _ = rr.update_mask(self.tile_vec_m, elem_bits=32)
-            stride = qk_ub.physical_stride[0]
+            stride = qk_ub.physical_layout.stride[0]
             for row in range(self.tile_vec_m):
                 base = row * stride
                 val0 = rr.vload(qk_ub, base)
@@ -274,7 +274,7 @@ class _SmallKAttentionVector:
         with vf(mode="simd"):
             lanes, _ = rr.update_mask(64, elem_bits=32)
             rowmask, _ = rr.update_mask(self.tile_vec_m, elem_bits=32)
-            stride = qk_ub.physical_stride[0]
+            stride = qk_ub.physical_layout.stride[0]
             for row in range(self.tile_vec_m):
                 base = row * stride
                 val0 = rr.vload(qk_ub, base)

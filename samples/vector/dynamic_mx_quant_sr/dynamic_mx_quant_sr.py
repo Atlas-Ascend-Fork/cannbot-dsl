@@ -13,6 +13,8 @@ owns binary management; this sample keeps bounded, generation-safe Program
 references. Compilation requires stable process configuration.
 """
 
+from cannbotdsl import from_tensor
+
 import math
 import os
 import struct
@@ -35,7 +37,7 @@ from cannbotdsl.lang import const_expr, host, jit, kernel, vf
 from cannbotdsl.ops import reg, scalar, simt
 from cannbotdsl.ops.arch import get_block_idx, get_block_num
 from cannbotdsl.ops.memcpy import copy_options, mem_copy
-from cannbotdsl.tensor import MemLoc, Tensor, make_tiler, reinterpret, tile_slice
+from cannbotdsl.tensor import MemLoc, Tensor, make_tiler, tile_slice
 
 
 # Framework RNG contract and lazy native state reservation.
@@ -540,7 +542,7 @@ def _copy_to_gm(destination, source):
         columns = source.shape[1]
     mem_copy(
         destination,
-        reinterpret(source, layout=make_layout((rows, columns), stride=source.stride)),
+        from_tensor(source, layout=make_layout((rows, columns), stride=source.stride)),
     )
 
 
@@ -1630,7 +1632,7 @@ def _prepare_eight_field_aos_linear(random, start, batches, seed, block_offset):
 
 @jit
 def _emit_nibble_clean_part(self, random, x, y, first, stop):
-    sign_source = reinterpret(
+    sign_source = from_tensor(
         x,
         dtypes.uint8,
         layout=make_layout((1, self.tile_elements * SIGN_BYTE_INTERLEAVE_FACTOR)),
@@ -1643,7 +1645,7 @@ def _emit_nibble_clean_part(self, random, x, y, first, stop):
         random_mask = reg.vdups(
             (1 << BF16_FRACTION_BITS - self.mantissa) - 1, dtypes.uint16, mask=full16
         )
-        random_bytes = reinterpret(
+        random_bytes = from_tensor(
             random.buffer, dtypes.uint8, layout=make_layout((1, random.capacity_bytes))
         )
         for part in range(first, stop):
@@ -1722,7 +1724,7 @@ def _sr_bf16_middle_q12_direct(self, value, random12, absolute_mask, multiplier,
 
 @jit
 def _emit_nibble_middle_part(self, random, x, y, first, stop):
-    sign_source = reinterpret(
+    sign_source = from_tensor(
         x,
         dtypes.uint8,
         layout=make_layout((1, self.tile_elements * SIGN_BYTE_INTERLEAVE_FACTOR)),
@@ -1753,7 +1755,7 @@ def _emit_nibble_middle_part(self, random, x, y, first, stop):
         )
         pair_index = reg.vbitwise_or(base, position, mask=full8)
         field_mask = reg.vdups(SR_Q12_MASK, dtypes.uint16, mask=full16)
-        random_bytes = reinterpret(
+        random_bytes = from_tensor(
             random.buffer, dtypes.uint8, layout=make_layout((1, random.capacity_bytes))
         )
         absolute_mask = reg.vdups(BF16_ABS_MASK, dtypes.uint16, mask=full16)
@@ -1808,12 +1810,12 @@ def _emit_nibble_middle_part(self, random, x, y, first, stop):
 @jit
 def _emit_nibble_general_part(self, random, x, y, first, stop, packed_scales=None):
     if const_expr(self.bf16_four_panel or self.bf16_compact_four_panel):
-        sign_source = reinterpret(
+        sign_source = from_tensor(
             x,
             dtypes.uint8,
             layout=make_layout((1, self.tile_elements * SIGN_BYTE_INTERLEAVE_FACTOR)),
         )
-        scale16 = reinterpret(
+        scale16 = from_tensor(
             self.scale32,
             dtypes.uint16,
             layout=make_layout(
@@ -1838,7 +1840,7 @@ def _emit_nibble_general_part(self, random, x, y, first, stop, packed_scales=Non
                 reg.vshr(ids8, PACKED_QUANT_PLANE_BITS, mask=full8),
                 mask=full8,
             )
-            random_bytes = reinterpret(
+            random_bytes = from_tensor(
                 random.buffer,
                 dtypes.uint8,
                 layout=make_layout((1, random.capacity_bytes)),
@@ -2028,12 +2030,12 @@ def _emit_nibble_general_part(self, random, x, y, first, stop, packed_scales=Non
             # Finish encoded byte stores before the next VF or DMA reuses this output slot.
             reg.vmem_bar("vst_vld")
     else:
-        sign_source = reinterpret(
+        sign_source = from_tensor(
             x,
             dtypes.uint8,
             layout=make_layout((1, self.tile_elements * SIGN_BYTE_INTERLEAVE_FACTOR)),
         )
-        scale16 = reinterpret(
+        scale16 = from_tensor(
             self.scale32,
             dtypes.uint16,
             layout=make_layout(
@@ -2245,7 +2247,7 @@ def _quantize_bf16_nibble_partial_256(
 ):
     parts = count // QUANT_PANEL_ELEMENTS
     batches = (count + RNG_BATCH_ROUND_UP_ELEMENTS) // RNG_BATCH_ELEMENTS
-    scale16 = reinterpret(
+    scale16 = from_tensor(
         self.scale32,
         dtypes.uint16,
         layout=make_layout((1, self.tile_elements // SCALE_U16_VIEW_ELEMENTS_PER_SLOT)),
@@ -3031,7 +3033,7 @@ def quantize_tile(
 
 @jit
 def _emit_bf16_clean_normal_part(self, random, x, y, first, stop):
-    sign_source = reinterpret(
+    sign_source = from_tensor(
         x,
         dtypes.uint8,
         layout=make_layout((1, self.tile_elements * SIGN_BYTE_INTERLEAVE_FACTOR)),
@@ -3142,7 +3144,7 @@ def _sr_bf16_middle_q12(self, value, random16, absolute_mask, multiplier, mask):
 
 @jit
 def _emit_bf16_middle_q12_part(self, random, x, y, first, stop):
-    sign_source = reinterpret(
+    sign_source = from_tensor(
         x,
         dtypes.uint8,
         layout=make_layout((1, self.tile_elements * SIGN_BYTE_INTERLEAVE_FACTOR)),
@@ -3204,12 +3206,12 @@ def _emit_bf16_middle_q12_part(self, random, x, y, first, stop):
 
 @jit
 def _emit_bf16_general_part(self, random, x, y, first, stop):
-    sign_source = reinterpret(
+    sign_source = from_tensor(
         x,
         dtypes.uint8,
         layout=make_layout((1, self.tile_elements * SIGN_BYTE_INTERLEAVE_FACTOR)),
     )
-    scale16 = reinterpret(
+    scale16 = from_tensor(
         self.scale32,
         dtypes.uint16,
         layout=make_layout((1, self.tile_elements // SCALE_U16_VIEW_ELEMENTS_PER_SLOT)),
@@ -3943,7 +3945,7 @@ def _quantize_bf16_four_field_panels(
 ):
     parts = count // QUANT_PANEL_ELEMENTS
     batches = (count + RNG_BATCH_ROUND_UP_ELEMENTS) // RNG_BATCH_ELEMENTS
-    scale16 = reinterpret(
+    scale16 = from_tensor(
         self.scale32,
         dtypes.uint16,
         layout=make_layout((1, self.tile_elements // SCALE_U16_VIEW_ELEMENTS_PER_SLOT)),
@@ -4067,7 +4069,7 @@ def _quantize_fp32_eight_compact_256(
     seed,
     block_offset,
 ):
-    sign_source = reinterpret(
+    sign_source = from_tensor(
         x,
         dtypes.uint8 if self.bf16 else dtypes.uint16,
         layout=make_layout((1, self.tile_elements * SIGN_BYTE_INTERLEAVE_FACTOR)),
@@ -4419,7 +4421,7 @@ def _quantize_tile_256_baseline(
     seed,
     block_offset,
 ):
-    sign_source = reinterpret(
+    sign_source = from_tensor(
         x,
         dtypes.uint8 if self.bf16 else dtypes.uint16,
         layout=make_layout((1, self.tile_elements * SIGN_BYTE_INTERLEAVE_FACTOR)),
@@ -4646,11 +4648,11 @@ def quantize_short_rows(
     column_mask = dtypes.uint32(pitch // UINT32_BYTES - 1)
     columns4 = dtypes.uint32(columns // UINT32_BYTES)
     row_count = dtypes.uint32(rows)
-    packed_y = reinterpret(
+    packed_y = from_tensor(
         y, dtypes.uint32, layout=make_layout((1, self.tile_elements // UINT32_BYTES))
     )
     if const_expr(self.bf16):
-        packed_x = reinterpret(
+        packed_x = from_tensor(
             x,
             dtypes.uint32,
             layout=make_layout((1, self.tile_elements // RNG_EIGHT_ELEMENTS_PER_BYTE)),
@@ -4861,7 +4863,7 @@ def quantize_wide64(
     col_group = dtypes.int64(group) * dtypes.int64(tile_rows) // RNG_GROUP_ELEMENTS
     axis_groups = dtypes.int64(quant_length) // RNG_GROUP_ELEMENTS
     key0, key1 = _split_uint64(seed)
-    scale_pairs = reinterpret(
+    scale_pairs = from_tensor(
         scales,
         dtypes.uint16,
         layout=make_layout((1, self.tile_elements // MX_BLOCK_ELEMENTS)),
@@ -5011,7 +5013,7 @@ def quantize_wide32(
     col_group = dtypes.int64(group) * dtypes.int64(tile_rows) // RNG_GROUP_ELEMENTS
     axis_groups = dtypes.int64(quant_length) // RNG_GROUP_ELEMENTS
     key0, key1 = _split_uint64(seed)
-    scale_pairs = reinterpret(
+    scale_pairs = from_tensor(
         scales,
         dtypes.uint16,
         layout=make_layout((1, self.tile_elements // MX_BLOCK_ELEMENTS)),
@@ -6664,14 +6666,14 @@ def _stage_run_non_tail_fused(
         )
         second_y = self.output.next_read()
         second_s = self.scale.next_read()
-        first_pairs = reinterpret(
+        first_pairs = from_tensor(
             self.saved_scale,
             dtypes.uint16,
             layout=make_layout(
                 (1, self.quantization.tile_elements // MX_BLOCK_ELEMENTS)
             ),
         )
-        second_pairs = reinterpret(
+        second_pairs = from_tensor(
             second_s,
             dtypes.uint16,
             layout=make_layout(
@@ -6702,7 +6704,7 @@ def _stage_run_non_tail_fused(
             ),
             self.interleaved_output,
         )
-        scale_bytes = reinterpret(
+        scale_bytes = from_tensor(
             self.interleaved_scale,
             dtypes.uint8,
             layout=make_layout(
@@ -8550,7 +8552,7 @@ def _quantize_bf16_single_panel(
 ):
     parts = count // QUANT_PANEL_ELEMENTS
     batches = (count + RNG_BATCH_ROUND_UP_ELEMENTS) // RNG_BATCH_ELEMENTS
-    scale16 = reinterpret(
+    scale16 = from_tensor(
         self.scale32,
         dtypes.uint16,
         layout=make_layout((1, self.tile_elements // SCALE_U16_VIEW_ELEMENTS_PER_SLOT)),
@@ -8586,7 +8588,7 @@ def _quantize_bf16_single_panel(
 
 @jit
 def _emit_nibble_half_q7_part(self, random, x, y, first, stop):
-    sign_source = reinterpret(
+    sign_source = from_tensor(
         x,
         dtypes.uint8,
         layout=make_layout((1, self.tile_elements * SIGN_BYTE_INTERLEAVE_FACTOR)),
@@ -8617,7 +8619,7 @@ def _emit_nibble_half_q7_part(self, random, x, y, first, stop):
         )
         pair_index = reg.vbitwise_or(base, position, mask=full8)
         field_mask = reg.vdups(SR_Q12_MASK, dtypes.uint16, mask=full16)
-        random_bytes = reinterpret(
+        random_bytes = from_tensor(
             random.buffer, dtypes.uint8, layout=make_layout((1, random.capacity_bytes))
         )
         absolute_mask = reg.vdups(BF16_ABS_MASK, dtypes.uint16, mask=full16)
@@ -9040,14 +9042,14 @@ def _produce_fp32_random_in_output(scratch, start, batches, seed, block_offset):
 def _quantize_fp32_output_alias(
     self, x, y, scales, start, count, scale_factor, quant_length, seed, block_offset
 ):
-    sign_source = reinterpret(
+    sign_source = from_tensor(
         x,
         dtypes.uint8 if self.bf16 else dtypes.uint16,
         layout=make_layout((1, self.tile_elements * SIGN_BYTE_INTERLEAVE_FACTOR)),
     )
     parts = count // QUANT_PANEL_ELEMENTS
     batches = (count + RNG_BATCH_ROUND_UP_ELEMENTS) // RNG_BATCH_ELEMENTS
-    scratch = reinterpret(
+    scratch = from_tensor(
         y,
         dtypes.int32,
         layout=make_layout(
@@ -9275,14 +9277,14 @@ def _quantize_fp32_output_alias(
 def _quantize_fp32_output_alias_batched(
     self, x, y, scales, start, count, scale_factor, quant_length, seed, block_offset
 ):
-    sign_source = reinterpret(
+    sign_source = from_tensor(
         x,
         dtypes.uint8 if self.bf16 else dtypes.uint16,
         layout=make_layout((1, self.tile_elements * SIGN_BYTE_INTERLEAVE_FACTOR)),
     )
     parts = count // QUANT_PANEL_ELEMENTS
     batches = (count + RNG_BATCH_ROUND_UP_ELEMENTS) // RNG_BATCH_ELEMENTS
-    scratch = reinterpret(
+    scratch = from_tensor(
         y,
         dtypes.int32,
         layout=make_layout(
@@ -10339,12 +10341,12 @@ def _encode_bf16_middle_in_vf(self, x, y, first, stop, sign_source, random_bytes
 
 @jit
 def _encode_bf16_adjacent_bundles(self, random, x, y, first, flag_0, flag_1):
-    sign_source = reinterpret(
+    sign_source = from_tensor(
         x,
         dtypes.uint8,
         layout=make_layout((1, self.tile_elements * SIGN_BYTE_INTERLEAVE_FACTOR)),
     )
-    random_bytes = reinterpret(
+    random_bytes = from_tensor(
         random.buffer, dtypes.uint8, layout=make_layout((1, random.capacity_bytes))
     )
     with vf(mode="simd"):
@@ -10475,7 +10477,7 @@ def _quantize_bf16_four_panel(
 @jit
 def _normalize_bf16_vector_scale_e2b(self, x, scales, parts, scale_factor):
     """Derive scales in batches, then normalize from a separate reciprocal buffer."""
-    scale16 = reinterpret(
+    scale16 = from_tensor(
         self.scale32,
         dtypes.uint16,
         layout=make_layout((1, self.tile_elements // SCALE_U16_VIEW_ELEMENTS_PER_SLOT)),
@@ -10661,7 +10663,7 @@ def _normalize_bf16_vector_scale_e2b(self, x, scales, parts, scale_factor):
 @jit
 def _normalize_bf16_four_panels(self, x, scales, parts, scale_factor):
     """Normalize four panels per iteration and publish group minima/scale bytes."""
-    scale16 = reinterpret(
+    scale16 = from_tensor(
         self.scale32,
         dtypes.uint16,
         layout=make_layout((1, self.tile_elements // SCALE_U16_VIEW_ELEMENTS_PER_SLOT)),
@@ -11196,7 +11198,7 @@ def _normalize_bf16_four_panels(self, x, scales, parts, scale_factor):
 @jit
 def _normalize_bf16_four_panels_batched(self, x, scales, parts, scale_factor):
     """Normalize four panels per iteration and publish group minima/scale bytes."""
-    scale16 = reinterpret(
+    scale16 = from_tensor(
         self.scale32,
         dtypes.uint16,
         layout=make_layout((1, self.tile_elements // SCALE_U16_VIEW_ELEMENTS_PER_SLOT)),
@@ -11749,12 +11751,12 @@ def _encode_bf16_adjacent_eight(
     self, random, x, y, first, flag_0, flag_1, flag_2, flag_3
 ):
     """Use one VF for four eight-panel classes; caller excludes general groups."""
-    sign_source = reinterpret(
+    sign_source = from_tensor(
         x,
         dtypes.uint8,
         layout=make_layout((1, self.tile_elements * SIGN_BYTE_INTERLEAVE_FACTOR)),
     )
-    random_bytes = reinterpret(
+    random_bytes = from_tensor(
         random.buffer, dtypes.uint8, layout=make_layout((1, random.capacity_bytes))
     )
     with vf(mode="simd"):
@@ -12782,7 +12784,7 @@ def _quantize_fp32_four_pair_256(
     seed,
     block_offset,
 ):
-    sign_source = reinterpret(
+    sign_source = from_tensor(
         x,
         dtypes.uint8 if self.bf16 else dtypes.uint16,
         layout=make_layout((1, self.tile_elements * SIGN_BYTE_INTERLEAVE_FACTOR)),

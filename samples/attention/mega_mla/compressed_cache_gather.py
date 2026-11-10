@@ -20,6 +20,8 @@ decoded16384 B and zero1024 B before index storage/alignment.
 No full-cache BF16 workspace is read or written by this path.
 """
 
+from cannbotdsl import from_tensor
+
 from cannbotdsl import make_layout
 from cannbotdsl import RingBuffer, MemLoc, dtypes, tile_slice as tile_view
 from cannbotdsl.buffer import Buffer
@@ -173,13 +175,13 @@ class CompressedCacheGather:
                 MemLoc.UB, dtypes.int32, make_layout((1, INDEX_CACHE_COLUMNS))
             )
         else:
-            index_cache = zero.reinterpret(dtypes.int32, make_layout((1, 256)))
+            index_cache = from_tensor(zero, dtypes.int32, make_layout((1, 256)))
         if const_expr(self.cache_batch_stride > 0):
             table_cache = Buffer(
                 MemLoc.UB, dtypes.int32, make_layout((1, PAGE_TABLE_CACHE_COLUMNS))
             )
         else:
-            table_cache = zero.reinterpret(dtypes.int32, make_layout((1, 256)))
+            table_cache = from_tensor(zero, dtypes.int32, make_layout((1, 256)))
         if const_expr(self.physical_index_cache):
             # 每个阶段只缓存自己负责的索引区间；GM可覆盖多于T个query。
             physical_indices = Buffer(

@@ -1,3 +1,5 @@
+from cannbotdsl import from_tensor
+from cannbotdsl.ops.memcpy import cube_fill_l1
 # Copyright (c) 2026 Huawei Technologies Co., Ltd.
 # This program is free software, you can redistribute it and/or modify it under the terms and conditions of
 # CANN Open Software License Agreement Version 2.0 (the "License").
@@ -39,7 +41,6 @@ from cannbotdsl.lang.vf import vf
 from cannbotdsl._mlir.dialects import arith
 from cannbotdsl.ops import reg as rr
 from cannbotdsl.ops.sync import (
-    cube_fill_l1,
     cube_sync_pipe,
     cube_sync_intra_arrive,
     cube_sync_intra_wait,
@@ -53,7 +54,7 @@ from sparse_flash_mla_sparse_n64_kernel import sparse_n64_kernel
 from cannbotdsl import Array
 from cannbotdsl.buffer import Buffer
 from cannbotdsl.ring_buffer import RingBuffer
-from cannbotdsl.tensor import make_layout, reinterpret
+from cannbotdsl.tensor import make_layout
 
 
 _BITS_PER_BYTE = 8
@@ -218,34 +219,32 @@ class SmlaMatmulBase:
         # View P at the parent NZ pitch and round the reduction extent up to
         # the 16-row fractal; P is masked to zero beyond actual_n.
         pv_k = (valid_kv_rows + (_NZ_ROW - 1)) // _NZ_ROW * _NZ_ROW
-        l0_a_view = reinterpret(
+        l0_a_view = from_tensor(
             l0_a,
             layout=make_layout((self.tile_cube_m, pv_k), stride=(self.tile_n, 1)),
             physical_layout=make_layout(
-                l0_a.physical_shape,
-                stride=l0_a.physical_stride,
+                l0_a.physical_layout.shape,
+                stride=l0_a.physical_layout.stride,
             ),
         )
         for chunk in range_constexpr(_D_TILES):
             l0_b = self.l0b.next_write()
             # A ZN destination view makes this L1 -> L0B copy transpose the
             # KV chunk; the matmul reads the same view at the pv_k extent.
-            l0_b_view = reinterpret(
-                l0_b,
-                layout=make_layout((self.tile_n, _TILE)),
-                data_format="zn",
+            l0_b_view = from_tensor(
+                l0_b, layout=make_layout((self.tile_n, _TILE)), data_format="zn"
             )
             mem_copy(l0_b_view, self._kv_chunk(kv_slot, chunk))
             pv_accumulator = self.l0c.next_write()
             matmul(
                 pv_accumulator,
                 l0_a_view,
-                reinterpret(
+                from_tensor(
                     l0_b_view,
                     layout=make_layout((pv_k, _TILE)),
                     physical_layout=make_layout(
-                        l0_b_view.physical_shape,
-                        stride=l0_b_view.physical_stride,
+                        l0_b_view.physical_layout.shape,
+                        stride=l0_b_view.physical_layout.stride,
                     ),
                 ),
                 init=True,
@@ -318,7 +317,7 @@ class GeneralSmlaVector:
         self.res_o = Buffer(
             MemLoc.UB, dtypes.float32, make_layout((tile_vec_m, tile_d))
         )
-        self.res_o_b16 = reinterpret(
+        self.res_o_b16 = from_tensor(
             self.res_o, self.dtype, layout=make_layout((tile_vec_m, tile_d))
         )
         p_n1_pad = _DATA_BLOCK_BYTES // (_F16_BITS // _BITS_PER_BYTE)
@@ -560,7 +559,7 @@ class GeneralSmlaVector:
         # res_o and its dtype view share the framework's Buffer sync identity.
         mem_copy(
             o_tile_gm.partition(dim=0, part_id=self.subblock_idx),
-            reinterpret(
+            from_tensor(
                 self.res_o,
                 self.dtype,
                 layout=make_layout((self.tile_vec_m, self.tile_d)),
@@ -613,7 +612,7 @@ class GeneralSmlaVector:
                 )
 
     def _nz_params(self):
-        p_nz_strides = self.p_ub.physical_stride
+        p_nz_strides = self.p_ub.physical_layout.stride
         s_n1, s_m1, s_m0, s_n0 = (
             p_nz_strides[0],
             p_nz_strides[1],
@@ -1040,9 +1039,8 @@ class SmlaVec0:
                 ready = self.gather_ping.next_read()
                 mem_copy(
                     workspace[tail_kv_row_start : tail_kv_row_start + tail_rows, None],
-                    reinterpret(
-                        ready,
-                        layout=make_layout((tail_rows, _D), stride=(_D, 1)),
+                    from_tensor(
+                        ready, layout=make_layout((tail_rows, _D), stride=(_D, 1))
                     ),
                 )
             else:
@@ -1064,9 +1062,8 @@ class SmlaVec0:
                 ready = self.gather_pong.next_read()
                 mem_copy(
                     workspace[tail_kv_row_start : tail_kv_row_start + tail_rows, None],
-                    reinterpret(
-                        ready,
-                        layout=make_layout((tail_rows, _D), stride=(_D, 1)),
+                    from_tensor(
+                        ready, layout=make_layout((tail_rows, _D), stride=(_D, 1))
                     ),
                 )
         vec_sync_intra_arrive(PIPE.MTE3, self.ready_flag)
@@ -1837,9 +1834,8 @@ class SparseFlashMlaCsaKernel:
         m_bank = query_job_idx % 2
         exp_bank = tick % 2
         score_ub_slot = self.qk_ub.next_read()
-        score_ub = reinterpret(
-            score_ub_slot,
-            layout=make_layout((_VEC_TILE_M, _TILE), stride=(_TILE, 1)),
+        score_ub = from_tensor(
+            score_ub_slot, layout=make_layout((_VEC_TILE_M, _TILE), stride=(_TILE, 1))
         )
         if kv_tile_idx == 0:
             sink_ub_write = self.vector.sinks_ub.next_write()
@@ -2341,9 +2337,8 @@ class SparseFlashMlaSwaHcaKernel:
         m_bank = query_job_idx % 2
         exp_bank = tick % 2
         score_ub_slot = self.qk_ub.next_read()
-        score_ub = reinterpret(
-            score_ub_slot,
-            layout=make_layout((_VEC_TILE_M, _TILE), stride=(_TILE, 1)),
+        score_ub = from_tensor(
+            score_ub_slot, layout=make_layout((_VEC_TILE_M, _TILE), stride=(_TILE, 1))
         )
         if kv_tile_idx == 0:
             sink_ub_write = self.vector.sinks_ub.next_write()
@@ -3184,9 +3179,8 @@ class SparseFlashMlaOriSparseKernel:
         m_bank = query_job_idx % 2
         exp_bank = tick % 2
         score_ub_slot = self.qk_ub.next_read()
-        score_ub = reinterpret(
-            score_ub_slot,
-            layout=make_layout((_VEC_TILE_M, _TILE), stride=(_TILE, 1)),
+        score_ub = from_tensor(
+            score_ub_slot, layout=make_layout((_VEC_TILE_M, _TILE), stride=(_TILE, 1))
         )
         if kv_tile_idx == 0:
             sink_ub_write = self.vector.sinks_ub.next_write()

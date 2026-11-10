@@ -30,6 +30,7 @@ manipulation and a small gather table, then packed two-per-byte.
 # directly or writes partials into workspace for a later reduction.
 
 from __future__ import annotations
+from cannbotdsl import from_tensor
 
 __all__ = [
     "IndexerPrologueQw",
@@ -57,7 +58,6 @@ from cannbotdsl import (
     TensorSpec,
     compile as dsl_compile,
     const_expr,
-    convert,
     copy_options,
     dtypes,
     host,
@@ -119,7 +119,7 @@ from cannbotdsl.ops.sync import (
     vec_sync_all,
     vec_sync_block_wait,
 )
-from cannbotdsl.tensor import reinterpret, tile_slice
+from cannbotdsl.tensor import tile_slice
 
 Float8E4M3FN = dtypes.float8_e4m3fn
 Float8E8M0 = dtypes.float8_e8m0
@@ -130,7 +130,7 @@ def tile_view(tensor, tiler, coord):
 
 
 def local_slice(tensor, shape, stride=None, offset=0):
-    return reinterpret(tensor, layout=make_layout(shape, stride=stride), offset=offset)
+    return from_tensor(tensor, layout=make_layout(shape, stride=stride), offset=offset)
 
 
 def _mx_scale_view(tensor):
@@ -1179,7 +1179,7 @@ class CubeQ:
                     wqb_gm, descale_wqb_gm, head, kw + 1, (kw + 1) % p.n_buf_wqb
                 )
             buf = kw % p.n_buf_wqb
-            wqb_ready = reinterpret(self.wqb_l1[buf].next_read(), dtype=Float8E4M3FN)
+            wqb_ready = from_tensor(self.wqb_l1[buf].next_read(), dtype=Float8E4M3FN)
             scale_ready = self.scale_wqb_l1.next_read()
             for kk in range_constexpr(p.step_k_q):
                 k_l0 = kw * p.step_k_q + kk
@@ -1464,7 +1464,7 @@ class CubeW:
         c_rows = self.c_rows(self.l0c.next_read(), rows_l1)
         mem_copy(
             tile_view(self.w_gm, (p.base_m, p.base_n_w), (tile, 0)),
-            convert(c_rows, c_rows.dtype, scale=self.softmax_scale),
+            c_rows.convert(c_rows.dtype, scale=self.softmax_scale),
             options=copy_options(l2_cache_ctl=L2_W),
         )
 
@@ -1492,7 +1492,7 @@ class CubeW:
             tile_view(
                 self.workspace_gm, (p.base_m, p.base_n_w), (h_block * n_tiles + tile, 0)
             ),
-            convert(c_rows, c_rows.dtype, scale=self.softmax_scale),
+            c_rows.convert(c_rows.dtype, scale=self.softmax_scale),
             options=copy_options(l2_cache_ctl=L2_W),
         )
 

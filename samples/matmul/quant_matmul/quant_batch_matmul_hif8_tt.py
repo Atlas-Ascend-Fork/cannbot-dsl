@@ -31,6 +31,8 @@ how QuantBatchMatmulV3 passes ``deqScalar`` to AscendC Fixpipe):
     ``quant_batch_matmul_mx``.
 """
 
+from cannbotdsl import from_tensor
+
 __all__ = ["npu_quant_matmul"]
 
 import math
@@ -47,7 +49,7 @@ from cannbotdsl.lang.kernel import kernel
 from cannbotdsl.ops.matmul import matmul
 from cannbotdsl import MemLoc, Tensor
 from cannbotdsl.tensor import tile_slice
-from cannbotdsl.ops.memcpy import copy_options, mem_copy, convert
+from cannbotdsl.ops.memcpy import copy_options, mem_copy
 
 
 # ============================================================================
@@ -669,10 +671,11 @@ class QbmmTtKernel:
                 b_panel = gm_b[n_start : n_start + n_count, None]
             else:
                 b_panel = gm_b[None, n_start : n_start + n_count]
-            l0c_acc = (
-                l0c.next_write()
-                .bare()
-                .view(make_layout(gm_c_tile.shape), dtype=l0c_dtype, data_format="nz")
+            l0c_acc = from_tensor(
+                l0c.next_write(),
+                layout=make_layout(gm_c_tile.shape),
+                dtype=l0c_dtype,
+                data_format="nz",
             )
             for k_l1_idx in range(k_l1_tiles):
                 k_start = k_l1_idx * tiling.k_l1
@@ -730,14 +733,19 @@ class QbmmTtKernel:
                     b_source = (
                         l1_b_slice if tiling.transpose_b else l1_b_slice.permute(1, 0)
                     )
-                    l0a_tensor = l0a.next_write(bare=True)
-                    l0a_tensor = l0a_tensor.view(make_layout(a_source.shape))
+                    l0a_tensor = l0a.next_write()
+                    l0a_tensor = from_tensor(
+                        l0a_tensor, layout=make_layout(a_source.shape)
+                    )
                     mem_copy(l0a_tensor, a_source)
-                    l0b_tensor = l0b.next_write(bare=True)
-                    l0b_tensor = l0b_tensor.view(make_layout(b_source.shape))
+                    l0b_tensor = l0b.next_write()
+                    l0b_tensor = from_tensor(
+                        l0b_tensor, layout=make_layout(b_source.shape)
+                    )
                     mem_copy(l0b_tensor, b_source)
-                    c_view = l0c_acc.bare().view(
-                        make_layout((l0a_tensor.shape[0], l0b_tensor.shape[0])),
+                    c_view = from_tensor(
+                        l0c_acc,
+                        layout=make_layout((l0a_tensor.shape[0], l0b_tensor.shape[0])),
                         dtype=l0c_dtype,
                         data_format="nz",
                     )
@@ -754,7 +762,7 @@ class QbmmTtKernel:
 
             mem_copy(
                 gm_c_tile,
-                convert(l0c_tensor, gm_c_tile.dtype, scale=deq_scale),
+                l0c_tensor.convert(gm_c_tile.dtype, scale=deq_scale),
                 options=copy_options(unit_flag=3),
             )
 

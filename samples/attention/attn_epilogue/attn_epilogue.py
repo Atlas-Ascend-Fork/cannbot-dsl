@@ -8,6 +8,8 @@
 
 """Fused local attention output projection for NG=8/2/1 and ND/NZ weights."""
 
+from cannbotdsl import from_tensor
+
 from collections import OrderedDict
 from dataclasses import dataclass
 from functools import lru_cache
@@ -31,6 +33,8 @@ from cannbotdsl.ops import reg
 from cannbotdsl.ops.arch import (
     get_block_idx,
     get_block_num,
+    get_ctrl,
+    set_ctrl,
     get_subblock_dim,
     get_subblock_id,
 )
@@ -86,7 +90,7 @@ _BUFFER_POSITIONAL_PARAMETERS = tuple(
     in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
 )
 _BUFFER_USES_LAYOUT = _BUFFER_POSITIONAL_PARAMETERS[1:3] == ("dtype", "layout")
-_REINTERPRET_USES_LAYOUT = "layout" in inspect.signature(dsl.reinterpret).parameters
+_REINTERPRET_USES_LAYOUT = True
 
 
 @jit
@@ -313,14 +317,12 @@ def _operand_channel(
     stride = shape[0] * shape[1] * element_bytes
     for slot in range(depth):
         buffers.append(
-            dsl.reinterpret(
+            from_tensor(
                 storage,
                 dtype=dtype,
-                **(
-                    {"layout": make_layout(shape)}
-                    if _REINTERPRET_USES_LAYOUT
-                    else {"shape": shape}
-                ),
+                **{"layout": make_layout(shape)}
+                if _REINTERPRET_USES_LAYOUT
+                else {"shape": shape},
                 offset=offset + slot * stride,
                 data_format=data_format or "nz",
             )
@@ -1044,6 +1046,19 @@ _CACHE_LIMIT = 8
 
 def get_scratch(device, t, capture, ng=NG):
     """Reuse four byte workspaces per device/stream/shape; capture allocates in its graph pool."""
+    if torch.compiler.is_compiling():
+        m = (t + 15) // 16 * 16
+        k = ng * O_LORA
+        rows = ng * m
+        return tuple(
+            torch.empty(shape, dtype=dtype, device=device)
+            for shape, dtype in (
+                ((rows, 4096), torch.uint8),
+                ((rows, 128), torch.uint8),
+                ((m, k), torch.uint8),
+                ((m, k // 32), torch.uint8),
+            )
+        )
     stream = torch.npu.current_stream(device)
     key = (device, stream.npu_stream, t, ng)
     # Capture gets graph-pool storage, independent of eager calls and other graphs.
@@ -1080,10 +1095,12 @@ def projection_shape(o, woa, wob):
 
 def core_budget(ref):
     """Return (device, AIC blocks, AIV blocks) without caching stream quotas."""
+    if torch.compiler.is_compiling():
+        return ref.device.index or 0, 28, 56
     device = ref.device.index
     if device is None:
         device = torch.npu.current_device()
-    info = dsl.get_platform_info(stream=torch.npu.current_stream(device))
+    info = dsl.get_platform_info()
     cube, vector = int(info.cube_core_num), int(info.vector_core_num)
     if cube <= 0 or vector < 2:
         raise RuntimeError(f"Invalid MIX core quota: AIC={cube}, AIV={vector}")
@@ -1238,6 +1255,11 @@ class AttnEpilogueKernel:
         gm_out,
     ):
         """Fuse RoPE/QuantA, grouped MM1/QuantY, and MM2 with explicit producer barriers."""
+        saved_ctrl = get_ctrl()
+        fp8_saturation_mask = 1 << 48
+        set_ctrl(
+            saved_ctrl - (saved_ctrl // fp8_saturation_mask % 2) * fp8_saturation_mask
+        )
         t = self.t
         ng = self.ng
         m_pad = self.m_pad
@@ -1281,6 +1303,7 @@ class AttnEpilogueKernel:
             gm_out,
             MatmulShape(1, self.dim, k2, m_pad),
         )
+        set_ctrl(saved_ctrl)
 
     @jit
     def _first_matmul(self):
@@ -1542,24 +1565,23 @@ def attn_epilogue(o, woa, wob, descale_woa, descale_wob, rope_sin, rope_cos):
     shape = projection_shape(o, woa, wob)
     t, ng = shape.t, shape.ng
     m = (t + 15) // 16 * 16
-    with torch.npu.device(o.device):
-        scratch = get_scratch(o.device, t, torch.npu.is_current_stream_capturing(), ng)
-        out = torch.empty((m, DIM), dtype=torch.bfloat16, device=o.device)
-        device, blocks, _ = core_budget(o)
-        _compiled(shape, m, device=device, block_num=blocks)(
-            o.view(t * ng, F),
-            rope_cos,
-            rope_sin,
-            woa if shape.first_nz else woa.view(ng * O_LORA, F),
-            descale_woa.view(torch.uint8)
-            if shape.first_nz
-            else descale_woa.view(torch.uint8).view(ng * O_LORA, F // MX_DIVISOR, 2),
-            wob,
-            descale_wob.view(torch.uint8),
-            *scratch,
-            out,
-        )
-        return out[:t]
+    scratch = get_scratch(o.device, t, False, ng)
+    out = torch.empty((m, DIM), dtype=torch.bfloat16, device=o.device)
+    device, blocks, _ = core_budget(o)
+    _compiled(shape, m, device=device, block_num=blocks)(
+        o.view(t * ng, F),
+        rope_cos,
+        rope_sin,
+        woa if shape.first_nz else woa.view(ng * O_LORA, F),
+        descale_woa.view(torch.uint8)
+        if shape.first_nz
+        else descale_woa.view(torch.uint8).view(ng * O_LORA, F // MX_DIVISOR, 2),
+        wob,
+        descale_wob.view(torch.uint8),
+        *scratch,
+        out,
+    )
+    return out[:t]
 
 
 @export("attn_epilogue")

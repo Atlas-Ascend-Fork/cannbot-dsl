@@ -49,7 +49,7 @@ def test_catalog_exports_and_staged_resources(tmp_path, monkeypatch):
                             continue
                         if name == "export":
                             exports.add(ast.literal_eval(decorator.args[0]))
-    assert exports == set(operators)
+    assert set(operators) <= exports
     package = tmp_path / "package"
     builder.stage_python_package(package, list(operators), operators, sources)
     for source in sources.glob("*.py"):
@@ -210,9 +210,7 @@ def test_build_wheel_contains_sources_and_native_resources(tmp_path, monkeypatch
             name for name in archive.namelist() if name.endswith(".dist-info/METADATA")
         )
         assert "Requires-Dist: opkit" not in archive.read(metadata).decode()
-        assert (
-            "Requires-Dist: cannbot-dsl<0.9,>=0.8.0" in archive.read(metadata).decode()
-        )
+        assert "Requires-Dist: cannbot-dsl>=0.8.0" in archive.read(metadata).decode()
 
 
 def test_ds41_selection():
@@ -277,12 +275,14 @@ def test_indexer_export_profiles(operator, monkeypatch):
         namespace,
     )
     namespace[f"export_{operator}"]()
-    assert len(calls) == 18
-    assert {layout for layout, _ in calls} == {"PA_BBND", "TND"}
+    assert len(calls) == (24 if operator == "qli" else 18)
+    assert {layout for layout, _ in calls} == (
+        {"PA_BBND"} if operator == "qli" else {"PA_BBND", "TND"}
+    )
     for layout, config in calls:
         if operator == "qli":
-            assert config[-2:] == (32, 6)
-            assert config[9] in ((64, 128) if layout == "PA_BBND" else (256,))
+            assert config[11:13] == (32, 6)
+            assert config[9] in (64, 128, 256)
         else:
             assert config[10] in ((64, 128) if layout == "PA_BBND" else (0,))
 

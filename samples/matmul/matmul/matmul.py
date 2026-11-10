@@ -16,6 +16,8 @@ Structure:
 Formula:  C[M,N] = A[M,K] @ B[N,K]^T   (fp16/bf16 inputs, fp32 accumulator)
 """
 
+from cannbotdsl import from_tensor
+
 from cannbotdsl.lang.host import host
 
 __all__ = ["matmul"]
@@ -1082,12 +1084,11 @@ class MatmulKernel:
             gm_c_tile = gm_c[
                 m_origin : m_origin + m_extent, n_origin : n_origin + n_extent
             ]
-            l0c_acc = (
-                l0c.next_write()
-                .bare()
-                .view(
-                    make_layout(gm_c_tile.shape), dtype=dtypes.float32, data_format="nz"
-                )
+            l0c_acc = from_tensor(
+                l0c.next_write(),
+                layout=make_layout(gm_c_tile.shape),
+                dtype=dtypes.float32,
+                data_format="nz",
             )
             for k_l1_idx in range(k_l1_tiles):
                 k_org = k_l1_idx * t.k_l1
@@ -1124,16 +1125,21 @@ class MatmulKernel:
                     l1_b_slice = tile_slice(
                         l1_b_tensor, (t.base_n, t.base_k), (0, k_l0_idx)
                     )
-                    l0a_tensor = l0a.next_write(bare=True)
-                    l0a_tensor = l0a_tensor.view(make_layout(l1_a_slice.shape))
+                    l0a_tensor = l0a.next_write()
+                    l0a_tensor = from_tensor(
+                        l0a_tensor, layout=make_layout(l1_a_slice.shape)
+                    )
                     mem_copy(l0a_tensor, l1_a_slice)
-                    l0b_tensor = l0b.next_write(bare=True)
-                    l0b_tensor = l0b_tensor.view(make_layout(l1_b_slice.shape))
+                    l0b_tensor = l0b.next_write()
+                    l0b_tensor = from_tensor(
+                        l0b_tensor, layout=make_layout(l1_b_slice.shape)
+                    )
                     mem_copy(l0b_tensor, l1_b_slice)
                     global_k = k_l1_idx * k_l0_per_l1 + k_l0_idx
                     is_final = k_l1_idx == k_l1_tiles - 1 and k_l0_idx == k_l0_total - 1
-                    c_view = l0c_acc.bare().view(
-                        make_layout((l0a_tensor.shape[0], l0b_tensor.shape[0])),
+                    c_view = from_tensor(
+                        l0c_acc,
+                        layout=make_layout((l0a_tensor.shape[0], l0b_tensor.shape[0])),
                         dtype=dtypes.float32,
                         data_format="nz",
                     )

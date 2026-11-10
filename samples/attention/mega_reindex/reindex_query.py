@@ -8,17 +8,14 @@
 
 """T-tiled WQ_B + RoPE + FP4 QDQ; L0C -> UB, no Q/RoPE GM intermediates."""
 
+from cannbotdsl import from_tensor
+
 import cannbotdsl as cb
 from cannbotdsl import simt
-from cannbotdsl._mlir.dialects import cannir
 
 from .reindex_runtime import Q_LORA_RANK, QUERY_DIM, ceil_mx_scale, encode_fp4_e2m1
 
-try:
-    from cannbotdsl.core.ir_transport import unwrap_operand
-except ImportError:
-    from cannbotdsl.ir_transport import unwrap_operand
-from cannbotdsl.tensor import make_layout, make_tensor
+from cannbotdsl.tensor import make_layout
 
 from .reindex_mx import (
     MX_K_ALIGN,
@@ -44,10 +41,9 @@ from .reindex_mx import (
 def _fp8_nz_transposed_view(gm_weight, output_size, input_size):
     """Describe packed [N/32,K,32] bytes as logical W.T[K,N]."""
     typed = gm_weight.view(dtype=dtypes.int8)
-    pointer = cannir.extract_pointer(unwrap_operand(typed))
-    return make_tensor(
-        pointer,
-        make_layout((input_size, output_size)),
+    return from_tensor(
+        typed,
+        layout=make_layout((input_size, output_size)),
         physical_layout=make_layout((output_size // 32, input_size // 16, 16, 32)),
         data_format="nz",
     )
@@ -277,7 +273,7 @@ class TailQueryPhase(QbmmMxKernel):
                 # Same kL1 window for the L1→L0A/L0B reads below: select
                 # once per window (full_load keeps A resident in slot 0).
                 a_l1_rd = l1_a.next_read()
-                b_l1_rd = l1_b.next_read().reinterpret(dtype=self.b_dtype)
+                b_l1_rd = from_tensor(l1_b.next_read(), dtype=self.b_dtype)
 
                 # The final kL1 window contains only its valid baseK blocks.
                 current_k_l1 = k_end - k_start
@@ -315,7 +311,7 @@ class TailQueryPhase(QbmmMxKernel):
                     # L1→L0B + MX ScaleB
                     if const_expr(self.prepacked_b):
                         b_l1_tile = tile_slice(
-                            b_l1_rd.reinterpret(dtype=dtypes.float8_e4m3fn),
+                            from_tensor(b_l1_rd, dtype=dtypes.float8_e4m3fn),
                             (self.base_k, self.base_n),
                             (k_l0_idx, 0),
                         )

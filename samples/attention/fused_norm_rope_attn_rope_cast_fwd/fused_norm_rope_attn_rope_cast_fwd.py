@@ -20,6 +20,8 @@ Only compiled programs are cached, using tensor metadata and core quotas.
 All host/device implementation dependencies are contained in this file.
 """
 
+from cannbotdsl import from_tensor
+
 import ctypes
 import cannbotdsl as dsl
 import math
@@ -81,7 +83,6 @@ from cannbotdsl.tensor import (
     make_layout,
     make_pointer,
     make_tensor,
-    reinterpret,
     tile_slice,
     tile_slice_multi,
 )
@@ -282,7 +283,7 @@ def ub_view(view):
 
 def fixed_view(root, shape, dtype, address=0, data_format="nz"):
     return make_buffer(
-        reinterpret(
+        from_tensor(
             root,
             layout=make_layout(shape),
             dtype=dtype,
@@ -303,7 +304,7 @@ class Vector:
         if manual_gather:
             self.gather_buffers = tuple(
                 ub_view(
-                    reinterpret(
+                    from_tensor(
                         root,
                         dtype=dtypes.bfloat16,
                         layout=make_layout((32, 512)),
@@ -315,7 +316,7 @@ class Vector:
         else:
             self.gather = make_ring_buffer(
                 tuple(
-                    reinterpret(
+                    from_tensor(
                         root,
                         dtype=dtypes.bfloat16,
                         layout=make_layout((32, 512)),
@@ -325,38 +326,30 @@ class Vector:
                 )
             )
         scratch = ub_view(
-            reinterpret(
-                root,
-                dtype=dtypes.bfloat16,
-                layout=make_layout((33, 512)),
-                offset=98304,
+            from_tensor(
+                root, dtype=dtypes.bfloat16, layout=make_layout((33, 512)), offset=98304
             )
         )
-        self.nz = reinterpret(
+        self.nz = from_tensor(
             scratch,
             layout=make_layout((32, 512)),
             data_format="nz",
             physical_layout=make_layout((32, 2, 16, 16), stride=(528, 256, 16, 1)),
         )
         self.accum = ub_view(
-            reinterpret(
-                root,
-                dtype=dtypes.float32,
-                layout=make_layout((32, 512)),
-                offset=132096,
+            from_tensor(
+                root, dtype=dtypes.float32, layout=make_layout((32, 512)), offset=132096
             )
         )
-        self.final = reinterpret(
-            self.accum,
-            dtype=dtypes.bfloat16,
-            layout=make_layout((32, 512)),
+        self.final = from_tensor(
+            self.accum, dtype=dtypes.bfloat16, layout=make_layout((32, 512))
         )
         # Four logical publications share the original two physical slots.
         # Each view is read once per flush, so automatic read sharing cannot
         # retain a slot across the explicit acknowledgement and its overwrite.
         self.fragments = tuple(
             ub_view(
-                reinterpret(
+                from_tensor(
                     root,
                     dtype=dtypes.float32,
                     layout=make_layout((32, 128)),
@@ -366,33 +359,26 @@ class Vector:
             for slot in range(4)
         )
         self.score = ub_view(
-            reinterpret(
-                root,
-                dtype=dtypes.float32,
-                layout=make_layout((32, 64)),
-                offset=230400,
+            from_tensor(
+                root, dtype=dtypes.float32, layout=make_layout((32, 64)), offset=230400
             )
         )
-        self.prob = reinterpret(
-            self.score,
-            dtype=dtypes.bfloat16,
-            layout=make_layout((32, 64)),
+        self.prob = from_tensor(
+            self.score, dtype=dtypes.bfloat16, layout=make_layout((32, 64))
         )
         if nz_score:
-            self.prob = reinterpret(
-                self.score,
-                dtype=dtypes.bfloat16,
-                layout=make_layout((4096,)),
+            self.prob = from_tensor(
+                self.score, dtype=dtypes.bfloat16, layout=make_layout((4096,))
             )
             # The raw payload has N0=16; canonical UB fp32 NZ has N0=8.
             # The parent preserves the native 512-float N1 DMA pitch.
             self.score_nz = tile_slice(
-                reinterpret(self.score, layout=make_layout((64, 64)), data_format="nz"),
+                from_tensor(self.score, layout=make_layout((64, 64)), data_format="nz"),
                 (32, 64),
                 (0, 0),
             )
             # Pack BF16 in place with a 512-element gap per N1.
-            self.prob_nz = reinterpret(
+            self.prob_nz = from_tensor(
                 self.score,
                 dtype=dtypes.bfloat16,
                 layout=make_layout((32, 64)),
@@ -401,20 +387,18 @@ class Vector:
             )
         else:
             prob_storage = ub_view(
-                reinterpret(
+                from_tensor(
                     root,
                     dtype=dtypes.bfloat16,
                     layout=make_layout((32, 64)),
                     offset=234496,
                 )
             )
-            self.prob_nz = reinterpret(
-                prob_storage,
-                layout=make_layout((32, 64)),
-                data_format="nz",
+            self.prob_nz = from_tensor(
+                prob_storage, layout=make_layout((32, 64)), data_format="nz"
             )
         self.maximum = ub_view(
-            reinterpret(
+            from_tensor(
                 root,
                 dtype=dtypes.float32,
                 layout=make_layout((128,)),
@@ -422,7 +406,7 @@ class Vector:
             )
         )
         self.base = ub_view(
-            reinterpret(
+            from_tensor(
                 root,
                 dtype=dtypes.float32,
                 layout=make_layout((128,)),
@@ -430,7 +414,7 @@ class Vector:
             )
         )
         self.sum = ub_view(
-            reinterpret(
+            from_tensor(
                 root,
                 dtype=dtypes.float32,
                 layout=make_layout((128,)),
@@ -438,7 +422,7 @@ class Vector:
             )
         )
         self.denorm = ub_view(
-            reinterpret(
+            from_tensor(
                 root,
                 dtype=dtypes.float32,
                 layout=make_layout((128,)),
@@ -446,7 +430,7 @@ class Vector:
             )
         )
         self.scales = ub_view(
-            reinterpret(
+            from_tensor(
                 root,
                 dtype=dtypes.float32,
                 layout=make_layout((256,)),
@@ -454,7 +438,7 @@ class Vector:
             )
         )
         self.indices = ub_view(
-            reinterpret(
+            from_tensor(
                 root,
                 dtype=dtypes.int32,
                 layout=make_layout((INDEX_GROUP_SIZE,)),
@@ -462,7 +446,7 @@ class Vector:
             )
         )
         self.validity = ub_view(
-            reinterpret(
+            from_tensor(
                 root,
                 dtype=dtypes.uint8,
                 layout=make_layout((4 * INDEX_GROUP_SIZE,)),
@@ -470,7 +454,7 @@ class Vector:
             )
         )
         self.delta = ub_view(
-            reinterpret(
+            from_tensor(
                 root,
                 dtype=dtypes.float32,
                 layout=make_layout((4,)),
@@ -479,7 +463,7 @@ class Vector:
         )
         if have_sink:
             self.sink = ub_view(
-                reinterpret(
+                from_tensor(
                     root,
                     dtype=dtypes.float32,
                     layout=make_layout((32,)),
@@ -920,7 +904,7 @@ class Cube:
         # participate in the same automatic two-AIV completion handshake.
         self.k_pool = fixed_view(l1, (180224,), dtypes.bfloat16, 65536, "nd")
         self.k_lo = tuple(
-            reinterpret(
+            from_tensor(
                 self.k_pool,
                 layout=make_layout((32, 512)),
                 data_format="nz",
@@ -929,7 +913,7 @@ class Cube:
             for i in range(4)
         )
         self.k_hi = tuple(
-            reinterpret(
+            from_tensor(
                 self.k_pool,
                 layout=make_layout((32, 512)),
                 data_format="nz",
@@ -947,7 +931,7 @@ class Cube:
         self.score = fixed_view(l0c, (64, 64), dtypes.float32, 131072)
         self.out = fixed_view(l0c, (64, 512), dtypes.float32)
         self.out_fragments = tuple(
-            reinterpret(
+            from_tensor(
                 tile_slice(self.out, (64, 128), (0, column)),
                 layout=make_layout((64, 128)),
                 data_format="nz",
@@ -990,13 +974,13 @@ class Cube:
             else:
                 source = hi
             for row in range_constexpr(2):
-                dst = reinterpret(
+                dst = from_tensor(
                     destination,
                     layout=make_layout((16, 464)),
                     offset=half * 1024 + row * 512,
                     data_format="nz",
                 )
-                src = reinterpret(
+                src = from_tensor(
                     source,
                     layout=make_layout((16, 240)),
                     offset=column * 8192 + row * 512,
@@ -1010,7 +994,7 @@ class Cube:
     @jit
     def pv(self, klo, khi, clear, first_block, last_block):
         set_mmad_direction("n")
-        a = reinterpret(self.a[0], layout=make_layout((64, 64)), data_format="nz")
+        a = from_tensor(self.a[0], layout=make_layout((64, 64)), data_format="nz")
         mem_copy(a, self.s)
         unit_flag = dtypes.int32(0)
         if first_block != 0:
@@ -1019,18 +1003,15 @@ class Cube:
             unit_flag = dtypes.int32(3)
         for column in range_constexpr(4):
             b_slot = self.b[column]
-            b = reinterpret(b_slot, layout=make_layout((128, 64)), data_format="nz")
+            b = from_tensor(b_slot, layout=make_layout((128, 64)), data_format="nz")
             # Transposed K=64, N=128: each K=32 half is a contiguous 8 KiB.
             mem_copy(
-                reinterpret(b, layout=make_layout((128, 32)), data_format="nz"),
+                from_tensor(b, layout=make_layout((128, 32)), data_format="nz"),
                 tile_slice(klo, (32, 128), (0, column)).permute(1, 0),
             )
             mem_copy(
-                reinterpret(
-                    b,
-                    layout=make_layout((128, 32)),
-                    offset=8192,
-                    data_format="nz",
+                from_tensor(
+                    b, layout=make_layout((128, 32)), offset=8192, data_format="nz"
                 ),
                 tile_slice(khi, (32, 128), (0, column)).permute(1, 0),
             )
@@ -2580,7 +2561,7 @@ def pointer_space(space, capacity):
 
 
 def unbound_view(root, shape, dtype, address=0, data_format="nz"):
-    return reinterpret(
+    return from_tensor(
         root,
         layout=make_layout(shape),
         dtype=dtype,
@@ -2600,7 +2581,7 @@ class DirectVector(Vector):
         if manual_gather:
             self.gather_buffers = tuple(
                 identity_view(
-                    reinterpret(
+                    from_tensor(
                         root,
                         dtype=dtypes.bfloat16,
                         layout=make_layout((32, 512)),
@@ -2612,7 +2593,7 @@ class DirectVector(Vector):
         else:
             self.gather = make_ring_buffer(
                 tuple(
-                    reinterpret(
+                    from_tensor(
                         root,
                         dtype=dtypes.bfloat16,
                         layout=make_layout((32, 512)),
@@ -2622,38 +2603,30 @@ class DirectVector(Vector):
                 )
             )
         scratch = identity_view(
-            reinterpret(
-                root,
-                dtype=dtypes.bfloat16,
-                layout=make_layout((33, 512)),
-                offset=98304,
+            from_tensor(
+                root, dtype=dtypes.bfloat16, layout=make_layout((33, 512)), offset=98304
             )
         )
-        self.nz = reinterpret(
+        self.nz = from_tensor(
             scratch,
             layout=make_layout((32, 512)),
             data_format="nz",
             physical_layout=make_layout((32, 2, 16, 16), stride=(528, 256, 16, 1)),
         )
         self.accum = identity_view(
-            reinterpret(
-                root,
-                dtype=dtypes.float32,
-                layout=make_layout((32, 512)),
-                offset=132096,
+            from_tensor(
+                root, dtype=dtypes.float32, layout=make_layout((32, 512)), offset=132096
             )
         )
-        self.final = reinterpret(
-            self.accum,
-            dtype=dtypes.bfloat16,
-            layout=make_layout((32, 512)),
+        self.final = from_tensor(
+            self.accum, dtype=dtypes.bfloat16, layout=make_layout((32, 512))
         )
         # Four logical publications share the original two physical slots.
         # Each view is read once per flush, so automatic read sharing cannot
         # retain a slot across the explicit acknowledgement and its overwrite.
         self.fragments = tuple(
             identity_view(
-                reinterpret(
+                from_tensor(
                     root,
                     dtype=dtypes.float32,
                     layout=make_layout((32, 128)),
@@ -2663,23 +2636,16 @@ class DirectVector(Vector):
             for slot in range(4)
         )
         self.score = identity_view(
-            reinterpret(
-                root,
-                dtype=dtypes.float32,
-                layout=make_layout((32, 64)),
-                offset=230400,
+            from_tensor(
+                root, dtype=dtypes.float32, layout=make_layout((32, 64)), offset=230400
             )
         )
-        self.prob = reinterpret(
-            self.score,
-            dtype=dtypes.bfloat16,
-            layout=make_layout((32, 64)),
+        self.prob = from_tensor(
+            self.score, dtype=dtypes.bfloat16, layout=make_layout((32, 64))
         )
         if nz_score:
-            self.prob = reinterpret(
-                self.score,
-                dtype=dtypes.bfloat16,
-                layout=make_layout((4096,)),
+            self.prob = from_tensor(
+                self.score, dtype=dtypes.bfloat16, layout=make_layout((4096,))
             )
             # The raw payload has N0=16; canonical UB fp32 NZ has N0=8.
             # The parent preserves the native 512-float N1 DMA pitch.
@@ -2694,16 +2660,14 @@ class DirectVector(Vector):
                 )
             else:
                 self.score_nz = tile_slice(
-                    reinterpret(
-                        self.score,
-                        layout=make_layout((64, 64)),
-                        data_format="nz",
+                    from_tensor(
+                        self.score, layout=make_layout((64, 64)), data_format="nz"
                     ),
                     (32, 64),
                     (0, 0),
                 )
             # Pack BF16 in place with a 512-element gap per N1.
-            self.prob_nz = reinterpret(
+            self.prob_nz = from_tensor(
                 self.score,
                 dtype=dtypes.bfloat16,
                 layout=make_layout((32, 64)),
@@ -2712,20 +2676,18 @@ class DirectVector(Vector):
             )
         else:
             prob_storage = identity_view(
-                reinterpret(
+                from_tensor(
                     root,
                     dtype=dtypes.bfloat16,
                     layout=make_layout((32, 64)),
                     offset=234496,
                 )
             )
-            self.prob_nz = reinterpret(
-                prob_storage,
-                layout=make_layout((32, 64)),
-                data_format="nz",
+            self.prob_nz = from_tensor(
+                prob_storage, layout=make_layout((32, 64)), data_format="nz"
             )
         self.maximum = identity_view(
-            reinterpret(
+            from_tensor(
                 root,
                 dtype=dtypes.float32,
                 layout=make_layout((128,)),
@@ -2733,7 +2695,7 @@ class DirectVector(Vector):
             )
         )
         self.base = identity_view(
-            reinterpret(
+            from_tensor(
                 root,
                 dtype=dtypes.float32,
                 layout=make_layout((128,)),
@@ -2741,7 +2703,7 @@ class DirectVector(Vector):
             )
         )
         self.sum = identity_view(
-            reinterpret(
+            from_tensor(
                 root,
                 dtype=dtypes.float32,
                 layout=make_layout((128,)),
@@ -2749,7 +2711,7 @@ class DirectVector(Vector):
             )
         )
         self.denorm = identity_view(
-            reinterpret(
+            from_tensor(
                 root,
                 dtype=dtypes.float32,
                 layout=make_layout((128,)),
@@ -2757,7 +2719,7 @@ class DirectVector(Vector):
             )
         )
         self.scales = identity_view(
-            reinterpret(
+            from_tensor(
                 root,
                 dtype=dtypes.float32,
                 layout=make_layout((256,)),
@@ -2765,7 +2727,7 @@ class DirectVector(Vector):
             )
         )
         self.indices = identity_view(
-            reinterpret(
+            from_tensor(
                 root,
                 dtype=dtypes.int32,
                 layout=make_layout((INDEX_GROUP_SIZE,)),
@@ -2773,7 +2735,7 @@ class DirectVector(Vector):
             )
         )
         self.validity = identity_view(
-            reinterpret(
+            from_tensor(
                 root,
                 dtype=dtypes.uint8,
                 layout=make_layout((4 * INDEX_GROUP_SIZE,)),
@@ -2781,7 +2743,7 @@ class DirectVector(Vector):
             )
         )
         self.addresses = identity_view(
-            reinterpret(
+            from_tensor(
                 root,
                 dtype=dtypes.uint64,
                 layout=make_layout((INDEX_PAIRS_PER_GROUP,)),
@@ -2789,7 +2751,7 @@ class DirectVector(Vector):
             )
         )
         self.strides = identity_view(
-            reinterpret(
+            from_tensor(
                 root,
                 dtype=dtypes.uint64,
                 layout=make_layout((INDEX_PAIRS_PER_GROUP,)),
@@ -2797,7 +2759,7 @@ class DirectVector(Vector):
             )
         )
         self.delta = identity_view(
-            reinterpret(
+            from_tensor(
                 root,
                 dtype=dtypes.float32,
                 layout=make_layout((4,)),
@@ -2806,7 +2768,7 @@ class DirectVector(Vector):
         )
         if have_sink:
             self.sink = identity_view(
-                reinterpret(
+                from_tensor(
                     root,
                     dtype=dtypes.float32,
                     layout=make_layout((32,)),
@@ -2832,7 +2794,7 @@ class DirectCube(Cube):
         # participate in the same automatic two-AIV completion handshake.
         self.k_pool = unbound_view(l1, (180224,), dtypes.bfloat16, 65536, "nd")
         self.k_lo = tuple(
-            reinterpret(
+            from_tensor(
                 self.k_pool,
                 layout=make_layout((32, 512)),
                 data_format="nz",
@@ -2841,7 +2803,7 @@ class DirectCube(Cube):
             for i in range(4)
         )
         self.k_hi = tuple(
-            reinterpret(
+            from_tensor(
                 self.k_pool,
                 layout=make_layout((32, 512)),
                 data_format="nz",
@@ -2859,7 +2821,7 @@ class DirectCube(Cube):
         self.score = unbound_view(l0c, (64, 64), dtypes.float32, 131072)
         self.out = unbound_view(l0c, (64, 512), dtypes.float32)
         self.out_fragments = tuple(
-            reinterpret(
+            from_tensor(
                 tile_slice(self.out, (64, 128), (0, column)),
                 layout=make_layout((64, 128)),
                 data_format="nz",
@@ -2958,7 +2920,7 @@ class PipelineVector(DirectVector):
             # Dynamic intervals limit the index DMA to the effective prefix.
             # Keep one full index group in the raw workspace for both K values.
             if length > 0:
-                raw = reinterpret(
+                raw = from_tensor(
                     self.indices,
                     dtype=dtypes.int32,
                     layout=make_layout((1, INDEX_GROUP_SIZE)),
@@ -2985,12 +2947,12 @@ class PipelineVector(DirectVector):
             full = rr.full_mask(32)
             invalid = rr.vdups(self.kv_count, dtypes.uint32)
             stride = rr.vdups(1024, dtypes.uint32)
-            address_words = reinterpret(
+            address_words = from_tensor(
                 self.addresses,
                 dtype=dtypes.uint32,
                 layout=make_layout((2 * INDEX_PAIRS_PER_GROUP,)),
             )
-            stride_words = reinterpret(
+            stride_words = from_tensor(
                 self.strides,
                 dtype=dtypes.uint32,
                 layout=make_layout((2 * INDEX_PAIRS_PER_GROUP,)),
@@ -3122,10 +3084,8 @@ class PipelineVector(DirectVector):
     def gather_block(self, kv, job, tile, global_block):
         stage = self.gathered(global_block)
         if const_expr(self.optimizations & GATHER_BYTE_INTERVAL):
-            stage = reinterpret(
-                stage,
-                dtype=dtypes.uint8,
-                layout=make_layout((32, 1024)),
+            stage = from_tensor(
+                stage, dtype=dtypes.uint8, layout=make_layout((32, 1024))
             )
         vec_get_buf(PIPE.MTE2, 8 + global_block % 3)
         vec_get_buf(PIPE.S, 1)
@@ -3207,7 +3167,7 @@ class PipelineVector(DirectVector):
         vec_get_buf(PIPE.V, 8 + global_block % 3)
         vec_get_buf(PIPE.V, 11)
         sources = tuple(
-            reinterpret(
+            from_tensor(
                 stage,
                 dtype=dtypes.bfloat16,
                 layout=make_layout((16000,)),
@@ -3220,7 +3180,7 @@ class PipelineVector(DirectVector):
             mask = rr.full_mask(16)
             if const_expr(self.optimizations & KV_LOCAL_CURSORS):
                 local_sources = tuple(
-                    reinterpret(
+                    from_tensor(
                         stage,
                         dtype=dtypes.bfloat16,
                         layout=make_layout((16000,)),
@@ -3387,21 +3347,15 @@ class PipelineVector(DirectVector):
 
     @jit
     def softmax_first_block(self, job, scale):
-        maximum = reinterpret(
-            self.maximum,
-            layout=make_layout((64,)),
-            offset=(job % 2) * 256,
+        maximum = from_tensor(
+            self.maximum, layout=make_layout((64,)), offset=(job % 2) * 256
         )
-        base = reinterpret(self.base, layout=make_layout((64,)), offset=(job % 2) * 256)
-        total_sum = reinterpret(
-            self.sum,
-            layout=make_layout((64,)),
-            offset=(job % 2) * 256,
+        base = from_tensor(self.base, layout=make_layout((64,)), offset=(job % 2) * 256)
+        total_sum = from_tensor(
+            self.sum, layout=make_layout((64,)), offset=(job % 2) * 256
         )
-        scales = reinterpret(
-            self.scales,
-            layout=make_layout((64,)),
-            offset=(job % 2) * 512,
+        scales = from_tensor(
+            self.scales, layout=make_layout((64,)), offset=(job % 2) * 512
         )
         vec_sync_intra_wait(PIPE.V, SCORE_FLAG)
         vec_get_buf(PIPE.V, 2 + job % 2)
@@ -3419,7 +3373,7 @@ class PipelineVector(DirectVector):
             scale,
             bool(self.optimizations & 32),
             bool(self.optimizations & 512),
-            reinterpret(self.denorm, dtype=dtypes.uint32, layout=make_layout((128,))),
+            from_tensor(self.denorm, dtype=dtypes.uint32, layout=make_layout((128,))),
             (dtypes.int64(job) % 2) * 64 + 32,
             bool(self.optimizations & FUSED_HISTORY_STATE),
         )
@@ -3428,30 +3382,22 @@ class PipelineVector(DirectVector):
 
     @jit
     def softmax_repacked(self, job, tile, scale, first_tile: Constexpr[int] = -1):
-        maximum_buf = reinterpret(
-            self.maximum,
-            layout=make_layout((64,)),
-            offset=(job % 2) * 256,
+        maximum_buf = from_tensor(
+            self.maximum, layout=make_layout((64,)), offset=(job % 2) * 256
         )
-        base_buf = reinterpret(
-            self.base,
-            layout=make_layout((64,)),
-            offset=(job % 2) * 256,
+        base_buf = from_tensor(
+            self.base, layout=make_layout((64,)), offset=(job % 2) * 256
         )
-        sum_buf = reinterpret(
-            self.sum,
-            layout=make_layout((64,)),
-            offset=(job % 2) * 256,
+        sum_buf = from_tensor(
+            self.sum, layout=make_layout((64,)), offset=(job % 2) * 256
         )
-        scales_buf = reinterpret(
+        scales_buf = from_tensor(
             self.scales,
             layout=make_layout((64,)),
             offset=(job % 2) * 512 + (tile % 2) * 256,
         )
-        history_words = reinterpret(
-            self.denorm,
-            dtype=dtypes.uint32,
-            layout=make_layout((128,)),
+        history_words = from_tensor(
+            self.denorm, dtype=dtypes.uint32, layout=make_layout((128,))
         )
         vec_sync_intra_wait(PIPE.V, SCORE_FLAG)
         vec_get_buf(PIPE.V, 2 + job % 2)
@@ -3461,25 +3407,21 @@ class PipelineVector(DirectVector):
             if const_expr(self.optimizations & SM_LOCAL_VIEWS):
                 job32 = dtypes.uint32(dtypes.int64(job))
                 tile32 = dtypes.uint32(dtypes.int64(tile))
-                maximum_buf = reinterpret(
+                maximum_buf = from_tensor(
                     self.maximum, layout=make_layout((64,)), offset=(job32 % 2) * 256
                 )
-                base_buf = reinterpret(
-                    self.base,
-                    layout=make_layout((64,)),
-                    offset=(job32 % 2) * 256,
+                base_buf = from_tensor(
+                    self.base, layout=make_layout((64,)), offset=(job32 % 2) * 256
                 )
-                sum_buf = reinterpret(
-                    self.sum,
-                    layout=make_layout((64,)),
-                    offset=(job32 % 2) * 256,
+                sum_buf = from_tensor(
+                    self.sum, layout=make_layout((64,)), offset=(job32 % 2) * 256
                 )
-                scales_buf = reinterpret(
+                scales_buf = from_tensor(
                     self.scales,
                     layout=make_layout((64,)),
                     offset=(job32 % 2) * 512 + (tile32 % 2) * 256,
                 )
-                history_words = reinterpret(
+                history_words = from_tensor(
                     self.denorm, dtype=dtypes.uint32, layout=make_layout((128,))
                 )
             if const_expr(self.optimizations & NZ_SHARED_FULL_MASK):
@@ -3725,26 +3667,20 @@ class PipelineVector(DirectVector):
 
     @jit
     def softmax_nd_block(self, job, tile, scale):
-        maximum = reinterpret(
-            self.maximum,
-            layout=make_layout((64,)),
-            offset=(job % 2) * 256,
+        maximum = from_tensor(
+            self.maximum, layout=make_layout((64,)), offset=(job % 2) * 256
         )
-        base = reinterpret(self.base, layout=make_layout((64,)), offset=(job % 2) * 256)
-        total_sum = reinterpret(
-            self.sum,
-            layout=make_layout((64,)),
-            offset=(job % 2) * 256,
+        base = from_tensor(self.base, layout=make_layout((64,)), offset=(job % 2) * 256)
+        total_sum = from_tensor(
+            self.sum, layout=make_layout((64,)), offset=(job % 2) * 256
         )
-        scales = reinterpret(
+        scales = from_tensor(
             self.scales,
             layout=make_layout((64,)),
             offset=(job % 2) * 512 + (tile % 2) * 256,
         )
-        history_words = reinterpret(
-            self.denorm,
-            dtype=dtypes.uint32,
-            layout=make_layout((128,)),
+        history_words = from_tensor(
+            self.denorm, dtype=dtypes.uint32, layout=make_layout((128,))
         )
         vec_sync_intra_wait(PIPE.V, SCORE_FLAG)
         vec_get_buf(PIPE.V, 2 + job % 2)
@@ -3912,7 +3848,7 @@ class PipelineVector(DirectVector):
     def publish_rescale(self, flags, job, tile, scale):
         if tile != 0:
             vec_sync_wait(PIPE.V, PIPE.S, 0)
-            flags.vec[job % 8, tile % 8, self.part] = dtypes.uint32(
+            flags[job % 8, tile % 8, self.part] = dtypes.uint32(
                 self.delta[(job % 2) * 2 + tile % 2] > 6.0 / scale
             )
             vec_sync_intra_arrive(PIPE.S, RESCALE_FLAG)
@@ -3921,17 +3857,13 @@ class PipelineVector(DirectVector):
     def finish_state(
         self, maximum_out, lse_out, job, query, scale, have_sink: Constexpr[bool]
     ):
-        maximum = reinterpret(
-            self.maximum,
-            layout=make_layout((64,)),
-            offset=(job % 2) * 256,
+        maximum = from_tensor(
+            self.maximum, layout=make_layout((64,)), offset=(job % 2) * 256
         )
-        base = reinterpret(self.base, layout=make_layout((64,)), offset=(job % 2) * 256)
-        sums = reinterpret(self.sum, layout=make_layout((64,)), offset=(job % 2) * 256)
-        denorm = reinterpret(
-            self.denorm,
-            layout=make_layout((64,)),
-            offset=(job % 2) * 256,
+        base = from_tensor(self.base, layout=make_layout((64,)), offset=(job % 2) * 256)
+        sums = from_tensor(self.sum, layout=make_layout((64,)), offset=(job % 2) * 256)
+        denorm = from_tensor(
+            self.denorm, layout=make_layout((64,)), offset=(job % 2) * 256
         )
         vec_get_buf(PIPE.V, 2 + job % 2)
         with vf():
@@ -3984,10 +3916,8 @@ class PipelineVector(DirectVector):
     @jit
     def output_block(self, out, flags, job, query, tile, blocks, history):
         # Word 32 in each denorm bank is outside its 32 final inverse values.
-        history_words = reinterpret(
-            self.denorm,
-            dtype=dtypes.uint32,
-            layout=make_layout((128,)),
+        history_words = from_tensor(
+            self.denorm, dtype=dtypes.uint32, layout=make_layout((128,))
         )
         if const_expr(not bool(self.optimizations & FUSED_HISTORY_STATE)):
             vec_get_buf(PIPE.S, 2 + job % 2)
@@ -3999,23 +3929,19 @@ class PipelineVector(DirectVector):
         if tile != 0:
             vec_sync_intra_wait(PIPE.S, RESCALE_FLAG)
             if const_expr(self.optimizations & SSBUF_UINT64):
-                packed_flags = reinterpret(
-                    flags,
-                    dtype=dtypes.uint64,
-                    layout=make_layout((64,)),
+                packed_flags = from_tensor(
+                    flags, dtype=dtypes.uint64, layout=make_layout((64,))
                 )
-                rescale = dtypes.uint32(packed_flags.vec[(job % 8) * 8 + tile % 8] != 0)
+                rescale = dtypes.uint32(packed_flags[(job % 8) * 8 + tile % 8] != 0)
             else:
-                rescale = (
-                    flags.vec[job % 8, tile % 8, 0] + flags.vec[job % 8, tile % 8, 1]
-                )
+                rescale = flags[job % 8, tile % 8, 0] + flags[job % 8, tile % 8, 1]
         if const_expr(self.optimizations & FUSED_HISTORY_STATE):
             history = dtypes.uint32(0)
             if tile != 0 and (rescale != 0 or tile + 1 == blocks):
                 vec_get_buf(PIPE.S, 2 + job % 2)
                 history = history_words[(dtypes.int64(job) % 2) * 64 + 32]
                 vec_release_buf(PIPE.S, 2 + job % 2)
-        scales = reinterpret(
+        scales = from_tensor(
             self.scales,
             layout=make_layout((64,)),
             offset=(job % 2) * 512 + (tile % 2) * 256,
@@ -4062,23 +3988,21 @@ class PipelineVector(DirectVector):
                 vec_release_buf(PIPE.V, 4 + column)
             history = history + dtypes.uint32(1)
         if tile + 1 == blocks:
-            denorm = reinterpret(
-                self.denorm,
-                layout=make_layout((64,)),
-                offset=(job % 2) * 256,
+            denorm = from_tensor(
+                self.denorm, layout=make_layout((64,)), offset=(job % 2) * 256
             )
             for column in range_constexpr(4):
                 vec_get_buf(PIPE.V, 4 + column)
                 vec_sync_intra_wait(PIPE.V, FRAGMENT_FLAG + column % 2)
                 fragment = self.fragments[column]
-                final = reinterpret(
+                final = from_tensor(
                     self.accum,
                     dtype=dtypes.bfloat16,
                     layout=make_layout((32, 128), stride=(1024, 1)),
                     offset=column * 512,
                 )
                 if const_expr(self.optimizations & 8):
-                    history_view = reinterpret(
+                    history_view = from_tensor(
                         self.accum,
                         layout=make_layout((32, 128), stride=(512, 1)),
                         offset=column * 512,
@@ -4352,10 +4276,8 @@ class PipelineCube(DirectCube):
         rescale = dtypes.uint32(0)
         set_mmad_direction("n")
         a_index = self.native_cursor.slot
-        a = reinterpret(
-            self.a_slot(a_index),
-            layout=make_layout((64, 64)),
-            data_format="nz",
+        a = from_tensor(
+            self.a_slot(a_index), layout=make_layout((64, 64)), data_format="nz"
         )
         self.native_cursor.slot = dtypes.uint32((a_index + 1) % 4)
         unit = dtypes.int32(0)
@@ -4364,22 +4286,17 @@ class PipelineCube(DirectCube):
         if tile + 1 == blocks:
             unit = dtypes.int32(3)
         for column in range_constexpr(4):
-            b = reinterpret(
-                self.b[column],
-                layout=make_layout((128, 64)),
-                data_format="nz",
+            b = from_tensor(
+                self.b[column], layout=make_layout((128, 64)), data_format="nz"
             )
             cube_get_buf(PIPE.MTE1, 4 + column)
             mem_copy(
-                reinterpret(b, layout=make_layout((128, 32)), data_format="nz"),
+                from_tensor(b, layout=make_layout((128, 32)), data_format="nz"),
                 tile_slice(klo, (32, 128), (0, column)).permute(1, 0),
             )
             mem_copy(
-                reinterpret(
-                    b,
-                    layout=make_layout((128, 32)),
-                    offset=8192,
-                    data_format="nz",
+                from_tensor(
+                    b, layout=make_layout((128, 32)), offset=8192, data_format="nz"
                 ),
                 tile_slice(khi, (32, 128), (0, column)).permute(1, 0),
             )
@@ -4396,16 +4313,15 @@ class PipelineCube(DirectCube):
                     if const_expr(self.optimizations & SSBUF_EARLY_NOTIFY):
                         cube_pair_arrive(PIPE.S, RESCALE_FLAG)
                     if const_expr(self.optimizations & SSBUF_UINT64):
-                        packed_flags = reinterpret(
+                        packed_flags = from_tensor(
                             flags, dtype=dtypes.uint64, layout=make_layout((64,))
                         )
                         rescale = dtypes.uint32(
-                            packed_flags.cube[(job % 8) * 8 + tile % 8] != 0
+                            packed_flags[(job % 8) * 8 + tile % 8] != 0
                         )
                     else:
                         rescale = (
-                            flags.cube[job % 8, tile % 8, 0]
-                            + flags.cube[job % 8, tile % 8, 1]
+                            flags[job % 8, tile % 8, 0] + flags[job % 8, tile % 8, 1]
                         )
                     if const_expr(not bool(self.optimizations & SSBUF_EARLY_NOTIFY)):
                         cube_pair_arrive(PIPE.S, RESCALE_FLAG)
@@ -4480,7 +4396,7 @@ class FusedVector(PipelineVector):
         start = dtypes.int64(tile // INDEX_TILES_PER_GROUP) * INDEX_GROUP_SIZE
         count = min(max(dtypes.int64(length) - start, 0), INDEX_GROUP_SIZE)
         if count > 0:
-            raw = reinterpret(
+            raw = from_tensor(
                 self.indices,
                 dtype=dtypes.int32,
                 layout=make_layout((1, INDEX_GROUP_SIZE)),
@@ -4547,30 +4463,22 @@ class FusedVector(PipelineVector):
         mask_tile = tile
         if const_expr(self.multi_group):
             mask_tile = tile % INDEX_TILES_PER_GROUP
-        maximum_buf = reinterpret(
-            self.maximum,
-            layout=make_layout((64,)),
-            offset=(job % 2) * 256,
+        maximum_buf = from_tensor(
+            self.maximum, layout=make_layout((64,)), offset=(job % 2) * 256
         )
-        base_buf = reinterpret(
-            self.base,
-            layout=make_layout((64,)),
-            offset=(job % 2) * 256,
+        base_buf = from_tensor(
+            self.base, layout=make_layout((64,)), offset=(job % 2) * 256
         )
-        sum_buf = reinterpret(
-            self.sum,
-            layout=make_layout((64,)),
-            offset=(job % 2) * 256,
+        sum_buf = from_tensor(
+            self.sum, layout=make_layout((64,)), offset=(job % 2) * 256
         )
-        scales_buf = reinterpret(
+        scales_buf = from_tensor(
             self.scales,
             layout=make_layout((64,)),
             offset=(job % 2) * 512 + (tile % 2) * 256,
         )
-        history_words = reinterpret(
-            self.denorm,
-            dtype=dtypes.uint32,
-            layout=make_layout((128,)),
+        history_words = from_tensor(
+            self.denorm, dtype=dtypes.uint32, layout=make_layout((128,))
         )
         vec_sync_intra_wait(PIPE.V, SCORE_FLAG)
         vec_get_buf(PIPE.V, 2 + job % 2)
@@ -4582,25 +4490,21 @@ class FusedVector(PipelineVector):
             if const_expr(self.optimizations & SM_LOCAL_VIEWS):
                 job32 = dtypes.uint32(dtypes.int64(job))
                 tile32 = dtypes.uint32(dtypes.int64(tile))
-                maximum_buf = reinterpret(
+                maximum_buf = from_tensor(
                     self.maximum, layout=make_layout((64,)), offset=(job32 % 2) * 256
                 )
-                base_buf = reinterpret(
-                    self.base,
-                    layout=make_layout((64,)),
-                    offset=(job32 % 2) * 256,
+                base_buf = from_tensor(
+                    self.base, layout=make_layout((64,)), offset=(job32 % 2) * 256
                 )
-                sum_buf = reinterpret(
-                    self.sum,
-                    layout=make_layout((64,)),
-                    offset=(job32 % 2) * 256,
+                sum_buf = from_tensor(
+                    self.sum, layout=make_layout((64,)), offset=(job32 % 2) * 256
                 )
-                scales_buf = reinterpret(
+                scales_buf = from_tensor(
                     self.scales,
                     layout=make_layout((64,)),
                     offset=(job32 % 2) * 512 + (tile32 % 2) * 256,
                 )
-                history_words = reinterpret(
+                history_words = from_tensor(
                     self.denorm, dtype=dtypes.uint32, layout=make_layout((128,))
                 )
             if const_expr(self.optimizations & NZ_SHARED_FULL_MASK):
@@ -4652,7 +4556,7 @@ class FusedVector(PipelineVector):
                 old_sum = rr.vload(sum_buf)
                 rr.vmem_bar("vld_vst")
             if const_expr(self.fuse_score_norm):
-                norm = reinterpret(
+                norm = from_tensor(
                     self.denorm,
                     layout=make_layout((64,)),
                     offset=(dtypes.int64(job) % 2) * 256,
@@ -4895,10 +4799,8 @@ class FusedVector(PipelineVector):
     @jit
     def output_block(self, out, flags, job, query, tile, blocks, history):
         # Word 32 in each denorm bank is outside its 32 final inverse values.
-        history_words = reinterpret(
-            self.denorm,
-            dtype=dtypes.uint32,
-            layout=make_layout((128,)),
+        history_words = from_tensor(
+            self.denorm, dtype=dtypes.uint32, layout=make_layout((128,))
         )
         if const_expr(not bool(self.optimizations & FUSED_HISTORY_STATE)):
             vec_get_buf(PIPE.S, 2 + job % 2)
@@ -4910,23 +4812,19 @@ class FusedVector(PipelineVector):
         if tile != 0:
             vec_sync_intra_wait(PIPE.S, RESCALE_FLAG)
             if const_expr(self.optimizations & SSBUF_UINT64):
-                packed_flags = reinterpret(
-                    flags,
-                    dtype=dtypes.uint64,
-                    layout=make_layout((64,)),
+                packed_flags = from_tensor(
+                    flags, dtype=dtypes.uint64, layout=make_layout((64,))
                 )
-                rescale = dtypes.uint32(packed_flags.vec[(job % 8) * 8 + tile % 8] != 0)
+                rescale = dtypes.uint32(packed_flags[(job % 8) * 8 + tile % 8] != 0)
             else:
-                rescale = (
-                    flags.vec[job % 8, tile % 8, 0] + flags.vec[job % 8, tile % 8, 1]
-                )
+                rescale = flags[job % 8, tile % 8, 0] + flags[job % 8, tile % 8, 1]
         if const_expr(self.optimizations & FUSED_HISTORY_STATE):
             history = dtypes.uint32(0)
             if tile != 0 and (rescale != 0 or tile + 1 == blocks):
                 vec_get_buf(PIPE.S, 2 + job % 2)
                 history = history_words[(dtypes.int64(job) % 2) * 64 + 32]
                 vec_release_buf(PIPE.S, 2 + job % 2)
-        scales = reinterpret(
+        scales = from_tensor(
             self.scales,
             layout=make_layout((64,)),
             offset=(job % 2) * 512 + (tile % 2) * 256,
@@ -4973,16 +4871,14 @@ class FusedVector(PipelineVector):
                 vec_release_buf(PIPE.V, 4 + column)
             history = history + dtypes.uint32(1)
         if tile + 1 == blocks:
-            denorm = reinterpret(
-                self.denorm,
-                layout=make_layout((64,)),
-                offset=(job % 2) * 256,
+            denorm = from_tensor(
+                self.denorm, layout=make_layout((64,)), offset=(job % 2) * 256
             )
             for column in range_constexpr(4):
                 vec_get_buf(PIPE.V, 4 + column)
                 vec_sync_intra_wait(PIPE.V, FRAGMENT_FLAG + column % 2)
                 fragment = self.fragments[column]
-                final = reinterpret(
+                final = from_tensor(
                     self.accum,
                     dtype=dtypes.float32,
                     layout=make_layout((32, 128), stride=(512, 1)),
@@ -5116,7 +5012,7 @@ def dma_sf_store(words, sf, query, head_tile, part, column, s: Constexpr[int]):
         g = head_tile * 8 + part * 4 + group
         mem_copy(
             tile_slice(target, (8, 1), (g * 4 + column, query)),
-            reinterpret(
+            from_tensor(
                 words,
                 layout=make_layout((8, 1), stride=(8, 1)),
                 offset=group * 256,
@@ -5127,7 +5023,7 @@ def dma_sf_store(words, sf, query, head_tile, part, column, s: Constexpr[int]):
             if query + 1 == s:
                 mem_copy(
                     target[g * 32 + column * 8 : g * 32 + column * 8 + 8, s:aligned_s],
-                    reinterpret(
+                    from_tensor(
                         words,
                         layout=make_layout((8, aligned_s - s), stride=(8, 1)),
                         offset=1024,
@@ -5204,12 +5100,12 @@ def preprocess_index_prefix(self, length, job, k: Constexpr[int]):
         full = rr.full_mask(32)
         invalid = rr.vdups(self.kv_count, dtypes.uint32)
         stride = rr.vdups(1024, dtypes.uint32)
-        address_words = reinterpret(
+        address_words = from_tensor(
             self.addresses,
             dtype=dtypes.uint32,
             layout=make_layout((2 * INDEX_PAIRS_PER_GROUP,)),
         )
-        stride_words = reinterpret(
+        stride_words = from_tensor(
             self.strides,
             dtype=dtypes.uint32,
             layout=make_layout((2 * INDEX_PAIRS_PER_GROUP,)),
@@ -5366,10 +5262,8 @@ class SingleCube(PipelineCube):
         if job % 2 == 0:
             mem_copy(
                 tile_slice(
-                    reinterpret(
-                        self.q_lo[0],
-                        layout=make_layout((32, 512)),
-                        data_format="nd",
+                    from_tensor(
+                        self.q_lo[0], layout=make_layout((32, 512)), data_format="nd"
                     ),
                     (28, 512),
                     (0, 0),
@@ -5378,10 +5272,8 @@ class SingleCube(PipelineCube):
             )
             mem_copy(
                 tile_slice(
-                    reinterpret(
-                        self.q_hi[0],
-                        layout=make_layout((32, 512)),
-                        data_format="nd",
+                    from_tensor(
+                        self.q_hi[0], layout=make_layout((32, 512)), data_format="nd"
                     ),
                     (28, 512),
                     (0, 0),
@@ -5391,10 +5283,8 @@ class SingleCube(PipelineCube):
         else:
             mem_copy(
                 tile_slice(
-                    reinterpret(
-                        self.q_lo[1],
-                        layout=make_layout((32, 512)),
-                        data_format="nd",
+                    from_tensor(
+                        self.q_lo[1], layout=make_layout((32, 512)), data_format="nd"
                     ),
                     (28, 512),
                     (0, 0),
@@ -5403,10 +5293,8 @@ class SingleCube(PipelineCube):
             )
             mem_copy(
                 tile_slice(
-                    reinterpret(
-                        self.q_hi[1],
-                        layout=make_layout((32, 512)),
-                        data_format="nd",
+                    from_tensor(
+                        self.q_hi[1], layout=make_layout((32, 512)), data_format="nd"
                     ),
                     (28, 512),
                     (0, 0),
@@ -5442,13 +5330,13 @@ class SingleVector(FusedVector):
         actual = query // self.head_tiles
         head_tile = query % self.head_tiles
         # Full four-head loads stay inside the 4 KiB physical Q tail.
-        scratch = reinterpret(
+        scratch = from_tensor(
             self.nz,
             layout=make_layout((2048,)),
             dtype=dtypes.bfloat16,
             data_format="nd",
         )
-        coeff = reinterpret(
+        coeff = from_tensor(
             self.nz,
             layout=make_layout((64,)),
             dtype=dtypes.float32,
@@ -5459,7 +5347,7 @@ class SingleVector(FusedVector):
         vec_get_buf(PIPE.MTE2, 11)
         source = tile_slice(q, (1, self.h * 512), (actual, 0)).view((32, self.h * 16))
         mem_copy(
-            reinterpret(scratch, layout=make_layout((4, 512)), data_format="nd"),
+            from_tensor(scratch, layout=make_layout((4, 512)), data_format="nd"),
             tile_slice(source, (4, 512), (7, head_tile * 2 + self.part)),
         )
         position = positions[actual]
@@ -5519,7 +5407,7 @@ class SingleVector(FusedVector):
         if self.part == 0:
             if job % 2 == 0:
                 mem_copy(
-                    reinterpret(
+                    from_tensor(
                         cube.q_lo[0],
                         layout=make_layout((2048,)),
                         offset=28672,
@@ -5529,7 +5417,7 @@ class SingleVector(FusedVector):
                 )
             else:
                 mem_copy(
-                    reinterpret(
+                    from_tensor(
                         cube.q_lo[1],
                         layout=make_layout((2048,)),
                         offset=28672,
@@ -5540,7 +5428,7 @@ class SingleVector(FusedVector):
         else:
             if job % 2 == 0:
                 mem_copy(
-                    reinterpret(
+                    from_tensor(
                         cube.q_hi[0],
                         layout=make_layout((2048,)),
                         offset=28672,
@@ -5550,7 +5438,7 @@ class SingleVector(FusedVector):
                 )
             else:
                 mem_copy(
-                    reinterpret(
+                    from_tensor(
                         cube.q_hi[1],
                         layout=make_layout((2048,)),
                         offset=28672,
@@ -5583,7 +5471,7 @@ class SingleVector(FusedVector):
         # releases it after tap5 output, before next tick's Gather(g+4).
         actual = query // self.head_tiles
         head_tile = query % self.head_tiles
-        scratch = reinterpret(
+        scratch = from_tensor(
             self.gathered(global_block + 1),
             layout=make_layout((32, 512)),
             data_format="nd",
@@ -5597,7 +5485,7 @@ class SingleVector(FusedVector):
     def norm_coefficients(self, q, query, job, global_block, eps):
         # Raw Q arrives at early tap3. Produce coefficients at late tap3,
         # after tap5 consumes the prior owner of denorm's two-job bank.
-        scratch = reinterpret(
+        scratch = from_tensor(
             self.gathered(global_block + 1),
             layout=make_layout((32, 512)),
             data_format="nd",
@@ -5662,7 +5550,7 @@ class SingleVector(FusedVector):
                 with vf():
                     full = rr.full_mask(32)
                     heads = rr.vshr(rr.varange(0, dtypes.uint32), 4, mask=full)
-                    norm = reinterpret(
+                    norm = from_tensor(
                         self.denorm,
                         layout=make_layout((64,)),
                         offset=dtypes.int64(bank) * 256,
@@ -5694,28 +5582,17 @@ class SingleVector(FusedVector):
     @jit
     def quantized_output(self, out, sf, positions, cache, query, column):
         fragment = self.fragments[column]
-        packed = reinterpret(
-            fragment,
-            dtype=dtypes.float8_e4m3fn,
-            layout=make_layout((4096,)),
+        packed = from_tensor(
+            fragment, dtype=dtypes.float8_e4m3fn, layout=make_layout((4096,))
         )
-        codes = reinterpret(
-            fragment,
-            dtype=dtypes.int32,
-            layout=make_layout((128,)),
-            offset=4096,
+        codes = from_tensor(
+            fragment, dtype=dtypes.int32, layout=make_layout((128,)), offset=4096
         )
-        words = reinterpret(
-            fragment,
-            dtype=dtypes.int32,
-            layout=make_layout((320,)),
-            offset=4864,
+        words = from_tensor(
+            fragment, dtype=dtypes.int32, layout=make_layout((320,)), offset=4864
         )
-        coeff = reinterpret(
-            fragment,
-            dtype=dtypes.float32,
-            layout=make_layout((64,)),
-            offset=4608,
+        coeff = from_tensor(
+            fragment, dtype=dtypes.float32, layout=make_layout((64,)), offset=4608
         )
         actual = query // self.head_tiles
         head_tile = query % self.head_tiles
@@ -5799,7 +5676,7 @@ class SingleVector(FusedVector):
         group = actual * (self.h // 8) + head_tile * 8 + self.part * 4
         mem_copy(
             tile_slice(out, (4, 1024), (group // 4, column)),
-            reinterpret(packed, layout=make_layout((4, 1024)), data_format="nd"),
+            from_tensor(packed, layout=make_layout((4, 1024)), data_format="nd"),
         )
         vec_release_buf(PIPE.MTE3, 4 + column)
         # FixPipe may overwrite this physical fragment only after its FP8
@@ -5811,27 +5688,27 @@ class SingleVector(FusedVector):
     @jit
     def quantized_output_norm_scratch(self, out, sf, positions, cache, query, column):
         self.fragments[column]
-        packed = reinterpret(
+        packed = from_tensor(
             self.nz,
             dtype=dtypes.float8_e4m3fn,
             layout=make_layout((4096,)),
             data_format="nd",
         )
-        codes = reinterpret(
+        codes = from_tensor(
             self.nz,
             dtype=dtypes.int32,
             layout=make_layout((128,)),
             offset=4096,
             data_format="nd",
         )
-        words = reinterpret(
+        words = from_tensor(
             self.nz,
             dtype=dtypes.int32,
             layout=make_layout((320,)),
             offset=4864,
             data_format="nd",
         )
-        coeff = reinterpret(
+        coeff = from_tensor(
             self.nz,
             dtype=dtypes.float32,
             layout=make_layout((64,)),
@@ -5923,7 +5800,7 @@ class SingleVector(FusedVector):
         group = actual * (self.h // 8) + head_tile * 8 + self.part * 4
         mem_copy(
             tile_slice(out, (4, 1024), (group // 4, column)),
-            reinterpret(packed, layout=make_layout((4, 1024)), data_format="nd"),
+            from_tensor(packed, layout=make_layout((4, 1024)), data_format="nd"),
         )
         vec_release_buf(PIPE.MTE3, 11)
         # Preserve output-scratch protection through DMA completion.
@@ -5941,10 +5818,8 @@ class SingleVector(FusedVector):
             )
             return
         # Word 32 in each denorm bank is outside its 32 final inverse values.
-        history_words = reinterpret(
-            self.denorm,
-            dtype=dtypes.uint32,
-            layout=make_layout((128,)),
+        history_words = from_tensor(
+            self.denorm, dtype=dtypes.uint32, layout=make_layout((128,))
         )
         if const_expr(not bool(self.optimizations & FUSED_HISTORY_STATE)):
             vec_get_buf(PIPE.S, 2 + job % 2)
@@ -5956,23 +5831,19 @@ class SingleVector(FusedVector):
         if tile != 0:
             vec_sync_intra_wait(PIPE.S, RESCALE_FLAG)
             if const_expr(self.optimizations & SSBUF_UINT64):
-                packed_flags = reinterpret(
-                    flags,
-                    dtype=dtypes.uint64,
-                    layout=make_layout((64,)),
+                packed_flags = from_tensor(
+                    flags, dtype=dtypes.uint64, layout=make_layout((64,))
                 )
-                rescale = dtypes.uint32(packed_flags.vec[(job % 8) * 8 + tile % 8] != 0)
+                rescale = dtypes.uint32(packed_flags[(job % 8) * 8 + tile % 8] != 0)
             else:
-                rescale = (
-                    flags.vec[job % 8, tile % 8, 0] + flags.vec[job % 8, tile % 8, 1]
-                )
+                rescale = flags[job % 8, tile % 8, 0] + flags[job % 8, tile % 8, 1]
         if const_expr(self.optimizations & FUSED_HISTORY_STATE):
             history = dtypes.uint32(0)
             if tile != 0 and (rescale != 0 or tile + 1 == blocks):
                 vec_get_buf(PIPE.S, 2 + job % 2)
                 history = history_words[(dtypes.int64(job) % 2) * 64 + 32]
                 vec_release_buf(PIPE.S, 2 + job % 2)
-        scales = reinterpret(
+        scales = from_tensor(
             self.scales,
             layout=make_layout((64,)),
             offset=(job % 2) * 512 + (tile % 2) * 256,
@@ -6019,16 +5890,14 @@ class SingleVector(FusedVector):
                 vec_release_buf(PIPE.V, 4 + column)
             history = history + dtypes.uint32(1)
         if tile + 1 == blocks:
-            denorm = reinterpret(
-                self.denorm,
-                layout=make_layout((64,)),
-                offset=(job % 2) * 256,
+            denorm = from_tensor(
+                self.denorm, layout=make_layout((64,)), offset=(job % 2) * 256
             )
             for column in range_constexpr(4):
                 vec_get_buf(PIPE.V, 4 + column)
                 vec_sync_intra_wait(PIPE.V, FRAGMENT_FLAG + column % 2)
                 fragment = self.fragments[column]
-                final = reinterpret(
+                final = from_tensor(
                     self.accum,
                     dtype=dtypes.float32,
                     layout=make_layout((32, 128), stride=(512, 1)),
@@ -6725,13 +6594,13 @@ def workspace_load_epilogue_bank(
 ):
     # bank is a compile-time literal at every call. There are no Tensor phis,
     # dynamic UB allocations, or shared IDs between either bank or input/output.
-    values = reinterpret(
+    values = from_tensor(
         root,
         dtype=dtypes.float32,
         layout=make_layout((4, 4096)),
         offset=bank * WORKSPACE_UB_BANK_BYTES + WORKSPACE_UB_VALUES,
     )
-    coeff = reinterpret(
+    coeff = from_tensor(
         root,
         dtype=dtypes.float32,
         layout=make_layout((4, 64)),
@@ -6754,31 +6623,31 @@ def workspace_load_epilogue_bank(
 
 @jit
 def workspace_compute_epilogue_bank(root, bank: Constexpr[int]):
-    values = reinterpret(
+    values = from_tensor(
         root,
         dtype=dtypes.float32,
         layout=make_layout((4, 4096)),
         offset=bank * WORKSPACE_UB_BANK_BYTES + WORKSPACE_UB_VALUES,
     )
-    packed = reinterpret(
+    packed = from_tensor(
         root,
         dtype=dtypes.float8_e4m3fn,
         layout=make_layout((4, 4096)),
         offset=bank * WORKSPACE_UB_BANK_BYTES + WORKSPACE_UB_PACKED,
     )
-    codes = reinterpret(
+    codes = from_tensor(
         root,
         dtype=dtypes.int32,
         layout=make_layout((512,)),
         offset=bank * WORKSPACE_UB_BANK_BYTES + WORKSPACE_UB_CODES,
     )
-    words = reinterpret(
+    words = from_tensor(
         root,
         dtype=dtypes.int32,
         layout=make_layout((32, 8)),
         offset=bank * WORKSPACE_UB_BANK_BYTES + WORKSPACE_UB_SF_WORDS,
     )
-    coeff = reinterpret(
+    coeff = from_tensor(
         root,
         dtype=dtypes.float32,
         layout=make_layout((4, 64)),
@@ -6799,22 +6668,20 @@ def workspace_compute_epilogue_bank(root, bank: Constexpr[int]):
 def workspace_store_epilogue_bank(
     root, out, sf, tile, h: Constexpr[int], bank: Constexpr[int]
 ):
-    packed = reinterpret(
+    packed = from_tensor(
         root,
         dtype=dtypes.float8_e4m3fn,
         layout=make_layout((4, 4096)),
         offset=bank * WORKSPACE_UB_BANK_BYTES + WORKSPACE_UB_PACKED,
     )
-    words = reinterpret(
+    words = from_tensor(
         root,
         dtype=dtypes.int32,
         layout=make_layout((32, 8)),
         offset=bank * WORKSPACE_UB_BANK_BYTES + WORKSPACE_UB_SF_WORDS,
     )
-    sf_source = reinterpret(
-        words,
-        layout=make_layout((32, 4), stride=(8, 1)),
-        data_format="nd",
+    sf_source = from_tensor(
+        words, layout=make_layout((32, 4), stride=(8, 1)), data_format="nd"
     )
     sf_target = sf.view((h // 8 * 32, out.shape[0]))
     batch = tile // (h // 8)

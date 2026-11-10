@@ -9,6 +9,7 @@
 """Q/W/K前处理：固定投影切分、模型RoPE、nearest-even量化和双cache发布。"""
 
 from __future__ import annotations
+from cannbotdsl import from_tensor
 
 import os
 from dataclasses import dataclass
@@ -36,7 +37,7 @@ from cannbotdsl.ops.arch import (
     get_subblock_id,
 )
 from cannbotdsl.ops.matmul import matmul
-from cannbotdsl.ops.memcpy import convert, copy_options, mem_copy
+from cannbotdsl.ops.memcpy import copy_options, mem_copy
 from cannbotdsl.ops.reg import (
     PackMode,
     create_mask,
@@ -72,7 +73,6 @@ from cannbotdsl.ops.reg import (
 )
 from cannbotdsl.ops.sync import vec_sync_all
 from cannbotdsl.tensor import make_layout, make_pointer, make_tensor, tile_slice
-from cannbotdsl.tensor import reinterpret as _reinterpret_op
 
 
 def reinterpret(tensor, dtype=None, shape=None, stride=None, offset=0, **kwargs):
@@ -81,7 +81,7 @@ def reinterpret(tensor, dtype=None, shape=None, stride=None, offset=0, **kwargs)
         kwargs["layout"] = (
             make_layout(shape) if stride is None else make_layout(shape, stride=stride)
         )
-    return _reinterpret_op(tensor, dtype=dtype, offset=offset, **kwargs)
+    return from_tensor(tensor, dtype=dtype, offset=offset, **kwargs)
 
 
 # Q/W投影：专用包装器不覆盖原生K接口。
@@ -113,7 +113,7 @@ def make_bounded_tiler(shape, capacity=None, alignment=None):
 
 
 def local_slice(tensor, tiler, stride=None, offset=0):
-    return reinterpret(tensor, shape=tiler, stride=stride, offset=offset)
+    return from_tensor(tensor, layout=make_layout(tiler, stride=stride), offset=offset)
 
 
 def qw_mem_copy(dst, src, *args, **kwargs):
@@ -847,7 +847,7 @@ class CubeQ:
         # DSL 0.8.0 Buffer only accepts data_format 'nd'/'nz'; the ZN scale
         # staging is an ordinary byte allocation rebound to a ZN view.
         self.scale_qr_l1 = _SingleSlot(
-            _reinterpret_op(
+            from_tensor(
                 Buffer(
                     MemLoc.L1,
                     dtypes.uint8,
@@ -1042,7 +1042,7 @@ class CubeQ:
                     wqb_gm, descale_wqb_gm, head, kw + 1, (kw + 1) % p.n_buf_wqb
                 )
             buf = kw % p.n_buf_wqb
-            wqb_ready = reinterpret(self.wqb_l1[buf].next_read(), dtype=Float8E4M3FN)
+            wqb_ready = from_tensor(self.wqb_l1[buf].next_read(), dtype=Float8E4M3FN)
             scale_ready = self.scale_wqb_l1.next_read()
             for kk in range_constexpr(p.step_k_q):
                 k_l0 = kw * p.step_k_q + kk
@@ -1315,8 +1315,7 @@ class CubeW:
         ready = self.l0c.next_read()
         qw_mem_copy(
             tile_view(self.w_gm, (p.base_m, p.base_n_w), (tile, 0)),
-            convert(
-                self.c_rows(ready, rows_l1),
+            self.c_rows(ready, rows_l1).convert(
                 tile_view(self.w_gm, (p.base_m, p.base_n_w), (tile, 0)).dtype,
                 scale=self.softmax_scale,
             ),
@@ -1347,8 +1346,7 @@ class CubeW:
             tile_view(
                 self.workspace_gm, (p.base_m, p.base_n_w), (h_block * n_tiles + tile, 0)
             ),
-            convert(
-                self.c_rows(ready, rows_l1),
+            self.c_rows(ready, rows_l1).convert(
                 tile_view(
                     self.workspace_gm,
                     (p.base_m, p.base_n_w),
@@ -2414,11 +2412,13 @@ def publish_combined_cache(tokens: Tensor, indices: Tensor, cache: Tensor):
                                 rows.next_write(), tile_slice(tokens, (1, 96), (row, 0))
                             )
                             source = rows.next_read()
-                            source32 = reinterpret(
-                                source, dtype=dtypes.uint32, shape=(1, 24)
+                            source32 = from_tensor(
+                                source, layout=make_layout((1, 24)), dtype=dtypes.uint32
                             )
-                            target32 = reinterpret(
-                                target, dtype=dtypes.uint32, shape=(1, 136)
+                            target32 = from_tensor(
+                                target,
+                                layout=make_layout((1, 136)),
+                                dtype=dtypes.uint32,
                             )
                             subslot = current % 8
                             with vf(mode="simd"):

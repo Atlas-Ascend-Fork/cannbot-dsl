@@ -8,6 +8,8 @@
 
 """Metadata-scheduled sparse flash MLA kernels for N1 <= 64."""
 
+from cannbotdsl import from_tensor
+
 import contextlib
 import math
 import numbers
@@ -55,7 +57,7 @@ from cannbotdsl.ops import reg as rr
 from cannbotdsl import Array
 from cannbotdsl.buffer import Buffer
 from cannbotdsl.ring_buffer import RingBuffer
-from cannbotdsl.tensor import make_layout, reinterpret
+from cannbotdsl.tensor import make_layout
 
 
 _BITS_PER_BYTE = 8
@@ -218,7 +220,7 @@ def scalar_select(condition, yes, no):
 
 
 def view_nz(tensor, rows, cols):
-    return reinterpret(tensor, layout=make_layout((rows, cols)), data_format="nz")
+    return from_tensor(tensor, layout=make_layout((rows, cols)), data_format="nz")
 
 
 def get_nz_column_tile(tensor, rows, column_tile):
@@ -228,7 +230,7 @@ def get_nz_column_tile(tensor, rows, column_tile):
 
 def get_bmm1_operand_half(tensor, rows, row_group_idx):
     # QK joins two NZ row groups in one operand buffer.
-    return reinterpret(
+    return from_tensor(
         tensor,
         layout=make_layout((rows, _FP32_VECTOR_LENGTH)),
         offset=row_group_idx * rows * _NZ_ROW * _F16_BYTES,
@@ -239,13 +241,13 @@ def get_bmm1_operand_half(tensor, rows, row_group_idx):
                 _NZ_ROW,
                 _NZ_ROW,
             ),
-            stride=tensor.physical_stride,
+            stride=tensor.physical_layout.stride,
         ),
     )
 
 
 def get_bmm2_operand_half(tensor, kv_row_group_idx):
-    return reinterpret(
+    return from_tensor(
         tensor,
         layout=make_layout((_FP32_VECTOR_LENGTH, _KV_ROWS_PER_VECTOR)),
         offset=kv_row_group_idx
@@ -2583,16 +2585,13 @@ class SparseN64Kernel:
         addresses_ub = self.pa_physical_rows_ub_ring.next_write()
         if batch_idx != staged_batch:
             mem_copy(
-                reinterpret(
-                    self.pa_block_table_ub,
-                    layout=make_layout((1, block_table_width)),
-                ),
+                from_tensor(self.pa_block_table_ub, layout=make_layout((1, block_table_width))),
                 block_table_gm[
                     batch_idx * block_table_width: (batch_idx + 1) * block_table_width,
                 ].view(1, block_table_width),
             )  # fmt: skip
         mem_copy(
-            reinterpret(indices_ub, layout=make_layout((1, sparse_index_stride))),
+            from_tensor(indices_ub, layout=make_layout((1, sparse_index_stride))),
             sparse_indices_gm[
                 query_row_idx * sparse_index_stride: (query_row_idx + 1)
                 * sparse_index_stride,
@@ -2618,11 +2617,11 @@ class SparseN64Kernel:
             kv_physical_rows_gm[
                 self.fd_address_row(query_row_idx) * padded_width: (self.fd_address_row(query_row_idx) + 1) * padded_width,
             ].view(1, padded_width),
-            reinterpret(addresses_ub, layout=make_layout((1, padded_width))),
+            from_tensor(addresses_ub, layout=make_layout((1, padded_width))),
         )  # fmt: skip
         # Preserve fallback slot 0; selection alone has no storage access.
-        self.pa_sparse_indices_ub_ring.next_write(bare=True)
-        self.pa_physical_rows_ub_ring.next_write(bare=True)
+        self.pa_sparse_indices_ub_ring.next_write()
+        self.pa_physical_rows_ub_ring.next_write()
         return batch_idx
 
     @jit
@@ -2726,10 +2725,7 @@ class SparseN64Kernel:
                     if all_queries_valid != 0:
                         if indices_loaded == 0:
                             mem_copy(
-                                reinterpret(
-                                    indices_ub,
-                                    layout=make_layout((1, rows * sparse_index_stride)),
-                                ),
+                                from_tensor(indices_ub, layout=make_layout((1, rows * sparse_index_stride))),
                                 sparse_indices_gm[
                                     first_query_row * sparse_index_stride: (
                                         first_query_row + rows
@@ -2740,10 +2736,7 @@ class SparseN64Kernel:
                             indices_loaded = dtypes.int64(1)
                     else:
                         mem_copy(
-                            reinterpret(
-                                indices_ub,
-                                layout=make_layout((rows * padded_width,)),
-                            )[
+                            from_tensor(indices_ub, layout=make_layout((rows * padded_width,)))[
                                 row * padded_width: row * padded_width
                                 + sparse_index_stride,
                             ].view(1, sparse_index_stride),
@@ -2756,10 +2749,7 @@ class SparseN64Kernel:
                         )  # fmt: skip
                     if batch_idx != staged_batch:
                         mem_copy(
-                            reinterpret(
-                                self.pa_block_table_ub,
-                                layout=make_layout((1, block_table_width)),
-                            ),
+                            from_tensor(self.pa_block_table_ub, layout=make_layout((1, block_table_width))),
                             block_table_gm[
                                 batch_idx * block_table_width: (batch_idx + 1)
                                 * block_table_width,
@@ -2790,10 +2780,7 @@ class SparseN64Kernel:
                                 query_row_idx * padded_width: (query_row_idx + 1)
                                 * padded_width,
                             ].view(1, padded_width),
-                            reinterpret(
-                                addresses_ub,
-                                layout=make_layout((rows * padded_width,)),
-                            )[
+                            from_tensor(addresses_ub, layout=make_layout((rows * padded_width,)))[
                                 row * padded_width: (row + 1) * padded_width,
                             ].view(1, padded_width),
                         )  # fmt: skip
@@ -2803,7 +2790,7 @@ class SparseN64Kernel:
                     first_query_row * padded_width: (first_query_row + rows)
                     * padded_width,
                 ].view(1, rows * padded_width),
-                reinterpret(addresses_ub, layout=make_layout((1, rows * padded_width))),
+                from_tensor(addresses_ub, layout=make_layout((1, rows * padded_width))),
             )  # fmt: skip
         return staged_batch
 
@@ -3480,7 +3467,7 @@ class SparseN64Kernel:
         ) = self.buffer_storage.get_next_bmm2_res_ub_buffers(
             False,
         )
-        attention_out_lower_d_ub = reinterpret(
+        attention_out_lower_d_ub = from_tensor(
             bmm2_res_lower_d_ub,
             self.buffer_storage.dtype,
             layout=make_layout(
@@ -3488,7 +3475,7 @@ class SparseN64Kernel:
                 stride=(_RESULT_HALF_COLS * _F32_BYTES // _F16_BYTES, 1),
             ),
         )
-        attention_out_upper_d_ub = reinterpret(
+        attention_out_upper_d_ub = from_tensor(
             bmm2_res_upper_d_ub,
             self.buffer_storage.dtype,
             layout=make_layout(

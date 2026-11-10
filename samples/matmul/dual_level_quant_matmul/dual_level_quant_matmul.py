@@ -11,6 +11,8 @@
 Requires ND A and FRACTAL_NZ B in FT layout; supports FP16/BF16 output and Bias.
 """
 
+from cannbotdsl import from_tensor
+
 import torch
 import torch_npu
 
@@ -32,12 +34,7 @@ from cannbotdsl.ops.memcpy import (
     mem_copy,
 )
 from cannbotdsl.ops import reg
-from cannbotdsl.tensor import (
-    MemLoc,
-    Tensor,
-    reinterpret,
-    tile_slice,
-)
+from cannbotdsl.tensor import MemLoc, Tensor, tile_slice
 
 __all__ = ["npu_dual_level_quant_matmul"]
 
@@ -698,7 +695,9 @@ class DualLevelQuantMatmulMxfp4Kernel:
         current_step_k = (
             1 if const_expr(self.step_k == 1) else ceil_div(actual_k, self.base_k)
         )
-        l0c_slot = self.l0c.next_write(bare=True).view(make_layout(out_tile.shape))
+        l0c_slot = from_tensor(
+            self.l0c.next_write(), layout=make_layout(out_tile.shape)
+        )
         for k_l0_idx in range(current_step_k):
             a_l1_tile = tile_slice(
                 a_l1_rd,
@@ -722,11 +721,11 @@ class DualLevelQuantMatmulMxfp4Kernel:
             )
             valid_k = min(self.base_k, actual_k - k_l0_idx * self.base_k)
             valid_scale_k = ceil_div(valid_k, MX_K_ALIGN) * MX_SCALE_PAIR
-            a_ready = self.l0a.next_write(bare=True).view(
-                make_layout((out_tile.shape[0], valid_k))
+            a_ready = from_tensor(
+                self.l0a.next_write(), layout=make_layout((out_tile.shape[0], valid_k))
             )
-            b_ready = self.l0b.next_write(bare=True).view(
-                make_layout((out_tile.shape[1], valid_k))
+            b_ready = from_tensor(
+                self.l0b.next_write(), layout=make_layout((out_tile.shape[1], valid_k))
             )
             mem_copy(
                 a_ready,
@@ -779,7 +778,7 @@ class DualLevelQuantMatmulMxfp4Kernel:
         if const_expr(not self.reuse_l1):
             scale_b0_tile = scale_b0_gm[level0_idx : level0_idx + 1, n_start:n_end]
             mem_copy(self.ub_scale_b0.next_write(), scale_b0_tile)
-        partial = reinterpret(
+        partial = from_tensor(
             self.ub_partial.next_read(),
             layout=make_layout(matrix_shape, stride=(self.partial_stride, 1)),
         )
@@ -798,7 +797,7 @@ class DualLevelQuantMatmulMxfp4Kernel:
                 accumulator_offset,
                 output=self.ub_output.next_write(),
             )
-            output_view = reinterpret(
+            output_view = from_tensor(
                 self.ub_output.next_read(),
                 layout=make_layout(matrix_shape, stride=(self.partial_stride, 1)),
             )
@@ -963,7 +962,7 @@ class DualLevelQuantMatmulMxfp4Kernel:
                 a_l1_rd = self.l1_a.next_read()
                 b_l1_rd = self.l1_b.next_read()
                 if const_expr(self.reuse_l1):
-                    b_l1_rd = reinterpret(
+                    b_l1_rd = from_tensor(
                         b_l1_rd, layout=make_layout((self.tile_n, actual_k))
                     )
                     if const_expr(
@@ -1042,7 +1041,7 @@ class DualLevelQuantMatmulMxfp4Kernel:
         l1_storage = cannbotdsl.L1.view(L1_CAPACITY_BYTES)
         self.l1_a = make_ring_buffer(
             [
-                reinterpret(
+                from_tensor(
                     l1_storage,
                     dtype=dtypes.fp4x2_e2m1,
                     layout=make_layout((tile_m, LEVEL0_GROUP_SIZE)),
@@ -1054,7 +1053,7 @@ class DualLevelQuantMatmulMxfp4Kernel:
         )
         self.l1_b = make_ring_buffer(
             [
-                reinterpret(
+                from_tensor(
                     l1_storage,
                     dtype=dtypes.fp4x2_e2m1,
                     layout=make_layout((tile_n, LEVEL0_GROUP_SIZE)),
@@ -1066,7 +1065,7 @@ class DualLevelQuantMatmulMxfp4Kernel:
         )
         self.l1_scale_a = make_ring_buffer(
             [
-                reinterpret(
+                from_tensor(
                     l1_storage,
                     dtype=dtypes.float8_e8m0,
                     layout=make_layout((tile_m, self.scale_k_l1_len)),
@@ -1078,7 +1077,7 @@ class DualLevelQuantMatmulMxfp4Kernel:
         )
         self.l1_scale_b = make_ring_buffer(
             [
-                reinterpret(
+                from_tensor(
                     l1_storage,
                     dtype=dtypes.float8_e8m0,
                     layout=make_layout((self.scale_k_l1_len, tile_n)),

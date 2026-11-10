@@ -12,6 +12,8 @@ Supports full, right-down causal, and sliding-window attention.
 3-stage pipeline (QK -> softmax -> PV -> update), raw-mode Vector.
 """
 
+from cannbotdsl import from_tensor
+
 from dataclasses import dataclass
 from functools import lru_cache
 
@@ -19,17 +21,8 @@ import torch
 
 from cannbotdsl import get_platform_info
 
-from cannbotdsl import (
-    Array,
-    MemLoc,
-    PIPE,
-    RingBuffer,
-    Tensor,
-    dtypes,
-    make_layout,
-    permute,
-)
-from cannbotdsl import reinterpret as dsl_reinterpret
+from cannbotdsl import Array, MemLoc, PIPE, RingBuffer, Tensor, dtypes, make_layout
+
 from cannbotdsl.buffer import Buffer as _Buffer
 from cannbotdsl.ops.memcpy import copy_options, mem_copy as _mem_copy
 from cannbotdsl.ops.sync import onchip_rewind
@@ -159,7 +152,7 @@ def reinterpret(
         and value.data_format in ("nz", "zn")
     ):
         physical = value.physical_layout
-    return dsl_reinterpret(
+    return from_tensor(
         value,
         dtype=dtype,
         layout=layout,
@@ -201,16 +194,16 @@ def mem_copy(
             src = src.partition(dim=engine.split_axis)
         elif part_id is not None:
             if actual is not None:
-                dst = dsl_reinterpret(
+                dst = from_tensor(
                     dst, layout=make_layout(actual), physical_layout=dst.physical_layout
                 )
             dst = dst.partition(dim=engine.split_axis, part_id=part_id)
             actual = dst.shape
     if actual is not None and src.memloc != MemLoc.L0C:
         if src.data_format == "nd":
-            src = reinterpret(src, shape=actual, stride=src.stride)
+            src = from_tensor(src, layout=make_layout(actual, stride=src.stride))
         else:
-            src = dsl_reinterpret(
+            src = from_tensor(
                 src, layout=make_layout(actual), physical_layout=src.physical_layout
             )
     if axis not in (None, 0):
@@ -455,10 +448,10 @@ def _merged_segment(
     if const_expr(s1g):
         count = min(remaining, group - g)
         if const_expr(layout == "TND"):
-            token_major = permute(gm, (1, 0, 2))
+            token_major = gm.permute((1, 0, 2))
             part = token_major[token, head : head + count, None]
         else:
-            token_major = permute(gm, (0, 2, 1, 3))
+            token_major = gm.permute((0, 2, 1, 3))
             part = token_major[batch, token, head : head + count, None]
     else:
         count = min(remaining, length - start % length)
@@ -474,10 +467,8 @@ def _nd_rows(tensor, offset, rows, width, row_stride=None):
     if row_stride is None:
         row_stride = width
     origin = tile_slice(tensor, (1, width), (offset, 0))
-    return reinterpret(
-        origin,
-        shape=(rows, width),
-        stride=(row_stride, 1),
+    return from_tensor(
+        origin, layout=make_layout((rows, width), stride=(row_stride, 1))
     )
 
 
@@ -488,8 +479,8 @@ def _cast_nd_rows(dst, src, rows: int, width):
         full, _ = rr.update_mask(VL_T, elem_bits=32)
         for row in range(rows):
             for col_offset in tuple(range(0, width, VL_T)):
-                src_offset = row * src.physical_stride[0] + col_offset
-                dst_offset = row * dst.physical_stride[0] + col_offset
+                src_offset = row * src.physical_layout.stride[0] + col_offset
+                dst_offset = row * dst.physical_layout.stride[0] + col_offset
                 if const_expr(src.dtype == dtypes.float32):
                     value = rr.vload(src, src_offset)
                     narrowed = rr.vcast(value, dst.dtype, mask=full, rounding="rn")
@@ -645,10 +636,15 @@ class Matmul:
 
     def _active_l0a(self, active_m, active_k):
         # Keep L1's physical pitch. Only the destination is packed to M.
-        return reinterpret(self.l0a.next_write(), shape=(active_m, active_k))
+        return from_tensor(
+            self.l0a.next_write(), layout=make_layout((active_m, active_k))
+        )
 
     def _active_l0c(self, active_m, active_n):
-        return self.l0c.next_write(bare=True)
+        return from_tensor(
+            self.l0c.next_write(),
+            layout=make_layout((active_m, active_n)),
+        )
 
     def _compute_l0a_view(self, active_view):
         # The selected L0 view already carries the active matrix extent.
@@ -677,14 +673,10 @@ class Matmul:
                     (self.tile_n, self.cube_d),
                     (0, d_idx),
                 )
-                k_valid = reinterpret(
-                    k_part,
-                    shape=(valid_n, self.cube_d),
-                )
+                k_valid = reinterpret(k_part, shape=(valid_n, self.cube_d))
                 mem_copy(q_l0a, q_part)
-                k_l0b = reinterpret(
-                    self.qk_l0b.next_write(),
-                    shape=(valid_n, self.cube_d),
+                k_l0b = from_tensor(
+                    self.qk_l0b.next_write(), layout=make_layout((valid_n, self.cube_d))
                 )
                 mem_copy(k_l0b, k_valid)
                 s_l0c = matmul(
@@ -693,13 +685,9 @@ class Matmul:
         else:
             mem_copy(q_l0a, q_source)
             # Retain the L1 source pitch while packing only valid KV rows.
-            k_valid = reinterpret(
-                k_l1,
-                shape=(valid_n, self.cube_d),
-            )
-            k_l0b = reinterpret(
-                self.qk_l0b.next_write(),
-                shape=(valid_n, self.cube_d),
+            k_valid = reinterpret(k_l1, shape=(valid_n, self.cube_d))
+            k_l0b = from_tensor(
+                self.qk_l0b.next_write(), layout=make_layout((valid_n, self.cube_d))
             )
             mem_copy(k_l0b, k_valid)
             s_l0c = matmul(s_l0c, self._compute_l0a_view(q_l0a), k_l0b, init=True)
@@ -710,8 +698,10 @@ class Matmul:
         """PV uses this delayed task's M and the original P storage pitch."""
         p_l0a = self._active_l0a(active_m, p_l1_ch.shape[1])
         o_l0c = self._active_l0c(active_m, self.tile_d)
-        v_l0b = reinterpret(
-            self.pv_l0b.next_write(), shape=(self.tile_n, self.tile_d), data_format="zn"
+        v_l0b = from_tensor(
+            self.pv_l0b.next_write(),
+            layout=make_layout((self.tile_n, self.tile_d)),
+            data_format="zn",
         )
         mem_copy(v_l0b, v_slot)
         mem_copy(p_l0a, p_l1_ch)
@@ -729,9 +719,9 @@ class Matmul:
         mem_copy(p_l0a, p_l1_ch)
         for d_idx in tuple(range(self.d_loops)):
             o_l0c = self._active_l0c(active_m, self.cube_d)
-            v_l0b = reinterpret(
+            v_l0b = from_tensor(
                 self.pv_l0b.next_write(),
-                shape=(self.tile_n, self.cube_d),
+                layout=make_layout((self.tile_n, self.cube_d)),
                 data_format="zn",
             )
             v_part = tile_slice(
@@ -740,14 +730,8 @@ class Matmul:
                 (0, d_idx),
             )
             if valid_n is not None:
-                v_valid = reinterpret(
-                    v_part,
-                    shape=(valid_n, self.cube_d),
-                )
-                v_l0b = reinterpret(
-                    v_l0b,
-                    shape=(valid_n, self.cube_d),
-                )
+                v_valid = reinterpret(v_part, shape=(valid_n, self.cube_d))
+                v_l0b = from_tensor(v_l0b, layout=make_layout((valid_n, self.cube_d)))
                 mem_copy(v_l0b, v_valid)
             else:
                 mem_copy(v_l0b, v_part)
@@ -837,11 +821,10 @@ class Vector:
         if const_expr(tile_d > CUBE_D_TILE):
             # Final cast runs after the last update. Its packed fp16 view
             # reuses the accumulator storage without a second UB allocation.
-            self.o_ub = reinterpret(
+            self.o_ub = from_tensor(
                 self.res_o,
+                layout=make_layout((tile_vec_m, tile_d), stride=(tile_d, 1)),
                 dtype=self.dtype_16,
-                shape=(tile_vec_m, tile_d),
-                stride=(tile_d, 1),
             )
         else:
             self.o_ub = RingBuffer(
@@ -886,7 +869,7 @@ class Vector:
 
     def _nz_params(self, p_ub):
         """Derive NZ fractal addressing from p_ub physical layout stride."""
-        s = p_ub.physical_stride
+        s = p_ub.physical_layout.stride
         s_n1, s_m1, s_m0, s_n0 = s[0], s[1], s[2], s[3]
         m0 = s_m1 // s_m0
         n0 = s_m0 // s_n0
@@ -1005,10 +988,11 @@ class Vector:
             tile_row : tile_row + tile_tokens,
             tile_col : tile_col + tile_valid_n,
         ]
-        target = reinterpret(
+        target = from_tensor(
             self.template_mask_ch,
-            shape=(tile_tokens, tile_valid_n),
-            stride=(group * self.tile_n, 1),
+            layout=make_layout(
+                (tile_tokens, tile_valid_n), stride=(group * self.tile_n, 1)
+            ),
         )
         mem_copy(target, source, engine=self.template_copy)
 
@@ -1111,7 +1095,7 @@ class Vector:
         m0, s_m1, s_m0, block_stride = self._nz_params(p_ub)
         with vf(mode="simd"):
             rows, actual_n = qk_ch.shape
-            src_row_stride = qk_ch.physical_stride[0]
+            src_row_stride = qk_ch.physical_layout.stride[0]
             for row in range(rows):
                 full, _ = rr.update_mask(VL_T, elem_bits=32)
                 half0_mask, _ = rr.update_mask(actual_n, elem_bits=32)
@@ -1172,7 +1156,7 @@ class Vector:
         m0, s_m1, s_m0, block_stride = self._nz_params(p_ub)
         with vf(mode="simd"):
             rows, actual_n = qk_ch.shape
-            src_row_stride = qk_ch.physical_stride[0]
+            src_row_stride = qk_ch.physical_layout.stride[0]
             rowmask, _ = rr.update_mask(rows, elem_bits=32)
             for row in range(rows):
                 full, _ = rr.update_mask(VL_T, elem_bits=32)
@@ -1235,7 +1219,10 @@ class Vector:
 
     def init_o(self, pv_ch):
         """First PV tile: res_o = P0 @ V0."""
-        mem_copy(reinterpret(self.res_o, shape=(pv_ch.shape[0], self.tile_d)), pv_ch)
+        mem_copy(
+            from_tensor(self.res_o, layout=make_layout((pv_ch.shape[0], self.tile_d))),
+            pv_ch,
+        )
 
     @jit
     def init_o_chunk(self, pv_ch, d_offset: int):
@@ -1452,7 +1439,7 @@ class _ExternalLse:
         # S1G rows are adjacent in output GM only when G is one.
         s1g_contiguous_rows = s1g and (group == 1)
         if const_expr(s1g):
-            by_token = permute(by_head, (1, 0, 2))
+            by_token = by_head.permute((1, 0, 2))
 
         # Preserve the original stride path unless S1G output rows are adjacent.
         span = group if s1g else length
@@ -1640,9 +1627,7 @@ class FlashAttnKernel:
                 mem_copy(q_l1, src, engine=self.q_row_copy)
             else:
                 dst = reinterpret(
-                    q_l1,
-                    shape=(count, self.tile_d),
-                    offset=local_row * 32,
+                    q_l1, shape=(count, self.tile_d), offset=local_row * 32
                 )
                 mem_copy(dst, src, engine=self.q_row_copy)
 
@@ -2024,10 +2009,9 @@ class FlashAttnKernel:
                         )
                 else:
                     self._load_merged_mask(batch_idx, tok0, _rows, n_idx)
-        qk_view = reinterpret(
+        qk_view = from_tensor(
             self.qk_ub.next_read(),
-            shape=(actual_vec_m, valid_n),
-            stride=(self.tile_n, 1),
+            layout=make_layout((actual_vec_m, valid_n), stride=(self.tile_n, 1)),
         )
         if const_expr(self.mask_mode != 0):
             # Choose the VF once per block, not dynamically for each row.
@@ -2072,8 +2056,7 @@ class FlashAttnKernel:
             valid_n = v_tile_gm.shape[0]
         # The contraction excludes padded or neighboring-batch KV rows.
         p_l1_view = reinterpret(
-            self.p_l1.next_read(),
-            shape=(self.tile_cube_m, valid_n),
+            self.p_l1.next_read(), shape=(self.tile_cube_m, valid_n)
         )
         if const_expr(self.tile_d > CUBE_D_TILE):
             if const_expr(self._pa_strided and self.tile_cube_m > 64):
@@ -2115,10 +2098,11 @@ class FlashAttnKernel:
         active_rows = ceil_div(rows, 2) if self.subblock_idx == 0 else rows // 2
         if const_expr(self.tile_d > CUBE_D_TILE):
             for d_idx in tuple(range(self.tile_d // CUBE_D_TILE)):
-                pv = reinterpret(
+                pv = from_tensor(
                     self.pv_ubs[d_idx].next_read(),
-                    shape=(active_rows, CUBE_D_TILE),
-                    stride=(CUBE_D_TILE, 1),
+                    layout=make_layout(
+                        (active_rows, CUBE_D_TILE), stride=(CUBE_D_TILE, 1)
+                    ),
                 )
                 if first and last:
                     self.vector.init_o_last_chunk(pv, softmax_sum, d_idx * CUBE_D_TILE)
@@ -2138,10 +2122,9 @@ class FlashAttnKernel:
                         d_idx * CUBE_D_TILE,
                     )
         else:
-            pv = reinterpret(
+            pv = from_tensor(
                 self.pv_ub.next_read(),
-                shape=(active_rows, self.tile_d),
-                stride=(self.tile_d, 1),
+                layout=make_layout((active_rows, self.tile_d), stride=(self.tile_d, 1)),
             )
             if first and last:
                 self.vector.init_o_last(pv, softmax_sum)
@@ -2161,10 +2144,11 @@ class FlashAttnKernel:
             else:
                 sub_lo = 0 if self.subblock_idx == 0 else ceil_div(rows, 2)
                 _cast_nd_rows(
-                    reinterpret(
+                    from_tensor(
                         self.vector.o_ub,
-                        shape=(self.tile_vec_m, self.tile_d),
-                        stride=(self.tile_d, 1),
+                        layout=make_layout(
+                            (self.tile_vec_m, self.tile_d), stride=(self.tile_d, 1)
+                        ),
                     ),
                     self.vector.res_o,
                     active_rows,
@@ -2377,7 +2361,7 @@ class FlashAttnKernel:
                         mem_copy(dest, source)
                 else:
                     if const_expr(self.kv_layout == "PA_BBND"):
-                        page_cache = permute(gm, (0, 2, 1, 3))
+                        page_cache = gm.permute((0, 2, 1, 3))
                     else:
                         page_cache = gm
                     source = page_cache[
@@ -2402,10 +2386,8 @@ class FlashAttnKernel:
                                 value,
                                 load_mask,
                             )
-            nz_half = reinterpret(
-                self.pa_nz_ub,
-                shape=(16, half_d),
-                data_format="nz",
+            nz_half = from_tensor(
+                self.pa_nz_ub, layout=make_layout((16, half_d)), data_format="nz"
             )
             l1_strip = tile_slice(
                 slot,
@@ -2471,7 +2453,7 @@ class FlashAttnKernel:
                     mem_copy(dest, source)
             else:
                 if const_expr(self.kv_layout == "PA_BBND"):
-                    page_cache = permute(gm, (0, 2, 1, 3))
+                    page_cache = gm.permute((0, 2, 1, 3))
                 else:
                     page_cache = gm
                 source = page_cache[
@@ -2493,8 +2475,8 @@ class FlashAttnKernel:
                             value,
                             pa_load_mask,
                         )
-        nz_half = reinterpret(
-            self.pa_nz_ub, shape=(self.tile_n, half_d), data_format="nz"
+        nz_half = from_tensor(
+            self.pa_nz_ub, layout=make_layout((self.tile_n, half_d)), data_format="nz"
         )
         mem_copy(slot, nz_half, engine=self.pa_ub_to_l1, part_id=self.subblock_idx)
         return slot
@@ -2530,9 +2512,9 @@ class FlashAttnKernel:
                     self._block_table[batch_idx, token // self._pa_block_size]
                 )
                 d0 = 16
-                raw_slot = reinterpret(
+                raw_slot = from_tensor(
                     slot,
-                    shape=(self.tile_d // d0, self.tile_n * d0),
+                    layout=make_layout((self.tile_d // d0, self.tile_n * d0)),
                     data_format="nd",
                 )
                 if const_expr(gm.stride[3] == d0 and gm.stride[4] == 1):
@@ -2570,7 +2552,7 @@ class FlashAttnKernel:
                         page : page + 1, kv_head, page_row : page_row + take, None
                     ]
                 else:
-                    source = permute(gm, (0, 2, 1, 3))[
+                    source = gm.permute((0, 2, 1, 3))[
                         page : page + 1, kv_head, page_row : page_row + take, None
                     ]
                 source = tile_slice(source, (1, self.tile_n, self.tile_d), (0, 0, 0))
@@ -2579,9 +2561,9 @@ class FlashAttnKernel:
                 # block. Only take rows are written, and copied + take is
                 # bounded by valid_n, so the fixed-pitch alias never writes
                 # beyond this slot.
-                dest = reinterpret(
+                dest = from_tensor(
                     slot,
-                    shape=(self.tile_n, self.tile_d),
+                    layout=make_layout((self.tile_n, self.tile_d)),
                     offset=dtypes.int64(copied * 32),
                 )
                 mem_copy(dest, source, engine=self.pa_page_nd2nz)
@@ -2649,7 +2631,7 @@ class FlashAttnKernel:
             width = min(capacity, end - start - offset)
             mem_copy(
                 gm[base + start + offset : base + start + offset + width, None],
-                reinterpret(source, shape=(width, 1), stride=(1, 1)),
+                from_tensor(source, layout=make_layout((width, 1), stride=(1, 1))),
             )
 
     @jit
@@ -2745,7 +2727,9 @@ class FlashAttnKernel:
                 zeros_reg = rr.vdups(0.0, dtypes.float32, mask=mask)
                 rr.vstore(self.vector.res_o, offset, zeros_reg, mask=mask)
         vec_sync_all()
-        out_zero = reinterpret(self.vector.res_o, self.dtype_16, (fp16_capacity, 1))
+        out_zero = from_tensor(
+            self.vector.res_o, self.dtype_16, make_layout((fp16_capacity, 1))
+        )
 
         for batch in range(self._batch_size):
             used_q = dtypes.int64(self._q_length(batch))
@@ -3249,10 +3233,9 @@ class _CombineHelper:
         softmax row state): the 8-lane ASC LSE layout makes the lane-0
         reads strided, which the vectorized column form cannot express.
         """
-        o_in_view = reinterpret(
+        o_in_view = from_tensor(
             self.o_in.next_read(),
-            shape=(active_rows, self.tile_d),
-            stride=(self.tile_d, 1),
+            layout=make_layout((active_rows, self.tile_d), stride=(self.tile_d, 1)),
         )
         lse_in = self.lse_in.next_read()
         with vf(mode="simd"):
@@ -3360,10 +3343,11 @@ class _CombineHelper:
                     self._merge_slot(rows)
                 self.vector._finalize_div_vf(self.run_den, rows)
                 _cast_nd_rows(
-                    reinterpret(
+                    from_tensor(
                         self.vector.o_ub,
-                        shape=(self.tile_vec_m, self.tile_d),
-                        stride=(self.tile_d, 1),
+                        layout=make_layout(
+                            (self.tile_vec_m, self.tile_d), stride=(self.tile_d, 1)
+                        ),
                     ),
                     self.vector.res_o,
                     rows,
@@ -3491,22 +3475,22 @@ class FlashAttnLauncher:
         # indexing only; it must not select a different task model.
         s1g_mapping = self.s1g_mapping
         if const_expr(self.layout_q == "BSND"):
-            query = permute(query, (0, 2, 1, 3))
+            query = query.permute((0, 2, 1, 3))
         if const_expr(self.layout_kv == "BSND"):
-            key = permute(key, (0, 2, 1, 3))
-            value = permute(value, (0, 2, 1, 3))
+            key = key.permute((0, 2, 1, 3))
+            value = value.permute((0, 2, 1, 3))
         if const_expr(self.layout_out == "BSND"):
-            attn_out = permute(attn_out, (0, 2, 1, 3))
+            attn_out = attn_out.permute((0, 2, 1, 3))
         # TND arrives as (T, N, D) and becomes (N, T, D) so that narrowing the
         # head leaves the token axis second-to-last, where a rank-2 tiler can
         # reach it. This is a VIEW: no bytes move, and the row pitch stays N*D.
         if const_expr(self.layout_q == "TND"):
-            query = permute(query, (1, 0, 2))
+            query = query.permute((1, 0, 2))
         if const_expr(self.layout_kv == "TND"):
-            key = permute(key, (1, 0, 2))
-            value = permute(value, (1, 0, 2))
+            key = key.permute((1, 0, 2))
+            value = value.permute((1, 0, 2))
         if const_expr(self.layout_out == "TND"):
-            attn_out = permute(attn_out, (1, 0, 2))
+            attn_out = attn_out.permute((1, 0, 2))
 
         head_dim = query.shape[-1]
         if const_expr(self._has_tile_config):

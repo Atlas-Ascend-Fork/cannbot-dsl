@@ -9,6 +9,7 @@
 """QLI准备、KV128流水、Token TopK和候选块选择；不读取外部Metadata。"""
 
 from __future__ import annotations
+from cannbotdsl import from_tensor
 
 from typing import Optional
 
@@ -26,7 +27,6 @@ from cannbotdsl.ops.matmul import matmul
 from cannbotdsl.ops.memcpy import copy_options, mem_copy
 from cannbotdsl.ops.sync import global_sync_all, onchip_rewind, vec_sync_all
 from cannbotdsl.tensor import make_layout, make_pointer, make_tensor, tile_slice
-from cannbotdsl.tensor import reinterpret as _reinterpret_op
 
 
 def reinterpret(tensor, dtype=None, shape=None, stride=None, offset=0, **kwargs):
@@ -35,7 +35,7 @@ def reinterpret(tensor, dtype=None, shape=None, stride=None, offset=0, **kwargs)
         kwargs["layout"] = (
             make_layout(shape) if stride is None else make_layout(shape, stride=stride)
         )
-    return _reinterpret_op(tensor, dtype=dtype, offset=offset, **kwargs)
+    return from_tensor(tensor, dtype=dtype, offset=offset, **kwargs)
 
 
 QUERY_TILE_ROWS = 6
@@ -442,8 +442,9 @@ class QliRawTopKSelector(_RawTopKSelectorBase):
         if not self.pipelined:
             merge_slot = merge.next_write()
             mem_copy(
-                reinterpret(
-                    _offset_view(merge_slot, (0, history_prefix)), shape=(1, copied)
+                from_tensor(
+                    _offset_view(merge_slot, (0, history_prefix)),
+                    layout=make_layout((1, copied)),
                 ),
                 gm_keys[0:1, source_offset : source_offset + copied],
             )
@@ -458,13 +459,14 @@ class QliRawTopKSelector(_RawTopKSelectorBase):
             # Common case: no retained history -> load the trunk straight into
             # the double-buffered merge Channel (async, no extra V copy).
             mem_copy(
-                reinterpret(merge.next_write(), shape=(1, copied)),
+                from_tensor(merge.next_write(), layout=make_layout((1, copied))),
                 gm_keys[0:1, source_offset : source_offset + copied],
             )
         else:
             mem_copy(
-                reinterpret(
-                    self.workspace.current_trunk.next_write(), shape=(1, copied)
+                from_tensor(
+                    self.workspace.current_trunk.next_write(),
+                    layout=make_layout((1, copied)),
                 ),
                 gm_keys[0:1, source_offset : source_offset + copied],
             )
@@ -1810,8 +1812,9 @@ class CandidateQliRawTopKSelector(_RawTopKSelectorBase):
         copied = ((length + 127) // 128) * 128
         merge_slot = merge.next_write()
         mem_copy(
-            reinterpret(
-                _offset_view(merge_slot, (0, history_prefix)), shape=(1, copied)
+            from_tensor(
+                _offset_view(merge_slot, (0, history_prefix)),
+                layout=make_layout((1, copied)),
             ),
             gm_keys[0:1, source_offset : source_offset + copied],
         )
@@ -2577,11 +2580,15 @@ class CandidateLdTopKSelector(CandidateQliRawTopKSelector):
     ):
         if not preloaded:
             mem_copy(
-                reinterpret(self.ld_indices.next_write(), shape=(1, valid_length)),
+                from_tensor(
+                    self.ld_indices.next_write(), layout=make_layout((1, valid_length))
+                ),
                 partial_indices[0:1, 0:valid_length],
             )
             mem_copy(
-                reinterpret(self.ld_bits.next_write(), shape=(1, valid_length)),
+                from_tensor(
+                    self.ld_bits.next_write(), layout=make_layout((1, valid_length))
+                ),
                 partial_bits[0:1, 0:valid_length],
             )
         current_trunk = self.workspace.merge_key
@@ -2730,7 +2737,7 @@ class Sort512:
 
     @jit
     def run(self, indices, bits):
-        mem_copy(reinterpret(self.a, shape=(1, 512)), indices)
+        mem_copy(from_tensor(self.a, layout=make_layout((1, 512))), indices)
         bv = self.bv.next_write()
         mem_copy(bv, bits)
         val = self.bv.next_read()
@@ -2847,7 +2854,7 @@ class Sort512:
 
     @jit
     def run_indices(self, indices):
-        mem_copy(reinterpret(self.a, shape=(1, 512)), indices)
+        mem_copy(from_tensor(self.a, layout=make_layout((1, 512))), indices)
         with vf(mode="simd"):
             mask = rr.update_mask(64, elem_bits=32)[0]
             for chunk in dsl_range(8, unroll=1):
@@ -3537,7 +3544,7 @@ class KvCube:
         )
         self.qs = _ZnRing(
             [
-                _reinterpret_op(
+                from_tensor(
                     _qs_bytes,
                     dtype=dtypes.float8_e8m0,
                     layout=make_layout((self.tile_m, 4)),

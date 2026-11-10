@@ -8,6 +8,8 @@
 
 """BF16-input MLA Prolog: one MIX launch for nonempty inputs, no launch for T=0."""
 
+from cannbotdsl import from_tensor
+
 import atexit
 import inspect
 import json
@@ -73,12 +75,7 @@ from cannbotdsl.ops.reg import (
     vsub,
 )
 from cannbotdsl.ops.sync import onchip_rewind, global_sync_all
-from cannbotdsl.tensor import (
-    make_layout,
-    make_tiler,
-    reinterpret,
-    tile_slice,
-)
+from cannbotdsl.tensor import make_layout, make_tiler, tile_slice
 
 __all__ = [
     "CacheMode",
@@ -143,7 +140,7 @@ def write_cache_row(cache, cache_index, payload, token, row_tiler, cache_mode):
         slot = cache_index[token]
         if slot >= 0:
             cache_2d = cache_row_view(cache, slot // cache.shape[1])
-            valid_payload = reinterpret(
+            valid_payload = from_tensor(
                 payload, layout=make_layout((1, cache.shape[3]))
             )
             mem_copy(
@@ -161,7 +158,7 @@ def write_cache_row_group_fp8(cache, cache_index, payload_read, token, rope_dim)
         dtile = dtile_for(rope_dim)
         row_tiler = make_tiler((1, dtile), alignment=(1, DESCALE_BYTES))
         cache_2d = cache_row_view(cache, slot // cache.shape[1])
-        payload = reinterpret(payload_read, layout=make_layout((1, dtile)))
+        payload = from_tensor(payload_read, layout=make_layout((1, dtile)))
         mem_copy(
             tile_slice(cache_2d, row_tiler, (slot % cache.shape[1], 0)),
             payload,
@@ -333,7 +330,7 @@ class QbFourHeads:
             )
             b_panel = self.b_l1.next_read()
             for inner in range_constexpr(self.panel_k // CUBE_BK):
-                a_view = reinterpret(
+                a_view = from_tensor(
                     self.a_full,
                     layout=make_layout((self.bm, CUBE_BK)),
                     offset=(k_idx * self.panel_k + inner * CUBE_BK) * 16 * ITEM_A16,
@@ -346,7 +343,7 @@ class QbFourHeads:
                             b_panel, (self.head_dim, CUBE_BK), (head_part, inner)
                         ),
                     )
-                    c_view = reinterpret(
+                    c_view = from_tensor(
                         self.c_all,
                         layout=make_layout((self.bm, self.head_dim)),
                         offset=head_part * self.head_dim * 16 * ITEM_F32,
@@ -373,7 +370,7 @@ class QbFourHeads:
         full_output = tile_slice(out_gm, (out_gm.shape[0], full_columns), (0, 0))
         if block < groups:
             for m_tile in cannbotdsl.range(0, m_tiles):
-                staging_write = reinterpret(
+                staging_write = from_tensor(
                     self.b_l1.next_write(),
                     layout=make_layout((self.bm, self.q_lora)),
                     data_format="nz",
@@ -383,7 +380,7 @@ class QbFourHeads:
                     tile_slice(a_gm, (self.bm, self.q_lora), (m_tile, 0)),
                     options=copy_options(l2_cache_ctl=1),
                 )
-                staging_read = reinterpret(
+                staging_read = from_tensor(
                     self.b_l1.next_read(),
                     layout=make_layout((self.bm, self.q_lora)),
                     data_format="nz",
@@ -517,10 +514,10 @@ class NzProjection:
 
     @jit
     def actual_row_view(self, slot, valid_rows, width, physical_rows):
-        storage = reinterpret(
+        storage = from_tensor(
             slot, layout=make_layout((physical_rows, width)), data_format="nz"
         )
-        return reinterpret(storage, layout=make_layout((valid_rows, width)))
+        return from_tensor(storage, layout=make_layout((valid_rows, width)))
 
     @jit
     def project_actual_rows(self, a_gm, weight, out_gm, k_total, n_idx, m_tile):
@@ -877,14 +874,14 @@ class WkbProjection:
         row = m_tile * self.bm
         col_base = head * head_dim
         out_base = head * kvr
-        c_view = reinterpret(
+        c_view = from_tensor(
             self.c_l0.next_write(),
             layout=make_layout((tile_rows, CUBE_BK)),
             data_format="nz",
         )
         for k_idx in cannbotdsl.range(0, dn // BKW):
             mem_copy(
-                reinterpret(
+                from_tensor(
                     self.a_l1.next_write(),
                     layout=make_layout((tile_rows, BKW)),
                     data_format="nz",
@@ -896,12 +893,12 @@ class WkbProjection:
                 options=copy_options(l2_cache_ctl=1),
             )
             mem_copy(
-                reinterpret(
+                from_tensor(
                     self.a_l0.next_write(),
                     layout=make_layout((tile_rows, BKW)),
                     data_format="nz",
                 ),
-                reinterpret(
+                from_tensor(
                     self.a_l1.next_read(),
                     layout=make_layout((tile_rows, BKW)),
                     data_format="nz",
@@ -911,7 +908,7 @@ class WkbProjection:
             mem_copy(self.b_l0.next_write(), self.b_l1.next_read().permute(1, 0))
             matmul(
                 c_view,
-                reinterpret(
+                from_tensor(
                     self.a_l0.next_read(),
                     layout=make_layout((tile_rows, BKW)),
                     data_format="nz",
@@ -924,7 +921,7 @@ class WkbProjection:
                 row : row + tile_rows,
                 out_base + n_chunk * CUBE_BK : out_base + (n_chunk + 1) * CUBE_BK,
             ],
-            reinterpret(
+            from_tensor(
                 self.c_l0.next_read(),
                 layout=make_layout((tile_rows, CUBE_BK)),
                 data_format="nz",
@@ -1187,8 +1184,11 @@ def write_cache_row_fp8(cache, cache_index, payload_read, token, kvr, cache_mode
     if const_expr(isinstance(kvr, int)):
         byte_view = tile_slice(payload_read, (1, kvr), (0, 0))
     else:
-        byte_view = payload_read.reinterpret(
-            dtype=dtypes.float8_e4m3fn, layout=make_layout((1, kvr)), offset=0
+        byte_view = from_tensor(
+            payload_read,
+            dtype=dtypes.float8_e4m3fn,
+            layout=make_layout((1, kvr)),
+            offset=0,
         )
     if cache_mode == 0:
         slot = cache_index[token]
@@ -1228,8 +1228,8 @@ def write_cache_row_hif8(cache, cache_index, payload_read, token, kvr, cache_mod
     if const_expr(isinstance(kvr, int)):
         byte_view = tile_slice(payload_read, (1, kvr), (0, 0))
     else:
-        byte_view = payload_read.reinterpret(
-            dtype=dtypes.uint8, layout=make_layout((1, kvr)), offset=0
+        byte_view = from_tensor(
+            payload_read, dtype=dtypes.uint8, layout=make_layout((1, kvr)), offset=0
         )
     if cache_mode == 0:
         slot = cache_index[token]
@@ -1338,7 +1338,7 @@ class QaRmsNorm:
                 vmem_bar(mode="vst_vld")
             mem_copy(
                 tile_slice(out_gm, row_tiler, (row, 0)),
-                reinterpret(self.out_bf16.next_read(), layout=make_layout((1, q_lora))),
+                from_tensor(self.out_bf16.next_read(), layout=make_layout((1, q_lora))),
             )
 
     @jit
@@ -1385,7 +1385,7 @@ class QaRmsNorm:
                 vmem_bar(mode="vst_vld")
             mem_copy(
                 tile_slice(ws_raw, row_tiler, (token, 0)),
-                reinterpret(self.out.next_read(), layout=make_layout((1, q_lora))),
+                from_tensor(self.out.next_read(), layout=make_layout((1, q_lora))),
             )
 
     @jit
@@ -1443,7 +1443,7 @@ class QaRmsNorm:
                 vmem_bar(mode="vst_vld")
             mem_copy(
                 tile_slice(out_gm, row_tiler, (token, 0)),
-                reinterpret(self.out_bf16.next_read(), layout=make_layout((1, q_lora))),
+                from_tensor(self.out_bf16.next_read(), layout=make_layout((1, q_lora))),
             )
 
     @jit
@@ -1503,11 +1503,11 @@ class QaRmsNorm:
                 vmem_bar(mode="vst_vld")
             mem_copy(
                 tile_slice(ws_raw, row_tiler, (token, 0)),
-                reinterpret(self.out.next_read(), layout=make_layout((1, q_lora))),
+                from_tensor(self.out.next_read(), layout=make_layout((1, q_lora))),
             )
             mem_copy(
                 tile_slice(qr_gm, row_tiler, (token, 0)),
-                reinterpret(self.out_bf16.next_read(), layout=make_layout((1, q_lora))),
+                from_tensor(self.out_bf16.next_read(), layout=make_layout((1, q_lora))),
             )
 
     @jit
@@ -1576,11 +1576,11 @@ class QaRmsNorm:
             bf16_read = self.out_bf16.next_read()
             mem_copy(
                 tile_slice(out_gm, row_tiler, (token, 0)),
-                reinterpret(bf16_read, layout=make_layout((1, q_lora))),
+                from_tensor(bf16_read, layout=make_layout((1, q_lora))),
             )
             mem_copy(
                 tile_slice(qr_gm, row_tiler, (token, 0)),
-                reinterpret(bf16_read, layout=make_layout((1, q_lora))),
+                from_tensor(bf16_read, layout=make_layout((1, q_lora))),
             )
 
 
@@ -1765,15 +1765,20 @@ class KvChain:
         kvr_scale,
         rope_dim,
     ):
-        kr_view = payload_write.reinterpret(
+        kr_view = from_tensor(
+            payload_write,
             dtype=dtypes.bfloat16,
             layout=make_layout((1, (DTILE_MAX - KV_BYTES) // 2)),
             offset=KV_BYTES,
         )
-        tail_low = payload_write.reinterpret(
-            dtype=dtypes.float32, layout=make_layout((1, GROUPS)), offset=KV_BYTES
+        tail_low = from_tensor(
+            payload_write,
+            dtype=dtypes.float32,
+            layout=make_layout((1, GROUPS)),
+            offset=KV_BYTES,
         )
-        tail_high = payload_write.reinterpret(
+        tail_high = from_tensor(
+            payload_write,
             dtype=dtypes.float32,
             layout=make_layout((1, GROUPS)),
             offset=KV_BYTES + 2 * 64,
@@ -2200,7 +2205,7 @@ class InputPad:
                 mem_copy(self.row.next_write(), tile_slice(x, copy_tiler, (row, 0)))
                 mem_copy(
                     tile_slice(padded, copy_tiler, (row, 0)),
-                    reinterpret(self.row.next_read(), layout=make_layout((1, dim))),
+                    from_tensor(self.row.next_read(), layout=make_layout((1, dim))),
                 )
             else:
                 zero_row = self.row.next_write()
@@ -2212,7 +2217,7 @@ class InputPad:
                     vmem_bar(mode="vst_vld")
                 mem_copy(
                     tile_slice(padded, copy_tiler, (row, 0)),
-                    reinterpret(self.row.next_read(), layout=make_layout((1, dim))),
+                    from_tensor(self.row.next_read(), layout=make_layout((1, dim))),
                 )
 
 
@@ -2757,8 +2762,11 @@ class QRowQuant:
             if const_expr(isinstance(kvr, int)):
                 byte_view = tile_slice(payload_read, (1, kvr), (0, 0))
             else:
-                byte_view = payload_read.reinterpret(
-                    dtype=dtypes.float8_e4m3fn, layout=make_layout((1, kvr)), offset=0
+                byte_view = from_tensor(
+                    payload_read,
+                    dtype=dtypes.float8_e4m3fn,
+                    layout=make_layout((1, kvr)),
+                    offset=0,
                 )
             mem_copy(tile_slice(q2d, row_tiler, (token, head)), byte_view)
             mem_copy(
@@ -2942,8 +2950,11 @@ class QGlobalQuant:
             if const_expr(isinstance(kvr, int)):
                 byte_view = tile_slice(payload_read, (1, kvr), (0, 0))
             else:
-                byte_view = payload_read.reinterpret(
-                    dtype=dtypes.uint8, layout=make_layout((1, kvr)), offset=0
+                byte_view = from_tensor(
+                    payload_read,
+                    dtype=dtypes.uint8,
+                    layout=make_layout((1, kvr)),
+                    offset=0,
                 )
             mem_copy(tile_slice(q2d, row_tiler, (token, head)), byte_view)
 
@@ -6420,7 +6431,9 @@ def _register_torch():
     for name, schema, implementation in schemas:
         _LIBRARY.define(schema)
         impl(_LIBRARY, name, "PrivateUse1")(implementation)
-        torch.library.register_fake("cannbot_dsl_mla_prolog_v4::" + name)(mla_prolog_v2_fake)
+        torch.library.register_fake("cannbot_dsl_mla_prolog_v4::" + name)(
+            mla_prolog_v2_fake
+        )
 
 
 _register_torch()

@@ -20,6 +20,7 @@ weighted reduction and uint16 streaming TopK, with optional candidate TopK.
 """
 
 from __future__ import annotations
+from cannbotdsl import from_tensor
 
 __all__ = ["quant_lightning_indexer"]
 
@@ -55,13 +56,7 @@ from cannbotdsl.ops.sync import (
     vec_sync_notify,
     vec_sync_wait,
 )
-from cannbotdsl.tensor import (
-    reinterpret,
-    make_pointer,
-    make_tensor,
-    make_layout,
-    tile_slice,
-)
+from cannbotdsl.tensor import make_pointer, make_tensor, make_layout, tile_slice
 from cannbotdsl.ops import reg as rr
 
 from cannbotdsl.ops.sync import cube_sync_all
@@ -69,7 +64,7 @@ from cannbotdsl.buffer import L0B, L0C
 from cannbotdsl.ring_buffer import RingBuffer, make_ring_buffer
 from cannbotdsl.lang.constexpr import const_expr
 from cannbotdsl.ops.arch import is_aiv, get_squeeze_status
-from cannbotdsl.ops.memcpy import copy_options, relu
+from cannbotdsl.ops.memcpy import copy_options
 from cannbotdsl.ops.sync import vec_sync_block_arrive, vec_sync_block_wait
 
 
@@ -318,7 +313,7 @@ class _UbPool:
             raise ValueError("QLI UB allocation exceeds the device capacity")
         ub_root = UB.view(UB_CAPACITY_BYTES)
         return [
-            reinterpret(
+            from_tensor(
                 ub_root,
                 dtype=dtype,
                 offset=start + slot * slot_pitch,
@@ -718,13 +713,13 @@ class QliRawTopKSelector:
     def _prepare_ld_merge(self, partial_indices, partial_bits, valid_length, preloaded):
         if not preloaded:
             mem_copy(
-                reinterpret(
+                from_tensor(
                     self.ld_indices.next_write(), layout=make_layout((1, valid_length))
                 ),
                 partial_indices[0:1, 0:valid_length],
             )
             mem_copy(
-                reinterpret(
+                from_tensor(
                     self.ld_bits.next_write(), layout=make_layout((1, valid_length))
                 ),
                 partial_bits[0:1, 0:valid_length],
@@ -1095,7 +1090,7 @@ class QliRawTopKSelector:
         if not self.pipelined:
             merge_slot = merge.next_write()
             mem_copy(
-                reinterpret(
+                from_tensor(
                     _offset_view(merge_slot, (0, history_prefix)),
                     layout=make_layout((1, copied)),
                 ),
@@ -1112,12 +1107,12 @@ class QliRawTopKSelector:
             # Common case: no retained history -> load the trunk straight into
             # the double-buffered merge RingBuffer (async, no extra V copy).
             mem_copy(
-                reinterpret(merge.next_write(), layout=make_layout((1, copied))),
+                from_tensor(merge.next_write(), layout=make_layout((1, copied))),
                 gm_keys[0:1, source_offset : source_offset + copied],
             )
         else:
             mem_copy(
-                reinterpret(
+                from_tensor(
                     self.workspace.current_trunk.next_write(),
                     layout=make_layout((1, copied)),
                 ),
@@ -1834,7 +1829,7 @@ class QliRawTopKSelector:
 
     @jit
     def _byte_select(self, sort_key, valid_len, tmp_idx, kth, retained):
-        candidates = reinterpret(
+        candidates = from_tensor(
             tmp_idx,
             offset=(tmp_idx.shape[0] // 2) * 2,
             layout=make_layout((tmp_idx.shape[0] // 2,)),
@@ -1908,7 +1903,7 @@ class QliRawTopKSelector:
                             rr.vgather(cached, idx, mask=m16), dtypes.uint16
                         )
                         over = rr.veqs(code, 255, mask=m16)
-                        prefix = rr.vsqueeze(over, dtypes.uint16)
+                        prefix = rr.vunsqueeze(over, dtypes.uint16)
                         position = rr.vadd(prefix, offset, mask=m16)
                         exact = rr.vgather(overflow_cache, position, mask=over)
                         keys16 = rr.vselect(
@@ -1948,7 +1943,7 @@ class QliRawTopKSelector:
                     rr.vmem_bar("vst_vld")
                 copied = ((length + 127) // 128) * 128
                 mem_copy(
-                    reinterpret(
+                    from_tensor(
                         self.byte_fallback_keys,
                         layout=make_layout((1, copied), stride=(BYTE_CACHE_TOKENS, 1)),
                     ),
@@ -2193,13 +2188,13 @@ class LdMergeStage:
                         # Carry stays on-core: the previous round's output-stage
                         # slots are the sole producer of this round's carry.
                         mem_copy(
-                            reinterpret(
+                            from_tensor(
                                 ld_idx_write, layout=make_layout((1, self.topk))
                             ),
                             self.selector.output_idx_stage.next_read(),
                         )
                         mem_copy(
-                            reinterpret(
+                            from_tensor(
                                 ld_bits_write, layout=make_layout((1, self.topk))
                             ),
                             self.selector.output_value_bits_stage.next_read(),
@@ -2493,7 +2488,7 @@ class CandidateQliRawTopKSelector(QliRawTopKSelector):
         copied = ((length + 127) // 128) * 128
         merge_slot = merge.next_write()
         mem_copy(
-            reinterpret(
+            from_tensor(
                 _offset_view(merge_slot, (0, history_prefix)),
                 layout=make_layout((1, copied)),
             ),
@@ -2810,7 +2805,7 @@ class QliCube:
         )
         self.l0b = make_ring_buffer(
             [
-                reinterpret(
+                from_tensor(
                     L0B.view(65536),
                     dtype=dtypes.fp4x2_e2m1,
                     layout=make_layout((QK_COLUMNS, LOGICAL_D)),
@@ -2822,7 +2817,7 @@ class QliCube:
         )
         self.l0c = make_ring_buffer(
             [
-                reinterpret(
+                from_tensor(
                     L0C.view(262144),
                     dtype=dtypes.float32,
                     layout=make_layout((self.tile_m // 2, QK_COLUMNS)),
@@ -2842,7 +2837,7 @@ class QliCube:
         avail = avail if avail > 0 else dtypes.int64(0)
         rows_to_copy = avail if avail < self.tile_m else dtypes.int64(self.tile_m)
         mem_copy(
-            reinterpret(
+            from_tensor(
                 self.q_l1.next_write(),
                 dtype=dtypes.uint8,
                 layout=make_layout((self.tile_m, PACKED_D)),
@@ -2871,13 +2866,13 @@ class QliCube:
         mem_copy(
             self.l0a0.next_write(),
             tile_slice(
-                reinterpret(query_read, layout=make_layout((self.tile_m, LOGICAL_D))),
+                from_tensor(query_read, layout=make_layout((self.tile_m, LOGICAL_D))),
                 (self.tile_m // 2, LOGICAL_D),
                 (0, 0),
             ),
             options=copy_options(
                 mx_scale=tile_slice(
-                    reinterpret(scale_read, layout=make_layout((self.tile_m, 4))),
+                    from_tensor(scale_read, layout=make_layout((self.tile_m, 4))),
                     (self.tile_m // 2, 4),
                     (0, 0),
                 )
@@ -2886,13 +2881,13 @@ class QliCube:
         mem_copy(
             self.l0a1.next_write(),
             tile_slice(
-                reinterpret(query_read, layout=make_layout((self.tile_m, LOGICAL_D))),
+                from_tensor(query_read, layout=make_layout((self.tile_m, LOGICAL_D))),
                 (self.tile_m // 2, LOGICAL_D),
                 (1, 0),
             ),
             options=copy_options(
                 mx_scale=tile_slice(
-                    reinterpret(scale_read, layout=make_layout((self.tile_m, 4))),
+                    from_tensor(scale_read, layout=make_layout((self.tile_m, 4))),
                     (self.tile_m // 2, 4),
                     (1, 0),
                 )
@@ -2935,7 +2930,7 @@ class QliCube:
             )
             mem_copy(
                 tile_slice(
-                    reinterpret(
+                    from_tensor(
                         key_write,
                         dtype=dtypes.uint8,
                         layout=make_layout((self.key_tile_columns, PACKED_D)),
@@ -2985,27 +2980,25 @@ class QliCube:
         )
         qk_l0c_read0 = self.l0c.next_read()
         mem_copy(
-            reinterpret(
+            from_tensor(
                 qk_handoff, layout=make_layout((self.tile_m // 2, 128), stride=(256, 1))
             ),
-            relu(
-                reinterpret(qk_l0c_read0, layout=make_layout((self.tile_m // 2, 128)))
-            ),
+            from_tensor(
+                qk_l0c_read0, layout=make_layout((self.tile_m // 2, 128))
+            ).relu(),
             options=copy_options(dst_subblock=0, unit_flag=3),
         )
         mem_copy(
-            reinterpret(
+            from_tensor(
                 qk_handoff,
                 layout=make_layout((self.tile_m // 2, 128), stride=(256, 1)),
                 offset=(self.tile_m // 2) * 512,
             ),
-            relu(
-                reinterpret(
-                    qk_l0c_read0,
-                    layout=make_layout((self.tile_m // 2, 128)),
-                    offset=(self.tile_m // 2) * 128 * 4,
-                )
-            ),
+            from_tensor(
+                qk_l0c_read0,
+                layout=make_layout((self.tile_m // 2, 128)),
+                offset=(self.tile_m // 2) * 128 * 4,
+            ).relu(),
             options=copy_options(dst_subblock=0, unit_flag=3),
         )
         dsl_matmul(
@@ -3018,27 +3011,25 @@ class QliCube:
         )
         qk_l0c_read1 = self.l0c.next_read()
         mem_copy(
-            reinterpret(
+            from_tensor(
                 qk_handoff, layout=make_layout((self.tile_m // 2, 128), stride=(256, 1))
             ),
-            relu(
-                reinterpret(qk_l0c_read1, layout=make_layout((self.tile_m // 2, 128)))
-            ),
+            from_tensor(
+                qk_l0c_read1, layout=make_layout((self.tile_m // 2, 128))
+            ).relu(),
             options=copy_options(dst_subblock=1, unit_flag=3),
         )
         mem_copy(
-            reinterpret(
+            from_tensor(
                 qk_handoff,
                 layout=make_layout((self.tile_m // 2, 128), stride=(256, 1)),
                 offset=(self.tile_m // 2) * 512,
             ),
-            relu(
-                reinterpret(
-                    qk_l0c_read1,
-                    layout=make_layout((self.tile_m // 2, 128)),
-                    offset=(self.tile_m // 2) * 128 * 4,
-                )
-            ),
+            from_tensor(
+                qk_l0c_read1,
+                layout=make_layout((self.tile_m // 2, 128)),
+                offset=(self.tile_m // 2) * 128 * 4,
+            ).relu(),
             options=copy_options(dst_subblock=1, unit_flag=3),
         )
 
@@ -3071,7 +3062,7 @@ class OwnerCube512(QliCube):
         )
         self.l0b = make_ring_buffer(
             [
-                reinterpret(
+                from_tensor(
                     L0B.view(65536),
                     dtype=dtypes.fp4x2_e2m1,
                     layout=make_layout((512, LOGICAL_D)),
@@ -3084,14 +3075,14 @@ class OwnerCube512(QliCube):
         self.l0c_root = L0C.view(262144)
         self.micro_l0c = make_ring_buffer(
             [
-                reinterpret(
+                from_tensor(
                     self.l0c_root,
                     dtype=dtypes.float32,
                     layout=make_layout((64, 512)),
                     offset=0,
                     data_format="nz",
                 ),
-                reinterpret(
+                from_tensor(
                     self.l0c_root,
                     dtype=dtypes.float32,
                     layout=make_layout((64, 512)),
@@ -3313,7 +3304,7 @@ class QliVector:
         )
         byte_mask = rr.update_mask(valid_count, elem_bits=16)[0]
         byte_over = rr.veqs(key_high, 255, mask=byte_mask)
-        byte_prefix = rr.vsqueeze(byte_over, dtypes.uint16)
+        byte_prefix = rr.vunsqueeze(byte_over, dtypes.uint16)
         byte_pos = rr.vadd(byte_used, byte_prefix, mask=mask16)
         byte_keep = rr.mask_and(
             byte_over, rr.vlts(byte_pos, 512, mask=mask16), exec_mask=mask16
@@ -4031,7 +4022,7 @@ class QliVector:
                         (self.vec_rows, QK_COLUMNS),
                         (0, 0),
                     ),
-                    reinterpret(
+                    from_tensor(
                         key_read,
                         layout=make_layout((dtypes.int64(rows_to_store), QK_COLUMNS)),
                     ),
@@ -4049,7 +4040,7 @@ class QliVector:
                         (self.vec_rows, QK_COLUMNS // CANDIDATE_BLOCK_SIZE),
                         (0, 0),
                     ),
-                    reinterpret(
+                    from_tensor(
                         self.candidate_key_ub.next_read(),
                         layout=make_layout(
                             (
@@ -4950,73 +4941,73 @@ class StreamingLdTopK:
             dtypes.uint8,
             addr=0,
         )
-        self.arena = reinterpret(
+        self.arena = from_tensor(
             self.root_arena,
             dtype=dtypes.uint8,
             offset=STREAM_ARENA_OFFSET,
             layout=make_layout((STREAM_ARENA_BYTES,)),
         )
-        self.values = reinterpret(
+        self.values = from_tensor(
             self.arena,
             dtype=dtypes.uint16,
             offset=0,
             layout=make_layout((3, STREAM_POOL_TOKENS)),
         )
-        self.indices = reinterpret(
+        self.indices = from_tensor(
             self.arena,
             dtype=dtypes.uint16,
             offset=STREAM_INDICES_OFFSET,
             layout=make_layout((3, STREAM_POOL_TOKENS)),
         )
-        self.positions = reinterpret(
+        self.positions = from_tensor(
             self.arena,
             dtype=dtypes.uint16,
             offset=STREAM_POSITIONS_OFFSET,
             layout=make_layout((STREAM_POOL_TOKENS,)),
         )
-        self.histogram = reinterpret(
+        self.histogram = from_tensor(
             self.arena,
             dtype=dtypes.uint16,
             offset=STREAM_HISTOGRAM_OFFSET,
             layout=make_layout((256,)),
         )
-        self.carrier = reinterpret(
+        self.carrier = from_tensor(
             self.arena,
             dtype=dtypes.int32,
             offset=STREAM_CARRIER_OFFSET,
             layout=make_layout((64,)),
         )
-        self.thresholds = reinterpret(
+        self.thresholds = from_tensor(
             self.arena,
             dtype=dtypes.uint16,
             offset=STREAM_THRESHOLDS_OFFSET,
             layout=make_layout((3, 16)),
         )
-        self.counts = reinterpret(
+        self.counts = from_tensor(
             self.arena,
             dtype=dtypes.int32,
             offset=STREAM_COUNTS_OFFSET,
             layout=make_layout((3, 8)),
         )
-        self.packed = reinterpret(
+        self.packed = from_tensor(
             self.arena,
             dtype=dtypes.uint16,
             offset=STREAM_PACKED_OFFSET,
             layout=make_layout((STREAM_PAGE_TOKENS,)),
         )
-        self.tmp_values = reinterpret(
+        self.tmp_values = from_tensor(
             self.arena,
             dtype=dtypes.uint16,
             offset=STREAM_TMP_VALUES_OFFSET,
             layout=make_layout((512,)),
         )
-        self.tmp_indices = reinterpret(
+        self.tmp_indices = from_tensor(
             self.arena,
             dtype=dtypes.uint16,
             offset=STREAM_TMP_INDICES_OFFSET,
             layout=make_layout((512,)),
         )
-        self.stage = reinterpret(
+        self.stage = from_tensor(
             self.arena,
             dtype=dtypes.uint16,
             offset=STREAM_STAGE_OFFSET,
@@ -5454,31 +5445,31 @@ class QliFusedKernel:
         # Byte-cache and streaming pools alias UB and execute exclusively.
         # One arena keeps aliased byte buffers within the hardware buf_id limit.
         self.byte_arena = self.streaming.arena
-        self.byte_cache0 = reinterpret(
+        self.byte_cache0 = from_tensor(
             self.byte_arena,
             dtype=dtypes.uint8,
             offset=0,
             layout=make_layout((BYTE_CACHE_TOKENS,)),
         )
-        self.byte_cache1 = reinterpret(
+        self.byte_cache1 = from_tensor(
             self.byte_arena,
             dtype=dtypes.uint8,
             offset=BYTE_CACHE_TOKENS,
             layout=make_layout((BYTE_CACHE_TOKENS,)),
         )
-        self.byte_cache2 = reinterpret(
+        self.byte_cache2 = from_tensor(
             self.byte_arena,
             dtype=dtypes.uint8,
             offset=BYTE_ROW2_OFFSET,
             layout=make_layout((BYTE_CACHE_TOKENS,)),
         )
-        self.byte_overflow = reinterpret(
+        self.byte_overflow = from_tensor(
             self.byte_arena,
             dtype=dtypes.uint16,
             offset=BYTE_OVERFLOW_OFFSET,
             layout=make_layout((STREAM_ROWS, CACHED_TOPK_COUNT)),
         )
-        self.byte_meta = reinterpret(
+        self.byte_meta = from_tensor(
             self.byte_arena,
             dtype=dtypes.uint16,
             offset=BYTE_META_OFFSET,
@@ -5489,23 +5480,23 @@ class QliFusedKernel:
         self.vector.byte_cache2 = self.byte_cache2
         self.vector.byte_overflow = self.byte_overflow
         self.vector.byte_meta = self.byte_meta
-        self.topk.byte_fallback_keys = reinterpret(
+        self.topk.byte_fallback_keys = from_tensor(
             self.streaming.root_arena,
             dtype=dtypes.uint16,
             offset=0,
             layout=make_layout((1, BYTE_CACHE_TOKENS)),
         )
         # Fallback keys occupy [0, 99328); scratch must start after them.
-        self.topk.byte_fallback_tmp = reinterpret(
+        self.topk.byte_fallback_tmp = from_tensor(
             self.byte_arena,
             dtype=dtypes.uint16,
             offset=BYTE_FALLBACK_SCRATCH_OFFSET,
             layout=make_layout((BYTE_CACHE_TOKENS,)),
         )
-        self.topk.byte_tmp = reinterpret(
+        self.topk.byte_tmp = from_tensor(
             self.topk.byte_fallback_keys, layout=make_layout((49152,))
         )
-        self.vector.byte_seed = reinterpret(
+        self.vector.byte_seed = from_tensor(
             self.byte_arena,
             dtype=dtypes.uint16,
             offset=BYTE_SEED_OFFSET,
@@ -5995,7 +5986,7 @@ class QliFusedKernel:
                     if cache_task == 2:
                         self.topk._select_row_byte(
                             _offset_view(key_out, (workspace_row, 0)),
-                            reinterpret(
+                            from_tensor(
                                 self.byte_cache0,
                                 offset=row_in_subblock * BYTE_CACHE_TOKENS,
                                 layout=make_layout((BYTE_CACHE_TOKENS,)),
@@ -6189,7 +6180,7 @@ class QliFusedKernel:
         tokens,
     ):
         dsl_matmul(
-            reinterpret(
+            from_tensor(
                 self.owner_cube.micro_l0c.next_write(), layout=make_layout((64, 512))
             ),
             query_ring.next_read(),
@@ -6200,11 +6191,9 @@ class QliFusedKernel:
         )
         mem_copy(
             qk_slot,
-            relu(
-                reinterpret(
-                    self.owner_cube.micro_l0c.next_read(), layout=make_layout((64, 512))
-                )
-            ),
+            from_tensor(
+                self.owner_cube.micro_l0c.next_read(), layout=make_layout((64, 512))
+            ).relu(),
             options=copy_options(dst_subblock=owner, unit_flag=3),
         )
         if dtypes.int32(get_subblock_id()) == owner:
@@ -7832,7 +7821,7 @@ class QliTndCube(QliCube):
         # Tile windows pin the full NZ frame while the dynamic source slice
         # keeps the copy height clamped to the available key rows.
         mem_copy(
-            reinterpret(
+            from_tensor(
                 key_write,
                 dtype=dtypes.uint8,
                 layout=make_layout((QK_COLUMNS, PACKED_D)),

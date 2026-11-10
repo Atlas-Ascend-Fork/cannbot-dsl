@@ -21,6 +21,7 @@ head_dim``.  The current implementation requires ``head_dim_qk = head_dim_v
 # extracting helpers would change DSL lowering or measured kernel performance.
 
 from __future__ import annotations
+from cannbotdsl import from_tensor
 
 import threading
 from typing import NamedTuple, Optional, Tuple
@@ -64,7 +65,7 @@ from cannbotdsl.ops.reg import (
 )
 from cannbotdsl.ops.sync import onchip_rewind
 from cannbotdsl.ring_buffer import RingBuffer
-from cannbotdsl.tensor import idx2crd, reinterpret, tile_slice
+from cannbotdsl.tensor import idx2crd, tile_slice
 
 SUPPORTED_HEAD_DIM = 128
 VL = 64
@@ -83,8 +84,8 @@ _COMPILED_KERNEL_LOCK = threading.Lock()
 @jit
 def _cast_bf16_to_fp32_tile(dst, src):
     rows, cols = dst.shape
-    src_stride = src.physical_stride[0]
-    dst_stride = dst.physical_stride[0]
+    src_stride = src.physical_layout.stride[0]
+    dst_stride = dst.physical_layout.stride[0]
     with vf(mode="simd"):
         for row in range(rows):
             for col in range(0, cols, VL):
@@ -101,8 +102,8 @@ def _cast_bf16_to_fp32_tile(dst, src):
 @jit
 def _cast_fp32_to_bf16_tile(dst, src):
     rows, cols = dst.shape
-    src_stride = src.physical_stride[0]
-    dst_stride = dst.physical_stride[0]
+    src_stride = src.physical_layout.stride[0]
+    dst_stride = dst.physical_layout.stride[0]
     with vf(mode="simd"):
         for row in range(rows):
             for col in range(0, cols, VL):
@@ -221,7 +222,7 @@ class FusedRecurrentKDASnapshotVector:
         self.state_tensor = self.state.next_write()
         state = self.state_tensor
         if active_rows < self.row_block:
-            state = reinterpret(state, offset=0, layout=make_layout((active_rows, self.dk)))
+            state = from_tensor(state, offset=0, layout=make_layout((active_rows, self.dk)))
         if self.state_is_bf16:
             state_bf16 = self.state_bf16.next_write()
             mem_copy(state_bf16, gm_state_tile)
@@ -322,7 +323,7 @@ class FusedRecurrentKDASnapshotVector:
             mem_copy(self.dt_bias, dt_bias_gm)
         else:
             mem_copy(self.a_log, a_log_gm)
-            mem_copy(reinterpret(self.dt_bias, offset=0, layout=make_layout((value_heads, self.dk))), dt_bias_gm)
+            mem_copy(from_tensor(self.dt_bias, offset=0, layout=make_layout((value_heads, self.dk))), dt_bias_gm)
 
     def load_g_beta_value(self, raw_g_gm, value_gm, raw_beta_gm):
         mem_copy(self.raw_g.next_write(), raw_g_gm)
@@ -467,7 +468,7 @@ class FusedRecurrentKDASnapshotVector:
         output = self.output.next_write()
         out = self.out
         if active_rows < self.row_block:
-            output = reinterpret(output, offset=0, layout=make_layout((1, active_rows)))
+            output = from_tensor(output, offset=0, layout=make_layout((1, active_rows)))
         _cast_fp32_to_bf16_tile(output, out)
         mem_copy(gm_out_tile, output)
 
@@ -478,7 +479,7 @@ class FusedRecurrentKDASnapshotVector:
             state_bf16_output = self.state_bf16_output.next_write()
             state = self.state_tensor
             if active_rows < self.row_block:
-                state_bf16_output = reinterpret(state_bf16_output, offset=0, layout=make_layout((active_rows, self.dk)))
+                state_bf16_output = from_tensor(state_bf16_output, offset=0, layout=make_layout((active_rows, self.dk)))
             _cast_fp32_to_bf16_tile(state_bf16_output, state)
             mem_copy(gm_state_tile, state_bf16_output)
         else:

@@ -18,6 +18,7 @@ other shapes retain the flat QK, vector Softmax and PV paths.
 """
 
 from __future__ import annotations
+from cannbotdsl import from_tensor
 from cannbotdsl import (
     get_mem_size,
     make_layout,
@@ -672,7 +673,7 @@ class MegaMlaKernel:
         cos_ub = Buffer(MemLoc.UB, dtypes.float32, make_layout((1, 64)))
         sin_ub = Buffer(MemLoc.UB, dtypes.float32, make_layout((1, 64)))
         record_ub = Buffer(MemLoc.UB, dtypes.uint8, make_layout((1, 544)))
-        scale_ub = record_ub.reinterpret(dtypes.int16, make_layout((1, 272)))
+        scale_ub = from_tensor(record_ub, dtypes.int16, make_layout((1, 272)))
         ps = self.attn.page_size
         mem_copy(gamma_ub, tile_view(gamma_gm, (1, D), (0, 0)))
         for tok in range(block, self.tokens, nblk):
@@ -719,7 +720,7 @@ class MegaMlaKernel:
                 offset = dtypes.int64(slot % ps)
                 mem_copy(
                     tile_view(cache_gm, (1, 544), (page, offset)),
-                    record_ub.reinterpret(dtypes.int8),
+                    from_tensor(record_ub, dtypes.int8),
                 )
             # Drain the record write before its UB is reused for another token.
             vec_sync_all()
@@ -971,8 +972,10 @@ class MegaMlaKernel:
     @jit
     def _dequantize_window_cache_row(self, data_ub, dst_ub, row, base):
         """E4M3 times stored BF16 scale -> BF16, one selected cache row."""
-        scale_data = data_ub.reinterpret(
-            dtypes.bfloat16, make_layout((data_ub.shape[0], data_ub.shape[1] // 2))
+        scale_data = from_tensor(
+            data_ub,
+            dtypes.bfloat16,
+            make_layout((data_ub.shape[0], data_ub.shape[1] // 2)),
         )
         with vf(mode="simd"):
             full = rr.full_mask()
@@ -1120,8 +1123,8 @@ class MegaMlaKernel:
         kv_rot_ub = Buffer(MemLoc.UB, dtypes.bfloat16, make_layout((1, 64)))
         data_ub = Buffer(MemLoc.UB, dtypes.int8, make_layout((1, 64)))
         scale_ub = Buffer(MemLoc.UB, dtypes.int16, make_layout((1, 16)))
-        scale_words = scale_ub.reinterpret(dtypes.uint32, make_layout((1, 8)))
-        data_words = data_ub.reinterpret(dtypes.uint64, make_layout((1, 8)))
+        scale_words = from_tensor(scale_ub, dtypes.uint32, make_layout((1, 8)))
+        data_words = from_tensor(data_ub, dtypes.uint64, make_layout((1, 8)))
         vec_id = block * 2 + get_subblock_id()
         vec_num = nblk * 2
         for item in range(vec_id, self.tokens * (d // 64), vec_num):
@@ -1173,7 +1176,7 @@ class MegaMlaKernel:
                     mem_copy(wkc_gm[blk : blk + 1, payload : payload + 64], data_ub)
                     mem_copy(
                         wkc_gm[blk : blk + 1, scale_offset : scale_offset + 4],
-                        scale_ub.reinterpret(dtypes.int8, make_layout((1, 32)))[
+                        from_tensor(scale_ub, dtypes.int8, make_layout((1, 32)))[
                             0:1, 0:4
                         ],
                     )

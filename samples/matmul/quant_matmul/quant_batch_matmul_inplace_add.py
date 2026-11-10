@@ -1,3 +1,5 @@
+from cannbotdsl import from_tensor
+from cannbotdsl.ops.memcpy import cube_fill_l1_zero
 # Copyright (c) 2026 Huawei Technologies Co., Ltd.
 # This program is free software, you can redistribute it and/or modify it under the terms and conditions of
 # CANN Open Software License Agreement Version 2.0 (the "License").
@@ -37,7 +39,7 @@ from cannbotdsl.lang.host import host
 from cannbotdsl.lang.jit import jit
 from cannbotdsl.lang.kernel import kernel
 from cannbotdsl.ops.matmul import matmul
-from cannbotdsl.ops.sync import cube_fill_l1_zero
+
 from cannbotdsl.tensor import MemLoc
 from cannbotdsl.tensor import Tensor
 from cannbotdsl.tensor import tile_slice
@@ -1370,8 +1372,11 @@ class QbmmMxInplaceAddKernel:
             # One L0C slot per output tile: the whole K-accumulation and the
             # FixPipe read below share it; the produce cursor advances once per
             # tile so depth>1 rotates slots across tiles (FixPipe overlap).
-            l0c_slot = l0c.next_write(bare=True).view(
-                make_layout(y_tile.shape), dtype=dtypes.float32, data_format="nz"
+            l0c_slot = from_tensor(
+                l0c.next_write(),
+                layout=make_layout(y_tile.shape),
+                dtype=dtypes.float32,
+                data_format="nz",
             )
 
             # Each scaleKL1 window covers scale_k_l1_factor data kL1 windows.
@@ -1528,8 +1533,10 @@ class QbmmMxInplaceAddKernel:
                             a_l1_tile.permute(1, 0) if self.transpose_a else a_l1_tile
                         )
                         a_source = a_source[:current_m, :valid_k]
-                        a_ready = l0a.next_write(bare=True)
-                        a_ready = a_ready.view(make_layout(a_source.shape))
+                        a_ready = l0a.next_write()
+                        a_ready = from_tensor(
+                            a_ready, layout=make_layout(a_source.shape)
+                        )
                         mem_copy(
                             a_ready,
                             a_source,
@@ -1558,8 +1565,10 @@ class QbmmMxInplaceAddKernel:
                             else b_l1_tile
                         )
                         b_source = b_source[:current_n, :valid_k]
-                        b_ready = l0b.next_write(bare=True)
-                        b_ready = b_ready.view(make_layout(b_source.shape))
+                        b_ready = l0b.next_write()
+                        b_ready = from_tensor(
+                            b_ready, layout=make_layout(b_source.shape)
+                        )
                         mem_copy(
                             b_ready,
                             b_source,

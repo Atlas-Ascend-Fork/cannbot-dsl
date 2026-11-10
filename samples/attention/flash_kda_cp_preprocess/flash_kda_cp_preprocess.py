@@ -9,6 +9,8 @@
 # fmt: off
 
 """FlashKDA CP preprocess public operator."""
+from cannbotdsl import from_tensor
+from cannbotdsl.ops.memcpy import cube_fill_l1_zero
 
 import dataclasses
 import os
@@ -70,21 +72,9 @@ from cannbotdsl.ops.reg import (
     vsub,
 )
 from cannbotdsl.ops.reg import vselect as vselect_raw
-from cannbotdsl.ops.sync import (
-    cube_fill_l1_zero,
-    cube_sync_all,
-    cube_sync_block_arrive,
-    cube_sync_block_wait,
-    cube_sync_pipe,
-    onchip_rewind,
-    vec_sync_all,
-    vec_sync_block_arrive,
-    vec_sync_block_wait,
-    vec_sync_notify,
-    vec_sync_wait,
-)
+from cannbotdsl.ops.sync import cube_sync_all, cube_sync_block_arrive, cube_sync_block_wait, cube_sync_pipe, onchip_rewind, vec_sync_all, vec_sync_block_arrive, vec_sync_block_wait, vec_sync_notify, vec_sync_wait
 from cannbotdsl.ring_buffer import RingBuffer
-from cannbotdsl.tensor import idx2crd, reinterpret, tile_slice, tile_slice_multi
+from cannbotdsl.tensor import idx2crd, tile_slice, tile_slice_multi
 
 try:
     from cannbotdsl import aot
@@ -99,8 +89,8 @@ compile_cache = getattr(aot, "compile_cache", lru_cache(maxsize=1))
 @jit
 def _cast_vector_row(dst, src, row):
     cols = dst.shape[1]
-    src_stride = src.physical_stride[0]
-    dst_stride = dst.physical_stride[0]
+    src_stride = src.physical_layout.stride[0]
+    dst_stride = dst.physical_layout.stride[0]
     for col in range(0, cols, 64):
         mask, _ = reg_ops.update_mask(cols - col, elem_bits=32)
         if const_expr(src.dtype == dtypes.float32):
@@ -118,8 +108,8 @@ def _cast_vector_row(dst, src, row):
 def cast_tile(dst, src):
     """Convert a 2D tile while preserving physical row strides."""
     rows, cols = dst.shape
-    src_stride = src.physical_stride[0]
-    dst_stride = dst.physical_stride[0]
+    src_stride = src.physical_layout.stride[0]
+    dst_stride = dst.physical_layout.stride[0]
     with vf(mode="simd"):
         for row in range(rows):
             if const_expr(isinstance(cols, int) and cols == 1):
@@ -134,8 +124,8 @@ def cast_tile(dst, src):
 @jit
 def nd2nz_tile(dst, src, elem_bits: int = 16):
     rows, cols = src.shape
-    src_stride = src.physical_stride[0]
-    dst_stride = dst.physical_stride[0]
+    src_stride = src.physical_layout.stride[0]
+    dst_stride = dst.physical_layout.stride[0]
     n0 = 256 // elem_bits
     block_stride = dst_stride * elem_bits // 256
     with vf(mode="simd"):
@@ -562,11 +552,11 @@ class StageOneMatmul:
 
     def mm_per_d_kkt(self, row_block: int, col_block: int, right_k):
         kkt_tile = tile_slice(self.raw_l0c_main, (NEUMANN_BLOCK_SIZE, NEUMANN_BLOCK_SIZE), (row_block, col_block))
-        matmul(reinterpret(kkt_tile, layout=make_layout((NEUMANN_BLOCK_SIZE, NEUMANN_BLOCK_SIZE)), data_format="nz"), self.per_d_left_k_l0a, right_k, init=True)
+        matmul(from_tensor(kkt_tile, layout=make_layout((NEUMANN_BLOCK_SIZE, NEUMANN_BLOCK_SIZE)), data_format="nz"), self.per_d_left_k_l0a, right_k, init=True)
 
     def mm_per_d_mqk(self, row_block: int, col_block: int, right_k):
         mqk_tile = tile_slice(self.raw_l0c_aux, (NEUMANN_BLOCK_SIZE, NEUMANN_BLOCK_SIZE), (row_block, col_block))
-        matmul(reinterpret(mqk_tile, layout=make_layout((NEUMANN_BLOCK_SIZE, NEUMANN_BLOCK_SIZE)), data_format="nz"), self.per_d_left_q_l0a, right_k, init=True)
+        matmul(from_tensor(mqk_tile, layout=make_layout((NEUMANN_BLOCK_SIZE, NEUMANN_BLOCK_SIZE)), data_format="nz"), self.per_d_left_q_l0a, right_k, init=True)
 
     def finish_per_d_matrices(self, ub_kkt, ub_mqk):
         mem_copy(ub_kkt, self.raw_l0c_main.partition(dim=0))
@@ -923,10 +913,10 @@ class StageOneMatmul:
         self.store_l0c_to_gm(u_chunk)
 
     def _raw_l0a_block(self, l0a_slot, row_block: int, col_block: int):
-        return reinterpret(l0a_slot, layout=make_layout((NEUMANN_BLOCK_SIZE, NEUMANN_BLOCK_SIZE)), offset=self.l0_matrix_block_offset_elems(row_block, col_block) * 2, physical_layout=make_layout(((NEUMANN_BLOCK_SIZE + 15) // 16, (NEUMANN_BLOCK_SIZE + 15) // 16, 16, 16), stride=l0a_slot.physical_layout.stride))
+        return from_tensor(l0a_slot, layout=make_layout((NEUMANN_BLOCK_SIZE, NEUMANN_BLOCK_SIZE)), offset=self.l0_matrix_block_offset_elems(row_block, col_block) * 2, physical_layout=make_layout(((NEUMANN_BLOCK_SIZE + 15) // 16, (NEUMANN_BLOCK_SIZE + 15) // 16, 16, 16), stride=l0a_slot.physical_layout.stride))
 
     def _raw_l0b_block(self, l0b_slot, row_block: int, col_block: int):
-        return reinterpret(l0b_slot, layout=make_layout((NEUMANN_BLOCK_SIZE, NEUMANN_BLOCK_SIZE)), offset=self.l0_matrix_block_offset_elems(row_block, col_block) * 2, physical_layout=make_layout(((NEUMANN_BLOCK_SIZE + 15) // 16, (NEUMANN_BLOCK_SIZE + 15) // 16, 16, 16), stride=l0b_slot.physical_layout.stride))
+        return from_tensor(l0b_slot, layout=make_layout((NEUMANN_BLOCK_SIZE, NEUMANN_BLOCK_SIZE)), offset=self.l0_matrix_block_offset_elems(row_block, col_block) * 2, physical_layout=make_layout(((NEUMANN_BLOCK_SIZE + 15) // 16, (NEUMANN_BLOCK_SIZE + 15) // 16, 16, 16), stride=l0b_slot.physical_layout.stride))
 
     def _load_l1_block_to_l0a_block(
         self, l1_block, l0a_slot, row_block: int, col_block: int,):
@@ -955,8 +945,8 @@ class StageOneMatmul:
             l0_offset = self.l0_matrix_block_offset_elems((dst_row + row_offset) // NEUMANN_BLOCK_SIZE, dst_col // NEUMANN_BLOCK_SIZE)
             # A transpose view has shape [32, 16]; the L0 destination must match.
             l0_shape = (HALF_CHUNK_SIZE, NEUMANN_BLOCK_SIZE) if transpose else (NEUMANN_BLOCK_SIZE, HALF_CHUNK_SIZE)
-            l0_tile = reinterpret(l0b_slot, layout=make_layout(l0_shape), offset=l0_offset * 2, physical_layout=make_layout(((l0_shape[1] + 15) // 16, (l0_shape[0] + 15) // 16, 16, 16), stride=l0b_slot.physical_layout.stride))
-            l1_tile = reinterpret(l1_matrix, layout=make_layout((NEUMANN_BLOCK_SIZE, HALF_CHUNK_SIZE)), offset=l1_offset * 2, physical_layout=make_layout(((HALF_CHUNK_SIZE + 15) // 16, (NEUMANN_BLOCK_SIZE + 15) // 16, 16, 16), stride=l1_matrix.physical_layout.stride))
+            l0_tile = from_tensor(l0b_slot, layout=make_layout(l0_shape), offset=l0_offset * 2, physical_layout=make_layout(((l0_shape[1] + 15) // 16, (l0_shape[0] + 15) // 16, 16, 16), stride=l0b_slot.physical_layout.stride))
+            l1_tile = from_tensor(l1_matrix, layout=make_layout((NEUMANN_BLOCK_SIZE, HALF_CHUNK_SIZE)), offset=l1_offset * 2, physical_layout=make_layout(((HALF_CHUNK_SIZE + 15) // 16, (NEUMANN_BLOCK_SIZE + 15) // 16, 16, 16), stride=l1_matrix.physical_layout.stride))
             mem_copy(l0_tile, (l1_tile).permute(1, 0) if transpose else l1_tile)
 
     def _load_packed32_block_to_full64_l0a_raw(
@@ -972,8 +962,8 @@ class StageOneMatmul:
             l0_offset -= 6 * NEUMANN_FRACTAL_ELEMS
             # A transpose view has shape [32, 16]; the L0 destination must match.
             l0_shape = (HALF_CHUNK_SIZE, NEUMANN_BLOCK_SIZE) if transpose else (NEUMANN_BLOCK_SIZE, HALF_CHUNK_SIZE)
-            l0_tile = reinterpret(l0a_slot, layout=make_layout(l0_shape), offset=l0_offset * 2, physical_layout=make_layout(((l0_shape[1] + 15) // 16, (l0_shape[0] + 15) // 16, 16, 16), stride=l0a_slot.physical_layout.stride))
-            l1_tile = reinterpret(l1_matrix, layout=make_layout((NEUMANN_BLOCK_SIZE, HALF_CHUNK_SIZE)), offset=l1_offset * 2, physical_layout=make_layout(((HALF_CHUNK_SIZE + 15) // 16, (NEUMANN_BLOCK_SIZE + 15) // 16, 16, 16), stride=l1_matrix.physical_layout.stride))
+            l0_tile = from_tensor(l0a_slot, layout=make_layout(l0_shape), offset=l0_offset * 2, physical_layout=make_layout(((l0_shape[1] + 15) // 16, (l0_shape[0] + 15) // 16, 16, 16), stride=l0a_slot.physical_layout.stride))
+            l1_tile = from_tensor(l1_matrix, layout=make_layout((NEUMANN_BLOCK_SIZE, HALF_CHUNK_SIZE)), offset=l1_offset * 2, physical_layout=make_layout(((HALF_CHUNK_SIZE + 15) // 16, (NEUMANN_BLOCK_SIZE + 15) // 16, 16, 16), stride=l1_matrix.physical_layout.stride))
             mem_copy(l0_tile, (l1_tile).permute(1, 0) if transpose else l1_tile)
 
     def _load_packed16_pair_to_full64_l0a_with_gap(
@@ -989,7 +979,7 @@ class StageOneMatmul:
             (src1_row_block, src1_col_block, dst1_block),):
             # 3510 L0A 的 16x16 单块地址仍需补偿一个 full64 M span。
             dst_offset = (dst_block - (NEUMANN_DIAG_BLOCK_NUM - 1)) * NEUMANN_FRACTAL_ELEMS
-            l0_tile = reinterpret(l0a_slot, layout=make_layout((NEUMANN_BLOCK_SIZE, NEUMANN_BLOCK_SIZE)), offset=dst_offset * 2, physical_layout=make_layout(((NEUMANN_BLOCK_SIZE + 15) // 16, (NEUMANN_BLOCK_SIZE + 15) // 16, 16, 16), stride=l0a_slot.physical_layout.stride))
+            l0_tile = from_tensor(l0a_slot, layout=make_layout((NEUMANN_BLOCK_SIZE, NEUMANN_BLOCK_SIZE)), offset=dst_offset * 2, physical_layout=make_layout(((NEUMANN_BLOCK_SIZE + 15) // 16, (NEUMANN_BLOCK_SIZE + 15) // 16, 16, 16), stride=l0a_slot.physical_layout.stride))
             l1_tile = tile_slice(l1_matrix, (NEUMANN_BLOCK_SIZE, NEUMANN_BLOCK_SIZE), (src_row_block, src_col_block))
             mem_copy(l0_tile, l1_tile)
 
@@ -1029,8 +1019,8 @@ class StageOneMatmul:
 
     def _load_beta_to_l0b(self, beta_channel):
         beta_read = beta_channel
-        l0b_slot = self.l0b_db.next_write(bare=True)
-        l0b_beta = l0b_slot.view(make_layout((beta_read.shape[1], beta_read.shape[0])), dtype=beta_read.dtype, data_format="nz")
+        l0b_slot = self.l0b_db.next_write()
+        l0b_beta = from_tensor(l0b_slot, layout=make_layout((beta_read.shape[1], beta_read.shape[0])), dtype=beta_read.dtype, data_format="nz")
         mem_copy(l0b_beta, beta_read.permute(1, 0))
         self.l0b_db.next_read()
         return l0b_beta
@@ -1100,7 +1090,7 @@ class StageOneVector:
 
     def store_shared_score_operand16(self, value, tile, row, mask):
         vstore_strided(self.ub_shared_score_nz, (tile * NEUMANN_BLOCK_SIZE + row) * 16, value, mask,
-                       block_stride=self.ub_shared_score_nz.physical_stride[0] // 16)
+                       block_stride=self.ub_shared_score_nz.physical_layout.stride[0] // 16)
 
     @jit
     def pack_shared_score_panel(self, q, k, gate, panel_idx: int):
@@ -1212,8 +1202,8 @@ class StageOneVector:
     def _cast_bf16_ub_tile_to_f32(
         ub_cast_bf16, ub_f32_tile, *, rows: int = HALF_CHUNK_SIZE, cols: int = SUPPORTED_HEAD_DIM
     ):
-        bf16_valid = reinterpret(ub_cast_bf16, offset=0, layout=make_layout((rows, cols)))
-        f32_valid = reinterpret(ub_f32_tile, offset=0, layout=make_layout((rows, cols)))
+        bf16_valid = from_tensor(ub_cast_bf16, offset=0, layout=make_layout((rows, cols)))
+        f32_valid = from_tensor(ub_f32_tile, offset=0, layout=make_layout((rows, cols)))
         cast_tile(f32_valid, bf16_valid)
 
     def scratch_half_tile(self, gm_scratch, block_idx, cols: int):
@@ -1479,16 +1469,16 @@ class StageOneVector:
     def _normalize_and_publish_q(self, q_slot, q_to_k):
         vec_sync_wait(PIPE.MTE2, PIPE.V, MTE2_TO_V_EVENT_ID)
         self.normalize_full_d_bf16(q_slot)
-        mem_copy(self.ub_q_bf16, reinterpret(q_slot, offset=0, layout=make_layout((CHUNK_SIZE, D_HALF), stride=(SUPPORTED_HEAD_DIM, 1))))
-        outgoing_half = reinterpret(q_slot, offset=D_HALF * 2, layout=make_layout((CHUNK_SIZE, D_HALF), stride=(SUPPORTED_HEAD_DIM, 1)))
+        mem_copy(self.ub_q_bf16, from_tensor(q_slot, offset=0, layout=make_layout((CHUNK_SIZE, D_HALF), stride=(SUPPORTED_HEAD_DIM, 1))))
+        outgoing_half = from_tensor(q_slot, offset=D_HALF * 2, layout=make_layout((CHUNK_SIZE, D_HALF), stride=(SUPPORTED_HEAD_DIM, 1)))
         self.publish_normalized_qk_half(q_to_k, outgoing_half)
 
     @jit
     def _normalize_and_publish_k(self, k_slot, k_to_q):
         vec_sync_wait(PIPE.MTE2, PIPE.V, MTE2_TO_V_SUBBLOCK1_EVENT_ID)
         self.normalize_full_d_bf16(k_slot)
-        mem_copy(self.ub_k_bf16, reinterpret(k_slot, offset=D_HALF * 2, layout=make_layout((CHUNK_SIZE, D_HALF), stride=(SUPPORTED_HEAD_DIM, 1))))
-        outgoing_half = reinterpret(k_slot, layout=make_layout((CHUNK_SIZE, D_HALF), stride=(SUPPORTED_HEAD_DIM, 1)))
+        mem_copy(self.ub_k_bf16, from_tensor(k_slot, offset=D_HALF * 2, layout=make_layout((CHUNK_SIZE, D_HALF), stride=(SUPPORTED_HEAD_DIM, 1))))
+        outgoing_half = from_tensor(k_slot, layout=make_layout((CHUNK_SIZE, D_HALF), stride=(SUPPORTED_HEAD_DIM, 1)))
         self.publish_normalized_qk_half(k_to_q, outgoing_half)
 
     @jit
@@ -2098,16 +2088,16 @@ class StageTwoMatmul:
             self.l0a_chunk = shared.l0a_chunk
             self.l0b_chunk = shared.l0b_chunk
             self.l0c_phi = shared.l0c_phi
-            self.l0c_rank_phi = reinterpret(shared.l0c_phi, layout=make_layout((row_count, head_dim)), data_format="nz")
-            self.l0c_psi = reinterpret(shared.l0c_psi, layout=make_layout((row_count, head_dim)), data_format="nz")
+            self.l0c_rank_phi = from_tensor(shared.l0c_phi, layout=make_layout((row_count, head_dim)), data_format="nz")
+            self.l0c_psi = from_tensor(shared.l0c_psi, layout=make_layout((row_count, head_dim)), data_format="nz")
             return
         # Chunk products and recurrent products share FP32 storage and dtype.
         self.l0a = RingBuffer(MemLoc.L0A, dtypes.float32, make_layout((head_dim, head_dim)), depth=1).next_write()
         self.l0b = RingBuffer(MemLoc.L0B, dtypes.float32, make_layout((head_dim, head_dim)), depth=1).next_write()
-        self.l0a_chunk = reinterpret(self.l0a, layout=make_layout((CHUNK_SIZE, head_dim)), data_format="zn")
-        self.l0b_chunk = reinterpret(self.l0b, layout=make_layout((CHUNK_SIZE, head_dim)), data_format="zn")
+        self.l0a_chunk = from_tensor(self.l0a, layout=make_layout((CHUNK_SIZE, head_dim)), data_format="zn")
+        self.l0b_chunk = from_tensor(self.l0b, layout=make_layout((CHUNK_SIZE, head_dim)), data_format="zn")
         self.l0c_phi = RingBuffer(MemLoc.L0C, dtypes.float32, make_layout((head_dim, head_dim)), depth=1).next_write()
-        self.l0c_rank_phi = reinterpret(self.l0c_phi, layout=make_layout((row_count, head_dim)), data_format="nz")
+        self.l0c_rank_phi = from_tensor(self.l0c_phi, layout=make_layout((row_count, head_dim)), data_format="nz")
         self.l0c_psi = RingBuffer(MemLoc.L0C, dtypes.float32, make_layout((row_count, head_dim)), depth=1).next_write()
 
     def store_summary_to_l1(self, l1_dst, l0c_src, row_index):
@@ -2119,7 +2109,7 @@ class StageTwoMatmul:
         mem_copy(self.l0b_chunk, kg_l1)
         if partial:
             source = tile_slice(lhs_l1, (CHUNK_SIZE, self.row_count), (0, row_index))
-            left = reinterpret(self.l0a, layout=make_layout((CHUNK_SIZE, self.row_count)), data_format="zn")
+            left = from_tensor(self.l0a, layout=make_layout((CHUNK_SIZE, self.row_count)), data_format="zn")
             mem_copy(left, source)
             matmul(l0c_dst, left.permute(1, 0), self.l0b_chunk, init=True)
         else:
@@ -2133,7 +2123,7 @@ class StageTwoMatmul:
     def compute_rank_product(self, rank_l1, l0c_dst, *, init: bool, row_index):
         """Compute ``rank @ phi`` with FP32 operands and accumulation."""
         source = tile_slice(rank_l1, (self.row_count, self.head_dim), (row_index, 0))
-        left = reinterpret(self.l0a, layout=make_layout((self.row_count, self.head_dim)), data_format="nz")
+        left = from_tensor(self.l0a, layout=make_layout((self.row_count, self.head_dim)), data_format="nz")
         mem_copy(left, source)
         matmul(l0c_dst, left, self.l0b, init=init)
 
@@ -2142,9 +2132,8 @@ class StageTwoMatmul:
         if self.row_count <= self.head_dim // 2:
             phi_source = tile_slice(phi_l1, (self.row_count, self.head_dim), (row_index, 0))
             psi_source = tile_slice(psi_l1, (self.row_count, self.head_dim), (row_index, 0))
-            phi_left = reinterpret(self.l0a, layout=make_layout((self.row_count, self.head_dim)), data_format="nz")
-            psi_left = reinterpret(self.l0a, offset=self.head_dim * self.head_dim * 4 // 2,
-                                   layout=make_layout((self.row_count, self.head_dim)), data_format="nz")
+            phi_left = from_tensor(self.l0a, layout=make_layout((self.row_count, self.head_dim)), data_format="nz")
+            psi_left = from_tensor(self.l0a, offset=self.head_dim * self.head_dim * 4 // 2, layout=make_layout((self.row_count, self.head_dim)), data_format="nz")
             if not skip_phi:
                 mem_copy(phi_left, phi_source)
             mem_copy(psi_left, psi_source)
@@ -2163,7 +2152,7 @@ class StageTwoMatmul:
         mem_copy(output_ub, l0c_src.partition(dim=0))
 
     def load_summary(self, l1_dst, gm_src):
-        destination = reinterpret(l1_dst, layout=make_layout((self.head_dim, self.head_dim)), data_format="nz")
+        destination = from_tensor(l1_dst, layout=make_layout((self.head_dim, self.head_dim)), data_format="nz")
         mem_copy(destination, gm_src)
 
 
@@ -2238,7 +2227,7 @@ class StageTwoVector:
     @jit
     def promote_chunk_operand_to_nz(self, source):
         destination = self.operand_nz_ub
-        dst_stride = destination.physical_stride[0]
+        dst_stride = destination.physical_layout.stride[0]
         with vf(mode="simd"):
             mask, _ = update_mask(VL, elem_bits=32)
             for row in dsl_range(0, HALF_CHUNK_SIZE, 1, unroll=4):
@@ -2447,8 +2436,7 @@ def _run_cp_prepare_summary_active_body(head_dim, inputs, outputs, schedule, seq
                 offset = chunk_id - schedule.group_start
                 if schedule.group_count >= 32 and inputs.enable_zero and skip_phi == 0 and not is_group_last:
                     if offset == 31 or offset == 63 or (schedule.group_start > 0 and is_group_first):
-                        check = reinterpret(workspace.vector.zero_check_ub,
-                                            layout=make_layout((head_dim // schedule.splits // 2, head_dim)))
+                        check = from_tensor(workspace.vector.zero_check_ub, layout=make_layout((head_dim // schedule.splits // 2, head_dim)))
                         workspace.matmul.store_summary_to_ub(check, workspace.matmul.l0c_rank_phi)
                         block = get_block_idx()
                         status = tile_slice(inputs.zero_status[block, subblock_idx, None, None], (1, 8), (0, 0))

@@ -15,6 +15,7 @@
 # extracting helpers would change DSL lowering or measured kernel performance.
 
 from __future__ import annotations
+from cannbotdsl import from_tensor
 
 import cannbotdsl
 import torch
@@ -42,7 +43,7 @@ from cannbotdsl.ops.reg import (
 )
 from cannbotdsl.ops.sync import onchip_rewind
 from cannbotdsl.ring_buffer import RingBuffer
-from cannbotdsl.tensor import idx2crd, reinterpret, tile_slice
+from cannbotdsl.tensor import idx2crd, tile_slice
 
 TILE = 128
 VL = 64
@@ -185,7 +186,7 @@ class CommitRecurrentKDAReplaySSMStage:
     ):
         replay_u = self.replay_u.next_write()
         if active_rows < TILE:
-            replay_u = reinterpret(replay_u, offset=0, layout=make_layout((1, active_rows)))
+            replay_u = from_tensor(replay_u, offset=0, layout=make_layout((1, active_rows)))
         mem_copy(
             replay_u,
             tile_slice(
@@ -261,7 +262,7 @@ class CommitRecurrentKDAReplaySSMStage:
         if accepted > 0:
             state = self.state_current
             if active_rows < TILE:
-                state = reinterpret(self.state_current, offset=0, layout=make_layout((active_rows, TILE)))
+                state = from_tensor(self.state_current, offset=0, layout=make_layout((active_rows, TILE)))
             state_tile = tile_slice(
                 state_gm[batch_index, value_head, None, None],
                 (active_rows, TILE),
@@ -327,7 +328,7 @@ class CommitRecurrentKDAReplaySSMStage:
         )
         next_state = self.state_next
         if next_active_rows < TILE:
-            next_state = reinterpret(self.state_next, offset=0, layout=make_layout((next_active_rows, TILE)))
+            next_state = from_tensor(self.state_next, offset=0, layout=make_layout((next_active_rows, TILE)))
 
         if current_accepted > 0:
             mem_copy(self.state_current, current_state_tile)

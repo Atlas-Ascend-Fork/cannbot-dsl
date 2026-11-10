@@ -1,3 +1,4 @@
+from cannbotdsl.ops.memcpy import cube_fill_l1_zero
 # Copyright (c) 2026 Huawei Technologies Co., Ltd.
 # This program is free software, you can redistribute it and/or modify it under the terms and conditions of
 # CANN Open Software License Agreement Version 2.0 (the "License").
@@ -34,11 +35,12 @@ MX semantics: both L0 loads bind an E8M0 scale (OCP MXFP8 mmad); the bias
 rides the mmad BT path (hardware applies it on the init mmad only).
 
 K handling: every K-sized on-chip structure is a k_l1 = k_blocks_per_window*k_l0 ring,
-so K is unbounded. The consume runs k_blocks_per_window L0 sub-blocks per L1 window in
-runtime loops. K tails (K % 256 != 0) need NO GM padding: the channel-
-actual mechanism narrows the L0 loads and the mmad n_dim to the window's
-runtime width (published by the A staging's channel dst and the B piece
-copy's DualParam actual), and the scale loads narrow in lockstep.
+so K is unbounded. Every window executes all of its L0 sub-blocks. The
+wrapper zero-pads the packed B grid to complete windows, so the AIV fetch
+and conversion use the same extent as the L1 handoff. A stays unpadded
+along K; its unused L1 fractals are zero-filled on chip. Scale descriptors
+cover the full padded windows, and fixpipe is signalled after the last
+executed sub-block.
 
 Cross-core handoff (AIV -> AIC, flash_attn/flash_kda pattern): the
 converted B travels a k_l1-wide CrossCore L1 ring; AIV0/AIV1 each write
@@ -87,8 +89,8 @@ from cannbotdsl.lang.jit import jit
 from cannbotdsl.lang.kernel import kernel
 from cannbotdsl.ops.arch import get_block_idx, get_subblock_id
 from cannbotdsl.ops.matmul import matmul as dsl_matmul
-from cannbotdsl.ops.memcpy import copy_options, mem_copy, convert
-from cannbotdsl.ops.sync import cube_fill_l1_zero
+from cannbotdsl.ops.memcpy import copy_options, mem_copy
+
 from cannbotdsl.ops.reg import (
     create_mask,
     vload,
@@ -331,14 +333,15 @@ class MixQuantTiling:
         self.k_block_count = _ceil_div(self.k, self.k_l0)
         # ceil keeps full K coverage when k_blocks_per_window does not divide k_block_count
         self.k_window_count = _ceil_div(self.k_block_count, self.k_blocks_per_window)
-        # repacked B grid height in k-fractals (the AIV fetch bound and
-        # the host repack target): align64(k)/32; beyond-k rows are real
-        # zero-filled GM
-        self.k_fractals_in_grid = _ceil_align(self.k, 64) // 32
         # K-tail model: full-width window claims; the wrapper pads only the
         # E8M0 scale columns to the k_l1 grid (A columns never pad — the
         # kernel zero-fills the stale L1 tail fractals via cube_fill_l1_zero)
         self.k_fractals_per_window = self.k_l1 // 32
+        # The B fetch/conversion and the L1 handoff must cover the same
+        # complete windows. A partial packed grid loses live tail data on
+        # CANN 9.3.0 and can fault in the vector prologue. The wrapper
+        # supplies zero FP4 codes for the unused fractals.
+        self.k_fractals_in_grid = self.k_window_count * self.k_fractals_per_window
         self.scale_bytes_per_window = self.k_l1 // 32
 
         self.tile_rows = _ceil_div(self.m, self.tile_m)
@@ -468,7 +471,7 @@ class MixQuantKernel:
                     tile_m_idx * t.tile_m : (tile_m_idx + 1) * t.tile_m,
                     tile_n_idx * t.tile_n : (tile_n_idx + 1) * t.tile_n,
                 ],
-                convert(l0c_accumulator, gm_c.dtype, scale=64.0),
+                l0c_accumulator.convert(gm_c.dtype, scale=64.0),
                 options=copy_options(unit_flag=3),
             )
 
@@ -539,7 +542,7 @@ class MixQuantKernel:
         (constexpr-unrolled bodies trip the legacy rank check).
         """
         t = self.t
-        s = converted_b_slot.physical_stride
+        s = converted_b_slot.physical_layout.stride
         k_fractal_stride, n_group_stride = s[0], s[1]
         ngrps = t.n_groups_per_tile
         first_group = n_group_lo
@@ -801,8 +804,9 @@ class MixQuantKernel:
             options=copy_options(mx_scale=scale_b_sub_block),
         )
         l0b_slot = self.l0b.next_read()
-        # final flag rides the last global sub: k_block_count = ceil(k/k_l0)
-        last_sub_idx = t.k_block_count - 1
+        # Include zero-padded sub-blocks: fixpipe must follow the last
+        # executed MMAD, rather than the last sub-block with live K.
+        last_sub_idx = t.k_window_count * t.k_blocks_per_window - 1
         # bias rides the init mmad (init is a runtime condition in the
         # sub-block loop, so the bias operand is always attached — the
         # hardware applies it on the init mmad only)

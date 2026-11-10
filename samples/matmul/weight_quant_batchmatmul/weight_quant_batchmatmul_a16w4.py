@@ -34,6 +34,8 @@ multiples (see ``_pad_inputs``) so every tile and part runs the full-width
 path; the wrapper crops the output back to (M, N).
 """
 
+from cannbotdsl import from_tensor
+
 __all__ = ["npu_weight_quant_batchmatmul"]
 
 import os
@@ -58,7 +60,6 @@ from cannbotdsl import (
     matmul,
     mem_copy,
     range_constexpr,
-    reinterpret,
     tile_slice,
     vf,
 )
@@ -717,7 +718,7 @@ class WqbmmKernel:
                     b0_l0 = l0b0.next_write()
                     mem_copy(
                         b0_l0,
-                        reinterpret(
+                        from_tensor(
                             w_slot,
                             layout=make_layout((t.kb, t.nh)),
                             offset=0,
@@ -727,7 +728,7 @@ class WqbmmKernel:
                     b1_l0 = l0b1.next_write()
                     mem_copy(
                         b1_l0,
-                        reinterpret(
+                        from_tensor(
                             w_slot,
                             layout=make_layout((t.kb, t.nh)),
                             offset=t.kb * t.nh * 2,
@@ -775,7 +776,7 @@ class WqbmmKernel:
                 b0_l0 = l0b0.next_write()
                 mem_copy(
                     b0_l0,
-                    reinterpret(
+                    from_tensor(
                         w_slot,
                         layout=make_layout((t.kb_tail, t.nh)),
                         offset=0,
@@ -785,7 +786,7 @@ class WqbmmKernel:
                 b1_l0 = l0b1.next_write()
                 mem_copy(
                     b1_l0,
-                    reinterpret(
+                    from_tensor(
                         w_slot,
                         layout=make_layout((t.kb_tail, t.nh)),
                         offset=t.kb * t.nh * 2,
@@ -892,20 +893,20 @@ class WqbmmKernel:
         self._vf_quant(fp4r, scr, ub_idx, ub_scf16, znw, n_grp)
 
         # MTE3：UB zn 半区 → L1 zn slot 的本 AIV 行块（zn→zn 恒等）
-        znr = reinterpret(
+        znr = from_tensor(
             ub_wzn.next_read(), layout=make_layout((t.kb, t.nh)), data_format="zn"
         )
         slot = l1_w.next_write()
         if sub == 0:
             mem_copy(
-                reinterpret(
+                from_tensor(
                     slot, layout=make_layout((t.kb, t.nh)), offset=0, data_format="zn"
                 ),
                 znr,
             )
         else:
             mem_copy(
-                reinterpret(
+                from_tensor(
                     slot,
                     layout=make_layout((t.kb, t.nh)),
                     offset=t.kb * t.nh * 2,

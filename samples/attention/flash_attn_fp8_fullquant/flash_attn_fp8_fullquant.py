@@ -19,6 +19,8 @@
 ``BNSD``/``TND`` 两种 Q/O 布局。公开入口为 :func:`flash_attn_fp8_fullquant`。
 """
 
+from cannbotdsl import from_tensor
+
 __all__ = ["flash_attn_fp8_fullquant"]
 
 import math
@@ -237,8 +239,11 @@ class Matmul:
     def compute_qk(self, score_ub, q_slot):
         key_l0a = self.l0a.next_write()
         # 复用较大 L0 槽位时，显式 NZ 布局按本次矩阵形状重建紧凑物理跨度。
-        query_l0b = self.l0b.next_write().reinterpret(
-            Float8E4M3FN, make_layout((self.m_base_size, self.d)), data_format="nz"
+        query_l0b = from_tensor(
+            self.l0b.next_write(),
+            Float8E4M3FN,
+            make_layout((self.m_base_size, self.d)),
+            data_format="nz",
         )
         score_l0c = self.l0c_mm1.next_write()
         mem_copy(key_l0a, self.kv_l1.next_read())
@@ -269,13 +274,17 @@ class Matmul:
     @jit
     def compute_pv(self, p_l1, output_ub):
         # P/V 的逻辑转置与目标 L0 形状一起声明，搬运按两端视图选择格式转换。
-        probability_l0a = self.l0a.next_write().reinterpret(
+        probability_l0a = from_tensor(
+            self.l0a.next_write(),
             Float8E4M3FN,
             make_layout((self.m_base_size, self.s2_base_size)),
             data_format="nz",
         )
-        value_l0b = self.l0b.next_write().reinterpret(
-            Float8E4M3FN, make_layout((self.d, self.s2_base_size)), data_format="nz"
+        value_l0b = from_tensor(
+            self.l0b.next_write(),
+            Float8E4M3FN,
+            make_layout((self.d, self.s2_base_size)),
+            data_format="nz",
         )
         output_l0c = self.l0c_mm2.next_write()
         mem_copy(probability_l0a, p_l1.next_read().permute(1, 0))
@@ -327,7 +336,8 @@ class Vector:
             for _ in range(KEY_SCALE_BUFFER_SLOTS)
         ]
         self.key_dequant_scale_byte_views = [
-            slot.reinterpret(
+            from_tensor(
+                slot,
                 dtypes.uint8,
                 make_layout(
                     (KEY_DEQUANT_SCALE_COPIES, self.key_dequant_scale_stride * 4)

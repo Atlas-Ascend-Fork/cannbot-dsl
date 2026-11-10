@@ -8,6 +8,8 @@
 
 """A5 quant_mla_prolog fused Kernel, Torch interface and Native export."""
 
+from cannbotdsl import from_tensor
+
 import json as _json
 import math as _math
 import os as _os
@@ -50,7 +52,11 @@ from cannbotdsl.ops.sync import (
 )
 from cannbotdsl.ops import sync as _sync_ops
 from cannbotdsl.ring_buffer import RingBuffer
-from cannbotdsl.tensor import make_layout, reinterpret as _dsl_reinterpret, tile_slice
+from cannbotdsl.tensor import make_layout, tile_slice
+
+
+def _permute(value, dims):
+    return value.permute(dims)
 
 
 _NATIVE_DIRECTORY = _Path(__file__).resolve().parent / "_native"
@@ -273,7 +279,7 @@ def _view(
         if layout is not None:
             raise ValueError("shape and layout are mutually exclusive")
         layout = make_layout(shape)
-    return _dsl_reinterpret(
+    return from_tensor(
         value,
         dtype=dtype,
         layout=layout,
@@ -298,13 +304,21 @@ def _copy_plan(*, format_transform=None, split_axis=None):
 
 
 def _accumulator(ring, rows, columns):
-    slot = ring.next_write(bare=True)
-    view = _view(
-        slot.view(),
-        shape=(rows, columns),
-        physical_layout=make_layout(((columns + 15) // 16, (rows + 15) // 16, 16, 16)),
+    slot = ring.next_write()
+    full_rows = slot.shape[0]
+    full = _view(
+        slot,
+        shape=(full_rows, columns),
+        physical_layout=make_layout(
+            ((columns + 15) // 16, (full_rows + 15) // 16, 16, 16)
+        ),
     )
-    return slot, view
+    view = _view(
+        full,
+        shape=(rows, columns),
+        physical_layout=full.physical_layout,
+    )
+    return full, view
 
 
 def _copy(
@@ -643,7 +657,7 @@ class QaRowPipeline:
                                 acc_slot,
                                 _view(
                                     a0.next_read(),
-                                    shape=(valid_rows, QA_PIPELINE_REDUCTION),
+                                    shape=(self.bm, QA_PIPELINE_REDUCTION),
                                 ),
                                 b0.next_read(),
                                 init=(kt == start + 1 and inner == 0),
@@ -688,7 +702,7 @@ class QaRowPipeline:
                             acc_slot,
                             _view(
                                 a0.next_read(),
-                                shape=(valid_rows, QA_PIPELINE_REDUCTION),
+                                shape=(self.bm, QA_PIPELINE_REDUCTION),
                             ),
                             b0.next_read(),
                             init=kt == start + 1,
@@ -813,7 +827,7 @@ class _WkbProjection:
                 if dsl.const_expr(publish_heads and not token_major_output):
                     output_heads = q.view((N, rows, KV_ELEMENTS))
                 else:
-                    output_heads = dsl.permute(q.view((rows, N, q.shape[1])), (1, 0, 2))
+                    output_heads = _permute(q.view((rows, N, q.shape[1])), (1, 0, 2))
                 # Keep the token stride, including other heads and the RoPE tail.
                 head_output = output_heads[head, None, 0:KV_ELEMENTS]
                 _copy(
@@ -911,7 +925,7 @@ class _WkbProjection:
                             acc_slot,
                             _view(
                                 a_l0.next_read(),
-                                shape=(output_tile.shape[0], WKB_C2V_REDUCTION),
+                                shape=(self.tile_rows, WKB_C2V_REDUCTION),
                             ),
                             _view(
                                 b_l0.next_read(),
@@ -1006,7 +1020,7 @@ class _WkbProjection:
                 if dsl.const_expr(publish_heads and not token_major_output):
                     output_heads = q.view((N, rows, KV_ELEMENTS))
                 else:
-                    output_heads = dsl.permute(q.view((rows, N, q.shape[1])), (1, 0, 2))
+                    output_heads = _permute(q.view((rows, N, q.shape[1])), (1, 0, 2))
                 # Keep the token stride, including other heads and the RoPE tail.
                 head_output = output_heads[head, None, 0:KV_ELEMENTS]
                 for column_tile in range(KV_ELEMENTS // self.tile_columns):
@@ -1054,7 +1068,7 @@ class _WkbProjection:
                             acc_slot,
                             _view(
                                 a_l0.next_read(),
-                                shape=(output_tile.shape[0], WKB_C2V_REDUCTION),
+                                shape=(self.tile_rows, WKB_C2V_REDUCTION),
                             ),
                             b_l0.next_read(),
                             init=k_tile == 0,
@@ -1137,7 +1151,7 @@ class _WkbProjection:
                 if dsl.const_expr(publish_heads):
                     output_heads = q.view((N, rows, KV_ELEMENTS))
                 else:
-                    output_heads = dsl.permute(q.view((rows, N, q.shape[1])), (1, 0, 2))
+                    output_heads = _permute(q.view((rows, N, q.shape[1])), (1, 0, 2))
                 # Keep the token stride, including other heads and the RoPE tail.
                 head_output = output_heads[head, None, 0:KV_ELEMENTS]
                 for column_tile in range(KV_ELEMENTS // self.tile_columns):
@@ -1195,7 +1209,7 @@ class _WkbProjection:
                             acc_slot,
                             _view(
                                 a_l0.next_read(),
-                                shape=(output_tile.shape[0], WKB_C2V_REDUCTION),
+                                shape=(self.tile_rows, WKB_C2V_REDUCTION),
                             ),
                             b_l0.next_read(),
                             init=k_tile == 0,
@@ -2580,7 +2594,7 @@ class _Projection:
         head_count = wkb.shape[0]
         wkb_reduction = wkb.shape[1]
         input_tokens = q_nope.view((rows, head_count * wkb_reduction))
-        output_heads = dsl.permute(q.view((rows, head_count, q.shape[1])), (1, 0, 2))
+        output_heads = _permute(q.view((rows, head_count, q.shape[1])), (1, 0, 2))
         if dsl.const_expr(self.w_qr_quant_mode == 1):
             if dsl.const_expr(self.weight_is_nz):
                 sa_l1 = _ring_buffer(
@@ -4478,7 +4492,7 @@ class _QueryPrepare:
             cos_buffer = _buffer(MemLoc.UB, (vector_rows, self.Dr), dtypes.bfloat16)
             rope_values = _buffer(MemLoc.UB, (vector_rows, self.Dr), dtypes.bfloat16)
             scaled_rope = _buffer(MemLoc.UB, (vector_rows, self.Dr), dtypes.float32)
-            output_heads = dsl.permute(q.view((rows, self.N, q.shape[1])), (1, 0, 2))
+            output_heads = _permute(q.view((rows, self.N, q.shape[1])), (1, 0, 2))
         for task in range(get_block_idx(), row_tiles * self.N, get_block_num()):
             head = task % self.N
             batch = task // self.N * VECTOR_SUBBLOCKS + get_subblock_id()
@@ -5163,7 +5177,7 @@ class _QueryPrepare:
             cos_values = _buffer(MemLoc.UB, (vector_rows, self.Dr), dtypes.bfloat16)
             rows = q_rope.shape[0] // self.N
             if dsl.const_expr(packed_output):
-                output_heads = dsl.permute(
+                output_heads = _permute(
                     q_rope.view((rows, self.N, q_rope.shape[1])), (1, 0, 2)
                 )
             else:
@@ -5344,7 +5358,7 @@ class _QueryPrepare:
             cos_buffer = _buffer(MemLoc.UB, (vector_rows, self.Dr), dtypes.bfloat16)
             rope_values = _buffer(MemLoc.UB, (vector_rows, self.Dr), dtypes.bfloat16)
             scaled_rope = _buffer(MemLoc.UB, (vector_rows, self.Dr), dtypes.float32)
-            output_heads = dsl.permute(q.view((rows, self.N, q.shape[1])), (1, 0, 2))
+            output_heads = _permute(q.view((rows, self.N, q.shape[1])), (1, 0, 2))
         for task in range(get_block_idx(), row_tiles * self.N, get_block_num()):
             head = task % self.N
             batch = task // self.N * VECTOR_SUBBLOCKS + get_subblock_id()
@@ -5440,7 +5454,7 @@ class _QueryPrepare:
             sin_buffer = _buffer(MemLoc.UB, (vector_rows, self.Dr), dtypes.bfloat16)
             cos_buffer = _buffer(MemLoc.UB, (vector_rows, self.Dr), dtypes.bfloat16)
             rope_values = _buffer(MemLoc.UB, (vector_rows, self.Dr), dtypes.bfloat16)
-            output_heads = dsl.permute(q.view((rows, self.N, q.shape[1])), (1, 0, 2))
+            output_heads = _permute(q.view((rows, self.N, q.shape[1])), (1, 0, 2))
         for task in range(get_block_idx(), row_tiles * self.N, get_block_num()):
             head = task % self.N
             batch = task // self.N * VECTOR_SUBBLOCKS + get_subblock_id()
@@ -7514,7 +7528,15 @@ def _mode_value(name, value, enum_type):
 def _schema_mode_value(name, value, enum_type):
     if type(value) is not int:
         raise TypeError(f"{name} schema value must be int")
-    if value not in tuple(member.value for member in enum_type):
+    if enum_type is WQrQuantMode:
+        valid_values = (1, 2, 3)
+    elif enum_type is QkvQuantMode:
+        valid_values = (0, 1, 2, 3)
+    elif enum_type is CacheMode:
+        valid_values = (0, 1)
+    else:
+        valid_values = (0, 1, 2)
+    if value not in valid_values:
         raise ValueError(f"{name} has unsupported schema value {value}")
     return value
 

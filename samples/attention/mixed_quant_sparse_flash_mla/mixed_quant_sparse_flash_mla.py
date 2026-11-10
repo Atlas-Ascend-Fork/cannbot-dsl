@@ -1,3 +1,4 @@
+from cannbotdsl import from_tensor
 # Copyright (c) 2026 Huawei Technologies Co., Ltd.
 # This program is free software, you can redistribute it and/or modify it under the terms and conditions of
 # CANN Open Software License Agreement Version 2.0 (the "License").
@@ -26,10 +27,7 @@ from cannbotdsl.ops.matmul import matmul
 from cannbotdsl.ops.cube import set_mmad_direction
 from cannbotdsl.ops.memcpy import copy_options, mem_copy
 from cannbotdsl import MemLoc, PIPE, Tensor, is_aic, CArray, datastruct, make_layout
-from cannbotdsl.tensor import (
-    tile_slice,
-    reinterpret,
-)
+from cannbotdsl.tensor import tile_slice
 from cannbotdsl.buffer import Buffer
 from cannbotdsl.lang.vf import vf
 from cannbotdsl.ops.sync import (
@@ -242,13 +240,13 @@ def _addr_tab_w(k):
 
 
 def _addr_pipe_view(slot, begin, count):
-    root = reinterpret(slot, layout=make_layout((1, _ADDR_PIPE_INPUT_ELEMS)))
+    root = from_tensor(slot, layout=make_layout((1, _ADDR_PIPE_INPUT_ELEMS)))
     return root[0:1, begin : begin + count]
 
 
 def _copy_addr_elements_from_gm(ch, gm, elem_off, count):
     mem_copy(
-        reinterpret(ch, layout=make_layout((1, count))),
+        from_tensor(ch, layout=make_layout((1, count))),
         gm.view(gm.shape[0] * gm.shape[1])[elem_off : elem_off + count,].view(1, count),
     )
 
@@ -256,7 +254,7 @@ def _copy_addr_elements_from_gm(ch, gm, elem_off, count):
 def _copy_addr_from_gm(ch, gm, elem_off, burst_bytes):
     count = burst_bytes // 4
     mem_copy(
-        reinterpret(ch, layout=make_layout((1, count))),
+        from_tensor(ch, layout=make_layout((1, count))),
         gm.view(gm.shape[0] * gm.shape[1])[elem_off : elem_off + count,].view(1, count),
     )
 
@@ -399,7 +397,7 @@ class Matmul:
         q_lo, q_hi = self.q_lower_heads_l1[0], self.q_upper_heads_l1[0]
         for col in range_constexpr(8):
             a_raw = self.l0a.next_write()
-            a_slot = reinterpret(
+            a_slot = from_tensor(
                 a_raw, layout=make_layout((self.tile_cube_m, 64)), data_format="nz"
             )
             if const_expr(col < 6):
@@ -420,7 +418,7 @@ class Matmul:
                 tile_slice(a_slot, (self.tile_vec_m, 64), (1, 0)),
                 tile_slice(q_hi, (self.tile_vec_m, 64), (0, q_col)),
             )
-            b_slot = reinterpret(
+            b_slot = from_tensor(
                 self.l0b[col % 4],
                 layout=make_layout((self.tile_n, 64)),
                 data_format="nz",
@@ -428,7 +426,7 @@ class Matmul:
             mem_copy(
                 tile_slice(b_slot, (self.tile_n // 2, 64), (0, 0)),
                 tile_slice(
-                    reinterpret(
+                    from_tensor(
                         kv_lower_rows_l1,
                         layout=make_layout((self.tile_n // 2, D)),
                         data_format="nz",
@@ -440,7 +438,7 @@ class Matmul:
             mem_copy(
                 tile_slice(b_slot, (self.tile_n // 2, 64), (1, 0)),
                 tile_slice(
-                    reinterpret(
+                    from_tensor(
                         kv_upper_rows_l1,
                         layout=make_layout((self.tile_n // 2, D)),
                         data_format="nz",
@@ -469,20 +467,20 @@ class Matmul:
         set_mmad_direction("n")
         a_slot = self.l0a.next_write()
         for col in range_constexpr(8):
-            b_slot = reinterpret(
+            b_slot = from_tensor(
                 self.l0b[col % 4],
                 layout=make_layout((64, self.tile_n)),
                 data_format="nz",
             )
             mem_copy(
-                reinterpret(
+                from_tensor(
                     b_slot,
                     layout=make_layout((64, self.tile_n // 2)),
                     offset=0,
                     data_format="nz",
                 ),
                 tile_slice(
-                    reinterpret(
+                    from_tensor(
                         kv_lower_rows_l1,
                         layout=make_layout((self.tile_n // 2, D)),
                         data_format="nz",
@@ -492,14 +490,14 @@ class Matmul:
                 ).permute(1, 0),
             )
             mem_copy(
-                reinterpret(
+                from_tensor(
                     b_slot,
                     layout=make_layout((64, self.tile_n // 2)),
                     offset=64 * (self.tile_n // 2) * 2,
                     data_format="nz",
                 ),
                 tile_slice(
-                    reinterpret(
+                    from_tensor(
                         kv_upper_rows_l1,
                         layout=make_layout((self.tile_n // 2, D)),
                         data_format="nz",
@@ -572,7 +570,7 @@ class Vector:
     def bind_result(self, results):
         self.result_views = results
         self.out_halves = [
-            reinterpret(
+            from_tensor(
                 results[half * 2 + 1],
                 dtypes.bfloat16,
                 layout=make_layout((self.tile_vec_m, 256), stride=(512, 1)),
@@ -889,7 +887,7 @@ class Vector:
                 rr.vstore(self.lse_ub, 0, rr.vload(self.sinks_ub, 0), mask)
             mem_copy(
                 tile_slice(lse_gm, (self.tile_vec_m,), (lse_base,)),
-                reinterpret(self.lse_ub, layout=make_layout((self.tile_vec_m,))),
+                from_tensor(self.lse_ub, layout=make_layout((self.tile_vec_m,))),
             )
 
     # Keep each FD VF in a separate JIT method: register/mask locals must not
@@ -919,7 +917,7 @@ class Vector:
                 (self.tile_vec_m,),
                 (slot * (FD_MS_ELEMS // self.tile_vec_m) + sub,),
             ),
-            reinterpret(self.lse_ub, layout=make_layout((self.tile_vec_m,))),
+            from_tensor(self.lse_ub, layout=make_layout((self.tile_vec_m,))),
         )
         self._fd_ms_to_ub(1, sum_idx)
         mem_copy(
@@ -932,7 +930,7 @@ class Vector:
                     + sub,
                 ),
             ),
-            reinterpret(self.lse_ub, layout=make_layout((self.tile_vec_m,))),
+            from_tensor(self.lse_ub, layout=make_layout((self.tile_vec_m,))),
         )
 
     @jit
@@ -962,7 +960,7 @@ class Vector:
             self._fd_lse_to_ub(self.lse_ub.next_write())
             mem_copy(
                 tile_slice(lse_gm, (self.tile_vec_m,), (row * 2 + sub,)),
-                reinterpret(
+                from_tensor(
                     self.lse_ub.next_read(), layout=make_layout((self.tile_vec_m,))
                 ),
             )
@@ -1016,7 +1014,7 @@ class Vector:
             )
         mem_copy(
             tile_slice(lse_gm, (self.tile_vec_m,), (lse_base,)),
-            reinterpret(self.lse_ub, layout=make_layout((self.tile_vec_m,))),
+            from_tensor(self.lse_ub, layout=make_layout((self.tile_vec_m,))),
         )
 
     @jit
@@ -1155,7 +1153,7 @@ class Vector:
         self.res_o = Buffer(
             MemLoc.UB, dtypes.float32, make_layout((self.tile_vec_m, self.tile_d))
         )
-        self.out_view = reinterpret(
+        self.out_view = from_tensor(
             self.res_o,
             dtypes.bfloat16,
             layout=make_layout((self.tile_vec_m, self.tile_d)),
@@ -1626,7 +1624,7 @@ class MqsmlaKernel:
         # Dequantize four 128-value chunks through FP32 to BF16 and compact even lanes.
         # Each chunk uses four group-32 scales and writes matching NZ columns.
         subtile_rows = _TILE_ROWS
-        scale_view = reinterpret(
+        scale_view = from_tensor(
             kv_fp8,
             layout=make_layout((_TILE_ROWS, _ROW_BF16)),
             dtype=dtypes.bfloat16,
@@ -1690,7 +1688,7 @@ class MqsmlaKernel:
         # Packed FP4 consumes an 8-bit mask; each byte expands to two BF16 values.
         # Scales follow groups of 16 features, and _v0_store writes NZ17 faces.
         subtile_rows = _TILE_ROWS
-        scale_view = reinterpret(
+        scale_view = from_tensor(
             kv_fp8,
             layout=make_layout((_TILE_ROWS, _ROW_BF16)),
             dtype=dtypes.bfloat16,
@@ -1911,13 +1909,13 @@ class MqsmlaKernel:
             else:
                 self._antiquant_vf_fp8_g32(rslot_bytes, v0_out)
             # NZ17 faces become one regular strided UB-to-L1 copy.
-            src = reinterpret(
+            src = from_tensor(
                 v0_out,
                 layout=make_layout((D // 16, subtile_rows * 16), stride=(_NZ_CHUNK, 1)),
             )
             lt = self.subblock_idx * 2 + chunk
             if half == 0:
-                l1_nd = reinterpret(
+                l1_nd = from_tensor(
                     kv_lower_rows_l1,
                     layout=make_layout((D // 16, self.tile_n // 2 * 16)),
                     data_format="nd",
@@ -1925,7 +1923,7 @@ class MqsmlaKernel:
                 dst = tile_slice(l1_nd, (D // 16, subtile_rows * 16), (0, lt))
                 mem_copy(dst, src)
             else:
-                l1_nd = reinterpret(
+                l1_nd = from_tensor(
                     kv_upper_rows_l1,
                     layout=make_layout((D // 16, self.tile_n // 2 * 16)),
                     data_format="nd",
@@ -1937,11 +1935,11 @@ class MqsmlaKernel:
     def _addr_load_local_group(self, batch, first, nr):
         # 每组 query 不跨 batch；两侧索引、页表和长度由 MTE2 连续填充。
         slot = self._addr_local_input
-        bt = reinterpret(slot, layout=make_layout((1, _ADDR_COMPACT_BT)))
+        bt = from_tensor(slot, layout=make_layout((1, _ADDR_COMPACT_BT)))
         _copy_addr_from_gm(
             bt, self._pa_bt, batch * self._pa_bt.shape[1], self._pa_bt.shape[1] * 4
         )
-        sp = reinterpret(
+        sp = from_tensor(
             slot,
             layout=make_layout((1, _ADDR_LOCAL_ROWS * _ADDR_LOCAL_ORI_K)),
             offset=_ADDR_LOCAL_ORI_INDEX_OFFSET,
@@ -1950,17 +1948,17 @@ class MqsmlaKernel:
             sp, self._ori_idx, first * self._avec_k1, nr * self._avec_k1 * 4
         )
         if const_expr(self._ori_topk_length is not None):
-            lens = reinterpret(
+            lens = from_tensor(
                 slot,
                 layout=make_layout((1, _ADDR_LOCAL_ROWS)),
                 offset=_ADDR_LOCAL_ORI_LENGTH_OFFSET,
             )
             mem_copy(
-                reinterpret(lens, layout=make_layout((1, nr))),
+                from_tensor(lens, layout=make_layout((1, nr))),
                 self._ori_topk_length[first : first + nr,].view(1, nr),
             )
         if const_expr(self.has_cmp):
-            bt = reinterpret(
+            bt = from_tensor(
                 slot,
                 layout=make_layout((1, _ADDR_COMPACT_BT)),
                 offset=_ADDR_COMPACT_BT * 4,
@@ -1971,7 +1969,7 @@ class MqsmlaKernel:
                 batch * self._pa_bt_cmp.shape[1],
                 self._pa_bt_cmp.shape[1] * 4,
             )
-            sp = reinterpret(
+            sp = from_tensor(
                 slot,
                 layout=make_layout((1, _ADDR_LOCAL_ROWS * _ADDR_LOCAL_CMP_K)),
                 offset=_ADDR_LOCAL_CMP_INDEX_OFFSET,
@@ -1980,13 +1978,13 @@ class MqsmlaKernel:
                 sp, self._cmp_idx, first * self._avec_k2, nr * self._avec_k2 * 4
             )
             if const_expr(self._cmp_topk_length is not None):
-                lens = reinterpret(
+                lens = from_tensor(
                     slot,
                     layout=make_layout((1, _ADDR_LOCAL_ROWS)),
                     offset=_ADDR_LOCAL_CMP_LENGTH_OFFSET,
                 )
                 mem_copy(
-                    reinterpret(lens, layout=make_layout((1, nr))),
+                    from_tensor(lens, layout=make_layout((1, nr))),
                     self._cmp_topk_length[first : first + nr,].view(1, nr),
                 )
 
@@ -2048,34 +2046,34 @@ class MqsmlaKernel:
 
     @jit
     def _addr_compute_local_group(self, slot, out, nr):
-        bt1 = reinterpret(slot, layout=make_layout((1, _ADDR_COMPACT_BT)))
-        sp1 = reinterpret(
+        bt1 = from_tensor(slot, layout=make_layout((1, _ADDR_COMPACT_BT)))
+        sp1 = from_tensor(
             slot,
             layout=make_layout((1, _ADDR_LOCAL_ROWS * _ADDR_LOCAL_ORI_K)),
             offset=_ADDR_LOCAL_ORI_INDEX_OFFSET,
         )
         len1 = None
         if const_expr(self._ori_topk_length is not None):
-            len1 = reinterpret(
+            len1 = from_tensor(
                 slot,
                 layout=make_layout((1, _ADDR_LOCAL_ROWS)),
                 offset=_ADDR_LOCAL_ORI_LENGTH_OFFSET,
             )
         cols = (self._avec_k1_tab + (self._avec_k2_tab if self.has_cmp else 0)) // 2
         if const_expr(self.has_cmp):
-            bt2 = reinterpret(
+            bt2 = from_tensor(
                 slot,
                 layout=make_layout((1, _ADDR_COMPACT_BT)),
                 offset=_ADDR_COMPACT_BT * 4,
             )
-            sp2 = reinterpret(
+            sp2 = from_tensor(
                 slot,
                 layout=make_layout((1, _ADDR_LOCAL_ROWS * _ADDR_LOCAL_CMP_K)),
                 offset=_ADDR_LOCAL_CMP_INDEX_OFFSET,
             )
             len2 = None
             if const_expr(self._cmp_topk_length is not None):
-                len2 = reinterpret(
+                len2 = from_tensor(
                     slot,
                     layout=make_layout((1, _ADDR_LOCAL_ROWS)),
                     offset=_ADDR_LOCAL_CMP_LENGTH_OFFSET,
@@ -2122,7 +2120,7 @@ class MqsmlaKernel:
             dst = dst[0:bursts, self.subblock_idx * 32 : self.subblock_idx * 32 + 32]
             mem_copy(
                 dst,
-                reinterpret(self._addr_local_output, layout=make_layout((bursts, 32))),
+                from_tensor(self._addr_local_output, layout=make_layout((bursts, 32))),
             )
             current = current + nr
         # 每个 AIV 仅消费自己的地址区，S 等待本地 MTE3 完成后才回收预处理存储。
@@ -2145,7 +2143,7 @@ class MqsmlaKernel:
         if const_expr(self._ori_topk_length is not None):
             lens = _addr_pipe_view(slot, self._addr_pipe_ori_length, 16)
             mem_copy(
-                reinterpret(lens, layout=make_layout((1, nr))),
+                from_tensor(lens, layout=make_layout((1, nr))),
                 self._ori_topk_length[first : first + nr,].view(1, nr),
             )
         if const_expr(self.has_cmp):
@@ -2165,7 +2163,7 @@ class MqsmlaKernel:
             if const_expr(self._cmp_topk_length is not None):
                 lens = _addr_pipe_view(slot, self._addr_pipe_cmp_length, 16)
                 mem_copy(
-                    reinterpret(lens, layout=make_layout((1, nr))),
+                    from_tensor(lens, layout=make_layout((1, nr))),
                     self._cmp_topk_length[first : first + nr,].view(1, nr),
                 )
 
@@ -2320,7 +2318,7 @@ class MqsmlaKernel:
             ready = self._addr_out_ring.next_read()
             mem_copy(
                 self._addr_tab[first : first + nr, 0:cols],
-                reinterpret(ready, layout=make_layout((nr, cols))),
+                from_tensor(ready, layout=make_layout((nr, cols))),
             )
             consumed = consumed + nr
         vec_sync_intra_arrive(PIPE.MTE3, self._addr_bar_sid)
@@ -2494,7 +2492,7 @@ class MqsmlaKernel:
             None, 0 : self.tile_vec_m * 16
         ]
         target = tile_slice(
-            reinterpret(
+            from_tensor(
                 p_l1_write,
                 layout=make_layout((self.tile_n // 16, self.tile_cube_m * 16)),
                 data_format="nd",

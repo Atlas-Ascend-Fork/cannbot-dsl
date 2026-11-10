@@ -26,6 +26,7 @@ MegaReindexTailWorkspace = _sample.MegaReindexTailWorkspace
 prepare_mega_reindex = _sample.prepare_mega_reindex
 _front = load_sample("attention/mega_reindex/reindex_front.py")
 _formats = load_sample("attention/mega_reindex/reindex_front.py")
+_runtime = load_sample("attention/mega_reindex/reindex_runtime.py")
 prepare_weight_nz = _front.prepare_weight_nz
 prepare_wqa_nz = _formats.prepare_wqa_nz
 prepare_wqb_nz = _formats.prepare_wqb_nz
@@ -33,6 +34,7 @@ prepare_wqb_nz = _formats.prepare_wqb_nz
 B, S, KV_S, TOPK, SEED = 1, 8, 8192, 512, 2026
 T = B * S
 torch.npu.set_device(0)
+MAX_CUBE_CORES = _runtime.check_platform()
 torch.manual_seed(SEED)
 
 cpu = {
@@ -233,7 +235,7 @@ for batch_count in (1, 256):
     batch_candidates[:, 0, :64] = torch.arange(64, dtype=torch.int32)
     torch.npu.synchronize()
     with torch.npu.stream(metadata_stream):
-        quota = 8 if batch_count == 256 else 32
+        quota = 8 if batch_count == 256 else MAX_CUBE_CORES
         torch.npu.set_stream_limit(
             metadata_stream, cube_num=quota, vector_num=2 * quota
         )
@@ -343,7 +345,7 @@ quota_stream = torch.npu.Stream()
 with torch.npu.stream(quota_stream):
     previous = torch.npu.get_stream_limit(quota_stream)
     try:
-        for quota in (28, 8, 2, 32):
+        for quota in (MAX_CUBE_CORES, 8, 2, MAX_CUBE_CORES):
             torch.npu.set_stream_limit(
                 quota_stream, cube_num=quota, vector_num=2 * quota
             )
@@ -356,7 +358,7 @@ with torch.npu.stream(quota_stream):
             for name, expected in quota_reference.items():
                 assert torch.equal(workspace_bytes()[name], expected), (quota, name)
             assert program._core_count == quota
-            if quota == 28:
+            if quota == MAX_CUBE_CORES:
                 graph = torch.npu.NPUGraph()
                 with torch.npu.graph(graph, stream=quota_stream):
                     program(*args)

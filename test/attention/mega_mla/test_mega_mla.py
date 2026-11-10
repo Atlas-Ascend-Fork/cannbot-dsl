@@ -14,6 +14,8 @@ Run pytest on this file, or use the test / benchmark / benchmark-paged /
 analyze-profile commands. Device-only dependencies are loaded on demand.
 """
 
+from cannbotdsl import from_tensor
+
 import argparse
 import ast
 from contextlib import nullcontext
@@ -668,8 +670,8 @@ def _device_probes():
             x_ub = Buffer(MemLoc.UB, dtypes.bfloat16, make_layout((1, 64)))
             data_ub = Buffer(MemLoc.UB, dtypes.int8, make_layout((1, 64)))
             scale_ub = Buffer(MemLoc.UB, dtypes.int16, make_layout((1, 16)))
-            data_words = data_ub.reinterpret(dtypes.uint64, make_layout((1, 8)))
-            scale_bytes = scale_ub.reinterpret(dtypes.int8, make_layout((1, 32)))
+            data_words = from_tensor(data_ub, dtypes.uint64, make_layout((1, 8)))
+            scale_bytes = from_tensor(scale_ub, dtypes.int8, make_layout((1, 32)))
             for item in range(0, x.shape[0] * 8):
                 row = item // 8
                 chunk = item % 8

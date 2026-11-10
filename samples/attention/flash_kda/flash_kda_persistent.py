@@ -11,10 +11,12 @@
 
 
 """persistent 训练前向：驻留 FP32 状态，并保存反向所需输入。"""
+from cannbotdsl import from_tensor
+from cannbotdsl.ops.memcpy import cube_fill_l1_zero
 
 from typing import Optional, Tuple
 
-from cannbotdsl import make_layout, PIPE, MemLoc, Tensor, convert, dtypes
+from cannbotdsl import make_layout, PIPE, MemLoc, Tensor, dtypes
 from cannbotdsl.aot import export
 from cannbotdsl.buffer import Buffer
 from cannbotdsl.lang import vf
@@ -61,19 +63,9 @@ from cannbotdsl.ops.reg import (
     vstore_strided,
 )
 from cannbotdsl.ops.reg import vselect as vselect_raw
-from cannbotdsl.ops.sync import (
-    cube_fill_l1_zero,
-    cube_sync_all,
-    cube_sync_pipe,
-    onchip_rewind,
-    vec_sync_all,
-    vec_sync_block_arrive,
-    vec_sync_block_wait,
-    vec_sync_notify,
-    vec_sync_wait,
-)
+from cannbotdsl.ops.sync import cube_sync_all, cube_sync_pipe, onchip_rewind, vec_sync_all, vec_sync_block_arrive, vec_sync_block_wait, vec_sync_notify, vec_sync_wait
 from cannbotdsl.ring_buffer import RingBuffer
-from cannbotdsl.tensor import reinterpret, tile_slice
+from cannbotdsl.tensor import tile_slice
 import torch
 
 from . import flash_kda as fwd
@@ -600,8 +592,8 @@ class ChunkMatmul:
         ).next_write()
         self.l0a_scores = RingBuffer(MemLoc.L0A, dtypes.bfloat16, make_layout((HALF_CHUNK_SIZE, SUPPORTED_HEAD_DIM)), depth=2)
         self.raw_l0a_db = RingBuffer(MemLoc.L0A, dtypes.float16, make_layout((CHUNK_SIZE, CHUNK_SIZE)), depth=2)
-        self.raw_l0c_main = reinterpret(self.l0c_state, layout=make_layout((CHUNK_SIZE, CHUNK_SIZE)), data_format="nz")
-        self.raw_l0c_aux = reinterpret(self.l0c_o, layout=make_layout((CHUNK_SIZE, CHUNK_SIZE)), data_format="nz")
+        self.raw_l0c_main = from_tensor(self.l0c_state, layout=make_layout((CHUNK_SIZE, CHUNK_SIZE)), data_format="nz")
+        self.raw_l0c_aux = from_tensor(self.l0c_o, layout=make_layout((CHUNK_SIZE, CHUNK_SIZE)), data_format="nz")
         self.l0c_kkt = RingBuffer(MemLoc.L0C, dtypes.float32, make_layout((CHUNK_SIZE, CHUNK_SIZE)), depth=1).next_write()
         self.l0c_qkt = RingBuffer(MemLoc.L0C, dtypes.float32, make_layout((CHUNK_SIZE, CHUNK_SIZE)), depth=1).next_write()
         self.w_l1 = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((CHUNK_SIZE, SUPPORTED_HEAD_DIM)), depth=1)
@@ -616,7 +608,7 @@ class ChunkMatmul:
             (1, 2), (1, 3), (1, 4), (1, 5),
         )
         for slot, panel in panel_layout:
-            operand = reinterpret(l0b_cache_0 if slot == 0 else l0b_cache_1, layout=make_layout((DIAGONAL_BLOCK_SIZE, SUPPORTED_HEAD_DIM)), offset=panel * DIAGONAL_BLOCK_SIZE * SUPPORTED_HEAD_DIM * 2, data_format="nz")
+            operand = from_tensor(l0b_cache_0 if slot == 0 else l0b_cache_1, layout=make_layout((DIAGONAL_BLOCK_SIZE, SUPPORTED_HEAD_DIM)), offset=panel * DIAGONAL_BLOCK_SIZE * SUPPORTED_HEAD_DIM * 2, data_format="nz")
             k_transpose_panels.append(operand)
         self.k_transpose_l0b_cache = tuple(k_transpose_panels)
 
@@ -660,14 +652,14 @@ class ChunkMatmul:
         self.begin_mmad_raw_l0ab_db_packed64(self.raw_l0c_aux, init_c=True, unit_flag=3)
         self.publish_inverse_product_fp16_l1(self.inverse_product_l1, self.raw_l0c_aux)
         left = self.raw_l0a_db.next_write()
-        right = self.l0b_recurrent.next_write().reinterpret(layout=self.raw_operand_layout, dtype=dtypes.float16, data_format='nz')
-        self.raw_l0b_pending.append(reinterpret(right, layout=make_layout((CHUNK_SIZE, CHUNK_SIZE)), data_format="nz"))
+        right = from_tensor(self.l0b_recurrent.next_write(), layout=self.raw_operand_layout, dtype=dtypes.float16, data_format='nz')
+        self.raw_l0b_pending.append(from_tensor(right, layout=make_layout((CHUNK_SIZE, CHUNK_SIZE)), data_format="nz"))
         mem_copy(left, self.zero_l1)
         for block in range_constexpr(DIAGONAL_BLOCK_COUNT):
             source = tile_slice(diagonal, (DIAGONAL_BLOCK_SIZE, DIAGONAL_BLOCK_SIZE), (block, block))
-            target = reinterpret(left, layout=make_layout((DIAGONAL_BLOCK_SIZE, DIAGONAL_BLOCK_SIZE)), offset=self.l0_matrix_block_offset_elems(block, block) * 2, physical_layout=staged.nz_layout(DIAGONAL_BLOCK_SIZE, DIAGONAL_BLOCK_SIZE, left.physical_layout.stride))
+            target = from_tensor(left, layout=make_layout((DIAGONAL_BLOCK_SIZE, DIAGONAL_BLOCK_SIZE)), offset=self.l0_matrix_block_offset_elems(block, block) * 2, physical_layout=staged.nz_layout(DIAGONAL_BLOCK_SIZE, DIAGONAL_BLOCK_SIZE, left.physical_layout.stride))
             mem_copy(target, source)
-        mem_copy(reinterpret(right, layout=make_layout((CHUNK_SIZE, CHUNK_SIZE)), data_format="nz"), (identity).permute(1, 0))
+        mem_copy(from_tensor(right, layout=make_layout((CHUNK_SIZE, CHUNK_SIZE)), data_format="nz"), (identity).permute(1, 0))
         self._load_packed16_pair_to_full64_l0b_trans_with_gap(
             self.inverse_product_l1, right, dst_offset_elems=4 * 256,
             dst_gap_fractals=self.c64_odd_even_pair_dst_gap_fractals(),
@@ -685,12 +677,12 @@ class ChunkMatmul:
                 scores.ub_k_norm, scores.ub_g_cumsum, row_block, scores.l1_per_d_operand,
             )
             mem_copy(
-                reinterpret(left_k, layout=make_layout((DIAGONAL_BLOCK_SIZE, SUPPORTED_HEAD_DIM)), data_format="nz"),
+                from_tensor(left_k, layout=make_layout((DIAGONAL_BLOCK_SIZE, SUPPORTED_HEAD_DIM)), data_format="nz"),
                 scores.l1_per_d_operand.next_read(),
             )
             scores.build_per_d_left_q_from_decay(scores.ub_q_norm, row_block, scores.l1_per_d_operand)
             mem_copy(
-                reinterpret(left_q, layout=make_layout((DIAGONAL_BLOCK_SIZE, SUPPORTED_HEAD_DIM)), data_format="nz"),
+                from_tensor(left_q, layout=make_layout((DIAGONAL_BLOCK_SIZE, SUPPORTED_HEAD_DIM)), data_format="nz"),
                 scores.l1_per_d_operand.next_read(),
             )
             for col_block in range_constexpr(row_block):
@@ -699,15 +691,15 @@ class ChunkMatmul:
                 )
                 right = self.l0b_recurrent.next_write()
                 right_source = scores.l1_per_d_operand.next_read()
-                right = right.reinterpret(layout=make_layout(right_source.shape))
+                right = from_tensor(right, layout=make_layout(right_source.shape))
                 mem_copy(right, right_source)
                 matmul(
-                    tile_slice(self.l0c_kkt, (DIAGONAL_BLOCK_SIZE, DIAGONAL_BLOCK_SIZE), (row_block, col_block)).reinterpret(layout=make_layout((DIAGONAL_BLOCK_SIZE, DIAGONAL_BLOCK_SIZE)), data_format="nz"),
-                    reinterpret(left_k, layout=make_layout((DIAGONAL_BLOCK_SIZE, SUPPORTED_HEAD_DIM)), data_format="nz"), right, init=True,
+                    from_tensor(tile_slice(self.l0c_kkt, (DIAGONAL_BLOCK_SIZE, DIAGONAL_BLOCK_SIZE), (row_block, col_block)), layout=make_layout((DIAGONAL_BLOCK_SIZE, DIAGONAL_BLOCK_SIZE)), data_format="nz"),
+                    from_tensor(left_k, layout=make_layout((DIAGONAL_BLOCK_SIZE, SUPPORTED_HEAD_DIM)), data_format="nz"), right, init=True,
                 )
                 matmul(
-                    tile_slice(self.l0c_qkt, (DIAGONAL_BLOCK_SIZE, DIAGONAL_BLOCK_SIZE), (row_block, col_block)).reinterpret(layout=make_layout((DIAGONAL_BLOCK_SIZE, DIAGONAL_BLOCK_SIZE)), data_format="nz"),
-                    reinterpret(left_q, layout=make_layout((DIAGONAL_BLOCK_SIZE, SUPPORTED_HEAD_DIM)), data_format="nz"), right, init=True,
+                    from_tensor(tile_slice(self.l0c_qkt, (DIAGONAL_BLOCK_SIZE, DIAGONAL_BLOCK_SIZE), (row_block, col_block)), layout=make_layout((DIAGONAL_BLOCK_SIZE, DIAGONAL_BLOCK_SIZE)), data_format="nz"),
+                    from_tensor(left_q, layout=make_layout((DIAGONAL_BLOCK_SIZE, SUPPORTED_HEAD_DIM)), data_format="nz"), right, init=True,
                 )
             scores.prepare_safe_diagonal_left()
             for active_row in dsl_range(0, DIAGONAL_BLOCK_SIZE, 1):
@@ -715,12 +707,12 @@ class ChunkMatmul:
                     scores.ub_k_norm, scores.ub_q_norm, row_block, active_row, scores.l1_per_d_operand,
                 )
                 mem_copy(
-                    reinterpret(left_k, layout=make_layout((DIAGONAL_BLOCK_SIZE, SUPPORTED_HEAD_DIM)), data_format="nz"),
+                    from_tensor(left_k, layout=make_layout((DIAGONAL_BLOCK_SIZE, SUPPORTED_HEAD_DIM)), data_format="nz"),
                     scores.l1_per_d_operand.next_read(),
                 )
                 scores._write_per_d_full_d_handoff(scores.l1_per_d_operand, scores.ub_safe_left_q)
                 mem_copy(
-                    reinterpret(left_q, layout=make_layout((DIAGONAL_BLOCK_SIZE, SUPPORTED_HEAD_DIM)), data_format="nz"),
+                    from_tensor(left_q, layout=make_layout((DIAGONAL_BLOCK_SIZE, SUPPORTED_HEAD_DIM)), data_format="nz"),
                     scores.l1_per_d_operand.next_read(),
                 )
                 scores.build_safe_diagonal_right(
@@ -728,15 +720,15 @@ class ChunkMatmul:
                 )
                 right = self.l0b_recurrent.next_write()
                 right_source_2 = scores.l1_per_d_operand.next_read()
-                right = right.reinterpret(layout=make_layout(right_source_2.shape))
+                right = from_tensor(right, layout=make_layout(right_source_2.shape))
                 mem_copy(right, right_source_2)
                 matmul(
-                    tile_slice(self.l0c_kkt, (DIAGONAL_BLOCK_SIZE, DIAGONAL_BLOCK_SIZE), (row_block, row_block)).reinterpret(layout=make_layout((DIAGONAL_BLOCK_SIZE, DIAGONAL_BLOCK_SIZE)), data_format="nz"),
-                    reinterpret(left_k, layout=make_layout((DIAGONAL_BLOCK_SIZE, SUPPORTED_HEAD_DIM)), data_format="nz"), right, init=active_row == 0,
+                    from_tensor(tile_slice(self.l0c_kkt, (DIAGONAL_BLOCK_SIZE, DIAGONAL_BLOCK_SIZE), (row_block, row_block)), layout=make_layout((DIAGONAL_BLOCK_SIZE, DIAGONAL_BLOCK_SIZE)), data_format="nz"),
+                    from_tensor(left_k, layout=make_layout((DIAGONAL_BLOCK_SIZE, SUPPORTED_HEAD_DIM)), data_format="nz"), right, init=active_row == 0,
                 )
                 matmul(
-                    tile_slice(self.l0c_qkt, (DIAGONAL_BLOCK_SIZE, DIAGONAL_BLOCK_SIZE), (row_block, row_block)).reinterpret(layout=make_layout((DIAGONAL_BLOCK_SIZE, DIAGONAL_BLOCK_SIZE)), data_format="nz"),
-                    reinterpret(left_q, layout=make_layout((DIAGONAL_BLOCK_SIZE, SUPPORTED_HEAD_DIM)), data_format="nz"), right, init=active_row == 0,
+                    from_tensor(tile_slice(self.l0c_qkt, (DIAGONAL_BLOCK_SIZE, DIAGONAL_BLOCK_SIZE), (row_block, row_block)), layout=make_layout((DIAGONAL_BLOCK_SIZE, DIAGONAL_BLOCK_SIZE)), data_format="nz"),
+                    from_tensor(left_q, layout=make_layout((DIAGONAL_BLOCK_SIZE, SUPPORTED_HEAD_DIM)), data_format="nz"), right, init=active_row == 0,
                 )
         mem_copy(scores.ub_kkt, (self.l0c_kkt).partition(dim=0))
         mem_copy(scores.ub_mqk, (self.l0c_qkt).partition(dim=0))
@@ -747,7 +739,7 @@ class ChunkMatmul:
             destination = self.l0c_kkt if kind == 0 else self.l0c_qkt
             left = self.l0a_scores.next_write()
             left_source = tile_slice(main, (DIAGONAL_BLOCK_SIZE, SUPPORTED_HEAD_DIM), (kind, 0))
-            left = left.reinterpret(layout=make_layout(left_source.shape))
+            left = from_tensor(left, layout=make_layout(left_source.shape))
             mem_copy(left, left_source)
             next_left = left
             for row_block in range_constexpr(DIAGONAL_BLOCK_COUNT):
@@ -764,9 +756,9 @@ class ChunkMatmul:
                                     tile_slice(main, (DIAGONAL_BLOCK_SIZE, SUPPORTED_HEAD_DIM), (8 + cache_index, 0)),
                                 )
                     matmul(
-                        tile_slice(
+                        from_tensor(tile_slice(
                             destination, (DIAGONAL_BLOCK_SIZE, DIAGONAL_BLOCK_SIZE), (row_block, col_block)
-                        ).reinterpret(layout=make_layout((DIAGONAL_BLOCK_SIZE, DIAGONAL_BLOCK_SIZE)), data_format="nz"),
+                        ), layout=make_layout((DIAGONAL_BLOCK_SIZE, DIAGONAL_BLOCK_SIZE)), data_format="nz"),
                         left,
                         right,
                         init=True,
@@ -776,7 +768,7 @@ class ChunkMatmul:
                         next_left_source = tile_slice(
                             main, (DIAGONAL_BLOCK_SIZE, SUPPORTED_HEAD_DIM), (2 * (row_block + 1) + kind, 0)
                         )
-                        next_left = next_left.reinterpret(layout=make_layout(next_left_source.shape))
+                        next_left = from_tensor(next_left, layout=make_layout(next_left_source.shape))
                         mem_copy(next_left, next_left_source)
                     if const_expr(kind == 0 and index == 0):
                         for cache_index in range_constexpr(2, 4):
@@ -813,7 +805,7 @@ class ChunkMatmul:
             destination = self.l0c_kkt if kind == 0 else self.l0c_qkt
             left = self.l0a_scores.next_write()
             left_source = tile_slice(main, (DIAGONAL_BLOCK_SIZE, SUPPORTED_HEAD_DIM), (kind, 0))
-            left = left.reinterpret(layout=make_layout(left_source.shape))
+            left = from_tensor(left, layout=make_layout(left_source.shape))
             mem_copy(left, left_source)
             next_left = left
             for row_block in range_constexpr(DIAGONAL_BLOCK_COUNT):
@@ -852,13 +844,13 @@ class ChunkMatmul:
                                         ),
                                     )
                     matmul(
-                        tile_slice(destination, (DIAGONAL_BLOCK_SIZE, DIAGONAL_BLOCK_SIZE), (row_block, col_block)).reinterpret(layout=make_layout((DIAGONAL_BLOCK_SIZE, DIAGONAL_BLOCK_SIZE)), data_format="nz"),
+                        from_tensor(tile_slice(destination, (DIAGONAL_BLOCK_SIZE, DIAGONAL_BLOCK_SIZE), (row_block, col_block)), layout=make_layout((DIAGONAL_BLOCK_SIZE, DIAGONAL_BLOCK_SIZE)), data_format="nz"),
                         left, right, init=True,
                     )
                     if const_expr(row_block + 1 < DIAGONAL_BLOCK_COUNT and col_block == 0):
                         next_left = self.l0a_scores.next_write()
                         next_left_source = tile_slice(main, (DIAGONAL_BLOCK_SIZE, SUPPORTED_HEAD_DIM), (2 * (row_block + 1) + kind, 0))
-                        next_left = next_left.reinterpret(layout=make_layout(next_left_source.shape))
+                        next_left = from_tensor(next_left, layout=make_layout(next_left_source.shape))
                         mem_copy(next_left, next_left_source)
             if const_expr(kind == 0):
                 mem_copy(scores_and_inverse.ub_kkt, (self.l0c_kkt).partition(dim=0))
@@ -869,11 +861,11 @@ class ChunkMatmul:
     def compute_u_pre_and_w(self, preprocessing, recurrent_state):
         inverse_l0a = self._load_resident_inv_to_l0a()
         k_beta_l0b = self._load_beta_to_l0b(preprocessing.operand_tiles[K_DECAYED_BETA_OPERAND_INDEX])
-        matmul(self.l0c_w_product, reinterpret(inverse_l0a, layout=make_layout((CHUNK_SIZE, CHUNK_SIZE)), offset=0, physical_layout=staged.nz_layout(CHUNK_SIZE, CHUNK_SIZE, inverse_l0a.physical_layout.stride)), k_beta_l0b, init=True)
+        matmul(self.l0c_w_product, from_tensor(inverse_l0a, layout=make_layout((CHUNK_SIZE, CHUNK_SIZE)), offset=0, physical_layout=staged.nz_layout(CHUNK_SIZE, CHUNK_SIZE, inverse_l0a.physical_layout.stride)), k_beta_l0b, init=True)
         # 保存的 W 保持原符号；FIXPIPE 发布 -W，用于 U_pre + (-W) @ S。
-        mem_copy(self.w_l1.next_write(), convert(self.l0c_w_product, dtype=dtypes.bfloat16, scale=-1.0))
+        mem_copy(self.w_l1.next_write(), self.l0c_w_product.convert(dtype=dtypes.bfloat16, scale=-1.0))
         v_beta_l0b = self._load_beta_to_l0b(preprocessing.operand_tiles[V_BETA_OPERAND_INDEX])
-        matmul(self.l0c_w, reinterpret(inverse_l0a, layout=make_layout((CHUNK_SIZE, CHUNK_SIZE)), offset=0, physical_layout=staged.nz_layout(CHUNK_SIZE, CHUNK_SIZE, inverse_l0a.physical_layout.stride)), v_beta_l0b, init=True)
+        matmul(self.l0c_w, from_tensor(inverse_l0a, layout=make_layout((CHUNK_SIZE, CHUNK_SIZE)), offset=0, physical_layout=staged.nz_layout(CHUNK_SIZE, CHUNK_SIZE, inverse_l0a.physical_layout.stride)), v_beta_l0b, init=True)
         if self.save_backward_inputs != 0:
             mem_copy(
                 tile_slice(
@@ -893,15 +885,15 @@ class ChunkMatmul:
     def compute_w_state_and_q_state(self, preprocessing, recurrent_state):
         state_l0b = self.l0b_recurrent.next_write()
         state_l0b_source = recurrent_state.state_l1.next_read()
-        state_l0b = state_l0b.reinterpret(layout=make_layout(state_l0b_source.shape))
+        state_l0b = from_tensor(state_l0b, layout=make_layout(state_l0b_source.shape))
         mem_copy(state_l0b, state_l0b_source)
         w_l0a = self.l0a_recurrent.next_write()
         w_l0a_source = self.w_l1.next_read()
-        w_l0a = w_l0a.reinterpret(layout=make_layout(w_l0a_source.shape))
+        w_l0a = from_tensor(w_l0a, layout=make_layout(w_l0a_source.shape))
         mem_copy(w_l0a, w_l0a_source)
         q_l0a = self.l0a_recurrent.next_write()
         q_l0a_source = preprocessing.operand_tiles[Q_DECAYED_OPERAND_INDEX]
-        q_l0a = q_l0a.reinterpret(layout=make_layout(q_l0a_source.shape))
+        q_l0a = from_tensor(q_l0a, layout=make_layout(q_l0a_source.shape))
         mem_copy(q_l0a, q_l0a_source)
         matmul(self.l0c_w, w_l0a, state_l0b, init=False)
         matmul(self.l0c_o, q_l0a, state_l0b, init=True)
@@ -921,21 +913,21 @@ class ChunkMatmul:
     ):
         k_l0b = self.l0b_recurrent.next_write()
         k_l0b_source = preprocessing.operand_tiles[K_RESTORED_OPERAND_INDEX].permute(1, 0)
-        k_l0b = k_l0b.reinterpret(layout=make_layout(k_l0b_source.shape))
+        k_l0b = from_tensor(k_l0b, layout=make_layout(k_l0b_source.shape))
         mem_copy(k_l0b, k_l0b_source)
         causal_scores_l0a = self.l0a_recurrent.next_write()
         causal_scores_l0a_source = scores_and_inverse.mqk_l1.next_read()
-        causal_scores_l0a = causal_scores_l0a.reinterpret(layout=make_layout(causal_scores_l0a_source.shape))
+        causal_scores_l0a = from_tensor(causal_scores_l0a, layout=make_layout(causal_scores_l0a_source.shape))
         mem_copy(causal_scores_l0a, causal_scores_l0a_source)
         u_l1 = recurrent_state.u_l1.next_read()
-        u_l0a = reinterpret(self.l0a_recurrent.next_write(), layout=make_layout((SUPPORTED_HEAD_DIM, CHUNK_SIZE)), data_format='nz')
+        u_l0a = from_tensor(self.l0a_recurrent.next_write(), layout=make_layout((SUPPORTED_HEAD_DIM, CHUNK_SIZE)), data_format='nz')
         u_l0a_source = u_l1.permute(1, 0)
         u_l0a = u_l0a[tuple(map(slice, u_l0a_source.shape))]
         mem_copy(u_l0a, u_l0a_source)
         matmul(self.l0c_state, u_l0a, k_l0b, init=True)
         u_l0b = self.l0b_recurrent.next_write()
         u_l0b_source = u_l1.permute(1, 0)
-        u_l0b = u_l0b.reinterpret(layout=make_layout(u_l0b_source.shape))
+        u_l0b = from_tensor(u_l0b, layout=make_layout(u_l0b_source.shape))
         mem_copy(u_l0b, u_l0b_source)
         matmul(self.l0c_o, causal_scores_l0a, u_l0b, init=False)
         mem_copy(recurrent_state.ub_state_delta, (self.l0c_state).partition(dim=1))
@@ -975,8 +967,8 @@ class ChunkMatmul:
 
     def issue_odd_lower_even_inv_full64(self, scratch, packed_inv):
         l0a_write = self.raw_l0a_db.next_write()
-        l0b_write = self.l0b_recurrent.next_write().reinterpret(layout=self.raw_operand_layout, dtype=dtypes.float16, data_format='nz')
-        self.raw_l0b_pending.append(reinterpret(l0b_write, layout=make_layout((CHUNK_SIZE, CHUNK_SIZE)), data_format="nz"))
+        l0b_write = from_tensor(self.l0b_recurrent.next_write(), layout=self.raw_operand_layout, dtype=dtypes.float16, data_format='nz')
+        self.raw_l0b_pending.append(from_tensor(l0b_write, layout=make_layout((CHUNK_SIZE, CHUNK_SIZE)), data_format="nz"))
         self.zero_packed64_l0_operands(l0a_write, l0b_write)
         self._load_packed16_pair_to_full64_l0a_with_gap(
             scratch, l0a_write, src0_row_block=1, src0_col_block=0, src1_row_block=3, src1_col_block=2,
@@ -990,8 +982,8 @@ class ChunkMatmul:
 
     def issue_odd32_lower_even32_inv_full64(self, scratch, packed_inv):
         l0a_write = self.raw_l0a_db.next_write()
-        l0b_write = self.l0b_recurrent.next_write().reinterpret(layout=self.raw_operand_layout, dtype=dtypes.float16, data_format='nz')
-        self.raw_l0b_pending.append(reinterpret(l0b_write, layout=make_layout((CHUNK_SIZE, CHUNK_SIZE)), data_format="nz"))
+        l0b_write = from_tensor(self.l0b_recurrent.next_write(), layout=self.raw_operand_layout, dtype=dtypes.float16, data_format='nz')
+        self.raw_l0b_pending.append(from_tensor(l0b_write, layout=make_layout((CHUNK_SIZE, CHUNK_SIZE)), data_format="nz"))
         self.zero_packed64_l0_operands(l0a_write, l0b_write)
         mem_copy(l0a_write, scratch)
         self._load_packed32_block_to_full64_l0b(
@@ -1000,8 +992,8 @@ class ChunkMatmul:
 
     def prepare_odd32_inv_odd32_tmp_full64(self, packed_inv):
         l0a_write = self.raw_l0a_db.next_write()
-        l0b_write = self.l0b_recurrent.next_write().reinterpret(layout=self.raw_operand_layout, dtype=dtypes.float16, data_format='nz')
-        self.raw_l0b_pending.append(reinterpret(l0b_write, layout=make_layout((CHUNK_SIZE, CHUNK_SIZE)), data_format="nz"))
+        l0b_write = from_tensor(self.l0b_recurrent.next_write(), layout=self.raw_operand_layout, dtype=dtypes.float16, data_format='nz')
+        self.raw_l0b_pending.append(from_tensor(l0b_write, layout=make_layout((CHUNK_SIZE, CHUNK_SIZE)), data_format="nz"))
         self.zero_packed64_l0_operands(l0a_write, l0b_write)
         mem_copy(l0a_write, packed_inv)
         return l0b_write
@@ -1027,12 +1019,12 @@ class ChunkMatmul:
     def _load_beta_to_l0b(self, beta_read):
         destination_2 = self.l0b_recurrent.next_write()
         destination_2_source = beta_read.permute(1, 0)
-        destination_2 = destination_2.reinterpret(layout=make_layout(destination_2_source.shape))
+        destination_2 = from_tensor(destination_2, layout=make_layout(destination_2_source.shape))
         mem_copy(destination_2, destination_2_source)
         return destination_2
 
     def _raw_l0b_block(self, l0b_slot, row_block: int, col_block: int):
-        return reinterpret(l0b_slot, layout=make_layout((DIAGONAL_BLOCK_SIZE, DIAGONAL_BLOCK_SIZE)), offset=self.l0_matrix_block_offset_elems(row_block, col_block) * 2, physical_layout=staged.nz_layout(DIAGONAL_BLOCK_SIZE, DIAGONAL_BLOCK_SIZE, l0b_slot.physical_layout.stride))
+        return from_tensor(l0b_slot, layout=make_layout((DIAGONAL_BLOCK_SIZE, DIAGONAL_BLOCK_SIZE)), offset=self.l0_matrix_block_offset_elems(row_block, col_block) * 2, physical_layout=staged.nz_layout(DIAGONAL_BLOCK_SIZE, DIAGONAL_BLOCK_SIZE, l0b_slot.physical_layout.stride))
 
     def _load_l1_block_to_l0b_block(
         self, l1_matrix, l0b_slot, row_block: int, col_block: int,
@@ -1060,14 +1052,14 @@ class ChunkMatmul:
             l0_offset = self.l0_matrix_block_offset_elems(
                 (dst_row + row_offset) // DIAGONAL_BLOCK_SIZE, dst_col // DIAGONAL_BLOCK_SIZE,
             )
-            l1_tile = reinterpret(l1_matrix, layout=make_layout((DIAGONAL_BLOCK_SIZE, HALF_CHUNK_SIZE)), offset=l1_offset * 2, physical_layout=staged.nz_layout(DIAGONAL_BLOCK_SIZE, HALF_CHUNK_SIZE, l1_matrix.physical_layout.stride))
+            l1_tile = from_tensor(l1_matrix, layout=make_layout((DIAGONAL_BLOCK_SIZE, HALF_CHUNK_SIZE)), offset=l1_offset * 2, physical_layout=staged.nz_layout(DIAGONAL_BLOCK_SIZE, HALF_CHUNK_SIZE, l1_matrix.physical_layout.stride))
             if const_expr(transpose):
                 mem_copy(
-                    reinterpret(l0b_slot, layout=make_layout((HALF_CHUNK_SIZE, DIAGONAL_BLOCK_SIZE)), offset=l0_offset * 2, data_format="nz"),
+                    from_tensor(l0b_slot, layout=make_layout((HALF_CHUNK_SIZE, DIAGONAL_BLOCK_SIZE)), offset=l0_offset * 2, data_format="nz"),
                     (l1_tile).permute(1, 0,),
                 )
             else:
-                l0_tile = reinterpret(l0b_slot, layout=make_layout((DIAGONAL_BLOCK_SIZE, HALF_CHUNK_SIZE)), offset=l0_offset * 2, physical_layout=staged.nz_layout(DIAGONAL_BLOCK_SIZE, HALF_CHUNK_SIZE, l0b_slot.physical_layout.stride))
+                l0_tile = from_tensor(l0b_slot, layout=make_layout((DIAGONAL_BLOCK_SIZE, HALF_CHUNK_SIZE)), offset=l0_offset * 2, physical_layout=staged.nz_layout(DIAGONAL_BLOCK_SIZE, HALF_CHUNK_SIZE, l0b_slot.physical_layout.stride))
                 mem_copy(l0_tile, l1_tile)
 
     def _load_packed16_pair_to_full64_l0a_with_gap(
@@ -1091,7 +1083,7 @@ class ChunkMatmul:
         ):
             # 3510 L0A 的 16x16 单块地址仍需补偿一个 full64 M span。
             dst_offset = (dst_block - (DIAGONAL_BLOCK_COUNT - 1)) * FRACTAL_ELEMENTS
-            l0_tile = reinterpret(l0a_slot, layout=make_layout((DIAGONAL_BLOCK_SIZE, DIAGONAL_BLOCK_SIZE)), offset=dst_offset * 2, physical_layout=staged.nz_layout(DIAGONAL_BLOCK_SIZE, DIAGONAL_BLOCK_SIZE, l0a_slot.physical_layout.stride))
+            l0_tile = from_tensor(l0a_slot, layout=make_layout((DIAGONAL_BLOCK_SIZE, DIAGONAL_BLOCK_SIZE)), offset=dst_offset * 2, physical_layout=staged.nz_layout(DIAGONAL_BLOCK_SIZE, DIAGONAL_BLOCK_SIZE, l0a_slot.physical_layout.stride))
             l1_tile = tile_slice(l1_matrix, (DIAGONAL_BLOCK_SIZE, DIAGONAL_BLOCK_SIZE), (src_row_block, src_col_block))
             mem_copy(l0_tile, l1_tile)
 
@@ -1128,12 +1120,12 @@ class GateWeightedScoresAndDiagonalInverse:
             if self.use_stable_scores
             else RECURRENT_OPERANDS * CHUNK_SIZE + HALF_CHUNK_SIZE
         )
-        self.ub_score_operands_nz = reinterpret(preprocessing.ub_operand_staging, layout=make_layout((score_rows, D_HALF)), data_format="nz", physical_layout=staged.nz_layout(score_rows, D_HALF))
+        self.ub_score_operands_nz = from_tensor(preprocessing.ub_operand_staging, layout=make_layout((score_rows, D_HALF)), data_format="nz", physical_layout=staged.nz_layout(score_rows, D_HALF))
         self.l1_score_operands = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((score_rows, SUPPORTED_HEAD_DIM)), depth=1)
         self.ub_kkt = RingBuffer(MemLoc.UB, dtypes.float32, make_layout((HALF_CHUNK_SIZE, CHUNK_SIZE)), depth=1).next_write()
         self.ub_mqk = RingBuffer(MemLoc.UB, dtypes.float32, make_layout((HALF_CHUNK_SIZE, CHUNK_SIZE)), depth=1).next_write()
-        self.ub_negative_kkt_nz = reinterpret(preprocessing.ub_recurrent_operands_nz, dtype=dtypes.float16, layout=make_layout((HALF_CHUNK_SIZE, CHUNK_SIZE)), data_format="nz", physical_layout=staged.nz_layout(HALF_CHUNK_SIZE, CHUNK_SIZE))
-        self.ub_mqk_nz = reinterpret(preprocessing.ub_recurrent_operands_nz, layout=make_layout((HALF_CHUNK_SIZE, CHUNK_SIZE)), offset=self.ub_negative_kkt_nz.physical_layout.stride[0] * (CHUNK_SIZE // staged.NZ_TILE) * BF16_BYTES, data_format="nz", physical_layout=staged.nz_layout(HALF_CHUNK_SIZE, CHUNK_SIZE))
+        self.ub_negative_kkt_nz = from_tensor(preprocessing.ub_recurrent_operands_nz, dtype=dtypes.float16, layout=make_layout((HALF_CHUNK_SIZE, CHUNK_SIZE)), data_format="nz", physical_layout=staged.nz_layout(HALF_CHUNK_SIZE, CHUNK_SIZE))
+        self.ub_mqk_nz = from_tensor(preprocessing.ub_recurrent_operands_nz, layout=make_layout((HALF_CHUNK_SIZE, CHUNK_SIZE)), offset=self.ub_negative_kkt_nz.physical_layout.stride[0] * (CHUNK_SIZE // staged.NZ_TILE) * BF16_BYTES, data_format="nz", physical_layout=staged.nz_layout(HALF_CHUNK_SIZE, CHUNK_SIZE))
         self.mqk_l1 = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((CHUNK_SIZE, CHUNK_SIZE)), depth=1)
         self.ub_diag_inv_nz = RingBuffer(
             MemLoc.UB,
@@ -1144,18 +1136,15 @@ class GateWeightedScoresAndDiagonalInverse:
             data_format="nz",
         ).next_write()
         self.ub_inverse_prefix = preprocessing.ub_inverse_prefix
-        self.ub_inverse_indices = reinterpret(
-            self.ub_diag_inv_nz, layout=make_layout((2, 32)), offset=self.ub_diag_inv_nz.physical_layout.stride[0] * 2,
-            dtype=dtypes.uint32, data_format="nd",
-        )
+        self.ub_inverse_indices = from_tensor(self.ub_diag_inv_nz, layout=make_layout((2, 32)), offset=self.ub_diag_inv_nz.physical_layout.stride[0] * 2, dtype=dtypes.uint32, data_format="nd")
         self.ub_k_norm = preprocessing.ub_k_norm
         self.ub_q_norm = preprocessing.ub_q_norm
         self.ub_g_cumsum = preprocessing.ub_g_cumsum
         self.scale_value = preprocessing.scale
         if self.use_stable_scores:
             self.ub_qk_exchange = preprocessing.ub_k[1].view(dtype=dtypes.float32).flatten()[0:DIAGONAL_BLOCK_SIZE * D_HALF,].reshape((DIAGONAL_BLOCK_SIZE, D_HALF))
-            self.ub_per_d_nd = reinterpret(preprocessing.ub_operand_staging, layout=make_layout((DIAGONAL_BLOCK_SIZE, D_HALF)), data_format="nd")
-            self.ub_per_d_nz = reinterpret(preprocessing.ub_operand_staging, layout=make_layout((DIAGONAL_BLOCK_SIZE, D_HALF)), offset=DIAGONAL_BLOCK_SIZE * D_HALF * 2, data_format="nz", physical_layout=staged.nz_layout(DIAGONAL_BLOCK_SIZE, D_HALF))
+            self.ub_per_d_nd = from_tensor(preprocessing.ub_operand_staging, layout=make_layout((DIAGONAL_BLOCK_SIZE, D_HALF)), data_format="nd")
+            self.ub_per_d_nz = from_tensor(preprocessing.ub_operand_staging, layout=make_layout((DIAGONAL_BLOCK_SIZE, D_HALF)), offset=DIAGONAL_BLOCK_SIZE * D_HALF * 2, data_format="nz", physical_layout=staged.nz_layout(DIAGONAL_BLOCK_SIZE, D_HALF))
             self.ub_safe_left_k = preprocessing.ub_q[0].flatten()[0:DIAGONAL_BLOCK_SIZE * D_HALF,].reshape((DIAGONAL_BLOCK_SIZE, D_HALF))
             self.ub_safe_left_q = preprocessing.ub_q[1].flatten()[0:DIAGONAL_BLOCK_SIZE * D_HALF,].reshape((DIAGONAL_BLOCK_SIZE, D_HALF))
             self.ub_safe_right_k = preprocessing.ub_k[0].flatten()[0:DIAGONAL_BLOCK_SIZE * D_HALF,].reshape((DIAGONAL_BLOCK_SIZE, D_HALF))

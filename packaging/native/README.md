@@ -64,7 +64,7 @@ python3 -m pip install --force-reinstall --no-deps packaging/native/output/group
 构建 `ds41` 分组时，安装路径改为 `packaging/native/output/groups/ds41/wheels/*.whl`；构建全部已登记算子时，改为 `packaging/native/output/all/wheels/*.whl`。单算子产物位于 `packaging/native/output/operators/<算子名>/wheels/`，实际路径以构建日志为准。
 
 wheel 分发名为 `cannbot-arena-net`，Python 包名为 `ops`，依赖
-`cannbot-dsl>=0.8.0,<0.9`。导入 `ops` 时注册 Native 资源；AICPU 资源位于 `ops/_aicpu/`。
+`cannbot-dsl>=0.8.0`。导入 `ops` 时注册 Native 资源；AICPU 资源位于 `ops/_aicpu/`。
 
 安装后验证包导入与 Native 资源注册：
 

@@ -15,6 +15,8 @@ QK and PV cross-core handoffs use ring buffers with compiler-synthesized
 transactions; resident state and interleaved L1 aliases remain Buffers.
 """
 
+from cannbotdsl import from_tensor
+
 from collections import OrderedDict
 from dataclasses import dataclass
 from threading import RLock
@@ -31,7 +33,6 @@ from cannbotdsl import (
     host,
     make_layout,
     make_ring_buffer,
-    reinterpret as dsl_reinterpret,
 )
 from cannbotdsl.buffer import UB, L1, L0A, L0B, L0C, make_buffer
 from cannbotdsl.ops.memcpy import copy_options, mem_copy as _mem_copy
@@ -167,7 +168,7 @@ def reinterpret(
         and value.data_format in ("nz", "zn")
     ):
         physical = value.physical_layout
-    return dsl_reinterpret(
+    return from_tensor(
         value,
         dtype=dtype,
         layout=layout,
@@ -209,16 +210,16 @@ def mem_copy(
             src = src.partition(dim=engine.split_axis)
         elif part_id is not None:
             if actual is not None:
-                dst = dsl_reinterpret(
+                dst = from_tensor(
                     dst, layout=make_layout(actual), physical_layout=dst.physical_layout
                 )
             dst = dst.partition(dim=engine.split_axis, part_id=part_id)
             actual = dst.shape
     if actual is not None and src.memloc != MemLoc.L0C:
         if src.data_format == "nd":
-            src = reinterpret(src, shape=actual, stride=src.stride)
+            src = from_tensor(src, layout=make_layout(actual, stride=src.stride))
         else:
-            src = dsl_reinterpret(
+            src = from_tensor(
                 src, layout=make_layout(actual), physical_layout=src.physical_layout
             )
     if axis not in (None, 0):
@@ -521,19 +522,19 @@ class AttentionVectorStage:
         # P's padded NZ allocation ends at 237824. These two 4 KiB tiles stay
         # below the first softmax state at 246016 (also for 32 AIV rows).
         self.mask_rows = make_buffer(
-            reinterpret(
+            from_tensor(
                 UB.view(262144),
+                layout=make_layout((TILE_VEC_M, QK_UB_ROW_STRIDE)),
                 dtype=dtypes.int8,
-                shape=(TILE_VEC_M, QK_UB_ROW_STRIDE),
                 offset=UB_MASK_HEAD_ADDR,
                 data_format="nd",
             )
         )
         # Static row views retain the mask DMA/VF synchronization resource.
         self.mask_row_aliases = [
-            reinterpret(
+            from_tensor(
                 self.mask_rows,
-                shape=(1, QK_UB_ROW_STRIDE),
+                layout=make_layout((1, QK_UB_ROW_STRIDE)),
                 offset=row * QK_UB_ROW_STRIDE,
             )
             for row in range(TILE_VEC_M)
@@ -544,20 +545,20 @@ class AttentionVectorStage:
         self.use_padded_lse_storage = True
         self.output_accumulator = make_ring_buffer(
             [
-                reinterpret(
+                from_tensor(
                     UB.view(262144),
+                    layout=make_layout((tile_vec_m, TILE_D)),
                     dtype=dtypes.float32,
-                    shape=(tile_vec_m, TILE_D),
                     offset=UB_OUTPUT_ACCUM_ADDR,
                     data_format="nd",
                 )
             ]
         ).next_write()
         self.packed_output_alias = make_buffer(
-            reinterpret(
+            from_tensor(
                 UB.view(262144),
+                layout=make_layout((tile_vec_m, TILE_D // 2)),
                 dtype=dtypes.float32,
-                shape=(tile_vec_m, TILE_D // 2),
                 offset=UB_OUTPUT_ACCUM_ADDR,
                 data_format="nd",
             )
@@ -579,10 +580,10 @@ class AttentionVectorStage:
         ).next_write()
         self.softmax_rescale_slots = [
             make_buffer(
-                reinterpret(
+                from_tensor(
                     UB.view(262144),
+                    layout=make_layout((tile_vec_m, 1)),
                     dtype=dtypes.float32,
-                    shape=(tile_vec_m, 1),
                     offset=UB_SOFTMAX_EXP_BASE + i * UB_STATE_SLOT_STRIDE,
                     data_format="nd",
                 )
@@ -592,10 +593,10 @@ class AttentionVectorStage:
         # Row-wise softmax and partial-result DMA use the same state roots.
         self.softmax_sum_slots = [
             make_buffer(
-                reinterpret(
+                from_tensor(
                     UB.view(262144),
+                    layout=make_layout((tile_vec_m, 1)),
                     dtype=dtypes.float32,
-                    shape=(tile_vec_m, 1),
                     offset=UB_SOFTMAX_SUM_BASE + i * UB_STATE_SLOT_STRIDE,
                     data_format="nd",
                 )
@@ -604,10 +605,10 @@ class AttentionVectorStage:
         ]
         self.softmax_max_slots = [
             make_buffer(
-                reinterpret(
+                from_tensor(
                     UB.view(262144),
+                    layout=make_layout((tile_vec_m, 1)),
                     dtype=dtypes.float32,
-                    shape=(tile_vec_m, 1),
                     offset=UB_SOFTMAX_MAX_BASE + i * UB_STATE_SLOT_STRIDE,
                     data_format="nd",
                 )
@@ -616,20 +617,20 @@ class AttentionVectorStage:
         ]
         self.lse_output_ub = make_ring_buffer(
             [
-                reinterpret(
+                from_tensor(
                     UB.view(262144),
+                    layout=make_layout((tile_vec_m, 1)),
                     dtype=dtypes.float32,
-                    shape=(tile_vec_m, 1),
                     offset=UB_LSE_ADDR,
                     data_format="nd",
                 )
             ]
         ).next_write()
         self.lse_output_alias = make_buffer(
-            reinterpret(
+            from_tensor(
                 UB.view(262144),
+                layout=make_layout((tile_vec_m, 1)),
                 dtype=dtypes.float32,
-                shape=(tile_vec_m, 1),
                 offset=UB_LSE_ADDR,
                 data_format="nd",
             )
@@ -637,28 +638,28 @@ class AttentionVectorStage:
         # Every layout uses one 32-byte UB slot per LSE value so split
         # writebacks retain an aligned MTE3 source across token boundaries.
         self.padded_lse_buffer = make_buffer(
-            reinterpret(
+            from_tensor(
                 UB.view(262144),
+                layout=make_layout((tile_vec_m, FD_STATE_COLUMNS)),
                 dtype=dtypes.float32,
-                shape=(tile_vec_m, FD_STATE_COLUMNS),
                 offset=UB_FD_LSE_ADDR,
                 data_format="nd",
             )
         )
         self.candidate_max = make_buffer(
-            reinterpret(
+            from_tensor(
                 UB.view(262144),
+                layout=make_layout((tile_vec_m, 1)),
                 dtype=dtypes.float32,
-                shape=(tile_vec_m, 1),
                 offset=UB_NEW_MAX_ADDR,
                 data_format="nd",
             )
         )
         self.candidate_sum = make_buffer(
-            reinterpret(
+            from_tensor(
                 UB.view(262144),
+                layout=make_layout((tile_vec_m, 1)),
                 dtype=dtypes.float32,
-                shape=(tile_vec_m, 1),
                 offset=UB_NEW_SUM_ADDR,
                 data_format="nd",
             )
@@ -667,7 +668,7 @@ class AttentionVectorStage:
 
     def _nz_params(self):
         """Derive NZ fractal addressing from p_ub physical layout stride."""
-        s = self.probability_ub.physical_stride
+        s = self.probability_ub.physical_layout.stride
         s_n1, s_m1, s_m0, s_n0 = s[0], s[1], s[2], s[3]
         m0 = s_m1 // s_m0
         query_head_start = s_m0 // s_n0
@@ -871,8 +872,7 @@ class AttentionVectorStage:
     def store_probability_tile(self, probability_l1_destination, valid_query_rows):
         """p_ub -> the explicit per-AIV M tile of the shared L1 slot."""
         destination = reinterpret(
-            probability_l1_destination,
-            shape=(valid_query_rows, TILE_N),
+            probability_l1_destination, shape=(valid_query_rows, TILE_N)
         )
         mem_copy(
             destination,
@@ -1039,7 +1039,10 @@ class AttentionVectorStage:
                     # dynamic offset during lowering.
                     src = tile_slice(mask_gm, span, (src_row, src_col))
                     mem_copy(
-                        reinterpret(self.mask_row_aliases[row], shape=(1, valid_n)), src
+                        from_tensor(
+                            self.mask_row_aliases[row], layout=make_layout((1, valid_n))
+                        ),
+                        src,
                     )
 
     @jit
@@ -1134,7 +1137,7 @@ class AttentionVectorStage:
         sm_max = self.softmax_max_slots[softmax_state_slot]
         sm_sum = self.softmax_sum_slots[softmax_state_slot]
         rows, actual_n = qk_scores_handoff.shape
-        row_stride = qk_scores_handoff.physical_stride[0]
+        row_stride = qk_scores_handoff.physical_layout.stride[0]
         m0, s_m1, s_m0, block_stride = self._nz_params()
         if const_expr(per_row_causal):
             if const_expr(not self.uses_gs1_row_order):
@@ -1238,7 +1241,7 @@ class AttentionVectorStage:
         sm_max = self.softmax_max_slots[softmax_state_slot]
         sm_sum = self.softmax_sum_slots[softmax_state_slot]
         rows, actual_n = qk_scores_handoff.shape
-        row_stride = qk_scores_handoff.physical_stride[0]
+        row_stride = qk_scores_handoff.physical_layout.stride[0]
         m0, s_m1, s_m0, block_stride = self._nz_params()
         if const_expr(per_row_causal):
             if const_expr(not self.uses_gs1_row_order):
@@ -1376,7 +1379,7 @@ class AttentionVectorStage:
             self._clear_inactive_rows_vf(
                 rows, sm_max, sm_sum, m0, s_m1, s_m0, block_stride
             )
-            stride = qk_scores_handoff.physical_stride[0]
+            stride = qk_scores_handoff.physical_layout.stride[0]
             full_lane_mask, _ = rr.update_mask(VL_T, elem_bits=32)
             b16_full, _ = rr.update_mask(self.tile_n, elem_bits=16)
             for row in range(rows):
@@ -1465,7 +1468,7 @@ class AttentionVectorStage:
             self._clear_inactive_rows_vf(
                 rows, sm_max, sm_sum, m0, s_m1, s_m0, block_stride
             )
-            stride = qk_scores_handoff.physical_stride[0]
+            stride = qk_scores_handoff.physical_layout.stride[0]
             full_lane_mask, _ = rr.update_mask(VL_T, elem_bits=32)
             b16_full, _ = rr.update_mask(self.tile_n, elem_bits=16)
             h0m, _ = rr.update_mask(valid_columns, elem_bits=32)
@@ -1551,7 +1554,7 @@ class AttentionVectorStage:
             self._clear_inactive_rows_vf(
                 rows, sm_max, sm_sum, m0, s_m1, s_m0, block_stride
             )
-            stride = qk_scores_handoff.physical_stride[0]
+            stride = qk_scores_handoff.physical_layout.stride[0]
             full_lane_mask, _ = rr.update_mask(VL_T, elem_bits=32)
             b16_full, _ = rr.update_mask(self.tile_n, elem_bits=16)
             active_row_mask, _ = rr.update_mask(rows, elem_bits=32)
@@ -1653,7 +1656,7 @@ class AttentionVectorStage:
             self._clear_inactive_rows_vf(
                 rows, sm_max, sm_sum, m0, s_m1, s_m0, block_stride
             )
-            stride = qk_scores_handoff.physical_stride[0]
+            stride = qk_scores_handoff.physical_layout.stride[0]
             full_lane_mask, _ = rr.update_mask(VL_T, elem_bits=32)
             b16_full, _ = rr.update_mask(self.tile_n, elem_bits=16)
             active_row_mask, _ = rr.update_mask(rows, elem_bits=32)
@@ -2112,10 +2115,10 @@ class SplitKvReducer:
         state_shape = (FD_PARTIAL_CAPACITY, FD_STATE_COLUMNS)
         self.partial_sum_buffers = [
             make_buffer(
-                reinterpret(
+                from_tensor(
                     UB.view(262144),
+                    layout=make_layout(state_shape),
                     dtype=dtypes.float32,
-                    shape=state_shape,
                     offset=UB_FD_SUM_BASE + split_idx * UB_FD_STATE_SLOT_STRIDE,
                     data_format="nd",
                 )
@@ -2124,10 +2127,10 @@ class SplitKvReducer:
         ]
         self.partial_max_buffers = [
             make_buffer(
-                reinterpret(
+                from_tensor(
                     UB.view(262144),
+                    layout=make_layout(state_shape),
                     dtype=dtypes.float32,
-                    shape=state_shape,
                     offset=UB_FD_MAX_BASE + split_idx * UB_FD_STATE_SLOT_STRIDE,
                     data_format="nd",
                 )
@@ -2135,20 +2138,20 @@ class SplitKvReducer:
             for split_idx in range(FD_STATS_PER_SLOT)
         ]
         self.split_weight_buffer = make_buffer(
-            reinterpret(
+            from_tensor(
                 UB.view(262144),
+                layout=make_layout(state_shape),
                 dtype=dtypes.float32,
-                shape=state_shape,
                 offset=UB_FD_EXP_ADDR,
                 data_format="nd",
             )
         )
         self.partial_output_handoff = make_ring_buffer(
             [
-                reinterpret(
+                from_tensor(
                     UB.view(262144),
+                    layout=make_layout((FD_WINDOW_ROWS, TILE_D)),
                     dtype=dtypes.float32,
-                    shape=(FD_WINDOW_ROWS, TILE_D),
                     offset=(UB_FD_INPUT_ADDR)
                     + _slot
                     * prod((FD_WINDOW_ROWS, TILE_D))
@@ -2159,40 +2162,40 @@ class SplitKvReducer:
             ]
         )
         self.output_accumulator = make_buffer(
-            reinterpret(
+            from_tensor(
                 UB.view(262144),
+                layout=make_layout((FD_WINDOW_ROWS, TILE_D)),
                 dtype=dtypes.float32,
-                shape=(FD_WINDOW_ROWS, TILE_D),
                 offset=UB_FD_OUTPUT_ACCUM_ADDR,
                 data_format="nd",
             )
         )
         self.output_ub_handoff = make_ring_buffer(
             [
-                reinterpret(
+                from_tensor(
                     UB.view(262144),
+                    layout=make_layout((FD_WINDOW_ROWS, TILE_D)),
                     dtype=element_dtype,
-                    shape=(FD_WINDOW_ROWS, TILE_D),
                     offset=UB_FD_OUTPUT_ADDR,
                     data_format="nd",
                 )
             ]
         ).next_write()
         self.output_ub_alias = make_buffer(
-            reinterpret(
+            from_tensor(
                 UB.view(262144),
+                layout=make_layout((FD_WINDOW_ROWS, TILE_D)),
                 dtype=element_dtype,
-                shape=(FD_WINDOW_ROWS, TILE_D),
                 offset=UB_FD_OUTPUT_ADDR,
                 data_format="nd",
             )
         )
         self.softmax_max_slots = [
             make_buffer(
-                reinterpret(
+                from_tensor(
                     UB.view(262144),
+                    layout=make_layout((FD_WINDOW_ROWS, 1)),
                     dtype=dtypes.float32,
-                    shape=(FD_WINDOW_ROWS, 1),
                     offset=UB_FD_MAX_STATE_ADDR,
                     data_format="nd",
                 )
@@ -2200,10 +2203,10 @@ class SplitKvReducer:
         ]
         self.softmax_sum_slots = [
             make_buffer(
-                reinterpret(
+                from_tensor(
                     UB.view(262144),
+                    layout=make_layout((FD_WINDOW_ROWS, 1)),
                     dtype=dtypes.float32,
-                    shape=(FD_WINDOW_ROWS, 1),
                     offset=UB_FD_SUM_STATE_ADDR,
                     data_format="nd",
                 )
@@ -2211,29 +2214,29 @@ class SplitKvReducer:
         ]
         self.lse_output_ub = make_ring_buffer(
             [
-                reinterpret(
+                from_tensor(
                     UB.view(262144),
+                    layout=make_layout((FD_WINDOW_ROWS, 1)),
                     dtype=dtypes.float32,
-                    shape=(FD_WINDOW_ROWS, 1),
                     offset=UB_FD_LSE_ADDR,
                     data_format="nd",
                 )
             ]
         ).next_write()
         self.lse_output_alias = make_buffer(
-            reinterpret(
+            from_tensor(
                 UB.view(262144),
+                layout=make_layout((FD_WINDOW_ROWS, 1)),
                 dtype=dtypes.float32,
-                shape=(FD_WINDOW_ROWS, 1),
                 offset=UB_FD_LSE_ADDR,
                 data_format="nd",
             )
         )
         self.padded_lse_buffer = make_buffer(
-            reinterpret(
+            from_tensor(
                 UB.view(262144),
+                layout=make_layout((FD_WINDOW_ROWS, FD_STATE_COLUMNS)),
                 dtype=dtypes.float32,
-                shape=(FD_WINDOW_ROWS, FD_STATE_COLUMNS),
                 offset=UB_FD_LSE_ADDR,
                 data_format="nd",
             )
@@ -2261,19 +2264,17 @@ class SplitKvReducer:
                 (0, 0),
             )
             mem_copy(
-                reinterpret(
+                from_tensor(
                     self.partial_max_buffers[buffer_phase],
-                    shape=(FD_WINDOW_ROWS, 1),
-                    stride=(1, 1),
+                    layout=make_layout((FD_WINDOW_ROWS, 1), stride=(1, 1)),
                     offset=split_idx * FD_WINDOW_ROWS * 4,
                 ),
                 src,
             )
             mem_copy(
-                reinterpret(
+                from_tensor(
                     self.partial_sum_buffers[buffer_phase],
-                    shape=(FD_WINDOW_ROWS, 1),
-                    stride=(1, 1),
+                    layout=make_layout((FD_WINDOW_ROWS, 1), stride=(1, 1)),
                     offset=split_idx * FD_WINDOW_ROWS * 4,
                 ),
                 srcsum,
@@ -2382,9 +2383,9 @@ class SplitKvReducer:
         # only the rows assigned to this reducer. Every row is DMA-aligned.
         partial_output_tile = self.partial_output_handoff.next_write()
         mem_copy(
-            reinterpret(
+            from_tensor(
                 partial_output_tile,
-                shape=(active_rows, TILE_D),
+                layout=make_layout((active_rows, TILE_D)),
                 offset=window_row_offset * TILE_D * 4,
             ),
             tile_slice(
@@ -2466,10 +2467,10 @@ class AttentionCubeStage:
         self.kv_page_size = kv_page_size
         self.kv_uses_pa_nz_storage = kv_layout == "PA_NZ"
         self.q_l1 = make_buffer(
-            reinterpret(
+            from_tensor(
                 L1.view(524288),
+                layout=make_layout((max_query_rows, HEAD_DIM_QK)),
                 dtype=element_dtype,
-                shape=(max_query_rows, HEAD_DIM_QK),
                 offset=L1_Q_ADDR,
                 data_format="nz",
             )
@@ -2479,10 +2480,10 @@ class AttentionCubeStage:
             # static NZ owning root and its synchronization identity.
             self.kv_l1_slots = [
                 make_buffer(
-                    reinterpret(
+                    from_tensor(
                         L1.view(524288),
+                        layout=make_layout((TILE_N, HEAD_DIM_QK)),
                         dtype=element_dtype,
-                        shape=(TILE_N, HEAD_DIM_QK),
                         offset=L1_KV_BASE_ADDR + kv_pipeline_slot * L1_KV_SLOT_STRIDE,
                         data_format="nz",
                     )
@@ -2493,10 +2494,10 @@ class AttentionCubeStage:
         else:
             self.kv_l1_slots = [
                 make_buffer(
-                    reinterpret(
+                    from_tensor(
                         L1.view(524288),
+                        layout=make_layout((TILE_N, HEAD_DIM_QK)),
                         dtype=element_dtype,
-                        shape=(TILE_N, HEAD_DIM_QK),
                         offset=L1_KV_BASE_ADDR + kv_pipeline_slot * L1_KV_SLOT_STRIDE,
                         data_format="nz",
                     )
@@ -2508,9 +2509,9 @@ class AttentionCubeStage:
         # physical ordering. Do not let auto selection apply ND2NZ again.
         self.physical_copy = make_copy_engine(format_transform="identity")
         self.value_band_l1 = [
-            reinterpret(
+            from_tensor(
                 storage,
-                shape=(TILE_N, PV_BAND_WIDTH),
+                layout=make_layout((TILE_N, PV_BAND_WIDTH)),
                 data_format="nz",
                 offset=band * PV_BAND_WIDTH * TILE_N * 2,
             )
@@ -2519,28 +2520,28 @@ class AttentionCubeStage:
         ]
         # Hardware-sized tiling, independent of batch/head/query counts.
         self.q_chunk_96_l0a = make_buffer(
-            reinterpret(
+            from_tensor(
                 L0A.view(65536),
+                layout=make_layout((max_query_rows, QK_CHUNK_WIDTHS[0])),
                 dtype=element_dtype,
-                shape=(max_query_rows, QK_CHUNK_WIDTHS[0]),
                 offset=L0A_Q96_ADDR,
                 data_format="nz",
             )
         )
         self.q_chunk_128_l0a = make_buffer(
-            reinterpret(
+            from_tensor(
                 L0A.view(65536),
+                layout=make_layout((max_query_rows, QK_UB_ROW_STRIDE)),
                 dtype=element_dtype,
-                shape=(max_query_rows, QK_UB_ROW_STRIDE),
                 offset=L0A_Q128_ADDR,
                 data_format="nz",
             )
         )
         self.q_chunk_112_l0a = make_buffer(
-            reinterpret(
+            from_tensor(
                 L0A.view(65536),
+                layout=make_layout((max_query_rows, TILE_N)),
                 dtype=element_dtype,
-                shape=(max_query_rows, TILE_N),
                 offset=L0A_Q112_ADDR,
                 data_format="nz",
             )
@@ -2551,10 +2552,10 @@ class AttentionCubeStage:
         self.probability_second_l0a = self.q_chunk_128_l0a
         self.operand_b_l0_slots = [
             make_buffer(
-                reinterpret(
+                from_tensor(
                     L0B.view(65536),
+                    layout=make_layout((QK_UB_ROW_STRIDE, QK_UB_ROW_STRIDE)),
                     dtype=element_dtype,
-                    shape=(QK_UB_ROW_STRIDE, QK_UB_ROW_STRIDE),
                     offset=qk_chunk_idx * L0B_SLOT_STRIDE,
                     data_format="nz",
                 )
@@ -2565,10 +2566,10 @@ class AttentionCubeStage:
         # views describe the transaction's M pitch for both MMAD and FIXPIPE.
         self.accumulator_l0c_slots = [
             make_buffer(
-                reinterpret(
+                from_tensor(
                     L0C.view(262144),
+                    layout=make_layout((TILE_CUBE_M, PV_BAND_WIDTH)),
                     dtype=dtypes.float32,
-                    shape=(TILE_CUBE_M, PV_BAND_WIDTH),
                     offset=kv_pipeline_slot * L0C_SLOT_STRIDE,
                     data_format="nz",
                 )
@@ -2590,9 +2591,9 @@ class AttentionCubeStage:
         # The owning L1 storage remains typed NZ with a fixed TILE_N pitch.
         # Describe the full physical D1/token/D0 span before taking a DMA
         # window. A dynamic reinterpret of the NZ root would retain ND2NZ.
-        physical = reinterpret(
+        physical = from_tensor(
             self.kv_l1_slots[kv_pipeline_slot],
-            shape=(PA_NZ_D1, TILE_N * FRACTAL_SIZE),
+            layout=make_layout((PA_NZ_D1, TILE_N * FRACTAL_SIZE)),
             data_format="nd",
         )
         destination = _offset_view(physical, (0, destination_column * FRACTAL_SIZE))
@@ -2622,9 +2623,9 @@ class AttentionCubeStage:
         aligned_query_rows = (
             (valid_query_rows + FRACTAL_SIZE - 1) // FRACTAL_SIZE * FRACTAL_SIZE
         )
-        accumulator_storage = reinterpret(
+        accumulator_storage = from_tensor(
             self.accumulator_l0c_slots[l0c_slot],
-            shape=(aligned_query_rows, QK_UB_ROW_STRIDE),
+            layout=make_layout((aligned_query_rows, QK_UB_ROW_STRIDE)),
         )
         self._compute_qk_at_row_pitch(
             kv_pipeline_slot,
@@ -2651,8 +2652,9 @@ class AttentionCubeStage:
         hardware_query_rows,
         accumulator_storage,
     ):
-        accumulator = reinterpret(
-            accumulator_storage, shape=(hardware_query_rows, valid_kv_columns)
+        accumulator = from_tensor(
+            accumulator_storage,
+            layout=make_layout((hardware_query_rows, valid_kv_columns)),
         )
         TILE_N // FRACTAL_SIZE
         for qk_chunk_idx in tuple(range(5)):
@@ -2660,15 +2662,16 @@ class AttentionCubeStage:
             qk_chunk_offset = QK_CHUNK_OFFSETS[qk_chunk_idx]
             l0b_slot = (l0b_bank_phase + qk_chunk_idx) % 2
             if const_expr(qk_chunk_idx == 0):
-                a = reinterpret(
-                    self.q_chunk_96_l0a, shape=(hardware_query_rows, qk_chunk_width)
+                a = from_tensor(
+                    self.q_chunk_96_l0a,
+                    layout=make_layout((hardware_query_rows, qk_chunk_width)),
                 )
                 if initialize_accumulator:
                     mem_copy(
                         a,
-                        reinterpret(
+                        from_tensor(
                             self.q_l1,
-                            shape=(self.max_query_rows, qk_chunk_width),
+                            layout=make_layout((self.max_query_rows, qk_chunk_width)),
                             data_format="nz",
                             offset=qk_chunk_offset * self.max_query_rows * 2,
                         ),
@@ -2676,35 +2679,35 @@ class AttentionCubeStage:
 
             else:
                 if const_expr(qk_chunk_idx % 2 == 0):
-                    a = reinterpret(
+                    a = from_tensor(
                         self.q_chunk_128_l0a,
-                        shape=(hardware_query_rows, qk_chunk_width),
+                        layout=make_layout((hardware_query_rows, qk_chunk_width)),
                     )
                 else:
-                    a = reinterpret(
+                    a = from_tensor(
                         self.q_chunk_112_l0a,
-                        shape=(hardware_query_rows, qk_chunk_width),
+                        layout=make_layout((hardware_query_rows, qk_chunk_width)),
                     )
 
                 mem_copy(
                     a,
-                    reinterpret(
+                    from_tensor(
                         self.q_l1,
-                        shape=(self.max_query_rows, qk_chunk_width),
+                        layout=make_layout((self.max_query_rows, qk_chunk_width)),
                         data_format="nz",
                         offset=qk_chunk_offset * self.max_query_rows * 2,
                     ),
                 )
 
-            b = reinterpret(
+            b = from_tensor(
                 self.operand_b_l0_slots[l0b_slot],
-                shape=(valid_kv_columns, qk_chunk_width),
+                layout=make_layout((valid_kv_columns, qk_chunk_width)),
             )
             mem_copy(
                 b,
-                reinterpret(
+                from_tensor(
                     self.kv_l1_slots[kv_pipeline_slot],
-                    shape=(TILE_N, qk_chunk_width),
+                    layout=make_layout((TILE_N, qk_chunk_width)),
                     data_format="nz",
                     offset=qk_chunk_offset * TILE_N * 2,
                 ),
@@ -2715,14 +2718,17 @@ class AttentionCubeStage:
             # tail pitch inferred by the compiler.
             matmul(
                 accumulator,
-                reinterpret(a, shape=(hardware_query_rows, qk_chunk_width)),
-                reinterpret(b, shape=(valid_kv_columns, qk_chunk_width)),
+                from_tensor(
+                    a, layout=make_layout((hardware_query_rows, qk_chunk_width))
+                ),
+                from_tensor(b, layout=make_layout((valid_kv_columns, qk_chunk_width))),
                 init=qk_chunk_idx == 0,
             )
 
         mem_copy(
-            reinterpret(
-                output_handoff, shape=(self.max_query_rows // 2, 128), stride=(128, 1)
+            from_tensor(
+                output_handoff,
+                layout=make_layout((self.max_query_rows // 2, 128), stride=(128, 1)),
             ),
             accumulator_storage,
             engine=self.fixpipe_copy,
@@ -2745,9 +2751,9 @@ class AttentionCubeStage:
         aligned_query_rows = (
             (valid_query_rows + FRACTAL_SIZE - 1) // FRACTAL_SIZE * FRACTAL_SIZE
         )
-        accumulator_storage = reinterpret(
+        accumulator_storage = from_tensor(
             self.accumulator_l0c_slots[l0c_slot],
-            shape=(aligned_query_rows, PV_BAND_WIDTH),
+            layout=make_layout((aligned_query_rows, PV_BAND_WIDTH)),
         )
         self._compute_pv_band_at_row_pitch(
             kv_pipeline_slot,
@@ -2776,7 +2782,9 @@ class AttentionCubeStage:
         hardware_query_rows,
         accumulator_storage,
     ):
-        accumulator = reinterpret(accumulator_storage, shape=(hardware_query_rows, 256))
+        accumulator = from_tensor(
+            accumulator_storage, layout=make_layout((hardware_query_rows, 256))
+        )
         TILE_N // FRACTAL_SIZE
         for kv_half_idx in tuple(range(2)):
             if valid_kv_columns > kv_half_idx * 64:
@@ -2786,32 +2794,32 @@ class AttentionCubeStage:
                     else 64
                 )
                 if const_expr(kv_half_idx == 0):
-                    pa = reinterpret(
+                    pa = from_tensor(
                         self.probability_first_l0a,
-                        shape=(hardware_query_rows, valid_half_columns),
+                        layout=make_layout((hardware_query_rows, valid_half_columns)),
                     )
                 else:
-                    pa = reinterpret(
+                    pa = from_tensor(
                         self.probability_second_l0a,
-                        shape=(hardware_query_rows, valid_half_columns),
+                        layout=make_layout((hardware_query_rows, valid_half_columns)),
                     )
                 l0b_slot = (l0b_bank_phase + kv_half_idx) % 2
                 if output_band_idx == 0:
                     p_columns = 64 if const_expr(kv_half_idx == 0) else TILE_N - 64
                     mem_copy(
                         pa,
-                        reinterpret(
+                        from_tensor(
                             probability_l1,
-                            shape=(self.max_query_rows, p_columns),
+                            layout=make_layout((self.max_query_rows, p_columns)),
                             data_format="nz",
                             offset=kv_half_idx * 64 * self.max_query_rows * 2,
                         ),
                     )
                 # Preserve the source NZ pitch; the transpose copy materializes
                 # the PV operand in L0B.
-                b = reinterpret(
+                b = from_tensor(
                     self.operand_b_l0_slots[l0b_slot],
-                    shape=(valid_half_columns, PV_BAND_WIDTH),
+                    layout=make_layout((valid_half_columns, PV_BAND_WIDTH)),
                     data_format="zn",
                 )
                 value_band = self.value_band_l1[kv_pipeline_slot * 2 + output_band_idx]
@@ -2821,14 +2829,20 @@ class AttentionCubeStage:
 
                 matmul(
                     accumulator,
-                    reinterpret(pa, shape=(hardware_query_rows, valid_half_columns)),
-                    reinterpret(b, shape=(valid_half_columns, PV_BAND_WIDTH)),
+                    from_tensor(
+                        pa,
+                        layout=make_layout((hardware_query_rows, valid_half_columns)),
+                    ),
+                    from_tensor(
+                        b, layout=make_layout((valid_half_columns, PV_BAND_WIDTH))
+                    ),
                     init=kv_half_idx == 0,
                 )
 
         mem_copy(
-            reinterpret(
-                output_handoff, shape=(self.max_query_rows // 2, 256), stride=(256, 1)
+            from_tensor(
+                output_handoff,
+                layout=make_layout((self.max_query_rows // 2, 256), stride=(256, 1)),
             ),
             accumulator_storage,
             engine=self.fixpipe_copy,
@@ -2893,10 +2907,10 @@ class FlashMlaWithKvcache:
         self.vector_subblock_idx = get_subblock_id()
         self.qk_scores_handoff = make_ring_buffer(
             [
-                reinterpret(
+                from_tensor(
                     UB.view(262144),
+                    layout=make_layout((TILE_VEC_M, QK_UB_ROW_STRIDE)),
                     dtype=dtypes.float32,
-                    shape=(TILE_VEC_M, QK_UB_ROW_STRIDE),
                     offset=UB_QK_ADDR,
                     data_format="nd",
                 )
@@ -2904,10 +2918,10 @@ class FlashMlaWithKvcache:
         ).next_write()
         self.pv_output_handoff = make_ring_buffer(
             [
-                reinterpret(
+                from_tensor(
                     UB.view(262144),
+                    layout=make_layout((TILE_VEC_M, PV_BAND_WIDTH)),
                     dtype=dtypes.float32,
-                    shape=(TILE_VEC_M, PV_BAND_WIDTH),
                     offset=(UB_PV_ADDR)
                     + _slot
                     * prod((TILE_VEC_M, PV_BAND_WIDTH))
@@ -2921,10 +2935,10 @@ class FlashMlaWithKvcache:
         # The slots are noncontiguous, so this stays explicit.
         self.probability_l1_slots = [
             make_buffer(
-                reinterpret(
+                from_tensor(
                     L1.view(524288),
+                    layout=make_layout((TILE_CUBE_M, TILE_N)),
                     dtype=input_dtype,
-                    shape=(TILE_CUBE_M, TILE_N),
                     offset=L1_KV_BASE_ADDR + i * L1_KV_SLOT_STRIDE + L1_P_OFFSET,
                     data_format="nz",
                 )
@@ -2954,19 +2968,19 @@ class FlashMlaWithKvcache:
         # The UB scratch aliases the retired PV area and is used before
         # attention for output initialization, and after it for BNSD tails.
         self.output_init_scratch = make_buffer(
-            reinterpret(
+            from_tensor(
                 UB.view(262144),
+                layout=make_layout((TILE_VEC_M, HEAD_DIM_QK)),
                 dtype=input_dtype,
-                shape=(TILE_VEC_M, HEAD_DIM_QK),
                 offset=UB_PV_ADDR,
                 data_format="nd",
             )
         )
         self.lse_init_scratch = make_buffer(
-            reinterpret(
+            from_tensor(
                 UB.view(262144),
+                layout=make_layout((TILE_VEC_M, 1)),
                 dtype=dtypes.float32,
-                shape=(TILE_VEC_M, 1),
                 offset=UB_LSE_ADDR,
                 data_format="nd",
             )
@@ -3048,7 +3062,9 @@ class FlashMlaWithKvcache:
                 )
                 mem_copy(
                     tile_slice(_offset_view(plane, (start, 0)), span, (0, 0)),
-                    reinterpret(self.output_init_scratch, shape=(chunk, width)),
+                    from_tensor(
+                        self.output_init_scratch, layout=make_layout((chunk, width))
+                    ),
                 )
                 done += chunk
             row += workers * TILE_VEC_M
@@ -3087,7 +3103,7 @@ class FlashMlaWithKvcache:
                 )
                 mem_copy(
                     tile_slice(_offset_view(plane, (start, 0)), span, (0, 0)),
-                    reinterpret(self.lse_init_scratch, shape=(chunk, 1)),
+                    from_tensor(self.lse_init_scratch, layout=make_layout((chunk, 1))),
                 )
                 done += chunk
             row += workers * TILE_VEC_M
@@ -3229,10 +3245,11 @@ class FlashMlaWithKvcache:
             batch_idx, query_token_idx, query_head_start
         )
         valid_n = self._valid_kv_columns(batch_idx, kv_tile_idx)
-        qk_view = reinterpret(
+        qk_view = from_tensor(
             self.qk_scores_handoff,
-            shape=(valid_vector_rows, valid_n),
-            stride=(QK_UB_ROW_STRIDE, 1),
+            layout=make_layout(
+                (valid_vector_rows, valid_n), stride=(QK_UB_ROW_STRIDE, 1)
+            ),
         )
         # The slice-relative first tile (kv_tile_start, 0 on FA tiles) initializes
         # the online-softmax state -- an FD slice starts cold at kv_tile_start.
@@ -3393,10 +3410,11 @@ class FlashMlaWithKvcache:
         if first and output_band_idx == 0 and valid_vector_rows < self.tile_vec_m:
             self.vector_stage.clear_inactive_output_rows(valid_vector_rows)
         self.vector_stage.update_output_band(
-            reinterpret(
+            from_tensor(
                 self.pv_output_handoff.next_read(),
-                shape=(self.tile_vec_m, PV_BAND_WIDTH),
-                stride=(PV_BAND_WIDTH, 1),
+                layout=make_layout(
+                    (self.tile_vec_m, PV_BAND_WIDTH), stride=(PV_BAND_WIDTH, 1)
+                ),
             ),
             self.vector_stage.softmax_rescale_slots[rescale_state_slot],
             self.vector_stage.softmax_sum_slots[softmax_state_slot],
@@ -3548,10 +3566,9 @@ class FlashMlaWithKvcache:
             )
             mem_copy(
                 tile_slice(_offset_view(plane, (start, 0)), span, (0, 0)),
-                reinterpret(
+                from_tensor(
                     source,
-                    shape=(count, width),
-                    stride=(source_pitch, 1),
+                    layout=make_layout((count, width), stride=(source_pitch, 1)),
                     offset=done * source_bytes,
                 ),
             )
@@ -3625,7 +3642,7 @@ class FlashMlaWithKvcache:
                 make_tiler((tvm, self.tile_d), alignment=(1, 1)),
                 (0, 0),
             ),
-            reinterpret(vec.output_accumulator, shape=(tvm, self.tile_d)),
+            from_tensor(vec.output_accumulator, layout=make_layout((tvm, self.tile_d))),
         )
         # Fix the max/sum slot first, then store this AIV's row segment.
         mrow = offset
@@ -3636,7 +3653,9 @@ class FlashMlaWithKvcache:
                 make_tiler((tvm, 1), alignment=(1, 1)),
                 (0, 0),
             ),
-            reinterpret(softmax_max_buffer, shape=(tvm, 1), stride=(1, 1)),
+            from_tensor(
+                softmax_max_buffer, layout=make_layout((tvm, 1), stride=(1, 1))
+            ),
         )
         mem_copy(
             tile_slice(
@@ -3644,7 +3663,9 @@ class FlashMlaWithKvcache:
                 make_tiler((tvm, 1), alignment=(1, 1)),
                 (0, 0),
             ),
-            reinterpret(softmax_sum_buffer, shape=(tvm, 1), stride=(1, 1)),
+            from_tensor(
+                softmax_sum_buffer, layout=make_layout((tvm, 1), stride=(1, 1))
+            ),
         )
 
     @jit
@@ -3809,9 +3830,9 @@ class FlashMlaWithKvcache:
                     aligned_count = FRACTAL_SIZE
                 for blocks in tuple(range(1, TILE_CUBE_M // FRACTAL_SIZE + 1)):
                     if aligned_count == blocks * FRACTAL_SIZE:
-                        matrix = reinterpret(
+                        matrix = from_tensor(
                             self.cube_stage.q_l1,
-                            shape=(TILE_CUBE_M, HEAD_DIM_QK),
+                            layout=make_layout((TILE_CUBE_M, HEAD_DIM_QK)),
                             data_format="nz",
                         )
                         span = (blocks * FRACTAL_SIZE, HEAD_DIM_QK)
@@ -3826,9 +3847,9 @@ class FlashMlaWithKvcache:
                 filled += aligned_count
             else:
                 # Scatter one contiguous Q row into the fixed-pitch NZ root.
-                physical = reinterpret(
+                physical = from_tensor(
                     self.cube_stage.q_l1,
-                    shape=(PA_NZ_D1, self.tile_cube_m * FRACTAL_SIZE),
+                    layout=make_layout((PA_NZ_D1, self.tile_cube_m * FRACTAL_SIZE)),
                     data_format="nd",
                 )
                 destination = tile_slice(

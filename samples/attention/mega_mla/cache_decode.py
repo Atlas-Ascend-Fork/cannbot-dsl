@@ -12,6 +12,8 @@ FP8 uses E4M3FN values; FP4 uses packed E2M1 values. Both gather FP32 scale
 bit patterns through uint32 registers and return decoded BF16 records.
 """
 
+from cannbotdsl import from_tensor
+
 from cannbotdsl import make_layout, dtypes, RegLayout
 from cannbotdsl.lang import jit, vf, const_expr
 from cannbotdsl.ops import reg as rr
@@ -20,8 +22,8 @@ from cannbotdsl.ops import reg as rr
 class Fp8CacheDecoder:
     @jit
     def decode(self, data, dst, row, base):
-        scale_data = data.reinterpret(
-            dtypes.bfloat16, make_layout((data.shape[0], data.shape[1] // 2))
+        scale_data = from_tensor(
+            data, dtypes.bfloat16, make_layout((data.shape[0], data.shape[1] // 2))
         )
         with vf(mode="simd"):
             m32 = rr.full_mask(elem_bits=32)
@@ -109,8 +111,10 @@ class Fp4CacheDecoder:
     @jit
     def _prepare_scales(self, data_ub, row):
         """Prepare shared scale registers inside the caller SIMD scope."""
-        scale_data = data_ub.reinterpret(
-            dtypes.bfloat16, make_layout((data_ub.shape[0], data_ub.shape[1] // 2))
+        scale_data = from_tensor(
+            data_ub,
+            dtypes.bfloat16,
+            make_layout((data_ub.shape[0], data_ub.shape[1] // 2)),
         )
         m32 = rr.full_mask(elem_bits=32)
         if const_expr(self.native_bf16_scales):

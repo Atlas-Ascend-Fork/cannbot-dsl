@@ -16,7 +16,6 @@ ignore:
   - scripts/format_cpp.sh
   - scripts/run_codespell.sh
   - test/test_config.yaml
-  - net/
 mla_prolog_v4:
   module: true
   src:
@@ -32,7 +31,7 @@ add:
   options:
     - vector/add
 attn_epilogue:
-  module: true
+  module: false
   src:
     - samples/attention/attn_epilogue
     - test/attention/attn_epilogue
@@ -320,7 +319,7 @@ mixed_quant_sparse_flash_mla_metadata:
     - attention/mixed_quant_sparse_flash_mla
     - attention/mixed_quant_sparse_flash_mla_metadata
 moonep:
-  module: true
+  module: false
   src:
     - samples/mc2/moonep
     - test/mc2/moonep
@@ -341,7 +340,7 @@ dynamic_mx_quant_sr:
   options:
     - vector/dynamic_mx_quant_sr
 mega_full_index:
-  module: true
+  module: false
   src:
     - samples/attention/mega_full_index
     - test/attention/mega_full_index

@@ -19,6 +19,8 @@ Matmul 管理 Q/K/V L1 和 L0；Vector 持有 UB；kernel 持有 QK/P/PV 三个�
 每个 AIV 处理 64 行。QK/P/PV 交接深度为 2/3/1，无 GM 中间结果或手工地址别名。
 """
 
+from cannbotdsl import from_tensor
+
 import math
 from threading import Lock
 from typing import NamedTuple
@@ -45,12 +47,11 @@ from cannbotdsl import (
     copy_options,
     matmul,
     mem_copy,
-    permute,
     tile_slice,
     vf,
 )
 from cannbotdsl import reg as rr
-from cannbotdsl import make_layout, reinterpret
+from cannbotdsl import make_layout
 from cannbotdsl.lang.host import host
 
 TILE_M = 128
@@ -213,7 +214,7 @@ class Matmul:
 
     @jit
     def _compute_full_pv(self, p_l1, value0, value1, p_input, accumulator):
-        v_slot = reinterpret(self.v_l1.next_write(), data_format="zn")
+        v_slot = from_tensor(self.v_l1.next_write(), data_format="zn")
         mem_copy(tile_slice(v_slot, (SPARSE_BLOCK, HEAD_DIM), (0, 0)), value0)
         mem_copy(tile_slice(v_slot, (SPARSE_BLOCK, HEAD_DIM), (1, 0)), value1)
         mem_copy(p_input, p_l1.permute(1, 0))
@@ -222,12 +223,12 @@ class Matmul:
 
     @jit
     def compute_pv(self, p_l1, value0, value1, pair: SparsePair, pv_ub):
-        p_input = reinterpret(
+        p_input = from_tensor(
             self.p_l0a.next_write(),
             layout=make_layout((TILE_M, MACRO_N)),
             data_format="nz",
         )
-        accumulator = reinterpret(
+        accumulator = from_tensor(
             self.qk_l0c.next_write(), layout=make_layout((TILE_M, HEAD_DIM))
         )
         if const_expr(self.shared_l0a):
@@ -245,7 +246,7 @@ class Matmul:
                 depth=1,
                 data_format="nz",
             ).next_write()
-            tail_slot = reinterpret(tail_v_l1, data_format="zn")
+            tail_slot = from_tensor(tail_v_l1, data_format="zn")
             mem_copy(
                 tile_slice(tail_slot, (SPARSE_BLOCK, HEAD_DIM), (0, 0)),
                 value0[: pair.valid0, None],
@@ -444,7 +445,7 @@ class Vector:
         p_ub_slot = self.p_ub.next_write()
         if const_expr(is_update):
             rescale_slot = self.rescale.next_write()
-        stride_n1, _, stride_m0, _ = p_ub_slot.physical_stride
+        stride_n1, _, stride_m0, _ = p_ub_slot.physical_layout.stride
         mask_channel0 = None
         mask_channel1 = None
         if const_expr(self.mask_mode == 3):
@@ -788,7 +789,7 @@ class Vector:
         # 相邻源 burst 跨 4160 B，目的端连续写入一个 8192 B 半区。
         p_ub_slot = self.p_ub.next_read()
         slot = p_l1.next_write()
-        src_pairs = reinterpret(
+        src_pairs = from_tensor(
             p_ub_slot,
             data_format="nd",
             layout=make_layout(
@@ -811,7 +812,7 @@ class Vector:
             (1, 1, P_DMA_BURST_COUNT, P_DMA_BURST_BYTES),
             (0, 1, 0, 0),
         )
-        dst_pairs = reinterpret(
+        dst_pairs = from_tensor(
             slot,
             data_format="nd",
             layout=make_layout(
@@ -1779,10 +1780,10 @@ class QuantBlockSparseAttnLauncher:
         # Q/scale 统一按 head 取 GM 视图；只调整视图轴，不重排或重新量化。
         # TND 的 token stride 为 N1*128 / N1，NTD 为 128 / 1。
         if const_expr(self.layout_q == "TND"):
-            query = permute(query, (1, 0, 2))
-            q_descale = permute(q_descale, (1, 0))
+            query = query.permute((1, 0, 2))
+            q_descale = q_descale.permute((1, 0))
         # 输出始终保持公开 TND 布局，不随 Query layout 改变。
-        out = permute(out, (1, 0, 2))
+        out = out.permute((1, 0, 2))
         # k_descale 保留公开四维 stride，仅在设备选页后将连续子块转成一维视图。
         op = QuantBlockSparseAttnKernel(
             query.shape[0],
