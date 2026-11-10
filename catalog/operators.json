@@ -98,6 +98,14 @@
       "source": "samples/matmul/grouped_matmul",
       "test": "test/matmul/grouped_matmul"
     },
+    "grouped_matmul_finalize_routing": {
+      "source": "samples/matmul/grouped_matmul_finalize_routing",
+      "test": "test/matmul/grouped_matmul_finalize_routing"
+    },
+    "transpose_batch_matmul": {
+      "source": "samples/matmul/transpose_batch_matmul",
+      "test": "test/matmul/transpose_batch_matmul"
+    },
     "qwen_sparse_attn": {
       "source": "samples/attention/qwen_sparse_attn",
       "test": "test/attention/qwen_sparse_attn"
@@ -435,6 +443,8 @@
       "quant_matmul",
       "weight_quant_batchmatmul",
       "grouped_matmul",
+      "grouped_matmul_finalize_routing",
+      "transpose_batch_matmul",
       "qwen_sparse_attn",
       "stem_indexer",
       "qsa_indexer",
@@ -745,6 +755,28 @@
         ],
         "tests": [
           "@grouped_matmul/test"
+        ]
+      },
+      {
+        "name": "grouped_matmul_finalize_routing",
+        "enabled": true,
+        "watch": [
+          "@grouped_matmul_finalize_routing/source",
+          "@grouped_matmul_finalize_routing/test"
+        ],
+        "tests": [
+          "@grouped_matmul_finalize_routing/test"
+        ]
+      },
+      {
+        "name": "transpose_batch_matmul",
+        "enabled": true,
+        "watch": [
+          "@transpose_batch_matmul/source",
+          "@transpose_batch_matmul/test"
+        ],
+        "tests": [
+          "@transpose_batch_matmul/test"
         ]
       },
       {

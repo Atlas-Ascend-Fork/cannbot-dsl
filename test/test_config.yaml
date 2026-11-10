@@ -191,6 +191,20 @@ grouped_matmul:
     - test/matmul/grouped_matmul
   options:
     - matmul/grouped_matmul
+grouped_matmul_finalize_routing:
+  module: true
+  src:
+    - samples/matmul/grouped_matmul_finalize_routing
+    - test/matmul/grouped_matmul_finalize_routing
+  options:
+    - matmul/grouped_matmul_finalize_routing
+transpose_batch_matmul:
+  module: true
+  src:
+    - samples/matmul/transpose_batch_matmul
+    - test/matmul/transpose_batch_matmul
+  options:
+    - matmul/transpose_batch_matmul
 qwen_sparse_attn:
   module: true
   src:

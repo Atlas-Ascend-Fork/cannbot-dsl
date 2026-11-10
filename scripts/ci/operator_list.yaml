@@ -22,6 +22,8 @@ operators:
   - matmul/quant_matmul
   - matmul/weight_quant_batchmatmul
   - matmul/grouped_matmul
+  - matmul/grouped_matmul_finalize_routing
+  - matmul/transpose_batch_matmul
   - attention/qwen_sparse_attn
   - attention/stem_indexer
   - attention/qsa_indexer

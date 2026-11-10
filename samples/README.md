@@ -50,6 +50,8 @@ Attention、MLA、KDA，以及专属索引、前后处理和 KV Cache 算子。
 - [dual_level_quant_matmul](matmul/dual_level_quant_matmul/README.md)
 - [fused_matmul](matmul/fused_matmul/README.md)
 - [grouped_matmul](matmul/grouped_matmul/README.md)
+- [grouped_matmul_finalize_routing](matmul/grouped_matmul_finalize_routing/README.md)
+- [transpose_batch_matmul](matmul/transpose_batch_matmul/README.md)
 - [matmul](matmul/matmul/README.md)
 - [quant_matmul](matmul/quant_matmul/README.md)
 - [weight_quant_batchmatmul](matmul/weight_quant_batchmatmul/README.md)
