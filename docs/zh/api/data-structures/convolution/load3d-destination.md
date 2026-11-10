@@ -1,0 +1,84 @@
+# Load3DDestination
+
+## 产品支持情况
+
+- Ascend 950PR&950DT系列产品：支持
+
+## 功能说明
+
+显式描述 [load3d](../../data-movement/convolution/load3d.md) 结果在目标中的存放间距和起点。用于重复展开、非自动推导的数据类型或自定义目标放置；不改变源窗口，也不分配目标存储。
+
+## 函数原型
+
+```python
+Load3DDestination(
+    *, k_stride_fractals: int, m_start_fractals: int = 0,
+) -> Load3DDestination
+```
+
+整数参数也接受 DSL 整数标量表达式。
+
+## 参数说明
+
+| 参数 | 输入/输出 | 说明 |
+| --- | --- | --- |
+| k_stride_fractals | 输入 | 目标 K 方向的分形块间距，0～65535，单位为 512 字节分形块。常规 fp16 NZ 矩阵按其实际物理间距设置，不按源矩阵宽度猜测。 |
+| m_start_fractals | 输入 | 相对目标 Tensor 起点的 M 方向分形块偏移，0～65535，单位为 512 字节，默认 0。 |
+
+## 返回值说明
+
+返回不可变的 `Load3DDestination` 配置对象。
+
+## 约束说明
+
+显式描述必须与目标 Tensor 的实际排布相符，且覆盖所有重复展开、转置和起点偏移。声明目标描述不扩容 Tensor；未初始化的目标空洞不能作为有效值读取。
+
+## 调用示例
+
+以下示例展开 L1 特征图，通过单位矩阵乘法读回结果并校验。
+
+```python
+# Copyright (c) 2026 Huawei Technologies Co., Ltd.
+# Licensed under the CANN Open Software License Agreement Version 2.0.
+import cannbotdsl as cb
+import torch
+import torch_npu
+
+@cb.kernel
+def kernel(src: cb.Tensor, eye: cb.Tensor, out: cb.Tensor):
+    fmap = cb.Buffer(cb.MemLoc.L1, cb.dtypes.float16, cb.make_layout((256,)), data_format="nd")
+    identity = cb.Buffer(cb.MemLoc.L1, cb.dtypes.float16, cb.make_layout((16, 16)))
+    a = cb.Buffer(cb.MemLoc.L0A, cb.dtypes.float16, cb.make_layout((16, 16)))
+    b = cb.Buffer(cb.MemLoc.L0B, cb.dtypes.float16, cb.make_layout((16, 16)))
+    c = cb.Buffer(cb.MemLoc.L0C, cb.dtypes.float32, cb.make_layout((16, 16)))
+    cb.mem_copy(fmap, src)
+    cb.mem_copy(identity, eye)
+    cb.load3d(a, fmap,
+        feature=cb.Load3DFeatureMap(height=4, width=4, channels=16),
+        window=cb.Load3DWindow(m_extent=16, k_extent=16),
+        destination=cb.Load3DDestination(k_stride_fractals=1),
+        repeat=cb.Load3DRepeat(count=1), padding=cb.Load3DPadding.value(0))
+    cb.mem_copy(b, identity)
+    cb.matmul(c, a, b, init=True)
+    cb.mem_copy(out, c)
+
+@cb.host
+def launch(src: cb.Tensor, eye: cb.Tensor, out: cb.Tensor):
+    kernel[1](src, eye, out)
+
+def main():
+    matrix = torch.arange(256, dtype=torch.float16).reshape(16, 16)
+    # One C1 plane: (C1, H, W, C0) = (1, 4, 4, 16).
+    src = matrix.flatten().to("npu:0")
+    eye = torch.eye(16, dtype=torch.float16, device="npu:0")
+    out = torch.empty((16, 16), dtype=torch.float32, device="npu:0")
+    launch(src, eye, out)
+    torch.npu.synchronize()
+    torch.testing.assert_close(out.cpu(), matrix.float(), rtol=0, atol=0)
+    print("load3d example passed")
+
+if __name__ == "__main__":
+    main()
+```
+
+预期结果：校验通过，输出 `load3d example passed`。

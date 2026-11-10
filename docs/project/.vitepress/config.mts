@@ -2784,6 +2784,9 @@ const apiSidebar = [
 // when a directory already exposes the same route as a group.
 const cleanSidebar = (items: any[]): any[] => items.map((item) => {
   if (!Array.isArray(item.items) || item.items.length === 0) return item
+    if (item.link === "/zh/api/data-structures/convolution/make-conv2d-spec") {
+      return { ...item, items: item.items.map(removeParentLinks) }
+    }
 
   const rawChildren = item.items
   const directoryLinks = new Set(
@@ -2853,6 +2856,9 @@ const normalizeApiSidebar = (sidebar: any[]) => {
   }
   const removeParentLinks = (item: any): any => {
     if (!Array.isArray(item.items) || item.items.length === 0) return item
+    if (item.link === "/zh/api/data-structures/convolution/make-conv2d-spec") {
+      return { ...item, items: item.items.map(removeParentLinks) }
+    }
     const { link: _link, ...group } = item
     return { ...group, items: item.items.map(removeParentLinks) }
   }
@@ -2970,6 +2976,24 @@ const normalizeApiSidebar = (sidebar: any[]) => {
       find(aicpuItems, '/aicpu/validation'),
       find(aicpuItems, '/aicpu/runtime'),
     ].filter(Boolean)
+  }
+
+  if (dataMovement) dataMovement.items = [...(dataMovement.items ?? []), {"text": "卷积数据搬运", "collapsed": true, "items": [{"text": "conv2d_load_filter", "link": "/zh/api/data-movement/convolution/conv2d-load-filter"}, {"text": "conv2d_load_fmap", "link": "/zh/api/data-movement/convolution/conv2d-load-fmap"}, {"text": "conv2d_load_im2col", "link": "/zh/api/data-movement/convolution/conv2d-load-im2col"}, {"text": "conv2d_store_output", "link": "/zh/api/data-movement/convolution/conv2d-store-output"}, {"text": "load3d", "link": "/zh/api/data-movement/convolution/load3d"}]}]
+  if (dataStructures) dataStructures.items = [...(dataStructures.items ?? []), {"text": "卷积数据结构", "collapsed": true, "items": [{"text": "Conv2dTile", "link": "/zh/api/data-structures/convolution/conv2d-tile"}, {"text": "Load3DDestination", "link": "/zh/api/data-structures/convolution/load3d-destination"}, {"text": "Load3DFeatureMap", "link": "/zh/api/data-structures/convolution/load3d-feature-map"}, {"text": "Load3DPadding", "link": "/zh/api/data-structures/convolution/load3d-padding"}, {"text": "Load3DRepeat", "link": "/zh/api/data-structures/convolution/load3d-repeat"}, {"text": "Load3DWindow", "link": "/zh/api/data-structures/convolution/load3d-window"}, {"text": "make_conv2d_spec", "link": "/zh/api/data-structures/convolution/make-conv2d-spec", "collapsed": true, "items": [{"text": "Conv2dSpec.tile_count", "link": "/zh/api/data-structures/convolution/make-conv2d-spec/tile-count"}, {"text": "Conv2dSpec.fmap_l1_shape", "link": "/zh/api/data-structures/convolution/make-conv2d-spec/fmap-l1-shape"}, {"text": "Conv2dSpec.tile", "link": "/zh/api/data-structures/convolution/make-conv2d-spec/tile"}]}]}]
+  if (dataStructures) {
+    const tensorGroup = find(dataStructures.items ?? [], '/tensor')
+    const storageGroup = find(dataStructures.items ?? [], '/storage')
+    if (tensorGroup) tensorGroup.items = [...(tensorGroup.items ?? []), [{"text": "Tensor.convert", "link": "/zh/api/data-structures/tensor/convert"}, {"text": "storage_bits", "link": "/zh/api/data-structures/tensor/storage-bits"}]].flat()
+    if (storageGroup) storageGroup.items = [...(storageGroup.items ?? []), [{"text": "FBUF_ACT.view", "link": "/zh/api/data-structures/storage/fbuf-act-view"}, {"text": "make_conv2d_fmap_l1", "link": "/zh/api/data-structures/storage/buffer/make-conv2d-fmap-l1"}]].flat()
+  }
+  if (compute) {
+    const tensorGroup = find(compute.items ?? [], '/compute/tensor')
+    if (tensorGroup) tensorGroup.items = [...(tensorGroup.items ?? []), { text: 'vnchwconv', link: '/zh/api/compute/tensor/vnchwconv' }]
+  }
+
+  if (compute) {
+    const matrixGroup = find(compute.items ?? [], '/compute/matrix')
+    if (matrixGroup) matrixGroup.items = [...(matrixGroup.items ?? []), { text: '使用矩阵乘实现卷积', link: '/zh/api/compute/matrix/convolution' }]
   }
 
   const ordered = [

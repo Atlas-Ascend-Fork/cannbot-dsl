@@ -612,3 +612,7 @@ API 页面按语言、数据结构、数据搬运、计算、设备执行、调�
     - [dcci_single](simt/memory/dcci-single.md)
     - [dcci_entire_out](simt/memory/dcci-entire-out.md)
     - [nop](simt/memory/nop.md)
+
+## 卷积接口
+
+- [使用矩阵乘实现卷积](compute/matrix/convolution.md)

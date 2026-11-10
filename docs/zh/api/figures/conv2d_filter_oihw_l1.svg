@@ -1,0 +1,127 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="650" viewBox="0 0 1280 650" role="img" aria-labelledby="title desc"><title id="title">卷积权重从 OIHW 到 L1 的三维排布变换</title><desc id="desc">左侧每个输出通道对应I乘Kh乘Kw的权重体。中间将I切为每组16通道。右侧每个I1组重排为以I0为宽、输出通道O为深、Kh乘Kw为高的权重体，依次存放。所有立方体是维度折叠示意，不表示真实大小比例。</desc><defs><marker id="a" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0L8 4L0 8Z" fill="#8c98a8"/></marker><marker id="dim" markerWidth="6" markerHeight="6" refX="3" refY="3" orient="auto-start-reverse"><path d="M6 3L0 0L0 6Z" fill="#677487"/></marker></defs><rect width="1280" height="650" fill="white"/><style>text{font-family:'Microsoft YaHei','Noto Sans CJK SC',sans-serif;fill:#26374b;font-size:18px}.head{font-size:22px;font-weight:600}.small{font-size:15px}.dim{font-size:19px}</style>
+<text x="45" y="43" class="head" text-anchor="start">GM：OIHW</text>
+<text x="450" y="43" class="head" text-anchor="start">I → I1 × I0</text>
+<text x="935" y="43" class="head" text-anchor="start">L1：I1·Kh·Kw·O·I0</text>
+<path d="M121 150l36 -30h100l-36 30Z" fill="#ade8dc" stroke="#738096"/>
+<path d="M221 150l36 -30v100l-36 30Z" fill="#ade8dc" stroke="#738096"/>
+<rect x="121" y="150" width="100" height="100" fill="#ade8dc" stroke="#738096"/>
+<path d="M121 150l36 -30h100l-36 30Z" fill="white" opacity=".20"/>
+<path d="M221 150l36 -30v100l-36 30Z" fill="#24425c" opacity=".07"/>
+<path d="M85 180l36 -30h100l-36 30Z" fill="#c7d6fa" stroke="#738096"/>
+<path d="M185 180l36 -30v100l-36 30Z" fill="#c7d6fa" stroke="#738096"/>
+<rect x="85" y="180" width="100" height="100" fill="#c7d6fa" stroke="#738096"/>
+<path d="M85 180l36 -30h100l-36 30Z" fill="white" opacity=".20"/>
+<path d="M185 180l36 -30v100l-36 30Z" fill="#24425c" opacity=".07"/>
+<path d="M118.33333333333334 180L118.33333333333334 280" fill="none" stroke="#677487" stroke-width="1.2"/>
+<path d="M85 213.33333333333334L185 213.33333333333334" fill="none" stroke="#677487" stroke-width="1.2"/>
+<path d="M151.66666666666669 180L151.66666666666669 280" fill="none" stroke="#677487" stroke-width="1.2"/>
+<path d="M85 246.66666666666669L185 246.66666666666669" fill="none" stroke="#677487" stroke-width="1.2"/>
+<path d="M68 180L68 280" fill="none" stroke="#677487" stroke-width="1.2" marker-start="url(#dim)" marker-end="url(#dim)"/>
+<text x="57" y="236" class="dim" text-anchor="end">Kh</text>
+<path d="M85 299L185 299" fill="none" stroke="#677487" stroke-width="1.2" marker-start="url(#dim)" marker-end="url(#dim)"/>
+<text x="135" y="324" class="dim" text-anchor="middle">Kw</text>
+<path d="M190 168L262 108" fill="none" stroke="#677487" stroke-width="1.2" marker-start="url(#dim)" marker-end="url(#dim)"/>
+<text x="241" y="117" class="dim" text-anchor="start">I</text>
+<text x="130" y="350" class="small" text-anchor="middle">o=0</text>
+<path d="M251 380l36 -30h100l-36 30Z" fill="#ade8dc" stroke="#738096"/>
+<path d="M351 380l36 -30v100l-36 30Z" fill="#ade8dc" stroke="#738096"/>
+<rect x="251" y="380" width="100" height="100" fill="#ade8dc" stroke="#738096"/>
+<path d="M251 380l36 -30h100l-36 30Z" fill="white" opacity=".20"/>
+<path d="M351 380l36 -30v100l-36 30Z" fill="#24425c" opacity=".07"/>
+<path d="M215 410l36 -30h100l-36 30Z" fill="#c7d6fa" stroke="#738096"/>
+<path d="M315 410l36 -30v100l-36 30Z" fill="#c7d6fa" stroke="#738096"/>
+<rect x="215" y="410" width="100" height="100" fill="#c7d6fa" stroke="#738096"/>
+<path d="M215 410l36 -30h100l-36 30Z" fill="white" opacity=".20"/>
+<path d="M315 410l36 -30v100l-36 30Z" fill="#24425c" opacity=".07"/>
+<path d="M248.33333333333334 410L248.33333333333334 510" fill="none" stroke="#677487" stroke-width="1.2"/>
+<path d="M215 443.3333333333333L315 443.3333333333333" fill="none" stroke="#677487" stroke-width="1.2"/>
+<path d="M281.6666666666667 410L281.6666666666667 510" fill="none" stroke="#677487" stroke-width="1.2"/>
+<path d="M215 476.6666666666667L315 476.6666666666667" fill="none" stroke="#677487" stroke-width="1.2"/>
+<text x="262" y="550" class="small" text-anchor="middle">o=15</text>
+<text x="190" y="374" class="head" text-anchor="start">…</text>
+<path d="M465 185l36 -30h100l-36 30Z" fill="#c7d6fa" stroke="#738096"/>
+<path d="M565 185l36 -30v100l-36 30Z" fill="#c7d6fa" stroke="#738096"/>
+<rect x="465" y="185" width="100" height="100" fill="#c7d6fa" stroke="#738096"/>
+<path d="M465 185l36 -30h100l-36 30Z" fill="white" opacity=".20"/>
+<path d="M565 185l36 -30v100l-36 30Z" fill="#24425c" opacity=".07"/>
+<path d="M635 185l36 -30h100l-36 30Z" fill="#ade8dc" stroke="#738096"/>
+<path d="M735 185l36 -30v100l-36 30Z" fill="#ade8dc" stroke="#738096"/>
+<rect x="635" y="185" width="100" height="100" fill="#ade8dc" stroke="#738096"/>
+<path d="M635 185l36 -30h100l-36 30Z" fill="white" opacity=".20"/>
+<path d="M735 185l36 -30v100l-36 30Z" fill="#24425c" opacity=".07"/>
+<path d="M498.3333333333333 185L498.3333333333333 285" fill="none" stroke="#677487" stroke-width="1.2"/>
+<path d="M465 218.33333333333334L565 218.33333333333334" fill="none" stroke="#677487" stroke-width="1.2"/>
+<path d="M531.6666666666666 185L531.6666666666666 285" fill="none" stroke="#677487" stroke-width="1.2"/>
+<path d="M465 251.66666666666669L565 251.66666666666669" fill="none" stroke="#677487" stroke-width="1.2"/>
+<path d="M572 175L608 145" fill="none" stroke="#677487" stroke-width="1.2" marker-start="url(#dim)" marker-end="url(#dim)"/>
+<text x="605" y="139" class="dim" text-anchor="middle">I0</text>
+<path d="M668.3333333333334 185L668.3333333333334 285" fill="none" stroke="#677487" stroke-width="1.2"/>
+<path d="M635 218.33333333333334L735 218.33333333333334" fill="none" stroke="#677487" stroke-width="1.2"/>
+<path d="M701.6666666666666 185L701.6666666666666 285" fill="none" stroke="#677487" stroke-width="1.2"/>
+<path d="M635 251.66666666666669L735 251.66666666666669" fill="none" stroke="#677487" stroke-width="1.2"/>
+<path d="M742 175L778 145" fill="none" stroke="#677487" stroke-width="1.2" marker-start="url(#dim)" marker-end="url(#dim)"/>
+<text x="775" y="139" class="dim" text-anchor="middle">I0</text>
+<text x="515" y="320" class="small" text-anchor="middle">I1=0</text>
+<text x="685" y="320" class="small" text-anchor="middle">I1=1</text>
+<text x="600" y="364" class="small" text-anchor="middle">每个 o 分别切分</text>
+<text x="600" y="400" class="dim" text-anchor="middle">I0=16</text>
+<path d="M325 235L415 235" fill="none" stroke="#c2c9d3" stroke-width="8" marker-end="url(#a)"/>
+<path d="M790 235L880 235" fill="none" stroke="#c2c9d3" stroke-width="8" marker-end="url(#a)"/>
+<path d="M985 170l77 -55h115l-77 55Z" fill="#c7d6fa" stroke="#738096"/>
+<path d="M1100 170l77 -55v135l-77 55Z" fill="#c7d6fa" stroke="#738096"/>
+<rect x="985" y="170" width="115" height="135" fill="#c7d6fa" stroke="#738096"/>
+<path d="M985 170l77 -55h115l-77 55Z" fill="white" opacity=".20"/>
+<path d="M1100 170l77 -55v135l-77 55Z" fill="#24425c" opacity=".07"/>
+<path d="M985 185.0L1100 185.0" fill="none" stroke="#677487" stroke-width="1.2"/>
+<path d="M1100 185.0L1177 130.0" fill="none" stroke="#677487" stroke-width="1.2"/>
+<path d="M985 200.0L1100 200.0" fill="none" stroke="#677487" stroke-width="1.2"/>
+<path d="M1100 200.0L1177 145.0" fill="none" stroke="#677487" stroke-width="1.2"/>
+<path d="M985 215.0L1100 215.0" fill="none" stroke="#677487" stroke-width="1.2"/>
+<path d="M1100 215.0L1177 160.0" fill="none" stroke="#677487" stroke-width="1.2"/>
+<path d="M985 230.0L1100 230.0" fill="none" stroke="#677487" stroke-width="1.2"/>
+<path d="M1100 230.0L1177 175.0" fill="none" stroke="#677487" stroke-width="1.2"/>
+<path d="M985 245.0L1100 245.0" fill="none" stroke="#677487" stroke-width="1.2"/>
+<path d="M1100 245.0L1177 190.0" fill="none" stroke="#677487" stroke-width="1.2"/>
+<path d="M985 260.0L1100 260.0" fill="none" stroke="#677487" stroke-width="1.2"/>
+<path d="M1100 260.0L1177 205.0" fill="none" stroke="#677487" stroke-width="1.2"/>
+<path d="M985 275.0L1100 275.0" fill="none" stroke="#677487" stroke-width="1.2"/>
+<path d="M1100 275.0L1177 220.0" fill="none" stroke="#677487" stroke-width="1.2"/>
+<path d="M985 290.0L1100 290.0" fill="none" stroke="#677487" stroke-width="1.2"/>
+<path d="M1100 290.0L1177 235.0" fill="none" stroke="#677487" stroke-width="1.2"/>
+<path d="M967 170L967 305" fill="none" stroke="#677487" stroke-width="1.2" marker-start="url(#dim)" marker-end="url(#dim)"/>
+<text x="957" y="245" class="dim" text-anchor="end">Kh·Kw</text>
+<path d="M985 321L1100 321" fill="none" stroke="#677487" stroke-width="1.2" marker-start="url(#dim)" marker-end="url(#dim)"/>
+<text x="1042.5" y="346" class="dim" text-anchor="middle">I0</text>
+<path d="M1110 158L1187 103" fill="none" stroke="#677487" stroke-width="1.2" marker-start="url(#dim)" marker-end="url(#dim)"/>
+<text x="1163.5" y="117.5" class="dim" text-anchor="middle">O</text>
+<text x="905" y="152" class="small" text-anchor="start">I1=0</text>
+<path d="M985 405l77 -55h115l-77 55Z" fill="#ade8dc" stroke="#738096"/>
+<path d="M1100 405l77 -55v135l-77 55Z" fill="#ade8dc" stroke="#738096"/>
+<rect x="985" y="405" width="115" height="135" fill="#ade8dc" stroke="#738096"/>
+<path d="M985 405l77 -55h115l-77 55Z" fill="white" opacity=".20"/>
+<path d="M1100 405l77 -55v135l-77 55Z" fill="#24425c" opacity=".07"/>
+<path d="M985 420.0L1100 420.0" fill="none" stroke="#677487" stroke-width="1.2"/>
+<path d="M1100 420.0L1177 365.0" fill="none" stroke="#677487" stroke-width="1.2"/>
+<path d="M985 435.0L1100 435.0" fill="none" stroke="#677487" stroke-width="1.2"/>
+<path d="M1100 435.0L1177 380.0" fill="none" stroke="#677487" stroke-width="1.2"/>
+<path d="M985 450.0L1100 450.0" fill="none" stroke="#677487" stroke-width="1.2"/>
+<path d="M1100 450.0L1177 395.0" fill="none" stroke="#677487" stroke-width="1.2"/>
+<path d="M985 465.0L1100 465.0" fill="none" stroke="#677487" stroke-width="1.2"/>
+<path d="M1100 465.0L1177 410.0" fill="none" stroke="#677487" stroke-width="1.2"/>
+<path d="M985 480.0L1100 480.0" fill="none" stroke="#677487" stroke-width="1.2"/>
+<path d="M1100 480.0L1177 425.0" fill="none" stroke="#677487" stroke-width="1.2"/>
+<path d="M985 495.0L1100 495.0" fill="none" stroke="#677487" stroke-width="1.2"/>
+<path d="M1100 495.0L1177 440.0" fill="none" stroke="#677487" stroke-width="1.2"/>
+<path d="M985 510.0L1100 510.0" fill="none" stroke="#677487" stroke-width="1.2"/>
+<path d="M1100 510.0L1177 455.0" fill="none" stroke="#677487" stroke-width="1.2"/>
+<path d="M985 525.0L1100 525.0" fill="none" stroke="#677487" stroke-width="1.2"/>
+<path d="M1100 525.0L1177 470.0" fill="none" stroke="#677487" stroke-width="1.2"/>
+<path d="M967 405L967 540" fill="none" stroke="#677487" stroke-width="1.2" marker-start="url(#dim)" marker-end="url(#dim)"/>
+<text x="957" y="480" class="dim" text-anchor="end">Kh·Kw</text>
+<path d="M985 556L1100 556" fill="none" stroke="#677487" stroke-width="1.2" marker-start="url(#dim)" marker-end="url(#dim)"/>
+<text x="1042.5" y="581" class="dim" text-anchor="middle">I0</text>
+<path d="M1110 393L1187 338" fill="none" stroke="#677487" stroke-width="1.2" marker-start="url(#dim)" marker-end="url(#dim)"/>
+<text x="1163.5" y="352.5" class="dim" text-anchor="middle">O</text>
+<text x="905" y="387" class="small" text-anchor="start">I1=1</text>
+<text x="40" y="620" class="small" text-anchor="start">O=16，I=32，Kh=Kw=3；I0 为连续的16个输入通道元素。</text>
+</svg>
