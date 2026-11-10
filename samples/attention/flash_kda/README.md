@@ -4,15 +4,14 @@
 
 基于 CANNBot-DSL 的 Kimi Delta Attention prefill 融合算子，训练和推理共用实现：
 
-- `flash_kda` 是统一入口，固定返回 `(out, final_state, chunk_states)`。
-- `flash_kda_fwd` 是兼容的完整前向入口，固定返回 16 项，供需要显式读取训练缓存的调用方使用。
-- 两个入口的入参、默认值、计算逻辑和模式判断一致。运行模式由 `torch.is_inference_mode_enabled()` 决定，`torch.no_grad()` 不会切换到推理分支。
-- `flash_kda_metadata` 与 `flash_kda_fwd_metadata` 是同一调度接口的两个名称。调用方应令 `enable_grad` 与主算子的运行模式一致：推理为 False，训练为 True。
+- `flash_kda` 是算子公开入口，固定返回 `(out, final_state, chunk_states)`。
+- `flash_kda_metadata` 是公开的调度元数据生成接口。调用方应令 `enable_grad` 与主算子的运行模式一致：推理为 False，训练为 True。
+- 运行模式由 `torch.is_inference_mode_enabled()` 决定，`torch.no_grad()` 不会切换到推理分支。当前支持训练前向，尚未实现自动反向。
 
 实现文件均位于本目录：
 
-- [`flash_kda.py`](flash_kda.py)：统一入口和兼容的 fwd 入口。
-- [`flash_kda_metadata.py`](flash_kda_metadata.py)：AICPU metadata 生成与解码。
+- [`flash_kda.py`](flash_kda.py)：公开算子入口及内部前向实现。
+- [`flash_kda_metadata.py`](flash_kda_metadata.py)：Host 模板选择、AICPU metadata 生成与解码。
 - [`flash_kda_staged.py`](flash_kda_staged.py)：按 chunk group 分阶段调度，通过 workspace 交换阶段结果。
 - [`flash_kda_persistent.py`](flash_kda_persistent.py)：一个核连续处理序列头的 chunk，使递推状态驻留。
 - [`flash_kda_validation.py`](flash_kda_validation.py)：主入口、metadata 与 Meta/FakeTensor 共用的参数和调度校验。
@@ -55,9 +54,9 @@ H_{c+1}=H_c\operatorname{diag}(\gamma_{\mathrm{last}})
        +V_{\mathrm{new}}^\top K_{\mathrm{restored}}.
 $$
 
-训练缓存 `Aqk`、`Akk`、`w`、`u`、`v_new` 分别对应 $M_{qk}$、$A_c$、$W$、$U$、$V_{\mathrm{new}}$；`qg` 对应未乘 scale 的 $\gamma\odot Q$，`kg` 对应 $K_{\mathrm{restored}}$，`g_cumsum` 对应 $G$，`chunk_states` 保存各 chunk 的入口状态 $H_c$。缓存是否返回由接口开关决定，存储类型见返回值说明；状态使用 FP32 递推。
+内部训练缓存 `Aqk`、`Akk`、`w`、`u`、`v_new` 分别对应 $M_{qk}$、$A_c$、$W$、$U$、$V_{\mathrm{new}}$；`qg` 对应未乘 scale 的 $\gamma\odot Q$，`kg` 对应 $K_{\mathrm{restored}}$，`g_cumsum` 对应 $G$。公开的 `chunk_states` 保存各 chunk 的入口状态 $H_c$，仅在推理模式按开关返回。训练缓存由实现内部管理，不通过公开接口返回；公开返回项见返回值说明。状态使用 FP32 递推。
 
-metadata 根据布局、有效长度、`enable_grad` 和调度配置自动选择 staged/persistent 模板，两个模板共用公开接口和缓存布局。公开 metadata 接口不接受 `template`；定向模板测试使用内部构建函数，见同仓库测试用例。
+metadata 的 Host 入口根据布局、有效长度、`enable_grad` 和调度配置，沿用原成本模型自动选择 staged/persistent 模板及分组上限；AICPU 根据选择结果生成调度表。两个模板共用公开接口和缓存布局。公开 metadata 接口不接受 `template`；定向模板测试使用内部构建函数，见同仓库测试用例。
 
 ## 快速开始
 
@@ -67,7 +66,7 @@ metadata 根据布局、有效长度、`enable_grad` 和调度配置自动选择
 import torch
 import torch_npu
 
-from flash_kda.flash_kda import flash_kda, flash_kda_fwd
+from flash_kda.flash_kda import flash_kda
 from flash_kda.flash_kda_metadata import flash_kda_metadata
 
 B, Nqk, Nv, S, D = 1, 1, 2, 65, 128
@@ -102,21 +101,11 @@ out, final_state, chunk_states = flash_kda(
     layout="BNSD", output_final_state=True,
 )
 assert chunk_states is None
-
-# Use the compatible fwd entry when explicit training caches are required.
-results = flash_kda_fwd(
-    q, k, v, g, beta, metadata, initial_state, A_log, dt_bias,
-    layout="BNSD", output_final_state=True,
-)
-(out, final_state, chunk_states, Aqk, Akk, w, u, qg, kg, v_new,
- g_cumsum, q_norm, q_rstd, k_norm, k_rstd, beta_sigmoid) = results
 ```
-
-`flash_kda_fwd_metadata` 也从 `flash_kda.flash_kda_metadata` 导入，参数和行为与 `flash_kda_metadata` 完全相同。这里的训练模式表示训练前向分支；当前统一入口尚未实现自动反向。
 
 ## 参数说明
 
-两个前向入口使用相同签名：
+`flash_kda` 的公开签名：
 
 ```python
 def flash_kda(
@@ -138,32 +127,32 @@ def flash_kda(
 
 `B` 为逻辑序列数，`Nqk`、`Nv` 为 Q/K、Value 头数，`S` 为存储序列长度，`T` 为 packed token 总数，`Dk=Dv=D=128`。
 
-| 参数 | BNSD shape / 取值 | 类型 | 说明 |
-|:---|:---|:---|:---|
-| `q`, `k` | `[B,Nqk,S,D]` | BF16 | Query/Key；可在内核归一化，也可由调用方预处理。 |
-| `v` | `[B,Nv,S,D]` | BF16 | Value。 |
-| `g` | 与 `v` 相同 | BF16 / FP32 | 原始 gate 或预处理的对数衰减；FP32 输入会转换为 BF16。 |
-| `beta` | `[B,Nv,S]` | BF16 / FP32 | 原始 logits 或预处理 beta；核内激活使用 FP32 操作数。 |
-| `metadata` | `[M]` | int32 | 必传；由配套 metadata 接口生成。 |
-| `initial_state` | `[B,Nv,Dv,Dk]` | FP32 | 可为 None，此时使用全零状态；已传入的状态必须符合规格。 |
-| `A_log` | `[Nv]` | FP32 / None | 内核激活 gate 时必传；外部激活时可为 None。 |
-| `dt_bias` | `[Nv,Dk]` | FP32 / None | gate 偏置；None 按零处理。 |
-| `cu_seqlens` | `[B+1]` | int32 / None | 有效长度前缀和；TND 必传，首项为 0、末项为 T。 |
-| `seqused` | `[B]` | int32 / None | 每条序列的有效长度；同时提供 cu 时必须与相邻差值一致。 |
-| `scale` | 默认 `D ** -0.5` | float / None | 传 None 时按头维度计算缩放。 |
-| `output_final_state` | 默认 False | bool | 控制是否返回最终状态。 |
-| `return_intermediate_states` | 默认 False | bool | 仅推理且 True 时返回各 chunk 入口状态。 |
-| `use_qk_l2norm_in_kernel` | 默认 True | bool | True 执行 L2Norm；训练时返回 norm/rstd，与 disable_recompute 无关。 |
-| `use_gate_in_kernel` | 默认 True | bool | False 时 g 已激活，忽略 `A_log`、`dt_bias`、`lower_bound`。 |
-| `use_beta_sigmoid_in_kernel` | 默认 True | bool | True 执行 sigmoid；训练时返回 beta_sigmoid，与 disable_recompute 无关。 |
-| `allow_neg_eigval` | 默认 False | bool | True 时 sigmoid beta 乘 2；要求开启 beta sigmoid。 |
-| `disable_recompute` | 默认 True | bool | 仅训练且 True 时返回 w/u/qg/kg/v_new/g_cumsum。 |
-| `lower_bound` | 默认 None，数值范围 `[-5,0)` | int / float / None | gate 开启时 None 使用 -exp(A_log) × softplus(g + dt_bias)，有限数值使用有界 sigmoid；关闭时忽略。 |
-| `layout` | `"BNSD"` / `"BSND"` / `"TND"` | str | 默认 `TND`。 |
+| 参数 | BNSD shape / 取值 | 类型 | 必选/可选 | 说明 |
+|:---|:---|:---|:---|:---|
+| `q`, `k` | `[B,Nqk,S,D]` | BF16 | 必选 | Query/Key；可在内核归一化，也可由调用方预处理。 |
+| `v` | `[B,Nv,S,D]` | BF16 | 必选 | Value。 |
+| `g` | 与 `v` 相同 | BF16 / FP32 | 必选 | 原始 gate 或预处理的对数衰减；FP32 输入会转换为 BF16。 |
+| `beta` | `[B,Nv,S]` | BF16 / FP32 | 必选 | 原始 logits 或预处理 beta；核内激活使用 FP32 操作数。 |
+| `metadata` | `[M]` | int32 | 必选 | 由 `flash_kda_metadata` 生成的调度元数据。 |
+| `initial_state` | `[B,Nv,Dv,Dk]` | FP32 | 可选 | 可为 None，此时使用全零状态；已传入的状态必须符合规格。 |
+| `A_log` | `[Nv]` | FP32 / None | 条件必选 | 内核激活 gate 时必传；外部激活时可为 None。 |
+| `dt_bias` | `[Nv,Dk]` | FP32 / None | 可选 | gate 偏置；None 按零处理。 |
+| `cu_seqlens` | `[B+1]` | int32 / None | 条件必选 | 有效长度前缀和；TND 必传，首项为 0、末项为 T。 |
+| `seqused` | `[B]` | int32 / None | 可选 | 每条序列的有效长度；同时提供 cu 时必须与相邻差值一致。 |
+| `scale` | 默认 `D ** -0.5` | float / None | 可选 | 传 None 时按头维度计算缩放。 |
+| `output_final_state` | 默认 False | bool | 可选 | 控制是否返回最终状态。 |
+| `return_intermediate_states` | 默认 False | bool | 可选 | 仅推理且 True 时返回各 chunk 入口状态。 |
+| `use_qk_l2norm_in_kernel` | 默认 True | bool | 可选 | True 执行 L2Norm；训练时由内部实现保存 norm/rstd。 |
+| `use_gate_in_kernel` | 默认 True | bool | 可选 | False 时 g 已激活，忽略 `A_log`、`dt_bias`、`lower_bound`。 |
+| `use_beta_sigmoid_in_kernel` | 默认 True | bool | 可选 | True 执行 sigmoid；训练时由内部实现保存激活结果。 |
+| `allow_neg_eigval` | 默认 False | bool | 可选 | True 时 sigmoid beta 乘 2；要求开启 beta sigmoid。 |
+| `disable_recompute` | 默认 True | bool | 可选 | 控制训练前向的中间缓存保存；True 时保留用于避免重计算的内部缓存，不改变公开返回项。 |
+| `lower_bound` | 默认 None，数值范围 `[-5,0)` | int / float / None | 可选 | gate 开启时 None 使用 -exp(A_log) × softplus(g + dt_bias)，有限数值使用有界 sigmoid；关闭时忽略。 |
+| `layout` | `"BNSD"` / `"BSND"` / `"TND"` | str | 可选 | 默认 `TND`。 |
 
 BSND 的 `q/k` 为 `[B,S,Nqk,D]`，`v/g` 为 `[B,S,Nv,D]`，`beta` 为 `[B,S,Nv]`。TND 分别为 `[T,Nqk,D]`、`[T,Nv,D]`、`[T,Nv]`。
 
-metadata 接口接收尺寸属性，不接收 q/v/initial_state；两个公开名称使用相同签名：
+`flash_kda_metadata` 接收尺寸属性及可选的长度张量，用于生成传给 `flash_kda` 的调度元数据。公开签名：
 
 ```python
 def flash_kda_metadata(
@@ -173,53 +162,48 @@ def flash_kda_metadata(
 ): ...
 ```
 
+| 参数 | shape / 取值 | 类型 | 必选/可选 | 说明 |
+|:---|:---|:---|:---|:---|
+| `cu_seqlens` | `[B+1]` / None | int32 Tensor / None | 条件必选 | TND 布局必传；有效长度前缀和，首项为 0、末项为 T。BNSD/BSND 可省略。张量须连续且位于当前 NPU。 |
+| `seqused` | `[B]` / None | int32 Tensor / None | 可选 | 每条序列的有效长度；同时提供 `cu_seqlens` 时必须与相邻差值一致。张量须连续且位于当前 NPU。 |
+| `batch_size` | `B >= 1` | int | 必选（关键字） | 逻辑序列数。 |
+| `nheads_qk` | `1 <= Nqk <= Nv` | int | 必选（关键字） | Query/Key 头数。 |
+| `nheads_v` | `Nv <= 96`，`Nv % Nqk == 0` | int | 必选（关键字） | Value 头数。 |
+| `seqlens` | 正整数 | int | 必选（关键字） | BNSD/BSND 的存储长度 S，或 TND 的总 token 数 T。 |
+| `headdim_qk` | 默认 128，当前仅支持 128 | int | 可选 | Query/Key 头维度。 |
+| `headdim_v` | 默认 128，当前仅支持 128 | int | 可选 | Value 头维度。 |
+| `enable_grad` | 默认 False | bool | 可选 | 推理使用 False，训练前向使用 True；与主算子运行模式保持一致。 |
+| `layout` | `"BNSD"` / `"BSND"` / `"TND"` | str | 可选 | 默认 `"TND"`，与主算子的布局保持一致。 |
+
 调用时必须显式提供 `seqlens`：BNSD/BSND 为存储长度 S，TND 为总长度 T。TND 必须传连续 INT32 `[B+1]` 的 `cu_seqlens`；padded 布局可用 cu 或 `seqused` 指定有效长度，不传时均为 S。
 
 给定的长度张量必须位于当前 NPU，生成的 metadata 也位于当前 NPU。metadata 和主算子必须使用一致的长度参数；主算子不会只凭 metadata 替代 `cu_seqlens` / `seqused` 入参。
 
-`enable_grad=False` 用于推理，训练使用 True。主算子不会从 `enable_grad` 切换运行模式；切换模式、设备、设备有效核数、形状、布局或有效长度后重新生成 metadata。在相同配置下，两个前向入口可以共用 metadata。真实前向会阻塞回读 metadata 和给定的长度张量，校验本次调用的序列边界与调度；Meta/FakeTensor 只执行静态检查。尺寸、长度、连续性和 GQA 等非法参数抛出 `ValueError`。
+`enable_grad=False` 用于推理，训练使用 True。主算子不会从 `enable_grad` 切换运行模式；切换模式、设备、设备有效核数、形状、布局或有效长度后重新生成 metadata。相同调度配置下可以复用 metadata。真实前向会阻塞回读 metadata 和给定的长度张量，校验本次调用的序列边界与调度；Meta/FakeTensor 只执行静态检查。尺寸、长度、连续性和 GQA 等非法参数抛出 `ValueError`。
 
 主算子的第六个必填输入为 `metadata`，可按位置或关键字传入；从 `scale` 开始的属性按关键字传入；`scale` 的签名默认值为 `128 ** -0.5`，显式传 None 时仍使用该缩放值。
 
 ## 返回值说明
 
-`flash_kda` 固定返回前三项，未启用的可选输出为 None：
+`flash_kda` 固定返回以下三项，未启用的可选输出为 None：
 
 ```python
 (out, final_state, chunk_states)
 ```
 
-`flash_kda_fwd` 固定返回下列 16 项，未生效的位置为 None：
+令 BNSD/BSND 的 `J=ceil(S/64)`，TND 的容量 `J=ceil(T/64)+B`：
 
-```python
-(out, final_state, chunk_states, Aqk, Akk, w, u, qg, kg, v_new,
- g_cumsum, q_norm, q_rstd, k_norm, k_rstd, beta_sigmoid)
-```
-
-`flash_kda` 不向调用方返回第 4 至 16 项；需要显式读取这些训练缓存时，使用 `flash_kda_fwd`。下表的训练缓存行均描述 fwd 入口。`q_rstd` 表示 Q 的逆范数。
-
-两个入口的阶段判断和前三项输出条件一致。推理时融合计算仍按开关执行，fwd 的 Aqk/Akk 和所有训练缓存为 None。内部计算仍需的状态及 scratch 不随公开返回关闭而删除。
-
-令 padded 的 `J=ceil(S/64)`，TND 的容量 `J=ceil(T/64)+B`：
-
-| 参数名 | 参数类型 | 可选/必选 | 描述 | 数据类型 | 维度(shape) |
+| 参数名 | 参数类型 | 必选/可选 | 描述 | 数据类型 | 维度(shape) |
 |:---|:---|:---|:---|:---|:---|
 | `out` | Tensor | 必选 | 序列输出，布局与 `v` 相同；metadata 标记的有效序列范围之外，输出值未定义。 | bfloat16 | 与 `v` 相同 |
 | `final_state` | Tensor 或 None | 可选 | `output_final_state=True` 时返回每条序列的最终递归状态，训练和推理均生效；不原地修改 `initial_state`。 | float32 | `[B,Nv,Dv,Dk]` |
 | `chunk_states` | Tensor 或 None | 可选 | 各 chunk 入口状态；仅推理且 `return_intermediate_states=True` 时返回，训练时为 None。 | float32 | BNSD/BSND：`[B,J,Nv,Dv,Dk]`；TND：`[J,Nv,Dv,Dk]` |
-| `Aqk` | Tensor 或 None | 可选 | 带 decay 和 scale 的 chunk-major 因果 QK 矩阵；训练时返回，不受 `disable_recompute` 控制，推理时为 None。 | bfloat16 | BNSD/BSND：`[B,J,Nv,64,64]`；TND：`[J,Nv,64,64]` |
-| `Akk` | Tensor 或 None | 可选 | chunk-major 的 $(I+T)^{-1}$；训练时返回，不受 `disable_recompute` 控制，推理时为 None。 | bfloat16 | 同 `Aqk` |
-| `w`、`u` | Tensor 或 None | 可选 | 状态修正权重和修正前 value；仅训练且 `disable_recompute=True` 时返回。 | bfloat16 | BSND：`[B,S,Nv,D]`；BNSD：`[B,Nv,S,D]`；TND：`[T,Nv,D]` |
-| `qg`、`kg` | Tensor 或 None | 可选 | 带累计衰减的 Q 和从 chunk 末端恢复的 K；仅训练且 `disable_recompute=True` 时返回。 | bfloat16 | 同 `w`、`u` |
-| `v_new` | Tensor 或 None | 可选 | 扣除入口状态预测后的 value；仅训练且 `disable_recompute=True` 时返回。 | bfloat16 | 同 `w`、`u` |
-| `g_cumsum` | Tensor 或 None | 可选 | 按有效序列分 chunk 保存累计对数衰减；仅训练且 `disable_recompute=True` 时返回。内部累计和公开缓存均使用 FP32。 | float32 | BNSD/BSND：`[B,J,Nv,64,Dk]`；TND：`[J,Nv,64,Dk]` |
-| `q_norm`、`k_norm` | Tensor 或 None | 可选 | 归一化后的 Query/Key；仅训练且 `use_qk_l2norm_in_kernel=True` 时返回，不受 `disable_recompute` 控制。BSND 输入也按 BNSD 返回，TND 保持 TND。 | bfloat16 | BNSD/BSND：`[B,Nqk,S,D]`；TND：`[T,Nqk,D]` |
-| `q_rstd`、`k_rstd` | Tensor 或 None | 可选 | Query/Key 的逆范数；与对应 norm 缓存使用相同返回条件。 | float32 | 对应 norm 去掉最后一维 |
-| `beta_sigmoid` | Tensor 或 None | 可选 | 核内 sigmoid 后的 beta；仅训练且 `use_beta_sigmoid_in_kernel=True` 时返回，不受 `disable_recompute` 控制。`allow_neg_eigval=True` 时包含乘 2 后的实际计算值。 | float32 | BNSD/BSND：`[B,S,Nv]`；TND：`[T,Nv]` |
 
-非 None 的张量均位于输入所在设备。状态递推、`initial_state`、`final_state` 和保存的 `chunk_states` 均使用 FP32。
+非 None 的张量均位于输入所在设备。状态递推、`initial_state`、`final_state` 和保存的 `chunk_states` 均使用 FP32。训练中间缓存由内部实现管理，不属于公开返回项。
 
-TND 的 chunk 缓存按 `token_start//64 + logical_batch` 定位各序列首槽，容量中可能有未使用槽。只消费有效序列和有效 chunk 范围；out 的无效尾区未定义。内部 out 按 64 对齐，公开 out 在非对齐场景可能为不连续视图。
+TND 的 chunk 状态按 `token_start//64 + logical_batch` 定位各序列首槽，容量中可能有未使用槽。只消费有效序列和有效 chunk 范围；out 的无效尾区未定义。内部 out 按 64 对齐，公开 out 在非对齐场景可能为不连续视图。
+
+`flash_kda_metadata` 返回当前 NPU 上的一维 int32 Tensor `metadata`，形状为 `[M]`，其中 M 由调度容量决定。将其作为 `flash_kda` 的第六个输入传入。
 
 ## 约束说明
 
@@ -227,7 +211,7 @@ TND 的 chunk 缓存按 `token_start//64 + logical_batch` 定位各序列首槽�
 - 当前实现支持 GQA，要求 `1 <= Nqk <= Nv <= 96` 且 `Nv % Nqk == 0`。
 - 参与计算和校验的公开输入必须连续；不校验输入之间的设备一致性。状态、`A_log`、`dt_bias` 使用 FP32，Q/K/V 使用 BF16。
 - TND 前缀和首项为 0、末项为 T，严格递增；BNSD/BSND 的有效长度必须在 `[1,S]` 内。
-- metadata 必须由本目录的配套模块生成，并与当前布局、形状、长度、运行模式和设备有效核数匹配。两个 metadata 公开名称可以互换；合并前的旧推理 metadata 或其他 ABI 版本的 metadata 不可混用。
+- metadata 必须由本目录的配套模块生成，并与当前布局、形状、长度、运行模式和设备有效核数匹配。应使用 `flash_kda_metadata` 生成；合并前的旧推理 metadata 或其他 ABI 版本的 metadata 不可混用。
 - TND 的 chunk 缓存按容量 `ceil(T/64)+B` 分配，仅每条序列实际使用的 chunk 有效。
 
 自定义参数拦截统一抛出 `ValueError`。检查参与计算的输入类型、shape、dtype、设备和连续性；七个开关严格为 bool，`allow_neg_eigval=True` 要求开启 beta sigmoid。`scale` 可为 None 或有限数值，不接受 bool。关闭输出不免除计算输入检查。
@@ -236,11 +220,11 @@ Host 检查长度张量的规格和内容，metadata 设备内核也会报告非
 
 ## 验证与测试
 
-在仓库根目录运行统一入口、完整 fwd 前向及 metadata 测试：
+在仓库根目录运行 `flash_kda` 和 `flash_kda_metadata` 的测试：
 
 ```bash
 OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 python -m pytest -q \
-    test/attention/flash_kda/ test/attention/flash_kda_fwd/
+    test/attention/flash_kda/
 ```
 
 默认精度容差为 `atol=rtol=5e-3`。`test/attention/flash_kda/test_flash_kda.py` 直接调用 Python 入口，检查返回契约、Meta 输出和 NPU 前向精度。

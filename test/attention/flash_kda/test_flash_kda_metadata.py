@@ -307,9 +307,6 @@ def test_forward_metadata_reports_invalid_lengths_without_faulting_stream(
     # Exercise the device ABI directly as well as the public asynchronous entry.
     metadata_module._get_aicpu_kernel().launch(
         metadata_module.current_raw_stream(prefix.get_device()),
-        route_coefficients=0,
-        calibration_enabled=0,
-        layout_kind=0 if layout == "BNSD" else 1,
         cu_seqlens=prefix.data_ptr(),
         metadata=metadata.data_ptr(),
         metadata_word_capacity=capacity,
@@ -317,7 +314,6 @@ def test_forward_metadata_reports_invalid_lengths_without_faulting_stream(
         physical_batches=1,
         storage_length=2,
         value_heads=1,
-        query_heads=1,
         has_cu=1,
         is_packed=int(layout == "TND"),
         core_num=metadata_module._device_block_num(prefix),

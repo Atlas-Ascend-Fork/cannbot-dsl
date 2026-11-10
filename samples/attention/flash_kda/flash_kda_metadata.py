@@ -9,12 +9,13 @@
 # fmt: off
 # 保持参数分组紧凑，与原有 FlashKDA 样例风格一致。
 
-"""根据成本模型生成 FlashKDA 训练前向的 AICPU 调度元数据。"""
+"""Host 选择计算模板，AICPU 生成 FlashKDA 前向调度元数据。"""
 
 import os
 import tempfile
 import threading
 from collections.abc import Sequence
+from types import SimpleNamespace
 from typing import Optional
 
 from cannbotdsl import get_platform_info
@@ -240,16 +241,12 @@ def metadata_capacity_upper_bound(
 
 class FlashKDAFwdMetadataArgs:
     cu_seqlens: gm_in(I32)
-    route_coefficients: gm_in(I64)
-    calibration_enabled: U32
-    layout_kind: U32
     metadata: gm_out(U32)
     metadata_word_capacity: U32
     batch: U32
     physical_batches: U32
     storage_length: U32
     value_heads: U32
-    query_heads: U32
     has_cu: U32
     is_packed: U32
     core_num: U32
@@ -561,8 +558,97 @@ def _select_route_from_model(
 
 
 
+def _select_template_on_host(schedule_args: SimpleNamespace) -> tuple[int, int]:
+    """在 Host 执行原 AICPU 模板选择逻辑。
+
+    schedule_args 包含序列长度前缀和、Q/K 与 V 头数、布局和核数、
+    模板请求、成本模型系数、分组与工作区约束，以及 Host 临时存储。
+
+    成本公式、定点保护、负载分配顺序和自动/强制模板语义保持不变。
+    返回明确的模板编号和交给设备调度器的最终分组上限。
+    """
+    status = STATUS_OK
+    route_core_costs = [0] * MAX_AIC_CORES
+    route_lpt_costs = [0] * MAX_AIC_CORES
+    route_valid_rows = [0] * MAX_AIC_CORES
+    remaining_chunk_num = [0] * MAX_ACTIVE_BATCHES
+    # 发布选路结果或任务前，检查所有实际序列长度。
+    uniform_chunk_num = 1
+    first_chunk_num = 0
+    route_max_chunk_num = 0
+    route_total_chunk_num = 0
+    route_peak_chunk_num = 0
+    route_total_rows = 0
+    route_query_rows = 0
+    evaluate_route = 0
+    if schedule_args.template_kind == TEMPLATE_AUTO and schedule_args.calibration_enabled == 1:
+        evaluate_route = 1
+    for batch_idx in range(0, schedule_args.batch):
+        valid_seq_len = schedule_args.storage_length
+        if schedule_args.has_cu == 1:
+            valid_seq_len = schedule_args.cu_seqlens[batch_idx + 1] - schedule_args.cu_seqlens[batch_idx]
+        if valid_seq_len <= 0:
+            status = STATUS_BAD_LENGTH
+        elif schedule_args.is_packed == 0 and valid_seq_len > schedule_args.storage_length:
+            status = STATUS_BAD_PADDED_LENGTH
+        else:
+            current_chunk_num = (valid_seq_len + CHUNK_SIZE - 1) // CHUNK_SIZE
+            if batch_idx == 0:
+                first_chunk_num = current_chunk_num
+            elif current_chunk_num != first_chunk_num:
+                uniform_chunk_num = 0
+            if current_chunk_num > route_max_chunk_num:
+                route_max_chunk_num = current_chunk_num
+            if evaluate_route == 1:
+                if current_chunk_num > INT64_MAX // schedule_args.value_heads:
+                    evaluate_route = 0
+                else:
+                    batch_chunk_num = schedule_args.value_heads * current_chunk_num
+                    if route_total_chunk_num > INT64_MAX - batch_chunk_num:
+                        evaluate_route = 0
+                    else:
+                        route_total_chunk_num += batch_chunk_num
+                        route_total_rows = _route_add_cost(route_total_rows, schedule_args.value_heads, valid_seq_len)
+                        route_query_rows = _route_add_cost(route_query_rows, schedule_args.query_heads, valid_seq_len)
+                        if route_total_rows < 0 or route_query_rows < 0:
+                            evaluate_route = 0
+                        # 每个核的成本不超过已检查的总成本。
+                        for value_head_idx in range(0, schedule_args.value_heads):
+                            cyclic_core = (
+                                batch_idx * schedule_args.value_heads + value_head_idx
+                            ) % schedule_args.core_num
+                            route_core_costs[cyclic_core] += current_chunk_num
+    if status == STATUS_OK and schedule_args.is_packed == 1:
+        if schedule_args.cu_seqlens[schedule_args.batch] != schedule_args.storage_length:
+            status = STATUS_BAD_PACKED_END
+    if status != STATUS_OK:
+        raise ValueError(f"flash_kda_fwd_metadata produced status {status}")
+    selected_template = schedule_args.template_kind
+    if selected_template == TEMPLATE_AUTO:
+        selected_template = TEMPLATE_STAGED
+        if evaluate_route == 1:
+            for core_idx in range(0, schedule_args.core_num):
+                if route_core_costs[core_idx] > route_peak_chunk_num:
+                    route_peak_chunk_num = route_core_costs[core_idx]
+            persistent_peak = _route_persistent_loads(
+                schedule_args, uniform_chunk_num, route_lpt_costs, route_valid_rows
+            )
+            selected_template = _select_route_from_model(
+                schedule_args, route_peak_chunk_num, route_total_chunk_num, route_total_rows,
+                route_query_rows, persistent_peak, route_valid_rows,
+                _training_group_limit(schedule_args, route_max_chunk_num), remaining_chunk_num,
+            )
+            # 短多序列训练保留直接 U 路径的缓存。
+            if schedule_args.has_cu == 1 and schedule_args.batch > 1 and route_max_chunk_num <= 2:
+                selected_template = TEMPLATE_PERSISTENT
+    max_chunk_group = schedule_args.max_chunk_group
+    if schedule_args.template_kind == TEMPLATE_AUTO:
+        max_chunk_group = _training_group_limit(schedule_args, route_max_chunk_num)
+    return selected_template, max_chunk_group
+
+
 @aicpu_kernel
-def flash_kda_fwd_metadata_kernel(a: FlashKDAFwdMetadataArgs):
+def flash_kda_fwd_metadata_kernel(metadata_args: FlashKDAFwdMetadataArgs):
     valid_seq_len_by_batch = zeros(I64, MAX_ACTIVE_BATCHES)  # noqa: F821 - AICPU 编译器内建函数。
     token_start_by_batch = zeros(I64, MAX_ACTIVE_BATCHES)  # noqa: F821 - AICPU 编译器内建函数。
     chunk_num_by_batch = zeros(I64, MAX_ACTIVE_BATCHES)  # noqa: F821 - AICPU 编译器内建函数。
@@ -577,89 +663,73 @@ def flash_kda_fwd_metadata_kernel(a: FlashKDAFwdMetadataArgs):
     candidate_stage2_core_ranges = zeros(I64, MAX_AIC_CORES * 2)  # noqa: F821 - AICPU 编译器内建函数。
     candidate_stage2_core_costs = zeros(I64, MAX_AIC_CORES)  # noqa: F821 - AICPU 编译器内建函数。
     selected_stage2_core_ranges = zeros(I64, MAX_AIC_CORES * 2)  # noqa: F821 - AICPU 编译器内建函数。
-    route_core_costs = zeros(I64, MAX_AIC_CORES)  # noqa: F821 - AICPU 编译器内建函数。
-    route_lpt_costs = zeros(I64, MAX_AIC_CORES)  # noqa: F821 - AICPU 编译器内建函数。
-    route_valid_rows = zeros(I64, MAX_AIC_CORES)  # noqa: F821 - AICPU 编译器内建函数。
     chunk_core_costs = zeros(I64, MAX_AIC_CORES)  # noqa: F821 - AICPU 编译器内建函数。
     chunk_core_tails = zeros(I64, MAX_AIC_CORES)  # noqa: F821 - AICPU 编译器内建函数。
 
-    if a.metadata_word_capacity < HEADER_WORDS:
+    if metadata_args.metadata_word_capacity < HEADER_WORDS:
         # AICPU 将非零内核返回值视为任务异常（ACL 507005）。
         # 诊断码写入 metadata 头部，不作为内核返回值。
         return STATUS_OK
 
-    a.metadata[HEADER_MAGIC] = MAGIC
-    a.metadata[HEADER_ABI_VERSION] = ABI_VERSION
-    a.metadata[HEADER_STATUS] = STATUS_OK
-    a.metadata[HEADER_CORE_NUM] = a.core_num
-    a.metadata[HEADER_STAGE12_ROUND_NUM] = 0
-    a.metadata[HEADER_BATCH] = a.batch
-    a.metadata[HEADER_VALUE_HEADS] = a.value_heads
-    a.metadata[HEADER_HAS_CU] = a.has_cu
-    a.metadata[HEADER_WORKSPACE_SLOTS] = a.workspace_slots
-    a.metadata[HEADER_TEMPLATE] = TEMPLATE_AUTO
-    a.metadata[HEADER_CHUNK_TASK_NUM] = 0
-    if a.metadata_word_capacity > HEADER_WORDS:
-        a.metadata[HEADER_WORDS] = HEADER_WORDS + 1
+    metadata_args.metadata[HEADER_MAGIC] = MAGIC
+    metadata_args.metadata[HEADER_ABI_VERSION] = ABI_VERSION
+    metadata_args.metadata[HEADER_STATUS] = STATUS_OK
+    metadata_args.metadata[HEADER_CORE_NUM] = metadata_args.core_num
+    metadata_args.metadata[HEADER_STAGE12_ROUND_NUM] = 0
+    metadata_args.metadata[HEADER_BATCH] = metadata_args.batch
+    metadata_args.metadata[HEADER_VALUE_HEADS] = metadata_args.value_heads
+    metadata_args.metadata[HEADER_HAS_CU] = metadata_args.has_cu
+    metadata_args.metadata[HEADER_WORKSPACE_SLOTS] = metadata_args.workspace_slots
+    metadata_args.metadata[HEADER_TEMPLATE] = TEMPLATE_AUTO
+    metadata_args.metadata[HEADER_CHUNK_TASK_NUM] = 0
+    if metadata_args.metadata_word_capacity > HEADER_WORDS:
+        metadata_args.metadata[HEADER_WORDS] = HEADER_WORDS + 1
 
     status = STATUS_OK
-    if a.core_num < 1 or a.core_num > MAX_AIC_CORES:
+    if metadata_args.core_num < 1 or metadata_args.core_num > MAX_AIC_CORES:
         status = STATUS_BAD_CORE_NUM
     elif (
-        a.template_kind != TEMPLATE_AUTO
-        and a.template_kind != TEMPLATE_STAGED
-        and a.template_kind != TEMPLATE_PERSISTENT
+        metadata_args.template_kind != TEMPLATE_STAGED
+        and metadata_args.template_kind != TEMPLATE_PERSISTENT
     ):
         status = STATUS_BAD_FLAGS
-    elif a.calibration_enabled != 0 and a.calibration_enabled != 1:
-        status = STATUS_BAD_FLAGS
-    elif a.layout_kind != 0 and a.layout_kind != 1:
-        status = STATUS_BAD_FLAGS
-    elif a.workspace_slots != WORKSPACE_SLOTS:
+    elif metadata_args.workspace_slots != WORKSPACE_SLOTS:
         status = STATUS_BAD_WORKSPACE_SLOTS
-    elif a.max_chunk_group < 1 or a.max_chunk_group > MAX_CHUNK_GROUP:
+    elif metadata_args.max_chunk_group < 1 or metadata_args.max_chunk_group > MAX_CHUNK_GROUP:
         status = STATUS_BAD_FLAGS
-    elif not (a.has_cu == 0 or a.has_cu == 1):
+    elif not (metadata_args.has_cu == 0 or metadata_args.has_cu == 1):
         status = STATUS_BAD_FLAGS
-    elif not (a.is_packed == 0 or a.is_packed == 1):
+    elif not (metadata_args.is_packed == 0 or metadata_args.is_packed == 1):
         status = STATUS_BAD_FLAGS
-    elif a.is_packed == 1 and a.has_cu == 0:
+    elif metadata_args.is_packed == 1 and metadata_args.has_cu == 0:
         status = STATUS_BAD_FLAGS
-    elif a.batch < 1 or a.storage_length < 1 or a.value_heads < 1:
+    elif metadata_args.batch < 1 or metadata_args.storage_length < 1 or metadata_args.value_heads < 1:
         status = STATUS_BAD_SHAPE
-    elif a.value_heads > MAX_VALUE_HEADS:
+    elif metadata_args.value_heads > MAX_VALUE_HEADS:
         status = STATUS_BAD_SHAPE
-    elif a.is_packed == 1 and a.physical_batches != 1:
+    elif metadata_args.is_packed == 1 and metadata_args.physical_batches != 1:
         status = STATUS_BAD_SHAPE
-    elif a.is_packed == 0 and a.physical_batches != a.batch:
+    elif metadata_args.is_packed == 0 and metadata_args.physical_batches != metadata_args.batch:
         status = STATUS_BAD_SHAPE
     if status != STATUS_OK:
-        a.metadata[HEADER_STATUS] = status
+        metadata_args.metadata[HEADER_STATUS] = status
         return STATUS_OK
 
-    if a.has_cu == 1:
-        if a.cu_seqlens[0] != 0:
-            a.metadata[HEADER_STATUS] = STATUS_BAD_CU_START
+    if metadata_args.has_cu == 1:
+        if metadata_args.cu_seqlens[0] != 0:
+            metadata_args.metadata[HEADER_STATUS] = STATUS_BAD_CU_START
             return STATUS_OK
 
-    # 发布选路结果或任务前，检查所有实际序列长度。
+    # 选路已在 Host 完成；仍在设备发布调度前检查所有实际序列长度。
     uniform_chunk_num = 1
     first_chunk_num = 0
-    route_max_chunk_num = 0
-    route_total_chunk_num = 0
-    route_peak_chunk_num = 0
-    route_total_rows = 0
-    route_query_rows = 0
-    evaluate_route = 0
-    if a.template_kind == TEMPLATE_AUTO and a.calibration_enabled == 1:
-        evaluate_route = 1
-    for batch_idx in range(0, a.batch):
-        valid_seq_len = a.storage_length
-        if a.has_cu == 1:
-            valid_seq_len = a.cu_seqlens[batch_idx + 1] - a.cu_seqlens[batch_idx]
+    for batch_idx in range(0, metadata_args.batch):
+        valid_seq_len = metadata_args.storage_length
+        if metadata_args.has_cu == 1:
+            valid_seq_len = metadata_args.cu_seqlens[batch_idx + 1] - metadata_args.cu_seqlens[batch_idx]
         if valid_seq_len <= 0:
             status = STATUS_BAD_LENGTH
-        elif a.is_packed == 0 and valid_seq_len > a.storage_length:
+        elif metadata_args.is_packed == 0 and valid_seq_len > metadata_args.storage_length:
             status = STATUS_BAD_PADDED_LENGTH
         else:
             current_chunk_num = (valid_seq_len + CHUNK_SIZE - 1) // CHUNK_SIZE
@@ -667,132 +737,92 @@ def flash_kda_fwd_metadata_kernel(a: FlashKDAFwdMetadataArgs):
                 first_chunk_num = current_chunk_num
             elif current_chunk_num != first_chunk_num:
                 uniform_chunk_num = 0
-            if current_chunk_num > route_max_chunk_num:
-                route_max_chunk_num = current_chunk_num
-            if evaluate_route == 1:
-                if current_chunk_num > INT64_MAX // a.value_heads:
-                    evaluate_route = 0
-                else:
-                    batch_chunk_num = a.value_heads * current_chunk_num
-                    if route_total_chunk_num > INT64_MAX - batch_chunk_num:
-                        evaluate_route = 0
-                    else:
-                        route_total_chunk_num += batch_chunk_num
-                        route_total_rows = _route_add_cost(route_total_rows, a.value_heads, valid_seq_len)
-                        route_query_rows = _route_add_cost(route_query_rows, a.query_heads, valid_seq_len)
-                        if route_total_rows < 0 or route_query_rows < 0:
-                            evaluate_route = 0
-                        # 每个核的成本不超过已检查的总成本。
-                        for value_head_idx in range(0, a.value_heads):
-                            cyclic_core = (
-                                batch_idx * a.value_heads + value_head_idx
-                            ) % a.core_num
-                            route_core_costs[cyclic_core] += current_chunk_num
-    if status == STATUS_OK and a.is_packed == 1:
-        if a.cu_seqlens[a.batch] != a.storage_length:
+    if status == STATUS_OK and metadata_args.is_packed == 1:
+        if metadata_args.cu_seqlens[metadata_args.batch] != metadata_args.storage_length:
             status = STATUS_BAD_PACKED_END
     if status != STATUS_OK:
-        a.metadata[HEADER_STATUS] = status
+        metadata_args.metadata[HEADER_STATUS] = status
         return STATUS_OK
-    selected_template = a.template_kind
-    if selected_template == TEMPLATE_AUTO:
-        selected_template = TEMPLATE_STAGED
-        if evaluate_route == 1:
-            for core_idx in range(0, a.core_num):
-                if route_core_costs[core_idx] > route_peak_chunk_num:
-                    route_peak_chunk_num = route_core_costs[core_idx]
-            persistent_peak = _route_persistent_loads(
-                a, uniform_chunk_num, route_lpt_costs, route_valid_rows
-            )
-            selected_template = _select_route_from_model(
-                a, route_peak_chunk_num, route_total_chunk_num, route_total_rows,
-                route_query_rows, persistent_peak, route_valid_rows,
-                _training_group_limit(a, route_max_chunk_num), remaining_chunk_num,
-            )
-            # 短多序列训练保留直接 U 路径的缓存。
-            if a.has_cu == 1 and a.batch > 1 and route_max_chunk_num <= 2:
-                selected_template = TEMPLATE_PERSISTENT
-    a.metadata[HEADER_TEMPLATE] = selected_template
+    selected_template = metadata_args.template_kind
+    metadata_args.metadata[HEADER_TEMPLATE] = selected_template
     if selected_template == TEMPLATE_PERSISTENT:
-        task_num = a.batch * a.value_heads
+        task_num = metadata_args.batch * metadata_args.value_heads
         task_base = HEADER_WORDS + MAX_AIC_CORES
         used_words = task_base + CHUNK_TASK_WORDS * task_num
         heap_base = used_words
-        if used_words + a.batch > a.metadata_word_capacity:
-            a.metadata[HEADER_STATUS] = STATUS_BAD_METADATA_CAPACITY
+        if used_words + metadata_args.batch > metadata_args.metadata_word_capacity:
+            metadata_args.metadata[HEADER_STATUS] = STATUS_BAD_METADATA_CAPACITY
             return STATUS_OK
         for core_idx in range(0, MAX_AIC_CORES):
-            a.metadata[HEADER_WORDS + core_idx] = 0
+            metadata_args.metadata[HEADER_WORDS + core_idx] = 0
         # 等长序列保持原始批次和头顺序；变长批次采用 O(B log B) 的 LPT 调度。
         # 使用 B 个 GM 临时字，避免固定本地数组和反复扫描全部批次。
-        heap_num = a.batch
+        heap_num = metadata_args.batch
         if uniform_chunk_num == 0:
-            for batch_idx in range(0, a.batch):
-                a.metadata[heap_base + batch_idx] = batch_idx
-            heap_root = a.batch // 2
+            for batch_idx in range(0, metadata_args.batch):
+                metadata_args.metadata[heap_base + batch_idx] = batch_idx
+            heap_root = metadata_args.batch // 2
             while heap_root > 0:
                 heap_root -= 1
-                _chunk_heap_sift_down(a.cu_seqlens, a.metadata, heap_base, heap_num, heap_root)
+                _chunk_heap_sift_down(metadata_args.cu_seqlens, metadata_args.metadata, heap_base, heap_num, heap_root)
         task_cursor = task_base
-        for scheduled_batch_idx in range(0, a.batch):
+        for scheduled_batch_idx in range(0, metadata_args.batch):
             batch_idx = scheduled_batch_idx
             if uniform_chunk_num == 0:
-                batch_idx = a.metadata[heap_base]
+                batch_idx = metadata_args.metadata[heap_base]
                 heap_num -= 1
                 if heap_num > 0:
-                    a.metadata[heap_base] = a.metadata[heap_base + heap_num]
-                    _chunk_heap_sift_down(a.cu_seqlens, a.metadata, heap_base, heap_num, 0)
+                    metadata_args.metadata[heap_base] = metadata_args.metadata[heap_base + heap_num]
+                    _chunk_heap_sift_down(metadata_args.cu_seqlens, metadata_args.metadata, heap_base, heap_num, 0)
             storage_batch_idx = batch_idx
             token_start = 0
-            valid_seq_len = a.storage_length
-            if a.has_cu == 1:
-                token_start = a.cu_seqlens[batch_idx]
-                valid_seq_len = a.cu_seqlens[batch_idx + 1] - token_start
-            if a.is_packed == 1:
+            valid_seq_len = metadata_args.storage_length
+            if metadata_args.has_cu == 1:
+                token_start = metadata_args.cu_seqlens[batch_idx]
+                valid_seq_len = metadata_args.cu_seqlens[batch_idx + 1] - token_start
+            if metadata_args.is_packed == 1:
                 storage_batch_idx = 0
             else:
                 token_start = 0
             chunk_num = (valid_seq_len + CHUNK_SIZE - 1) // CHUNK_SIZE
-            for value_head_idx in range(0, a.value_heads):
+            for value_head_idx in range(0, metadata_args.value_heads):
                 selected_core = 0
-                for core_idx in range(1, a.core_num):
+                for core_idx in range(1, metadata_args.core_num):
                     if chunk_core_costs[core_idx] < chunk_core_costs[selected_core]:
                         selected_core = core_idx
-                a.metadata[task_cursor + CHUNK_TASK_BATCH] = batch_idx
-                a.metadata[task_cursor + CHUNK_TASK_STORAGE_BATCH] = storage_batch_idx
-                a.metadata[task_cursor + CHUNK_TASK_TOKEN_START] = token_start
-                a.metadata[task_cursor + CHUNK_TASK_LENGTH] = valid_seq_len
-                a.metadata[task_cursor + CHUNK_TASK_VALUE_HEAD] = value_head_idx
-                a.metadata[task_cursor + CHUNK_TASK_NEXT] = 0
+                metadata_args.metadata[task_cursor + CHUNK_TASK_BATCH] = batch_idx
+                metadata_args.metadata[task_cursor + CHUNK_TASK_STORAGE_BATCH] = storage_batch_idx
+                metadata_args.metadata[task_cursor + CHUNK_TASK_TOKEN_START] = token_start
+                metadata_args.metadata[task_cursor + CHUNK_TASK_LENGTH] = valid_seq_len
+                metadata_args.metadata[task_cursor + CHUNK_TASK_VALUE_HEAD] = value_head_idx
+                metadata_args.metadata[task_cursor + CHUNK_TASK_NEXT] = 0
                 previous_task = chunk_core_tails[selected_core]
                 if previous_task == 0:
-                    a.metadata[HEADER_WORDS + selected_core] = task_cursor
+                    metadata_args.metadata[HEADER_WORDS + selected_core] = task_cursor
                 else:
-                    a.metadata[previous_task + CHUNK_TASK_NEXT] = task_cursor
+                    metadata_args.metadata[previous_task + CHUNK_TASK_NEXT] = task_cursor
                 chunk_core_tails[selected_core] = task_cursor
                 chunk_core_costs[selected_core] += chunk_num
                 task_cursor += CHUNK_TASK_WORDS
-        a.metadata[HEADER_CHUNK_TASK_NUM] = task_num
+        metadata_args.metadata[HEADER_CHUNK_TASK_NUM] = task_num
         return STATUS_OK
 
-    max_chunk_group = a.max_chunk_group
-    if a.template_kind == TEMPLATE_AUTO:
-        max_chunk_group = _training_group_limit(a, route_max_chunk_num)
-    batch_num_per_set = a.workspace_slots // a.value_heads
+    max_chunk_group = metadata_args.max_chunk_group
+    batch_num_per_set = metadata_args.workspace_slots // metadata_args.value_heads
     stage12_round_num = 0
     total_active_batch_entries = 0
     batch_start = 0
-    while batch_start < a.batch:
-        batch_num_in_set = a.batch - batch_start
+    while batch_start < metadata_args.batch:
+        batch_num_in_set = metadata_args.batch - batch_start
         if batch_num_in_set > batch_num_per_set:
             batch_num_in_set = batch_num_per_set
         for local_batch_idx in range(0, batch_num_in_set):
             batch_idx = batch_start + local_batch_idx
             token_start = 0
-            valid_seq_len = a.storage_length
-            if a.has_cu == 1:
-                token_start = a.cu_seqlens[batch_idx]
-                token_end = a.cu_seqlens[batch_idx + 1]
+            valid_seq_len = metadata_args.storage_length
+            if metadata_args.has_cu == 1:
+                token_start = metadata_args.cu_seqlens[batch_idx]
+                token_end = metadata_args.cu_seqlens[batch_idx + 1]
                 valid_seq_len = token_end - token_start
             valid_seq_len_by_batch[local_batch_idx] = valid_seq_len
             token_start_by_batch[local_batch_idx] = token_start
@@ -800,7 +830,7 @@ def flash_kda_fwd_metadata_kernel(a: FlashKDAFwdMetadataArgs):
                 status = STATUS_BAD_LENGTH
                 chunk_num_by_batch[local_batch_idx] = 0
                 tail_row_num_by_batch[local_batch_idx] = 0
-            elif a.is_packed == 0 and valid_seq_len > a.storage_length:
+            elif metadata_args.is_packed == 0 and valid_seq_len > metadata_args.storage_length:
                 status = STATUS_BAD_PADDED_LENGTH
                 chunk_num_by_batch[local_batch_idx] = 0
                 tail_row_num_by_batch[local_batch_idx] = 0
@@ -821,41 +851,45 @@ def flash_kda_fwd_metadata_kernel(a: FlashKDAFwdMetadataArgs):
             if active_batch_num == 0:
                 break
             group_num = _select_group_num(
-                remaining_chunk_num, active_batch_num, a.value_heads, a.workspace_slots, max_chunk_group,
+                remaining_chunk_num, active_batch_num, metadata_args.value_heads,
+                metadata_args.workspace_slots, max_chunk_group,
             )
             stage12_round_num += 1
             total_active_batch_entries += active_batch_num
             chunk_start += group_num
         batch_start += batch_num_in_set
 
-    if status == STATUS_OK and a.is_packed == 1:
-        if a.cu_seqlens[a.batch] != a.storage_length:
+    if status == STATUS_OK and metadata_args.is_packed == 1:
+        if metadata_args.cu_seqlens[metadata_args.batch] != metadata_args.storage_length:
             status = STATUS_BAD_PACKED_END
     if status != STATUS_OK:
-        a.metadata[HEADER_STATUS] = status
+        metadata_args.metadata[HEADER_STATUS] = status
         return STATUS_OK
 
     record_begin = HEADER_WORDS + stage12_round_num + 1
-    used_words = record_begin + ROUND_FIXED_WORDS * stage12_round_num + ROUND_WORDS_PER_BATCH * total_active_batch_entries
-    if used_words > a.metadata_word_capacity:
-        a.metadata[HEADER_STATUS] = STATUS_BAD_METADATA_CAPACITY
+    used_words = (
+        record_begin + ROUND_FIXED_WORDS * stage12_round_num
+        + ROUND_WORDS_PER_BATCH * total_active_batch_entries
+    )
+    if used_words > metadata_args.metadata_word_capacity:
+        metadata_args.metadata[HEADER_STATUS] = STATUS_BAD_METADATA_CAPACITY
         return STATUS_OK
 
-    a.metadata[HEADER_STAGE12_ROUND_NUM] = stage12_round_num
+    metadata_args.metadata[HEADER_STAGE12_ROUND_NUM] = stage12_round_num
     record_cursor = record_begin
     global_round_idx = 0
     batch_start = 0
-    while batch_start < a.batch:
-        batch_num_in_set = a.batch - batch_start
+    while batch_start < metadata_args.batch:
+        batch_num_in_set = metadata_args.batch - batch_start
         if batch_num_in_set > batch_num_per_set:
             batch_num_in_set = batch_num_per_set
         for local_batch_idx in range(0, batch_num_in_set):
             batch_idx = batch_start + local_batch_idx
             token_start = 0
-            valid_seq_len = a.storage_length
-            if a.has_cu == 1:
-                token_start = a.cu_seqlens[batch_idx]
-                token_end = a.cu_seqlens[batch_idx + 1]
+            valid_seq_len = metadata_args.storage_length
+            if metadata_args.has_cu == 1:
+                token_start = metadata_args.cu_seqlens[batch_idx]
+                token_end = metadata_args.cu_seqlens[batch_idx + 1]
                 valid_seq_len = token_end - token_start
             valid_seq_len_by_batch[local_batch_idx] = valid_seq_len
             token_start_by_batch[local_batch_idx] = token_start
@@ -876,7 +910,8 @@ def flash_kda_fwd_metadata_kernel(a: FlashKDAFwdMetadataArgs):
                 break
 
             group_num = _select_group_num(
-                remaining_chunk_num, active_batch_num, a.value_heads, a.workspace_slots, max_chunk_group,
+                remaining_chunk_num, active_batch_num, metadata_args.value_heads,
+                metadata_args.workspace_slots, max_chunk_group,
             )
             for active_idx in range(0, active_batch_num):
                 current_chunk_num = remaining_chunk_num[active_idx]
@@ -884,58 +919,58 @@ def flash_kda_fwd_metadata_kernel(a: FlashKDAFwdMetadataArgs):
                     current_chunk_num = group_num
                 chunk_num_per_group[active_idx] = current_chunk_num
 
-            a.metadata[HEADER_WORDS + global_round_idx] = record_cursor
+            metadata_args.metadata[HEADER_WORDS + global_round_idx] = record_cursor
             cursor = record_cursor
-            a.metadata[cursor] = global_round_idx
-            a.metadata[cursor + 1] = active_batch_num
+            metadata_args.metadata[cursor] = global_round_idx
+            metadata_args.metadata[cursor + 1] = active_batch_num
             cursor += 2
             for active_idx in range(0, active_batch_num):
-                a.metadata[cursor + active_idx] = (
+                metadata_args.metadata[cursor + active_idx] = (
                     batch_start + active_local_batch_idx[active_idx]
                 )
             cursor += active_batch_num
             for active_idx in range(0, active_batch_num):
                 logical_batch_idx = batch_start + active_local_batch_idx[active_idx]
-                if a.is_packed == 1:
-                    a.metadata[cursor + active_idx] = 0
+                if metadata_args.is_packed == 1:
+                    metadata_args.metadata[cursor + active_idx] = 0
                 else:
-                    a.metadata[cursor + active_idx] = logical_batch_idx
+                    metadata_args.metadata[cursor + active_idx] = logical_batch_idx
             cursor += active_batch_num
             for active_idx in range(0, active_batch_num):
                 local_batch_idx = active_local_batch_idx[active_idx]
-                if a.is_packed == 1:
-                    a.metadata[cursor + active_idx] = token_start_by_batch[
+                if metadata_args.is_packed == 1:
+                    metadata_args.metadata[cursor + active_idx] = token_start_by_batch[
                         local_batch_idx
                     ]
                 else:
-                    a.metadata[cursor + active_idx] = 0
+                    metadata_args.metadata[cursor + active_idx] = 0
             cursor += active_batch_num
             for active_idx in range(0, active_batch_num):
                 local_batch_idx = active_local_batch_idx[active_idx]
-                a.metadata[cursor + active_idx] = valid_seq_len_by_batch[
+                metadata_args.metadata[cursor + active_idx] = valid_seq_len_by_batch[
                     local_batch_idx
                 ]
             cursor += active_batch_num
-            a.metadata[cursor] = group_num
+            metadata_args.metadata[cursor] = group_num
             cursor += 1
             for active_idx in range(0, active_batch_num):
-                a.metadata[cursor + active_idx] = chunk_start
+                metadata_args.metadata[cursor + active_idx] = chunk_start
             cursor += active_batch_num
             for active_idx in range(0, active_batch_num):
-                a.metadata[cursor + active_idx] = chunk_num_per_group[active_idx]
+                metadata_args.metadata[cursor + active_idx] = chunk_num_per_group[active_idx]
             cursor += active_batch_num
 
             stage1_task_num = 0
-            a.metadata[cursor] = 0
+            metadata_args.metadata[cursor] = 0
             for active_idx in range(0, active_batch_num):
-                stage1_task_num += a.value_heads * chunk_num_per_group[active_idx]
-                a.metadata[cursor + active_idx + 1] = stage1_task_num
+                stage1_task_num += metadata_args.value_heads * chunk_num_per_group[active_idx]
+                metadata_args.metadata[cursor + active_idx + 1] = stage1_task_num
             cursor += active_batch_num + 1
 
             stage1_task_idx = 0
             for active_idx in range(0, active_batch_num):
                 local_batch_idx = active_local_batch_idx[active_idx]
-                for _ in range(0, a.value_heads):
+                for _ in range(0, metadata_args.value_heads):
                     for local_chunk_idx in range(0, chunk_num_per_group[active_idx]):
                         global_chunk_idx = chunk_start + local_chunk_idx
                         stage1_cost = FULL_CHUNK_COST_NS
@@ -946,9 +981,12 @@ def flash_kda_fwd_metadata_kernel(a: FlashKDAFwdMetadataArgs):
                             stage1_cost = _stage1_task_cost(tail_row_num_by_batch[local_batch_idx])
                         stage1_task_costs[stage1_task_idx] = stage1_cost
                         stage1_task_idx += 1
-            _partition_costs(stage1_task_costs, stage1_task_num, a.core_num, stage1_core_ranges, stage1_core_costs)
+            _partition_costs(
+                stage1_task_costs, stage1_task_num, metadata_args.core_num,
+                stage1_core_ranges, stage1_core_costs,
+            )
             for range_idx in range(0, MAX_AIC_CORES * 2):
-                a.metadata[cursor + range_idx] = stage1_core_ranges[range_idx]
+                metadata_args.metadata[cursor + range_idx] = stage1_core_ranges[range_idx]
             cursor += MAX_AIC_CORES * 2
 
             selected_dv_splits_num = 1
@@ -962,13 +1000,13 @@ def flash_kda_fwd_metadata_kernel(a: FlashKDAFwdMetadataArgs):
                 candidate_total_cost = 0
                 for active_idx in range(0, active_batch_num):
                     task_cost = _stage2_task_cost(candidate_idx, chunk_num_per_group[active_idx])
-                    batch_task_num = a.value_heads * candidate_dv_splits_num
+                    batch_task_num = metadata_args.value_heads * candidate_dv_splits_num
                     for _ in range(0, batch_task_num):
                         stage2_task_costs[candidate_task_num] = task_cost
                         candidate_task_num += 1
                         candidate_total_cost += task_cost
                 _partition_costs(
-                    stage2_task_costs, candidate_task_num, a.core_num, candidate_stage2_core_ranges,
+                    stage2_task_costs, candidate_task_num, metadata_args.core_num, candidate_stage2_core_ranges,
                     candidate_stage2_core_costs,
                 )
                 candidate_max_core_cost = 0
@@ -1002,16 +1040,16 @@ def flash_kda_fwd_metadata_kernel(a: FlashKDAFwdMetadataArgs):
                         )
 
             for active_idx in range(0, active_batch_num):
-                a.metadata[cursor + active_idx] = selected_dv_splits_num
+                metadata_args.metadata[cursor + active_idx] = selected_dv_splits_num
             cursor += active_batch_num
             stage2_task_num = 0
-            a.metadata[cursor] = 0
+            metadata_args.metadata[cursor] = 0
             for active_idx in range(0, active_batch_num):
-                stage2_task_num += a.value_heads * selected_dv_splits_num
-                a.metadata[cursor + active_idx + 1] = stage2_task_num
+                stage2_task_num += metadata_args.value_heads * selected_dv_splits_num
+                metadata_args.metadata[cursor + active_idx + 1] = stage2_task_num
             cursor += active_batch_num + 1
             for range_idx in range(0, MAX_AIC_CORES * 2):
-                a.metadata[cursor + range_idx] = selected_stage2_core_ranges[range_idx]
+                metadata_args.metadata[cursor + range_idx] = selected_stage2_core_ranges[range_idx]
             cursor += MAX_AIC_CORES * 2
 
             record_cursor = cursor
@@ -1019,7 +1057,7 @@ def flash_kda_fwd_metadata_kernel(a: FlashKDAFwdMetadataArgs):
             chunk_start += group_num
         batch_start += batch_num_in_set
 
-    a.metadata[HEADER_WORDS + stage12_round_num] = record_cursor
+    metadata_args.metadata[HEADER_WORDS + stage12_round_num] = record_cursor
     return STATUS_OK
 
 
@@ -1417,10 +1455,24 @@ def _build_flash_kda_fwd_metadata(
     # 两个模板的舍入边界不同，同一输入在训推模式下选择相同模板。
     # 输出和缓存需求仍由调用方执行模式控制。
     route_parameters, calibration_enabled = _get_route_parameters(device)
+    host_prefix = [0]
+    for size in lengths:
+        host_prefix.append(host_prefix[-1] + size)
+    template_id, max_chunk_group = _select_template_on_host(SimpleNamespace(
+        cu_seqlens=host_prefix, route_coefficients=route_parameters,
+        calibration_enabled=calibration_enabled, layout_kind=0 if layout == "BNSD" else 1,
+        # Only heap scratch is accessed by routing; retain its original word offsets
+        # and capacity check without allocating the complete device metadata on Host.
+        metadata={}, metadata_word_capacity=capacity, batch=batch_size,
+        storage_length=seqlens, value_heads=nheads_v, query_heads=nheads_qk,
+        has_cu=int(has_cu), is_packed=int(is_packed), core_num=core_num,
+        workspace_slots=WORKSPACE_SLOTS, max_chunk_group=max_chunk_group,
+        template_kind=template_id,
+    ))
     device_id = device.index
     with torch.npu.device(device_id), _AICPU_LOCK:
         stream = torch.npu.current_stream(device_id)
-        for tensor in (cu_seqlens, route_parameters, metadata):
+        for tensor in (cu_seqlens, metadata):
             if tensor is not None:
                 tensor.record_stream(stream)
         _AICPU_STREAMS[(device_id, stream.npu_stream)] = stream
@@ -1428,12 +1480,10 @@ def _build_flash_kda_fwd_metadata(
             aicpu = _get_aicpu_kernel()
             aicpu.launch(
                 current_raw_stream(device_id),
-                route_coefficients=0 if route_parameters is None else route_parameters.data_ptr(),
-                calibration_enabled=calibration_enabled, layout_kind=0 if layout == "BNSD" else 1,
                 cu_seqlens=0 if cu_seqlens is None else cu_seqlens.data_ptr(),
                 metadata=metadata.data_ptr(), metadata_word_capacity=capacity,
                 batch=batch_size, physical_batches=1 if is_packed else batch_size,
-                storage_length=seqlens, value_heads=nheads_v, query_heads=nheads_qk, has_cu=int(has_cu),
+                storage_length=seqlens, value_heads=nheads_v, has_cu=int(has_cu),
                 is_packed=int(is_packed), core_num=core_num, workspace_slots=WORKSPACE_SLOTS,
                 max_chunk_group=max_chunk_group, template_kind=template_id,
             )
@@ -1487,24 +1537,19 @@ _DT_ROUTE_PARAMETERS = (
     4135271144, 193981546, 366448654, 12881511041, 29417161, 4351059785, 158980371, 10652650460, 3206978745, 332321804, 0, 419242242, 29945874, 7, 0, 0,
     20317858430, 1160598799, 1018161115, 1015361233, 14389959, 933231823, 115749683, 11499084207, 4373896639, 413928806, 41555011, 0, 0, 7, 0, 0,
 )
-_ROUTE_TENSORS = {}
-_ROUTE_PARAMETER_LOCK = threading.Lock()
 
 
-def _get_route_parameters(device):
+def _get_route_parameters(device) -> tuple[tuple[int, ...], bool]:
+    """返回成本系数及标定模型启用标志，供 Host 模板选择使用。
+
+    calibration_enabled 为 True，表示启用原有标定成本模型进行自动选路。
+    """
     device = torch.device(device)
     with torch.npu.device(device):
-        stream = torch.npu.current_stream(device)
-        key = (device, stream.npu_stream)
-        with _ROUTE_PARAMETER_LOCK:
-            tensor = _ROUTE_TENSORS.get(key)
-            if tensor is None:
-                device_name = torch.npu.get_device_properties(device).name.upper()
-                parameters = _DT_ROUTE_PARAMETERS if device_name.startswith("ASCEND950DT") else _ROUTE_PARAMETERS
-                tensor = torch.tensor(parameters, dtype=torch.int64).to(device=device, non_blocking=True)
-                _ROUTE_TENSORS[key] = tensor
-        tensor.record_stream(stream)
-    return tensor, 1
+        device_name = torch.npu.get_device_properties(device).name.upper()
+    parameters = _DT_ROUTE_PARAMETERS if device_name.startswith("ASCEND950DT") else _ROUTE_PARAMETERS
+    calibration_enabled = True
+    return parameters, calibration_enabled
 
 
 # Both public names share the same metadata contract and scheduler.
