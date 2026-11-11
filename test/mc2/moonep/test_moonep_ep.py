@@ -39,6 +39,7 @@ sys.path.insert(
     ),
 )
 
+from conftest import fill_and_repush  # noqa: E402
 from moonep_golden import (  # noqa: E402
     RouteShape,
     make_router_inputs,
@@ -76,7 +77,9 @@ _E2E_CASES = [
     pytest.param(4, 2, 2, "skewed", 42, id="s4k2_skewed", marks=pytest.mark.full),
     pytest.param(4, 2, 2, "extreme", 42, id="s4k2_extreme", marks=pytest.mark.full),
     # 多 chunk/多 block 落位路径（N=4096→bd=2；N=32768→bd=16，对齐推荐配置量级）
-    # 大 S 只用 balanced：skewed/extreme 集中路由会使接收量远超 per-peer 容量
+    # 大 S 只用 balanced：历史排除理由"集中路由使接收量远超 per-peer 容量"
+    # 基于 per-peer 扩展对模型（已证伪——EB 槽位承载 token 行，per-peer ≤ S
+    # 恒成立）；nmtr=S 收口后该排除是否仍必要未验证，暂保守保留
     pytest.param(
         512, 8, 4, "balanced", 42, id="s512k8_balanced", marks=pytest.mark.full
     ),
@@ -145,8 +148,20 @@ def _get_ep_buf(world_size, num_tokens, top_k):
     """
     key = (num_tokens, top_k)
     if key not in _EP_POOL:
-        ep_group = dist.new_group(backend="hccl", ranks=list(range(world_size)))
-        # nmtr 余量：balanced 下 per-peer 期望=S*K/R，随机方差会略越界
+        from torch_npu._C._distributed_c10d import ProcessGroupHCCL
+
+        eb_mb = ElasticBuffer.get_moe_ep_ccl_buffer_size(
+            world_size, _ep_nmtr(num_tokens, top_k), _H, _EPN * world_size, top_k
+        )
+        eb_opts = ProcessGroupHCCL.Options()
+        eb_opts.hccl_config = {"hccl_buffer_size": eb_mb}
+        ep_group = dist.new_group(
+            backend="hccl",
+            ranks=list(range(world_size)),
+            pg_options=eb_opts,
+        )
+        # nmtr = S：EB 窗口 per-peer 槽位承载 token 行（扩展发生在接收侧
+        # recv 区），per-peer 到达 ≤ S 恒成立，无需路由余量
         buf = ElasticBuffer(
             ep_group,
             num_max_tokens_per_rank=_ep_nmtr(num_tokens, top_k),
@@ -158,14 +173,16 @@ def _get_ep_buf(world_size, num_tokens, top_k):
 
 
 def _ep_nmtr(num_tokens, top_k):
-    """per-peer 容量：期望 S*K/R + 泊松方差余量（按实际 world size）。
+    """per-peer 容量 = S（与 torchtitan 生产口径一致）。
 
-    发送侧同时要求 x.dim0 ≤ nmtr：K/R 较小时 S*K/R*1.25+64 < S，须与 S
-    取 max（接入指南口径）——8P K6 形状曾因 3904 < S=4094 触发 dispatch
-    tiling 拒绝（x dim0 超上限）。
+    EB 窗口 per-peer 槽位承载 token 行而非 (token,expert) 扩展对，per-peer
+    到达 ≤ S 恒成立（与路由分布/plan 均衡无关）；plan 均衡不变量（每 rank
+    扩展行恰 S*K）由接收侧 recv 分配承载。历史公式 max(S, S*K/R*1.25+64)
+    诞生于 plan 尚在修均衡 bug 的窗口期（3ee880219），且 10-24 才补 max
+    （8P K6 形状 3904 < S=4094 触发 dispatch tiling 拒绝——发送侧约束
+    的推导有缺陷，已废弃。
     """
-    r = dist.get_world_size()
-    return max(num_tokens, int(num_tokens * top_k / r * 1.25) + 64)
+    return num_tokens
 
 
 def _make_case(shape, mode, seed):
@@ -299,30 +316,20 @@ class _ReduceCase(NamedTuple):
     etc_cpu: torch.Tensor
 
 
-def _fill_grad_views(ctx, num_groups, epn, w_elems, base, grad_dtype=torch.float32):
-    """v4 契约：home 梯度种子 [epn, W] + 对称堆梯度槽副本 [epn, W]。
+def _full_dw_tensors(num_groups, epn, w_elems, base, grad_dtype=torch.float32):
+    """full-dW 契约：[2*epn, W] 张量（GMM 反传原生形态）。
 
-    home 行值 (row+1)*(g+1)+base（FFN 反向预写种子）；槽行 j 值
-    (epn+j+1)*(g+1)+base（模拟 FFN 反向直写副本编码——与旧 [2epn] 布局
-    同律，归并期望公式 _expect_merged_row 不变）。
-    副本 dW 落 create_grad_slot_view 创建的梯度槽（独立于权重发布区），
-    reduce_grad 的 owner 远端读槽原子累加进 home；槽不再清零。
+    home 行 i（[0, epn)）值 (i+1)*(g+1)+base（种子）；副本行 epn+j 值
+    (epn+j+1)*(g+1)+base（dW 尾段——reduce 内部入槽，owner 远端读槽
+    原子累加进 home）。归并期望公式 _expect_merged_row 不变。
     """
-    from reduce_grad import create_grad_slot_view
-
-    homes, slots = [], []
+    grads = []
     for g in range(num_groups):
-        h = torch.empty(epn, w_elems, dtype=grad_dtype)
-        for i in range(epn):
-            h[i] = float((i + 1) * (g + 1) + base)
-        homes.append(h.npu())
-        s = create_grad_slot_view(
-            ctx, epn, w_elems, group=g, groups=num_groups, grad_dtype=grad_dtype
-        )
-        for j in range(epn):
-            s[j] = float((epn + j + 1) * (g + 1) + base)
-        slots.append(s)
-    return homes, slots
+        t = torch.empty(2 * epn, w_elems, dtype=grad_dtype)
+        for i in range(2 * epn):
+            t[i] = float((i + 1) * (g + 1) + base)
+        grads.append(t.npu())
+    return grads
 
 
 def _expect_merged_row(case, g, row, base):
@@ -338,31 +345,32 @@ def _expect_merged_row(case, g, row, base):
     return exp_val
 
 
-def _verify_reduce_group(home_cpu, slot_cpu, case, g=0, base=0.0, tag=""):
-    """校验单组（v4 契约）：home 行归并值 + 副本槽保持 FFN 写入值（不清零）。"""
+def _verify_reduce_group(grad_cpu, case, g=0, base=0.0, tag=""):
+    """校验单组（full-dW 契约）：home 段归并值 + 副本段保持调用方原值。"""
     _assert_one_source_etc(case.etc_cpu, case.epn)
-    for i in range(case.epn):
+    epn = case.epn
+    for i in range(epn):
         exp_val = _expect_merged_row(case, g, i, base)
         assert torch.allclose(
-            home_cpu[i], torch.full((case.w_elems,), exp_val), atol=1e-3, rtol=1e-3
+            grad_cpu[i], torch.full((case.w_elems,), exp_val), atol=1e-3, rtol=1e-3
         ), f"{tag}组 {g} 行 {i} 归并错误（mode={case.mode}）"
-    for j in range(case.epn):
-        exp_slot = float((case.epn + j + 1) * (g + 1) + base)
+    for j in range(epn):
+        exp_tail = float((epn + j + 1) * (g + 1) + base)
         assert torch.allclose(
-            slot_cpu[j].float(),
-            torch.full((case.w_elems,), exp_slot),
+            grad_cpu[epn + j].float(),
+            torch.full((case.w_elems,), exp_tail),
             atol=1e-2,
             rtol=1e-2,
         ), (
-            f"{tag}组 {g} 副本槽 {j} 被改写（v4 契约：副本槽不清零，"
-            f"应保持 FFN 反向写入值 {exp_slot}）"
+            f"{tag}组 {g} 副本行 {j} 被改写（full-dW 契约：副本段只读，"
+            f"应保持调用方写入值 {exp_tail}）"
         )
 
 
-def _verify_reduce_views(homes, slots, case, base, tag):
+def _verify_reduce_views(grads, case, base, tag):
     """逐组校验归并结果（每组独立 _verify_reduce_group）。"""
-    for g, (h, s) in enumerate(zip(homes, slots)):
-        _verify_reduce_group(h.cpu(), s.cpu(), case, g, base, tag)
+    for g, t in enumerate(grads):
+        _verify_reduce_group(t.cpu(), case, g, base, tag)
 
 
 @pytest.mark.npu
@@ -403,12 +411,12 @@ def test_moonep_ep_backward_vs_golden(num_tokens, top_k, epn, mode, seed):
         f"dispatch⁻¹ 输出与期望不符（mode={mode}）"
     )
 
-    # ---- reduce_grad：合成梯度归并（v4：home 种子 + 梯度槽副本，槽不清零）----
-    homes, slots = _fill_grad_views(ctx, 1, epn, w_elems, 0.0)
-    reduce_grad(ctx, etc, homes, epn)
+    # ---- reduce_grad：合成梯度归并（full-dW 直入——组数/行宽从张量解析）----
+    grads = _full_dw_tensors(2, epn, w_elems, 0.0)
+    reduce_grad(ctx, etc, grads, epn)
     torch.npu.synchronize()
     case = _ReduceCase(rank, world_size, epn, w_elems, mode, etc.cpu())
-    _verify_reduce_views(homes, slots, case, 0.0, "")
+    _verify_reduce_views(grads, case, 0.0, "")
 
 
 @pytest.mark.npu
@@ -433,16 +441,16 @@ def test_moonep_reduce_grad_multigroup_multichunk(mode):
     ctx, etc, *_ = _plan_case(rank, shape, mode)
     case = _ReduceCase(rank, world_size, epn, w_elems, mode, etc.cpu())
 
-    homes1, slots1 = _fill_grad_views(ctx, num_groups, epn, w_elems, 0.0)
-    reduce_grad(ctx, etc, homes1, epn)
+    grads1 = _full_dw_tensors(num_groups, epn, w_elems, 0.0)
+    reduce_grad(ctx, etc, grads1, epn)
     torch.npu.synchronize()
-    _verify_reduce_views(homes1, slots1, case, 0.0, "第1次 ")
+    _verify_reduce_views(grads1, case, 0.0, "第1次 ")
 
-    # 第 2 次调用：槽视图重填（同基址），验证 epoch 复入 + 槽值覆盖语义
-    homes2, slots2 = _fill_grad_views(ctx, num_groups, epn, w_elems, 100.0)
-    reduce_grad(ctx, etc, homes2, epn)
+    # 第 2 次调用：full-dW 重填（尾段=槽源重写），验证 epoch 复入 + 槽值覆盖语义
+    grads2 = _full_dw_tensors(num_groups, epn, w_elems, 100.0)
+    reduce_grad(ctx, etc, grads2, epn)
     torch.npu.synchronize()
-    _verify_reduce_views(homes2, slots2, case, 100.0, "第2次 ")
+    _verify_reduce_views(grads2, case, 100.0, "第2次 ")
 
 
 def _fill_weight_real(rank, epn, w_elems, g=0):
@@ -488,16 +496,13 @@ def _verify_prefetch_view(w_cpu, etc_cpu, case, g=0, tag=""):
 @_requires_dsl
 @pytest.mark.parametrize("num_tokens,top_k,epn,mode,seed", _E2E_CASES)
 def test_moonep_prefetch_weight(num_tokens, top_k, epn, mode, seed):
-    """prefetch_weight：副本专家权重从 home 预取到本地预取槽。
+    """prefetch_weight：副本专家权重从 home 预取到本地预取槽（3 组形态）。
 
-    权重值按 (rank, expert) 编码（rank*1000 + e），验证每个副本槽
-    epn+j 恰好等于其真实专家在 home 的发布值；无副本 rank 走空路径。
+    权重值按 (rank, expert, 组) 编码（(rank*1000 + e)*(g+1)），验证每个
+    副本槽 epn+j 恰好等于其真实专家在 home 的发布值；无副本 rank 走空
+    路径。参数化形状矩阵（s4k2/s4096k6/s200k8 等）承载 etc 矩形覆盖。
     """
-    from prefetch_weight import (
-        create_weight_view,
-        materialize_weights,
-        prefetch_weight,
-    )
+    from prefetch_weight import prefetch_weight
 
     rank, world_size = _init_ep_group()
     shape = RouteShape(world_size, num_tokens, top_k, epn * world_size)
@@ -505,39 +510,38 @@ def test_moonep_prefetch_weight(num_tokens, top_k, epn, mode, seed):
     topk_all, _, _ = _make_case(shape, mode, seed)
     ctx, etc, *_ = _plan_case(rank, shape, mode, seed)
 
-    # 对称区权重视图 [2epn, W]：真实专家行填编码值，预取槽初始 -1
-    w_real = _fill_weight_real(rank, epn, w_elems)
-    w_local = create_weight_view(ctx, epn, w_elems)
-    w_local.fill_(-1.0)
+    # prefetch 直传 reals（2/3 组自适应——视图按各组行宽创建并返回）
+    num_groups = 3
+    reals = [_fill_weight_real(rank, epn, w_elems, g) for g in range(num_groups)]
+    views_w, views_s = prefetch_weight(ctx, etc, reals, epn)
+    # 空槽哨兵（库内 fill 已移除）：fill → barrier → 复推
+    fill_and_repush(ctx, etc, (views_w, views_s), epn)
 
-    prefetch_weight(ctx, etc, w_real, w_local, epn)
-    torch.npu.synchronize()
-
-    _verify_prefetch_view(w_local.cpu(), etc.cpu(), _PrefetchCase(rank, epn, w_elems))
+    etc_cpu = etc.cpu()
+    for g, v in enumerate(views_w):
+        _verify_prefetch_view(v.cpu(), etc_cpu, _PrefetchCase(rank, epn, w_elems), g)
     # home 行同步（功能校验，非精度对比）：视图前 epn 行必须由 prefetch 写入
-    # real_weights；期望值按 (rank, 行号) 编码公式独立计算，不引用 w_real 本身。
-    exp_home = (
-        torch.tensor(
-            [float(rank * 1000 + rank * epn + i) for i in range(epn)],
-            dtype=torch.bfloat16,
+    # real_weights；期望值按 (rank, 行号, 组) 编码公式独立计算，不引用 reals。
+    for g, v in enumerate(views_w):
+        exp_home = (
+            torch.tensor(
+                [float((rank * 1000 + rank * epn + i) * (g + 1)) for i in range(epn)],
+                dtype=torch.bfloat16,
+            )
+            .unsqueeze(1)
+            .expand(epn, w_elems)
         )
-        .unsqueeze(1)
-        .expand(epn, w_elems)
-    )
-    assert torch.equal(w_local.cpu()[:epn], exp_home), (
-        "home 行未被 prefetch 写入（预期 = real_weights 的 (rank*1000+expert) 编码）"
-    )
-    # materialize_weights 落地助手：返回普通显存拷贝且内容一致
-    assert torch.equal(materialize_weights(w_local).cpu(), w_local.cpu()), (
-        "materialize_weights 拷贝内容不符"
-    )
+        assert torch.equal(v.cpu()[:epn], exp_home), (
+            f"组 {g} home 行未被 prefetch 写入（预期 = real_weights 的 "
+            "(rank*1000+expert)*(g+1) 编码）"
+        )
 
 
 @pytest.mark.npu
 @_requires_dsl
 def test_moonep_one_source_full_slot_fanout():
     """满副本槽 + 单 home 多目的 fan-out + home 多 sender 梯度归并。"""
-    from prefetch_weight import create_weight_view, prefetch_weight
+    from prefetch_weight import prefetch_weight
     from reduce_grad import reduce_grad
 
     rank, world_size = _init_ep_group()
@@ -552,20 +556,20 @@ def test_moonep_one_source_full_slot_fanout():
     _assert_one_source_etc(etc_cpu, epn)
     etc = etc_cpu.npu()
 
-    w_real = _fill_weight_real(rank, epn, w_elems)
-    w_view = create_weight_view(ctx, epn, w_elems)
-    w_view.fill_(-1.0)
-    prefetch_weight(ctx, etc, w_real, w_view, epn)
-    torch.npu.synchronize()
-    _verify_prefetch_view(
-        w_view.cpu(), etc_cpu, _PrefetchCase(rank, epn, w_elems), tag="full-slot "
-    )
+    w_reals = [_fill_weight_real(rank, epn, w_elems, g) for g in range(3)]
+    w_views_w, w_views_s = prefetch_weight(ctx, etc, w_reals, epn)
+    # 空槽哨兵（库内 fill 已移除）：fill → barrier → 复推
+    fill_and_repush(ctx, etc, (w_views_w, w_views_s), epn)
+    for g, v in enumerate(w_views_w):
+        _verify_prefetch_view(
+            v.cpu(), etc_cpu, _PrefetchCase(rank, epn, w_elems), g, "full-slot "
+        )
 
-    homes, slots = _fill_grad_views(ctx, 1, epn, w_elems, 0.0)
-    reduce_grad(ctx, etc, homes, epn)
+    grads = _full_dw_tensors(3, epn, w_elems, 0.0)
+    reduce_grad(ctx, etc, grads, epn)
     torch.npu.synchronize()
     case = _ReduceCase(rank, world_size, epn, w_elems, "full-slot", etc_cpu)
-    _verify_reduce_views(homes, slots, case, 0.0, "full-slot ")
+    _verify_reduce_views(grads, case, 0.0, "full-slot ")
 
 
 @pytest.mark.npu
@@ -577,7 +581,7 @@ def test_moonep_prefetch_weight_multigroup():
     编码值按 (home*1000+e)*(g+1) 区分组——若组间重叠，setup 期的
     fill/真实行写入与预取槽填充会互相踩踏，校验必失败。
     """
-    from prefetch_weight import create_weight_view, prefetch_weight
+    from prefetch_weight import prefetch_weight
 
     rank, world_size = _init_ep_group()
     num_tokens, top_k, epn = 32, 8, 4
@@ -595,18 +599,13 @@ def test_moonep_prefetch_weight_multigroup():
     torch.npu.synchronize()
 
     num_groups = 3
-    reals, views = [], []
-    for g in range(num_groups):
-        reals.append(_fill_weight_real(rank, epn, w_elems, g))
-        v = create_weight_view(ctx, epn, w_elems, group=g, groups=num_groups)
-        v.fill_(-1.0)
-        views.append(v)
-
-    prefetch_weight(ctx, etc, reals, views, epn)
-    torch.npu.synchronize()
+    reals = [_fill_weight_real(rank, epn, w_elems, g) for g in range(num_groups)]
+    views_w, views_s = prefetch_weight(ctx, etc, reals, epn)
+    # 空槽哨兵（库内 fill 已移除）：fill → barrier → 复推
+    fill_and_repush(ctx, etc, (views_w, views_s), epn)
 
     etc_cpu = etc.cpu()
-    for g, v in enumerate(views):
+    for g, v in enumerate(views_w):
         _verify_prefetch_view(
             v.cpu(), etc_cpu, _PrefetchCase(rank, epn, w_elems), g, f"组 {g} "
         )
@@ -622,7 +621,7 @@ def test_moonep_prefetch_weight_multislot():
     下一层写另一槽——免集成侧快照拷贝）。编码值按 (home*1000+e)*(s+1)
     区分槽——若槽间重叠，两次预取互相踩踏，校验必失败。
     """
-    from prefetch_weight import create_weight_view, prefetch_weight
+    from prefetch_weight import prefetch_weight
 
     rank, world_size = _init_ep_group()
     num_tokens, top_k, epn = 32, 8, 4
@@ -630,17 +629,8 @@ def test_moonep_prefetch_weight_multislot():
     w_elems = _H * 16
     ctx, etc, *_ = _plan_case(rank, shape)
 
-    num_groups, num_slots = 2, 2
-    slot_views = []
-    for s in range(num_slots):
-        views = []
-        for g in range(num_groups):
-            v = create_weight_view(
-                ctx, epn, w_elems, group=g, groups=num_groups, slot=s, slots=num_slots
-            )
-            v.fill_(-1.0)
-            views.append(v)
-        slot_views.append(views)
+    num_groups, num_slots = 3, 2
+    slot_views = []  # prefetch 返回视图按槽缓存（首调创建）
 
     etc_cpu = etc.cpu()
 
@@ -667,9 +657,11 @@ def test_moonep_prefetch_weight_multislot():
             _fill_weight_real(rank, epn, w_elems, g) * (s + 1)
             for g in range(num_groups)
         ]
-        prefetch_weight(ctx, etc, reals, slot_views[s], epn)
-        torch.npu.synchronize()
-        _verify_slot([v.cpu() for v in slot_views[s]], s, "")
+        slot_w, _slot_s = prefetch_weight(ctx, etc, reals, epn, slot=s, slots=num_slots)
+        slot_views.append(slot_w)
+        # 空槽哨兵（库内 fill 已移除）：fill → barrier → 同槽复推
+        fill_and_repush(ctx, etc, (slot_w, _slot_s), epn, slot=s, slots=num_slots)
+        _verify_slot([v.cpu() for v in slot_w], s, "")
         # 已写槽的数据在后续槽预取后须原样保留（双缓冲语义）
         if s > 0:
             _verify_slot([v.cpu() for v in slot_views[0]], 0, "复检 ")
@@ -686,7 +678,7 @@ def test_moonep_prefetch_weight_dualslot():
     取视图 home 行切片（参数建在视图上的推荐形态）——覆盖 sync_transport
     的同址零拷贝跳过路径。
     """
-    from prefetch_weight import create_weight_view, prefetch_weight
+    from prefetch_weight import prefetch_weight
 
     rank, world_size = _init_ep_group()
     num_tokens, top_k, epn = 64, 8, 4
@@ -704,21 +696,18 @@ def test_moonep_prefetch_weight_dualslot():
     _, _, etc, _, _ = moonep_plan(ctx, tpe_my, topk_my)
     torch.npu.synchronize()
 
-    reals, views = [], []
-    for g in range(num_groups):
-        real = _fill_weight_real(rank, epn, w_elems, g)
-        view = create_weight_view(
-            ctx, epn, w_elems, group=g, groups=num_groups, slot=1, slots=2
-        )
-        view.fill_(-1.0)
-        view[:epn] = real  # 推荐形态：参数直接建在视图 home 行上
-        reals.append(view[:epn])  # 直推源 = home 行切片（home 同步零拷贝）
-        views.append(view)
-
-    prefetch_weight(ctx, etc, reals, views, epn)
-    torch.npu.synchronize()
+    # 槽 0 首建（显式 real——视图创建 + home 拷贝 + 推送）
+    reals0 = [_fill_weight_real(rank, epn, w_elems, g) for g in range(num_groups)]
+    prefetch_weight(ctx, etc, reals0, epn, slot=0, slots=2)
+    # 槽 1：显式 real 建视图 + 推送；随后以 home 行切片为零拷贝 real 复推
+    # （data_ptr 同址——sync_transport 跳过，覆盖推荐零拷贝形态）
+    reals1 = [_fill_weight_real(rank, epn, w_elems, g) for g in range(num_groups)]
+    views1_w, _views1_s = prefetch_weight(ctx, etc, reals1, epn, slot=1, slots=2)
+    # 空槽哨兵（库内 fill 已移除）：fill → barrier → 零拷贝复推（home 行
+    # 切片——同址跳过，即本用例原本要覆盖的推荐零拷贝形态）
+    fill_and_repush(ctx, etc, (views1_w, _views1_s), epn, slot=1, slots=2)
     etc_cpu = etc.cpu()
-    for g, view in enumerate(views):
+    for g, view in enumerate(views1_w):
         _verify_prefetch_view(
             view.cpu(), etc_cpu, _PrefetchCase(rank, epn, w_elems), g, f"双槽 组 {g} "
         )
@@ -744,26 +733,26 @@ def test_moonep_reduce_grad_bf16(mode):
     ctx, etc, *_ = _plan_case(rank, shape, mode)
 
     # 同一非零编码模式分别走 fp32 / bf16（bf16 输入自带舍入，容差 5% 覆盖）。
-    # 槽区 dtype 跟随 grad_dtype：fp32 轮先固化结果再重填 bf16 槽（同基址顺序复用）
-    homes32, _ = _fill_grad_views(ctx, 1, epn, w_elems, 0.0, grad_dtype=torch.float32)
-    reduce_grad(ctx, etc, homes32, epn)
+    # dtype 从张量解析：fp32 轮先固化结果再跑 bf16 轮（同槽基址顺序复用）
+    grads32 = _full_dw_tensors(2, epn, w_elems, 0.0, grad_dtype=torch.float32)
+    reduce_grad(ctx, etc, grads32, epn)
     torch.npu.synchronize()
-    fp32_vals = homes32[0].cpu().float()
+    fp32_vals = grads32[0][:epn].cpu().float()
 
-    homes16, slots16 = _fill_grad_views(
-        ctx, 1, epn, w_elems, 0.0, grad_dtype=torch.bfloat16
-    )
-    reduce_grad(ctx, etc, homes16, epn)
+    grads16 = _full_dw_tensors(2, epn, w_elems, 0.0, grad_dtype=torch.bfloat16)
+    reduce_grad(ctx, etc, grads16, epn)
     torch.npu.synchronize()
-    bf16_vals = homes16[0].cpu().float()
+    bf16_vals = grads16[0][:epn].cpu().float()
     diff = (fp32_vals - bf16_vals).abs().max()
     rel = diff / (fp32_vals.abs().max() + 1e-6)
     assert float(rel) <= 5e-2, f"bf16 与 fp32 路径不一致（rel={float(rel):.4f}）"
     for j in range(epn):
-        exp_slot = float((epn + j + 1) + 0.0)
+        exp_tail = float((epn + j + 1) + 0.0)
         assert torch.allclose(
-            slots16[0].cpu()[j].float(), torch.full((w_elems,), exp_slot), atol=1e-2
-        ), f"bf16 副本槽 {j} 被改写（v4 不清零契约）"
+            grads16[0][epn + j].cpu().float(),
+            torch.full((w_elems,), exp_tail),
+            atol=1e-2,
+        ), f"bf16 副本行 {j} 被改写（full-dW 只读契约）"
 
 
 @pytest.mark.npu
@@ -783,7 +772,7 @@ def test_moonep_precision_pipeline_fp32_then_bf16():
     `sync_transport` 从 real_weights 复制来的输入侧数据，不是算子计算结果；
     其写入正确性由 `test_moonep_prefetch_weight*` 的独立断言覆盖。
     """
-    from prefetch_weight import create_weight_view, prefetch_weight
+    from prefetch_weight import prefetch_weight
     from reduce_grad import reduce_grad
 
     rank, world_size = _init_ep_group()
@@ -857,17 +846,12 @@ def test_moonep_precision_pipeline_fp32_then_bf16():
     }
 
     # ---- prefetch：副本槽逐元素精确比对（期望值由编码公式独立给出）----
-    reals, views = [], []
-    for g in range(num_groups):
-        real = _fill_weight_real(rank, epn, w_elems, g)
-        view = create_weight_view(ctx, epn, w_elems, group=g, groups=num_groups)
-        view.fill_(-1.0)
-        reals.append(real)
-        views.append(view)
-    prefetch_weight(ctx, etc, reals, views, epn)
-    torch.npu.synchronize()
+    reals = [_fill_weight_real(rank, epn, w_elems, g) for g in range(num_groups)]
+    views_w, views_s = prefetch_weight(ctx, etc, reals, epn)
+    # 空槽哨兵（库内不做 fill）：fill → barrier → 复推
+    fill_and_repush(ctx, etc, (views_w, views_s), epn)
     checked_slots = 0
-    for g, view in enumerate(views):
+    for g, view in enumerate(views_w):
         w_cpu = view.cpu()
         # 只比对副本槽（后 epn 行）；home 行是输入侧数据，按约定跳过
         for j in range(epn):
@@ -903,8 +887,8 @@ def test_moonep_precision_pipeline_fp32_then_bf16():
                 "请缩小编码基数或行数，逐位比较不成立"
             )
 
-    def _check_reduce_strict(homes_g, slots_g, dtype, tag):
-        for g, (dw, slot) in enumerate(zip(homes_g, slots_g)):
+    def _check_reduce_strict(grads_g, dtype, tag):
+        for g, dw in enumerate(grads_g):
             dw_cpu = dw.cpu()
             for i in range(epn):
                 exp_val = _expect_merged_row(case, g, i, base)
@@ -918,22 +902,22 @@ def test_moonep_precision_pipeline_fp32_then_bf16():
                         f"实得 {got[0].item()}（max|Δ|={(got - exp).abs().max().item()}）"
                     )
             for j in range(epn):
-                exp_slot = torch.tensor(
+                exp_tail = torch.tensor(
                     float((epn + j + 1) * (g + 1) + base), dtype=dtype
                 ).float()
                 assert torch.allclose(
-                    slot.cpu()[j].float(), exp_slot.expand(w_elems), atol=1e-2
+                    dw_cpu[epn + j].float(), exp_tail.expand(w_elems), atol=1e-2
                 ), (
-                    f"{tag} 组 {g} 副本槽 {j} 被改写（v4 不清零契约，"
-                    f"应保持 FFN 写入值 {exp_slot.item()}）"
+                    f"{tag} 组 {g} 副本行 {j} 被改写（full-dW 契约：副本段只读，"
+                    f"应保持调用方写入值 {exp_tail.item()}）"
                 )
 
-    grad32_h, grad32_s = _fill_grad_views(
-        ctx, num_groups, epn, w_elems, base, grad_dtype=torch.float32
+    grad32_h = _full_dw_tensors(
+        num_groups, epn, w_elems, base, grad_dtype=torch.float32
     )
     reduce_grad(ctx, etc, grad32_h, epn)
     torch.npu.synchronize()
-    _check_reduce_strict(grad32_h, grad32_s, torch.float32, "fp32")
+    _check_reduce_strict(grad32_h, torch.float32, "fp32")
     assert nontrivial["rows_with_copies"] == len(my_experts_with_copies) * num_groups, (
         f"归并校验覆盖的副本行数 {nontrivial['rows_with_copies']} != "
         f"{len(my_experts_with_copies) * num_groups}"
@@ -941,16 +925,16 @@ def test_moonep_precision_pipeline_fp32_then_bf16():
         "：期望值计算与路由表不一致"
     )
 
-    grad16_h, grad16_s = _fill_grad_views(
-        ctx, num_groups, epn, w_elems, base, grad_dtype=torch.bfloat16
+    grad16_h = _full_dw_tensors(
+        num_groups, epn, w_elems, base, grad_dtype=torch.bfloat16
     )
     reduce_grad(ctx, etc, grad16_h, epn)
     torch.npu.synchronize()
-    _check_reduce_strict(grad16_h, grad16_s, torch.bfloat16, "bf16")
+    _check_reduce_strict(grad16_h, torch.bfloat16, "bf16")
     for g in range(num_groups):
-        assert torch.equal(grad32_h[g].float().cpu(), grad16_h[g].float().cpu()), (
-            f"组 {g} fp32 与 bf16 归并结果不一致（跨 dtype 复用脏数据）"
-        )
+        assert torch.equal(
+            grad32_h[g][:epn].float().cpu(), grad16_h[g][:epn].float().cpu()
+        ), f"组 {g} fp32 与 bf16 归并结果不一致（跨 dtype 复用脏数据）"
 
 
 @pytest.mark.npu
@@ -987,6 +971,10 @@ def test_moonep_layout_formulas():
         ), "副本行段越组界"
     # 堆终点 = 发布区 + 尾部对齐余量
     assert LAYOUT_TAIL_BYTES >= 32
+    # 变宽组（交织型）：(2W, W) 与等宽 3 组字节相同（2W + W = 3W）
+    assert reduce_stg_off(epn, widths=(2 * w_elems, w_elems), slots=slots) == (
+        reduce_stg_off(epn, w_elems, num_groups=3, slots=slots)
+    ), "交织 2 组与等宽 3 组发布区终点应一致"
 
 
 # ---------------------------------------------------------------------------
@@ -1038,7 +1026,7 @@ def test_moonep_general_spec_8192_h7168_k16_epn28():
     资源：权重视图 3 组 × [2epn, H×16] bf16 ≈ 38MB，reduce staging
     ≈ 51MB（HCCL 对称堆），需 HCCL_BUFFSIZE 足够（本仓跑法设 4096）。
     """
-    from prefetch_weight import create_weight_view, prefetch_weight
+    from prefetch_weight import prefetch_weight
     from reduce_grad import reduce_grad
 
     rank, world_size = _init_ep_group()
@@ -1099,22 +1087,16 @@ def test_moonep_general_spec_8192_h7168_k16_epn28():
             )
 
     # ---- prefetch：3 组权重 ----
-    reals, views = [], []
-    for g in range(num_groups):
-        real = _fill_weight_real(rank, epn, w_elems, g)
-        view = create_weight_view(ctx, epn, w_elems, group=g, groups=num_groups)
-        view.fill_(-1.0)
-        view[:epn] = real
-        reals.append(real)
-        views.append(view)
-    prefetch_weight(ctx, etc, reals, views, epn)
-    torch.npu.synchronize()
+    reals = [_fill_weight_real(rank, epn, w_elems, g) for g in range(num_groups)]
+    views_w, views_s = prefetch_weight(ctx, etc, reals, epn)
+    # 空槽哨兵（库内 fill 已移除）：fill → barrier → 复推
+    fill_and_repush(ctx, etc, (views_w, views_s), epn)
     case = _PrefetchCase(rank, epn, w_elems)
-    for g, view in enumerate(views):
+    for g, view in enumerate(views_w):
         _verify_prefetch_view(view.cpu(), etc_cpu, case, g, f"spec 组 {g} ")
 
     # ---- reduce_grad：3 组梯度 ----
-    grads = _fill_grad_views(num_groups, epn, w_elems, 0.0)
+    grads = _full_dw_tensors(num_groups, epn, w_elems, 0.0)
     reduce_grad(ctx, etc, grads, epn)
     torch.npu.synchronize()
     _verify_reduce_views(
@@ -1148,7 +1130,7 @@ def test_moonep_prefetch_overlap_async():
     阻塞到侧流全部完成（负载 + 直推，数百 ms）；async 路径应在负载仍在
     执行时即返回（side.query() 为 False 是 host 未阻塞的直接证据）。
     """
-    from prefetch_weight import create_weight_view, prefetch_weight
+    from prefetch_weight import prefetch_weight
 
     rank, world_size = _init_ep_group()
     num_tokens, top_k, epn = 64, 8, 4
@@ -1157,24 +1139,23 @@ def test_moonep_prefetch_overlap_async():
     num_groups = 3
     ctx, etc, *_ = _plan_case(rank, shape, "balanced", seed=21)
 
-    reals, views = [], []
-    for g in range(num_groups):
-        real = _fill_weight_real(rank, epn, w_elems, g)
-        view = create_weight_view(ctx, epn, w_elems, group=g, groups=num_groups)
-        view.fill_(-1.0)
-        reals.append(real)
-        views.append(view)
+    reals = [_fill_weight_real(rank, epn, w_elems, g) for g in range(num_groups)]
 
     # 热身（阻塞形态，同 spec）：预热编译/HCCL/清单缓存——否则首拍 host 开销
-    # （编译秒级）会比侧流负载还长，污染"host 未阻塞"判据
-    prefetch_weight(ctx, etc, reals, views, epn)
-    for view in views:
+    # （编译秒级）会比侧流负载还长，污染"host 未阻塞"判据；视图随热身创建
+    views_w, views_s = prefetch_weight(ctx, etc, reals, epn)
+    for view in views_w:
         view.fill_(-1.0)  # 清掉热身数据：async 调用必须重新填槽，校验才有意义
+    # 空槽哨兵时序（库内 fill 已移除——bcdf4d8）：全组 fill 先于 async
+    # push（fill 在本 rank 默认流、push 在侧流，跨 rank 须显式对齐）
+    from moonep_context import sym_barrier
+
+    sym_barrier(ctx)
 
     side = torch.npu.Stream()
     _side_stream_load(side)
     with torch.npu.stream(side):
-        ev = prefetch_weight(ctx, etc, reals, views, epn, async_finish=True)
+        _views_a, ev = prefetch_weight(ctx, etc, reals, epn, async_finish=True)
     assert ev is not None, "async_finish=True 应返回发起流完成事件"
     still_busy = not side.query()
     assert still_busy, (
@@ -1193,7 +1174,7 @@ def test_moonep_prefetch_overlap_async():
     torch.npu.synchronize()
     case = _PrefetchCase(rank, epn, w_elems)
     etc_cpu = etc.cpu()
-    for g, view in enumerate(views):
+    for g, view in enumerate(views_w):
         _verify_prefetch_view(view.cpu(), etc_cpu, case, g, f"async 组 {g} ")
     exp_home = (
         torch.tensor(
@@ -1203,10 +1184,9 @@ def test_moonep_prefetch_overlap_async():
         .unsqueeze(1)
         .expand(epn, w_elems)
     )
-    assert torch.equal(views[0].cpu()[:epn], exp_home), "async home 行未写入"
+    assert torch.equal(views_w[0].cpu()[:epn], exp_home), "async home 行未写入"
 
 
-# test_moonep_reduce_overlap_async 已删除（2026-10-31）：
-# pull 协议 reduce_grad 移除 async_finish kwarg（master 77dc5d2 契约变更），
-# 侧流并发语义由 barrier kwarg 的发射序纪律承担（sync_transport_stream +
-# sym_barrier）。async_finish 路径仅保留于 prefetch_weight（其用例不删）。
+# reduce_grad 的 async_finish kwarg 极性与 finish_op 对齐
+# （True=异步 Event / False=阻塞），侧流并发语义由发射序
+# 纪律承担（sync_transport_stream + sym_barrier）。

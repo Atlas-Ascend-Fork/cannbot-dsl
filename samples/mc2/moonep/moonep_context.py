@@ -39,57 +39,37 @@ from cannbotdsl.ops.distributed import (
 )
 from cannbotdsl.ops.distributed.context import hccl
 
-# 对称堆内布局（字节偏移，均以 heap_base=4096 为基址，32B 对齐）：
-#   [0, PLAN_REGION_END)         元数据与同步标志区
-#   [prefetch_weight_off(), ...) 权重视图（每组包含本地专家行与预取槽）
-#   [reduce_stg_off(...), ...)   发布区之后的工作缓冲区
-# 同步标志与工作缓冲区使用各自的固定基址。
-# 各区域基址由下列函数按运行时形状计算，所有 rank 公式一致 → 结果一致。
-HEAP_BASE = 4096  # 对称堆基址（与 cannbotdsl SymBuffer 的默认 heap_base 一致）
-MAX_E = 1024  # v1 支持的专家总数上限
-MAX_R = 64  # COMM_MAX_RANK_NUM
-DEM_ALL_OFF = 0  # (MAX_R, MAX_E) int32：各 rank 本地计数交换区（256KB）
-READY_OFF = MAX_R * MAX_E * 4  # (MAX_R,) int32：元数据就绪标志
-BAR_FLAGS_OFF = READY_OFF + MAX_R * 4  # (MAX_R,) int32：rank 自旋同步屏障的 epoch flag
-LAYOUT_TAIL_BYTES = 4096  # 区域尾部对齐余量（32B 对齐要求下取整页）
-PLAN_REGION_END = BAR_FLAGS_OFF + MAX_R * 4 + LAYOUT_TAIL_BYTES
-
-
-def prefetch_weight_off() -> int:
-    """prefetch 权重发布区基址（紧随 plan 交换区）。"""
-    return PLAN_REGION_END
-
-
-def reduce_stg_off(epn: int, w_elems: int, num_groups: int = 1, slots: int = 1) -> int:
-    """权重发布区后的工作缓冲区基址（发布区按 slots×num_groups 预留）。
-
-    每组发布区是完整的 [2*epn, W] bf16 权重视图（真实行 + 预取槽同址），
-    组步长必须按整视图 2*epn*W*2 字节计——按 epn*W*2 计会使组间重叠一半
-    （组 g+1 起点压在组 g 的预取槽区正中）。slots 为多槽窗口池层数
-    （槽 s、组 g 的视图基址 = prefetch_weight_off + (s*num_groups+g)*步长）：
-    双槽轮转使 GEMM 可直读当前槽视图，下一层 prefetch 写另一槽，免快照拷贝。
-    """
-    return prefetch_weight_off() + slots * num_groups * 2 * epn * w_elems * 2
-
-
-def grad_slot_off(epn: int, w_elems: int, num_groups: int = 1, slots: int = 1) -> int:
-    """pull 协议梯度槽区基址（紧随权重发布区）。"""
-    return reduce_stg_off(epn, w_elems, num_groups, slots)
-
-
-def reduce_region_end(
-    world_size: int,
-    epn: int,
-    w_elems: int,
-    num_groups: int = 1,
-    slots: int = 1,
-    grad_bytes_per_elem: int = 2,
-) -> int:
-    """pull 协议的堆上界（含梯度槽区）。"""
-    slot_off = grad_slot_off(epn, w_elems, num_groups, slots)
-    return (
-        slot_off + num_groups * epn * w_elems * grad_bytes_per_elem + LAYOUT_TAIL_BYTES
-    )
+# ---------------------------------------------------------------------------
+# moonep_layout 为布局契约唯一真源
+# （常量 + 区域公式 + LCM），moonep_topology 为 rank graph 层选择补丁
+# （host 侧建链驱动——见其模块 docstring）。此处重导出全部符号，
+# 既有 import 面（from moonep_context import HEAP_BASE, ...）零变更。
+# ---------------------------------------------------------------------------
+from moonep_layout import (  # noqa: F401
+    BAR_FLAGS_OFF,
+    DEM_ALL_OFF,
+    HEAP_BASE,
+    LAYOUT_TAIL_BYTES,
+    MAX_E,
+    MAX_R,
+    PLAN_REGION_END,
+    READY_OFF,
+    ROWS_PER_EXPERT,
+    SCALE_ALIGN_BYTES,
+    WEIGHT_BYTES,
+    WEIGHT_DTYPE,
+    XFER_WORKSPACE_BYTES,
+    grad_slot_off,
+    lcm_slot_stride,
+    prefetch_weight_off,
+    reduce_region_end,
+    reduce_stg_off,
+    slot_stride_bytes,
+)
+from moonep_topology import (  # noqa: F401
+    _patch_rank_graph_layer_selection,
+    _select_rank_graph_links_by_protocol,
+)
 
 
 _RESIDENT_BLOCKS = None  # 本机有效 AIV 核数（首次查询后缓存）
@@ -172,14 +152,22 @@ def finish_op(context, async_finish=False):
     return ev
 
 
-def normalize_group_list(context, tensors, op_name):
-    """将 Tensor、list 或 tuple 归一化为列表，并检查组数、行宽和布局元数据。
+def normalize_group_list(context, tensors, op_name, *, min_groups=2, max_groups=3):
+    """将 Tensor、list 或 tuple 归一化为列表，并检查组数、形状和布局元数据。
 
-    返回 (tensors, w_elems)。同一上下文内的组数由首次调用确定。"""
+    返回 ``(tensors, widths)``：``widths`` 为各组行宽元组（元素数）——
+    支持变宽组（交织型 W13 宽 2W、down 宽 W）。同一上下文内的组数由
+    首次调用确定（layout_groups 守卫防发布区/槽区错位）。
+    """
     if isinstance(tensors, torch.Tensor):
         tensors = [tensors]
     if not tensors:
-        raise ValueError(f"{op_name} 至少一组（可为单 Tensor 或多组 list/tuple）")
+        raise ValueError(f"{op_name} 组列表为空（须 {min_groups}~{max_groups} 组）")
+    if not (min_groups <= len(tensors) <= max_groups):
+        raise ValueError(
+            f"{op_name} 支持 {min_groups} 组或 {max_groups} 组（kernel 入口按组数"
+            f"固定），实得 {len(tensors)} 组"
+        )
     if context.layout_groups is None:
         context.layout_groups = len(tensors)
     elif context.layout_groups != len(tensors):
@@ -187,21 +175,43 @@ def normalize_group_list(context, tensors, op_name):
             f"权重组数不一致（已有 {context.layout_groups}，本次 {len(tensors)}），"
             "会导致发布/staging 区重叠"
         )
-    w_elems = tensors[0].shape[1]
-    if any(t.shape[1] != w_elems for t in tensors):
-        raise ValueError("多组的行宽 W 必须一致（gate/up/down 同为 H*H'）")
+    widths = []
+    for g, t in enumerate(tensors):
+        if t.dim() < 2 or t.shape[0] == 0:
+            raise ValueError(
+                f"{op_name} 第 {g} 组须为 (行, ...) >= 2 维，实得 {tuple(t.shape)}"
+            )
+        # 行宽 = 尾维展平宽（N-D 形态如 [行, F, D]——调用方免 reshape）；
+        # 行宽 0（如 [行, 0] 张量）须入口拦截——下游 LCM 公式会除零
+        w = int(t.numel() // t.shape[0])
+        if w <= 0:
+            raise ValueError(
+                f"{op_name} 第 {g} 组行宽须为正（尾维展平宽），实得 {w}"
+                f"（张量形状 {tuple(t.shape)}）"
+            )
+        widths.append(w)
+    # 组宽守卫（E4）：与首调定型值一致——梯度槽区基址按实际 widths 计算，
+    # 宽度漂移会使槽区起点落进权重发布区（发布/槽区重叠互踩）
+    widths = tuple(widths)
+    if context.layout_widths is None:
+        context.layout_widths = widths
+    elif widths != context.layout_widths:
+        raise RuntimeError(
+            f"{op_name} 组宽不一致（已有 {context.layout_widths}，本次 {widths}）"
+            "——宽度变化会使梯度槽区基址错位、发布/槽区重叠"
+        )
     if context.last_plan_shape is None:
         raise RuntimeError(
             f"{op_name} 需要先设置 context.last_plan_shape（输入形状与窗口布局）"
         )
-    return tensors, w_elems
+    return tensors, widths
 
 
 def pick_weight_chunk(w_elems: int, ub_limit_elems: int) -> int:
     """UB 分块粒度：整行单块（W<=ub_limit）或最大 2 的幂因子（保证整除、无尾块）。
 
     DSL 的 tile_slice 拒绝静态部分宽度尾块与超尺寸 tile，因此分块必须
-    满足 W % chunk == 0。W=H*CH2（H=7168=2^10*7）必能命中；W 非 512 倍数且超
+    满足 W % chunk == 0。W=H*Hp（H=3584=2^9*7）必能命中；W 非 512 倍数且超
     上限时抛 ValueError。
     """
     if w_elems <= ub_limit_elems:
@@ -265,6 +275,19 @@ class MoonepContext:
         # 多权重组布局守卫：同一上下文的组数须一致，避免发布区与工作区重叠
         # （内部状态，勿改）
         self.layout_groups = None
+        # 组结构守卫：各组行宽/scale 行宽首调定型、此后不可变
+        # ——梯度槽区基址按实际 widths 计算，宽度漂移会使槽区起点落进发布区
+        # （内部状态，勿改）
+        self.layout_widths = None
+        self.layout_scale_widths = None
+        # 权重 dtype 定型值：MoonepBuffer 构造传入（weight_dtype）；
+        # 裸 API 首次 prefetch 冻结。dtype 进编译键与视图 dtype，不可漂移
+        # （内部状态，勿改）
+        self.weight_dtype = None
+        # grad dtype 定型值：MoonepBuffer 构造传入（grad_dtype，
+        # 缺省 bf16）；裸 API 首次 reduce 冻结。local_grads 的 dtype 校验基
+        # （内部状态，勿改）
+        self.grad_dtype = None
         # 多槽窗口池层数：首个 create_weight_view 定型（缺省 1 = 单槽），
         # 后续调用须一致；reduce 容量校验按它推导（内部状态，勿改）
         self.window_slots = None
@@ -368,23 +391,6 @@ def check_no_shared_elastic_buffer(group_name):
             )
 
 
-def scalar_read_fence_pre(event_id):
-    """清单加载护栏·前置（S→MTE2）：与 busy_wait_flag 同款完整握手的前半。"""
-    vec_sync_notify(PIPE.S, PIPE.MTE2, event_id)
-    vec_sync_wait(PIPE.S, PIPE.MTE2, event_id)
-
-
-def scalar_read_fence_post(event_id):
-    """清单加载护栏·后置（MTE2→S）：标量读/坐标读前等拷贝落地。
-
-    以运行时标量驱动控制流（cannbotdsl.range 界/运行时 if/下标/tile 坐标）
-    前必须按 pre→拷贝→post 完整握手——否则标量单元可能读到 mem_copy 尚未
-    落地的 UB 内容（非确定性错；实测 cnt=0 致整轮直推静默跳过）。
-    """
-    vec_sync_notify(PIPE.MTE2, PIPE.S, event_id)
-    vec_sync_wait(PIPE.MTE2, PIPE.S, event_id)
-
-
 def busy_wait_flag(view, gm_epoch, event_id, ub_flag=None, ub_epoch=None, exact=False):
     """轮询 view 处 flag 就位（缺省 >= gm_epoch；exact=True 时 == gm_epoch）。
 
@@ -424,16 +430,14 @@ def busy_wait_flag(view, gm_epoch, event_id, ub_flag=None, ub_epoch=None, exact=
 # ---------------------------------------------------------------------------
 # 对称堆上的 rank 自旋同步屏障
 # ---------------------------------------------------------------------------
-# dist.barrier 落到 HCCL SoleMesh 4B allreduce，高并发通信负载下存在对称
-# 死锁风险（多 rank 永久挂起）。此处用与数据面相同的 put/flag 通道做 rank
-# 对齐：flag 与数据同通道保序，kernel 返回即全组本轮流上工作全部完成，
-# 不经过 HCCL 集合通信路径。
+# sym_barrier 独立实现的依据：①流级设备序保证强于
+# host 侧集合通信（kernel 返回即全组本轮此前流上工作完成）；②无 host 往返；
+# ③epoch 单调防陈旧 flag 提前放行。用与数据面相同的 put/flag 通道做 rank
+# 对齐：flag 与数据同通道保序，不经过 HCCL 集合通信路径。
 _BAR_EVENT_ID = 5  # plan=7、reduce=6、barrier=5
 _BAR_EPOCH = 0  # 跨算子共享的单调 rank 同步屏障 epoch（各次调用共用一套 flag）
 _BAR_PROGRAMS = {}
 _BAR_LOCK = threading.Lock()
-_BAR_ME = 0  # 组内 rank（编译锁内写入，trace 期烘焙）
-_BAR_R = 1  # 组内 rank_size（进编译缓存键）
 
 
 @kernel
@@ -478,42 +482,14 @@ class _MoonepBarrierKernel:
                 )
 
 
-@host
-def _barrier_host(gm_epoch, ctx: StructRef[CommContext]):
-    _MoonepBarrierKernel(_BAR_ME, _BAR_R)[1](gm_epoch, ctx)
+def _make_barrier_host(me, world_size):
+    """闭包工厂：rank/rank_size 进闭包参数（无 global 烘焙）。"""
 
+    @host
+    def _barrier_host(gm_epoch, ctx: StructRef[CommContext]):
+        _MoonepBarrierKernel(me, world_size)[1](gm_epoch, ctx)
 
-def barrier_tail(xfer, ctx, gm_epoch, me, world_size, ub_flag, ub_epoch):
-    """kernel 内联的 rank 同步屏障尾段：flag 广播 + 收齐（与 _MoonepBarrierKernel 同协议）。
-
-    供算子 kernel 融合发射使用（省一次独立 rank 同步屏障 launch，~550µs/次的发射器
-    host 开销）。语义与独立 sym_barrier 等价：本 kernel 完成即全组各 peer 的
-    epoch flag 到达（flag 与数据同通道保序——peer 的 flag 到达意味着其发往
-    本 rank 的数据已落地）。ub_flag/ub_epoch 由调用方在 kernel 入口分配一次
-    传入（VEC buf_id 预算）。
-    """
-    flags = SymBuffer(
-        ctx,
-        shape=(MAX_R,),
-        dtype=dtypes.int32,
-        rank_size=world_size,
-        base_offset=BAR_FLAGS_OFF,
-    )
-    for r in range_constexpr(world_size):
-        if const_expr(r != me):
-            xfer.put(r, tile_slice(flags, (1,), (me,)).peer(r), gm_epoch)
-    for r in range_constexpr(world_size):
-        if const_expr(r != me):
-            xfer.flush(r)
-    for r in range_constexpr(world_size):
-        if const_expr(r != me):
-            busy_wait_flag(
-                tile_slice(flags, (1,), (r,)),
-                gm_epoch,
-                _BAR_EVENT_ID,
-                ub_flag,
-                ub_epoch,
-            )
+    return _barrier_host
 
 
 def record_transport_event(context, stream=None):
@@ -532,15 +508,13 @@ def record_transport_event(context, stream=None):
 
 
 def _get_barrier_program(world_size, me):
-    """(world_size, me) 键控的 rank 同步屏障 program（烘焙与编译在锁内原子完成）。"""
+    """(world_size, me) 键控的 rank 同步屏障 program（闭包参数化，无 global）。"""
     key = (world_size, me)
     with _BAR_LOCK:
         prog = _BAR_PROGRAMS.get(key)
         if prog is None:
-            global _BAR_ME, _BAR_R
-            _BAR_ME, _BAR_R = me, world_size
             prog = cannbotdsl.compile(
-                _barrier_host,
+                _make_barrier_host(me, world_size),
                 TensorSpec((1,), dtypes.int32),
                 StructRef[CommContext],
             )
@@ -548,8 +522,24 @@ def _get_barrier_program(world_size, me):
     return prog
 
 
+def next_barrier_epoch(context):
+    """推进本轮 barrier epoch 并写回设备张量（1 元素 int32），返回该张量。
+
+    独立 barrier kernel 与内联在算子里的收尾 barrier 共用同一个 epoch 计数，
+    保证两种形态交错调用时 flag 不会串轮。
+    """
+    global _BAR_EPOCH
+    _BAR_EPOCH += 1
+    gm_epoch = context.bar_epoch_t
+    if gm_epoch is None:
+        gm_epoch = torch.empty(1, dtype=torch.int32, device="npu")
+        context.bar_epoch_t = gm_epoch
+    gm_epoch.fill_(_BAR_EPOCH)  # 复用张量：省掉每步一次分配
+    return gm_epoch
+
+
 def sym_barrier(context, *, sync=True):
-    """对称堆上的 rank 自旋同步屏障：替代 dist.barrier（绕开 HCCL SoleMesh 集合通信死锁）。
+    """对称堆自旋 barrier：dist.barrier 的流级强化替代（非因后者不可用）。
 
     语义与同流 dist.barrier 等价且更强：返回时全组 rank 本轮此前流上工作全部
     完成（kernel 内自旋收齐各 peer 的 epoch flag，flag 与数据同通道保序）。
@@ -560,13 +550,7 @@ def sym_barrier(context, *, sync=True):
     排在它之后），host 立即返回。供 async_finish 路径的组间 staging 复用
     同步屏障使用：staging 覆写的跨 rank 安全是设备序问题，不需要 host 等待。
     """
-    global _BAR_EPOCH
-    _BAR_EPOCH += 1
-    gm_epoch = context.bar_epoch_t
-    if gm_epoch is None:
-        gm_epoch = torch.empty(1, dtype=torch.int32, device="npu")
-        context.bar_epoch_t = gm_epoch
-    gm_epoch.fill_(_BAR_EPOCH)  # 复用张量：省掉每步一次分配
+    gm_epoch = next_barrier_epoch(context)
     _get_barrier_program(context.rank_size, context.rank)(gm_epoch, context.ctx_tensor)
     if not sync:
         return

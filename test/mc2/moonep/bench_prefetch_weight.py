@@ -26,11 +26,14 @@ import torch.distributed as dist
 import torch_npu
 
 sys.path.insert(
-    0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "samples", "mc2", "moonep")
+    0,
+    os.path.join(
+        os.path.dirname(__file__), "..", "..", "..", "samples", "mc2", "moonep"
+    ),
 )
 
 from moonep_context import create_moonep_context, sym_barrier  # noqa: E402
-from prefetch_weight import create_weight_view, prefetch_weight  # noqa: E402
+from prefetch_weight import prefetch_weight  # noqa: E402
 
 # 精确匹配 DSL 生成的 kernel 名（mangled 名里含 "MoonepPrefetchPushKernel"、
 # "MoonepBarrierKernel"），避免把 dist.barrier() 的 HCCL kernel 或 Fill 算进来。
@@ -122,22 +125,19 @@ def main():
     ctx = create_moonep_context()
     ctx.last_plan_shape = (32, 8)  # 绕开 plan 的调用顺序守卫
 
-    reals, views = [], []
-    for g in range(3):
-        real = torch.full(
+    reals = [
+        torch.full(
             (args.epn, args.w_elems), float(rank * 1000 + g), dtype=torch.bfloat16
         ).npu()
-        view = create_weight_view(ctx, args.epn, args.w_elems, group=g, groups=3)
-        view.fill_(-1.0)
-        reals.append(real)
-        views.append(view)
+        for g in range(3)
+    ]
 
     for pattern in args.pattern.split(","):
         etc_cpu = _build_etc(pattern, world, args.epn)
         etc = etc_cpu.npu()
 
         for _ in range(args.warmup):  # 首次调用含编译
-            prefetch_weight(ctx, etc, reals, views, args.epn)
+            prefetch_weight(ctx, etc, reals, args.epn)
         torch.npu.synchronize()
         dist.barrier()
 
@@ -163,7 +163,7 @@ def main():
         ) as prof:
             for _ in range(args.iters):
                 sym_barrier(ctx)
-                prefetch_weight(ctx, etc, reals, views, args.epn)
+                prefetch_weight(ctx, etc, reals, args.epn)
                 torch.npu.synchronize()
             prof.step()
 

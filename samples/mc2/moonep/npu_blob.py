@@ -51,6 +51,14 @@ torch::Tensor npu_from_blob(int64_t addr, std::vector<int64_t> sizes, std::strin
         options = at::TensorOptions().dtype(at::kBFloat16);
     } else if (dtype == "fp32") {
         options = at::TensorOptions().dtype(at::kFloat);
+    } else if (dtype == "uint8") {
+        options = at::TensorOptions().dtype(at::kByte);
+    } else if (dtype == "e4m3fn") {
+        options = at::TensorOptions().dtype(at::kFloat8_e4m3fn);
+    } else if (dtype == "e5m2") {
+        options = at::TensorOptions().dtype(at::kFloat8_e5m2);
+    } else if (dtype == "e8m0fnu") {
+        options = at::TensorOptions().dtype(at::kFloat8_e8m0fnu);
     } else if (dtype == "int32") {
         options = at::TensorOptions().dtype(at::kInt);
     } else {
@@ -99,5 +107,7 @@ def _get_ext():
 
 
 def npu_from_blob(addr, sizes, dtype):
-    """addr(int) + sizes(list[int]) + dtype("bf16"/"fp32"/"int32") -> NPU Tensor。"""
+    """addr(int) + sizes(list[int]) + dtype("bf16"/"fp32"/"uint8"/"e4m3fn"/
+    "e5m2"/"e8m0fnu"/"int32") -> NPU Tensor（mxfp8 数据面：e4m3fn/e5m2
+    权重 + e8m0fnu scale——OCP MX 标准编码）。"""
     return _get_ext().npu_from_blob(int(addr), list(sizes), str(dtype))

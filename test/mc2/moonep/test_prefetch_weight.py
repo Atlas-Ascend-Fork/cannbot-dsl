@@ -21,13 +21,27 @@ import torch
 
 sys.path.insert(0, os.path.dirname(__file__))
 sys.path.insert(
-    0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "samples", "mc2", "moonep")
+    0,
+    os.path.join(
+        os.path.dirname(__file__), "..", "..", "..", "samples", "mc2", "moonep"
+    ),
 )
 
-import prefetch_weight as pw  # noqa: E402
-from cannbotdsl.tensor import Layout  # noqa: E402
-from moonep_context import create_moonep_context  # noqa: E402
-from prefetch_weight import create_weight_view, prefetch_weight  # noqa: E402
+# 无 NPU 环境收集期兼容：守卫导入 + pytestmark skipif（裸 import
+# prefetch_weight → moonep_context → torch_npu 链在无 NPU 环境收集期失败）
+try:
+    import prefetch_weight as pw  # noqa: E402
+    from cannbotdsl.tensor import Layout  # noqa: E402
+    from moonep_context import create_moonep_context  # noqa: E402
+    from prefetch_weight import prefetch_weight  # noqa: E402
+
+    _HAS_DSL_IMPL = True
+except ImportError:
+    _HAS_DSL_IMPL = False
+
+pytestmark = pytest.mark.skipif(
+    not _HAS_DSL_IMPL, reason="requires NPU environment (cannbotdsl/torch_npu/HCCL)"
+)
 from prefetch_utils import (  # noqa: E402
     _H,
     _PrefetchCase,
@@ -38,7 +52,7 @@ from prefetch_utils import (  # noqa: E402
 
 
 @pytest.mark.npu
-def test_moonep_prefetch_weight_dsl_api(monkeypatch):
+def test_moonep_prefetch_weight_dsl_api(moonep_groups, monkeypatch):
     """prefetch_weight 在 layout 版 DSL（0.8）下的端到端验收。
 
     显式设置 context.last_plan_shape 并构造 experts_to_copy，独立验证
@@ -48,7 +62,9 @@ def test_moonep_prefetch_weight_dsl_api(monkeypatch):
     num_tokens, top_k, epn = 32, 8, 4
     w_elems = _H * 17  # 非默认行宽，确保重新 trace，不复用已编译 program
 
-    ctx = create_moonep_context()
+    # 独立子组建 ctx：裸 WORLD 会与本 session 其它文件已建的 EB 通信器
+    # 撞车（对称堆互踩守卫拒绝）
+    ctx = create_moonep_context(group=moonep_groups[0])
     ctx.last_plan_shape = (num_tokens, top_k)  # 设置窗口布局元数据
 
     # 每行至多一个 home rank，空槽填 -1
@@ -58,9 +74,6 @@ def test_moonep_prefetch_weight_dsl_api(monkeypatch):
     etc = etc_cpu.npu()
 
     reals = [_fill_weight_real(rank, epn, w_elems, g) for g in range(3)]
-    views = [create_weight_view(ctx, epn, w_elems, group=g, groups=3) for g in range(3)]
-    for view in views:
-        view.fill_(-1.0)
 
     # 记录真实 Buffer 构造参数：证明确实走了 0.8 的 (mem_loc, dtype, layout) 形态
     seen = []
@@ -72,8 +85,12 @@ def test_moonep_prefetch_weight_dsl_api(monkeypatch):
 
     monkeypatch.setattr(pw, "Buffer", _spy)
 
-    prefetch_weight(ctx, etc, reals, views, epn)
-    torch.npu.synchronize()
+    # 视图随调用按各组行宽创建并返回（统一 (views, event) 返回）
+    views_w, views_s = prefetch_weight(ctx, etc, reals, epn)
+    # 空槽哨兵（库内 fill 已移除——bcdf4d8）：fill → barrier → 复推
+    from conftest import fill_and_repush
+
+    fill_and_repush(ctx, etc, (views_w, views_s), epn)
 
     assert seen, "prefetch kernel 未重新 trace，Buffer 构造未被观测到"
     assert all(
@@ -82,7 +99,7 @@ def test_moonep_prefetch_weight_dsl_api(monkeypatch):
     ), f"0.8 Buffer 应收到 (dtype, Layout)，实得 {seen[:3]}"
 
     case = _PrefetchCase(rank, epn, w_elems)
-    for g, view in enumerate(views):
+    for g, view in enumerate(views_w):
         w_cpu = view.cpu()
         _verify_prefetch_view(w_cpu, etc_cpu, case, g=g, tag=f"dsl-api g{g} ")
         for i in range(epn):

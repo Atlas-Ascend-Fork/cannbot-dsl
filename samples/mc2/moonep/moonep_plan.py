@@ -1198,7 +1198,12 @@ def moonep_plan(context, tokens_per_expert, topk_experts_sk, *, verify=False):
     )
     # 跨流护栏 fork 点：只等我方算子，不等主流尾部
     record_transport_event(context, stream=cur_stream)
-    # 溢出检查延迟执行（返回路径零同步，不阻塞 dispatch 发射）
+    # 溢出检查延迟执行（返回路径零同步，不阻塞 dispatch 发射）；
+    # 冲洗上一轮延迟检查——async_finish 链的 finish_op 跳过检查且本行
+    # 无条件覆写，纯异步链的 plan 溢出信号曾在此被静默丢弃（
+    # moonep-architecture-challenge-review §3 发现：check 在旧值上执行，
+    # 旧 plan kernel 早已在本流前序完成，.item() 有界等待无死锁面）
+    check_pending_overflow(context)
     context.pending_overflow = (cu_seqlens, num_rows)
     context.last_plan_shape = (num_tokens, top_k)  # 供 prefetch/reduce 的调用顺序守卫
     if verify:

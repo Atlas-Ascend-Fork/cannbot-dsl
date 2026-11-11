@@ -28,11 +28,14 @@ import torch.distributed as dist
 import torch_npu
 
 sys.path.insert(
-    0, os.path.join(os.path.dirname(__file__), "..", "..", "samples", "moonep")
+    0,
+    os.path.join(
+        os.path.dirname(__file__), "..", "..", "..", "samples", "mc2", "moonep"
+    ),
 )
 
 from moonep_context import create_moonep_context, sym_barrier  # noqa: E402
-from reduce_grad import create_grad_slot_view, reduce_grad  # noqa: E402
+from reduce_grad import reduce_grad  # noqa: E402
 
 # 精确匹配 DSL 生成的 kernel 名（mangled 名里含 "MoonepReducePullAccKernel"、
 # "MoonepBarrierKernel"），避免把 dist.barrier() 的 HCCL kernel 或 Fill 算进来。
@@ -124,18 +127,14 @@ def main():
     ctx = create_moonep_context()
     ctx.last_plan_shape = (32, 8)  # 绕开 plan 的调用顺序守卫
 
-    # v4 契约（e2e 分支）：home 梯度 [epn, W] 普通 张量（预写种子）+
-    # 对称堆梯度槽视图 [epn, W]（副本 dW 落槽——owner 远端读槽原子累加进 home；
-    # 槽 v4 不清零，跨拍复用）
-    grads, slots = [], []
+    # full-dW 契约：[2*epn, W] 张量（前 epn 行 home 种子、后 epn 行副本 dW
+    # ——副本入槽由 reduce 内部完成；owner 远端读槽原子累加进 home 段）
+    grads = []
     for g in range(3):
-        h = torch.full(
-            (args.epn, args.w_elems), float(rank * 1000 + g), dtype=torch.bfloat16
+        t = torch.full(
+            (2 * args.epn, args.w_elems), float(rank * 1000 + g), dtype=torch.bfloat16
         ).npu()
-        grads.append(h)
-        s = create_grad_slot_view(ctx, args.epn, args.w_elems, group=g, groups=3)
-        s.fill_(float(rank * 1000 + g))
-        slots.append(s)
+        grads.append(t)
 
     for pattern in args.pattern.split(","):
         etc_cpu = _build_etc(pattern, world, args.epn)
@@ -166,7 +165,10 @@ def main():
         ) as prof:
             for _ in range(args.iters):
                 sym_barrier(ctx)
-                reduce_grad(ctx, etc, grads, args.epn)
+                # async_finish=True 保持历史测量结构（v2 前模块缺省 barrier=True
+                # 即异步形态；正名后缺省翻转为阻塞——多一次内部 barrier 会
+                # 改变 trace 的 barrier 行奇偶性分析）
+                reduce_grad(ctx, etc, grads, args.epn, async_finish=True)
                 torch.npu.synchronize()
             prof.step()
 

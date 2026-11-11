@@ -59,14 +59,19 @@ from cannbotdsl.ops.sync import PIPE, vec_sync_notify, vec_sync_wait
 from cannbotdsl.tensor import MemLoc, make_layout, tile_slice
 from cannbotdsl.types.datastruct import StructRef
 from moonep_context import (
+    _BAR_EVENT_ID,
+    BAR_FLAGS_OFF,
     HEAP_BASE,
     LAYOUT_TAIL_BYTES,
+    MAX_R,
+    busy_wait_flag,
     check_heap_capacity,
     finish_op,
     grad_slot_off,
+    hccl_buffer_base,
+    next_barrier_epoch,
     normalize_group_list,
     pick_weight_chunk,
-    sym_barrier,
     sync_transport_stream,
 )
 
@@ -75,32 +80,66 @@ VL = 64
 _R = 1  # 组内 rank_size（均须进 program 键）
 _GRAD_BF16 = False  # grad 视图 dtype（编译锁内写入，进 program 键）
 _BLOCKS = 28  # 实际启动块数（编译锁内写入，进 program 键）
-_REDUCE_PROGRAMS = {}
 _REDUCE_LOCK = threading.Lock()
 
 
-def _normalize_grad_views(context, grad_view):
-    """归一化为 list 并校验组数守卫/行宽一致/dtype/调用序，返回 (grad_view, w_elems, grad_bf16)。"""
-    grad_view, w_elems = normalize_group_list(context, grad_view, "reduce_grad")
-    grad_dtype = grad_view[0].dtype
+def _normalize_grad_views(context, local_grads, epn):
+    """归一化 full-dW 组列表并推导 (groups, widths, dtype)。
+
+    契约：每组 ``[2*epn, Wg]`` 或任意尾维 ``[2*epn, ...]``（连续——内部
+    展平为 [2*epn, Wg]，GMM 对全量权重视图反传的原生形态 [2*epn, F, D]
+    直入免调用方 reshape；行序与 prefetch 视图一致：前 epn 行 home、后
+    epn 行副本）。组数 2 或 3、各组行宽可不同（交织型 W13 宽 2W、down
+    宽 W）；组数/行宽从张量解析。返回 (flat_views, widths, grad_bf16)——
+    flat_views 为各组 [2*epn, Wg] 视图（与原张量同存储，归并原位生效）。
+
+    dtype 守卫：dtype 须与**构造定型值** context.grad_dtype 一致
+    （MoonepBuffer 构造注入，缺省 bf16）——梯度槽区字节宽在堆布局里按定型
+    值预留（fp32 = bf16 的 2×，建组时刻堆已定死），漂移只能首调报错暴露，
+    不能静默扩容。**裸模块 API（无 MoonepBuffer）不冻结**：ctx.grad_dtype
+    为 None 时维持历史契约——dtype 每调用从张量解析（同 ctx 双 dtype 混用
+    合法，#308 精度管线实证形态；梯度槽视图缓存键含 dtype、逐 dtype 独立
+    容量校验）。
+    """
+    local_grads, widths = normalize_group_list(context, local_grads, "reduce_grad")
+    grad_dtype = local_grads[0].dtype
     if grad_dtype not in (torch.float32, torch.bfloat16):
         raise TypeError(
-            f"grad_view 须为 fp32 或 bf16（bf16 时 staging/传输减半、UB 内 fp32 "
+            f"local_grads 须为 fp32 或 bf16（bf16 时 staging/传输减半、UB 内 fp32 "
             f"累加保精度、写回 bf16），got {grad_dtype}"
         )
-    if any(g.dtype != grad_dtype for g in grad_view):
-        raise TypeError("多梯度组的 dtype 必须一致")
-    return grad_view, w_elems, grad_dtype == torch.bfloat16
+    frozen = getattr(context, "grad_dtype", None)
+    if frozen is not None and frozen != grad_dtype:
+        raise TypeError(
+            f"local_grads dtype 与构造定型值不符（定型 {frozen}，本次 {grad_dtype}）"
+            "——梯度槽区按定型 dtype 预留（fp32 为 bf16 的 2×），"
+            "不可运行期漂移；请以 grad_dtype=... 重建或转换 local_grads"
+        )
+    flats = []
+    for g, t in enumerate(local_grads):
+        if t.dtype != grad_dtype:
+            raise TypeError("多梯度组的 dtype 必须一致")
+        if int(t.shape[0]) != 2 * int(epn):
+            raise ValueError(
+                f"第 {g} 组行数须为 2*epn={2 * int(epn)}（full-dW 形态：前 epn 行 "
+                f"home 种子、后 epn 行副本 dW——与 prefetch 权重视图同序），"
+                f"实得 {tuple(t.shape)}"
+            )
+        if not t.is_contiguous():
+            raise ValueError(f"第 {g} 组须连续（展平前置）")
+        flats.append(t.reshape(2 * int(epn), widths[g]))
+    return flats, widths, grad_dtype == torch.bfloat16
 
 
 # ===========================================================================
 # pull 协议 reduce_grad：owner 远端读对端副本行 + kernel 内原子直累
 #
 # 数据流：FFN 反向预写 grad_view[i] home 种子（本地零通信）→
+#   头部屏障（per-peer flag 握手）→
 #   block p 对每个（peer p 条目）：批量拉整行 → scratch 行 p → flush →
 #   逐 chunk 原子加把远端贡献并进 grad_view[i]。
 #
-# 约束与依据（2026-10-27 探针链定论）：
+# 约束与依据：
 #   - 队列单提交者：block p 的命令/flush 只进 channelHandles[p]
 #   - scratch [R, W]：block p 落地行 p（行独占，无互踩）
 #   - 同 kernel 消费：批 get → flush → 消费（排序已实证可行）
@@ -124,19 +163,37 @@ class _PullSpec(NamedTuple):
     scratch_cols: int = 0  # 0 = W（非双缓冲）；>0 = 2*k*chunk（双缓冲缩减）
 
 
-def create_grad_slot_view(
-    context, epn, w_elems, *, group=0, groups=1, slots=None, grad_dtype=torch.bfloat16
-):
-    """在对称堆的梯度槽区创建 [epn, W] 梯度槽视图（pull 协议的数据落点）。
+def _grad_region_params(context):
+    """(scale_widths, weight_bytes)——梯度槽区基址的两个布局参数。
 
-    与 create_weight_view 对称。FFN 反向把副本专家的 dW 直写到此槽
-    （本地写，零通信）；reduce_grad 的 owner 远端读此槽累加。
-    布局：组 g 的槽基址 = grad_slot_off() + g * epn * W * elem。
+    槽区紧跟权重发布区（含 scale 组）：scale_widths 取首调定型的
+    ``context.layout_scale_widths``（prefetch 冻结；无 scale = None）；
+    weight_bytes 取定型的 ``context.weight_dtype``（bf16 2B / fp8
+    （e4m3fn/e5m2）1B；未定型（None）取 2B 保守口径——实际区域更小，
+    偏移过大只留安全间隙不重叠）。
+    """
+    scale_widths = getattr(context, "layout_scale_widths", None) or None
+    weight_dtype = getattr(context, "weight_dtype", None)
+    if weight_dtype is None or weight_dtype == torch.bfloat16:
+        weight_bytes = 2
+    else:
+        weight_bytes = 1  # fp8（e4m3fn/e5m2）——dtype 终态
+    return scale_widths, weight_bytes
+
+
+def _create_grad_slot_views(
+    context, epn, widths, *, slots=None, grad_dtype=torch.bfloat16
+):
+    """按 widths 创建（或复用）全组梯度槽视图，返回同序元组（内部接口）。
+
+    副本 dW 的对称堆落点（独立于权重发布区——prefetch 与 reduce 内存解耦）。
+    组 g 的槽视图 ``[epn, widths[g]]``，槽内按 widths 前缀和紧密排布；
+    dtype 即槽区字节宽（bf16 2B / fp32 4B）。基址 = 权重发布区之后（含
+    scale 组——见 _grad_region_params，与 prefetch 窗口步长同式）。仅供
+    reduce_grad 内部调用（副本行入槽是 reduce 数据流的内部步骤，不经调用方）。
     """
     if context.last_plan_shape is None:
-        raise RuntimeError("create_grad_slot_view 需先调用 moonep_plan")
-    if group < 0 or group >= groups:
-        raise ValueError(f"group={group} 超出组数 {groups}")
+        raise RuntimeError("_create_grad_slot_views 需先调用 moonep_plan")
     if slots is None:
         slots = context.window_slots or 1
     used = context.pull_slots_used
@@ -144,27 +201,64 @@ def create_grad_slot_view(
         context.pull_slots_used = slots
     elif used != slots:
         raise ValueError(
-            f"create_grad_slot_view slots={slots} 与既有槽视图 slots={used}"
+            f"梯度槽视图 slots={slots} 与既有 slots={used}"
             " 不一致——槽区基址会错位（请保持全链 slots 一致）"
         )
     elem_bytes = 2 if grad_dtype == torch.bfloat16 else 4
-    slot_bytes = groups * epn * w_elems * elem_bytes
+    widths = tuple(int(w) for w in widths)
+    # 键须含布局参数（scale_widths/weight_bytes）：混序调用
+    # reduce→prefetch(scale)→reduce 时梯度槽基址随冻结值后移——键不含
+    # 则旧偏移缓存被复用（copy_ 写旧偏移、pull kernel 读新偏移，数据错位）
+    scale_widths, weight_bytes = _grad_region_params(context)
+    key = (
+        "grad_slots",
+        int(epn),
+        widths,
+        int(slots),
+        str(grad_dtype),
+        tuple(scale_widths) if scale_widths else (),
+        int(weight_bytes),
+    )
+    cached = getattr(context, "pull_slot_views", None)
+    if cached is not None and getattr(context, "_grad_slot_key", None) == key:
+        return cached
+    scale_widths, weight_bytes = _grad_region_params(context)
+    slot_region = sum(widths) * epn * elem_bytes
     need = (
         HEAP_BASE
-        + grad_slot_off(epn, w_elems, num_groups=groups, slots=slots)
-        + slot_bytes
+        + grad_slot_off(
+            epn,
+            widths=widths,
+            scale_widths=scale_widths,
+            weight_bytes=weight_bytes,
+            slots=slots,
+        )
+        + slot_region
         + LAYOUT_TAIL_BYTES
     )
     check_heap_capacity(context, need, "pull 梯度槽区")
-    from moonep_context import hccl_buffer_base
     from npu_blob import npu_from_blob
 
-    view_off = grad_slot_off(epn, w_elems, num_groups=groups, slots=slots)
-    group_off = view_off + group * epn * w_elems * elem_bytes
-    addr = hccl_buffer_base(context) + HEAP_BASE + group_off
-    return npu_from_blob(
-        addr, (epn, w_elems), "bf16" if grad_dtype == torch.bfloat16 else "fp32"
+    view_off = grad_slot_off(
+        epn,
+        widths=widths,
+        scale_widths=scale_widths,
+        weight_bytes=weight_bytes,
+        slots=slots,
     )
+    addr = hccl_buffer_base(context) + HEAP_BASE + view_off
+    views = []
+    for w in widths:
+        views.append(
+            npu_from_blob(
+                addr, (epn, w), "bf16" if grad_dtype == torch.bfloat16 else "fp32"
+            )
+        )
+        addr += epn * w * elem_bytes
+    views = tuple(views)
+    context.pull_slot_views = views
+    context._grad_slot_key = key
+    return views
 
 
 _PULL_PROGRAMS = {}
@@ -179,15 +273,16 @@ _PULL_VL = 64  # int32 向量寄存器 lane 数（256B / 4B）
 
 # 分块上限：对齐 push 的 _REDUCE_CHUNK_LIMIT——UB 预算
 # （acc fp32 64KB + tmp 32KB ≈ 96KB < 248KB；原子路径无 cur）
-_PULL_ACC_LIMIT = int(os.environ.get("MOONEP_PULL_CHUNK", "16384"))
 
 
 @kernel
 class _MoonepReducePullAccKernel:
-    """pull 协议 kernel 直累：block-per-peer 拉取 + 同 kernel 消费 + 原子加。
+    """pull 协议 kernel 直累：头部屏障 + block-per-peer 拉取 + 同 kernel 消费 + 原子加。
 
     数据流：
       FFN 反向预写 grad_g[i] 的 home 种子（本地零通信）→
+      头部屏障（per-peer flag 握手——我方 kernel 启动即入槽
+      host copy_（流序在前）已完成；等对端 flag 即等其入槽可见）→
       block p 向量扫 etc[p, :]（SIMD 64-lane 比较生成 UB 清单，消 host
       D2H）→ 命中 home 区间的 lane 逐条：批量拉整行 → scratch 行 p →
       flush → 逐 chunk 原子加把远端贡献并进 grad_g[i]。
@@ -234,11 +329,13 @@ class _MoonepReducePullAccKernel:
         # etc 行按 VL 向上取整，末块 vload 不越界（余 lane 由 exec mask 屏蔽）
         self._epn_pad = ((self._epn + _PULL_VL - 1) // _PULL_VL) * _PULL_VL
 
-    def __call__(self, gm_etc, gm_scratch, gm_grad, ctx: StructRef[CommContext]):
-        self._pull_seg(gm_etc, gm_scratch, gm_grad, ctx)
+    def __call__(
+        self, gm_etc, gm_scratch, gm_grad, gm_epoch, ctx: StructRef[CommContext]
+    ):
+        self._pull_seg(gm_etc, gm_scratch, gm_grad, gm_epoch, ctx)
 
     @jit
-    def _pull_seg(self, gm_etc, gm_scratch, gm_grad, ctx):
+    def _pull_seg(self, gm_etc, gm_scratch, gm_grad, gm_epoch, ctx):
         epn = self._epn
         w_elems = self._w
         R = self._r
@@ -271,10 +368,37 @@ class _MoonepReducePullAccKernel:
         # 共享同一份编译产物）
         me = dtypes.int32(ctx.rankId)
 
+        # 头部屏障（原独立 sym_barrier kernel 融入本
+        # kernel，省一次 kernel 发射）：block p 先向 p 推我方到达 flag、
+        # 再自旋等 p 的到达。我方 kernel 启动即我方 ① 入槽写入（流序在
+        # 前的 host copy_）已完成；对端 flag 到达即其入槽写入已可见。
+        # 同一 reduce 轮的逐组多次发射共用同一 epoch——首组真等、后续组
+        # flag 已 ≥ epoch 即时通过（幂等 put 无害）。epoch 与 push 内联
+        # 屏障/独立 sym_barrier 共用同一单调计数器，交错调用不串轮。
+        flags = SymBuffer(
+            ctx,
+            shape=(MAX_R,),
+            dtype=dtypes.int32,
+            rank_size=R,
+            base_offset=BAR_FLAGS_OFF,
+        )
+        ub_flag = Buffer(MemLoc.UB, dtypes.int32, make_layout((1,)))
+        ub_epoch = Buffer(MemLoc.UB, dtypes.int32, make_layout((1,)))
+
         # block-per-peer：block p 独占队列[p]
         blk = get_block_idx()
         if blk < dtypes.int32(R) and blk != me:
             p = blk
+            me64 = dtypes.int64(me)
+            xfer.put(p, tile_slice(flags, (1,), (me64,)).peer(p), gm_epoch)
+            xfer.flush(p)
+            busy_wait_flag(
+                tile_slice(flags, (1,), (dtypes.int64(p),)),
+                gm_epoch,
+                _BAR_EVENT_ID,
+                ub_flag,
+                ub_epoch,
+            )
             # Phase 0：向量扫 etc[p, :] → UB 清单（消 host D2H）。
             # lane j 命中本 rank home 区间时 ub_row[j] = home 行号，否则 -1
             ub_etc = Buffer(MemLoc.UB, dtypes.int32, make_layout((1, self._epn_pad)))
@@ -446,8 +570,11 @@ class _MoonepReducePullAccKernel:
 
 
 @host
-def _reduce_pull_acc_host(gm_etc, gm_scratch, gm_grad, ctx: StructRef[CommContext]):
-    """直累 host entry：gm_scratch=[R*cols]（行 p 起于 p*cols）；gm_grad=[epn*W]（行 i 起于 i*W）原子。"""
+def _reduce_pull_acc_host(
+    gm_etc, gm_scratch, gm_grad, gm_epoch, ctx: StructRef[CommContext]
+):
+    """直累 host entry：gm_scratch=[R*cols]（行 p 起于 p*cols）；gm_grad=[epn*W]（行 i 起于 i*W）原子；
+    gm_epoch=本轮屏障 epoch（头部内联屏障）。"""
     _MoonepReducePullAccKernel(
         _R,
         _PULL_EPN,
@@ -457,7 +584,7 @@ def _reduce_pull_acc_host(gm_etc, gm_scratch, gm_grad, ctx: StructRef[CommContex
         _PULL_COLS,
         _PULL_DUAL,
         _PULL_SEG_K,
-    )[_BLOCKS](gm_etc, gm_scratch, gm_grad, ctx)
+    )[_BLOCKS](gm_etc, gm_scratch, gm_grad, gm_epoch, ctx)
 
 
 _GRAD_SLOT_OFF = 0  # 副本行段源基址（编译锁内写入，进 program 键）
@@ -495,89 +622,155 @@ def _get_pull_program(spec):
             # 2-D 行列双坐标做不到，pull 链路统一 1-D
             TensorSpec((spec.rank_size * sc_cols,), dt),
             TensorSpec((spec.epn * spec.w_elems,), dt),
+            TensorSpec((1,), i32),  # 屏障 epoch（头部内联屏障）
             StructRef[CommContext],
         )
         _PULL_PROGRAMS[spec] = prog
         return prog
 
 
-def reduce_grad(context, experts_to_copy, grad_view, epn, *, barrier=True):
-    """pull 协议 reduce_grad：owner 远端读对端梯度槽归并进 home 梯度。
+def reduce_grad(
+    context,
+    experts_to_copy,
+    local_grads,
+    epn,
+    *,
+    slot=0,
+    slots=None,
+    async_finish=False,
+):
+    """pull 协议 reduce_grad：副本梯度归并回 home（full-dW 直入形态）。
 
-    副本 dW 由 FFN 反向直写 create_grad_slot_view 创建的对称堆梯度槽
-    （独立于权重发布区——prefetch 与 reduce 内存解耦，支持异步流水）。
-    本函数 owner 远端读对端梯度槽原子累加进 grad_view。
+    ``local_grads`` 为 2 或 3 组 ``[2*epn, Wg]`` 张量——GMM 对全量
+    （home+副本）权重视图反传的原生形态，行序与 prefetch 视图一致（前
+    epn 行 home、后 epn 行副本）。组数/各组行宽从张量解析；dtype 须与
+    构造定型值一致（交织型传 ``[2*epn, 2W] + [2*epn, W]`` 两组即可）。
 
-    接口与原 push 签名一致（无新增参数）：梯度槽视图经 context 共享
-    （调用方 create_grad_slot_view 创建后存入 context.pull_slot_views，
-    FFN 反向与 reduce 均从 context 读取）。
+    梯度搬运四步（数据流，prefetch_weight 不搬任何梯度——全部在本算子内）：
+
+    ① 入槽：副本行 ``t[epn:]`` 拷入对称堆梯度槽 ``[epn, Wg]``（本地写己方
+       堆分片，零通信；槽视图内部创建，不对外暴露）
+    ② 屏障（pull kernel 头部 per-peer flag 握手）：全组所有 rank 的
+       入槽写入互可见
+    ③ 拉取归并：owner 逐组远拉每个持副本 rank 的槽行（xfer.get → scratch
+       → UB 暂存）→ mem_copy(atomic_add=True) 原子加进本地 dw home 行
+       ``t[:epn]``（方向与 prefetch 相反：prefetch 是 owner push 权重到
+       消费方，reduce 是 owner pull 梯度回属主——同一张 experts_to_copy
+       清单，两个方向各用一次；搬运者双重身份：对他 rank home 专家的副本
+       是 holder（①入槽供他人拉）、对自己的 home 专家是 owner（③拉取归并））
+    ④ 收尾：finish_op（async_finish=False 阻塞 / True 返回发起流 Event）
 
     Args:
-        grad_view: [epn, W] 本地梯度（home 段——FFN 反向预写种子，
-                   reduce 后为全量）。
-    """
-    if isinstance(grad_view, torch.Tensor):
-        grad_view = [grad_view]
-    # 归一化 + 行宽/dtype/调用序守卫
-    grad_view, W, grad_bf16 = _normalize_grad_views(context, grad_view)
+        local_grads: list/tuple，每组 ``[2*epn, Wg]`` 连续张量（fp32/bf16，
+                     全组同 dtype，与构造 grad_dtype 定型值一致）。
+        async_finish: False（缺省）阻塞到全组归并完成（返回 event=None）；
+                     True 返回发起流 torch.npu.Event（wait_event 汇合后读
+                     归并结果）。
+        slot: 窗口池槽位（与 prefetch 同族约定——reduce 侧仅校验一致性，
+            归并落点与槽位无关）。
+        slots: 窗口池层数（None = context.window_slots 定型值；显式给出时
+            须与定型值一致，否则 ValueError）。
 
-    grad_dtype = grad_view[0].dtype
+    Returns:
+        变长返回：``async_finish=False``（缺省）只返回
+        ``home_views`` 单组视图元组；``async_finish=True`` 返回
+        ``(home_views, event)``。``home_views`` 为各组归并结果的
+        ``[epn, Wg]`` 视图（与输入张量同存储——原位归并的直接读柄，归并
+        完成后即全量 dW）；``event`` 同步模式为 None、异步为发起流事件。
+    """
+    # 归一化 + 行数/宽度/dtype/调用序守卫（组数与行宽从张量解析；dtype）。
+    # C15：单张量 isinstance 包装已删（只通向报错的死分支）——裸 Tensor
+    # 由 normalize_group_list 真身包装后触发组数守卫的清晰报错。
+    local_grads, widths, grad_bf16 = _normalize_grad_views(context, local_grads, epn)
+
+    grad_dtype = local_grads[0].dtype
     # 跨流护栏：本算子与前序通信算子共用 epoch 握手机制，须按发起序
     # 执行（同流为快路径零开销）
     sync_transport_stream(context)
 
     if context.rank_size == 1:
-        return None  # 单 rank 无副本可归并（etc 恒全 -1）
+        # 单 rank 无副本可归并（etc 恒全 -1）——home 段已是全量 dW；
+        # 变长返回契约：sync 只返回 home_views；async 返回
+        # (home_views, event=None)——无集合操作，事件立即可汇合
+        home_views = tuple(t[:epn] for t in local_grads)
+        if async_finish:
+            return home_views, None
+        return home_views
+
+    # —— 窗口池约定校验（与 prefetch 同族；归并落点与槽位无关）——
+    if slots is None:
+        slots = context.window_slots or 1
+    elif context.window_slots is not None and int(slots) != int(context.window_slots):
+        raise ValueError(
+            f"reduce_grad slots={slots} 与窗口池定型层数 {context.window_slots} 不一致"
+        )
+    # —— ① 副本行入槽（内部数据流：full-dW 尾段 → 对称堆梯度槽）——
+    slot_views = _create_grad_slot_views(
+        context, epn, widths, slots=slots, grad_dtype=grad_dtype
+    )
+    for t, sv in zip(local_grads, slot_views):
+        sv.copy_(t[epn:])
 
     # block-per-peer：每 block 独占一个 peer 的通道（无 grid 栅栏，块数=R 即可）
     blocks = context.rank_size
     elem_bytes = 2 if grad_bf16 else 4
     R = context.rank_size
-    # UB 预算：原子源暂存（grad_dtype）
-    # bf16 默认 65536（4× 少 WQE → 有效带宽 7→11.7 GB/s，瓶颈 rank −25%）；
-    # fp32 必须 16384（65536×4B = 256KB 超 248KB UB 上限）
-    chunk = pick_weight_chunk(W, 65536 if grad_bf16 else 16384)
-
-    # 源 = 对称堆独立梯度槽区（v3 终态）
+    # 源 = 对称堆独立梯度槽区（v3 终态；槽内按 widths 前缀和；基址含
+    # scale 组区域——与 prefetch 窗口步长同式）
+    scale_widths, weight_bytes = _grad_region_params(context)
     slot_off = grad_slot_off(
-        epn, W, num_groups=len(grad_view), slots=context.window_slots or 1
+        epn,
+        widths=widths,
+        scale_widths=scale_widths,
+        weight_bytes=weight_bytes,
+        slots=slots,
     )
 
-    # 行宽须为搬运通道的整数倍（尾块越界防护）
-    if W % VL:
-        raise ValueError(f"W={W} 非 {VL} 的倍数——尾块越界 UB 缓冲")
-
-    # 跨 rank 屏障：确保所有 rank 的 FFN 反向写入副本行完成并可见
-    # （与上方跨流护栏职责不同：那是本进程流序，这是全组到达语义）
-    sym_barrier(context)
+    # —— ② 跨 rank 屏障在 pull kernel 头部——对端 kernel 启动即其入槽
+    #     写入（流序在前的 host copy_）已完成，头部 flag 握手即等价原屏障
+    #     的全组到达语义。同一轮逐组发射共用本 epoch：首组真等、后续组
+    #     flag 已 ≥ epoch 即时通过。与上方跨流护栏职责不同：那是本进程
+    #     流序，这是全组到达语义。
+    gm_epoch = next_barrier_epoch(context)
 
     # scratch 常驻（键控缓存——零池 churn；block p 落地行 p）
     # 双缓冲缩减：scratch [R, 2*k*chunk]（k=5, chunk=65536 → 32P 仅 40 MiB）
     # k=5 足以容纳一个流水段（5×128KB=640KB per buf，远大于 DMA 单笔开销）
     # 性能无损：DMA 是瓶颈，scratch 大小不影响 DMA 速度
-    dual = int(os.environ.get("MOONEP_PULL_DUAL", "1"))
-    seg_k = int(os.environ.get("MOONEP_PULL_K", "5"))
-    if dual and seg_k > 0 and seg_k * chunk < W:
+    # 从 ctx 读 Buffer 构造参数（裸 API 时 ctx 未设——env 缺省回退）
+    dual = getattr(context, "pull_dual", None)
+    if dual is None:
+        dual = int(os.environ.get("MOONEP_PULL_DUAL", "1"))
+    seg_k = getattr(context, "pull_seg_k", None)
+    if seg_k is None:
+        seg_k = int(os.environ.get("MOONEP_PULL_K", "5"))
+    max_w = max(widths)
+    chunk = pick_weight_chunk(max_w, 65536 if grad_bf16 else 16384)
+    if dual and seg_k > 0 and seg_k * chunk < max_w:
         scratch_cols = 2 * seg_k * chunk
     else:
-        scratch_cols = W
+        scratch_cols = max_w
     skey = (R, scratch_cols, grad_dtype)
     scache = context.pull_scratch
     if scache is None or scache[0] != skey:
         gm_scratch = torch.empty(
-            R * scratch_cols, dtype=grad_dtype, device=grad_view[0].device
+            R * scratch_cols, dtype=grad_dtype, device=local_grads[0].device
         )
         context.pull_scratch = (skey, gm_scratch)
     else:
         gm_scratch = scache[1]
 
-    # 每组：kernel 拉取 + 同 kernel 原子直累（grad_g 归并后已是全量）
-    for gi, grad_g in enumerate(grad_view):
+    # —— ③ 逐组拉取 + 同 kernel 原子直累（home 段归并后已是全量）——
+    # 每组独立 spec：w_elems=Wg（变宽）、槽基址按 widths 前缀和推进
+    group_off = 0
+    for gi, (grad_g, wg) in enumerate(zip(local_grads, widths)):
+        if wg % VL:
+            raise ValueError(f"第 {gi} 组 W={wg} 非 {VL} 的倍数——尾块越界 UB 缓冲")
         spec = _PullSpec(
             epn=epn,
-            w_elems=W,
-            chunk=chunk,
-            slot_off=slot_off + gi * epn * W * elem_bytes,
+            w_elems=wg,
+            chunk=pick_weight_chunk(wg, 65536 if grad_bf16 else 16384),
+            slot_off=slot_off + group_off,
             rank_size=R,
             grad_bf16=grad_bf16,
             blocks=blocks,
@@ -586,7 +779,17 @@ def reduce_grad(context, experts_to_copy, grad_view, epn, *, barrier=True):
             scratch_cols=scratch_cols,
         )
         _get_pull_program(spec)(
-            experts_to_copy, gm_scratch, grad_g.view(-1), context.ctx_tensor
+            experts_to_copy,
+            gm_scratch,
+            grad_g[:epn].reshape(-1),
+            gm_epoch,
+            context.ctx_tensor,
         )
+        group_off += epn * wg * elem_bytes
 
-    return finish_op(context, barrier)
+    event = finish_op(context, async_finish)
+    home_views = tuple(t[:epn] for t in local_grads)
+    # H1/C14b 变长返回契约：sync 只返回 home_views 单值；async 二元组。
+    if async_finish:
+        return home_views, event
+    return home_views

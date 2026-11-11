@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 
-"""MEMSTAT 显存统计打印基础设施（2026-10-26 显存对账战役）。
+"""MEMSTAT 显存统计打印基础设施（显存对账口径）。
 
 对 plan / prefetch_weight / reduce_grad / ElasticBuffer.dispatch/combine 的
 全部显存分配点打统一格式标签行，供训练用例侧 grep 汇总：

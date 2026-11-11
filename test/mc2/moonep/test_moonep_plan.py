@@ -96,7 +96,18 @@ def _get_ep_buf(world_size, num_tokens, top_k):
     """
     key = (num_tokens, top_k)
     if key not in _EP_POOL:
-        ep_group = dist.new_group(backend="hccl", ranks=list(range(world_size)))
+        from torch_npu._C._distributed_c10d import ProcessGroupHCCL
+
+        eb_mb = ElasticBuffer.get_moe_ep_ccl_buffer_size(
+            world_size, _ep_nmtr(num_tokens, top_k), _H, _EPN * world_size, top_k
+        )
+        eb_opts = ProcessGroupHCCL.Options()
+        eb_opts.hccl_config = {"hccl_buffer_size": eb_mb}
+        ep_group = dist.new_group(
+            backend="hccl",
+            ranks=list(range(world_size)),
+            pg_options=eb_opts,
+        )
         # nmtr 余量：balanced 下 per-peer 期望=S*K/R，随机方差会略越界
         buf = ElasticBuffer(
             ep_group,
@@ -109,14 +120,15 @@ def _get_ep_buf(world_size, num_tokens, top_k):
 
 
 def _ep_nmtr(num_tokens, top_k):
-    """per-peer 容量：期望 S*K/R + 泊松方差余量（按实际 world size）。
+    """per-peer 容量 = S（与 torchtitan 生产口径一致）。
 
-    发送侧同时要求 x.dim0 ≤ nmtr：K/R 较小时 S*K/R*1.25+64 < S，须与 S
-    取 max（接入指南口径）——8P K6 形状曾因 3904 < S=4094 触发 dispatch
-    tiling 拒绝（x dim0 超上限）。
+    EB 窗口 per-peer 槽位承载 token 行而非 (token,expert) 扩展对，per-peer
+    到达 ≤ S 恒成立；plan 均衡不变量（每 rank 扩展行恰 S*K）由接收侧 recv
+    分配承载。历史公式 max(S, S*K/R*1.25+64) 非第一性推导（发送侧约束
+    的推导有缺陷），废弃（详见
+    test_moonep_ep._ep_nmtr 同款注释）。
     """
-    r = dist.get_world_size()
-    return max(num_tokens, int(num_tokens * top_k / r * 1.25) + 64)
+    return num_tokens
 
 
 def _make_case(shape, mode, seed):
