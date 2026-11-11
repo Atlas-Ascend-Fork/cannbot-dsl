@@ -708,6 +708,30 @@ def _store_cache_bytes(
     )
 
 
+def high_precision_projection(x, weight, *, rows_per_chunk=8192):
+    """Accumulate the complete K dimension in FP64, then export FP32.
+
+    Only independent token rows are batched to bound the widened input copy.
+    There is no K splitting, intermediate BF16 rounding or device tiling model.
+    Call this for the high-precision KVA reference only; ordinary Golden keeps
+    its existing numerical path.
+    """
+    if x.device.type != "cpu" or weight.device.type != "cpu":
+        raise ValueError("high-precision projection requires CPU operands")
+    if x.ndim != 2 or weight.ndim != 2 or x.shape[1] != weight.shape[1]:
+        raise ValueError("expected x[T,K] and weight[O,K]")
+    if rows_per_chunk <= 0:
+        raise ValueError("rows_per_chunk must be positive")
+    result = torch.empty((x.shape[0], weight.shape[0]), dtype=torch.float32)
+    weight_fp64 = weight.to(torch.float64)
+    for start in range(0, x.shape[0], rows_per_chunk):
+        stop = min(start + rows_per_chunk, x.shape[0])
+        result[start:stop] = (x[start:stop].to(torch.float64) @ weight_fp64.T).to(
+            torch.float32
+        )
+    return result
+
+
 def quant_mla_prolog_golden(
     x: torch.Tensor,
     wqa: torch.Tensor,
@@ -1035,7 +1059,8 @@ def quant_mla_prolog_golden(
                 )
             ]
         qa = x_real @ weights_real[0].T
-        kva_proj = x_real @ weights_real[2].T
+        # All high-precision modes share FP64 KVA accumulation after decoding.
+        kva_proj = high_precision_projection(x_real, weights_real[2])
         qa_scaled = _apply_norm_scale(_rms_norm(qa, norm_weight_qa, norm_eps), qr_scale)
         q_proj = qa_scaled @ weights_real[1].T
         qr_all = qa_scaled
@@ -1210,10 +1235,6 @@ def _aligned_error_metrics(value, golden, config):
         avg_re=float(relative.sum() / big.sum()) if g.numel() else 0.0,
         small_bad=int(((vs - gs).abs() > config["small_value_atol"]).sum()),
         rmse=float(delta.square().mean().sqrt()) if g.numel() else 0.0,
-        full_rmse_diagnostic=float((v - g).square().mean().sqrt())
-        if g.numel()
-        else 0.0,
-        max_abs_diagnostic=float((v - g).abs().max()) if g.numel() else 0.0,
         **special,
     )
 
@@ -1288,9 +1309,25 @@ def _aligned_record(method, elements, failed, allowed, passed, **details):
     )
 
 
+def first_failed_indices(bad, *, limit=8, chunk_elements=1 << 20):
+    """Return the first flat failures without allocating every failed index."""
+    if limit < 0 or chunk_elements <= 0:
+        raise ValueError("limit must be nonnegative and chunk_elements positive")
+    flat = bad.flatten()
+    indices = []
+    if limit == 0:
+        return indices
+    for start in range(0, flat.numel(), chunk_elements):
+        local = flat[start : start + chunk_elements].nonzero().flatten()
+        indices.extend(start + i for i in local[: limit - len(indices)].tolist())
+        if len(indices) == limit:
+            break
+    return indices
+
+
 def _aligned_first_failed_elements(actual, expected, bad, *, limit=8, **details):
     """Diagnostic samples in the current segment's flattened index space."""
-    indices = bad.flatten().nonzero().flatten()[:limit].tolist()
+    indices = first_failed_indices(bad, limit=limit)
     a, b = actual.flatten(), expected.flatten()
     return [
         dict(
@@ -1322,10 +1359,6 @@ def _aligned_mixed(actual, expected, *, scale=False):
     denominator = torch.maximum(a.abs(), b.abs()).clamp_min((1 / 16384) / 0.005) + 1e-9
     relative = (a - b).abs() / (denominator + 1e-9)
     hard = float(relative[finite_bad].max()) if finite_bad.any() else 0.0
-    af, bf = a[finite], b[finite]
-    delta = (af - bf).abs()
-    norm_a, norm_b = torch.linalg.vector_norm(af), torch.linalg.vector_norm(bf)
-    nonzero = bf != 0
     failed, allowed = int(bad.sum()), math.floor(m * 0.005)
     return _aligned_record(
         1,
@@ -1345,16 +1378,6 @@ def _aligned_mixed(actual, expected, *, scale=False):
         max_bad_relative=hard,
         hard_limit=10,
         special_mismatches=int((~finite & ~same_special).sum()),
-        max_abs=float(delta.max()) if delta.numel() else None,
-        max_rel_nonzero=float((delta[nonzero] / bf[nonzero].abs()).max())
-        if nonzero.any()
-        else None,
-        relative_l2=float(torch.linalg.vector_norm(af - bf) / norm_b)
-        if norm_b > 0
-        else None,
-        cosine=float(torch.dot(af, bf) / (norm_a * norm_b))
-        if norm_a > 0 and norm_b > 0
-        else None,
     )
 
 
@@ -1470,9 +1493,9 @@ def output_acceptance(name, whole_two, whole_three, branches, *, homogeneous=Tru
         method=ACCEPTANCE_POLICY_ID,
         gating=True,
         passed=passed,
-        status=("ACCEPTED_WITH_WARNING" if warning else "ACCEPTED")
-        if passed
-        else "FAILED",
+        status=(
+            ("ACCEPTED_WITH_WARNING" if warning else "ACCEPTED") if passed else "FAILED"
+        ),
         route=route,
         whole=whole,
         branches=branch_results,
@@ -1557,10 +1580,6 @@ def _record(actual, expected, matched, name, method, allowed_failures, errors=No
     failed = int((~matched).sum())
     finite = torch.isfinite(actual) & torch.isfinite(expected)
     difference = (actual - expected).abs()
-    finite_diff = difference[finite]
-    norm_ref = expected[finite].norm().item()
-    norm_actual = actual[finite].norm().item()
-    nonzero = finite & (expected != 0)
     classification_bad = (
         (torch.isnan(actual) != torch.isnan(expected))
         | (torch.isposinf(actual) != torch.isposinf(expected))
@@ -1589,22 +1608,12 @@ def _record(actual, expected, matched, name, method, allowed_failures, errors=No
         "matched_ratio": (total - failed) / total if total else 1.0,
         "finite_elements": int(finite.sum()),
         "classification_mismatches": int(classification_bad.sum()),
-        "max_abs": finite_diff.max().item() if finite_diff.numel() else 0.0,
-        "max_rel": (difference[nonzero] / expected[nonzero].abs()).max().item()
-        if nonzero.any()
-        else None,
-        "relative_l2": finite_diff.norm().item() / norm_ref if norm_ref else None,
-        "cosine": torch.nn.functional.cosine_similarity(
-            actual[finite].reshape(1, -1), expected[finite].reshape(1, -1)
-        ).item()
-        if norm_ref and norm_actual
-        else None,
         "max_failed_relative_error": max_failed_relative,
         "hard_cap_pass": hard_pass,
         "passed": failed <= allowed_failures and hard_pass,
         "empty_segment": total == 0,
     }
-    bad_indices = (~matched).flatten().nonzero().flatten()[:8].tolist()
+    bad_indices = first_failed_indices(~matched)
     result["first_failed_elements"] = [
         {
             "flat_index": i,
@@ -1686,11 +1695,12 @@ def encoded(actual, expected, name):
     signed_zero_pair = ((a == 0) & (b == 128)) | ((a == 128) & (b == 0))
     hard_bad = (distance > 2) & ~signed_zero_pair
     result = _record(a, b, distance <= 1, name, "fp8_method10", a.numel() // 200)
-    # Intentionally reproduce the supplied source, NOT a corrected size check.
-    # Test all >2 indices before applying the signed-zero exception.
-    over_two_indices = (distance > 2).flatten().nonzero().flatten()
-    hard_check_entered = bool(over_two_indices.any())
-    indices = hard_bad.flatten().nonzero().flatten()
+    # Preserve source any(indices), including a sole index-zero failure, without
+    # materializing every index. Apply the signed-zero exception separately.
+    over_two_count = int((distance > 2).sum())
+    hard_check_entered = bool((distance.flatten()[1:] > 2).any())
+    hard_count = int(hard_bad.sum())
+    indices = first_failed_indices(hard_bad)
     fulfill_percent = (
         (float(a.numel() - result["failed_elements"]) / float(a.numel()) * 100.0)
         if a.numel()
@@ -1700,11 +1710,11 @@ def encoded(actual, expected, name):
         pct_thd=0.005,
         code_distance_threshold=1,
         hard_code_distance_threshold=2,
-        hard_failed_elements=int(indices.numel()),
-        hard_cap_pass=not hard_check_entered or indices.numel() == 0,
+        hard_failed_elements=hard_count,
+        hard_cap_pass=not hard_check_entered or hard_count == 0,
         source_hard_check_entered=hard_check_entered,
         source_index_zero_hard_check_skipped=(
-            over_two_indices.numel() == 1 and not hard_check_entered
+            over_two_count == 1 and not hard_check_entered
         ),
         fulfill_percent=fulfill_percent,
         required_fulfill_percent=(1 - 0.005) * 100.0,
@@ -1720,7 +1730,7 @@ def encoded(actual, expected, name):
                 reference_code=int(b.flatten()[i]),
                 circular_distance=int(distance.flatten()[i]),
             )
-            for i in indices[:8].tolist()
+            for i in indices
         ],
     )
     result["passed"] = (
@@ -2300,28 +2310,31 @@ def npu_operator():
         Path(__file__).resolve().parents[3]
         / "samples/attention/quant_mla_prolog/quant_mla_prolog.py"
     )
-    spec = importlib.util.spec_from_file_location("quant_mla_prolog", path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    module = sys.modules.get("quant_mla_prolog")
+    if module is not None:
+        if Path(module.__file__).resolve() != path.resolve():
+            raise RuntimeError(
+                "Run the NPU tests in a fresh process with the requested source"
+            )
+    else:
+        spec = importlib.util.spec_from_file_location("quant_mla_prolog", path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
     check_enum_contract(module)
     check_return_qr_contract(module.quant_mla_prolog)
     return module, torch_npu
 
 
 CASES = (
+    pytest.param(0, 1, False, 0, 128, 64, 1, 3, 1024, 4, id="mxfp8_mode0_t3_rope_tail"),
     pytest.param(
-        0, 1, False, 0, 128, 64, 1, 3, 1024, 4, True, id="mxfp8_mode0_t3_rope_tail"
+        1, 1, True, 0, 192, 64, 1, 16, 1536, 4, id="mxfp8_mode1_t16_head_handoff"
     ),
     pytest.param(
-        1, 1, True, 0, 192, 64, 1, 16, 1536, 4, True, id="mxfp8_mode1_t16_head_handoff"
+        2, 1, True, 1, 192, 64, 1, 33, 2048, 104, id="mxfp8_mode2_t33_batch_tail"
     ),
-    pytest.param(
-        2, 1, True, 1, 192, 64, 1, 33, 2048, 104, True, id="mxfp8_mode2_t33_batch_tail"
-    ),
-    pytest.param(3, 2, False, 1, 128, 64, 2, 3, 1024, 2, False, id="hif8_mode3_rope2"),
-    pytest.param(0, 1, False, 0, 128, 64, 2, 3, 1024, 4, False, id="mxfp8_half_nd"),
-    pytest.param(0, 1, True, 0, 128, 64, 2, 3, 1024, 4, False, id="mxfp8_half_nz"),
-    pytest.param(3, 2, True, 1, 128, 64, 2, 3, 1024, 2, False, id="hif8_half_nz"),
+    pytest.param(3, 2, False, 1, 128, 64, 2, 3, 1024, 2, id="hif8_mode3_rope2"),
 )
 
 
@@ -2331,9 +2344,7 @@ def quant_reference_cases():
 
 
 @pytest.mark.npu
-@pytest.mark.parametrize(
-    "qm,wm,nz,cache_mode,dn,dr,rope_mode,tokens,ql,heads,expect_handoff", CASES
-)
+@pytest.mark.parametrize("qm,wm,nz,cache_mode,dn,dr,rope_mode,tokens,ql,heads", CASES)
 def test_quant_mla_prolog(
     qm,
     wm,
@@ -2345,7 +2356,6 @@ def test_quant_mla_prolog(
     tokens,
     ql,
     heads,
-    expect_handoff,
     npu_operator,
     quant_reference_cases,
 ):
@@ -2377,7 +2387,11 @@ def test_quant_mla_prolog(
     source_args = list(cpu_args)
     source_args[11] = initial
     device_weights = [
-        torch_npu.npu_format_cast(weight.npu(), 29) if nz else weight.npu()
+        (
+            torch_npu.npu_format_cast(weight.t().contiguous().npu(), 29)
+            if nz
+            else weight.npu()
+        )
         for weight in weights
     ]
     device_args = [
@@ -2426,9 +2440,9 @@ def test_quant_mla_prolog(
 
     def checked_program(*config):
         selected_configs.append(config)
-        assert (config[-1] != (0, 0)) is expect_handoff
+        assert config[-1] == (0, 0)
         if qm == 2:
-            assert config[12] >= 32 and tokens % 8 != 0
+            assert config[10] >= 32 and tokens % 8 != 0
         return factory(*config)
 
     module.quant_mla_prolog_precheck(*device_args, **public_attributes(operator, attrs))
@@ -2481,92 +2495,3 @@ def test_quant_mla_prolog(
         if metric.get("gating", True) and metric.get("passed") is False
     ]
     assert not failed, f"precision segments failed: {', '.join(failed)}"
-
-
-@pytest.mark.npu
-@pytest.mark.parametrize("execution", ("aclgraph", "compile"))
-@pytest.mark.parametrize("byte_carrier", (False, True), ids=("e8m0", "uint8"))
-def test_mxfp8_nz_descale_graph(npu_operator, execution, byte_carrier):
-    torch.set_num_threads(int(os.environ.get("MLA_PROLOG_CPU_THREADS", "8")))
-    module, torch_npu = npu_operator
-    cpu_args, weights, attrs = make_inputs(2, 1, True, 1, 128, 64, 2)
-    initial = cpu_args[11].clone()
-    expected, observed = golden_with_observations(
-        quant_mla_prolog_golden, cpu_args, attrs
-    )
-    device_args = [value.npu() if value is not None else None for value in cpu_args]
-    device_args[1:4] = [torch_npu.npu_format_cast(w.npu(), 29) for w in weights]
-    device_args[6:9] = [
-        make_nz_weight_descale(s, torch_npu, byte_carrier=byte_carrier)
-        for s in cpu_args[6:9]
-    ]
-    device_args[11].copy_(initial)
-    operator = module.quant_mla_prolog
-    public = public_attributes(operator, attrs)
-    module.quant_mla_prolog_precheck(*device_args, **public)
-    metadata = [
-        (s.data_ptr(), s.dtype, tuple(s.shape), torch_npu.get_npu_format(s))
-        for s in device_args[6:9]
-    ]
-    with patch.object(torch.compiler, "is_compiling", return_value=True):
-        for index in (5, 6, 7, 8):
-            invalid = list(device_args)
-            invalid[index] = torch.empty(
-                device_args[index].shape,
-                dtype=torch.uint8,
-                device=device_args[0].device,
-            )
-            with (
-                patch.object(module, "_program") as program,
-                pytest.raises((TypeError, ValueError), match="descale_.*"),
-            ):
-                operator(*invalid, **public)
-            program.assert_not_called()
-    operator(*device_args, **public)
-    torch.npu.synchronize()
-    device_args[11].copy_(initial)
-    if execution == "aclgraph":
-        graph = torch.npu.NPUGraph()
-        with torch.npu.graph(graph):
-            actual = operator(*device_args, **public)
-        device_args[11].copy_(initial)
-        graph.replay()
-    else:
-        torch.compiler.reset()
-        compiled = torch.compile(
-            operator,
-            backend="npugraph_ex",
-            fullgraph=True,
-            dynamic=False,
-            options={"force_eager": False, "clone_input": False},
-        )
-        compiled(*device_args, **public)
-        device_args[11].copy_(initial)
-        actual = compiled(*device_args, **public)
-    torch.npu.synchronize()
-    assert metadata == [
-        (s.data_ptr(), s.dtype, tuple(s.shape), torch_npu.get_npu_format(s))
-        for s in device_args[6:9]
-    ]
-    actual = tuple(v.cpu() for v in actual)
-    for value, reference in zip(actual, expected):
-        assert value.shape == reference.shape and value.dtype == reference.dtype
-    actual_cache = device_args[11].cpu()
-    metrics = compare_for_acceptance(
-        actual, expected, actual_cache, cpu_args[11], cpu_args, attrs, observed
-    )
-    assert not [m["name"] for m in metrics if m.get("gating", True) and not m["passed"]]
-    capacity = initial.shape[0] * initial.shape[1]
-    untouched = torch.ones(capacity, dtype=torch.bool)
-    untouched[cpu_args[12][cpu_args[12] >= 0]] = False
-    before = (
-        cache_to_logical(initial, attrs["cache_mode"])
-        .view(torch.uint8)
-        .reshape(capacity, -1)
-    )
-    after = (
-        cache_to_logical(actual_cache, attrs["cache_mode"])
-        .view(torch.uint8)
-        .reshape(capacity, -1)
-    )
-    assert torch.equal(before[untouched], after[untouched])

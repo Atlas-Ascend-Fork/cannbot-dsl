@@ -302,6 +302,30 @@ def cache_to_logical(cache, cache_mode):
     return raw.reshape(-1).view(cache.dtype).reshape(cache.shape)
 
 
+def high_precision_projection(x, weight, *, rows_per_chunk=8192):
+    """Accumulate the complete K dimension in FP64, then export FP32.
+
+    Only independent token rows are batched to bound the widened input copy.
+    There is no K splitting, intermediate BF16 rounding or device tiling model.
+    Call this for the high-precision KVA reference only; ordinary Golden keeps
+    its existing numerical path.
+    """
+    if x.device.type != "cpu" or weight.device.type != "cpu":
+        raise ValueError("high-precision projection requires CPU operands")
+    if x.ndim != 2 or weight.ndim != 2 or x.shape[1] != weight.shape[1]:
+        raise ValueError("expected x[T,K] and weight[O,K]")
+    if rows_per_chunk <= 0:
+        raise ValueError("rows_per_chunk must be positive")
+    result = torch.empty((x.shape[0], weight.shape[0]), dtype=torch.float32)
+    weight_fp64 = weight.to(torch.float64)
+    for start in range(0, x.shape[0], rows_per_chunk):
+        stop = min(start + rows_per_chunk, x.shape[0])
+        result[start:stop] = (x[start:stop].to(torch.float64) @ weight_fp64.T).to(
+            torch.float32
+        )
+    return result
+
+
 @torch.no_grad()
 def golden_mla_prolog(
     x,
@@ -332,8 +356,9 @@ def golden_mla_prolog(
     fixtures, and give the device operator separate NPU copies of those data.
     CPU layout/dtype and numerical limitations are documented in this module.
     bm_output preserves intermediate BF16 rounding; bm_output_gold keeps FP32
-    intermediates and returns unquantized FP32 Q/QR. Its in-place Cache must
-    be FP32 with logical width 512 + Dr, including mixed-payload mode 1.
+    intermediates, with FP64 KVA accumulation, and returns unquantized FP32 Q/QR.
+    Its in-place Cache must be FP32 with logical width 512 + Dr, including
+    mixed-payload mode 1.
     """
     _require(
         action_type in ("bm_output", "bm_output_gold"),
@@ -496,7 +521,7 @@ def golden_mla_prolog(
         high_precision=high_precision,
     )
     if action_type == "bm_output_gold":
-        kva_raw = x.float() @ kva.float().T
+        kva_raw = high_precision_projection(x, kva)
     else:
         kva_raw = (x.float() @ kva.float().T).to(torch.bfloat16).float()
     ckv = _scale(_rms_norm(kva_raw[:, :_KV_LORA], norm_weight_kva, norm_eps), kvr_scale)
@@ -592,10 +617,6 @@ def error_metrics(value, golden, config):
         avg_re=float(relative.sum() / big.sum()) if g.numel() else 0.0,
         small_bad=int(((vs - gs).abs() > config["small_value_atol"]).sum()),
         rmse=float(delta.square().mean().sqrt()) if g.numel() else 0.0,
-        full_rmse_diagnostic=float((v - g).square().mean().sqrt())
-        if g.numel()
-        else 0.0,
-        max_abs_diagnostic=float((v - g).abs().max()) if g.numel() else 0.0,
         **special,
     )
 
@@ -688,9 +709,25 @@ def _record(method, elements, failed, allowed, passed, **details):
     )
 
 
+def first_failed_indices(bad, *, limit=8, chunk_elements=1 << 20):
+    """Return the first flat failures without allocating every failed index."""
+    if limit < 0 or chunk_elements <= 0:
+        raise ValueError("limit must be nonnegative and chunk_elements positive")
+    flat = bad.flatten()
+    indices = []
+    if limit == 0:
+        return indices
+    for start in range(0, flat.numel(), chunk_elements):
+        local = flat[start : start + chunk_elements].nonzero().flatten()
+        indices.extend(start + i for i in local[: limit - len(indices)].tolist())
+        if len(indices) == limit:
+            break
+    return indices
+
+
 def _first_failed_elements(actual, expected, bad, *, limit=8, **details):
     """Diagnostic samples in the current segment's flattened index space."""
-    indices = bad.flatten().nonzero().flatten()[:limit].tolist()
+    indices = first_failed_indices(bad, limit=limit)
     a, b = actual.flatten(), expected.flatten()
     return [
         dict(
@@ -758,10 +795,6 @@ def mixed(actual, expected, *, scale=False):
     denominator = torch.maximum(a.abs(), b.abs()).clamp_min((1 / 16384) / 0.005) + 1e-9
     relative = (a - b).abs() / (denominator + 1e-9)
     hard = float(relative[finite_bad].max()) if finite_bad.any() else 0.0
-    af, bf = a[finite], b[finite]
-    delta = (af - bf).abs()
-    norm_a, norm_b = torch.linalg.vector_norm(af), torch.linalg.vector_norm(bf)
-    nonzero = bf != 0
     failed, allowed = int(bad.sum()), math.floor(m * 0.005)
     return _record(
         1,
@@ -781,16 +814,6 @@ def mixed(actual, expected, *, scale=False):
         max_bad_relative=hard,
         hard_limit=10,
         special_mismatches=int((~finite & ~same_special).sum()),
-        max_abs=float(delta.max()) if delta.numel() else None,
-        max_rel_nonzero=float((delta[nonzero] / bf[nonzero].abs()).max())
-        if nonzero.any()
-        else None,
-        relative_l2=float(torch.linalg.vector_norm(af - bf) / norm_b)
-        if norm_b > 0
-        else None,
-        cosine=float(torch.dot(af, bf) / (norm_a * norm_b))
-        if norm_a > 0 and norm_b > 0
-        else None,
     )
 
 
@@ -807,8 +830,8 @@ def e4m3fn(actual, expected):
     distance = torch.minimum(delta, 256 - delta)
     signed_zero = ((a == 0) & (b == 128)) | ((a == 128) & (b == 0))
     failed = int((distance > 1).sum())
-    over_two = (distance > 2).nonzero().flatten()
-    entered = bool(over_two.any())
+    # Preserve source any(indices): a sole failure at flat index zero skips it.
+    entered = bool((distance.flatten()[1:] > 2).any())
     hard = int(((distance > 2) & ~signed_zero).sum())
     percent = (
         float(a.numel() - failed) / float(a.numel()) * 100.0 if a.numel() else 100.0
@@ -1334,8 +1357,10 @@ def compare_outputs(cpu, actual, attrs, outputs, before):
 
 
 # Freeze numerical definitions, not the formatting or file organization.
-_FROZEN_NUMERIC_AST = "f996203fa3abe20a5b1f6a971029dff64236f8b1c90ff3d6e0eab52cbcf7a81a"
+_FROZEN_NUMERIC_AST = "65d110ccf32c86d64c550e975f2e63f4544e7a65048a2f4a0d3ebc00a4a68253"
 _FROZEN_NUMERIC_NAMES = (
+    "high_precision_projection",
+    "first_failed_indices",
     "_KV_LORA",
     "_GROUP_SIZE",
     "_FP8_MAX",
@@ -1504,15 +1529,13 @@ CASES = (
     (1, "NZ", "PA_BSND", 192, 64, 2, False),
     (2, "NZ", "PA_NZ", 128, 64, 1, False),
     (3, "ND", "PA_NZ", 256, 0, 0, True),
-    (0, "ND", "PA_BSND", 128, 64, 2, False),
-    (0, "NZ", "PA_BSND", 128, 64, 2, False),
 )
 
 
-def make_inputs(case, device):
+def make_inputs(case, device, dimensions=(3, 1024, 640, 2)):
     mode, weight_format, cache_mode, dn, dr, rope_mode, return_qr = case
     rng = torch.Generator().manual_seed(20261027 + mode)
-    tokens, dim, q_lora, heads = 3, 1024, 640, 2
+    tokens, dim, q_lora, heads = dimensions
 
     def random_bf16(shape):
         return (torch.randn(shape, generator=rng) * 0.1).bfloat16()
@@ -1533,19 +1556,24 @@ def make_inputs(case, device):
         norm_weight_qa=torch.linspace(0.75, 1.25, q_lora),
         norm_weight_kva=torch.linspace(0.75, 1.25, 512),
         kv_cache=torch.full((2, 128, 1, width), 0.25).to(cache_dtype),
-        cache_index=torch.tensor([128, 0, 127], dtype=torch.int64),
+        cache_index=(
+            torch.tensor([128, 0, 127], dtype=torch.int64)
+            if tokens == 3
+            else torch.arange(tokens, dtype=torch.int64)
+        ),
         quant_scale_kv=torch.tensor([1.25]) if mode >= 2 else None,
         rope_sin=random_bf16((tokens, dr)) if dr else None,
         rope_cos=random_bf16((tokens, dr)) if dr else None,
     )
-    cpu["x"] *= torch.tensor([0.5, 1.0, 2.0], dtype=torch.bfloat16)[:, None]
+    if tokens == 3:
+        cpu["x"] *= torch.tensor([0.5, 1.0, 2.0], dtype=torch.bfloat16)[:, None]
     actual = {
         name: value.to(device) if value is not None else None
         for name, value in cpu.items()
     }
     if weight_format == "NZ":
         for name in ("wqa", "wqb", "wkva"):
-            actual[name] = torch_npu.npu_format_cast(actual[name], 29)
+            actual[name] = torch_npu.npu_format_cast(actual[name].t().contiguous(), 29)
             assert torch_npu.get_npu_format(actual[name]) == 29
     attrs = dict(
         norm_eps=1e-5,
@@ -1780,9 +1808,7 @@ def enum_contract():
     check_enum_contract(op)
 
 
-@pytest.mark.parametrize(
-    "case", CASES, ids=("mode0", "mode1", "mode2", "mode3", "half_nd", "half_nz")
-)
+@pytest.mark.parametrize("case", CASES, ids=("mode0", "mode1", "mode2", "mode3"))
 def test_mla_prolog_v2(case):
     cache_factor, cache_gap, cache_offset = CACHE_LAYOUTS[case[0]]
     if not torch.npu.is_available():

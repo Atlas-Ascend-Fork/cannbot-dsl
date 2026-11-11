@@ -8,18 +8,22 @@
 
 """A5 quant_mla_prolog fused Kernel, Torch interface and Native export."""
 
-from cannbotdsl import from_tensor
-
+import atexit as _atexit
+import hashlib as _hashlib
 import json as _json
 import math as _math
 import os as _os
 import struct as _struct
+import threading as _threading
 from enum import Enum as _Enum
 from functools import lru_cache as _lru_cache
 from pathlib import Path as _Path
+from typing import NamedTuple as _NamedTuple
 
 import cannbotdsl as _dsl
 import cannbotdsl.aot as _aot
+from cannbotdsl.aot.cache import observe_compilations as _observe_compilations
+from cannbotdsl.aot.collection import current_collection as _current_collection
 from cannbotdsl import Tensor as _Tensor, dtypes as _dtypes
 import torch as _torch
 import torch_npu as _torch_npu
@@ -53,15 +57,101 @@ from cannbotdsl.ops.sync import (
 from cannbotdsl.ops import sync as _sync_ops
 from cannbotdsl.ring_buffer import RingBuffer
 from cannbotdsl.tensor import make_layout, tile_slice
+from cannbotdsl import from_tensor
 
 
-def _permute(value, dims):
-    return value.permute(dims)
+def _native_sha(path):
+    return _hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-_NATIVE_DIRECTORY = _Path(__file__).resolve().parent / "_native"
-if __name__ == "quant_mla_prolog" and _NATIVE_DIRECTORY.is_dir():
-    _aot.register_directory(_NATIVE_DIRECTORY)
+def _native_resource(root, relative):
+    path = (root / relative).resolve()
+    if not path.is_relative_to(root):
+        raise ValueError(f"Invalid MLA Native resource: {relative!r}")
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    return path
+
+
+def _native_read_checked(root, relative, files):
+    path = _native_resource(root, relative)
+    if _native_sha(path) != files.get(relative):
+        raise ValueError(f"MLA Native metadata SHA mismatch: {relative}")
+    return _json.loads(path.read_text())
+
+
+@_lru_cache(maxsize=None)
+def _native_catalog(source_file, operator):
+    source = _Path(source_file).resolve()
+    root = source.parent / "_native"
+    manifest = _json.loads((root / "manifest.json").read_text())
+    if manifest["target"] != "dav-3510":
+        raise ValueError("MLA Native target mismatch")
+    metadata = _native_read_checked(
+        root, f"operators/{operator}/operator.json", manifest["files"]
+    )
+    source_sha = _native_sha(source)
+    programs = {}
+    for entry in metadata.get("mla_dispatch", ()):
+        if entry["source_sha256"] != source_sha:
+            continue
+        if entry["schema_version"] != 1:
+            raise ValueError("Unsupported MLA Native dispatch schema")
+        token, binary_key = entry["compile_key"], entry["binary_key"]
+        if token in programs and programs[token] != binary_key:
+            raise ValueError("Conflicting MLA Native compile key")
+        programs[token] = binary_key
+    if not programs:
+        return None
+    native_index = _native_read_checked(root, manifest["index"], manifest["files"])
+    return root, manifest, programs, native_index
+
+
+def _load_native_program(source_file, operator, compile_key):
+    """Prefer an indexed Native; an absent resource or key uses the original builder."""
+    try:
+        return _indexed_native_program(source_file, operator, compile_key)
+    except FileNotFoundError:
+        return None
+
+
+def _indexed_native_program(source_file, operator, compile_key):
+    catalog = _native_catalog(str(_Path(source_file).resolve()), operator)
+    if catalog is None:
+        return None
+    root, manifest, programs, native_index = catalog
+    binary_key = programs.get(compile_key)
+    if binary_key is None:
+        return None
+    indexed = native_index.get(binary_key)
+    if indexed is None:
+        return None
+    descriptor = indexed["descriptor"]
+    if not descriptor.startswith(f"operators/{operator}/variants/"):
+        raise ValueError("MLA Native operator/descriptor mismatch")
+    variant = _native_read_checked(root, descriptor, manifest["files"])
+    if variant["binary_key"] != binary_key or variant["target"] != manifest["target"]:
+        raise ValueError("MLA Native variant identity mismatch")
+    binary = _native_resource(root, variant["binary"])
+    sidecar = _native_resource(root, variant["sidecar"])
+    if sidecar != _Path(str(binary) + ".meta.json"):
+        raise ValueError("MLA Native sidecar path mismatch")
+    metadata = _native_read_checked(root, variant["sidecar"], manifest["files"])
+    contract_digest = variant["key_inputs"]["call_contract_sha256"]
+    if metadata["binary_sha256"] != manifest["files"].get(variant["binary"]):
+        raise ValueError("MLA Native binary SHA metadata mismatch")
+    if metadata["host_abi_version"] != manifest["host_abi_version"]:
+        raise ValueError("MLA Native ABI mismatch")
+    if metadata["contract_digest"] != contract_digest:
+        raise ValueError("MLA Native call contract mismatch")
+    program = _dsl.load(str(binary))
+    if (
+        program.host_abi_version != manifest["host_abi_version"]
+        or program.contract_digest != contract_digest
+    ):
+        program.close()
+        raise ValueError("Loaded MLA Native ABI/contract mismatch")
+    return program
 
 
 STRIPE_PARTS = 6
@@ -176,7 +266,13 @@ def _ring_buffer(
     data_format=None,
     cross_core=False,
     raw_bytes=False,
+    transpose_storage=False,
 ):
+    if transpose_storage:
+        ring = _ring_buffer(
+            mem_loc, shape[::-1], dtype, depth=depth, data_format=data_format
+        )
+        return _TransposedWeightRing(ring)
     logical_shape = shape
     view_format = data_format
     if data_format == "zn":
@@ -233,6 +329,17 @@ def _ring_buffer(
     return ring
 
 
+class _TransposedWeightRing:
+    def __init__(self, ring):
+        self._ring = ring
+
+    def next_write(self):
+        return self._ring.next_write().permute(1, 0)
+
+    def next_read(self):
+        return self._ring.next_read().permute(1, 0)
+
+
 class _RingBufferView:
     def __init__(self, ring, shape, dtype, data_format):
         self._ring = ring
@@ -258,6 +365,10 @@ class _RingBufferView:
 
     def next_write_raw(self):
         return self._ring.next_write()
+
+
+def _permute(value, dims):
+    return value.permute(dims)
 
 
 def _view(
@@ -293,6 +404,7 @@ def _copy_plan(*, format_transform=None, split_axis=None):
     if format_transform not in (
         None,
         "identity",
+        "nz_weight",
         "nd2nz",
         "mx_scale_and",
         "mx_scale_bdn",
@@ -304,21 +416,8 @@ def _copy_plan(*, format_transform=None, split_axis=None):
 
 
 def _accumulator(ring, rows, columns):
-    slot = ring.next_write()
-    full_rows = slot.shape[0]
-    full = _view(
-        slot,
-        shape=(full_rows, columns),
-        physical_layout=make_layout(
-            ((columns + 15) // 16, (full_rows + 15) // 16, 16, 16)
-        ),
-    )
-    view = _view(
-        full,
-        shape=(rows, columns),
-        physical_layout=full.physical_layout,
-    )
-    return full, view
+    view = _view(ring.next_write(), shape=(rows, columns))
+    return view, view
 
 
 def _copy(
@@ -338,6 +437,8 @@ def _copy(
         source = source.permute(1, 0)
     if plan is not None:
         transform, split_axis = plan
+        if transform == "nz_weight":
+            destination = destination.permute(1, 0)
         if transform == "mx_scale_and":
             source = source.flatten(1, 2)
         elif transform == "mx_scale_bdn":
@@ -380,6 +481,13 @@ def _copy(
             }
         )
     _dsl_mem_copy(destination, source, options=options)
+
+
+@jit
+def _weight_tile(weight, shape, coord, nz):
+    if dsl.const_expr(nz):
+        return tile_slice(weight, (shape[1], shape[0]), (coord[1], coord[0]))
+    return tile_slice(weight, shape, coord)
 
 
 @jit
@@ -458,24 +566,35 @@ QA_BALANCED_COLUMNS = 96
 QA_BALANCED_MAX_ROWS = 32
 QA_BALANCED_L1_REDUCTION = 512
 QA_L1_REDUCTION = 1024
+_DENSE_PROJECTION_RATIO = 4
+
+
+class _ReductionConfig(_NamedTuple):
+    physical_width: int
+    l1_tile: int
+
+
+class _TokenProfile(_NamedTuple):
+    capacity: int
+    hif_c2v: bool
+    large_m: bool
+    split_l0_tail: bool
 
 
 class QaRowPipeline:
     def __init__(
         self,
-        rows,
         width,
-        reduction,
         mode,
         nz,
         bm,
         splits,
         row_major=False,
         columns=QA_PIPELINE_COLUMNS,
+        dynamic_width=False,
     ):
-        self.rows = rows
+        self.dynamic_width = dynamic_width
         self.width = width
-        self.reduction = reduction
         self.mode = mode
         self.nz = nz
         self.bm = bm
@@ -483,8 +602,6 @@ class QaRowPipeline:
         self.row_major = row_major
         self.columns = columns
         self.nc = width // self.columns
-        self.nm = (rows + bm - 1) // bm
-        self.nt = self.nm * self.nc * splits
         self.l1_reduction = QA_PIPELINE_REDUCTION
 
     @jit
@@ -496,6 +613,11 @@ class QaRowPipeline:
         descale_weight: Tensor,
         partial: Tensor,
     ):
+        width = self.width
+        column_tiles = self.nc
+        if dsl.const_expr(self.dynamic_width):
+            width = weight.shape[1] if self.nz else weight.shape[0]
+            column_tiles = width // self.columns
         dtype = dtypes.float8_e4m3fn
         cube_dtype = dtypes.float8_e4m3fn
         if dsl.const_expr(self.mode == 2):
@@ -510,6 +632,7 @@ class QaRowPipeline:
             dtype,
             depth=2,
             data_format="nz",
+            transpose_storage=self.nz,
         )
         a0 = _ring_buffer(
             MemLoc.L0A,
@@ -529,18 +652,21 @@ class QaRowPipeline:
         ae = _copy_plan(format_transform="nd2nz")
         be = _copy_plan(format_transform="nd2nz")
         if dsl.const_expr(self.nz):
-            be = _copy_plan(format_transform="identity")
+            be = _copy_plan(format_transform="nz_weight")
         if dsl.const_expr(self.mode == 1):
             sa = _ring_buffer(
                 MemLoc.L1,
-                (self.bm, self.reduction // 32),
+                (self.bm, (x.shape[1] if self.nz else MAX_REDUCTION_ELEMENTS) // 32),
                 dtypes.float8_e8m0,
                 depth=1,
                 data_format="zn",
             )
             sb = _ring_buffer(
                 MemLoc.L1,
-                (self.reduction // 32, self.columns),
+                (
+                    (x.shape[1] if self.nz else MAX_REDUCTION_ELEMENTS) // 32,
+                    self.columns,
+                ),
                 dtypes.float8_e8m0,
                 depth=1,
                 data_format="nz",
@@ -548,25 +674,32 @@ class QaRowPipeline:
             )
             sae = _copy_plan(format_transform="mx_scale_and")
             sbe = _copy_plan(format_transform="mx_scale_bdn")
+        rows = x.shape[0]
+        row_tiles = (rows + self.bm - 1) // self.bm
+        task_count = row_tiles * column_tiles * self.splits
         # Small-T: fixed K+N owner per core, M tiles advance locally.
         task_start = get_block_idx()
         task_stride = get_block_num()
-        for task in range(task_start, self.nt, task_stride):
+        for task in range(task_start, task_count, task_stride):
             split = task % self.splits
             tile = task // self.splits
-            mt = tile // self.nc
-            nt = tile % self.nc
-            valid_rows = min(self.bm, self.rows - mt * self.bm)
+            mt = tile // column_tiles
+            nt = tile % column_tiles
+            valid_rows = min(self.bm, rows - mt * self.bm)
             acc_slot, acc = _accumulator(c0, valid_rows, self.columns)
             sa_full = None
             sb_full = None
             if dsl.const_expr(self.mode == 1):
                 _copy(
-                    _view(sa.next_write(), shape=(valid_rows, self.reduction // 32)),
+                    (
+                        _view(sa.next_write(), shape=(valid_rows, x.shape[1] // 32))
+                        if self.nz
+                        else sa.next_write()[0:valid_rows, 0 : x.shape[1] // 32]
+                    ),
                     tile_slice(
                         descale_activation,
                         dsl.make_tiler(
-                            (self.bm, self.reduction // 64, 2),
+                            (self.bm, x.shape[1] // 64, 2),
                             alignment=(self.bm, 2, 2),
                         ),
                         (mt, 0, 0),
@@ -574,15 +707,22 @@ class QaRowPipeline:
                     plan=sae,
                 )
                 if dsl.const_expr(self.nz):
-                    pw = self.reduction // 64 * 16 * 2
-                    packed = descale_weight.view((self.width // 16, pw))
+                    pw = x.shape[1] // 64 * 16 * 2
+                    packed = descale_weight.view((width // 16, pw))
                     _copy(
                         _view(
                             sb.next_write_raw(),
                             shape=(self.columns // 16, pw),
                             data_format="nd",
                         ),
-                        tile_slice(packed, (self.columns // 16, pw), (nt, 0)),
+                        tile_slice(
+                            packed,
+                            dsl.make_tiler(
+                                (self.columns // 16, pw),
+                                alignment=(1, NZ_SCALE_COLUMNS * MX_SCALE_PAIR),
+                            ),
+                            (nt, 0),
+                        ),
                     )
                 else:
                     _copy(
@@ -590,19 +730,21 @@ class QaRowPipeline:
                         tile_slice(
                             descale_weight,
                             dsl.make_tiler(
-                                (self.columns, self.reduction // 64, 2),
+                                (self.columns, x.shape[1] // 64, 2),
                                 alignment=(self.columns, 2, 2),
                             ),
                             (nt, 0, 0),
                         ),
                         plan=sbe,
                     )
-                sa_full = _view(
-                    sa.next_read(), shape=(valid_rows, self.reduction // 32)
+                sa_full = (
+                    _view(sa.next_read(), shape=(valid_rows, x.shape[1] // 32))
+                    if self.nz
+                    else sa.next_read()[0:valid_rows, None]
                 )
                 sb_full = sb.next_read()
-            start = split * (self.reduction // self.l1_reduction) // self.splits
-            stop = (split + 1) * (self.reduction // self.l1_reduction) // self.splits
+            start = split * (x.shape[1] // self.l1_reduction) // self.splits
+            stop = (split + 1) * (x.shape[1] // self.l1_reduction) // self.splits
             for kt in range(start, stop + 1):
                 if kt < stop:
                     _copy(
@@ -612,7 +754,9 @@ class QaRowPipeline:
                     )
                     _copy(
                         b1.next_write(),
-                        tile_slice(weight, (self.columns, self.l1_reduction), (nt, kt)),
+                        _weight_tile(
+                            weight, (self.columns, self.l1_reduction), (nt, kt), self.nz
+                        ),
                         plan=be,
                     )
                 if kt > start:
@@ -657,7 +801,7 @@ class QaRowPipeline:
                                 acc_slot,
                                 _view(
                                     a0.next_read(),
-                                    shape=(self.bm, QA_PIPELINE_REDUCTION),
+                                    shape=(valid_rows, QA_PIPELINE_REDUCTION),
                                 ),
                                 b0.next_read(),
                                 init=(kt == start + 1 and inner == 0),
@@ -702,7 +846,7 @@ class QaRowPipeline:
                             acc_slot,
                             _view(
                                 a0.next_read(),
-                                shape=(self.bm, QA_PIPELINE_REDUCTION),
+                                shape=(valid_rows, QA_PIPELINE_REDUCTION),
                             ),
                             b0.next_read(),
                             init=kt == start + 1,
@@ -712,12 +856,12 @@ class QaRowPipeline:
                 row_major_output = partial
                 if dsl.const_expr(self.splits > 1):
                     row_major_output = partial.view(
-                        (self.splits * self.nm * self.bm, self.width)
+                        (self.splits * row_tiles * self.bm, width)
                     )
                 dest = tile_slice(
                     row_major_output,
                     (self.bm, self.columns),
-                    (split * self.nm + mt, nt),
+                    (split * row_tiles + mt, nt),
                 )
             else:
                 dest = tile_slice(partial, (1, self.bm * self.columns), (task, 0)).view(
@@ -728,7 +872,8 @@ class QaRowPipeline:
 
 
 class _WkbProjection:
-    def __init__(self, tile_rows):
+    def __init__(self, tile_rows, reduction):
+        self.reduction = reduction
         self.tile_rows = tile_rows
         self.tile_columns = (
             128 if tile_rows == WQB_SINGLE_TAIL_ROWS else WKB_C2V_COLUMNS
@@ -764,7 +909,7 @@ class _WkbProjection:
             )
             return
         N = wkb.shape[0]
-        reduction = wkb.shape[1]
+        reduction = self.reduction
         rows = q_nope.shape[0] // N
         row_tiles = (rows + self.tile_rows - 1) // self.tile_rows
         a_l1 = _ring_buffer(
@@ -925,7 +1070,7 @@ class _WkbProjection:
                             acc_slot,
                             _view(
                                 a_l0.next_read(),
-                                shape=(self.tile_rows, WKB_C2V_REDUCTION),
+                                shape=(output_tile.shape[0], WKB_C2V_REDUCTION),
                             ),
                             _view(
                                 b_l0.next_read(),
@@ -966,7 +1111,7 @@ class _WkbProjection:
             )
             return
         N = wkb.shape[0]
-        reduction = wkb.shape[1]
+        reduction = self.reduction
         rows = q_nope.shape[0] // N
         row_tiles = (rows + self.tile_rows - 1) // self.tile_rows
         a_l1 = _ring_buffer(
@@ -1068,7 +1213,7 @@ class _WkbProjection:
                             acc_slot,
                             _view(
                                 a_l0.next_read(),
-                                shape=(self.tile_rows, WKB_C2V_REDUCTION),
+                                shape=(output_tile.shape[0], WKB_C2V_REDUCTION),
                             ),
                             b_l0.next_read(),
                             init=k_tile == 0,
@@ -1097,7 +1242,7 @@ class _WkbProjection:
         head_group: int = 1,
     ):
         N = wkb.shape[0]
-        reduction = wkb.shape[1]
+        reduction = self.reduction
         rows = q_nope.shape[0] // N
         row_tiles = (rows + self.tile_rows - 1) // self.tile_rows
         a_l1 = _ring_buffer(
@@ -1209,7 +1354,7 @@ class _WkbProjection:
                             acc_slot,
                             _view(
                                 a_l0.next_read(),
-                                shape=(self.tile_rows, WKB_C2V_REDUCTION),
+                                shape=(output_tile.shape[0], WKB_C2V_REDUCTION),
                             ),
                             b_l0.next_read(),
                             init=k_tile == 0,
@@ -1230,7 +1375,7 @@ class _WkbProjection:
     @jit
     def run(self, q_nope: Tensor, wkb: Tensor, output: Tensor):
         N = wkb.shape[0]
-        reduction = wkb.shape[1]
+        reduction = self.reduction
         rows = q_nope.shape[0] // N
         row_tiles = (rows + self.tile_rows - 1) // self.tile_rows
         a_l1 = _ring_buffer(
@@ -1366,7 +1511,7 @@ class WqbStripeProjection:
     ):
         rows = activation.shape[0]
         reduction = activation.shape[1]
-        stripes_per_row = weight.shape[0] // STRIPE_COLUMNS
+        stripes_per_row = weight.shape[1] // STRIPE_COLUMNS
         task_count = ((rows + self.tile_rows - 1) // self.tile_rows) * stripes_per_row
         panels = reduction // REDUCTION_PANEL
         a_l1 = _ring_buffer(
@@ -1384,6 +1529,7 @@ class WqbStripeProjection:
                 dtypes.float8_e4m3fn,
                 depth=2,
                 data_format="nz",
+                transpose_storage=True,
             )
         a_l0 = _ring_buffer(
             MemLoc.L0A,
@@ -1425,16 +1571,18 @@ class WqbStripeProjection:
             raw_bytes=True,
         )
         nd_engine = _copy_plan(format_transform="nd2nz")
-        weight_engine = _copy_plan(format_transform="identity")
+        weight_engine = _copy_plan(format_transform="nz_weight")
         scale_engine = _copy_plan(format_transform="mx_scale_and")
         packed_width = reduction // (MX_GROUP * SCALE_PAIR) * NZ_COLUMNS * SCALE_PAIR
-        packed_scales = weight_scale.view((weight.shape[0] // NZ_COLUMNS, packed_width))
+        packed_scales = weight_scale.view((weight.shape[1] // NZ_COLUMNS, packed_width))
 
         if get_block_idx() < task_count:
             stripe = get_block_idx() % stripes_per_row
             _copy(
                 b_l1.next_write(),
-                tile_slice(weight, (STRIPE_COLUMNS, REDUCTION_PANEL), (stripe, 0)),
+                _weight_tile(
+                    weight, (STRIPE_COLUMNS, REDUCTION_PANEL), (stripe, 0), True
+                ),
                 plan=weight_engine,
             )
             scale_target = _view(
@@ -1446,7 +1594,10 @@ class WqbStripeProjection:
                 scale_target,
                 tile_slice(
                     packed_scales,
-                    (STRIPE_COLUMNS // NZ_COLUMNS, packed_width),
+                    dsl.make_tiler(
+                        (STRIPE_COLUMNS // NZ_COLUMNS, packed_width),
+                        alignment=(1, NZ_SCALE_COLUMNS * MX_SCALE_PAIR),
+                    ),
                     (stripe, 0),
                 ),
             )
@@ -1522,7 +1673,10 @@ class WqbStripeProjection:
                     scale_target,
                     tile_slice(
                         packed_scales,
-                        (STRIPE_COLUMNS // NZ_COLUMNS, packed_width),
+                        dsl.make_tiler(
+                            (STRIPE_COLUMNS // NZ_COLUMNS, packed_width),
+                            alignment=(1, NZ_SCALE_COLUMNS * MX_SCALE_PAIR),
+                        ),
                         (stripe, 0),
                     ),
                 )
@@ -1542,10 +1696,11 @@ class WqbStripeProjection:
                     if task != get_block_idx() or panel != 0:
                         _copy(
                             b_l1.next_write(),
-                            tile_slice(
+                            _weight_tile(
                                 weight,
                                 (STRIPE_COLUMNS, REDUCTION_PANEL),
                                 (stripe, panel),
+                                True,
                             ),
                             plan=weight_engine,
                         )
@@ -1767,7 +1922,9 @@ class WqbCompactHeadProjection(WqbStripeProjection):
         head_width,
         weight_is_nz,
         reduction_panel=REDUCTION_PANEL,
+        scale_capacity=0,
     ):
+        self.scale_capacity = scale_capacity
         self.tile_rows = tile_rows
         self.reduction_panel = reduction_panel
         self.ready_event = ready_event
@@ -1797,7 +1954,9 @@ class WqbCompactHeadProjection(WqbStripeProjection):
     ):
         rows = activation.shape[0]
         reduction = activation.shape[1]
-        stripes_per_row = weight.shape[0] // self.stripe_columns
+        stripes_per_row = (
+            weight.shape[1] if self.weight_is_nz else weight.shape[0]
+        ) // self.stripe_columns
         task_count = ((rows + self.tile_rows - 1) // self.tile_rows) * stripes_per_row
         panels = reduction // self.reduction_panel
         a_l1 = _ring_buffer(
@@ -1817,16 +1976,19 @@ class WqbCompactHeadProjection(WqbStripeProjection):
         )
         b_l0 = shared_l0_b
         c_l0 = shared_l0_c
+        scale_groups = reduction // MX_GROUP
+        if dsl.const_expr(self.scale_capacity > 0):
+            scale_groups = self.scale_capacity // MX_GROUP
         sa_l1 = _ring_buffer(
             MemLoc.L1,
-            (self.tile_rows, reduction // MX_GROUP),
+            (self.tile_rows, scale_groups),
             dtypes.float8_e8m0,
             depth=1,
             data_format="zn",
         )
         sb_l1 = _ring_buffer(
             MemLoc.L1,
-            (reduction // MX_GROUP, self.stripe_columns),
+            (scale_groups, self.stripe_columns),
             dtypes.float8_e8m0,
             depth=1,
             data_format="nz",
@@ -1835,13 +1997,17 @@ class WqbCompactHeadProjection(WqbStripeProjection):
         nd_engine = _copy_plan(format_transform="nd2nz")
         weight_engine = _copy_plan(format_transform="nd2nz")
         if dsl.const_expr(self.weight_is_nz):
-            weight_engine = _copy_plan(format_transform="identity")
+            weight_engine = _copy_plan(format_transform="nz_weight")
         weight_scale_engine = _copy_plan(format_transform="mx_scale_bdn")
         scale_engine = _copy_plan(format_transform="mx_scale_and")
         packed_width = reduction // (MX_GROUP * SCALE_PAIR) * NZ_COLUMNS * SCALE_PAIR
         if dsl.const_expr(self.weight_is_nz):
             packed_scales = weight_scale.view(
-                (weight.shape[0] // NZ_COLUMNS, packed_width)
+                (
+                    (weight.shape[1] if self.weight_is_nz else weight.shape[0])
+                    // NZ_COLUMNS,
+                    packed_width,
+                )
             )
 
         if get_block_idx() < task_count:
@@ -1850,8 +2016,11 @@ class WqbCompactHeadProjection(WqbStripeProjection):
                 _view(
                     b_l1.next_write(), shape=(self.stripe_columns, self.reduction_panel)
                 ),
-                tile_slice(
-                    weight, (self.stripe_columns, self.reduction_panel), (stripe, 0)
+                _weight_tile(
+                    weight,
+                    (self.stripe_columns, self.reduction_panel),
+                    (stripe, 0),
+                    self.weight_is_nz,
                 ),
                 plan=weight_engine,
             )
@@ -1865,13 +2034,21 @@ class WqbCompactHeadProjection(WqbStripeProjection):
                     scale_target,
                     tile_slice(
                         packed_scales,
-                        (self.stripe_columns // NZ_COLUMNS, packed_width),
+                        dsl.make_tiler(
+                            (self.stripe_columns // NZ_COLUMNS, packed_width),
+                            alignment=(1, NZ_SCALE_COLUMNS * MX_SCALE_PAIR),
+                        ),
                         (stripe, 0),
                     ),
                 )
             else:
                 _copy(
-                    sb_l1.next_write(),
+                    _scale_width_view(
+                        sb_l1.next_write(),
+                        reduction // MX_GROUP,
+                        self.scale_capacity,
+                        False,
+                    ),
                     tile_slice(
                         weight_scale,
                         dsl.make_tiler(
@@ -1907,7 +2084,9 @@ class WqbCompactHeadProjection(WqbStripeProjection):
             valid_m = self.tile_rows
             stripe_acc = _view(c_l0.next_write(), shape=(valid_m, self.stripe_columns))
             _copy(
-                sa_l1.next_write(),
+                _scale_width_view(
+                    sa_l1.next_write(), reduction // MX_GROUP, self.scale_capacity, True
+                ),
                 tile_slice(
                     activation_scale,
                     dsl.make_tiler(
@@ -1933,13 +2112,21 @@ class WqbCompactHeadProjection(WqbStripeProjection):
                         scale_target,
                         tile_slice(
                             packed_scales,
-                            (self.stripe_columns // NZ_COLUMNS, packed_width),
+                            dsl.make_tiler(
+                                (self.stripe_columns // NZ_COLUMNS, packed_width),
+                                alignment=(1, NZ_SCALE_COLUMNS * MX_SCALE_PAIR),
+                            ),
                             (stripe, 0),
                         ),
                     )
                 else:
                     _copy(
-                        sb_l1.next_write(),
+                        _scale_width_view(
+                            sb_l1.next_write(),
+                            reduction // MX_GROUP,
+                            self.scale_capacity,
+                            False,
+                        ),
                         tile_slice(
                             weight_scale,
                             dsl.make_tiler(
@@ -1973,10 +2160,11 @@ class WqbCompactHeadProjection(WqbStripeProjection):
                                 b_l1.next_write(),
                                 shape=(self.stripe_columns, self.reduction_panel),
                             ),
-                            tile_slice(
+                            _weight_tile(
                                 weight,
                                 (self.stripe_columns, self.reduction_panel),
                                 (stripe, panel),
+                                self.weight_is_nz,
                             ),
                             plan=weight_engine,
                         )
@@ -2079,7 +2267,9 @@ class _Projection:
         hif_c2v=False,
         hif_split_l0=False,
         drain_handoff=False,
+        nope_width=0,
     ):
+        self.nope_width = nope_width
         self.drain_handoff = drain_handoff
         self.columns = columns
         self.reduction = reduction
@@ -2118,7 +2308,7 @@ class _Projection:
         c_to_v=None,
     ):
         rows = activation.shape[0]
-        columns = weight_input.shape[0]
+        columns = weight_input.shape[1] if self.weight_is_nz else weight_input.shape[0]
         reduction = activation.shape[1]
         dtype = dtypes.float8_e4m3fn
         if dsl.const_expr(self.w_qr_quant_mode == 2):
@@ -2136,6 +2326,7 @@ class _Projection:
             dtype,
             depth=3 if self.weight_lookahead else 2,
             data_format="nz",
+            transpose_storage=self.weight_is_nz,
         )
         cube_dtype = dtypes.float8_e4m3fn
         if dsl.const_expr(self.w_qr_quant_mode == 2):
@@ -2159,8 +2350,6 @@ class _Projection:
             MemLoc.L0C, (self.tile_rows, self.tile_columns), dtypes.float32, depth=1
         )
         if dsl.const_expr(self.weight_is_nz):
-            # Packed NZ scale copies require the same physical stride as
-            # the GM payload; NZ K is statically specialized by the host.
             sa_l1 = _ring_buffer(
                 MemLoc.L1,
                 (self.tile_rows, reduction // MX_GROUP_ELEMENTS),
@@ -2179,7 +2368,7 @@ class _Projection:
         else:
             sa_l1 = _ring_buffer(
                 MemLoc.L1,
-                (self.tile_rows, reduction // MX_GROUP_ELEMENTS),
+                (self.tile_rows, MAX_REDUCTION_ELEMENTS // MX_GROUP_ELEMENTS),
                 dtypes.float8_e8m0,
                 depth=1,
                 data_format="zn",
@@ -2187,7 +2376,7 @@ class _Projection:
             )
             sb_l1 = _ring_buffer(
                 MemLoc.L1,
-                (reduction // MX_GROUP_ELEMENTS, self.tile_columns),
+                (MAX_REDUCTION_ELEMENTS // MX_GROUP_ELEMENTS, self.tile_columns),
                 dtypes.float8_e8m0,
                 depth=1,
                 data_format="nz",
@@ -2201,7 +2390,7 @@ class _Projection:
         nd_engine = _copy_plan(format_transform="nd2nz")
         b_engine = _copy_plan(format_transform="nd2nz")
         if dsl.const_expr(self.weight_is_nz):
-            b_engine = _copy_plan(format_transform="identity")
+            b_engine = _copy_plan(format_transform="nz_weight")
         tasks_per_row = columns // self.tile_columns
         task_count = (rows + self.tile_rows - 1) // self.tile_rows * tasks_per_row
         task_stride = get_block_num()
@@ -2212,10 +2401,11 @@ class _Projection:
                 first_col = (get_block_idx() - core_begin) % tasks_per_row
                 _copy(
                     b_l1.next_write(),
-                    tile_slice(
+                    _weight_tile(
                         weight_input,
                         (self.tile_columns, self.tile_reduction),
                         (first_col, 0),
+                        self.weight_is_nz,
                     ),
                     plan=b_engine,
                 )
@@ -2225,10 +2415,11 @@ class _Projection:
                 col_tile = get_block_idx() % tasks_per_row
                 _copy(
                     b_l1.next_write(),
-                    tile_slice(
+                    _weight_tile(
                         weight_input,
                         (self.tile_columns, self.tile_reduction),
                         (col_tile, 0),
+                        self.weight_is_nz,
                     ),
                     plan=b_engine,
                 )
@@ -2239,7 +2430,10 @@ class _Projection:
                     )
                     packed = tile_slice(
                         packed_rows,
-                        (self.tile_columns // NZ_SCALE_COLUMNS, packed_width),
+                        dsl.make_tiler(
+                            (self.tile_columns // NZ_SCALE_COLUMNS, packed_width),
+                            alignment=(1, NZ_SCALE_COLUMNS * MX_SCALE_PAIR),
+                        ),
                         (col_tile, 0),
                     )
                     raw_scale_tile = _view(
@@ -2250,7 +2444,7 @@ class _Projection:
                     _copy(raw_scale_tile, packed.view(dtype=dtypes.uint8))
                 else:
                     _copy(
-                        sb_l1.next_write(),
+                        sb_l1.next_write()[0 : reduction // MX_GROUP_ELEMENTS, None],
                         tile_slice(
                             descale_weight,
                             dsl.make_tiler(
@@ -2280,7 +2474,7 @@ class _Projection:
             acc = c_l0.next_write()
             if dsl.const_expr(self.w_qr_quant_mode == 1):
                 _copy(
-                    sa_l1.next_write(),
+                    sa_l1.next_write()[None, 0 : reduction // MX_GROUP_ELEMENTS],
                     tile_slice(
                         descale_activation,
                         dsl.make_tiler(
@@ -2301,7 +2495,10 @@ class _Projection:
                         )
                         packed = tile_slice(
                             packed_rows,
-                            (self.tile_columns // NZ_SCALE_COLUMNS, packed_width),
+                            dsl.make_tiler(
+                                (self.tile_columns // NZ_SCALE_COLUMNS, packed_width),
+                                alignment=(1, NZ_SCALE_COLUMNS * MX_SCALE_PAIR),
+                            ),
                             (col_tile, 0),
                         )
                         raw_scale_tile = _view(
@@ -2312,7 +2509,9 @@ class _Projection:
                         _copy(raw_scale_tile, packed.view(dtype=dtypes.uint8))
                     else:
                         _copy(
-                            sb_l1.next_write(),
+                            sb_l1.next_write()[
+                                0 : reduction // MX_GROUP_ELEMENTS, None
+                            ],
                             tile_slice(
                                 descale_weight,
                                 dsl.make_tiler(
@@ -2335,10 +2534,11 @@ class _Projection:
                 ):
                     _copy(
                         b_l1.next_write(),
-                        tile_slice(
+                        _weight_tile(
                             weight_input,
                             (self.tile_columns, self.tile_reduction),
                             (col_tile, 0),
+                            self.weight_is_nz,
                         ),
                         plan=b_engine,
                     )
@@ -2357,10 +2557,11 @@ class _Projection:
                         if reduction_tile + 1 < reduction // self.tile_reduction:
                             _copy(
                                 b_l1.next_write(),
-                                tile_slice(
+                                _weight_tile(
                                     weight_input,
                                     (self.tile_columns, self.tile_reduction),
                                     (col_tile, reduction_tile + 1),
+                                    self.weight_is_nz,
                                 ),
                                 plan=b_engine,
                             )
@@ -2376,10 +2577,11 @@ class _Projection:
                         ):
                             _copy(
                                 b_l1.next_write(),
-                                tile_slice(
+                                _weight_tile(
                                     weight_input,
                                     (self.tile_columns, self.tile_reduction),
                                     (col_tile, reduction_tile),
+                                    self.weight_is_nz,
                                 ),
                                 plan=b_engine,
                             )
@@ -2542,7 +2744,7 @@ class _Projection:
         defer_qr: bool = False,
     ):
         rows = activation.shape[0]
-        columns = weight_input.shape[0]
+        columns = weight_input.shape[1] if self.weight_is_nz else weight_input.shape[0]
         reduction = activation.shape[1]
         dtype = dtypes.float8_e4m3fn
         if dsl.const_expr(self.w_qr_quant_mode == 2):
@@ -2560,6 +2762,7 @@ class _Projection:
             dtype,
             depth=2,
             data_format="nz",
+            transpose_storage=self.weight_is_nz,
         )
         cube_dtype = dtypes.float8_e4m3fn
         if dsl.const_expr(self.w_qr_quant_mode == 2):
@@ -2583,7 +2786,7 @@ class _Projection:
         )
         wkb_l1_reduction = WKB_C2V_REDUCTION
         if dsl.const_expr(self.w_qr_quant_mode == 2):
-            wkb_l1_reduction = wkb.shape[1]
+            wkb_l1_reduction = self.nope_width
         wkb_a_l1 = _ring_buffer(
             MemLoc.L1, (self.tile_rows, wkb_l1_reduction), dtypes.bfloat16, depth=2
         )
@@ -2592,7 +2795,7 @@ class _Projection:
         )
         wkb_load_engine = _copy_plan(format_transform="nd2nz")
         head_count = wkb.shape[0]
-        wkb_reduction = wkb.shape[1]
+        wkb_reduction = self.nope_width
         input_tokens = q_nope.view((rows, head_count * wkb_reduction))
         output_heads = _permute(q.view((rows, head_count, q.shape[1])), (1, 0, 2))
         if dsl.const_expr(self.w_qr_quant_mode == 1):
@@ -2615,7 +2818,7 @@ class _Projection:
             else:
                 sa_l1 = _ring_buffer(
                     MemLoc.L1,
-                    (self.tile_rows, reduction // MX_GROUP_ELEMENTS),
+                    (self.tile_rows, MAX_REDUCTION_ELEMENTS // MX_GROUP_ELEMENTS),
                     dtypes.float8_e8m0,
                     depth=1,
                     data_format="zn",
@@ -2626,7 +2829,7 @@ class _Projection:
                 )
                 sb_l1 = _ring_buffer(
                     MemLoc.L1,
-                    (reduction // MX_GROUP_ELEMENTS, self.tile_columns),
+                    (MAX_REDUCTION_ELEMENTS // MX_GROUP_ELEMENTS, self.tile_columns),
                     dtypes.float8_e8m0,
                     depth=1,
                     data_format="nz",
@@ -2640,7 +2843,7 @@ class _Projection:
         nd_engine = _copy_plan(format_transform="nd2nz")
         b_engine = _copy_plan(format_transform="nd2nz")
         if dsl.const_expr(self.weight_is_nz):
-            b_engine = _copy_plan(format_transform="identity")
+            b_engine = _copy_plan(format_transform="nz_weight")
         tasks_per_row = columns // self.tile_columns
         task_count = (rows + self.tile_rows - 1) // self.tile_rows * tasks_per_row
         task_stride = get_block_num()
@@ -2652,10 +2855,11 @@ class _Projection:
                     col_tile = get_block_idx() % tasks_per_row
                     _copy(
                         b_l1.next_write(),
-                        tile_slice(
+                        _weight_tile(
                             weight_input,
                             (self.tile_columns, self.tile_reduction),
                             (col_tile, 0),
+                            self.weight_is_nz,
                         ),
                         plan=b_engine,
                     )
@@ -2668,7 +2872,10 @@ class _Projection:
                         )
                         packed = tile_slice(
                             packed_rows,
-                            (self.tile_columns // NZ_SCALE_COLUMNS, packed_width),
+                            dsl.make_tiler(
+                                (self.tile_columns // NZ_SCALE_COLUMNS, packed_width),
+                                alignment=(1, NZ_SCALE_COLUMNS * MX_SCALE_PAIR),
+                            ),
                             (col_tile, 0),
                         )
                         raw_scale_tile = _view(
@@ -2679,7 +2886,9 @@ class _Projection:
                         _copy(raw_scale_tile, packed.view(dtype=dtypes.uint8))
                     else:
                         _copy(
-                            sb_l1.next_write(),
+                            sb_l1.next_write()[
+                                0 : reduction // MX_GROUP_ELEMENTS, None
+                            ],
                             tile_slice(
                                 descale_weight,
                                 dsl.make_tiler(
@@ -2700,10 +2909,11 @@ class _Projection:
                 first_col = (get_block_idx() - core_begin) % tasks_per_row
                 _copy(
                     b_l1.next_write(),
-                    tile_slice(
+                    _weight_tile(
                         weight_input,
                         (self.tile_columns, self.tile_reduction),
                         (first_col, 0),
+                        self.weight_is_nz,
                     ),
                     plan=b_engine,
                 )
@@ -2720,7 +2930,7 @@ class _Projection:
             acc = _view(c_l0.next_write(), shape=(self.tile_rows, self.tile_columns))
             if dsl.const_expr(self.w_qr_quant_mode == 1):
                 _copy(
-                    sa_l1.next_write(),
+                    sa_l1.next_write()[None, 0 : reduction // MX_GROUP_ELEMENTS],
                     tile_slice(
                         descale_activation,
                         dsl.make_tiler(
@@ -2741,7 +2951,10 @@ class _Projection:
                         )
                         packed = tile_slice(
                             packed_rows,
-                            (self.tile_columns // NZ_SCALE_COLUMNS, packed_width),
+                            dsl.make_tiler(
+                                (self.tile_columns // NZ_SCALE_COLUMNS, packed_width),
+                                alignment=(1, NZ_SCALE_COLUMNS * MX_SCALE_PAIR),
+                            ),
                             (col_tile, 0),
                         )
                         raw_scale_tile = _view(
@@ -2752,7 +2965,9 @@ class _Projection:
                         _copy(raw_scale_tile, packed.view(dtype=dtypes.uint8))
                     else:
                         _copy(
-                            sb_l1.next_write(),
+                            sb_l1.next_write()[
+                                0 : reduction // MX_GROUP_ELEMENTS, None
+                            ],
                             tile_slice(
                                 descale_weight,
                                 dsl.make_tiler(
@@ -2788,10 +3003,11 @@ class _Projection:
                         ):
                             _copy(
                                 b_l1.next_write(),
-                                tile_slice(
+                                _weight_tile(
                                     weight_input,
                                     (self.tile_columns, self.tile_reduction),
                                     (col_tile, reduction_tile),
+                                    self.weight_is_nz,
                                 ),
                                 plan=b_engine,
                             )
@@ -2803,10 +3019,11 @@ class _Projection:
                         ):
                             _copy(
                                 b_l1.next_write(),
-                                tile_slice(
+                                _weight_tile(
                                     weight_input,
                                     (self.tile_columns, self.tile_reduction),
                                     (col_tile, reduction_tile),
+                                    self.weight_is_nz,
                                 ),
                                 plan=b_engine,
                             )
@@ -3113,6 +3330,27 @@ class _Projection:
         _sync_ops.cube_sync_all()
 
 
+def _scale_width_view(value, groups, capacity, is_a):
+    if not capacity:
+        return value
+    return value[None, 0:groups] if is_a else value[0:groups, None]
+
+
+def _width_view(value, width, dynamic):
+    return value[None, 0:width] if dynamic else value
+
+
+def _width_tile(width, dynamic, alignment):
+    return (
+        dsl.make_tiler((1, width), alignment=(1, alignment)) if dynamic else (1, width)
+    )
+
+
+@jit
+def _maximum_scratch_view(scratch, width):
+    return scratch.view((scratch.shape[0] * scratch.shape[1] // width, width))
+
+
 class _Normalize:
     def __init__(
         self,
@@ -3120,8 +3358,10 @@ class _Normalize:
         w_qr_quant_mode,
         partial_bm=0,
         hif_resident_rows=HIF_QR_RESIDENT_ROWS,
+        dynamic_width=False,
     ):
         self.width = width
+        self.dynamic_width = dynamic_width
         self.w_qr_quant_mode = w_qr_quant_mode
         self.partial_bm = partial_bm
         self.hif_resident_rows = hif_resident_rows
@@ -3572,7 +3812,12 @@ class _Normalize:
         norm_eps: float,
         post_norm_scale: float,
     ):
-        group_count = self.width // MX_GROUP_ELEMENTS
+        width = self.width
+        width_fp32 = float(self.width)
+        if dsl.const_expr(self.dynamic_width):
+            width = norm_weight.shape[1]
+            width_fp32 = dtypes.float32(width)
+        group_count = width // MX_GROUP_ELEMENTS
         padded_groups = (
             (group_count + VECTOR_FLOAT_ELEMENTS - 1)
             // VECTOR_FLOAT_ELEMENTS
@@ -3589,7 +3834,7 @@ class _Normalize:
             partial_rows = (
                 (qr.shape[0] + self.partial_bm - 1) // self.partial_bm * self.partial_bm
             )
-            partial_view = projection_fp32.view((2 * partial_rows, self.width))
+            partial_view = projection_fp32.view((2 * partial_rows, width))
         normalized_rows = _ring_buffer(
             MemLoc.UB,
             (1, self.width),
@@ -3600,27 +3845,47 @@ class _Normalize:
         output_rows = _ring_buffer(
             MemLoc.UB, (1, self.width), dtypes.float8_e4m3fn, depth=2
         )
-        scales = _ring_buffer(MemLoc.UB, (1, group_count), dtypes.float8_e8m0, depth=2)
+        scales = _ring_buffer(
+            MemLoc.UB, (1, self.width // MX_GROUP_ELEMENTS), dtypes.float8_e8m0, depth=2
+        )
         norm_weight_buffer = _buffer(MemLoc.UB, (1, self.width), dtypes.float32)
-        exponent_buffer = _buffer(MemLoc.UB, (padded_groups,), dtypes.uint32)
-        _copy(norm_weight_buffer, norm_weight)
+        exponent_buffer = _buffer(
+            MemLoc.UB,
+            (
+                (
+                    (self.width // MX_GROUP_ELEMENTS + VECTOR_FLOAT_ELEMENTS - 1)
+                    // VECTOR_FLOAT_ELEMENTS
+                    * VECTOR_FLOAT_ELEMENTS
+                ),
+            ),
+            dtypes.uint32,
+        )
+        _copy(_width_view(norm_weight_buffer, width, self.dynamic_width), norm_weight)
         worker = get_block_idx() * VECTOR_SUBBLOCKS + get_subblock_id()
         worker_count = get_block_num() * VECTOR_SUBBLOCKS
         for row in range(worker, qr.shape[0], worker_count):
             if dsl.const_expr(self.partial_bm > 0):
                 _copy(
-                    merged_rows.next_write(),
-                    tile_slice(partial_view, (1, self.width), (row, 0)),
+                    _width_view(merged_rows.next_write(), width, self.dynamic_width),
+                    tile_slice(
+                        partial_view,
+                        _width_tile(width, self.dynamic_width, 64),
+                        (row, 0),
+                    ),
                 )
                 _copy(
-                    incoming_rows.next_write(),
-                    tile_slice(partial_view, (1, self.width), (partial_rows + row, 0)),
+                    _width_view(incoming_rows.next_write(), width, self.dynamic_width),
+                    tile_slice(
+                        partial_view,
+                        _width_tile(width, self.dynamic_width, 64),
+                        (partial_rows + row, 0),
+                    ),
                 )
                 merged_row = merged_rows.next_read()
                 incoming_row = incoming_rows.next_read()
                 with vf(mode="simd"):
                     merge_mask = rr.full_mask()
-                    for offset in range(0, self.width, VECTOR_FLOAT_ELEMENTS):
+                    for offset in range(0, width, VECTOR_FLOAT_ELEMENTS):
                         merged = rr.vadd(
                             rr.vload(merged_row, offset),
                             rr.vload(incoming_row, offset),
@@ -3630,8 +3895,12 @@ class _Normalize:
                 values = merged_row
             else:
                 _copy(
-                    input_rows.next_write(),
-                    tile_slice(projection_fp32, (1, self.width), (row, 0)),
+                    _width_view(input_rows.next_write(), width, self.dynamic_width),
+                    tile_slice(
+                        projection_fp32,
+                        _width_tile(width, self.dynamic_width, 64),
+                        (row, 0),
+                    ),
                 )
                 values = input_rows.next_read()
             normalized = normalized_rows.next_write()
@@ -3639,7 +3908,7 @@ class _Normalize:
                 mask = rr.full_mask()
                 rr.vmem_bar("vst_vld")
                 squared_sum = rr.vdups(0.0, dtypes.float32, mask=mask)
-                for offset in range(0, self.width, VECTOR_FLOAT_ELEMENTS):
+                for offset in range(0, width, VECTOR_FLOAT_ELEMENTS):
                     value = rr.vload(values, offset)
                     squared_sum = rr.vadd(
                         squared_sum,
@@ -3649,14 +3918,14 @@ class _Normalize:
                 total = rr.vdup(squared_sum, mask=mask)
                 mean_square = rr.vdiv(
                     total,
-                    rr.vdups(float(self.width), dtypes.float32, mask=mask),
+                    rr.vdups(width_fp32, dtypes.float32, mask=mask),
                     mask=mask,
                     precision_mode=True,
                 )
                 denominator = rr.vsqrt(
                     rr.vadds(mean_square, norm_eps, mask=mask), mask=mask
                 )
-                for offset in range(0, self.width, VECTOR_FLOAT_ELEMENTS):
+                for offset in range(0, width, VECTOR_FLOAT_ELEMENTS):
                     value = rr.vdiv(
                         rr.vload(values, offset),
                         denominator,
@@ -3777,9 +4046,17 @@ class _Normalize:
                         mask,
                         pack_mode=rr.PackMode.B32_TO_B8,
                     )
-            _copy(tile_slice(qr, (1, self.width), (row, 0)), output_rows.next_read())
             _copy(
-                tile_slice(descale_qr, (1, group_count), (row, 0)), scales.next_read()
+                tile_slice(qr, _width_tile(width, self.dynamic_width, 64), (row, 0)),
+                output_rows.next_read(),
+            )
+            _copy(
+                tile_slice(
+                    descale_qr,
+                    _width_tile(group_count, self.dynamic_width, 16),
+                    (row, 0),
+                ),
+                scales.next_read(),
             )
 
 
@@ -4132,7 +4409,7 @@ def _bf16_sat_input(value, mask):
 
 @jit
 def _rope_row(rope_fp32, offset, rope_sin, rope_cos, rope_bf16, rope_mode, cache_sat=0):
-    if dsl.const_expr(rope_mode == 0):
+    if rope_mode == 0:
         with vf(mode="simd"):
             mask = rr.full_mask()
             value = rr.vload(rope_fp32, offset)
@@ -4151,7 +4428,7 @@ def _rope_row(rope_fp32, offset, rope_sin, rope_cos, rope_bf16, rope_mode, cache
     else:
         even_step = 1
         odd_start = VECTOR_FLOAT_ELEMENTS // 2
-        if dsl.const_expr(rope_mode == 1):
+        if rope_mode == 1:
             even_step = 2
             odd_start = 1
         with vf(mode="simd"):
@@ -4215,18 +4492,232 @@ def _rope_row(rope_fp32, offset, rope_sin, rope_cos, rope_bf16, rope_mode, cache
             )
 
 
+@jit
+def _rope_group(
+    rope_mode: int,
+    values: Tensor,
+    rope_sin: Tensor,
+    rope_cos: Tensor,
+    output: Tensor,
+    nope_output: Tensor,
+    vector_rows: int,
+    packed_nope: bool,
+    valid_rows: int,
+    head_group: int,
+    nope_width: int,
+    rope_width: int,
+):
+    width = nope_width + rope_width
+    columns = head_group * width
+    rope_columns = head_group * rope_width
+    nope_columns = head_group * nope_width
+    fractal_lanes = FRACTAL_BYTES // BF16_BYTES
+    even_step = 1
+    odd_start = VECTOR_FLOAT_ELEMENTS // 2
+    if rope_mode == 1:
+        even_step = 2
+        odd_start = 1
+    if rope_mode == 0:
+        with vf(mode="simd"):
+            full = rr.full_mask()
+            if dsl.const_expr(packed_nope):
+                packed_mask = rr.update_mask(VECTOR_FLOAT_ELEMENTS, elem_bits=16)[0]
+                zero = rr.vdups(0, dtypes.uint16, mask=packed_mask)
+                for row in range(valid_rows, vector_rows):
+                    for offset in range(0, nope_columns, VECTOR_FLOAT_ELEMENTS):
+                        rr.vstore_strided(
+                            nope_output,
+                            offset // fractal_lanes * vector_rows * fractal_lanes
+                            + row * fractal_lanes,
+                            rr.vreinterpret(zero, dtypes.bfloat16),
+                            packed_mask,
+                            block_stride=vector_rows,
+                        )
+            for row in range(valid_rows):
+                for head in range(head_group):
+                    for offset in range(0, nope_width, VECTOR_FLOAT_ELEMENTS):
+                        nope_value = rr.vload(
+                            values, row * columns + head * width + offset
+                        )
+                        nope_encoded = rr.vcast(
+                            nope_value,
+                            dtypes.bfloat16,
+                            mask=full,
+                            rounding=rr.RoundingMode.RN,
+                            reg_layout=RegLayout.ZERO,
+                        )
+                        if dsl.const_expr(packed_nope):
+                            packed = rr.vpack(
+                                rr.vreinterpret_lanes(nope_encoded, dtypes.uint32),
+                                dtypes.uint16,
+                                part="lower",
+                            )
+                            rr.vstore_strided(
+                                nope_output,
+                                (head * nope_width + offset)
+                                // fractal_lanes
+                                * vector_rows
+                                * fractal_lanes
+                                + row * fractal_lanes,
+                                rr.vreinterpret(packed, dtypes.bfloat16),
+                                packed_mask,
+                                block_stride=vector_rows,
+                            )
+                        else:
+                            rr.vstore_pack(
+                                nope_output,
+                                row * nope_columns + head * nope_width + offset,
+                                nope_encoded,
+                                full,
+                                pack_mode=rr.PackMode.B32_TO_B16,
+                            )
+                    encoded = rr.vcast(
+                        rr.vload(values, row * columns + head * width + nope_width),
+                        dtypes.bfloat16,
+                        mask=full,
+                        rounding=rr.RoundingMode.RN,
+                        reg_layout=RegLayout.ZERO,
+                    )
+                    rr.vstore_pack(
+                        output,
+                        row * rope_columns + head * rope_width,
+                        encoded,
+                        full,
+                        pack_mode=rr.PackMode.B32_TO_B16,
+                    )
+    else:
+        with vf(mode="simd"):
+            full = rr.full_mask()
+            half = rr.update_mask(VECTOR_FLOAT_ELEMENTS // 2, elem_bits=32)[0]
+            positions = rr.varange(0, dtypes.uint32)
+            first_idx = rr.vmuls(positions, even_step, mask=full)
+            second_idx = rr.vadds(first_idx, odd_start, mask=full)
+            upper_idx = rr.vadds(positions, VECTOR_FLOAT_ELEMENTS // 2, mask=full)
+            if dsl.const_expr(packed_nope):
+                packed_mask = rr.update_mask(VECTOR_FLOAT_ELEMENTS, elem_bits=16)[0]
+                zero = rr.vdups(0, dtypes.uint16, mask=packed_mask)
+                for row in range(valid_rows, vector_rows):
+                    for offset in range(0, nope_columns, VECTOR_FLOAT_ELEMENTS):
+                        rr.vstore_strided(
+                            nope_output,
+                            offset // fractal_lanes * vector_rows * fractal_lanes
+                            + row * fractal_lanes,
+                            rr.vreinterpret(zero, dtypes.bfloat16),
+                            packed_mask,
+                            block_stride=vector_rows,
+                        )
+            for row in range(valid_rows):
+                sin_row = rr.vcast(
+                    rr.vload_unpack(
+                        rope_sin, row * rope_width, unpack_mode=rr.UnpackMode.UNPACK2
+                    ),
+                    dtypes.float32,
+                    mask=full,
+                )
+                cos_row = rr.vcast(
+                    rr.vload_unpack(
+                        rope_cos, row * rope_width, unpack_mode=rr.UnpackMode.UNPACK2
+                    ),
+                    dtypes.float32,
+                    mask=full,
+                )
+                sin_upper = rr.vgather_reg(sin_row, upper_idx)
+                cos_upper = rr.vgather_reg(cos_row, upper_idx)
+                for head in range(head_group):
+                    for offset in range(0, nope_width, VECTOR_FLOAT_ELEMENTS):
+                        nope_value = rr.vload(
+                            values, row * columns + head * width + offset
+                        )
+                        nope_encoded = rr.vcast(
+                            nope_value,
+                            dtypes.bfloat16,
+                            mask=full,
+                            rounding=rr.RoundingMode.RN,
+                            reg_layout=RegLayout.ZERO,
+                        )
+                        if dsl.const_expr(packed_nope):
+                            packed = rr.vpack(
+                                rr.vreinterpret_lanes(nope_encoded, dtypes.uint32),
+                                dtypes.uint16,
+                                part="lower",
+                            )
+                            rr.vstore_strided(
+                                nope_output,
+                                (head * nope_width + offset)
+                                // fractal_lanes
+                                * vector_rows
+                                * fractal_lanes
+                                + row * fractal_lanes,
+                                rr.vreinterpret(packed, dtypes.bfloat16),
+                                packed_mask,
+                                block_stride=vector_rows,
+                            )
+                        else:
+                            rr.vstore_pack(
+                                nope_output,
+                                row * nope_columns + head * nope_width + offset,
+                                nope_encoded,
+                                full,
+                                pack_mode=rr.PackMode.B32_TO_B16,
+                            )
+                    value = rr.vload(values, row * columns + head * width + nope_width)
+                    first = rr.vgather_reg(value, first_idx)
+                    second = rr.vgather_reg(value, second_idx)
+                    lower = rr.vsub(
+                        rr.vmul(first, cos_row, mask=half),
+                        rr.vmul(second, sin_row, mask=half),
+                        mask=half,
+                    )
+                    upper = rr.vadd(
+                        rr.vmul(first, sin_upper, mask=half),
+                        rr.vmul(second, cos_upper, mask=half),
+                        mask=half,
+                    )
+                    lower_bf16 = rr.vcast(
+                        lower,
+                        dtypes.bfloat16,
+                        mask=half,
+                        rounding=rr.RoundingMode.RN,
+                        reg_layout=RegLayout.ZERO,
+                    )
+                    upper_bf16 = rr.vcast(
+                        upper,
+                        dtypes.bfloat16,
+                        mask=half,
+                        rounding=rr.RoundingMode.RN,
+                        reg_layout=RegLayout.ZERO,
+                    )
+                    rr.vstore_pack(
+                        output,
+                        row * rope_columns + head * rope_width,
+                        lower_bf16,
+                        half,
+                        pack_mode=rr.PackMode.B32_TO_B16,
+                    )
+                    rr.vstore_pack(
+                        output,
+                        row * rope_columns
+                        + head * rope_width
+                        + VECTOR_FLOAT_ELEMENTS // 2,
+                        upper_bf16,
+                        half,
+                        pack_mode=rr.PackMode.B32_TO_B16,
+                    )
+
+
 class _QueryPrepare:
-    def __init__(self, N, Dn, Dr, w_qr_quant_mode, rope_mode, mx_token_batch_rows=1):
-        self.N = N
+    def __init__(self, N, Dn, Dr, w_qr_quant_mode, mx_token_batch_rows=1):
+        self.batch_heads = w_qr_quant_mode == 1 and N % 8 == 0
         self.Dn = Dn
         self.Dr = Dr
         self.w_qr_quant_mode = w_qr_quant_mode
-        self.rope_mode = rope_mode
         self.mx_token_batch_rows = mx_token_batch_rows
 
     @jit
     def run(
         self,
+        heads: int,
+        rope_mode: int,
         wqb_matmul_fp32: Tensor,
         descale_qr: Tensor,
         descale_wqb: Tensor,
@@ -4244,10 +4735,16 @@ class _QueryPrepare:
         apply_rope: bool = True,
     ):
         if dsl.const_expr(
-            self.w_qr_quant_mode == 1 and self.N % 8 == 0 and not selected_tile
+            self.w_qr_quant_mode == 1 and self.batch_heads and not selected_tile
         ):
             self.run_mx_batch8(
-                wqb_matmul_fp32, rope_sin, rope_cos, q_nope_bf16, q_rope_bf16
+                heads,
+                rope_mode,
+                wqb_matmul_fp32,
+                rope_sin,
+                rope_cos,
+                q_nope_bf16,
+                q_rope_bf16,
             )
             return
         width = self.Dn + self.Dr
@@ -4274,7 +4771,7 @@ class _QueryPrepare:
                 scaled_rope = _buffer(MemLoc.UB, (1, self.Dr), dtypes.float32)
         worker = get_block_idx() * VECTOR_SUBBLOCKS + get_subblock_id()
         worker_count = get_block_num() * VECTOR_SUBBLOCKS
-        task_count = rows * self.N
+        task_count = rows * heads
         tasks_per_worker = (task_count + worker_count - 1) // worker_count
         task_begin = worker * tasks_per_worker
         task_end = task_begin + tasks_per_worker
@@ -4282,14 +4779,14 @@ class _QueryPrepare:
             task_end = task_count
         task_step = 1
         if selected_head >= 0:
-            task_begin = token_begin * self.N + selected_head
+            task_begin = token_begin * heads + selected_head
             task_end = task_count
             if token_end >= 0:
-                task_end = token_end * self.N + selected_head
-            task_step = self.N * token_step
+                task_end = token_end * heads + selected_head
+            task_step = heads * token_step
         for task in range(task_begin, task_end, task_step):
-            row = task // self.N
-            head = task % self.N
+            row = task // heads
+            head = task % heads
             _copy(
                 input_rows.next_write(),
                 tile_slice(wqb_matmul_fp32, (1, width), (row, head)),
@@ -4355,7 +4852,7 @@ class _QueryPrepare:
             if dsl.const_expr(self.Dr != 0 and apply_rope):
                 sin_values = rope_sin_buffer
                 cos_values = rope_cos_buffer
-                if dsl.const_expr(self.rope_mode != 0):
+                if rope_mode != 0:
                     if dsl.const_expr(resident_head):
                         sin_values = tile_slice(rope_sin, (1, self.Dr), (row, 0))
                         cos_values = tile_slice(rope_cos, (1, self.Dr), (row, 0))
@@ -4385,7 +4882,7 @@ class _QueryPrepare:
                         sin_values,
                         cos_values,
                         rope_values,
-                        self.rope_mode,
+                        rope_mode,
                     )
                 else:
                     _rope_row(
@@ -4394,7 +4891,7 @@ class _QueryPrepare:
                         sin_values,
                         cos_values,
                         rope_values,
-                        self.rope_mode,
+                        rope_mode,
                     )
                 _copy(
                     tile_slice(q_rope_bf16, (1, self.Dr), (task, 0)),
@@ -4404,6 +4901,8 @@ class _QueryPrepare:
     @jit
     def prepare_wkb_tile(
         self,
+        heads: int,
+        rope_mode: int,
         wqb_matmul_fp32: Tensor,
         descale_qr: Tensor,
         descale_wqb: Tensor,
@@ -4414,7 +4913,7 @@ class _QueryPrepare:
         task: int,
         tile_rows: int,
     ):
-        token_start = task // self.N * tile_rows
+        token_start = task // heads * tile_rows
         token_stop = min(token_start + tile_rows, wqb_matmul_fp32.shape[0])
         token_middle = token_start + (token_stop - token_start) // VECTOR_SUBBLOCKS
         token_begin = token_start
@@ -4426,6 +4925,8 @@ class _QueryPrepare:
             self.w_qr_quant_mode == 2 and tile_rows % HIF_PREPARE_BATCH_ROWS == 0
         ):
             self.run_hif_token_batch(
+                heads,
+                rope_mode,
                 wqb_matmul_fp32,
                 descale_qr,
                 descale_wqb,
@@ -4433,24 +4934,28 @@ class _QueryPrepare:
                 rope_cos,
                 q_nope_bf16,
                 q_rope_bf16,
-                task % self.N,
+                task % heads,
                 token_start,
                 token_stop,
             )
         elif dsl.const_expr(self.mx_token_batch_rows > 1):
             self.run_mx_token_batch(
+                heads,
+                rope_mode,
                 wqb_matmul_fp32,
                 rope_sin,
                 rope_cos,
                 q_nope_bf16,
                 q_rope_bf16,
-                task % self.N,
+                task % heads,
                 token_start,
                 token_stop,
             )
         else:
             if token_begin < token_end:
                 self.run(
+                    heads,
+                    rope_mode,
                     wqb_matmul_fp32,
                     descale_qr,
                     descale_wqb,
@@ -4458,7 +4963,7 @@ class _QueryPrepare:
                     rope_cos,
                     q_nope_bf16,
                     q_rope_bf16,
-                    selected_head=task % self.N,
+                    selected_head=task % heads,
                     token_begin=token_begin,
                     token_end=token_end,
                     selected_tile=True,
@@ -4469,6 +4974,8 @@ class _QueryPrepare:
     @jit
     def run_hif_resident_pipeline(
         self,
+        heads: int,
+        rope_mode: int,
         wqb_matmul_fp32: Tensor,
         descale_qr: Tensor,
         descale_wqb: Tensor,
@@ -4485,19 +4992,21 @@ class _QueryPrepare:
         values = _buffer(MemLoc.UB, (vector_rows, width), dtypes.float32)
         head_scales = _buffer(MemLoc.UB, (1, width), dtypes.float32)
         nope_values = _buffer(MemLoc.UB, (vector_rows, self.Dn), dtypes.bfloat16)
-        nope_tokens = q_nope_bf16.view((rows, self.N * self.Dn))
-        activation_scale = descale_qr[0]
+        nope_tokens = q_nope_bf16.view((rows, heads * self.Dn))
+        activation_scale = _buffer(MemLoc.UB, (1,), dtypes.float32)
         if dsl.const_expr(self.Dr != 0):
             sin_buffer = _buffer(MemLoc.UB, (vector_rows, self.Dr), dtypes.bfloat16)
             cos_buffer = _buffer(MemLoc.UB, (vector_rows, self.Dr), dtypes.bfloat16)
             rope_values = _buffer(MemLoc.UB, (vector_rows, self.Dr), dtypes.bfloat16)
             scaled_rope = _buffer(MemLoc.UB, (vector_rows, self.Dr), dtypes.float32)
-            output_heads = _permute(q.view((rows, self.N, q.shape[1])), (1, 0, 2))
-        for task in range(get_block_idx(), row_tiles * self.N, get_block_num()):
-            head = task % self.N
-            batch = task // self.N * VECTOR_SUBBLOCKS + get_subblock_id()
+            output_heads = _permute(q.view((rows, heads, q.shape[1])), (1, 0, 2))
+        for task in range(get_block_idx(), row_tiles * heads, get_block_num()):
+            head = task % heads
+            batch = task // heads * VECTOR_SUBBLOCKS + get_subblock_id()
             valid_rows = min(vector_rows, max(0, rows - batch * vector_rows))
             vec_sync_block_wait(_sync_ops.PIPE.S, HEAD_READY_EVENT, mode=2)
+            # The ready handoff also orders the QR producer and its GM scale.
+            _copy(activation_scale, descale_qr)
             if valid_rows > 0:
                 _copy(
                     values,
@@ -4513,7 +5022,11 @@ class _QueryPrepare:
                                 rr.vload(head_scales, offset),
                                 mask=mask,
                             )
-                            value = rr.vmuls(value, activation_scale, mask=mask)
+                            value = rr.vmul(
+                                value,
+                                rr.vload_broadcast(activation_scale, 0),
+                                mask=mask,
+                            )
                             encoded = rr.vcast(
                                 value,
                                 dtypes.bfloat16,
@@ -4536,7 +5049,7 @@ class _QueryPrepare:
             vec_sync_block_arrive(_sync_ops.PIPE.MTE3, HEAD_CONSUMED_EVENT, mode=2)
             if dsl.const_expr(self.Dr != 0):
                 if valid_rows > 0:
-                    if dsl.const_expr(self.rope_mode != 0):
+                    if rope_mode != 0:
                         _copy(
                             sin_buffer,
                             tile_slice(rope_sin, (vector_rows, self.Dr), (batch, 0)),
@@ -4553,7 +5066,11 @@ class _QueryPrepare:
                                 rr.vload(head_scales, self.Dn),
                                 mask=rope_mask,
                             )
-                            value = rr.vmuls(value, activation_scale, mask=rope_mask)
+                            value = rr.vmul(
+                                value,
+                                rr.vload_broadcast(activation_scale, 0),
+                                mask=rope_mask,
+                            )
                             rr.vstore(scaled_rope, row * self.Dr, value, rope_mask)
                     for row in range(valid_rows):
                         _rope_row(
@@ -4562,7 +5079,7 @@ class _QueryPrepare:
                             tile_slice(sin_buffer, (1, self.Dr), (row, 0)),
                             tile_slice(cos_buffer, (1, self.Dr), (row, 0)),
                             tile_slice(rope_values, (1, self.Dr), (row, 0)),
-                            self.rope_mode,
+                            rope_mode,
                         )
                     head_rope = output_heads[
                         head, None, KV_ELEMENTS : KV_ELEMENTS + self.Dr
@@ -4575,6 +5092,8 @@ class _QueryPrepare:
     @jit
     def run_hif_token_batch(
         self,
+        heads: int,
+        rope_mode: int,
         wqb_matmul_fp32: Tensor,
         descale_qr: Tensor,
         descale_wqb: Tensor,
@@ -4591,14 +5110,14 @@ class _QueryPrepare:
         rows = wqb_matmul_fp32.shape[0]
         first_batch = token_begin // batch_rows + get_subblock_id()
         stop_batch = (token_end + batch_rows - 1) // batch_rows
-        nope_tokens = q_nope_bf16.view((rows, self.N * self.Dn))
+        nope_tokens = q_nope_bf16.view((rows, heads * self.Dn))
         inputs = _ring_buffer(MemLoc.UB, (batch_rows, width), dtypes.float32, depth=2)
         nope_outputs = _ring_buffer(
             MemLoc.UB, (batch_rows, self.Dn), dtypes.bfloat16, depth=2
         )
         head_scales = _buffer(MemLoc.UB, (1, width), dtypes.float32)
         if dsl.const_expr(self.Dr != 0):
-            rope_tokens = q_rope_bf16.view((rows, self.N * self.Dr))
+            rope_tokens = q_rope_bf16.view((rows, heads * self.Dr))
             rope_outputs = _ring_buffer(
                 MemLoc.UB, (batch_rows, self.Dr), dtypes.bfloat16, depth=2
             )
@@ -4645,7 +5164,7 @@ class _QueryPrepare:
                     nope_outputs.next_read(),
                 )
                 if dsl.const_expr(self.Dr != 0):
-                    if dsl.const_expr(self.rope_mode != 0):
+                    if rope_mode != 0:
                         _copy(
                             sin_buffer,
                             tile_slice(rope_sin, (batch_rows, self.Dr), (batch, 0)),
@@ -4672,7 +5191,7 @@ class _QueryPrepare:
                             tile_slice(sin_buffer, (1, self.Dr), (row, 0)),
                             tile_slice(cos_buffer, (1, self.Dr), (row, 0)),
                             tile_slice(rope_values, (1, self.Dr), (row, 0)),
-                            self.rope_mode,
+                            rope_mode,
                         )
                     _copy(
                         tile_slice(rope_tokens, (batch_rows, self.Dr), (batch, head)),
@@ -4682,6 +5201,8 @@ class _QueryPrepare:
     @jit
     def run_mx_token_batch(
         self,
+        heads: int,
+        rope_mode: int,
         wqb_matmul_fp32: Tensor,
         rope_sin: Tensor,
         rope_cos: Tensor,
@@ -4694,13 +5215,13 @@ class _QueryPrepare:
         batch_rows = self.mx_token_batch_rows
         width = self.Dn + self.Dr
         rows = wqb_matmul_fp32.shape[0]
-        nope_tokens = q_nope_bf16.view((rows, self.N * self.Dn))
+        nope_tokens = q_nope_bf16.view((rows, heads * self.Dn))
         inputs = _ring_buffer(MemLoc.UB, (batch_rows, width), dtypes.float32, depth=2)
         nope_outputs = _ring_buffer(
             MemLoc.UB, (batch_rows, self.Dn), dtypes.bfloat16, depth=2
         )
         if dsl.const_expr(self.Dr != 0):
-            rope_tokens = q_rope_bf16.view((rows, self.N * self.Dr))
+            rope_tokens = q_rope_bf16.view((rows, heads * self.Dr))
             rope_outputs = _ring_buffer(
                 MemLoc.UB, (batch_rows, self.Dr), dtypes.bfloat16, depth=2
             )
@@ -4741,7 +5262,7 @@ class _QueryPrepare:
                 nope_outputs.next_read(),
             )
             if dsl.const_expr(self.Dr != 0):
-                if dsl.const_expr(self.rope_mode != 0):
+                if rope_mode != 0:
                     _copy(
                         sin_buffer,
                         tile_slice(rope_sin, (batch_rows, self.Dr), (batch, 0)),
@@ -4758,7 +5279,7 @@ class _QueryPrepare:
                         tile_slice(sin_buffer, (1, self.Dr), (row, 0)),
                         tile_slice(cos_buffer, (1, self.Dr), (row, 0)),
                         tile_slice(rope_values, (1, self.Dr), (row, 0)),
-                        self.rope_mode,
+                        rope_mode,
                     )
                 _copy(
                     tile_slice(rope_tokens, (batch_rows, self.Dr), (batch, head)),
@@ -4768,6 +5289,8 @@ class _QueryPrepare:
     @jit
     def run_pipeline(
         self,
+        heads: int,
+        rope_mode: int,
         wqb_matmul_fp32: Tensor,
         descale_qr: Tensor,
         descale_wqb: Tensor,
@@ -4779,11 +5302,20 @@ class _QueryPrepare:
     ):
         if dsl.const_expr(self.w_qr_quant_mode == 1):
             self.run_mx_resident_pipeline(
-                wqb_matmul_fp32, rope_sin, rope_cos, q_nope_bf16, q, tile_rows
+                heads,
+                rope_mode,
+                wqb_matmul_fp32,
+                rope_sin,
+                rope_cos,
+                q_nope_bf16,
+                q,
+                tile_rows,
             )
             return
         if dsl.const_expr(self.w_qr_quant_mode == 2):
             self.run_hif_resident_pipeline(
+                heads,
+                rope_mode,
                 wqb_matmul_fp32,
                 descale_qr,
                 descale_wqb,
@@ -4799,8 +5331,8 @@ class _QueryPrepare:
         q_rope = q_nope_bf16
         if dsl.const_expr(self.Dr != 0):
             q_rope = q[None, KV_ELEMENTS : KV_ELEMENTS + self.Dr]
-        for task in range(get_block_idx(), row_tiles * self.N, get_block_num()):
-            token_start = (task // self.N) * tile_rows
+        for task in range(get_block_idx(), row_tiles * heads, get_block_num()):
+            token_start = (task // heads) * tile_rows
             token_stop = min(token_start + tile_rows, rows)
             token_middle = token_start + (token_stop - token_start) // VECTOR_SUBBLOCKS
             token_begin = token_start
@@ -4811,6 +5343,8 @@ class _QueryPrepare:
             vec_sync_block_wait(_sync_ops.PIPE.S, HEAD_READY_EVENT, mode=2)
             if token_begin < token_end:
                 self.run(
+                    heads,
+                    rope_mode,
                     wqb_matmul_fp32,
                     descale_qr,
                     descale_wqb,
@@ -4818,7 +5352,7 @@ class _QueryPrepare:
                     rope_cos,
                     q_nope_bf16,
                     q_rope,
-                    selected_head=task % self.N,
+                    selected_head=task % heads,
                     token_begin=token_begin,
                     token_end=token_end,
                     selected_tile=True,
@@ -4829,6 +5363,8 @@ class _QueryPrepare:
             if dsl.const_expr(self.Dr != 0):
                 if token_begin < token_end:
                     self.run(
+                        heads,
+                        rope_mode,
                         wqb_matmul_fp32,
                         descale_qr,
                         descale_wqb,
@@ -4836,7 +5372,7 @@ class _QueryPrepare:
                         rope_cos,
                         q_nope_bf16,
                         q_rope,
-                        selected_head=task % self.N,
+                        selected_head=task % heads,
                         token_begin=token_begin,
                         token_end=token_end,
                         selected_tile=True,
@@ -4846,6 +5382,8 @@ class _QueryPrepare:
     @jit
     def run_mx_handoff(
         self,
+        heads: int,
+        rope_mode: int,
         projection: Tensor,
         c_to_v,
         rope_sin: Tensor,
@@ -4862,7 +5400,7 @@ class _QueryPrepare:
         width = self.Dn + self.Dr
         columns = head_group * width
         vector_rows = tile_rows // VECTOR_SUBBLOCKS
-        groups = self.N // head_group
+        groups = heads // head_group
         row_tiles = (rows + tile_rows - 1) // tile_rows
         gm_inputs = None
         if dsl.const_expr(not direct_ub):
@@ -4877,6 +5415,8 @@ class _QueryPrepare:
                 values = c_to_v.next_read()
                 if dsl.const_expr(nope_l1 is None):
                     self.convert_mx_handoff(
+                        heads,
+                        rope_mode,
                         values,
                         rope_sin,
                         rope_cos,
@@ -4890,6 +5430,8 @@ class _QueryPrepare:
                     )
                 else:
                     self.convert_mx_group_l1(
+                        heads,
+                        rope_mode,
                         values,
                         rope_sin,
                         rope_cos,
@@ -4913,6 +5455,8 @@ class _QueryPrepare:
                 values = gm_inputs.next_read()
                 if valid_rows > 0:
                     self.convert_mx_handoff(
+                        heads,
+                        rope_mode,
                         values,
                         rope_sin,
                         rope_cos,
@@ -4930,6 +5474,8 @@ class _QueryPrepare:
     @jit
     def convert_mx_handoff(
         self,
+        heads: int,
+        rope_mode: int,
         values: Tensor,
         rope_sin: Tensor,
         rope_cos: Tensor,
@@ -4941,10 +5487,10 @@ class _QueryPrepare:
         vector_rows: int,
         valid_rows: int,
     ):
-        if dsl.const_expr(
-            self.Dn == 192 and self.Dr == 64 and head_group == 2 and self.rope_mode == 1
-        ):
+        if dsl.const_expr(self.Dn == 192 and self.Dr == 64 and head_group == 2):
             self.convert_mx_group(
+                heads,
+                rope_mode,
                 values,
                 rope_sin,
                 rope_cos,
@@ -4957,17 +5503,17 @@ class _QueryPrepare:
                 valid_rows,
             )
             return
-        rows = q_nope.shape[0] // self.N
+        rows = q_nope.shape[0] // heads
         width = self.Dn + self.Dr
         columns = head_group * width
         nope_values = _buffer(MemLoc.UB, (vector_rows, self.Dn), dtypes.bfloat16)
-        nope_tokens = q_nope.view((rows, self.N * self.Dn))
-        rope_tokens = q_rope.view((rows, self.N * self.Dr))
+        nope_tokens = q_nope.view((rows, heads * self.Dn))
+        rope_tokens = q_rope.view((rows, heads * self.Dr))
         rope_values = _buffer(MemLoc.UB, (vector_rows, self.Dr), dtypes.bfloat16)
         sin_values = _buffer(MemLoc.UB, (vector_rows, self.Dr), dtypes.bfloat16)
         cos_values = _buffer(MemLoc.UB, (vector_rows, self.Dr), dtypes.bfloat16)
         if valid_rows > 0:
-            if dsl.const_expr(self.rope_mode != 0):
+            if rope_mode != 0:
                 _copy(
                     sin_values, tile_slice(rope_sin, (vector_rows, self.Dr), (batch, 0))
                 )
@@ -5010,7 +5556,7 @@ class _QueryPrepare:
                     tile_slice(sin_values, (1, self.Dr), (row, 0)),
                     tile_slice(cos_values, (1, self.Dr), (row, 0)),
                     tile_slice(rope_values, (1, self.Dr), (row, 0)),
-                    self.rope_mode,
+                    rope_mode,
                 )
             if valid_rows > 0:
                 _copy(
@@ -5021,6 +5567,8 @@ class _QueryPrepare:
     @jit
     def convert_mx_group(
         self,
+        heads: int,
+        rope_mode: int,
         values: Tensor,
         rope_sin: Tensor,
         rope_cos: Tensor,
@@ -5032,7 +5580,7 @@ class _QueryPrepare:
         vector_rows: int,
         valid_rows: int,
     ):
-        rows = q_nope.shape[0] // self.N
+        rows = q_nope.shape[0] // heads
         width = self.Dn + self.Dr
         columns = head_group * width
         nope_columns = head_group * self.Dn
@@ -5041,99 +5589,49 @@ class _QueryPrepare:
         rope_values = _buffer(MemLoc.UB, (vector_rows, rope_columns), dtypes.bfloat16)
         sin_values = _buffer(MemLoc.UB, (vector_rows, self.Dr), dtypes.bfloat16)
         cos_values = _buffer(MemLoc.UB, (vector_rows, self.Dr), dtypes.bfloat16)
-        nope_tokens = q_nope.view((rows, self.N * self.Dn))
-        rope_tokens = q_rope.view((rows, self.N * self.Dr))
-        if valid_rows > 0:
+        nope_tokens = q_nope.view((rows, heads * self.Dn))
+        rope_tokens = q_rope.view((rows, heads * self.Dr))
+        if valid_rows > 0 and rope_mode != 0:
             _copy(sin_values, tile_slice(rope_sin, (vector_rows, self.Dr), (batch, 0)))
             _copy(cos_values, tile_slice(rope_cos, (vector_rows, self.Dr), (batch, 0)))
-        with vf(mode="simd"):
-            full = rr.full_mask()
-            half = rr.update_mask(VECTOR_FLOAT_ELEMENTS // 2, elem_bits=32)[0]
-            positions = rr.varange(0, dtypes.uint32)
-            first_idx = rr.vmuls(positions, 2, mask=full)
-            second_idx = rr.vadds(first_idx, 1, mask=full)
-            upper_idx = rr.vadds(positions, VECTOR_FLOAT_ELEMENTS // 2, mask=full)
-            for row in range(valid_rows):
-                sin_row = rr.vcast(
-                    rr.vload_unpack(
-                        sin_values, row * self.Dr, unpack_mode=rr.UnpackMode.UNPACK2
-                    ),
-                    dtypes.float32,
-                    mask=full,
-                )
-                cos_row = rr.vcast(
-                    rr.vload_unpack(
-                        cos_values, row * self.Dr, unpack_mode=rr.UnpackMode.UNPACK2
-                    ),
-                    dtypes.float32,
-                    mask=full,
-                )
-                sin_upper = rr.vgather_reg(sin_row, upper_idx)
-                cos_upper = rr.vgather_reg(cos_row, upper_idx)
-                for local_head in range(head_group):
-                    for offset in range(0, self.Dn, VECTOR_FLOAT_ELEMENTS):
-                        value = rr.vload(
-                            values, row * columns + local_head * width + offset
-                        )
-                        encoded = rr.vcast(
-                            value,
-                            dtypes.bfloat16,
-                            mask=full,
-                            rounding=rr.RoundingMode.RN,
-                            reg_layout=RegLayout.ZERO,
-                        )
-                        rr.vstore_pack(
-                            nope_values,
-                            row * nope_columns + local_head * self.Dn + offset,
-                            encoded,
-                            full,
-                            pack_mode=rr.PackMode.B32_TO_B16,
-                        )
-                    rope_row = rr.vload(
-                        values, row * columns + local_head * width + self.Dn
-                    )
-                    first = rr.vgather_reg(rope_row, first_idx)
-                    second = rr.vgather_reg(rope_row, second_idx)
-                    lower = rr.vsub(
-                        rr.vmul(first, cos_row, mask=half),
-                        rr.vmul(second, sin_row, mask=half),
-                        mask=half,
-                    )
-                    upper = rr.vadd(
-                        rr.vmul(first, sin_upper, mask=half),
-                        rr.vmul(second, cos_upper, mask=half),
-                        mask=half,
-                    )
-                    lower_bf16 = rr.vcast(
-                        lower,
-                        dtypes.bfloat16,
-                        mask=half,
-                        rounding=rr.RoundingMode.RN,
-                        reg_layout=RegLayout.ZERO,
-                    )
-                    upper_bf16 = rr.vcast(
-                        upper,
-                        dtypes.bfloat16,
-                        mask=half,
-                        rounding=rr.RoundingMode.RN,
-                        reg_layout=RegLayout.ZERO,
-                    )
-                    rr.vstore_pack(
-                        rope_values,
-                        row * rope_columns + local_head * self.Dr,
-                        lower_bf16,
-                        half,
-                        pack_mode=rr.PackMode.B32_TO_B16,
-                    )
-                    rr.vstore_pack(
-                        rope_values,
-                        row * rope_columns
-                        + local_head * self.Dr
-                        + VECTOR_FLOAT_ELEMENTS // 2,
-                        upper_bf16,
-                        half,
-                        pack_mode=rr.PackMode.B32_TO_B16,
-                    )
+        if dsl.const_expr(self.Dr == 0):
+            with vf(mode="simd"):
+                full = rr.full_mask()
+                for row in range(valid_rows):
+                    for local_head in range(head_group):
+                        for offset in range(0, self.Dn, VECTOR_FLOAT_ELEMENTS):
+                            value = rr.vload(
+                                values, row * columns + local_head * width + offset
+                            )
+                            encoded = rr.vcast(
+                                value,
+                                dtypes.bfloat16,
+                                mask=full,
+                                rounding=rr.RoundingMode.RN,
+                                reg_layout=RegLayout.ZERO,
+                            )
+                            rr.vstore_pack(
+                                nope_values,
+                                row * nope_columns + local_head * self.Dn + offset,
+                                encoded,
+                                full,
+                                pack_mode=rr.PackMode.B32_TO_B16,
+                            )
+        else:
+            _rope_group(
+                rope_mode,
+                values,
+                sin_values,
+                cos_values,
+                rope_values,
+                nope_values,
+                vector_rows,
+                False,
+                valid_rows,
+                head_group,
+                self.Dn,
+                self.Dr,
+            )
         if valid_rows > 0:
             _copy(
                 tile_slice(nope_tokens, (vector_rows, nope_columns), (batch, group)),
@@ -5147,6 +5645,8 @@ class _QueryPrepare:
     @jit
     def convert_mx_group_l1(
         self,
+        heads: int,
+        rope_mode: int,
         values: Tensor,
         rope_sin: Tensor,
         rope_cos: Tensor,
@@ -5175,131 +5675,79 @@ class _QueryPrepare:
             )
             sin_values = _buffer(MemLoc.UB, (vector_rows, self.Dr), dtypes.bfloat16)
             cos_values = _buffer(MemLoc.UB, (vector_rows, self.Dr), dtypes.bfloat16)
-            rows = q_rope.shape[0] // self.N
+            rows = q_rope.shape[0] // heads
             if dsl.const_expr(packed_output):
                 output_heads = _permute(
-                    q_rope.view((rows, self.N, q_rope.shape[1])), (1, 0, 2)
+                    q_rope.view((rows, heads, q_rope.shape[1])), (1, 0, 2)
                 )
             else:
-                rope_tokens = q_rope.view((rows, self.N * self.Dr))
-            if valid_rows > 0:
+                rope_tokens = q_rope.view((rows, heads * self.Dr))
+            if valid_rows > 0 and rope_mode != 0:
                 _copy(
                     sin_values, tile_slice(rope_sin, (vector_rows, self.Dr), (batch, 0))
                 )
                 _copy(
                     cos_values, tile_slice(rope_cos, (vector_rows, self.Dr), (batch, 0))
                 )
-        with vf(mode="simd"):
-            full = rr.full_mask()
-            half = rr.update_mask(VECTOR_FLOAT_ELEMENTS // 2, elem_bits=32)[0]
-            packed_mask = rr.update_mask(VECTOR_FLOAT_ELEMENTS, elem_bits=16)[0]
-            zero = rr.vdups(0, dtypes.uint16, mask=packed_mask)
-            for row in range(valid_rows, vector_rows):
-                for offset in range(0, nope_columns, VECTOR_FLOAT_ELEMENTS):
-                    rr.vstore_strided(
-                        nope_values,
-                        offset // fractal_lanes * vector_rows * fractal_lanes
-                        + row * fractal_lanes,
-                        rr.vreinterpret(zero, dtypes.bfloat16),
-                        packed_mask,
-                        block_stride=vector_rows,
-                    )
-            positions = rr.varange(0, dtypes.uint32)
-            first_idx = rr.vmuls(positions, 2, mask=full)
-            second_idx = rr.vadds(first_idx, 1, mask=full)
-            upper_idx = rr.vadds(positions, VECTOR_FLOAT_ELEMENTS // 2, mask=full)
-            for row in range(valid_rows):
-                if dsl.const_expr(self.Dr != 0):
-                    sin_row = rr.vcast(
-                        rr.vload_unpack(
-                            sin_values, row * self.Dr, unpack_mode=rr.UnpackMode.UNPACK2
-                        ),
-                        dtypes.float32,
-                        mask=full,
-                    )
-                    cos_row = rr.vcast(
-                        rr.vload_unpack(
-                            cos_values, row * self.Dr, unpack_mode=rr.UnpackMode.UNPACK2
-                        ),
-                        dtypes.float32,
-                        mask=full,
-                    )
-                    sin_upper = rr.vgather_reg(sin_row, upper_idx)
-                    cos_upper = rr.vgather_reg(cos_row, upper_idx)
-                for local_head in range(head_group):
-                    for offset in range(0, self.Dn, VECTOR_FLOAT_ELEMENTS):
-                        value = rr.vload(
-                            values, row * columns + local_head * width + offset
-                        )
-                        encoded = rr.vcast(
-                            value,
-                            dtypes.bfloat16,
-                            mask=full,
-                            rounding=rr.RoundingMode.RN,
-                            reg_layout=RegLayout.ZERO,
-                        )
-                        packed = rr.vpack(
-                            rr.vreinterpret_lanes(encoded, dtypes.uint32),
-                            dtypes.uint16,
-                            part="lower",
-                        )
+        if dsl.const_expr(self.Dr == 0):
+            with vf(mode="simd"):
+                full = rr.full_mask()
+                packed_mask = rr.update_mask(VECTOR_FLOAT_ELEMENTS, elem_bits=16)[0]
+                zero = rr.vdups(0, dtypes.uint16, mask=packed_mask)
+                for row in range(valid_rows, vector_rows):
+                    for offset in range(0, nope_columns, VECTOR_FLOAT_ELEMENTS):
                         rr.vstore_strided(
                             nope_values,
-                            (local_head * self.Dn + offset)
-                            // fractal_lanes
-                            * vector_rows
-                            * fractal_lanes
+                            offset // fractal_lanes * vector_rows * fractal_lanes
                             + row * fractal_lanes,
-                            rr.vreinterpret(packed, dtypes.bfloat16),
+                            rr.vreinterpret(zero, dtypes.bfloat16),
                             packed_mask,
                             block_stride=vector_rows,
                         )
-                    if dsl.const_expr(self.Dr != 0):
-                        rope_row = rr.vload(
-                            values, row * columns + local_head * width + self.Dn
-                        )
-                        first = rr.vgather_reg(rope_row, first_idx)
-                        second = rr.vgather_reg(rope_row, second_idx)
-                        lower = rr.vsub(
-                            rr.vmul(first, cos_row, mask=half),
-                            rr.vmul(second, sin_row, mask=half),
-                            mask=half,
-                        )
-                        upper = rr.vadd(
-                            rr.vmul(first, sin_upper, mask=half),
-                            rr.vmul(second, cos_upper, mask=half),
-                            mask=half,
-                        )
-                        lower_bf16 = rr.vcast(
-                            lower,
-                            dtypes.bfloat16,
-                            mask=half,
-                            rounding=rr.RoundingMode.RN,
-                            reg_layout=RegLayout.ZERO,
-                        )
-                        upper_bf16 = rr.vcast(
-                            upper,
-                            dtypes.bfloat16,
-                            mask=half,
-                            rounding=rr.RoundingMode.RN,
-                            reg_layout=RegLayout.ZERO,
-                        )
-                        rr.vstore_pack(
-                            rope_values,
-                            row * rope_columns + local_head * self.Dr,
-                            lower_bf16,
-                            half,
-                            pack_mode=rr.PackMode.B32_TO_B16,
-                        )
-                        rr.vstore_pack(
-                            rope_values,
-                            row * rope_columns
-                            + local_head * self.Dr
-                            + VECTOR_FLOAT_ELEMENTS // 2,
-                            upper_bf16,
-                            half,
-                            pack_mode=rr.PackMode.B32_TO_B16,
-                        )
+                for row in range(valid_rows):
+                    for local_head in range(head_group):
+                        for offset in range(0, self.Dn, VECTOR_FLOAT_ELEMENTS):
+                            value = rr.vload(
+                                values, row * columns + local_head * width + offset
+                            )
+                            encoded = rr.vcast(
+                                value,
+                                dtypes.bfloat16,
+                                mask=full,
+                                rounding=rr.RoundingMode.RN,
+                                reg_layout=RegLayout.ZERO,
+                            )
+                            packed = rr.vpack(
+                                rr.vreinterpret_lanes(encoded, dtypes.uint32),
+                                dtypes.uint16,
+                                part="lower",
+                            )
+                            rr.vstore_strided(
+                                nope_values,
+                                (local_head * self.Dn + offset)
+                                // fractal_lanes
+                                * vector_rows
+                                * fractal_lanes
+                                + row * fractal_lanes,
+                                rr.vreinterpret(packed, dtypes.bfloat16),
+                                packed_mask,
+                                block_stride=vector_rows,
+                            )
+        else:
+            _rope_group(
+                rope_mode,
+                values,
+                sin_values,
+                cos_values,
+                rope_values,
+                nope_values,
+                vector_rows,
+                True,
+                valid_rows,
+                head_group,
+                self.Dn,
+                self.Dr,
+            )
         _copy(
             tile_slice(
                 destination,
@@ -5336,6 +5784,8 @@ class _QueryPrepare:
     @jit
     def run_hif_c2v_pipeline(
         self,
+        heads: int,
+        rope_mode: int,
         c_to_v,
         descale_qr: Tensor,
         descale_wqb: Tensor,
@@ -5345,25 +5795,27 @@ class _QueryPrepare:
         q: Tensor,
         tile_rows: int,
     ):
-        rows = q_nope_bf16.shape[0] // self.N
+        rows = q_nope_bf16.shape[0] // heads
         row_tiles = (rows + tile_rows - 1) // tile_rows
         vector_rows = tile_rows // VECTOR_SUBBLOCKS
         width = self.Dn + self.Dr
         head_scales = _buffer(MemLoc.UB, (1, width), dtypes.float32)
         nope_values = _buffer(MemLoc.UB, (vector_rows, self.Dn), dtypes.bfloat16)
-        nope_tokens = q_nope_bf16.view((rows, self.N * self.Dn))
-        activation_scale = descale_qr[0]
+        nope_tokens = q_nope_bf16.view((rows, heads * self.Dn))
+        activation_scale = _buffer(MemLoc.UB, (1,), dtypes.float32)
         if dsl.const_expr(self.Dr != 0):
             sin_buffer = _buffer(MemLoc.UB, (vector_rows, self.Dr), dtypes.bfloat16)
             cos_buffer = _buffer(MemLoc.UB, (vector_rows, self.Dr), dtypes.bfloat16)
             rope_values = _buffer(MemLoc.UB, (vector_rows, self.Dr), dtypes.bfloat16)
             scaled_rope = _buffer(MemLoc.UB, (vector_rows, self.Dr), dtypes.float32)
-            output_heads = _permute(q.view((rows, self.N, q.shape[1])), (1, 0, 2))
-        for task in range(get_block_idx(), row_tiles * self.N, get_block_num()):
-            head = task % self.N
-            batch = task // self.N * VECTOR_SUBBLOCKS + get_subblock_id()
+            output_heads = _permute(q.view((rows, heads, q.shape[1])), (1, 0, 2))
+        for task in range(get_block_idx(), row_tiles * heads, get_block_num()):
+            head = task % heads
+            batch = task // heads * VECTOR_SUBBLOCKS + get_subblock_id()
             valid_rows = min(vector_rows, max(0, rows - batch * vector_rows))
             values = c_to_v.next_read()
+            # The ready handoff also orders the QR producer and its GM scale.
+            _copy(activation_scale, descale_qr)
             _copy(head_scales, tile_slice(descale_wqb, (1, width), (0, head)))
             with vf(mode="simd"):
                 mask = rr.full_mask()
@@ -5374,7 +5826,9 @@ class _QueryPrepare:
                             rr.vload(head_scales, offset),
                             mask=mask,
                         )
-                        value = rr.vmuls(value, activation_scale, mask=mask)
+                        value = rr.vmul(
+                            value, rr.vload_broadcast(activation_scale, 0), mask=mask
+                        )
                         encoded = rr.vcast(
                             value,
                             dtypes.bfloat16,
@@ -5397,7 +5851,7 @@ class _QueryPrepare:
             vec_sync_block_arrive(_sync_ops.PIPE.MTE3, HEAD_CONSUMED_EVENT, mode=2)
             if dsl.const_expr(self.Dr != 0):
                 if valid_rows > 0:
-                    if dsl.const_expr(self.rope_mode != 0):
+                    if rope_mode != 0:
                         _copy(
                             sin_buffer,
                             tile_slice(rope_sin, (vector_rows, self.Dr), (batch, 0)),
@@ -5414,7 +5868,11 @@ class _QueryPrepare:
                                 rr.vload(head_scales, self.Dn),
                                 mask=rope_mask,
                             )
-                            value = rr.vmuls(value, activation_scale, mask=rope_mask)
+                            value = rr.vmul(
+                                value,
+                                rr.vload_broadcast(activation_scale, 0),
+                                mask=rope_mask,
+                            )
                             rr.vstore(scaled_rope, row * self.Dr, value, rope_mask)
                     for row in range(valid_rows):
                         _rope_row(
@@ -5423,7 +5881,7 @@ class _QueryPrepare:
                             tile_slice(sin_buffer, (1, self.Dr), (row, 0)),
                             tile_slice(cos_buffer, (1, self.Dr), (row, 0)),
                             tile_slice(rope_values, (1, self.Dr), (row, 0)),
-                            self.rope_mode,
+                            rope_mode,
                         )
                     head_rope = output_heads[
                         head, None, KV_ELEMENTS : KV_ELEMENTS + self.Dr
@@ -5436,6 +5894,8 @@ class _QueryPrepare:
     @jit
     def run_mx_resident_pipeline(
         self,
+        heads: int,
+        rope_mode: int,
         wqb_matmul_fp32: Tensor,
         rope_sin: Tensor,
         rope_cos: Tensor,
@@ -5449,15 +5909,15 @@ class _QueryPrepare:
         width = self.Dn + self.Dr
         values = _buffer(MemLoc.UB, (vector_rows, width), dtypes.float32)
         nope_values = _buffer(MemLoc.UB, (vector_rows, self.Dn), dtypes.bfloat16)
-        nope_tokens = q_nope_bf16.view((rows, self.N * self.Dn))
+        nope_tokens = q_nope_bf16.view((rows, heads * self.Dn))
         if dsl.const_expr(self.Dr != 0):
             sin_buffer = _buffer(MemLoc.UB, (vector_rows, self.Dr), dtypes.bfloat16)
             cos_buffer = _buffer(MemLoc.UB, (vector_rows, self.Dr), dtypes.bfloat16)
             rope_values = _buffer(MemLoc.UB, (vector_rows, self.Dr), dtypes.bfloat16)
-            output_heads = _permute(q.view((rows, self.N, q.shape[1])), (1, 0, 2))
-        for task in range(get_block_idx(), row_tiles * self.N, get_block_num()):
-            head = task % self.N
-            batch = task // self.N * VECTOR_SUBBLOCKS + get_subblock_id()
+            output_heads = _permute(q.view((rows, heads, q.shape[1])), (1, 0, 2))
+        for task in range(get_block_idx(), row_tiles * heads, get_block_num()):
+            head = task % heads
+            batch = task // heads * VECTOR_SUBBLOCKS + get_subblock_id()
             valid_rows = min(vector_rows, max(0, rows - batch * vector_rows))
             vec_sync_block_wait(_sync_ops.PIPE.S, HEAD_READY_EVENT, mode=2)
             if valid_rows > 0:
@@ -5491,7 +5951,7 @@ class _QueryPrepare:
             vec_sync_block_arrive(_sync_ops.PIPE.MTE3, HEAD_CONSUMED_EVENT, mode=2)
             if dsl.const_expr(self.Dr != 0):
                 if valid_rows > 0:
-                    if dsl.const_expr(self.rope_mode != 0):
+                    if rope_mode != 0:
                         _copy(
                             sin_buffer,
                             tile_slice(rope_sin, (vector_rows, self.Dr), (batch, 0)),
@@ -5507,7 +5967,7 @@ class _QueryPrepare:
                             tile_slice(sin_buffer, (1, self.Dr), (row, 0)),
                             tile_slice(cos_buffer, (1, self.Dr), (row, 0)),
                             tile_slice(rope_values, (1, self.Dr), (row, 0)),
-                            self.rope_mode,
+                            rope_mode,
                         )
                     head_rope = output_heads[
                         head, None, KV_ELEMENTS : KV_ELEMENTS + self.Dr
@@ -5520,6 +5980,8 @@ class _QueryPrepare:
     @jit
     def run_mx_batch8(
         self,
+        heads: int,
+        rope_mode: int,
         wqb_matmul_fp32: Tensor,
         rope_sin: Tensor,
         rope_cos: Tensor,
@@ -5529,7 +5991,7 @@ class _QueryPrepare:
         batch_rows = 8
         width = self.Dn + self.Dr
         rows = wqb_matmul_fp32.shape[0]
-        task_count = rows * self.N
+        task_count = rows * heads
         batch_count = task_count // batch_rows
         source_rows = wqb_matmul_fp32.view((task_count, width))
         input_batches = _ring_buffer(
@@ -5585,8 +6047,8 @@ class _QueryPrepare:
             if dsl.const_expr(self.Dr != 0):
                 rope_values = rope_batches.next_write()
                 # N is divisible by eight, so the batch shares one token's RoPE.
-                token = batch * batch_rows // self.N
-                if dsl.const_expr(self.rope_mode != 0):
+                token = batch * batch_rows // heads
+                if rope_mode != 0:
                     _copy(
                         rope_sin_buffer, tile_slice(rope_sin, (1, self.Dr), (token, 0))
                     )
@@ -5600,7 +6062,7 @@ class _QueryPrepare:
                         rope_sin_buffer,
                         rope_cos_buffer,
                         tile_slice(rope_values, (1, self.Dr), (local_row, 0)),
-                        self.rope_mode,
+                        rope_mode,
                     )
                 _copy(
                     tile_slice(q_rope_bf16, (batch_rows, self.Dr), (batch, 0)),
@@ -5617,13 +6079,10 @@ class _Assemble:
         batch_rows,
         absorb_tile_rows,
         query_prepare,
-        logical_rows=0,
     ):
-        self.N = N
         self.Dr = Dr
         self.qkv_quant_mode = qkv_quant_mode
         self.batch_rows = batch_rows
-        self.has_tail = not logical_rows or logical_rows % batch_rows != 0
         self.absorb_tile_rows = absorb_tile_rows
         self.query_prepare = query_prepare
         self.assembly_storage = (
@@ -5633,6 +6092,8 @@ class _Assemble:
     @jit
     def run(
         self,
+        heads: int,
+        rope_mode: int,
         q_nope_absorbed_bf16: Tensor,
         q_rope_bf16: Tensor,
         q_fp32: Tensor,
@@ -5648,7 +6109,7 @@ class _Assemble:
         input_prepared: bool = False,
         head_group: int = 1,
     ):
-        T = q_nope_absorbed_bf16.shape[0] // self.N
+        T = q_nope_bf16.shape[0] // heads
         inputs = _ring_buffer(
             MemLoc.UB, (self.batch_rows, LATENT), dtypes.bfloat16, depth=2
         )
@@ -5668,17 +6129,18 @@ class _Assemble:
             MemLoc.UB, (self.batch_rows, 1), dtypes.float32, depth=2
         )
         scale_buffer = _buffer(MemLoc.UB, (self.batch_rows, 2 * VECTOR), dtypes.float32)
-        if dsl.const_expr(self.has_tail):
-            head_inputs = q_nope_absorbed_bf16.view((self.N, T, LATENT))
-        q_tokens = q.view((T, self.N * (LATENT + self.Dr)))
-        q_fp32_tokens = q_fp32.view((T, self.N * (LATENT + self.Dr)))
+        q_tokens = q.view((T, heads * (LATENT + self.Dr)))
+        if dsl.const_expr(self.qkv_quant_mode == 3):
+            q_fp32_tokens = q_fp32.view((T, heads * (LATENT + self.Dr)))
+        else:
+            head_inputs = q_nope_absorbed_bf16.view((heads, T, LATENT))
         if dsl.const_expr(self.qkv_quant_mode == 2):
-            descale_tokens = descale_q.view((T, self.N))
+            descale_tokens = descale_q.view((T, heads))
         if dsl.const_expr(self.Dr != 0):
             rope_inputs = _ring_buffer(
                 MemLoc.UB, (self.batch_rows, self.Dr), dtypes.bfloat16, depth=2
             )
-            rope_tokens = q_rope_bf16.view((T, self.N * self.Dr))
+            rope_tokens = q_rope_bf16.view((T, heads * self.Dr))
         block = get_block_idx()
         core_count = get_block_num()
         subblock = get_subblock_id()
@@ -5697,8 +6159,10 @@ class _Assemble:
                         q_maximum, VECTOR_FLOAT_ELEMENTS, initial_zero, initial_mask
                     )
         token_tiles = (T + self.absorb_tile_rows - 1) // self.absorb_tile_rows
-        if not input_prepared and block < token_tiles * self.N:
+        if not input_prepared and block < token_tiles * heads:
             self.query_prepare.prepare_wkb_tile(
+                heads,
+                rope_mode,
                 wqb_matmul_fp32,
                 descale_qr,
                 descale_wqb,
@@ -5709,14 +6173,14 @@ class _Assemble:
                 block,
                 self.absorb_tile_rows,
             )
-        for group_task in range(
-            block, token_tiles * (self.N // head_group), core_count
-        ):
+        for group_task in range(block, token_tiles * (heads // head_group), core_count):
             for local_head in range(head_group):
                 task = group_task * head_group + local_head
                 # Prepare one task ahead before waiting for the current WKB result.
-                if not input_prepared and task + core_count < token_tiles * self.N:
+                if not input_prepared and task + core_count < token_tiles * heads:
                     self.query_prepare.prepare_wkb_tile(
+                        heads,
+                        rope_mode,
                         wqb_matmul_fp32,
                         descale_qr,
                         descale_wqb,
@@ -5727,30 +6191,19 @@ class _Assemble:
                         task + core_count,
                         self.absorb_tile_rows,
                     )
-                head = task % self.N
+                head = task % heads
                 token_batch_begin = (
-                    task // self.N * self.absorb_tile_rows // self.batch_rows
+                    task // heads * self.absorb_tile_rows // self.batch_rows
                 )
                 token_begin = token_batch_begin + subblock
                 token_step = VECTOR_SUBBLOCKS
-                if dsl.const_expr(self.has_tail):
-                    token_batches = (T + self.batch_rows - 1) // self.batch_rows
-                    token_end = min(
-                        token_batch_begin + self.absorb_tile_rows // self.batch_rows,
-                        token_batches,
-                    )
-                else:
-                    token_end = min(
-                        token_batch_begin + self.absorb_tile_rows // self.batch_rows,
-                        T // self.batch_rows,
-                    )
+                token_end = min(
+                    token_batch_begin + self.absorb_tile_rows // self.batch_rows,
+                    (T + self.batch_rows - 1) // self.batch_rows,
+                )
                 vec_sync_block_wait(_sync_ops.PIPE.S, HEAD_READY_EVENT, mode=2)
                 for token_batch in range(token_begin, token_end, token_step):
-                    valid_rows = self.batch_rows
-                    if dsl.const_expr(self.has_tail):
-                        valid_rows = min(
-                            self.batch_rows, T - token_batch * self.batch_rows
-                        )
+                    valid_rows = min(self.batch_rows, T - token_batch * self.batch_rows)
                     if dsl.const_expr(self.qkv_quant_mode == 3):
                         _copy(
                             inputs.next_write()[0:valid_rows, None],
@@ -5760,22 +6213,13 @@ class _Assemble:
                                 (token_batch, head),
                             )[None, 0:LATENT],
                         )
-                    elif dsl.const_expr(self.has_tail):
+                    else:
                         _copy(
                             inputs.next_write()[0:valid_rows, None],
                             tile_slice(
                                 head_inputs[head, None, None],
                                 (self.batch_rows, LATENT),
                                 (token_batch, 0),
-                            ),
-                        )
-                    else:
-                        _copy(
-                            inputs.next_write(),
-                            tile_slice(
-                                q_nope_absorbed_bf16,
-                                (self.batch_rows, LATENT),
-                                (head * (T // self.batch_rows) + token_batch, 0),
                             ),
                         )
                     source = inputs.next_read()
@@ -6078,18 +6522,16 @@ class _Assemble:
                 partial = _buffer(
                     MemLoc.UB, (1, MAXIMUM_PARTIAL_ELEMENTS), dtypes.float32
                 )
+                _copy(
+                    partial,
+                    tile_slice(
+                        partials,
+                        (1, MAXIMUM_PARTIAL_ELEMENTS),
+                        (block * VECTOR_SUBBLOCKS + subblock, 0),
+                    ),
+                )
                 with vf(mode="simd"):
                     final_partial_mask = rr.full_mask()
-                    partial_mask = rr.update_mask(
-                        MAXIMUM_PARTIAL_ELEMENTS, elem_bits=32
-                    )[0]
-                    rr.vstore(
-                        partial,
-                        0,
-                        rr.vdups(0.0, dtypes.float32, mask=partial_mask),
-                        partial_mask,
-                    )
-                    rr.vmem_bar("vst_vld")
                     final_partial_maximum = rr.vdup(
                         rr.vreduce_max(rr.vload(q_maximum, 0), mask=final_partial_mask),
                         mask=final_partial_mask,
@@ -6101,6 +6543,17 @@ class _Assemble:
                         ),
                         mask=final_partial_mask,
                     )
+                    final_partial_maximum = rr.vmax(
+                        final_partial_maximum,
+                        rr.vload_broadcast(partial, 0),
+                        mask=final_partial_mask,
+                    )
+                    final_partial_nan = rr.vmax(
+                        final_partial_nan,
+                        rr.vload_broadcast(partial, 1),
+                        mask=final_partial_mask,
+                    )
+                    rr.vmem_bar("vld_vst")
                     rr.vstore_first(partial, 0, final_partial_maximum)
                     rr.vstore_first(partial, 1, final_partial_nan)
                 _copy(
@@ -6114,20 +6567,15 @@ class _Assemble:
 
 
 class _PerTokenHeadQStrategy:
-    def __init__(
-        self, N, Dr, batch_rows, absorb_tile_rows, query_prepare, logical_rows=0
-    ):
+    def __init__(self, N, Dr, batch_rows, absorb_tile_rows, query_prepare):
         query_prepare = _QueryPrepare(
             N,
             query_prepare.Dn,
             Dr,
             query_prepare.w_qr_quant_mode,
-            query_prepare.rope_mode,
             mx_token_batch_rows=8,
         )
-        self.assemble = _Assemble(
-            N, Dr, 2, batch_rows, absorb_tile_rows, query_prepare, logical_rows
-        )
+        self.assemble = _Assemble(N, Dr, 2, batch_rows, absorb_tile_rows, query_prepare)
 
     @jit
     def finish(
@@ -6189,12 +6637,8 @@ class _Hif8OutputQuantize:
 
 
 class _PerTensorQStrategy:
-    def __init__(
-        self, N, Dr, batch_rows, absorb_tile_rows, query_prepare, logical_rows=0
-    ):
-        self.assemble = _Assemble(
-            N, Dr, 3, batch_rows, absorb_tile_rows, query_prepare, logical_rows
-        )
+    def __init__(self, N, Dr, batch_rows, absorb_tile_rows, query_prepare):
+        self.assemble = _Assemble(N, Dr, 3, batch_rows, absorb_tile_rows, query_prepare)
         self.maximum = _GlobalMaximum(KV_ELEMENTS + Dr, _Bfloat16Storage())
         self.quantize = _Hif8OutputQuantize(KV_ELEMENTS + Dr)
 
@@ -6226,14 +6670,31 @@ class _PerTensorQStrategy:
             self.quantize.run(q_fp32, q, descale_q)
         _mix_join()
 
+    @jit
+    def finish_accumulated(
+        self, q_fp32: Tensor, q: Tensor, descale_q: Tensor, scratch_fp32: Tensor
+    ):
+        partial_capacity = scratch_fp32.shape[1] // MAXIMUM_PARTIAL_ELEMENTS
+        if get_block_num() * VECTOR_SUBBLOCKS <= partial_capacity:
+            self.maximum.finish_partials(
+                scratch_fp32,
+                descale_q,
+                get_block_num() * VECTOR_SUBBLOCKS,
+                partial_capacity,
+            )
+        else:
+            self.maximum.run_parallel(q_fp32, descale_q, scratch_fp32, partial_capacity)
+        _mix_join()
+        onchip_rewind()
+        self.quantize.run(q_fp32, q, descale_q)
+        _mix_join()
+
 
 class _Cache:
-    def __init__(self, Dr, w_qr_quant_mode, qkv_quant_mode, cache_mode, rope_mode):
+    def __init__(self, Dr, w_qr_quant_mode, qkv_quant_mode):
         self.Dr = Dr
         self.w_qr_quant_mode = w_qr_quant_mode
         self.qkv_quant_mode = qkv_quant_mode
-        self.cache_mode = cache_mode
-        self.rope_mode = rope_mode
         self.quant_dtype = dtypes.float8_e4m3fn
         self.quant_rounding = rr.RoundingMode.RN
         if qkv_quant_mode == 3:
@@ -6250,6 +6711,7 @@ class _Cache:
     @jit
     def run(
         self,
+        rope_mode: int,
         kv_norm_fp32: Tensor,
         kva_matmul_fp32: Tensor,
         descale_x: Tensor,
@@ -6259,6 +6721,8 @@ class _Cache:
         quant_scale_kv: Tensor,
         kv_cache: Tensor,
         cache_index: Tensor,
+        cache_mode: int,
+        cache_quant_mode: int,
     ):
         input_rows = _ring_buffer(MemLoc.UB, (1, KV_ELEMENTS), dtypes.float32, depth=2)
         payload_rows = _ring_buffer(
@@ -6294,94 +6758,12 @@ class _Cache:
                 values = input_rows.next_read()
                 payload = payload_rows.next_write()
                 if dsl.const_expr(self.qkv_quant_mode == 0):
-                    bf16_payload = _view(
-                        payload, dtype=dtypes.bfloat16, shape=(1, KV_ELEMENTS + self.Dr)
-                    )
-                    with vf(mode="simd"):
-                        mask = rr.full_mask()
-                        for offset in range(0, KV_ELEMENTS, VECTOR_ELEMENTS):
-                            value = _bf16_sat_input(rr.vload(values, offset), mask)
-                            encoded = rr.vcast(
-                                value,
-                                dtypes.bfloat16,
-                                mask=mask,
-                                rounding=rr.RoundingMode.RN,
-                                reg_layout=RegLayout.ZERO,
-                            )
-                            rr.vstore_pack(
-                                bf16_payload,
-                                offset,
-                                encoded,
-                                mask,
-                                pack_mode=rr.PackMode.B32_TO_B16,
-                            )
+                    if cache_quant_mode == 0:
+                        self._encode_bf16(values, payload)
+                    else:
+                        self._encode_group(values, payload)
                 elif dsl.const_expr(self.qkv_quant_mode == 1):
-                    scale_payload = _view(
-                        payload,
-                        dtype=dtypes.float32,
-                        shape=(1, GROUP_COUNT),
-                        offset=KV_ELEMENTS + BF16_BYTES * self.Dr,
-                    )
-                    with vf(mode="simd"):
-                        mask = rr.full_mask()
-                        zero = rr.vdups(0.0, dtypes.float32, mask=mask)
-                        one = rr.vdups(1.0, dtypes.float32, mask=mask)
-                        nan = rr.vreinterpret(
-                            rr.vdups(2143289344, dtypes.uint32, mask=mask),
-                            dtypes.float32,
-                        )
-                        for group in range(GROUP_COUNT):
-                            maximum = zero
-                            has_nan = zero
-                            for step in range(GROUP_ELEMENTS // VECTOR_ELEMENTS):
-                                value = rr.vload(
-                                    values,
-                                    group * GROUP_ELEMENTS + step * VECTOR_ELEMENTS,
-                                )
-                                maximum = rr.vmax(
-                                    maximum, rr.vabs(value, mask=mask), mask=mask
-                                )
-                                has_nan = rr.vmax(
-                                    has_nan,
-                                    rr.vselect(
-                                        one,
-                                        zero,
-                                        cond_mask=rr.vne(value, value, mask=mask),
-                                    ),
-                                    mask=mask,
-                                )
-                            amax = rr.vdup(
-                                rr.vreduce_max(maximum, mask=mask), mask=mask
-                            )
-                            nan_seen = rr.vdup(
-                                rr.vreduce_max(has_nan, mask=mask), mask=mask
-                            )
-                            scale = rr.vdiv(
-                                rr.vmaxs(amax, CACHE_AMAX_FLOOR, mask=mask),
-                                rr.vdups(E4M3_MAX, dtypes.float32, mask=mask),
-                                mask=mask,
-                                precision_mode=True,
-                            )
-                            scale = rr.vselect(
-                                nan, scale, cond_mask=rr.vgts(nan_seen, 0.0, mask=mask)
-                            )
-                            rr.vstore_first(scale_payload, group, scale)
-                            for step in range(GROUP_ELEMENTS // VECTOR_ELEMENTS):
-                                offset = group * GROUP_ELEMENTS + step * VECTOR_ELEMENTS
-                                normalized = rr.vdiv(
-                                    rr.vload(values, offset),
-                                    scale,
-                                    mask=mask,
-                                    precision_mode=True,
-                                )
-                                encoded = _quantize_cast(normalized, mask, False)
-                                rr.vstore_pack(
-                                    payload,
-                                    offset,
-                                    encoded,
-                                    mask,
-                                    pack_mode=rr.PackMode.B32_TO_B8,
-                                )
+                    self._encode_group(values, payload)
                 else:
                     with vf(mode="simd"):
                         mask = rr.full_mask()
@@ -6422,7 +6804,7 @@ class _Cache:
                                 mask,
                             )
                             rr.vmem_bar("vst_vld")
-                    if dsl.const_expr(self.rope_mode != 0):
+                    if rope_mode != 0:
                         _copy(
                             rope_sin_buffer,
                             tile_slice(rope_sin, (1, self.Dr), (token, 0)),
@@ -6433,7 +6815,7 @@ class _Cache:
                         )
                     if dsl.const_expr(self.qkv_quant_mode in (0, 1)):
                         kr_offset_bytes = KV_ELEMENTS
-                        if dsl.const_expr(self.qkv_quant_mode == 0):
+                        if cache_quant_mode == 0:
                             kr_offset_bytes = KV_ELEMENTS * BF16_BYTES
                         kr_target = _view(
                             payload,
@@ -6447,7 +6829,7 @@ class _Cache:
                             rope_sin_buffer,
                             rope_cos_buffer,
                             kr_target,
-                            self.rope_mode,
+                            rope_mode,
                             1,
                         )
                     else:
@@ -6457,7 +6839,7 @@ class _Cache:
                             rope_sin_buffer,
                             rope_cos_buffer,
                             kr_rounded,
-                            self.rope_mode,
+                            rope_mode,
                             1,
                         )
                         with vf(mode="simd"):
@@ -6481,40 +6863,127 @@ class _Cache:
                                 mask,
                                 pack_mode=rr.PackMode.B32_TO_B8,
                             )
-                if dsl.const_expr(self.cache_mode == 0):
-                    cache_rows = kv_cache[
-                        slot // kv_cache.shape[1], None, 0, None
-                    ].view((kv_cache.shape[1], self.payload_bytes))
-                    _copy(
-                        tile_slice(
-                            cache_rows,
-                            (1, self.payload_bytes),
-                            (slot % kv_cache.shape[1], 0),
-                        ),
-                        payload_rows.next_read(),
-                    )
+                ready = payload_rows.next_read()
+                if cache_quant_mode == 1:
+                    self._store_bsnd(kv_cache, slot, ready)
+                elif cache_mode == 0:
+                    self._store_bsnd(kv_cache, slot, ready)
                 else:
-                    page = slot // kv_cache.shape[1]
-                    row = slot % kv_cache.shape[1]
-                    physical = kv_cache[page, None, 0, None].view(
-                        (
-                            self.payload_bytes // FRACTAL_BYTES,
-                            kv_cache.shape[1],
-                            FRACTAL_BYTES,
-                        )
+                    self._store_nz(kv_cache, slot, ready)
+
+    @jit
+    def _encode_bf16(self, values: Tensor, payload: Tensor):
+        bf16_payload = _view(
+            payload, dtype=dtypes.bfloat16, shape=(1, KV_ELEMENTS + self.Dr)
+        )
+        with vf(mode="simd"):
+            mask = rr.full_mask()
+            for offset in range(0, KV_ELEMENTS, VECTOR_ELEMENTS):
+                value = _bf16_sat_input(rr.vload(values, offset), mask)
+                encoded = rr.vcast(
+                    value,
+                    dtypes.bfloat16,
+                    mask=mask,
+                    rounding=rr.RoundingMode.RN,
+                    reg_layout=RegLayout.ZERO,
+                )
+                rr.vstore_pack(
+                    bf16_payload,
+                    offset,
+                    encoded,
+                    mask,
+                    pack_mode=rr.PackMode.B32_TO_B16,
+                )
+
+    @jit
+    def _encode_group(self, values: Tensor, payload: Tensor):
+        scale_payload = _view(
+            payload,
+            dtype=dtypes.float32,
+            shape=(1, GROUP_COUNT),
+            offset=KV_ELEMENTS + BF16_BYTES * self.Dr,
+        )
+        with vf(mode="simd"):
+            mask = rr.full_mask()
+            zero = rr.vdups(0.0, dtypes.float32, mask=mask)
+            one = rr.vdups(1.0, dtypes.float32, mask=mask)
+            nan = rr.vreinterpret(
+                rr.vdups(2143289344, dtypes.uint32, mask=mask),
+                dtypes.float32,
+            )
+            for group in range(GROUP_COUNT):
+                maximum = zero
+                has_nan = zero
+                for step in range(GROUP_ELEMENTS // VECTOR_ELEMENTS):
+                    value = rr.vload(
+                        values,
+                        group * GROUP_ELEMENTS + step * VECTOR_ELEMENTS,
                     )
-                    ready = payload_rows.next_read()
-                    for chunk in range(self.payload_bytes // FRACTAL_BYTES):
-                        destination = physical[chunk, row, None].view(
-                            (1, FRACTAL_BYTES)
-                        )
-                        _copy(
-                            destination,
-                            tile_slice(ready, (1, FRACTAL_BYTES), (0, chunk)),
-                        )
+                    maximum = rr.vmax(maximum, rr.vabs(value, mask=mask), mask=mask)
+                    has_nan = rr.vmax(
+                        has_nan,
+                        rr.vselect(
+                            one,
+                            zero,
+                            cond_mask=rr.vne(value, value, mask=mask),
+                        ),
+                        mask=mask,
+                    )
+                amax = rr.vdup(rr.vreduce_max(maximum, mask=mask), mask=mask)
+                nan_seen = rr.vdup(rr.vreduce_max(has_nan, mask=mask), mask=mask)
+                scale = rr.vdiv(
+                    rr.vmaxs(amax, CACHE_AMAX_FLOOR, mask=mask),
+                    rr.vdups(E4M3_MAX, dtypes.float32, mask=mask),
+                    mask=mask,
+                    precision_mode=True,
+                )
+                scale = rr.vselect(
+                    nan, scale, cond_mask=rr.vgts(nan_seen, 0.0, mask=mask)
+                )
+                rr.vstore_first(scale_payload, group, scale)
+                for step in range(GROUP_ELEMENTS // VECTOR_ELEMENTS):
+                    offset = group * GROUP_ELEMENTS + step * VECTOR_ELEMENTS
+                    normalized = rr.vdiv(
+                        rr.vload(values, offset),
+                        scale,
+                        mask=mask,
+                        precision_mode=True,
+                    )
+                    encoded = _quantize_cast(normalized, mask, False)
+                    rr.vstore_pack(
+                        payload,
+                        offset,
+                        encoded,
+                        mask,
+                        pack_mode=rr.PackMode.B32_TO_B8,
+                    )
+
+    @jit
+    def _store_bsnd(self, kv_cache: Tensor, slot: int, payload: Tensor):
+        cache_rows = kv_cache[slot // kv_cache.shape[1], None, 0, None].view(
+            (kv_cache.shape[1], kv_cache.shape[3])
+        )
+        _copy(
+            tile_slice(
+                cache_rows,
+                dsl.make_tiler((1, kv_cache.shape[3]), alignment=(1, 16)),
+                (slot % kv_cache.shape[1], 0),
+            ),
+            payload[None, 0 : kv_cache.shape[3]],
+        )
+
+    @jit
+    def _store_nz(self, kv_cache: Tensor, slot: int, payload: Tensor):
+        page = slot // kv_cache.shape[1]
+        row = slot % kv_cache.shape[1]
+        physical = kv_cache[page, None, 0, None].view(
+            (kv_cache.shape[3] // FRACTAL_BYTES, kv_cache.shape[1], FRACTAL_BYTES)
+        )
+        for chunk in range(kv_cache.shape[3] // FRACTAL_BYTES):
+            destination = physical[chunk, row, None].view((1, FRACTAL_BYTES))
+            _copy(destination, tile_slice(payload, (1, FRACTAL_BYTES), (0, chunk)))
 
 
-@kernel(profile=ProfileSpec(name="quant_mla_prolog", op_type="quant_mla_prolog"))
 class _QuantMlaPrologKernel:
     def __init__(
         self,
@@ -6525,71 +6994,61 @@ class _QuantMlaPrologKernel:
         w_qr_quant_mode,
         qkv_quant_mode,
         weight_is_nz,
-        cache_mode,
-        rope_mode,
         input_tile_rows,
         wqb_tile_rows,
         absorb_tile_rows,
-        qa_rows=0,
-        qa_dim=0,
+        token_profile,
+        qa_l1_reduction=QA_PIPELINE_REDUCTION,
         qa_config=(0, 1, 128),
         compact_head_handoff=(0, 0),
+        dynamic_lora=False,
     ):
-        self.qa_enabled = qa_rows > 0
-        self.qa_rows = qa_rows
-        self.hif_qr_resident_rows = (
-            HIF_QR_EXTENDED_ROWS
-            if HIF_QR_RESIDENT_ROWS < qa_rows <= HIF_QR_EXTENDED_ROWS
-            else HIF_QR_RESIDENT_ROWS
-        )
-        self.qa_bm = qa_config[0] if qa_rows else input_tile_rows
+        self.dynamic_lora = dynamic_lora
+        self.short_tokens = token_profile.capacity != 0
+        self.tail_group1 = None
+        self.tail_group2 = None
+        self.tail_group3 = None
+        self.tail_group4 = None
+        self.tail_hif = None
+        self.tail_slots1 = 0
+        self.tail_slots2 = 0
+        self.tail_slots3 = 0
+        self.tail_slots4 = 0
+        profile_rows = token_profile.capacity or COMPACT_HANDOFF_MAX_ROWS + 1
+        self.qa_enabled = True
+        self.hif_qr_resident_rows = HIF_QR_EXTENDED_ROWS
+        self.qa_bm = qa_config[0]
         self.qa_splits = qa_config[1]
         self.qa_bn = qa_config[2] if self.qa_enabled else QA_PROJECTION_COLUMNS
         self.qa_fused_norm = self.qa_enabled and self.qa_splits == 2
         self.qa_nc = q_lora // 128
-        self.qa_nm = (qa_rows + self.qa_bm - 1) // self.qa_bm
         qa_columns = QA_PIPELINE_COLUMNS
         if (
             w_qr_quant_mode == 1
             and qkv_quant_mode in (0, 2)
             and weight_is_nz
-            and 0 < qa_rows <= QA_BALANCED_MAX_ROWS
+            and profile_rows <= QA_BALANCED_MAX_ROWS
             and self.qa_splits == 2
             and q_lora % QA_BALANCED_COLUMNS == 0
         ):
             qa_columns = QA_BALANCED_COLUMNS
         if self.qa_enabled:
             self.qa_pipeline = QaRowPipeline(
-                qa_rows,
                 q_lora,
-                qa_dim,
                 w_qr_quant_mode,
                 weight_is_nz,
                 self.qa_bm,
                 self.qa_splits,
                 True,
                 qa_columns,
+                dynamic_lora,
             )
-            if (
-                qa_columns == QA_BALANCED_COLUMNS
-                and qa_dim % (self.qa_splits * QA_BALANCED_L1_REDUCTION) == 0
-            ):
-                self.qa_pipeline.l1_reduction = QA_BALANCED_L1_REDUCTION
-            elif (
-                w_qr_quant_mode == 1
-                and qkv_quant_mode in (0, 2)
-                and weight_is_nz
-                and 0 < qa_rows <= QA_BALANCED_MAX_ROWS
-                and qa_dim % (self.qa_splits * QA_L1_REDUCTION) == 0
-            ):
-                self.qa_pipeline.l1_reduction = QA_L1_REDUCTION
+            self.qa_pipeline.l1_reduction = qa_l1_reduction
         self.q_lora = q_lora
-        self.N = N
         self.Dn = Dn
         self.Dr = Dr
         self.w_qr_quant_mode = w_qr_quant_mode
         self.qkv_quant_mode = qkv_quant_mode
-        self.rope_mode = rope_mode
         self.input_tile_rows = input_tile_rows
         self.wqb_tile_rows = wqb_tile_rows
         self.wkb_tile_rows = min(
@@ -6613,7 +7072,7 @@ class _QuantMlaPrologKernel:
         if (
             w_qr_quant_mode == 1
             and qkv_quant_mode in (0, 1, 2)
-            and WQB_WIDE_MAX_ROWS < qa_rows <= COMPACT_HANDOFF_MAX_ROWS
+            and WQB_WIDE_MAX_ROWS < profile_rows <= COMPACT_HANDOFF_MAX_ROWS
             and compact_head_handoff[0]
         ):
             self.wqb_tile_rows = wqb_tile_rows
@@ -6632,24 +7091,23 @@ class _QuantMlaPrologKernel:
         wqb_columns = (
             256
             if wqb_output % 256 == 0
-            else QA_PROJECTION_COLUMNS
-            if wqb_output % QA_PROJECTION_COLUMNS == 0
-            else PROJECTION_COLUMNS
+            else (
+                QA_PROJECTION_COLUMNS
+                if wqb_output % QA_PROJECTION_COLUMNS == 0
+                else PROJECTION_COLUMNS
+            )
         )
         if qkv_quant_mode in (0, 1):
             wqb_columns = Dn + Dr
         # Experimental transport routing, not a public shape restriction.
         # Keep the scalar path for small T and partial row tiles.
         self.use_hif_c2v = (
-            w_qr_quant_mode == 2
-            and qkv_quant_mode == 0
-            and qa_rows >= 128
-            and qa_rows % self.wqb_tile_rows == 0
+            w_qr_quant_mode == 2 and qkv_quant_mode == 0 and token_profile.hif_c2v
         )
         self.coalesce_wkb_b = (
             w_qr_quant_mode == 1
             and qkv_quant_mode == 2
-            and 0 < qa_rows <= 32
+            and profile_rows <= 32
             and N >= 64
             and Dn == 128
         )
@@ -6659,7 +7117,7 @@ class _QuantMlaPrologKernel:
         self.mode0_coalesce_wkb_b = (
             w_qr_quant_mode == 1
             and qkv_quant_mode == 0
-            and 0 < qa_rows <= 32
+            and profile_rows <= 32
             and Dn == 128
             and 2
             * BF16_BYTES
@@ -6676,15 +7134,11 @@ class _QuantMlaPrologKernel:
             tile_columns=wqb_columns,
             tile_reduction=wqb_reduction,
             head_pipeline=qkv_quant_mode in (0, 1),
+            nope_width=Dn,
             hif_c2v=self.use_hif_c2v,
             hif_split_l0=hif_wqb_hierarchy,
             join_after_prefetch=w_qr_quant_mode == 1,
-            force_split_l0=(
-                qa_rows == WQB_LARGE_HEAD_ROWS + 1
-                and wqb_tile_rows == WQB_TAIL_HEAD_ROWS
-                and Dn + Dr == 256
-                and w_qr_quant_mode == 1
-            ),
+            force_split_l0=token_profile.split_l0_tail,
         )
         self.use_mm34_shared = (
             w_qr_quant_mode == 1
@@ -6728,7 +7182,7 @@ class _QuantMlaPrologKernel:
             w_qr_quant_mode == 1
             and qkv_quant_mode == 2
             and weight_is_nz
-            and 0 < qa_rows <= WQB_WIDE_MAX_ROWS
+            and profile_rows <= WQB_WIDE_MAX_ROWS
             and self.wqb_tile_rows <= WQB_WIDE_MAX_ROWS
             and q_lora % WQB_PROJECTION_REDUCTION == 0
             and wqb_output % WQB_WIDE_COLUMNS == 0
@@ -6749,7 +7203,7 @@ class _QuantMlaPrologKernel:
             and qkv_quant_mode == 0
             and Dn == 192
             and weight_is_nz
-            and 0 < qa_rows <= WQB_WIDE_MAX_ROWS
+            and profile_rows <= WQB_WIDE_MAX_ROWS
             and self.wqb_tile_rows <= WQB_WIDE_MAX_ROWS
             and q_lora % WQB_HEAD_L1_REDUCTION == 0
             and wqb_columns <= MM34_SHARED_COLUMNS
@@ -6768,8 +7222,7 @@ class _QuantMlaPrologKernel:
             w_qr_quant_mode == 1
             and qkv_quant_mode == 0
             and weight_is_nz
-            and qa_rows >= 2 * WQB_LARGE_HEAD_ROWS
-            and qa_rows % WQB_LARGE_HEAD_ROWS == 0
+            and token_profile.large_m
             and self.wqb_tile_rows == WKB_C2V_MAX_ROWS
             and wqb_columns <= MM34_SHARED_COLUMNS
             and self.wqb_projection.l0_reduction == WQB_PROJECTION_REDUCTION
@@ -6784,7 +7237,6 @@ class _QuantMlaPrologKernel:
             and qkv_quant_mode == 0
             and weight_is_nz
             and not self.use_mm34_shared
-            and qa_rows > 0
             and (
                 (2 * self.wqb_tile_rows + 3 * wqb_columns)
                 * self.wqb_projection.tile_reduction
@@ -6797,7 +7249,7 @@ class _QuantMlaPrologKernel:
             w_qr_quant_mode == 1
             and qkv_quant_mode == 2
             and weight_is_nz
-            and 0 < qa_rows <= WQB_WIDE_MAX_ROWS
+            and profile_rows <= WQB_WIDE_MAX_ROWS
             and Dn == 192
             and Dr == 64
             and N % 2 == 0
@@ -6814,28 +7266,30 @@ class _QuantMlaPrologKernel:
             stripe_columns = head_group * (Dn + Dr)
             reduction_panel = (
                 COMPACT_BOUNDARY_REDUCTION_PANEL
-                if qkv_quant_mode in (0, 1, 2) and qa_rows > WQB_WIDE_MAX_ROWS
+                if qkv_quant_mode in (0, 1, 2) and profile_rows > WQB_WIDE_MAX_ROWS
                 else REDUCTION_PANEL
             )
             weight_columns = max(
                 stripe_columns, Dn * WKB_C2V_COLUMNS * BF16_BYTES // reduction_panel
             )
-            l1_bytes = (
-                2 * weight_columns * reduction_panel
-                + 2 * self.wqb_tile_rows * reduction_panel
-                + (self.wqb_tile_rows + stripe_columns) * q_lora // MX_GROUP
-                + handoff_slots * self.wqb_tile_rows * head_group * Dn * BF16_BYTES
-                + 2 * self.wkb_tile_rows * WKB_C2V_REDUCTION * BF16_BYTES
+            l1_bytes = _compact_l1_bytes(
+                self.wqb_tile_rows,
+                self.wkb_tile_rows,
+                head_group,
+                Dn,
+                Dr,
+                q_lora,
+                handoff_slots,
+                reduction_panel,
             )
             if (
                 w_qr_quant_mode == 1
                 and qkv_quant_mode in (0, 1, 2)
-                and (rope_mode == 1 or Dr == 0)
                 and (
-                    0 < qa_rows <= WQB_WIDE_MAX_ROWS
+                    profile_rows <= WQB_WIDE_MAX_ROWS
                     or (
                         qkv_quant_mode in (0, 1, 2)
-                        and WQB_WIDE_MAX_ROWS < qa_rows <= COMPACT_HANDOFF_MAX_ROWS
+                        and WQB_WIDE_MAX_ROWS < profile_rows <= COMPACT_HANDOFF_MAX_ROWS
                     )
                 )
                 and self.wqb_tile_rows == self.wkb_tile_rows
@@ -6855,6 +7309,7 @@ class _QuantMlaPrologKernel:
                     Dn + Dr,
                     weight_is_nz,
                     reduction_panel,
+                    2048 if dynamic_lora else 0,
                 )
                 self.handoff_reduction_panel = reduction_panel
                 self.nope_l1_depth = handoff_slots
@@ -6864,10 +7319,9 @@ class _QuantMlaPrologKernel:
             w_qr_quant_mode == 1
             and qkv_quant_mode == 2
             and weight_is_nz
-            and rope_mode == 1
             and Dn == 128
             and Dr == 64
-            and 0 < qa_rows <= 32
+            and profile_rows <= 32
             and 0 < N <= 128
             and isinstance(self.wqb_projection, WqbStripeProjection)
             and self.wqb_tile_rows == self.wkb_tile_rows
@@ -6880,7 +7334,7 @@ class _QuantMlaPrologKernel:
         self.use_stripe_local = False
         if (
             isinstance(self.wqb_projection, WqbStripeProjection)
-            and 0 < qa_rows <= WQB_WIDE_MAX_ROWS
+            and profile_rows <= WQB_WIDE_MAX_ROWS
             and self.wqb_tile_rows == self.wkb_tile_rows
             and Dn == 128
             and Dr == 64
@@ -6922,23 +7376,30 @@ class _QuantMlaPrologKernel:
             w_qr_quant_mode,
             self.qa_bm if self.qa_fused_norm else 0,
             hif_resident_rows=self.hif_qr_resident_rows,
+            dynamic_width=dynamic_lora,
         )
         self.kva_rmsnorm = _Normalize(KV_ELEMENTS, w_qr_quant_mode)
         self.qr_max = _GlobalMaximum(q_lora)
         self.qr_hif = _Hif8Quantize(q_lora)
-        self.prepare = _QueryPrepare(N, Dn, Dr, w_qr_quant_mode, rope_mode)
+        self.prepare = _QueryPrepare(N, Dn, Dr, w_qr_quant_mode)
         tail_batch_rows = 8 if absorb_tile_rows >= 32 else 1
         if qkv_quant_mode == 2:
             self.q_strategy = _PerTokenHeadQStrategy(
-                N, Dr, tail_batch_rows, self.wkb_tile_rows, self.prepare, qa_rows
+                N,
+                Dr,
+                tail_batch_rows,
+                self.wkb_tile_rows,
+                self.prepare,
             )
         elif qkv_quant_mode == 3:
             self.q_strategy = _PerTensorQStrategy(
-                N, Dr, tail_batch_rows, self.wkb_tile_rows, self.prepare, qa_rows
+                N,
+                Dr,
+                tail_batch_rows,
+                self.wkb_tile_rows,
+                self.prepare,
             )
-        self.cache_writer = _Cache(
-            Dr, w_qr_quant_mode, qkv_quant_mode, cache_mode, rope_mode
-        )
+        self.cache_writer = _Cache(Dr, w_qr_quant_mode, qkv_quant_mode)
 
     def __call__(
         self,
@@ -6975,9 +7436,750 @@ class _QuantMlaPrologKernel:
         qr_scale: float,
         kvr_scale: float,
         qa_partial: Tensor,
+        cache_mode: int,
+        rope_mode: int,
+        cache_quant_mode: int,
     ):
+        self._execute(
+            x,
+            wqa,
+            wqb,
+            wkva,
+            wkb,
+            descale_x,
+            descale_wqa,
+            descale_wqb,
+            descale_wkva,
+            norm_weight_qa,
+            norm_weight_kva,
+            kv_cache,
+            cache_index,
+            quant_scale_kv,
+            rope_sin,
+            rope_cos,
+            qa_matmul_fp32,
+            kva_matmul_fp32,
+            qa_norm_fp32,
+            kv_norm_fp32,
+            qr,
+            descale_qr,
+            wqb_matmul_fp32,
+            q_nope_bf16,
+            q_rope_bf16,
+            q_nope_absorbed_bf16,
+            q_fp32,
+            q,
+            descale_q,
+            norm_eps,
+            qr_scale,
+            kvr_scale,
+            qa_partial,
+            cache_mode,
+            rope_mode,
+            cache_quant_mode,
+        )
+
+    @jit
+    def _execute(
+        self,
+        x: Tensor,
+        wqa: Tensor,
+        wqb: Tensor,
+        wkva: Tensor,
+        wkb: Tensor,
+        descale_x: Tensor,
+        descale_wqa: Tensor,
+        descale_wqb: Tensor,
+        descale_wkva: Tensor,
+        norm_weight_qa: Tensor,
+        norm_weight_kva: Tensor,
+        kv_cache: Tensor,
+        cache_index: Tensor,
+        quant_scale_kv: Tensor,
+        rope_sin: Tensor,
+        rope_cos: Tensor,
+        qa_matmul_fp32: Tensor,
+        kva_matmul_fp32: Tensor,
+        qa_norm_fp32: Tensor,
+        kv_norm_fp32: Tensor,
+        qr: Tensor,
+        descale_qr: Tensor,
+        wqb_matmul_fp32: Tensor,
+        q_nope_bf16: Tensor,
+        q_rope_bf16: Tensor,
+        q_nope_absorbed_bf16: Tensor,
+        q_fp32: Tensor,
+        q: Tensor,
+        descale_q: Tensor,
+        norm_eps: float,
+        qr_scale: float,
+        kvr_scale: float,
+        qa_partial: Tensor,
+        cache_mode: int,
+        rope_mode: int,
+        cache_quant_mode: int,
+    ):
+        if dsl.const_expr(self.w_qr_quant_mode != 1):
+            self._run_hif(
+                x,
+                wqa,
+                wqb,
+                wkva,
+                wkb,
+                descale_x,
+                descale_wqa,
+                descale_wqb,
+                descale_wkva,
+                norm_weight_qa,
+                norm_weight_kva,
+                kv_cache,
+                cache_index,
+                quant_scale_kv,
+                rope_sin,
+                rope_cos,
+                qa_matmul_fp32,
+                kva_matmul_fp32,
+                qa_norm_fp32,
+                kv_norm_fp32,
+                qr,
+                descale_qr,
+                wqb_matmul_fp32,
+                q_nope_bf16,
+                q_rope_bf16,
+                q_nope_absorbed_bf16,
+                q_fp32,
+                q,
+                descale_q,
+                norm_eps,
+                qr_scale,
+                kvr_scale,
+                qa_partial,
+                cache_mode,
+                rope_mode,
+                cache_quant_mode,
+            )
+            return
+        if dsl.const_expr(self.short_tokens):
+            onchip_rewind(reset_sync_id=True)
+            self._run_chunk(
+                x,
+                wqa,
+                wqb,
+                wkva,
+                wkb,
+                descale_x,
+                descale_wqa,
+                descale_wqb,
+                descale_wkva,
+                norm_weight_qa,
+                norm_weight_kva,
+                kv_cache,
+                cache_index,
+                quant_scale_kv,
+                rope_sin,
+                rope_cos,
+                qa_matmul_fp32,
+                kva_matmul_fp32,
+                qa_norm_fp32,
+                kv_norm_fp32,
+                qr,
+                descale_qr,
+                wqb_matmul_fp32,
+                q_nope_bf16,
+                q_rope_bf16,
+                q_nope_absorbed_bf16,
+                q_fp32,
+                q,
+                descale_q,
+                norm_eps,
+                qr_scale,
+                kvr_scale,
+                qa_partial,
+                cache_mode,
+                rope_mode,
+                cache_quant_mode,
+            )
+            return
+        heads = wkb.shape[0]
+        chunk_capacity = qa_matmul_fp32.shape[0]
+        for start in range(0, x.shape[0], qa_matmul_fp32.shape[0]):
+            onchip_rewind(reset_sync_id=True)
+            rows = min(qa_matmul_fp32.shape[0], x.shape[0] - start)
+            qr_start = 0
+            if qr.shape[0] == x.shape[0]:
+                qr_start = start
+            rope_start = 0
+            if rope_mode != 0:
+                rope_start = start
+            x_chunk = tile_slice(
+                x,
+                _dsl.make_tiler(
+                    (
+                        chunk_capacity,
+                        x.shape[1],
+                    ),
+                    alignment=(
+                        1,
+                        1,
+                    ),
+                ),
+                (
+                    start // chunk_capacity,
+                    0,
+                ),
+            )
+            descale_x_chunk = tile_slice(
+                descale_x,
+                _dsl.make_tiler(
+                    (
+                        chunk_capacity,
+                        descale_x.shape[1],
+                        2,
+                    ),
+                    alignment=(
+                        1,
+                        1,
+                        1,
+                    ),
+                ),
+                (
+                    start // chunk_capacity,
+                    0,
+                    0,
+                ),
+            )
+            cache_index_chunk = tile_slice(
+                cache_index,
+                _dsl.make_tiler((chunk_capacity,), alignment=(1,)),
+                (start // chunk_capacity,),
+            )
+            qa_matmul_fp32_chunk = tile_slice(
+                qa_matmul_fp32,
+                _dsl.make_tiler(
+                    (
+                        rows,
+                        qa_matmul_fp32.shape[1],
+                    ),
+                    alignment=(
+                        1,
+                        1,
+                    ),
+                ),
+                (
+                    0,
+                    0,
+                ),
+            )
+            kva_matmul_fp32_chunk = tile_slice(
+                kva_matmul_fp32,
+                _dsl.make_tiler(
+                    (
+                        rows,
+                        kva_matmul_fp32.shape[1],
+                    ),
+                    alignment=(
+                        1,
+                        1,
+                    ),
+                ),
+                (
+                    0,
+                    0,
+                ),
+            )
+            kv_norm_fp32_chunk = tile_slice(
+                kv_norm_fp32,
+                _dsl.make_tiler(
+                    (
+                        rows,
+                        kv_norm_fp32.shape[1],
+                    ),
+                    alignment=(
+                        1,
+                        1,
+                    ),
+                ),
+                (
+                    0,
+                    0,
+                ),
+            )
+            wqb_matmul_fp32_chunk = tile_slice(
+                wqb_matmul_fp32,
+                _dsl.make_tiler(
+                    (
+                        rows,
+                        wqb_matmul_fp32.shape[1],
+                    ),
+                    alignment=(
+                        1,
+                        1,
+                    ),
+                ),
+                (
+                    0,
+                    0,
+                ),
+            )
+            qr_chunk = tile_slice(
+                tile_slice(
+                    qr,
+                    _dsl.make_tiler(
+                        (
+                            chunk_capacity,
+                            qr.shape[1],
+                        ),
+                        alignment=(
+                            1,
+                            1,
+                        ),
+                    ),
+                    (
+                        qr_start // chunk_capacity,
+                        0,
+                    ),
+                ),
+                _dsl.make_tiler(
+                    (
+                        rows,
+                        qr.shape[1],
+                    ),
+                    alignment=(
+                        1,
+                        1,
+                    ),
+                ),
+                (
+                    0,
+                    0,
+                ),
+            )
+            descale_qr_chunk = tile_slice(
+                tile_slice(
+                    descale_qr,
+                    _dsl.make_tiler(
+                        (
+                            chunk_capacity,
+                            descale_qr.shape[1],
+                        ),
+                        alignment=(
+                            1,
+                            1,
+                        ),
+                    ),
+                    (
+                        qr_start // chunk_capacity,
+                        0,
+                    ),
+                ),
+                _dsl.make_tiler(
+                    (
+                        rows,
+                        descale_qr.shape[1],
+                    ),
+                    alignment=(
+                        1,
+                        1,
+                    ),
+                ),
+                (
+                    0,
+                    0,
+                ),
+            )
+            q_nope_bf16_chunk = tile_slice(
+                q_nope_bf16,
+                _dsl.make_tiler(
+                    (
+                        heads * rows,
+                        q_nope_bf16.shape[1],
+                    ),
+                    alignment=(
+                        1,
+                        1,
+                    ),
+                ),
+                (
+                    0,
+                    0,
+                ),
+            )
+            q_chunk = tile_slice(
+                q,
+                _dsl.make_tiler(
+                    (
+                        heads * chunk_capacity,
+                        q.shape[1],
+                    ),
+                    alignment=(
+                        1,
+                        1,
+                    ),
+                ),
+                (
+                    start // chunk_capacity,
+                    0,
+                ),
+            )
+            if dsl.const_expr(self.Dr != 0):
+                rope_sin_chunk = tile_slice(
+                    tile_slice(
+                        rope_sin,
+                        _dsl.make_tiler(
+                            (
+                                chunk_capacity,
+                                self.Dr,
+                            ),
+                            alignment=(
+                                1,
+                                1,
+                            ),
+                        ),
+                        (
+                            rope_start // chunk_capacity,
+                            0,
+                        ),
+                    ),
+                    _dsl.make_tiler(
+                        (
+                            rows,
+                            self.Dr,
+                        ),
+                        alignment=(
+                            1,
+                            1,
+                        ),
+                    ),
+                    (
+                        0,
+                        0,
+                    ),
+                )
+                rope_cos_chunk = tile_slice(
+                    tile_slice(
+                        rope_cos,
+                        _dsl.make_tiler(
+                            (
+                                chunk_capacity,
+                                self.Dr,
+                            ),
+                            alignment=(
+                                1,
+                                1,
+                            ),
+                        ),
+                        (
+                            rope_start // chunk_capacity,
+                            0,
+                        ),
+                    ),
+                    _dsl.make_tiler(
+                        (
+                            rows,
+                            self.Dr,
+                        ),
+                        alignment=(
+                            1,
+                            1,
+                        ),
+                    ),
+                    (
+                        0,
+                        0,
+                    ),
+                )
+            else:
+                rope_sin_chunk = q_nope_bf16_chunk
+                rope_cos_chunk = q_nope_bf16_chunk
+            if dsl.const_expr(self.qkv_quant_mode == 2):
+                q_nope_absorbed_chunk = tile_slice(
+                    q_nope_absorbed_bf16,
+                    _dsl.make_tiler(
+                        (
+                            heads * rows,
+                            KV_ELEMENTS,
+                        ),
+                        alignment=(
+                            1,
+                            1,
+                        ),
+                    ),
+                    (
+                        0,
+                        0,
+                    ),
+                )
+                descale_q_chunk = tile_slice(
+                    descale_q,
+                    _dsl.make_tiler(
+                        (
+                            heads * chunk_capacity,
+                            1,
+                        ),
+                        alignment=(
+                            1,
+                            1,
+                        ),
+                    ),
+                    (
+                        start // chunk_capacity,
+                        0,
+                    ),
+                )
+                if dsl.const_expr(self.Dr != 0):
+                    q_rope_chunk = tile_slice(
+                        q_rope_bf16,
+                        _dsl.make_tiler(
+                            (
+                                heads * rows,
+                                self.Dr,
+                            ),
+                            alignment=(
+                                1,
+                                1,
+                            ),
+                        ),
+                        (
+                            0,
+                            0,
+                        ),
+                    )
+                else:
+                    q_rope_chunk = q_nope_bf16_chunk
+            else:
+                q_nope_absorbed_chunk = q_nope_absorbed_bf16
+                descale_q_chunk = descale_q
+                q_rope_chunk = q_rope_bf16
+            if dsl.const_expr(self.qa_splits == 2):
+                partial_rows = (
+                    ((rows + self.qa_bm - 1) // self.qa_bm)
+                    * (qr.shape[1] // self.qa_bn)
+                    * self.qa_splits
+                )
+                qa_partial_chunk = tile_slice(
+                    qa_partial,
+                    _dsl.make_tiler(
+                        (
+                            partial_rows,
+                            qa_partial.shape[1],
+                        ),
+                        alignment=(
+                            1,
+                            1,
+                        ),
+                    ),
+                    (
+                        0,
+                        0,
+                    ),
+                )
+            else:
+                qa_partial_chunk = qa_matmul_fp32_chunk
+            self._run_chunk(
+                x_chunk,
+                wqa,
+                wqb,
+                wkva,
+                wkb,
+                descale_x_chunk,
+                descale_wqa,
+                descale_wqb,
+                descale_wkva,
+                norm_weight_qa,
+                norm_weight_kva,
+                kv_cache,
+                cache_index_chunk,
+                quant_scale_kv,
+                rope_sin_chunk,
+                rope_cos_chunk,
+                qa_matmul_fp32_chunk,
+                kva_matmul_fp32_chunk,
+                qa_norm_fp32,
+                kv_norm_fp32_chunk,
+                qr_chunk,
+                descale_qr_chunk,
+                wqb_matmul_fp32_chunk,
+                q_nope_bf16_chunk,
+                q_rope_chunk,
+                q_nope_absorbed_chunk,
+                q_fp32,
+                q_chunk,
+                descale_q_chunk,
+                norm_eps,
+                qr_scale,
+                kvr_scale,
+                qa_partial_chunk,
+                cache_mode,
+                rope_mode,
+                cache_quant_mode,
+            )
+
+    @jit
+    def _run_chunk(
+        self,
+        x: Tensor,
+        wqa: Tensor,
+        wqb: Tensor,
+        wkva: Tensor,
+        wkb: Tensor,
+        descale_x: Tensor,
+        descale_wqa: Tensor,
+        descale_wqb: Tensor,
+        descale_wkva: Tensor,
+        norm_weight_qa: Tensor,
+        norm_weight_kva: Tensor,
+        kv_cache: Tensor,
+        cache_index: Tensor,
+        quant_scale_kv: Tensor,
+        rope_sin: Tensor,
+        rope_cos: Tensor,
+        qa_matmul_fp32: Tensor,
+        kva_matmul_fp32: Tensor,
+        qa_norm_fp32: Tensor,
+        kv_norm_fp32: Tensor,
+        qr: Tensor,
+        descale_qr: Tensor,
+        wqb_matmul_fp32: Tensor,
+        q_nope_bf16: Tensor,
+        q_rope_bf16: Tensor,
+        q_nope_absorbed_bf16: Tensor,
+        q_fp32: Tensor,
+        q: Tensor,
+        descale_q: Tensor,
+        norm_eps: float,
+        qr_scale: float,
+        kvr_scale: float,
+        qa_partial: Tensor,
+        cache_mode: int,
+        rope_mode: int,
+        cache_quant_mode: int,
+    ):
+        self._run_front(
+            x,
+            wqa,
+            wqb,
+            wkva,
+            wkb,
+            descale_x,
+            descale_wqa,
+            descale_wqb,
+            descale_wkva,
+            norm_weight_qa,
+            norm_weight_kva,
+            kv_cache,
+            cache_index,
+            quant_scale_kv,
+            rope_sin,
+            rope_cos,
+            qa_matmul_fp32,
+            kva_matmul_fp32,
+            qa_norm_fp32,
+            kv_norm_fp32,
+            qr,
+            descale_qr,
+            wqb_matmul_fp32,
+            q_nope_bf16,
+            q_rope_bf16,
+            q_nope_absorbed_bf16,
+            q_fp32,
+            q,
+            descale_q,
+            norm_eps,
+            qr_scale,
+            kvr_scale,
+            qa_partial,
+            cache_mode,
+            rope_mode,
+            cache_quant_mode,
+        )
+        self._run_tail(
+            x,
+            wqa,
+            wqb,
+            wkva,
+            wkb,
+            descale_x,
+            descale_wqa,
+            descale_wqb,
+            descale_wkva,
+            norm_weight_qa,
+            norm_weight_kva,
+            kv_cache,
+            cache_index,
+            quant_scale_kv,
+            rope_sin,
+            rope_cos,
+            qa_matmul_fp32,
+            kva_matmul_fp32,
+            qa_norm_fp32,
+            kv_norm_fp32,
+            qr,
+            descale_qr,
+            wqb_matmul_fp32,
+            q_nope_bf16,
+            q_rope_bf16,
+            q_nope_absorbed_bf16,
+            q_fp32,
+            q,
+            descale_q,
+            norm_eps,
+            qr_scale,
+            kvr_scale,
+            qa_partial,
+            cache_mode,
+            rope_mode,
+            cache_quant_mode,
+        )
+
+    @jit
+    def _run_front(
+        self,
+        x: Tensor,
+        wqa: Tensor,
+        wqb: Tensor,
+        wkva: Tensor,
+        wkb: Tensor,
+        descale_x: Tensor,
+        descale_wqa: Tensor,
+        descale_wqb: Tensor,
+        descale_wkva: Tensor,
+        norm_weight_qa: Tensor,
+        norm_weight_kva: Tensor,
+        kv_cache: Tensor,
+        cache_index: Tensor,
+        quant_scale_kv: Tensor,
+        rope_sin: Tensor,
+        rope_cos: Tensor,
+        qa_matmul_fp32: Tensor,
+        kva_matmul_fp32: Tensor,
+        qa_norm_fp32: Tensor,
+        kv_norm_fp32: Tensor,
+        qr: Tensor,
+        descale_qr: Tensor,
+        wqb_matmul_fp32: Tensor,
+        q_nope_bf16: Tensor,
+        q_rope_bf16: Tensor,
+        q_nope_absorbed_bf16: Tensor,
+        q_fp32: Tensor,
+        q: Tensor,
+        descale_q: Tensor,
+        norm_eps: float,
+        qr_scale: float,
+        kvr_scale: float,
+        qa_partial: Tensor,
+        cache_mode: int,
+        rope_mode: int,
+        cache_quant_mode: int,
+    ):
+        _heads = wkb.shape[0]
+        q_lora = self.q_lora
+        if dsl.const_expr(self.dynamic_lora):
+            q_lora = qr.shape[1]
         if dsl.const_expr(self.qa_enabled):
-            self.qa_pipeline.project(x, wqa, descale_x, descale_wqa, qa_partial)
+            if dsl.const_expr(self.w_qr_quant_mode == 2 and not self.qa_fused_norm):
+                self.qa_pipeline.project(x, wqa, descale_x, descale_wqa, qa_matmul_fp32)
+            else:
+                self.qa_pipeline.project(x, wqa, descale_x, descale_wqa, qa_partial)
             _mix_join(False)
         else:
             self.qa_projection.run(x, wqa, descale_x, descale_wqa, qa_matmul_fp32)
@@ -6985,8 +8187,7 @@ class _QuantMlaPrologKernel:
         onchip_rewind(reset_sync_id=False)
         self.kva_projection.run(x, wkva, descale_x, descale_wkva, kva_matmul_fp32)
         use_hif_norm_summary = (
-            get_block_num() * VECTOR_SUBBLOCKS
-            <= self.q_lora // MAXIMUM_PARTIAL_ELEMENTS
+            get_block_num() * VECTOR_SUBBLOCKS <= q_lora // MAXIMUM_PARTIAL_ELEMENTS
             and get_block_num() * VECTOR_SUBBLOCKS
             <= wqb_matmul_fp32.shape[0]
             * wqb_matmul_fp32.shape[1]
@@ -7093,7 +8294,7 @@ class _QuantMlaPrologKernel:
                         wqb_matmul_fp32,
                         local_qr_scale,
                         get_block_num() * VECTOR_SUBBLOCKS,
-                        self.q_lora // MAXIMUM_PARTIAL_ELEMENTS,
+                        q_lora // MAXIMUM_PARTIAL_ELEMENTS,
                     )
                     if get_block_idx() == 0 and get_subblock_id() == 0:
                         _copy(descale_qr, local_qr_scale)
@@ -7103,8 +8304,8 @@ class _QuantMlaPrologKernel:
                         self.qr_max.run_parallel(
                             qa_norm_fp32,
                             descale_qr,
-                            qa_matmul_fp32,
-                            self.q_lora // MAXIMUM_PARTIAL_ELEMENTS,
+                            _maximum_scratch_view(qa_partial, q_lora),
+                            q_lora // MAXIMUM_PARTIAL_ELEMENTS,
                         )
                     elif get_block_idx() == 0 and get_subblock_id() == 0:
                         self.qr_max.run(qa_norm_fp32, descale_qr)
@@ -7127,19 +8328,15 @@ class _QuantMlaPrologKernel:
             vec_sync_all()
         _sync_ops.cube_sync_all()
         onchip_rewind(reset_sync_id=False)
-        descale_qr_view = descale_qr
+        _descale_qr_view = descale_qr
         if dsl.const_expr(self.w_qr_quant_mode == 1):
-            descale_qr_view = descale_qr.view((x.shape[0], self.q_lora // 64, 2))
+            _descale_qr_view = descale_qr.view((x.shape[0], q_lora // 64, 2))
         if dsl.const_expr(self.qkv_quant_mode == 3):
-            if (
-                get_block_num() * VECTOR_SUBBLOCKS
-                <= self.q_lora // MAXIMUM_PARTIAL_ELEMENTS
-            ):
-                partials = qa_matmul_fp32.view(
+            if get_block_num() * VECTOR_SUBBLOCKS <= q_lora // MAXIMUM_PARTIAL_ELEMENTS:
+                maximum_scratch = _maximum_scratch_view(qa_partial, q_lora)
+                partials = maximum_scratch.view(
                     (
-                        qa_matmul_fp32.shape[0]
-                        * self.q_lora
-                        // MAXIMUM_PARTIAL_ELEMENTS,
+                        maximum_scratch.shape[0] * q_lora // MAXIMUM_PARTIAL_ELEMENTS,
                         MAXIMUM_PARTIAL_ELEMENTS,
                     )
                 )
@@ -7163,19 +8360,419 @@ class _QuantMlaPrologKernel:
                     initial_partial,
                 )
 
-        if dsl.const_expr(self.use_mx_handoff):
-            vec_sync_all()
-            self.cache_writer.run(
-                kv_norm_fp32,
-                kva_matmul_fp32,
+    @jit
+    def _run_tail(
+        self,
+        x: Tensor,
+        wqa: Tensor,
+        wqb: Tensor,
+        wkva: Tensor,
+        wkb: Tensor,
+        descale_x: Tensor,
+        descale_wqa: Tensor,
+        descale_wqb: Tensor,
+        descale_wkva: Tensor,
+        norm_weight_qa: Tensor,
+        norm_weight_kva: Tensor,
+        kv_cache: Tensor,
+        cache_index: Tensor,
+        quant_scale_kv: Tensor,
+        rope_sin: Tensor,
+        rope_cos: Tensor,
+        qa_matmul_fp32: Tensor,
+        kva_matmul_fp32: Tensor,
+        qa_norm_fp32: Tensor,
+        kv_norm_fp32: Tensor,
+        qr: Tensor,
+        descale_qr: Tensor,
+        wqb_matmul_fp32: Tensor,
+        q_nope_bf16: Tensor,
+        q_rope_bf16: Tensor,
+        q_nope_absorbed_bf16: Tensor,
+        q_fp32: Tensor,
+        q: Tensor,
+        descale_q: Tensor,
+        norm_eps: float,
+        qr_scale: float,
+        kvr_scale: float,
+        qa_partial: Tensor,
+        cache_mode: int,
+        rope_mode: int,
+        cache_quant_mode: int,
+        qr_ready: bool = False,
+        finish_q: bool = True,
+        cache_ready: bool = False,
+    ):
+        policy = 0
+        heads = wkb.shape[0]
+        cores = get_block_num()
+        row_tiles = (x.shape[0] + self.wqb_tile_rows - 1) // self.wqb_tile_rows
+        if dsl.const_expr(self.tail_hif is not None):
+            if x.shape[0] >= 128 and x.shape[0] % self.wqb_tile_rows == 0:
+                policy = 5
+        if dsl.const_expr(self.tail_group4 is not None):
+            if (
+                heads > 2 * cores
+                and heads % 4 == 0
+                and row_tiles * (heads // 4) <= self.tail_slots4 * cores
+            ):
+                policy = 4
+        if dsl.const_expr(self.tail_group3 is not None):
+            if (
+                policy == 0
+                and heads > 2 * cores
+                and heads % 3 == 0
+                and row_tiles * (heads // 3) <= self.tail_slots3 * cores
+            ):
+                policy = 3
+        if dsl.const_expr(self.tail_group2 is not None):
+            if (
+                policy == 0
+                and heads % 2 == 0
+                and row_tiles * (heads // 2) <= self.tail_slots2 * cores
+            ):
+                if heads > cores or self.wqb_tile_rows >= 64:
+                    policy = 2
+        if dsl.const_expr(self.tail_group1 is not None):
+            if policy == 0 and row_tiles * heads <= self.tail_slots1 * cores:
+                policy = 1
+        if policy == 5:
+            if dsl.const_expr(self.tail_hif is not None):
+                onchip_rewind(reset_sync_id=False)
+                self.tail_hif._run_tail_impl(
+                    x,
+                    wqa,
+                    wqb,
+                    wkva,
+                    wkb,
+                    descale_x,
+                    descale_wqa,
+                    descale_wqb,
+                    descale_wkva,
+                    norm_weight_qa,
+                    norm_weight_kva,
+                    kv_cache,
+                    cache_index,
+                    quant_scale_kv,
+                    rope_sin,
+                    rope_cos,
+                    qa_matmul_fp32,
+                    kva_matmul_fp32,
+                    qa_norm_fp32,
+                    kv_norm_fp32,
+                    qr,
+                    descale_qr,
+                    wqb_matmul_fp32,
+                    q_nope_bf16,
+                    q_rope_bf16,
+                    q_nope_absorbed_bf16,
+                    q_fp32,
+                    q,
+                    descale_q,
+                    norm_eps,
+                    qr_scale,
+                    kvr_scale,
+                    qa_partial,
+                    cache_mode,
+                    rope_mode,
+                    cache_quant_mode,
+                    qr_ready,
+                    finish_q,
+                    cache_ready,
+                )
+        elif policy == 4:
+            if dsl.const_expr(self.tail_group4 is not None):
+                onchip_rewind(reset_sync_id=False)
+                self.tail_group4._run_tail_impl(
+                    x,
+                    wqa,
+                    wqb,
+                    wkva,
+                    wkb,
+                    descale_x,
+                    descale_wqa,
+                    descale_wqb,
+                    descale_wkva,
+                    norm_weight_qa,
+                    norm_weight_kva,
+                    kv_cache,
+                    cache_index,
+                    quant_scale_kv,
+                    rope_sin,
+                    rope_cos,
+                    qa_matmul_fp32,
+                    kva_matmul_fp32,
+                    qa_norm_fp32,
+                    kv_norm_fp32,
+                    qr,
+                    descale_qr,
+                    wqb_matmul_fp32,
+                    q_nope_bf16,
+                    q_rope_bf16,
+                    q_nope_absorbed_bf16,
+                    q_fp32,
+                    q,
+                    descale_q,
+                    norm_eps,
+                    qr_scale,
+                    kvr_scale,
+                    qa_partial,
+                    cache_mode,
+                    rope_mode,
+                    cache_quant_mode,
+                    qr_ready,
+                    finish_q,
+                    cache_ready,
+                )
+        elif policy == 3:
+            if dsl.const_expr(self.tail_group3 is not None):
+                onchip_rewind(reset_sync_id=False)
+                self.tail_group3._run_tail_impl(
+                    x,
+                    wqa,
+                    wqb,
+                    wkva,
+                    wkb,
+                    descale_x,
+                    descale_wqa,
+                    descale_wqb,
+                    descale_wkva,
+                    norm_weight_qa,
+                    norm_weight_kva,
+                    kv_cache,
+                    cache_index,
+                    quant_scale_kv,
+                    rope_sin,
+                    rope_cos,
+                    qa_matmul_fp32,
+                    kva_matmul_fp32,
+                    qa_norm_fp32,
+                    kv_norm_fp32,
+                    qr,
+                    descale_qr,
+                    wqb_matmul_fp32,
+                    q_nope_bf16,
+                    q_rope_bf16,
+                    q_nope_absorbed_bf16,
+                    q_fp32,
+                    q,
+                    descale_q,
+                    norm_eps,
+                    qr_scale,
+                    kvr_scale,
+                    qa_partial,
+                    cache_mode,
+                    rope_mode,
+                    cache_quant_mode,
+                    qr_ready,
+                    finish_q,
+                    cache_ready,
+                )
+        elif policy == 2:
+            if dsl.const_expr(self.tail_group2 is not None):
+                onchip_rewind(reset_sync_id=False)
+                self.tail_group2._run_tail_impl(
+                    x,
+                    wqa,
+                    wqb,
+                    wkva,
+                    wkb,
+                    descale_x,
+                    descale_wqa,
+                    descale_wqb,
+                    descale_wkva,
+                    norm_weight_qa,
+                    norm_weight_kva,
+                    kv_cache,
+                    cache_index,
+                    quant_scale_kv,
+                    rope_sin,
+                    rope_cos,
+                    qa_matmul_fp32,
+                    kva_matmul_fp32,
+                    qa_norm_fp32,
+                    kv_norm_fp32,
+                    qr,
+                    descale_qr,
+                    wqb_matmul_fp32,
+                    q_nope_bf16,
+                    q_rope_bf16,
+                    q_nope_absorbed_bf16,
+                    q_fp32,
+                    q,
+                    descale_q,
+                    norm_eps,
+                    qr_scale,
+                    kvr_scale,
+                    qa_partial,
+                    cache_mode,
+                    rope_mode,
+                    cache_quant_mode,
+                    qr_ready,
+                    finish_q,
+                    cache_ready,
+                )
+        elif policy == 1:
+            if dsl.const_expr(self.tail_group1 is not None):
+                onchip_rewind(reset_sync_id=False)
+                self.tail_group1._run_tail_impl(
+                    x,
+                    wqa,
+                    wqb,
+                    wkva,
+                    wkb,
+                    descale_x,
+                    descale_wqa,
+                    descale_wqb,
+                    descale_wkva,
+                    norm_weight_qa,
+                    norm_weight_kva,
+                    kv_cache,
+                    cache_index,
+                    quant_scale_kv,
+                    rope_sin,
+                    rope_cos,
+                    qa_matmul_fp32,
+                    kva_matmul_fp32,
+                    qa_norm_fp32,
+                    kv_norm_fp32,
+                    qr,
+                    descale_qr,
+                    wqb_matmul_fp32,
+                    q_nope_bf16,
+                    q_rope_bf16,
+                    q_nope_absorbed_bf16,
+                    q_fp32,
+                    q,
+                    descale_q,
+                    norm_eps,
+                    qr_scale,
+                    kvr_scale,
+                    qa_partial,
+                    cache_mode,
+                    rope_mode,
+                    cache_quant_mode,
+                    qr_ready,
+                    finish_q,
+                    cache_ready,
+                )
+        else:
+            self._run_tail_impl(
+                x,
+                wqa,
+                wqb,
+                wkva,
+                wkb,
                 descale_x,
+                descale_wqa,
+                descale_wqb,
                 descale_wkva,
-                rope_sin,
-                rope_cos,
-                quant_scale_kv,
+                norm_weight_qa,
+                norm_weight_kva,
                 kv_cache,
                 cache_index,
+                quant_scale_kv,
+                rope_sin,
+                rope_cos,
+                qa_matmul_fp32,
+                kva_matmul_fp32,
+                qa_norm_fp32,
+                kv_norm_fp32,
+                qr,
+                descale_qr,
+                wqb_matmul_fp32,
+                q_nope_bf16,
+                q_rope_bf16,
+                q_nope_absorbed_bf16,
+                q_fp32,
+                q,
+                descale_q,
+                norm_eps,
+                qr_scale,
+                kvr_scale,
+                qa_partial,
+                cache_mode,
+                rope_mode,
+                cache_quant_mode,
+                qr_ready,
+                finish_q,
+                cache_ready,
             )
+
+    @jit
+    def _run_tail_impl(
+        self,
+        x: Tensor,
+        wqa: Tensor,
+        wqb: Tensor,
+        wkva: Tensor,
+        wkb: Tensor,
+        descale_x: Tensor,
+        descale_wqa: Tensor,
+        descale_wqb: Tensor,
+        descale_wkva: Tensor,
+        norm_weight_qa: Tensor,
+        norm_weight_kva: Tensor,
+        kv_cache: Tensor,
+        cache_index: Tensor,
+        quant_scale_kv: Tensor,
+        rope_sin: Tensor,
+        rope_cos: Tensor,
+        qa_matmul_fp32: Tensor,
+        kva_matmul_fp32: Tensor,
+        qa_norm_fp32: Tensor,
+        kv_norm_fp32: Tensor,
+        qr: Tensor,
+        descale_qr: Tensor,
+        wqb_matmul_fp32: Tensor,
+        q_nope_bf16: Tensor,
+        q_rope_bf16: Tensor,
+        q_nope_absorbed_bf16: Tensor,
+        q_fp32: Tensor,
+        q: Tensor,
+        descale_q: Tensor,
+        norm_eps: float,
+        qr_scale: float,
+        kvr_scale: float,
+        qa_partial: Tensor,
+        cache_mode: int,
+        rope_mode: int,
+        cache_quant_mode: int,
+        qr_ready: bool = False,
+        finish_q: bool = True,
+        cache_ready: bool = False,
+    ):
+        heads = wkb.shape[0]
+        q_lora = qr.shape[1]
+        use_hif_resident = (
+            get_block_num() * VECTOR_SUBBLOCKS <= q_lora // MAXIMUM_PARTIAL_ELEMENTS
+            and get_block_num() * VECTOR_SUBBLOCKS
+            <= wqb_matmul_fp32.shape[0]
+            * wqb_matmul_fp32.shape[1]
+            // MAXIMUM_PARTIAL_ELEMENTS
+            and x.shape[0]
+            <= get_block_num() * VECTOR_SUBBLOCKS * HIF_QR_ROWS_PER_VECTOR
+        )
+        descale_qr_view = descale_qr
+        if dsl.const_expr(self.w_qr_quant_mode == 1):
+            descale_qr_view = descale_qr.view((x.shape[0], q_lora // 64, 2))
+        if dsl.const_expr(self.use_mx_handoff):
+            vec_sync_all()
+            if not cache_ready:
+                self.cache_writer.run(
+                    rope_mode,
+                    kv_norm_fp32,
+                    kva_matmul_fp32,
+                    descale_x,
+                    descale_wkva,
+                    rope_sin,
+                    rope_cos,
+                    quant_scale_kv,
+                    kv_cache,
+                    cache_index,
+                    cache_mode,
+                    cache_quant_mode,
+                )
             vec_sync_block_arrive(_sync_ops.PIPE.MTE3, HEAD_READY_EVENT, mode=2)
             mx_handoff = None
             if dsl.const_expr(self.handoff_ub):
@@ -7200,6 +8797,7 @@ class _QuantMlaPrologKernel:
                     dtypes.float8_e4m3fn,
                     depth=2,
                     data_format="nz",
+                    transpose_storage=self.qa_projection.weight_is_nz,
                 )
                 shared_l0_b = _ring_buffer(
                     MemLoc.L0B,
@@ -7250,6 +8848,8 @@ class _QuantMlaPrologKernel:
                 )
             if dsl.const_expr(self.qkv_quant_mode in (0, 1)):
                 self.prepare.run_mx_handoff(
+                    heads,
+                    rope_mode,
                     wqb_matmul_fp32,
                     mx_handoff,
                     rope_sin,
@@ -7264,6 +8864,8 @@ class _QuantMlaPrologKernel:
                 )
             else:
                 self.prepare.run_mx_handoff(
+                    heads,
+                    rope_mode,
                     wqb_matmul_fp32,
                     mx_handoff,
                     rope_sin,
@@ -7277,11 +8879,7 @@ class _QuantMlaPrologKernel:
                 )
             if dsl.const_expr(
                 self.use_stripe_local
-                or (
-                    self.handoff_heads == 2
-                    and self.handoff_rows == self.wkb_tile_rows
-                    and self.prepare.rope_mode == 1
-                )
+                or (self.handoff_heads == 2 and self.handoff_rows == self.wkb_tile_rows)
             ):
                 _sync_ops.cube_sync_all()
                 vec_sync_all()
@@ -7297,7 +8895,7 @@ class _QuantMlaPrologKernel:
                 _mix_join()
             if dsl.const_expr(not self.use_nope_shared):
                 onchip_rewind(reset_sync_id=True)
-            wkb_projection = _WkbProjection(self.wkb_tile_rows)
+            wkb_projection = _WkbProjection(self.wkb_tile_rows, self.Dn)
             if dsl.const_expr(self.qkv_quant_mode in (0, 1)):
                 wkb_projection.run_direct(
                     q_nope_bf16,
@@ -7326,12 +8924,14 @@ class _QuantMlaPrologKernel:
                 nope_l1=nope_l1,
             )
             self.q_strategy.assemble.run(
+                heads,
+                rope_mode,
                 q_nope_absorbed_bf16,
                 q_rope_bf16,
                 q_fp32,
                 q,
                 descale_q,
-                qa_matmul_fp32,
+                _maximum_scratch_view(qa_partial, q_lora),
                 wqb_matmul_fp32,
                 descale_qr,
                 descale_wqb,
@@ -7360,7 +8960,10 @@ class _QuantMlaPrologKernel:
                 descale_qr_view,
                 descale_wqb,
                 wqb_matmul_fp32,
-                defer_qr=(x.shape[0] <= self.hif_qr_resident_rows or use_hif_resident),
+                defer_qr=(
+                    not qr_ready
+                    and (x.shape[0] <= self.hif_qr_resident_rows or use_hif_resident)
+                ),
                 c_to_v=wqb_to_prepare,
             )
         elif dsl.const_expr(self.use_mm34_shared):
@@ -7374,7 +8977,8 @@ class _QuantMlaPrologKernel:
                 wkb,
                 q,
                 defer_qr=(
-                    self.w_qr_quant_mode == 2
+                    not qr_ready
+                    and self.w_qr_quant_mode == 2
                     and (x.shape[0] <= self.hif_qr_resident_rows or use_hif_resident)
                 ),
             )
@@ -7385,7 +8989,10 @@ class _QuantMlaPrologKernel:
                 descale_qr_view,
                 descale_wqb,
                 wqb_matmul_fp32,
-                defer_qr=(x.shape[0] <= self.hif_qr_resident_rows or use_hif_resident),
+                defer_qr=(
+                    not qr_ready
+                    and (x.shape[0] <= self.hif_qr_resident_rows or use_hif_resident)
+                ),
             )
         else:
             self.wqb_projection.run(
@@ -7395,20 +9002,26 @@ class _QuantMlaPrologKernel:
             # The remaining Cast credits are consumed per head by WKB.
             onchip_rewind()
         vec_sync_all()
-        self.cache_writer.run(
-            kv_norm_fp32,
-            kva_matmul_fp32,
-            descale_x,
-            descale_wkva,
-            rope_sin,
-            rope_cos,
-            quant_scale_kv,
-            kv_cache,
-            cache_index,
-        )
+        if not cache_ready:
+            self.cache_writer.run(
+                rope_mode,
+                kv_norm_fp32,
+                kva_matmul_fp32,
+                descale_x,
+                descale_wkva,
+                rope_sin,
+                rope_cos,
+                quant_scale_kv,
+                kv_cache,
+                cache_index,
+                cache_mode,
+                cache_quant_mode,
+            )
         if dsl.const_expr(self.qkv_quant_mode in (0, 1)):
             if dsl.const_expr(self.use_hif_c2v):
                 self.prepare.run_hif_c2v_pipeline(
+                    heads,
+                    rope_mode,
                     wqb_to_prepare,
                     descale_qr,
                     descale_wqb,
@@ -7421,6 +9034,8 @@ class _QuantMlaPrologKernel:
                 onchip_rewind(reset_sync_id=False)
             else:
                 self.prepare.run_pipeline(
+                    heads,
+                    rope_mode,
                     wqb_matmul_fp32,
                     descale_qr,
                     descale_wqb,
@@ -7431,7 +9046,7 @@ class _QuantMlaPrologKernel:
                     self.wqb_tile_rows,
                 )
             if dsl.const_expr(not self.use_mm34_shared):
-                wkb_projection = _WkbProjection(self.wkb_tile_rows)
+                wkb_projection = _WkbProjection(self.wkb_tile_rows, self.Dn)
                 wkb_projection.run_direct(
                     q_nope_bf16, wkb, q, coalesce_b=self.mode0_coalesce_wkb_b
                 )
@@ -7439,7 +9054,7 @@ class _QuantMlaPrologKernel:
             return
         _mix_join()
         onchip_rewind(reset_sync_id=True)
-        wkb_projection = _WkbProjection(self.wkb_tile_rows)
+        wkb_projection = _WkbProjection(self.wkb_tile_rows, self.Dn)
         if dsl.const_expr(self.qkv_quant_mode == 3):
             wkb_projection.run_direct(
                 q_nope_bf16, wkb, q_fp32, publish_heads=True, token_major_output=True
@@ -7453,12 +9068,14 @@ class _QuantMlaPrologKernel:
                 coalesce_b=self.coalesce_wkb_b,
             )
         self.q_strategy.assemble.run(
+            heads,
+            rope_mode,
             q_nope_absorbed_bf16,
             q_rope_bf16,
             q_fp32,
             q,
             descale_q,
-            qa_matmul_fp32,
+            _maximum_scratch_view(qa_partial, q_lora),
             wqb_matmul_fp32,
             descale_qr,
             descale_wqb,
@@ -7468,7 +9085,344 @@ class _QuantMlaPrologKernel:
         )
         _mix_join()
         onchip_rewind(reset_sync_id=True)
-        self.q_strategy.finish(q_fp32, q, descale_q, qa_matmul_fp32)
+        if finish_q:
+            self.q_strategy.finish(
+                q_fp32, q, descale_q, _maximum_scratch_view(qa_partial, q_lora)
+            )
+
+    @jit
+    def _run_hif(
+        self,
+        x: Tensor,
+        wqa: Tensor,
+        wqb: Tensor,
+        wkva: Tensor,
+        wkb: Tensor,
+        descale_x: Tensor,
+        descale_wqa: Tensor,
+        descale_wqb: Tensor,
+        descale_wkva: Tensor,
+        norm_weight_qa: Tensor,
+        norm_weight_kva: Tensor,
+        kv_cache: Tensor,
+        cache_index: Tensor,
+        quant_scale_kv: Tensor,
+        rope_sin: Tensor,
+        rope_cos: Tensor,
+        qa_matmul_fp32: Tensor,
+        kva_matmul_fp32: Tensor,
+        qa_norm_fp32: Tensor,
+        kv_norm_fp32: Tensor,
+        qr: Tensor,
+        descale_qr: Tensor,
+        wqb_matmul_fp32: Tensor,
+        q_nope_bf16: Tensor,
+        q_rope_bf16: Tensor,
+        q_nope_absorbed_bf16: Tensor,
+        q_fp32: Tensor,
+        q: Tensor,
+        descale_q: Tensor,
+        norm_eps: float,
+        qr_scale: float,
+        kvr_scale: float,
+        qa_partial: Tensor,
+        cache_mode: int,
+        rope_mode: int,
+        cache_quant_mode: int,
+    ):
+        if x.shape[0] <= wqb_matmul_fp32.shape[0]:
+            self._run_chunk(
+                x,
+                wqa,
+                wqb,
+                wkva,
+                wkb,
+                descale_x,
+                descale_wqa,
+                descale_wqb,
+                descale_wkva,
+                norm_weight_qa,
+                norm_weight_kva,
+                kv_cache,
+                cache_index,
+                quant_scale_kv,
+                rope_sin,
+                rope_cos,
+                qa_matmul_fp32,
+                kva_matmul_fp32,
+                qa_norm_fp32,
+                kv_norm_fp32,
+                qr,
+                descale_qr,
+                wqb_matmul_fp32,
+                q_nope_bf16,
+                q_rope_bf16,
+                q_nope_absorbed_bf16,
+                q_fp32,
+                q,
+                descale_q,
+                norm_eps,
+                qr_scale,
+                kvr_scale,
+                qa_partial,
+                cache_mode,
+                rope_mode,
+                cache_quant_mode,
+            )
+        else:
+            self._run_front(
+                x,
+                wqa,
+                wqb,
+                wkva,
+                wkb,
+                descale_x,
+                descale_wqa,
+                descale_wqb,
+                descale_wkva,
+                norm_weight_qa,
+                norm_weight_kva,
+                kv_cache,
+                cache_index,
+                quant_scale_kv,
+                rope_sin,
+                rope_cos,
+                qa_matmul_fp32,
+                kva_matmul_fp32,
+                qa_norm_fp32,
+                kv_norm_fp32,
+                qr,
+                descale_qr,
+                wqb_matmul_fp32,
+                q_nope_bf16,
+                q_rope_bf16,
+                q_nope_absorbed_bf16,
+                q_fp32,
+                q,
+                descale_q,
+                norm_eps,
+                qr_scale,
+                kvr_scale,
+                qa_partial,
+                cache_mode,
+                rope_mode,
+                cache_quant_mode,
+            )
+            _mix_join()
+            heads = wkb.shape[0]
+            chunk_capacity = wqb_matmul_fp32.shape[0]
+            output_passes = 1
+            if dsl.const_expr(self.qkv_quant_mode == 3):
+                if q_fp32.shape[0] < q.shape[0]:
+                    output_passes = 2
+            for output_pass in range(output_passes):
+                for start in range(0, x.shape[0], wqb_matmul_fp32.shape[0]):
+                    onchip_rewind(reset_sync_id=True)
+                    rows = min(wqb_matmul_fp32.shape[0], x.shape[0] - start)
+                    x_chunk = tile_slice(
+                        tile_slice(
+                            x,
+                            _dsl.make_tiler(
+                                (chunk_capacity, x.shape[1]), alignment=(1, 1)
+                            ),
+                            (start // chunk_capacity, 0),
+                        ),
+                        _dsl.make_tiler((rows, x.shape[1]), alignment=(1, 1)),
+                        (0, 0),
+                    )
+                    kva_matmul_fp32_chunk = tile_slice(
+                        tile_slice(
+                            kva_matmul_fp32,
+                            _dsl.make_tiler(
+                                (chunk_capacity, kva_matmul_fp32.shape[1]),
+                                alignment=(1, 1),
+                            ),
+                            (start // chunk_capacity, 0),
+                        ),
+                        _dsl.make_tiler(
+                            (rows, kva_matmul_fp32.shape[1]), alignment=(1, 1)
+                        ),
+                        (0, 0),
+                    )
+                    kv_norm_fp32_chunk = tile_slice(
+                        tile_slice(
+                            kv_norm_fp32,
+                            _dsl.make_tiler(
+                                (chunk_capacity, kv_norm_fp32.shape[1]),
+                                alignment=(1, 1),
+                            ),
+                            (start // chunk_capacity, 0),
+                        ),
+                        _dsl.make_tiler(
+                            (rows, kv_norm_fp32.shape[1]), alignment=(1, 1)
+                        ),
+                        (0, 0),
+                    )
+                    qr_chunk = tile_slice(
+                        tile_slice(
+                            qr,
+                            _dsl.make_tiler(
+                                (chunk_capacity, qr.shape[1]), alignment=(1, 1)
+                            ),
+                            (start // chunk_capacity, 0),
+                        ),
+                        _dsl.make_tiler((rows, qr.shape[1]), alignment=(1, 1)),
+                        (0, 0),
+                    )
+                    cache_index_chunk = tile_slice(
+                        cache_index,
+                        _dsl.make_tiler((chunk_capacity,), alignment=(1,)),
+                        (start // chunk_capacity,),
+                    )
+                    q_chunk = tile_slice(
+                        tile_slice(
+                            q,
+                            _dsl.make_tiler(
+                                (heads * chunk_capacity, q.shape[1]), alignment=(1, 1)
+                            ),
+                            (start // chunk_capacity, 0),
+                        ),
+                        _dsl.make_tiler((heads * rows, q.shape[1]), alignment=(1, 1)),
+                        (0, 0),
+                    )
+                    q_fp32_chunk = q_fp32
+                    if dsl.const_expr(self.qkv_quant_mode == 3):
+                        q_storage_chunk = 0
+                        if q_fp32.shape[0] >= q.shape[0]:
+                            q_storage_chunk = start // chunk_capacity
+                        q_fp32_chunk = tile_slice(
+                            tile_slice(
+                                q_fp32,
+                                _dsl.make_tiler(
+                                    (heads * chunk_capacity, q_fp32.shape[1]),
+                                    alignment=(1, 1),
+                                ),
+                                (q_storage_chunk, 0),
+                            ),
+                            _dsl.make_tiler(
+                                (heads * rows, q_fp32.shape[1]), alignment=(1, 1)
+                            ),
+                            (0, 0),
+                        )
+                    wqb_matmul_fp32_chunk = tile_slice(
+                        wqb_matmul_fp32,
+                        _dsl.make_tiler(
+                            (rows, wqb_matmul_fp32.shape[1]), alignment=(1, 1)
+                        ),
+                        (0, 0),
+                    )
+                    q_nope_bf16_chunk = tile_slice(
+                        q_nope_bf16,
+                        _dsl.make_tiler(
+                            (heads * rows, q_nope_bf16.shape[1]), alignment=(1, 1)
+                        ),
+                        (0, 0),
+                    )
+                    q_rope_bf16_chunk = q_rope_bf16
+                    if dsl.const_expr(self.Dr != 0 and self.qkv_quant_mode == 3):
+                        q_rope_bf16_chunk = tile_slice(
+                            q_rope_bf16,
+                            _dsl.make_tiler(
+                                (heads * rows, q_rope_bf16.shape[1]), alignment=(1, 1)
+                            ),
+                            (0, 0),
+                        )
+                    rope_start = 0
+                    if rope_mode != 0:
+                        rope_start = start
+                    rope_sin_chunk = rope_sin
+                    if dsl.const_expr(self.Dr != 0):
+                        rope_sin_chunk = tile_slice(
+                            tile_slice(
+                                rope_sin,
+                                _dsl.make_tiler(
+                                    (chunk_capacity, self.Dr), alignment=(1, 1)
+                                ),
+                                (rope_start // chunk_capacity, 0),
+                            ),
+                            _dsl.make_tiler((rows, self.Dr), alignment=(1, 1)),
+                            (0, 0),
+                        )
+                    rope_cos_chunk = rope_cos
+                    if dsl.const_expr(self.Dr != 0):
+                        rope_cos_chunk = tile_slice(
+                            tile_slice(
+                                rope_cos,
+                                _dsl.make_tiler(
+                                    (chunk_capacity, self.Dr), alignment=(1, 1)
+                                ),
+                                (rope_start // chunk_capacity, 0),
+                            ),
+                            _dsl.make_tiler((rows, self.Dr), alignment=(1, 1)),
+                            (0, 0),
+                        )
+                    self._run_tail(
+                        x_chunk,
+                        wqa,
+                        wqb,
+                        wkva,
+                        wkb,
+                        descale_x,
+                        descale_wqa,
+                        descale_wqb,
+                        descale_wkva,
+                        norm_weight_qa,
+                        norm_weight_kva,
+                        kv_cache,
+                        cache_index_chunk,
+                        quant_scale_kv,
+                        rope_sin_chunk,
+                        rope_cos_chunk,
+                        qa_matmul_fp32,
+                        kva_matmul_fp32_chunk,
+                        qa_norm_fp32,
+                        kv_norm_fp32_chunk,
+                        qr_chunk,
+                        descale_qr,
+                        wqb_matmul_fp32_chunk,
+                        q_nope_bf16_chunk,
+                        q_rope_bf16_chunk,
+                        q_nope_absorbed_bf16,
+                        q_fp32_chunk,
+                        q_chunk,
+                        descale_q,
+                        norm_eps,
+                        qr_scale,
+                        kvr_scale,
+                        qa_partial,
+                        cache_mode,
+                        rope_mode,
+                        cache_quant_mode,
+                        qr_ready=True,
+                        finish_q=False,
+                        cache_ready=output_pass != 0,
+                    )
+                    if dsl.const_expr(self.qkv_quant_mode == 3):
+                        if output_pass != 0:
+                            onchip_rewind(reset_sync_id=True)
+                            self.q_strategy.quantize.run(
+                                q_fp32_chunk, q_chunk, descale_q
+                            )
+                            _mix_join()
+                if dsl.const_expr(self.qkv_quant_mode == 3):
+                    if output_passes == 2 and output_pass == 0:
+                        onchip_rewind(reset_sync_id=True)
+                        self.q_strategy.maximum.finish_partials(
+                            _maximum_scratch_view(qa_partial, self.q_lora),
+                            descale_q,
+                            get_block_num() * VECTOR_SUBBLOCKS,
+                            self.q_lora // MAXIMUM_PARTIAL_ELEMENTS,
+                        )
+                        _mix_join()
+            if dsl.const_expr(self.qkv_quant_mode == 3):
+                if output_passes == 1:
+                    onchip_rewind(reset_sync_id=True)
+                    self.q_strategy.finish_accumulated(
+                        q_fp32,
+                        q,
+                        descale_q,
+                        _maximum_scratch_view(qa_partial, self.q_lora),
+                    )
 
 
 __all__ = [
@@ -7506,6 +9460,11 @@ class RopeMode(_Enum):
     ROPE_HALF = 2
 
 
+_W_QR_QUANT_MODE_VALUES = tuple(_m.value for _m in WQrQuantMode)
+_QKV_QUANT_MODE_VALUES = tuple(_m.value for _m in QkvQuantMode)
+_CACHE_MODE_VALUES = tuple(_m.value for _m in CacheMode)
+_ROPE_MODE_VALUES = tuple(_m.value for _m in RopeMode)
+
 _VALID_PAIRS = {(0, 1), (0, 2), (1, 1), (2, 1), (3, 2)}
 _E4 = _torch.float8_e4m3fn
 _E8 = _torch.float8_e8m0fnu
@@ -7525,30 +9484,17 @@ def _mode_value(name, value, enum_type):
     return value.value
 
 
-def _schema_mode_value(name, value, enum_type):
-    if type(value) is not int:
-        raise TypeError(f"{name} schema value must be int")
-    if enum_type is WQrQuantMode:
-        valid_values = (1, 2, 3)
-    elif enum_type is QkvQuantMode:
-        valid_values = (0, 1, 2, 3)
-    elif enum_type is CacheMode:
-        valid_values = (0, 1)
-    else:
-        valid_values = (0, 1, 2)
-    if value not in valid_values:
-        raise ValueError(f"{name} has unsupported schema value {value}")
-    return value
-
-
 def _validate_modes(w_qr_quant_mode, qkv_quant_mode, cache_mode, rope_mode):
-    for name, value, enum_type in (
-        ("w_qr_quant_mode", w_qr_quant_mode, WQrQuantMode),
-        ("qkv_quant_mode", qkv_quant_mode, QkvQuantMode),
-        ("cache_mode", cache_mode, CacheMode),
-        ("rope_mode", rope_mode, RopeMode),
+    for name, value, allowed in (
+        ("w_qr_quant_mode", w_qr_quant_mode, _W_QR_QUANT_MODE_VALUES),
+        ("qkv_quant_mode", qkv_quant_mode, _QKV_QUANT_MODE_VALUES),
+        ("cache_mode", cache_mode, _CACHE_MODE_VALUES),
+        ("rope_mode", rope_mode, _ROPE_MODE_VALUES),
     ):
-        _schema_mode_value(name, value, enum_type)
+        if type(value) is not int:
+            raise TypeError(f"{name} schema value must be int")
+        if value not in allowed:
+            raise ValueError(f"{name} has unsupported schema value {value}")
     if w_qr_quant_mode == WQrQuantMode.A4W4_HIFLOAT4.value:
         raise NotImplementedError("A4W4_HIFLOAT4 is not implemented")
     _require(
@@ -7769,20 +9715,20 @@ def _validate_inputs(
     for name, weight in (("wqa", wqa), ("wqb", wqb), ("wkva", wkva)):
         _require(
             isinstance(weight, _torch.Tensor) and weight.ndim == 2,
-            f"{name} Torch logical shape must use (O,K); a rank-4 ND carrier is not NZ",
+            f"{name} Torch weight must have rank 2: ND (O,K), NZ (K,O)",
         )
-    Dr = wkva.shape[0] - 512
-    _require(
-        (Dn, Dr) in ((128, 64), (192, 64), (256, 0)),
-        "(Dn,Dr) must be (128,64)/(192,64)/(256,0)",
-    )
-    _require(Dr != 0 or rope_mode == 0, "Dr=0 requires rope_mode=0")
     formats = tuple(_torch_npu.get_npu_format(w) for w in (wqa, wqb, wkva))
     _require(
         formats in ((2, 2, 2), (_NZ_FORMAT,) * 3),
         "wqa/wqb/wkva must be uniformly ND or true NZ",
     )
     weight_is_nz = formats[0] == _NZ_FORMAT
+    Dr = wkva.shape[1 if weight_is_nz else 0] - 512
+    _require(
+        (Dn, Dr) in ((128, 64), (192, 64), (256, 0)),
+        "(Dn,Dr) must be (128,64)/(192,64)/(256,0)",
+    )
+    _require(Dr != 0 or rope_mode == 0, "Dr=0 requires rope_mode=0")
     device = x.device
     data_dtype = _E4 if w_qr_quant_mode == 1 else _torch.uint8
     _tensor("x", x, (T, dim), data_dtype, device)
@@ -7794,7 +9740,7 @@ def _validate_inputs(
         _tensor(
             name,
             weight,
-            (width, reduction),
+            (reduction, width) if weight_is_nz else (width, reduction),
             data_dtype,
             device,
             weight_is_nz=weight_is_nz,
@@ -7850,6 +9796,615 @@ def _validate_inputs(
     return T, dim, q_lora, N, Dn, Dr, weight_is_nz
 
 
+def _runtime_geometry_pipeline(
+    q_lora,
+    Dn,
+    Dr,
+    w_qr_quant_mode,
+    qkv_quant_mode,
+    weight_is_nz,
+    input_tile_rows,
+    wqb_tile_rows,
+    absorb_tile_rows,
+    token_profile,
+    qa_l1_reduction,
+    qa_config,
+    compact_head_handoff,
+    dynamic_lora,
+):
+    def build(handoff=(0, 0), profile=token_profile):
+        return _QuantMlaPrologKernel(
+            q_lora,
+            1,
+            Dn,
+            Dr,
+            w_qr_quant_mode,
+            qkv_quant_mode,
+            weight_is_nz,
+            input_tile_rows,
+            wqb_tile_rows,
+            absorb_tile_rows,
+            profile,
+            qa_l1_reduction,
+            qa_config,
+            handoff,
+            dynamic_lora,
+        )
+
+    pipeline = build()
+    capacity = token_profile.capacity
+    if (
+        w_qr_quant_mode == 1
+        and qkv_quant_mode in (0, 2)
+        and capacity
+        and q_lora % WQB_PROJECTION_REDUCTION == 0
+    ):
+        choices = (
+            ((1, 2), (2, 2), (4 if Dn + Dr == 192 else 3, 1))
+            if capacity <= 32
+            else ((1, 8), (2, 4))
+            if Dr
+            else ()
+        )
+        for group, slots in choices:
+            alternate = build((group, slots))
+            if alternate.use_mx_handoff and alternate.use_nope_shared:
+                setattr(pipeline, f"tail_group{group}", alternate)
+                setattr(pipeline, f"tail_slots{group}", slots)
+    if (
+        w_qr_quant_mode == 2
+        and qkv_quant_mode == 0
+        and (capacity == 0 or capacity >= 128)
+    ):
+        pipeline.tail_hif = build(profile=token_profile._replace(hif_c2v=True))
+    return pipeline
+
+
+class _RuntimeGeometryPipeline:
+    def __init__(
+        self,
+        q_lora,
+        w_qr_quant_mode,
+        qkv_quant_mode,
+        weight_is_nz,
+        input_tile_rows,
+        wqb_tile_rows,
+        absorb_tile_rows,
+        token_profile,
+        qa_l1_reduction,
+        qa_config,
+        compact_head_handoff,
+        dynamic_lora,
+    ):
+        self.head128 = _runtime_geometry_pipeline(
+            q_lora,
+            128,
+            64,
+            w_qr_quant_mode,
+            qkv_quant_mode,
+            weight_is_nz,
+            input_tile_rows,
+            wqb_tile_rows,
+            absorb_tile_rows,
+            token_profile,
+            qa_l1_reduction,
+            qa_config,
+            compact_head_handoff,
+            dynamic_lora,
+        )
+        self.head192 = _runtime_geometry_pipeline(
+            q_lora,
+            192,
+            64,
+            w_qr_quant_mode,
+            qkv_quant_mode,
+            weight_is_nz,
+            input_tile_rows,
+            wqb_tile_rows,
+            absorb_tile_rows,
+            token_profile,
+            qa_l1_reduction,
+            qa_config,
+            compact_head_handoff,
+            dynamic_lora,
+        )
+        self.head256 = _runtime_geometry_pipeline(
+            q_lora,
+            256,
+            0,
+            w_qr_quant_mode,
+            qkv_quant_mode,
+            weight_is_nz,
+            input_tile_rows,
+            wqb_tile_rows,
+            absorb_tile_rows,
+            token_profile,
+            qa_l1_reduction,
+            qa_config,
+            compact_head_handoff,
+            dynamic_lora,
+        )
+
+    @jit
+    def _execute(
+        self,
+        x: Tensor,
+        wqa: Tensor,
+        wqb: Tensor,
+        wkva: Tensor,
+        wkb: Tensor,
+        descale_x: Tensor,
+        descale_wqa: Tensor,
+        descale_wqb: Tensor,
+        descale_wkva: Tensor,
+        norm_weight_qa: Tensor,
+        norm_weight_kva: Tensor,
+        kv_cache: Tensor,
+        cache_index: Tensor,
+        quant_scale_kv: Tensor,
+        rope_sin: Tensor,
+        rope_cos: Tensor,
+        qa_matmul_fp32: Tensor,
+        kva_matmul_fp32: Tensor,
+        qa_norm_fp32: Tensor,
+        kv_norm_fp32: Tensor,
+        qr: Tensor,
+        descale_qr: Tensor,
+        wqb_matmul_fp32: Tensor,
+        q_nope_bf16: Tensor,
+        q_rope_bf16: Tensor,
+        q_nope_absorbed_bf16: Tensor,
+        q_fp32: Tensor,
+        q: Tensor,
+        descale_q: Tensor,
+        norm_eps: float,
+        qr_scale: float,
+        kvr_scale: float,
+        qa_partial: Tensor,
+        cache_mode: int,
+        rope_mode: int,
+        cache_quant_mode: int,
+    ):
+        if wkb.shape[1] == 128:
+            onchip_rewind(reset_sync_id=True)
+            self.head128._execute(
+                x,
+                wqa,
+                wqb,
+                wkva,
+                wkb,
+                descale_x,
+                descale_wqa,
+                descale_wqb,
+                descale_wkva,
+                norm_weight_qa,
+                norm_weight_kva,
+                kv_cache,
+                cache_index,
+                quant_scale_kv,
+                rope_sin,
+                rope_cos,
+                qa_matmul_fp32,
+                kva_matmul_fp32,
+                qa_norm_fp32,
+                kv_norm_fp32,
+                qr,
+                descale_qr,
+                wqb_matmul_fp32,
+                q_nope_bf16,
+                q_rope_bf16,
+                q_nope_absorbed_bf16,
+                q_fp32,
+                q,
+                descale_q,
+                norm_eps,
+                qr_scale,
+                kvr_scale,
+                qa_partial,
+                cache_mode,
+                rope_mode,
+                cache_quant_mode,
+            )
+        elif wkb.shape[1] == 192:
+            onchip_rewind(reset_sync_id=True)
+            self.head192._execute(
+                x,
+                wqa,
+                wqb,
+                wkva,
+                wkb,
+                descale_x,
+                descale_wqa,
+                descale_wqb,
+                descale_wkva,
+                norm_weight_qa,
+                norm_weight_kva,
+                kv_cache,
+                cache_index,
+                quant_scale_kv,
+                rope_sin,
+                rope_cos,
+                qa_matmul_fp32,
+                kva_matmul_fp32,
+                qa_norm_fp32,
+                kv_norm_fp32,
+                qr,
+                descale_qr,
+                wqb_matmul_fp32,
+                q_nope_bf16,
+                q_rope_bf16,
+                q_nope_absorbed_bf16,
+                q_fp32,
+                q,
+                descale_q,
+                norm_eps,
+                qr_scale,
+                kvr_scale,
+                qa_partial,
+                cache_mode,
+                rope_mode,
+                cache_quant_mode,
+            )
+        else:
+            onchip_rewind(reset_sync_id=True)
+            self.head256._execute(
+                x,
+                wqa,
+                wqb,
+                wkva,
+                wkb,
+                descale_x,
+                descale_wqa,
+                descale_wqb,
+                descale_wkva,
+                norm_weight_qa,
+                norm_weight_kva,
+                kv_cache,
+                cache_index,
+                quant_scale_kv,
+                rope_sin,
+                rope_cos,
+                qa_matmul_fp32,
+                kva_matmul_fp32,
+                qa_norm_fp32,
+                kv_norm_fp32,
+                qr,
+                descale_qr,
+                wqb_matmul_fp32,
+                q_nope_bf16,
+                q_rope_bf16,
+                q_nope_absorbed_bf16,
+                q_fp32,
+                q,
+                descale_q,
+                norm_eps,
+                qr_scale,
+                kvr_scale,
+                qa_partial,
+                cache_mode,
+                rope_mode,
+                cache_quant_mode,
+            )
+
+
+def _profile_geometry_pipeline(
+    q_lora,
+    w_qr_quant_mode,
+    qkv_quant_mode,
+    weight_is_nz,
+    capacity,
+    qa_l1_reduction,
+    dynamic_lora,
+    physical_width,
+):
+    rows = (
+        16
+        if capacity == 16
+        else 32
+        if capacity == 32
+        else 64
+        if capacity == 128
+        else 128
+    )
+    qa_rows = 128 if capacity == 128 else rows
+    splits = 1 if capacity == 0 else 2
+    profile = _TokenProfile(capacity, False, False, False)
+    if (
+        w_qr_quant_mode == 1
+        and qkv_quant_mode in (0, 2)
+        and weight_is_nz
+        and 0 < capacity <= QA_BALANCED_MAX_ROWS
+    ):
+        if (
+            q_lora % QA_BALANCED_COLUMNS == 0
+            and physical_width % (splits * QA_BALANCED_L1_REDUCTION) == 0
+        ):
+            qa_l1_reduction = QA_BALANCED_L1_REDUCTION
+        elif physical_width % (splits * QA_L1_REDUCTION) == 0:
+            qa_l1_reduction = QA_L1_REDUCTION
+    return _RuntimeGeometryPipeline(
+        q_lora,
+        w_qr_quant_mode,
+        qkv_quant_mode,
+        weight_is_nz,
+        rows,
+        rows,
+        rows,
+        profile,
+        qa_l1_reduction,
+        (qa_rows, splits, 128),
+        (0, 0),
+        dynamic_lora,
+    )
+
+
+@kernel(profile=ProfileSpec(name="quant_mla_prolog", op_type="quant_mla_prolog"))
+class _RuntimeGeometryKernel:
+    def __init__(
+        self,
+        q_lora,
+        w_qr_quant_mode,
+        qkv_quant_mode,
+        weight_is_nz,
+        input_tile_rows,
+        wqb_tile_rows,
+        absorb_tile_rows,
+        token_profile,
+        qa_l1_reduction,
+        qa_config,
+        compact_head_handoff,
+        dynamic_lora,
+        physical_width,
+    ):
+        self.dense_projection = w_qr_quant_mode == 1 and qkv_quant_mode == 0
+        self.short16 = _profile_geometry_pipeline(
+            q_lora,
+            w_qr_quant_mode,
+            qkv_quant_mode,
+            weight_is_nz,
+            16,
+            qa_l1_reduction,
+            dynamic_lora,
+            physical_width,
+        )
+        self.short32 = _profile_geometry_pipeline(
+            q_lora,
+            w_qr_quant_mode,
+            qkv_quant_mode,
+            weight_is_nz,
+            32,
+            qa_l1_reduction,
+            dynamic_lora,
+            physical_width,
+        )
+        self.medium128 = _profile_geometry_pipeline(
+            q_lora,
+            w_qr_quant_mode,
+            qkv_quant_mode,
+            weight_is_nz,
+            128,
+            qa_l1_reduction,
+            dynamic_lora,
+            physical_width,
+        )
+        self.large = _profile_geometry_pipeline(
+            q_lora,
+            w_qr_quant_mode,
+            qkv_quant_mode,
+            weight_is_nz,
+            0,
+            qa_l1_reduction,
+            dynamic_lora,
+            physical_width,
+        )
+
+    def __call__(
+        self,
+        x: Tensor,
+        wqa: Tensor,
+        wqb: Tensor,
+        wkva: Tensor,
+        wkb: Tensor,
+        descale_x: Tensor,
+        descale_wqa: Tensor,
+        descale_wqb: Tensor,
+        descale_wkva: Tensor,
+        norm_weight_qa: Tensor,
+        norm_weight_kva: Tensor,
+        kv_cache: Tensor,
+        cache_index: Tensor,
+        quant_scale_kv: Tensor,
+        rope_sin: Tensor,
+        rope_cos: Tensor,
+        qa_matmul_fp32: Tensor,
+        kva_matmul_fp32: Tensor,
+        qa_norm_fp32: Tensor,
+        kv_norm_fp32: Tensor,
+        qr: Tensor,
+        descale_qr: Tensor,
+        wqb_matmul_fp32: Tensor,
+        q_nope_bf16: Tensor,
+        q_rope_bf16: Tensor,
+        q_nope_absorbed_bf16: Tensor,
+        q_fp32: Tensor,
+        q: Tensor,
+        descale_q: Tensor,
+        norm_eps: float,
+        qr_scale: float,
+        kvr_scale: float,
+        qa_partial: Tensor,
+        cache_mode: int,
+        rope_mode: int,
+        cache_quant_mode: int,
+    ):
+        if x.shape[0] <= 16:
+            onchip_rewind(reset_sync_id=True)
+            self.short16._execute(
+                x,
+                wqa,
+                wqb,
+                wkva,
+                wkb,
+                descale_x,
+                descale_wqa,
+                descale_wqb,
+                descale_wkva,
+                norm_weight_qa,
+                norm_weight_kva,
+                kv_cache,
+                cache_index,
+                quant_scale_kv,
+                rope_sin,
+                rope_cos,
+                qa_matmul_fp32,
+                kva_matmul_fp32,
+                qa_norm_fp32,
+                kv_norm_fp32,
+                qr,
+                descale_qr,
+                wqb_matmul_fp32,
+                q_nope_bf16,
+                q_rope_bf16,
+                q_nope_absorbed_bf16,
+                q_fp32,
+                q,
+                descale_q,
+                norm_eps,
+                qr_scale,
+                kvr_scale,
+                qa_partial,
+                cache_mode,
+                rope_mode,
+                cache_quant_mode,
+            )
+        elif x.shape[0] <= 32:
+            onchip_rewind(reset_sync_id=True)
+            self.short32._execute(
+                x,
+                wqa,
+                wqb,
+                wkva,
+                wkb,
+                descale_x,
+                descale_wqa,
+                descale_wqb,
+                descale_wkva,
+                norm_weight_qa,
+                norm_weight_kva,
+                kv_cache,
+                cache_index,
+                quant_scale_kv,
+                rope_sin,
+                rope_cos,
+                qa_matmul_fp32,
+                kva_matmul_fp32,
+                qa_norm_fp32,
+                kv_norm_fp32,
+                qr,
+                descale_qr,
+                wqb_matmul_fp32,
+                q_nope_bf16,
+                q_rope_bf16,
+                q_nope_absorbed_bf16,
+                q_fp32,
+                q,
+                descale_q,
+                norm_eps,
+                qr_scale,
+                kvr_scale,
+                qa_partial,
+                cache_mode,
+                rope_mode,
+                cache_quant_mode,
+            )
+        elif x.shape[0] <= 128 and (
+            not self.dense_projection
+            or x.shape[0] < 128
+            or wkb.shape[0] < get_block_num()
+            or wkb.shape[0] * (wkb.shape[1] + kva_matmul_fp32.shape[1] - 512)
+            < _DENSE_PROJECTION_RATIO * x.shape[1]
+        ):
+            onchip_rewind(reset_sync_id=True)
+            self.medium128._execute(
+                x,
+                wqa,
+                wqb,
+                wkva,
+                wkb,
+                descale_x,
+                descale_wqa,
+                descale_wqb,
+                descale_wkva,
+                norm_weight_qa,
+                norm_weight_kva,
+                kv_cache,
+                cache_index,
+                quant_scale_kv,
+                rope_sin,
+                rope_cos,
+                qa_matmul_fp32,
+                kva_matmul_fp32,
+                qa_norm_fp32,
+                kv_norm_fp32,
+                qr,
+                descale_qr,
+                wqb_matmul_fp32,
+                q_nope_bf16,
+                q_rope_bf16,
+                q_nope_absorbed_bf16,
+                q_fp32,
+                q,
+                descale_q,
+                norm_eps,
+                qr_scale,
+                kvr_scale,
+                qa_partial,
+                cache_mode,
+                rope_mode,
+                cache_quant_mode,
+            )
+        else:
+            onchip_rewind(reset_sync_id=True)
+            self.large._execute(
+                x,
+                wqa,
+                wqb,
+                wkva,
+                wkb,
+                descale_x,
+                descale_wqa,
+                descale_wqb,
+                descale_wkva,
+                norm_weight_qa,
+                norm_weight_kva,
+                kv_cache,
+                cache_index,
+                quant_scale_kv,
+                rope_sin,
+                rope_cos,
+                qa_matmul_fp32,
+                kva_matmul_fp32,
+                qa_norm_fp32,
+                kv_norm_fp32,
+                qr,
+                descale_qr,
+                wqb_matmul_fp32,
+                q_nope_bf16,
+                q_rope_bf16,
+                q_nope_absorbed_bf16,
+                q_fp32,
+                q,
+                descale_q,
+                norm_eps,
+                qr_scale,
+                kvr_scale,
+                qa_partial,
+                cache_mode,
+                rope_mode,
+                cache_quant_mode,
+            )
+
+
 class _QuantMlaPrologProgram:
     def __init__(
         self,
@@ -7860,33 +10415,30 @@ class _QuantMlaPrologProgram:
         w_qr_quant_mode,
         qkv_quant_mode,
         weight_is_nz,
-        cache_mode,
-        rope_mode,
         input_tile_rows,
         wqb_tile_rows,
         absorb_tile_rows,
-        qa_rows=0,
-        qa_dim=0,
+        token_profile,
+        qa_l1_reduction=QA_PIPELINE_REDUCTION,
         qa_config=(0, 1, 128),
         compact_head_handoff=(0, 0),
+        dynamic_lora=False,
+        physical_width=0,
     ):
-        self.op = _QuantMlaPrologKernel(
+        self.op = _RuntimeGeometryKernel(
             q_lora,
-            N,
-            Dn,
-            Dr,
             w_qr_quant_mode,
             qkv_quant_mode,
             weight_is_nz,
-            cache_mode,
-            rope_mode,
             input_tile_rows,
             wqb_tile_rows,
             absorb_tile_rows,
-            qa_rows,
-            qa_dim,
+            token_profile,
+            qa_l1_reduction,
             qa_config,
             compact_head_handoff,
+            dynamic_lora,
+            physical_width,
         )
 
     @_dsl.host
@@ -7926,6 +10478,9 @@ class _QuantMlaPrologProgram:
         kvr_scale: float,
         qa_partial: _Tensor,
         core_num: int,
+        cache_mode: int,
+        rope_mode: int,
+        cache_quant_mode: int,
     ):
         self.op[core_num](
             x,
@@ -7961,11 +10516,14 @@ class _QuantMlaPrologProgram:
             qr_scale,
             kvr_scale,
             qa_partial,
+            cache_mode,
+            rope_mode,
+            cache_quant_mode,
         )
 
 
 def _build_fused_program(
-    dim,
+    reduction_config,
     q_lora,
     N,
     Dn,
@@ -7973,46 +10531,60 @@ def _build_fused_program(
     w_qr_quant_mode,
     qkv_quant_mode,
     weight_is_nz,
-    cache_mode,
-    rope_mode,
     input_tile_rows,
     wqb_tile_rows,
     absorb_tile_rows,
-    single_token=False,
-    qa_rows=0,
-    qa_config=(0, 1, 128),
-    compact_head_handoff=(0, 0),
+    token_profile,
+    qa_config,
+    compact_head_handoff,
 ):
-    T = 1 if single_token else _dsl.Dim("tokens", min=1)
+    dynamic_lora = w_qr_quant_mode == 1 and not weight_is_nz and q_lora == 2048
+    lora_width = (
+        _dsl.Dim("q_lora", min=1024, max=2048, multiple_of=512)
+        if dynamic_lora
+        else q_lora
+    )
+    Dn = _dsl.Dim("nope_width", min=128, max=256, multiple_of=64)
+    Dr = _dsl.Dim("rope_width", min=0, max=64, multiple_of=64)
+    qa_l1_reduction = reduction_config.l1_tile
+    _capacity = token_profile.capacity
+    T = _dsl.Dim("tokens", min=1)
+    S = _dsl.Dim("scratch_tokens", min=1, max=_MX_SCRATCH_TOKEN_CAPACITY)
+    F = _dsl.Dim("front_tokens", min=1) if w_qr_quant_mode == 2 else S
+    R = _dsl.Dim("qr_tokens", min=1)
+    P = _dsl.Dim("rope_tokens", min=0)
+    head_count = _dsl.Dim("heads", min=1, max=128)
     block_number = _dsl.Dim("cache_blocks", min=1)
     block_size = _dsl.Dim("cache_block_size", min=16, max=1024)
     reduction = (
-        dim
-        if weight_is_nz or qa_rows
-        else _dsl.Dim("dim", min=1024, max=8192, multiple_of=256)
+        reduction_config.physical_width
+        if weight_is_nz
+        else _dsl.Dim("dim", min=1024, max=MAX_REDUCTION_ELEMENTS, multiple_of=256)
     )
     data_dtype = _dtypes.float8_e4m3fn if w_qr_quant_mode == 1 else _dtypes.uint8
     q_dtype = _dtypes.bfloat16 if qkv_quant_mode in (0, 1) else data_dtype
     x_spec = _dsl.TensorSpec((T, reduction), data_dtype)
     weight_specs = tuple(
         _dsl.TensorSpec(
-            shape, data_dtype, storage_format="nz" if weight_is_nz else "nd"
+            shape[::-1] if weight_is_nz else shape,
+            data_dtype,
+            storage_format="nz" if weight_is_nz else "nd",
         )
         for shape in (
-            (q_lora, reduction),
-            (N * (Dn + Dr), q_lora),
+            (lora_width, reduction),
+            (head_count * (Dn + Dr), lora_width),
             (KV_ELEMENTS + Dr, reduction),
         )
     )
     wqa_spec, wqb_spec, wkva_spec = weight_specs
-    wkb_spec = _dsl.TensorSpec((N, Dn, KV_ELEMENTS), _dtypes.bfloat16)
+    wkb_spec = _dsl.TensorSpec((head_count, Dn, KV_ELEMENTS), _dtypes.bfloat16)
     descale_x_spec = _dsl.TensorSpec((T, reduction // 64, 2), _dtypes.float8_e8m0)
     if w_qr_quant_mode == 2:
         descale_x_spec = _dsl.TensorSpec((1,), _dtypes.float32)
     descale_weight_specs = []
     for outputs, k in (
-        (q_lora, reduction),
-        (N * (Dn + Dr), q_lora),
+        (lora_width, reduction),
+        (head_count * (Dn + Dr), lora_width),
         (KV_ELEMENTS + Dr, reduction),
     ):
         shape = (1, outputs)
@@ -8026,7 +10598,7 @@ def _build_fused_program(
             dtype = _dtypes.uint8 if weight_is_nz else _dtypes.float8_e8m0
         descale_weight_specs.append(_dsl.TensorSpec(shape, dtype))
     descale_wqa_spec, descale_wqb_spec, descale_wkva_spec = descale_weight_specs
-    norm_weight_qa_spec = _dsl.TensorSpec((1, q_lora), _dtypes.float32)
+    norm_weight_qa_spec = _dsl.TensorSpec((1, lora_width), _dtypes.float32)
     norm_weight_kva_spec = _dsl.TensorSpec((1, KV_ELEMENTS), _dtypes.float32)
     payload_bytes = (
         2 * (KV_ELEMENTS + Dr)
@@ -8035,6 +10607,13 @@ def _build_fused_program(
         if qkv_quant_mode == 1
         else KV_ELEMENTS + Dr
     )
+    if w_qr_quant_mode == 1 and qkv_quant_mode == 0:
+        payload_bytes = _dsl.Dim(
+            "cache_payload_bytes",
+            min=KV_ELEMENTS,
+            max=BF16_BYTES * (KV_ELEMENTS + 64),
+            multiple_of=16,
+        )
     kv_cache_bytes_spec = _dsl.TensorSpec(
         (block_number, block_size, 1, payload_bytes),
         _dtypes.uint8,
@@ -8046,70 +10625,80 @@ def _build_fused_program(
         ),
     )
     cache_index_spec = _dsl.TensorSpec((T,), _dtypes.int64)
-    qa_matmul_fp32_spec = _dsl.TensorSpec((T, q_lora), _dtypes.float32)
-    qa_norm_fp32_spec = qa_matmul_fp32_spec
-    kva_matmul_fp32_spec = _dsl.TensorSpec((T, KV_ELEMENTS + Dr), _dtypes.float32)
-    kv_norm_fp32_spec = _dsl.TensorSpec((T, KV_ELEMENTS), _dtypes.float32)
+    qa_matmul_fp32_spec = _dsl.TensorSpec((F, lora_width), _dtypes.float32)
+    qa_norm_fp32_spec = (
+        qa_matmul_fp32_spec
+        if w_qr_quant_mode == 2
+        else _dsl.TensorSpec((1, 1), _dtypes.float32)
+    )
+    kva_matmul_fp32_spec = _dsl.TensorSpec((F, KV_ELEMENTS + Dr), _dtypes.float32)
+    kv_norm_fp32_spec = _dsl.TensorSpec(
+        (F, KV_ELEMENTS), _dtypes.float32, stride=(KV_ELEMENTS + Dr, 1)
+    )
     quant_scale_kv_spec = (
         _dsl.TensorSpec((1,), _dtypes.float32)
         if qkv_quant_mode in (2, 3)
         else kv_norm_fp32_spec
     )
-    qr_spec = _dsl.TensorSpec((T, q_lora), data_dtype)
+    qr_spec = _dsl.TensorSpec((R, lora_width), data_dtype)
     descale_qr_spec = (
-        _dsl.TensorSpec((T, q_lora // 32), _dtypes.float8_e8m0)
+        _dsl.TensorSpec((R, lora_width // 32), _dtypes.float8_e8m0)
         if w_qr_quant_mode == 1
         else _dsl.TensorSpec((1,), _dtypes.float32)
     )
-    wqb_matmul_fp32_spec = _dsl.TensorSpec((T, N * (Dn + Dr)), _dtypes.float32)
-    q_nope_bf16_spec = _dsl.TensorSpec((N * T, Dn), _dtypes.bfloat16)
+    wqb_matmul_fp32_spec = _dsl.TensorSpec((S, head_count * (Dn + Dr)), _dtypes.float32)
+    q_nope_bf16_spec = _dsl.TensorSpec((head_count * S, Dn), _dtypes.bfloat16)
     q_rope_bf16_spec = (
-        _dsl.TensorSpec((N * T, Dr), _dtypes.bfloat16) if Dr else q_nope_bf16_spec
+        _dsl.TensorSpec((head_count * S, Dr), _dtypes.bfloat16)
+        if qkv_quant_mode in (2, 3)
+        else _dsl.TensorSpec((1, 1), _dtypes.bfloat16)
     )
-    rope_sin_spec = (
-        _dsl.TensorSpec((T, Dr), _dtypes.bfloat16)
-        if Dr and rope_mode
-        else q_nope_bf16_spec
-    )
+    rope_sin_spec = _dsl.TensorSpec((P, Dr), _dtypes.bfloat16)
     rope_cos_spec = rope_sin_spec
-    q_nope_absorbed_bf16_spec = _dsl.TensorSpec((N * T, KV_ELEMENTS), _dtypes.bfloat16)
+    q_nope_absorbed_bf16_spec = _dsl.TensorSpec(
+        (head_count * S, KV_ELEMENTS) if qkv_quant_mode == 2 else (1, 1),
+        _dtypes.bfloat16,
+    )
     q_fp32_spec = _dsl.TensorSpec(
-        (N * T, KV_ELEMENTS + Dr),
+        (_dsl.Dim("q_storage_rows", min=1), KV_ELEMENTS + Dr)
+        if qkv_quant_mode == 3
+        else (1, 1),
         _dtypes.bfloat16 if qkv_quant_mode == 3 else _dtypes.float32,
     )
-    q_spec = _dsl.TensorSpec((N * T, KV_ELEMENTS + Dr), q_dtype)
+    q_spec = _dsl.TensorSpec((head_count * T, KV_ELEMENTS + Dr), q_dtype)
     descale_q_spec = (
-        _dsl.TensorSpec((N * T, 1), _dtypes.float32)
+        _dsl.TensorSpec((head_count * T, 1), _dtypes.float32)
         if qkv_quant_mode == 2
-        else _dsl.TensorSpec((1,), _dtypes.float32)
-        if qkv_quant_mode == 3
-        else q_fp32_spec
+        else (
+            _dsl.TensorSpec((1,), _dtypes.float32)
+            if qkv_quant_mode == 3
+            else q_fp32_spec
+        )
     )
     entry = _QuantMlaPrologProgram(
-        q_lora,
+        2048 if dynamic_lora else q_lora,
         N,
         Dn,
         Dr,
         w_qr_quant_mode,
         qkv_quant_mode,
         weight_is_nz,
-        cache_mode,
-        rope_mode,
         input_tile_rows,
         wqb_tile_rows,
         absorb_tile_rows,
-        qa_rows,
-        dim,
+        token_profile,
+        qa_l1_reduction,
         qa_config,
         compact_head_handoff,
+        dynamic_lora,
+        reduction_config.physical_width,
     )
-    bm = qa_config[0] if qa_rows else input_tile_rows
-    splits = qa_config[1]
-    nm, nc = (qa_rows + bm - 1) // bm, q_lora // 128
-    qa_partial_spec = (
-        _dsl.TensorSpec((nm * nc * splits, bm * 128), _dtypes.float32)
-        if splits == 2
-        else qa_matmul_fp32_spec
+    qa_partial_spec = _dsl.TensorSpec(
+        (
+            _dsl.Dim("qa_partial_rows", min=1),
+            _dsl.Dim("qa_partial_width", min=128, max=16384, multiple_of=128),
+        ),
+        _dtypes.float32,
     )
     return _dsl.compile(
         entry.run,
@@ -8147,12 +10736,71 @@ def _build_fused_program(
         _dtypes.float32,
         qa_partial_spec,
         _dtypes.int64,
+        _dtypes.int64,
+        _dtypes.int64,
+        _dtypes.int64,
     )
 
 
-@_lru_cache(maxsize=256)
+def _canonical_program_parameters(
+    reduction_config, q_lora, w_qr_quant_mode, qkv_quant_mode, weight_is_nz
+):
+    return (
+        reduction_config,
+        q_lora,
+        1,
+        128,
+        64,
+        w_qr_quant_mode,
+        qkv_quant_mode,
+        weight_is_nz,
+        128,
+        128,
+        128,
+        _TokenProfile(0, False, False, False),
+        (128, 1, 128),
+        (0, 0),
+    )
+
+
+_PROGRAM_CACHE = {}
+_PROGRAM_LOCK = _threading.Lock()
+
+
+def _native_dispatch_key(key):
+    return _json.dumps(key, separators=(",", ":"))
+
+
+def _runtime_program(
+    reduction_config, q_lora, w_qr_quant_mode, qkv_quant_mode, weight_is_nz
+):
+    key = (reduction_config, q_lora, w_qr_quant_mode, qkv_quant_mode, weight_is_nz)
+    program = _PROGRAM_CACHE.get(key)
+    if program is not None:
+        return program
+    with _PROGRAM_LOCK:
+        program = _PROGRAM_CACHE.get(key)
+        if program is None:
+            program = _load_native_program(
+                __file__, "quant_mla_prolog", _native_dispatch_key(key)
+            )
+            if program is None:
+                program = _build_fused_program(*_canonical_program_parameters(*key))
+            _PROGRAM_CACHE[key] = program
+        return program
+
+
+def _close_programs():
+    for program in tuple(_PROGRAM_CACHE.values()):
+        program.close()
+    _PROGRAM_CACHE.clear()
+
+
+_atexit.register(_close_programs)
+
+
 def _program(
-    dim,
+    reduction_config,
     q_lora,
     N,
     Dn,
@@ -8160,122 +10808,33 @@ def _program(
     w_qr_quant_mode,
     qkv_quant_mode,
     weight_is_nz,
-    cache_mode,
-    rope_mode,
     input_tile_rows,
     wqb_tile_rows,
     absorb_tile_rows,
-    single_token=False,
-    qa_rows=0,
-    qa_config=(0, 1, 128),
-    compact_head_handoff=(0, 0),
+    token_profile,
+    qa_config,
+    compact_head_handoff,
 ):
-    return _build_fused_program(
-        dim,
-        q_lora,
-        N,
-        Dn,
-        Dr,
-        w_qr_quant_mode,
-        qkv_quant_mode,
-        weight_is_nz,
-        cache_mode,
-        rope_mode,
-        input_tile_rows,
-        wqb_tile_rows,
-        absorb_tile_rows,
-        single_token,
-        qa_rows,
-        qa_config,
-        compact_head_handoff,
+    return _runtime_program(
+        reduction_config, q_lora, w_qr_quant_mode, qkv_quant_mode, weight_is_nz
     )
 
 
-def _select_qa_config(rows, width, reduction, core_count, mode, weight_is_nz):
-    column_tiles = width // QA_PIPELINE_COLUMNS
-    if (
-        rows <= 128
-        and not (reduction == 1024 and rows <= 16)
-        and column_tiles * 2 <= core_count
-    ):
-        return (((rows + 15) // 16) * 16, 2, QA_PIPELINE_COLUMNS)
-    row_owners = max(1, core_count // column_tiles)
-    balanced_rows = (rows + row_owners - 1) // row_owners
-    return (min(128, ((balanced_rows + 15) // 16) * 16), 1, QA_PIPELINE_COLUMNS)
-
-
-def _select_small_head_handoff(
-    rows,
-    heads,
-    nope_width,
-    rope_width,
-    reduction,
-    core_count,
-    reduction_panel=REDUCTION_PANEL,
-    max_slots=HEAD_PIPELINE_DEPTH,
+def _compact_l1_bytes(
+    rows, absorb_rows, group, nope_width, rope_width, reduction, slots, panel
 ):
-    head_width = nope_width + rope_width
-    max_group = min(heads, STRIPE_COLUMNS // head_width)
-    aligned_rows = ((rows + PROJECTION_ROWS - 1) // PROJECTION_ROWS) * PROJECTION_ROWS
-    best = None
-    choice = (0, 0, 0)
-    for tile_rows in range(PROJECTION_ROWS, aligned_rows + 1, PROJECTION_ROWS):
-        row_tiles = (rows + tile_rows - 1) // tile_rows
-        for group in range(1, max_group + 1):
-            if heads % group:
-                continue
-            columns = group * head_width
-            tasks = row_tiles * (heads // group)
-            waves = (tasks + core_count - 1) // core_count
-            if waves > max_slots:
-                continue
-            weight_columns = max(
-                columns, nope_width * WKB_C2V_COLUMNS * BF16_BYTES // reduction_panel
-            )
-            l1_bytes = (
-                2 * weight_columns * reduction_panel
-                + 2 * tile_rows * reduction_panel
-                + (tile_rows + columns) * reduction // MX_GROUP
-                + waves * tile_rows * group * nope_width * BF16_BYTES
-                + 2 * tile_rows * WKB_C2V_REDUCTION * BF16_BYTES
-            )
-            l0a_bytes = max(
-                2 * tile_rows * reduction_panel,
-                2 * tile_rows * WKB_C2V_REDUCTION * BF16_BYTES,
-            )
-            l0b_bytes = 2 * COLUMNS_PER_PART * REDUCTION_PANEL
-            l0c_bytes = 2 * tile_rows * max(columns, WKB_C2V_COLUMNS) * FLOAT_BYTES
-            vector_rows = tile_rows // VECTOR_SUBBLOCKS
-            ub_bytes = (
-                HEAD_PIPELINE_DEPTH * vector_rows * columns * FLOAT_BYTES
-                + vector_rows * group * head_width * BF16_BYTES
-                + 2 * vector_rows * rope_width * BF16_BYTES
-            )
-            if (
-                l1_bytes > _dsl.get_mem_size("l1")
-                or l0a_bytes > _dsl.get_mem_size("l0a")
-                or l0b_bytes > _dsl.get_mem_size("l0b")
-                or l0c_bytes > _dsl.get_mem_size("l0c")
-                or ub_bytes > _dsl.get_mem_size("ub")
-            ):
-                continue
-            projection_bytes = (tile_rows + columns) * reduction
-            scale_bytes = (tile_rows + columns) * reduction // MX_GROUP
-            absorb_weight_bytes = group * nope_width * KV_ELEMENTS * BF16_BYTES
-            task_bytes = projection_bytes + scale_bytes + absorb_weight_bytes
-            rank = (
-                waves * task_bytes,
-                tasks * task_bytes,
-                waves * tile_rows * group,
-                -tile_rows,
-                group,
-            )
-            if best is None or rank < best:
-                best = rank
-                choice = (tile_rows, group, waves)
-    return choice
+    columns = group * (nope_width + rope_width)
+    weight_columns = max(columns, nope_width * WKB_C2V_COLUMNS * BF16_BYTES // panel)
+    return (
+        2 * weight_columns * panel
+        + 2 * rows * panel
+        + (rows + columns) * reduction // MX_GROUP
+        + slots * rows * group * nope_width * BF16_BYTES
+        + 2 * absorb_rows * WKB_C2V_REDUCTION * BF16_BYTES
+    )
 
 
+@_lru_cache(maxsize=4096)
 def _program_parameters(
     T,
     dim,
@@ -8286,182 +10845,44 @@ def _program_parameters(
     w_qr_quant_mode,
     qkv_quant_mode,
     weight_is_nz,
-    cache_mode,
-    rope_mode,
     selected_core_num,
 ):
-    input_tile_rows = (
-        128 if T >= 128 and T % 128 == 0 else 32 if T >= 32 and T % 32 == 0 else 16
-    )
-    wqb_tile_rows = (
-        128 if T >= 128 and T % 128 == 0 else 32 if T >= 32 and T % 32 == 0 else 16
-    )
-    absorb_tile_rows = (
-        128 if T >= 128 and T % 128 == 0 else 32 if T >= 32 and T % 32 == 0 else 16
-    )
-    tail_head_min_rows = _TAIL_HEAD_ROW_CHOICES[0]
+    if qkv_quant_mode == 1:
+        qkv_quant_mode = 0
+    if T <= 16:
+        rows, qa_rows, splits, capacity = 16, 16, 2, 16
+    elif T <= 32:
+        rows, qa_rows, splits, capacity = 32, 32, 2, 32
+    elif T <= 128:
+        rows, qa_rows, splits, capacity = 64, 128, 2, 128
+    else:
+        rows, qa_rows, splits, capacity = 128, 128, 1, 0
     if (
-        w_qr_quant_mode == 1
-        and qkv_quant_mode in (0, 1)
-        and T > tail_head_min_rows
-        and T % tail_head_min_rows
-    ):
-        for rows_per_tile in _TAIL_HEAD_ROW_CHOICES:
-            if (
-                N * ((T + rows_per_tile - 1) // rows_per_tile)
-                >= HEAD_PIPELINE_DEPTH * selected_core_num
-            ):
-                wqb_tile_rows = rows_per_tile
-                absorb_tile_rows = rows_per_tile
-    if Dn + Dr == 256 and selected_core_num >= 8:
-        for tail_rows in _TAIL_PIPELINE_ROW_CHOICES:
-            if (
-                T > tail_rows
-                and N * ((T + tail_rows - 1) // tail_rows) <= selected_core_num
-            ):
-                wqb_tile_rows = tail_rows
-                absorb_tile_rows = tail_rows
-                break
-    if w_qr_quant_mode == 1 and qkv_quant_mode in (0, 1):
-        wqb_tile_rows = min(wqb_tile_rows, WKB_C2V_MAX_ROWS)
-        absorb_tile_rows = wqb_tile_rows
-    if (
-        w_qr_quant_mode == 1
-        and qkv_quant_mode in (0, 1)
-        and T == WKB_DIRECT_MAX_ROWS
+        T == 128
+        and w_qr_quant_mode == 1
+        and qkv_quant_mode == 0
         and N >= selected_core_num
+        and N * (Dn + Dr) >= _DENSE_PROJECTION_RATIO * dim
     ):
-        wqb_tile_rows = WKB_DIRECT_MAX_ROWS
-        absorb_tile_rows = WKB_DIRECT_MAX_ROWS
-    if (
-        w_qr_quant_mode == 1
-        and qkv_quant_mode in (0, 1)
-        and T in (WKB_C2V_MAX_ROWS, WKB_C2V_MAX_ROWS + 1)
-        and N >= selected_core_num
-    ):
-        wqb_tile_rows = ((T + PROJECTION_ROWS - 1) // PROJECTION_ROWS) * PROJECTION_ROWS
-        absorb_tile_rows = wqb_tile_rows
-    if (
-        w_qr_quant_mode == 1
-        and qkv_quant_mode in (0, 1)
-        and T in (WQB_LARGE_HEAD_ROWS, WQB_LARGE_HEAD_ROWS + 1)
-        and N >= selected_core_num
-    ):
-        wqb_tile_rows = WQB_LARGE_HEAD_ROWS
-        absorb_tile_rows = WQB_LARGE_HEAD_ROWS
-    if T == 33 and w_qr_quant_mode == 1 and qkv_quant_mode in (0, 1):
-        if N == 16:
-            wqb_tile_rows = 32
-            absorb_tile_rows = 32
-        elif 24 <= N < 64:
-            wqb_tile_rows = 48
-            absorb_tile_rows = 48
-    if (
-        w_qr_quant_mode == 1
-        and qkv_quant_mode in (0, 1)
-        and N < selected_core_num
-        and N * 4 >= selected_core_num * 3
-        and T in (WKB_C2V_MAX_ROWS, WQB_LARGE_HEAD_ROWS, WQB_LARGE_HEAD_ROWS + 1)
-    ):
-        wqb_tile_rows = (
-            WKB_C2V_MAX_ROWS if T == WKB_C2V_MAX_ROWS else WQB_LARGE_HEAD_ROWS
-        )
-        absorb_tile_rows = wqb_tile_rows
-    if (
-        w_qr_quant_mode == 1
-        and qkv_quant_mode in (0, 1)
-        and T == WQB_LARGE_HEAD_ROWS + 1
-        and Dn + Dr == 192
-        and wqb_tile_rows == WQB_LARGE_HEAD_ROWS
-    ):
-        wqb_tile_rows = WQB_SINGLE_TAIL_ROWS
-        absorb_tile_rows = WQB_SINGLE_TAIL_ROWS
-    if (
-        w_qr_quant_mode == 1
-        and qkv_quant_mode in (0, 1)
-        and T == WQB_LARGE_HEAD_ROWS + 1
-        and Dn + Dr == 256
-        and wqb_tile_rows == WQB_LARGE_HEAD_ROWS
-    ):
-        wqb_tile_rows = WQB_TAIL_HEAD_ROWS
-        absorb_tile_rows = WQB_TAIL_HEAD_ROWS
-    if (
-        w_qr_quant_mode == 1
-        and qkv_quant_mode in (0, 1)
-        and T == 6 * PROJECTION_ROWS
-        and N * 2 == selected_core_num
-        and Dn + Dr == WKB_C2V_COLUMNS
-    ):
-        wqb_tile_rows = T // 2
-        absorb_tile_rows = wqb_tile_rows
-    qa_config = _select_qa_config(
-        T, q_lora, dim, selected_core_num, w_qr_quant_mode, weight_is_nz
-    )
-    if (
-        w_qr_quant_mode == 1
-        and qkv_quant_mode == 2
-        and WQB_WIDE_MAX_ROWS < T <= WQB_LARGE_HEAD_ROWS
-        and N * (Dn + Dr) >= selected_core_num * MM34_SHARED_COLUMNS
-    ):
-        wqb_tile_rows = ((T + PROJECTION_ROWS - 1) // PROJECTION_ROWS) * PROJECTION_ROWS
-    compact_head_handoff = (0, 0)
-    if (
-        w_qr_quant_mode == 1
-        and qkv_quant_mode in (0, 1, 2)
-        and 0 < T <= WQB_WIDE_MAX_ROWS
-        and 0 < N <= 128
-        and (Dn, Dr) in ((128, 64), (192, 64), (256, 0))
-        and (rope_mode == 1 or Dr == 0)
-        and q_lora % WQB_PROJECTION_REDUCTION == 0
-    ):
-        compact_rows, group, slots = _select_small_head_handoff(
-            T, N, Dn, Dr, q_lora, selected_core_num
-        )
-        if group:
-            compact_head_handoff = (group, slots)
-            wqb_tile_rows = compact_rows
-            absorb_tile_rows = compact_rows
-    if (
-        w_qr_quant_mode == 1
-        and qkv_quant_mode == 2
-        and WQB_WIDE_MAX_ROWS < T <= COMPACT_HANDOFF_MAX_ROWS
-        and 0 < N <= 128
-        and (Dn, Dr) in ((128, 64), (192, 64))
-        and (rope_mode == 1 or Dr == 0)
-        and q_lora % WQB_PROJECTION_REDUCTION == 0
-    ):
-        compact_rows, group, slots = _select_small_head_handoff(
-            T,
-            N,
-            Dn,
-            Dr,
-            q_lora,
-            selected_core_num,
-            COMPACT_BOUNDARY_REDUCTION_PANEL,
-            COMPACT_HANDOFF_MAX_SLOTS,
-        )
-        if group:
-            compact_head_handoff = (group, slots)
-            wqb_tile_rows = compact_rows
-            absorb_tile_rows = compact_rows
+        rows, qa_rows, splits, capacity = 128, 128, 1, 0
+    profile = _TokenProfile(capacity, False, False, False)
+    if w_qr_quant_mode == 1 and not weight_is_nz and q_lora >= 1024:
+        q_lora = 2048
     return (
-        dim,
+        _ReductionConfig(dim if weight_is_nz else 0, 256),
         q_lora,
-        N,
+        1,
         Dn,
         Dr,
         w_qr_quant_mode,
         qkv_quant_mode,
         weight_is_nz,
-        cache_mode,
-        rope_mode,
-        input_tile_rows,
-        wqb_tile_rows,
-        absorb_tile_rows,
-        T == 1 and w_qr_quant_mode == 2,
-        T,
-        qa_config,
-        compact_head_handoff,
+        min(rows, 128),
+        rows,
+        rows,
+        profile,
+        (qa_rows, splits, 128),
+        (0, 0),
     )
 
 
@@ -8593,6 +11014,161 @@ def _execute_device(*values, **attributes):
     return _execute_async(*values, **attributes)
 
 
+_SCRATCH_BURST_ALIGNMENT = 512
+_MX_SCRATCH_TOKEN_CAPACITY = 1024
+_SCRATCH_MIN_CHUNK_ROWS = 128
+_SCRATCH_TARGET_BYTES = 32 * 1024 * 1024
+
+
+def _scratch_token_rows(tokens, q_lora, heads, nope_dim, rope_dim, qkv_mode):
+    if tokens <= _MX_SCRATCH_TOKEN_CAPACITY:
+        return tokens
+    row_bytes = (
+        4 * max(q_lora, heads * (nope_dim + rope_dim))
+        + 4 * (KV_ELEMENTS + rope_dim)
+        + 4 * KV_ELEMENTS
+        + BF16_BYTES * heads * nope_dim
+        + q_lora
+        + q_lora // MX_GROUP_ELEMENTS
+    )
+    if qkv_mode == 2:
+        row_bytes += BF16_BYTES * heads * (KV_ELEMENTS + rope_dim)
+    elif qkv_mode == 3:
+        row_bytes += BF16_BYTES * heads * (KV_ELEMENTS + 2 * rope_dim)
+    capacity = _MX_SCRATCH_TOKEN_CAPACITY
+    while (
+        capacity > _SCRATCH_MIN_CHUNK_ROWS
+        and capacity * row_bytes > _SCRATCH_TARGET_BYTES
+    ):
+        capacity //= 2
+    return min(tokens, capacity)
+
+
+@_lru_cache(maxsize=256)
+def _scratch_layout(specs, reuse_groups=()):
+    groups = {slot: group for group in reuse_groups for slot in group}
+    sizes = []
+    for shape, dtype in specs:
+        size = dtype.itemsize
+        for extent in shape:
+            size *= extent
+        sizes.append(size)
+    cursor = 0
+    layout = []
+    offsets = {}
+    for slot, (shape, dtype) in enumerate(specs):
+        group = groups.get(slot, (slot,))
+        if group not in offsets:
+            cursor = (
+                (cursor + _SCRATCH_BURST_ALIGNMENT - 1)
+                // _SCRATCH_BURST_ALIGNMENT
+                * _SCRATCH_BURST_ALIGNMENT
+            )
+            offsets[group] = cursor
+            cursor += max(sizes[index] for index in group)
+        stride = []
+        count = 1
+        for extent in reversed(shape):
+            stride.append(count)
+            count *= extent
+        layout.append(
+            (shape, dtype, tuple(reversed(stride)), offsets[group] // dtype.itemsize)
+        )
+    # Align GM tiles independently of the allocator base address.
+    payload = (
+        (cursor + _SCRATCH_BURST_ALIGNMENT - 1)
+        // _SCRATCH_BURST_ALIGNMENT
+        * _SCRATCH_BURST_ALIGNMENT
+    )
+    return payload + _SCRATCH_BURST_ALIGNMENT - FRACTAL_BYTES, tuple(layout)
+
+
+def _allocate_scratch(specs, device, reuse_groups=()):
+    size, layout = _scratch_layout(specs, reuse_groups)
+    storage = _torch.empty((size,), dtype=_torch.uint8, device=device)
+    prefix = (-storage.data_ptr()) % _SCRATCH_BURST_ALIGNMENT
+    typed = {
+        dtype: storage.view(dtype)
+        for dtype in dict.fromkeys(dtype for _, dtype in specs)
+    }
+    return tuple(
+        typed[dtype].as_strided(
+            shape,
+            stride,
+            typed[dtype].storage_offset() + prefix // dtype.itemsize + offset,
+        )
+        for shape, dtype, stride, offset in layout
+    )
+
+
+def _execution_scratch_specs(
+    T,
+    dim,
+    q_lora,
+    N,
+    Dn,
+    Dr,
+    w_qr_quant_mode,
+    qkv_quant_mode,
+    weight_is_nz,
+    core_num,
+    return_qr,
+):
+    parameters = _program_parameters(
+        T,
+        dim,
+        q_lora,
+        N,
+        Dn,
+        Dr,
+        w_qr_quant_mode,
+        qkv_quant_mode,
+        weight_is_nz,
+        core_num,
+    )
+    full_tokens = T
+    T = _scratch_token_rows(T, q_lora, N, Dn, Dr, qkv_quant_mode)
+    front_tokens = full_tokens if w_qr_quant_mode == 2 else T
+    q_storage_tokens = full_tokens
+    if (
+        qkv_quant_mode == 3
+        and full_tokens > T
+        and full_tokens * N * (KV_ELEMENTS + Dr) * BF16_BYTES > _SCRATCH_TARGET_BYTES
+        and core_num * VECTOR_SUBBLOCKS <= q_lora // MAXIMUM_PARTIAL_ELEMENTS
+    ):
+        q_storage_tokens = T
+    qa_bm, qa_splits, qa_bn = parameters[-2]
+    qa_tiles = ((front_tokens + qa_bm - 1) // qa_bm) * (q_lora // qa_bn)
+    specs = (
+        ((front_tokens, q_lora), _torch.float32),
+        ((front_tokens, 512 + Dr), _torch.float32),
+        ((front_tokens, q_lora) if w_qr_quant_mode == 2 else (1, 1), _torch.float32),
+        ((front_tokens, 512 + Dr), _torch.float32),
+        ((T, N * (Dn + Dr)), _torch.float32),
+        ((N * T, Dn), _torch.bfloat16),
+        ((N * T, 512) if qkv_quant_mode == 2 else (1, 1), _torch.bfloat16),
+        (
+            (N * q_storage_tokens, 512 + Dr) if qkv_quant_mode == 3 else (1, 1),
+            _torch.bfloat16 if qkv_quant_mode == 3 else _torch.float32,
+        ),
+    )
+    if Dr:
+        specs += (
+            ((N * T, Dr) if qkv_quant_mode in (2, 3) else (1, 1), _torch.bfloat16),
+        )
+    if qa_splits == 2:
+        specs += (((qa_tiles * qa_splits, qa_bm * qa_bn), _torch.float32),)
+    elif w_qr_quant_mode == 2:
+        specs += (((1, q_lora), _torch.float32),)
+    qr_dtype = _E4 if w_qr_quant_mode == 1 else _torch.uint8
+    descale_qr_dtype = _E8 if w_qr_quant_mode == 1 else _torch.float32
+    qr_shape = (front_tokens, q_lora)
+    qr_scale_shape = (T, q_lora // 32) if w_qr_quant_mode == 1 else (1,)
+    if not return_qr:
+        specs += ((qr_shape, qr_dtype), (qr_scale_shape, descale_qr_dtype))
+    return parameters, specs
+
+
 def _execute_async(
     x,
     wqa,
@@ -8667,30 +11243,7 @@ def _execute_async(
         if w_qr_quant_mode == 1
         else tuple(weight.view(_torch.uint8) for weight in (wqa, wqb, wkva))
     )
-    qa_matmul_fp32 = empty((T, q_lora), _torch.float32)
-    kva_matmul_fp32 = empty((T, 512 + Dr), _torch.float32)
-    qa_norm_fp32 = empty((T, q_lora), _torch.float32)
-    kv_norm_fp32 = empty((T, 512), _torch.float32)
-    qr = empty((T, q_lora), qr_dtype)
-    descale_qr = empty(
-        (T, q_lora // 32) if w_qr_quant_mode == 1 else (1,), descale_qr_dtype
-    )
-    wqb_matmul_fp32 = empty((T, N * (Dn + Dr)), _torch.float32)
-    q_nope_bf16 = empty((N * T, Dn), _torch.bfloat16)
-    q_rope_bf16 = empty((N * T, Dr), _torch.bfloat16) if Dr else q_nope_bf16
-    q_nope_absorbed_bf16 = empty((N * T, 512), _torch.bfloat16)
-    q_fp32 = empty(
-        (N * T, 512 + Dr), _torch.bfloat16 if qkv_quant_mode == 3 else _torch.float32
-    )
-    q = empty((N * T, 512 + Dr), q_dtype)
-    descale_q = empty(
-        (N * T, 1) if qkv_quant_mode == 2 else (1,) if qkv_quant_mode == 3 else (0,),
-        _torch.float32,
-    )
-    norm_weight_qa_view = norm_weight_qa.view(1, q_lora)
-    norm_weight_kva_view = norm_weight_kva.view(1, 512)
-    kv_cache_bytes = kv_cache.view(_torch.uint8)
-    parameters = _program_parameters(
+    parameters, specs = _execution_scratch_specs(
         T,
         dim,
         q_lora,
@@ -8700,17 +11253,61 @@ def _execute_async(
         w_qr_quant_mode,
         qkv_quant_mode,
         weight_is_nz,
-        cache_mode,
-        rope_mode,
         selected_core_num,
+        return_qr,
     )
-    qa_bm, qa_splits, qa_bn = parameters[-2]
-    qa_tiles = ((T + qa_bm - 1) // qa_bm) * (q_lora // qa_bn)
+    qa_splits = parameters[-2][1]
+    qr_shape = (T, q_lora)
+    qr_scale_shape = (T, q_lora // 32) if w_qr_quant_mode == 1 else (1,)
+    reuse_groups = ()
+    if w_qr_quant_mode == 1:
+        # WQB waits for every QR producer before overwriting the QA storage.
+        qa_group = (0, 4, 9 if Dr else 8) if qa_splits == 2 else (0, 4)
+        reuse_groups = (qa_group, (1, 3))
+    else:
+        # Norm loads each complete row before overwriting it; Q starts after QR.
+        reuse_groups = ((0, 2, 5), (1, 3))
+    scratch = iter(_allocate_scratch(specs, x.device, reuse_groups))
+    qa_matmul_fp32, kva_matmul_fp32, qa_norm_fp32, kv_norm_fp32 = (
+        next(scratch),
+        next(scratch),
+        next(scratch),
+        next(scratch),
+    )
+    kv_norm_fp32 = kv_norm_fp32.as_strided(
+        (kv_norm_fp32.shape[0], KV_ELEMENTS), (KV_ELEMENTS + Dr, 1)
+    )
+    wqb_matmul_fp32, q_nope_bf16, q_nope_absorbed_bf16, q_fp32 = (
+        next(scratch),
+        next(scratch),
+        next(scratch),
+        next(scratch),
+    )
+    q_rope_bf16 = (
+        next(scratch)
+        if Dr
+        else (
+            q_nope_bf16.as_strided((q_nope_bf16.shape[0], 0), (0, 1))
+            if qkv_quant_mode in (2, 3)
+            else q_nope_bf16.view(-1)[:1].view(1, 1)
+        )
+    )
     qa_partial = (
-        empty((qa_tiles * qa_splits, qa_bm * qa_bn), _torch.float32)
-        if qa_splits == 2
-        else qa_matmul_fp32
+        next(scratch) if qa_splits == 2 or w_qr_quant_mode == 2 else qa_matmul_fp32
     )
+    if return_qr:
+        qr = empty(qr_shape, qr_dtype)
+        descale_qr = empty(qr_scale_shape, descale_qr_dtype)
+    else:
+        qr, descale_qr = next(scratch), next(scratch)
+    q = empty((N * T, 512 + Dr), q_dtype)
+    descale_q = empty(
+        (N * T, 1) if qkv_quant_mode == 2 else (1,) if qkv_quant_mode == 3 else (0,),
+        _torch.float32,
+    )
+    norm_weight_qa_view = norm_weight_qa.view(1, q_lora)
+    norm_weight_kva_view = norm_weight_kva.view(1, 512)
+    kv_cache_bytes = kv_cache.view(_torch.uint8)
     if w_qr_quant_mode == WQrQuantMode.A8W8_MXFP8.value and weight_is_nz:
         descale_wqa, descale_wqb, descale_wkva = (
             _mx_weight_descale_view(scale)
@@ -8732,8 +11329,24 @@ def _execute_async(
         kv_cache_bytes,
         cache_index,
         quant_scale_kv if qkv_quant_mode in (2, 3) else kv_norm_fp32,
-        rope_sin if Dr and rope_mode else q_nope_bf16,
-        rope_cos if Dr and rope_mode else q_nope_bf16,
+        (
+            rope_sin
+            if Dr and rope_mode
+            else q_nope_bf16.view(-1)[: wqb_matmul_fp32.shape[0] * Dr].view(
+                wqb_matmul_fp32.shape[0], Dr
+            )
+            if Dr
+            else q_nope_bf16.as_strided((0, 0), (0, 1))
+        ),
+        (
+            rope_cos
+            if Dr and rope_mode
+            else q_nope_bf16.view(-1)[: wqb_matmul_fp32.shape[0] * Dr].view(
+                wqb_matmul_fp32.shape[0], Dr
+            )
+            if Dr
+            else q_nope_bf16.as_strided((0, 0), (0, 1))
+        ),
         qa_matmul_fp32,
         kva_matmul_fp32,
         qa_norm_fp32,
@@ -8752,6 +11365,9 @@ def _execute_async(
         kvr_scale,
         qa_partial,
         selected_core_num,
+        cache_mode,
+        rope_mode,
+        qkv_quant_mode,
     )
     if qkv_quant_mode == 2:
         descale_q = descale_q.view(T, N, 1)
@@ -8808,7 +11424,7 @@ def _fake(
     _validate_scalars(norm_eps, qr_scale, kvr_scale)
     T = x.shape[0]
     N = wkb.shape[0]
-    Dr = wkva.shape[0] - 512
+    Dr = 0 if wkb.shape[1] == 256 else 64
     q_lora = norm_weight_qa.shape[0]
     _require(
         Dr != 0 or rope_mode == RopeMode.NO_ROPE.value, "Dr=0 requires rope_mode=0"
@@ -8988,8 +11604,8 @@ def quant_mla_prolog(
                 raise TypeError(f"{name} must be a Tensor")
             # FakeTensor cannot query NPU formats; device dispatch validates NZ storage.
             byte_weight_scale = value.dtype == _torch.uint8 and tuple(value.shape) == (
-                weight.shape[1] // 64,
-                weight.shape[0],
+                weight.shape[0] // 64,
+                weight.shape[1],
                 2,
             )
             if value.dtype != _E8 and not byte_weight_scale:
@@ -9173,78 +11789,69 @@ def _program_configs(profile):
         raise ValueError(f"invalid deployment mode profile: {profile}")
     if T == 0:
         return []
-    # Cover every resource-threshold interval without binding the package to
-    # the build device's core count or accepting caller-supplied tiling.
-    column_tiles = q_lora // QA_PIPELINE_COLUMNS
-    resource_boundaries = {
-        1,
-        8,
-        column_tiles * 2,
-        N,
-        N + 1,
-        (N * 4) // 3 + 1,
-        N * 2,
-        N * 2 + 1,
-    }
-    resource_boundaries.update(
-        column_tiles * owners for owners in range(1, (T + 15) // 16 + 1)
-    )
-    for rows in _TAIL_HEAD_ROW_CHOICES:
-        tasks = N * ((T + rows - 1) // rows)
-        resource_boundaries.add(tasks // HEAD_PIPELINE_DEPTH + 1)
-    for rows in _TAIL_PIPELINE_ROW_CHOICES:
-        resource_boundaries.add(N * ((T + rows - 1) // rows))
-    if (
-        w_qr_quant_mode == 1
-        and qkv_quant_mode in (0, 1, 2)
-        and T <= COMPACT_HANDOFF_MAX_ROWS
-    ):
-        max_slots = (
-            HEAD_PIPELINE_DEPTH if T <= WQB_WIDE_MAX_ROWS else COMPACT_HANDOFF_MAX_SLOTS
+    parameters = list(
+        _program_parameters(
+            T,
+            dim,
+            q_lora,
+            N,
+            Dn,
+            Dr,
+            w_qr_quant_mode,
+            qkv_quant_mode,
+            weight_format == "NZ",
+            1,
         )
-        for rows in range(
-            PROJECTION_ROWS,
-            ((T + PROJECTION_ROWS - 1) // PROJECTION_ROWS) * PROJECTION_ROWS + 1,
-            PROJECTION_ROWS,
-        ):
-            for group in range(1, min(N, STRIPE_COLUMNS // (Dn + Dr)) + 1):
-                if N % group == 0:
-                    tasks = ((T + rows - 1) // rows) * (N // group)
-                    resource_boundaries.update(
-                        (tasks + waves - 1) // waves
-                        for waves in range(1, max_slots + 1)
-                    )
-        resource_boundaries.add(N * (Dn + Dr) // MM34_SHARED_COLUMNS + 1)
-    return sorted(
-        {
-            _program_parameters(
-                T,
-                dim,
-                q_lora,
-                N,
-                Dn,
-                Dr,
-                w_qr_quant_mode,
-                qkv_quant_mode,
-                weight_format == "NZ",
-                cache_mode,
-                rope_mode,
-                resources,
-            )
-            for resources in resource_boundaries
-        }
     )
+    return [
+        _canonical_program_parameters(
+            parameters[0],
+            parameters[1],
+            parameters[5],
+            parameters[6],
+            parameters[7],
+        )
+    ]
+
+
+def _native_program_configs():
+    path = _os.environ.get("CANNBOTDSL_QMP_PROFILES")
+    profiles = _json.loads(_Path(path).read_text()) if path else _default_profiles()
+    configs = {config for profile in profiles for config in _program_configs(profile)}
+    return sorted(configs)
 
 
 @_aot.export("quant_mla_prolog")
 def _export_quant_mla_prolog():
     """Export the same complete fused program used by the public operator."""
-    path = _os.environ.get("CANNBOTDSL_QMP_PROFILES")
-    profiles = _json.loads(_Path(path).read_text()) if path else _default_profiles()
-    configs = {config for profile in profiles for config in _program_configs(profile)}
-    for parameters in sorted(configs):
-        with _build_fused_program(*parameters):
-            pass
+    session = _current_collection()
+    source_sha = _native_sha(_Path(__file__))
+    for parameters in _native_program_configs():
+        compilations = []
+        with _observe_compilations(
+            lambda artifact, source: compilations.append(artifact)
+        ):
+            program = _build_fused_program(*parameters)
+        with program:
+            if session is not None:
+                if len(compilations) != 1:
+                    raise RuntimeError("MLA export must compile exactly one Program")
+                key = (
+                    parameters[0],
+                    parameters[1],
+                    parameters[5],
+                    parameters[6],
+                    parameters[7],
+                )
+                session.add_task_metadata(
+                    "mla_dispatch",
+                    dict(
+                        schema_version=1,
+                        compile_key=_native_dispatch_key(key),
+                        binary_key=compilations[0].binary_key,
+                        source_sha256=source_sha,
+                    ),
+                )
 
 
 for _entry in (quant_mla_prolog, quant_mla_prolog_native, quant_mla_prolog_precheck):

@@ -8,17 +8,17 @@
 
 """BF16-input MLA Prolog: one MIX launch for nonempty inputs, no launch for T=0."""
 
-from cannbotdsl import from_tensor
-
 import atexit
+import hashlib
 import inspect
 import json
 import math
 import os
 import struct
 import threading
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from enum import Enum
+from functools import lru_cache
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Optional, Tuple
@@ -28,8 +28,10 @@ import cannbotdsl as dsl
 import torch
 import torch_npu
 from torch.library import impl
-from cannbotdsl import Dim, MemLoc, Tensor, TensorSpec, dtypes
-from cannbotdsl.aot import export, register_directory
+from cannbotdsl import Dim, MemLoc, Tensor, TensorSpec, dtypes, from_tensor
+from cannbotdsl.aot import export
+from cannbotdsl.aot.cache import observe_compilations
+from cannbotdsl.aot.collection import current_collection
 from cannbotdsl.buffer import Buffer
 from cannbotdsl.ring_buffer import RingBuffer
 from cannbotdsl.lang.constexpr import const_expr, range_constexpr
@@ -74,8 +76,12 @@ from cannbotdsl.ops.reg import (
     vstore_pack,
     vsub,
 )
-from cannbotdsl.ops.sync import onchip_rewind, global_sync_all
-from cannbotdsl.tensor import make_layout, make_tiler, tile_slice
+from cannbotdsl.ops.sync import onchip_rewind, global_sync_all, cube_sync_all
+from cannbotdsl.tensor import (
+    make_layout,
+    make_tiler,
+    tile_slice,
+)
 
 __all__ = [
     "CacheMode",
@@ -86,10 +92,99 @@ __all__ = [
     "export_mla_prolog_v4",
 ]
 
-# Source imports have no bundled resources; wheels register them on the same import.
-_NATIVE_DIRECTORY = Path(__file__).resolve().parent / "_native"
-if _NATIVE_DIRECTORY.is_dir():
-    register_directory(_NATIVE_DIRECTORY)
+
+def _native_sha(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _native_resource(root, relative):
+    path = (root / relative).resolve()
+    if not path.is_relative_to(root):
+        raise ValueError(f"Invalid MLA Native resource: {relative!r}")
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    return path
+
+
+def _native_read_checked(root, relative, files):
+    path = _native_resource(root, relative)
+    if _native_sha(path) != files.get(relative):
+        raise ValueError(f"MLA Native metadata SHA mismatch: {relative}")
+    return json.loads(path.read_text())
+
+
+@lru_cache(maxsize=None)
+def _native_catalog(source_file, operator):
+    source = Path(source_file).resolve()
+    root = source.parent / "_native"
+    manifest = json.loads((root / "manifest.json").read_text())
+    if manifest["target"] != "dav-3510":
+        raise ValueError("MLA Native target mismatch")
+    metadata = _native_read_checked(
+        root, f"operators/{operator}/operator.json", manifest["files"]
+    )
+    source_sha = _native_sha(source)
+    programs = {}
+    for entry in metadata.get("mla_dispatch", ()):
+        if entry["source_sha256"] != source_sha:
+            continue
+        if entry["schema_version"] != 1:
+            raise ValueError("Unsupported MLA Native dispatch schema")
+        token, binary_key = entry["compile_key"], entry["binary_key"]
+        if token in programs and programs[token] != binary_key:
+            raise ValueError("Conflicting MLA Native compile key")
+        programs[token] = binary_key
+    if not programs:
+        return None
+    native_index = _native_read_checked(root, manifest["index"], manifest["files"])
+    return root, manifest, programs, native_index
+
+
+def _load_native_program(source_file, operator, compile_key):
+    """Prefer an indexed Native; an absent resource or key uses the original builder."""
+    try:
+        return _indexed_native_program(source_file, operator, compile_key)
+    except FileNotFoundError:
+        return None
+
+
+def _indexed_native_program(source_file, operator, compile_key):
+    catalog = _native_catalog(str(Path(source_file).resolve()), operator)
+    if catalog is None:
+        return None
+    root, manifest, programs, native_index = catalog
+    binary_key = programs.get(compile_key)
+    if binary_key is None:
+        return None
+    indexed = native_index.get(binary_key)
+    if indexed is None:
+        return None
+    descriptor = indexed["descriptor"]
+    if not descriptor.startswith(f"operators/{operator}/variants/"):
+        raise ValueError("MLA Native operator/descriptor mismatch")
+    variant = _native_read_checked(root, descriptor, manifest["files"])
+    if variant["binary_key"] != binary_key or variant["target"] != manifest["target"]:
+        raise ValueError("MLA Native variant identity mismatch")
+    binary = _native_resource(root, variant["binary"])
+    sidecar = _native_resource(root, variant["sidecar"])
+    if sidecar != Path(str(binary) + ".meta.json"):
+        raise ValueError("MLA Native sidecar path mismatch")
+    metadata = _native_read_checked(root, variant["sidecar"], manifest["files"])
+    contract_digest = variant["key_inputs"]["call_contract_sha256"]
+    if metadata["binary_sha256"] != manifest["files"].get(variant["binary"]):
+        raise ValueError("MLA Native binary SHA metadata mismatch")
+    if metadata["host_abi_version"] != manifest["host_abi_version"]:
+        raise ValueError("MLA Native ABI mismatch")
+    if metadata["contract_digest"] != contract_digest:
+        raise ValueError("MLA Native call contract mismatch")
+    program = cannbotdsl.load(str(binary))
+    if (
+        program.host_abi_version != manifest["host_abi_version"]
+        or program.contract_digest != contract_digest
+    ):
+        program.close()
+        raise ValueError("Loaded MLA Native ABI/contract mismatch")
+    return program
 
 
 PA_NZ_PLANE_ELEMS = 16
@@ -309,7 +404,7 @@ class QbFourHeads:
         self.b_l1 = RingBuffer(
             MemLoc.L1,
             dtypes.bfloat16,
-            make_layout((self.width, self.panel_k)),
+            make_layout((self.panel_k, self.width)),
             depth=2,
             data_format="nz",
         )
@@ -324,11 +419,11 @@ class QbFourHeads:
         columns = valid_heads * self.head_dim
         for k_idx in range_constexpr(self.q_lora // self.panel_k):
             mem_copy(
-                tile_slice(self.b_l1.next_write(), (columns, self.panel_k), (0, 0)),
-                tile_slice(weight, (columns, self.panel_k), (group, k_idx)),
+                tile_slice(self.b_l1.next_write(), (self.panel_k, columns), (0, 0)),
+                tile_slice(weight, (self.panel_k, columns), (k_idx, group)),
                 options=copy_options(l2_cache_ctl=4),
             )
-            b_panel = self.b_l1.next_read()
+            b_panel = self.b_l1.next_read().permute(1, 0)
             for inner in range_constexpr(self.panel_k // CUBE_BK):
                 a_view = from_tensor(
                     self.a_full,
@@ -365,9 +460,8 @@ class QbFourHeads:
         full_groups = n_total // self.width
         tail_columns = n_total % self.width
         groups = (n_total + self.width - 1) // self.width
-        full_columns = full_groups * self.width
-        full_weight = tile_slice(weight, (full_columns, self.q_lora), (0, 0))
-        full_output = tile_slice(out_gm, (out_gm.shape[0], full_columns), (0, 0))
+        full_weight = weight
+        full_output = out_gm
         if block < groups:
             for m_tile in cannbotdsl.range(0, m_tiles):
                 staging_write = from_tensor(
@@ -396,22 +490,37 @@ class QbFourHeads:
                             self.group_heads,
                         )
                     else:
-                        if tail_columns > 0:
-                            self.project_tile(
-                                tile_slice(
-                                    weight,
-                                    (self.width, self.q_lora),
-                                    (full_groups, 0),
-                                ),
-                                tile_slice(
-                                    out_gm,
-                                    (out_gm.shape[0], self.width),
-                                    (0, full_groups),
-                                ),
-                                0,
-                                m_tile,
-                                tail_columns // self.head_dim,
-                            )
+                        for tail_heads in range_constexpr(1, self.group_heads):
+                            if tail_columns == tail_heads * self.head_dim:
+                                self.project_tile(
+                                    tile_slice(
+                                        weight,
+                                        (self.q_lora, self.width),
+                                        (0, full_groups),
+                                    ),
+                                    tile_slice(
+                                        out_gm,
+                                        make_tiler(
+                                            (out_gm.shape[0], self.width),
+                                            alignment=(1, 1),
+                                        ),
+                                        (0, full_groups),
+                                    ),
+                                    0,
+                                    m_tile,
+                                    tail_heads,
+                                )
+
+
+class _TransposedWeightRing:
+    def __init__(self, ring):
+        self._ring = ring
+
+    def next_write(self):
+        return self._ring.next_write().permute(1, 0)
+
+    def next_read(self):
+        return self._ring.next_read().permute(1, 0)
 
 
 class NzProjection:
@@ -426,6 +535,7 @@ class NzProjection:
         weight_l2_hint=0,
         use_actual_rows=False,
     ):
+        self.weight_nz = weight_nz
         self.bm = bm
         self.width = width
         self.l2_hint = l2_hint
@@ -445,10 +555,12 @@ class NzProjection:
         self.b_l1 = RingBuffer(
             MemLoc.L1,
             dtypes.bfloat16,
-            make_layout((width, self.panel_k)),
+            make_layout((self.panel_k, width) if weight_nz else (width, self.panel_k)),
             depth=2,
             data_format="nz",
         )
+        if weight_nz:
+            self.b_l1 = _TransposedWeightRing(self.b_l1)
         self.a_l0 = RingBuffer(
             MemLoc.L0A, dtypes.bfloat16, make_layout((bm, CUBE_BK)), depth=2
         )
@@ -467,6 +579,17 @@ class NzProjection:
             self.a_full = Buffer(MemLoc.L1, dtypes.bfloat16, make_layout((bm, 1024)))
 
     @jit
+    def copy_weight(self, destination, weight, shape, coord, options=None):
+        if self.weight_nz:
+            mem_copy(
+                destination.permute(1, 0),
+                tile_slice(weight, (shape[1], shape[0]), (coord[1], coord[0])),
+                options=options,
+            )
+        else:
+            mem_copy(destination, tile_slice(weight, shape, coord), options=options)
+
+    @jit
     def project_tile(self, a_gm, weight, out_gm, k_total, n_idx, m_tiles, m_begin=0):
         bm = self.bm
         width = self.width
@@ -478,9 +601,11 @@ class NzProjection:
                     tile_slice(a_gm, (bm, self.panel_k), (m_tile, k_idx)),
                     options=copy_options(l2_cache_ctl=self.l2_hint),
                 )
-                mem_copy(
+                self.copy_weight(
                     self.b_l1.next_write(),
-                    tile_slice(weight, (width, self.panel_k), (n_idx, k_idx)),
+                    weight,
+                    (width, self.panel_k),
+                    (n_idx, k_idx),
                     options=copy_options(l2_cache_ctl=self.weight_l2_hint),
                 )
                 a_panel = self.a_l1.next_read()
@@ -618,9 +743,11 @@ class NzProjection:
                 tile_slice(a_gm, (bm, self.panel_k), (m_tile, k_idx)),
                 options=copy_options(l2_cache_ctl=self.l2_hint),
             )
-            mem_copy(
+            self.copy_weight(
                 self.b_l1.next_write(),
-                tile_slice(weight, (width, self.panel_k), (n_idx, k_idx)),
+                weight,
+                (width, self.panel_k),
+                (n_idx, k_idx),
                 options=copy_options(l2_cache_ctl=self.weight_l2_hint),
             )
             a_panel = self.actual_row_view(
@@ -690,9 +817,11 @@ class NzProjection:
                         tile_slice(a_gm, (self.bm, self.panel_k), (m_idx, k_idx)),
                         options=copy_options(l2_cache_ctl=self.l2_hint),
                     )
-                    mem_copy(
+                    self.copy_weight(
                         self.b_l1.next_write(),
-                        tile_slice(weight, (self.width, self.panel_k), (n_idx, k_idx)),
+                        weight,
+                        (self.width, self.panel_k),
+                        (n_idx, k_idx),
                     )
                     a_panel = self.a_l1.next_read()
                     b_panel = self.b_l1.next_read()
@@ -734,9 +863,11 @@ class NzProjection:
                     self.a_l0.next_write(),
                     tile_slice(self.a_full, (self.bm, CUBE_BK), (0, k_idx)),
                 )
-                mem_copy(
+                self.copy_weight(
                     self.b_l1.next_write(),
-                    tile_slice(weight, (self.width, CUBE_BK), (n_idx, k_idx)),
+                    weight,
+                    (self.width, CUBE_BK),
+                    (n_idx, k_idx),
                 )
                 mem_copy(self.b_l0.next_write(), self.b_l1.next_read())
                 matmul(
@@ -786,16 +917,10 @@ class NzProjection:
 
 
 class WkbProjection:
-    def __init__(self, bm, group_columns=False, heads=0):
+    def __init__(self, bm, group_columns=False, heads=0, weight_l2_hint=0):
         self.bm = bm
         self.group_columns = group_columns
-        self.weight_l2_hint = (
-            4
-            if (bm <= 8 or (group_columns and bm <= 64))
-            and isinstance(heads, int)
-            and heads >= 96
-            else 0
-        )
+        self.weight_l2_hint = weight_l2_hint
         self.columns = 4 * CUBE_BK if group_columns else CUBE_BK
         operand_dtype = dtypes.bfloat16
         self.a_l1 = RingBuffer(
@@ -1028,9 +1153,10 @@ class WkbProjection:
 
 
 @jit
-def project_wkb(
+def _wkb_projection_path(
     bm,
-    allow_grouped,
+    group_columns,
+    load_hint,
     q_proj,
     wkb2d,
     q2d,
@@ -1043,28 +1169,42 @@ def project_wkb(
     blocks,
     tokens,
 ):
-    if const_expr(
-        8 < bm <= 64 and allow_grouped and isinstance(heads, int) and heads >= 64
-    ):
-        grouped = WkbProjection(bm, group_columns=True, heads=heads)
-        grouped.project_grid(
-            q_proj,
-            wkb2d,
-            q2d,
-            heads,
-            dn,
-            head_dim,
-            kvr,
-            m_tiles,
-            block,
-            blocks,
-            tokens,
-        )
-    elif bm <= 8 and allow_grouped:
-        # Keep at least two whole-head tasks per launched AIC.
-        if m_tiles * heads >= 2 * blocks:
-            grouped = WkbProjection(bm, group_columns=True, heads=heads)
-            grouped.project_grid(
+    # The preceding AIC phase is complete. Runtime branches are exclusive;
+    # the planner preserves any live AIV resources across this boundary.
+    onchip_rewind(reset_sync_id=True)
+    projection = WkbProjection(
+        bm, group_columns=group_columns, weight_l2_hint=load_hint
+    )
+    projection.project_grid(
+        q_proj, wkb2d, q2d, heads, dn, head_dim, kvr, m_tiles, block, blocks, tokens
+    )
+    cube_sync_all()
+    onchip_rewind(reset_sync_id=True)
+
+
+@jit
+def project_wkb(
+    bm,
+    allow_grouped,
+    load_hint,
+    q_proj,
+    wkb2d,
+    q2d,
+    heads,
+    dn,
+    head_dim,
+    kvr,
+    m_tiles,
+    block,
+    blocks,
+    tokens,
+):
+    if const_expr(8 < bm <= 64 and allow_grouped):
+        if heads >= 64:
+            _wkb_projection_path(
+                bm,
+                True,
+                load_hint,
                 q_proj,
                 wkb2d,
                 q2d,
@@ -1078,8 +1218,45 @@ def project_wkb(
                 tokens,
             )
         else:
-            split = WkbProjection(bm, heads=heads)
-            split.project_grid(
+            _wkb_projection_path(
+                bm,
+                False,
+                0,
+                q_proj,
+                wkb2d,
+                q2d,
+                heads,
+                dn,
+                head_dim,
+                kvr,
+                m_tiles,
+                block,
+                blocks,
+                tokens,
+            )
+    elif const_expr(bm <= 8 and allow_grouped):
+        if m_tiles * heads >= 2 * blocks:
+            _wkb_projection_path(
+                bm,
+                True,
+                load_hint,
+                q_proj,
+                wkb2d,
+                q2d,
+                heads,
+                dn,
+                head_dim,
+                kvr,
+                m_tiles,
+                block,
+                blocks,
+                tokens,
+            )
+        else:
+            _wkb_projection_path(
+                bm,
+                False,
+                load_hint,
                 q_proj,
                 wkb2d,
                 q2d,
@@ -1093,8 +1270,10 @@ def project_wkb(
                 tokens,
             )
     else:
-        split = WkbProjection(bm, heads=heads)
-        split.project_grid(
+        _wkb_projection_path(
+            bm,
+            False,
+            load_hint,
             q_proj,
             wkb2d,
             q2d,
@@ -1152,6 +1331,21 @@ PA_NZ_FP8_PLANE_ELEMS = 32
 
 
 HIF8_MAX = 32768.0
+
+
+@jit
+def _cast_hif8(value):
+    mask = full_mask()
+    zero = vdups(0.0, dtypes.float32, mask=mask)
+    value = vselect(value, zero, cond_mask=veq(value, value, mask=mask))
+    value = vmins(vmaxs(value, -HIF8_MAX, mask=mask), HIF8_MAX, mask=mask)
+    return vcast(
+        value,
+        dtypes.hifloat8,
+        mask=mask,
+        rounding=RoundingMode.RNA,
+        reg_layout=RegLayout.ZERO,
+    )
 
 
 AMAX_VECTOR_LANES = 64
@@ -1949,15 +2143,7 @@ class KvChain:
                 )
                 normalized = vmuls(normalized, kvr_scale, mask=full_mask())
                 scaled = vmul(normalized, scale_vec, mask=full_mask())
-                scaled = vmaxs(scaled, -HIF8_MAX, mask=full_mask())
-                scaled = vmins(scaled, HIF8_MAX, mask=full_mask())
-                h8 = vcast(
-                    scaled,
-                    dtypes.hifloat8,
-                    mask=full_mask(),
-                    rounding=RoundingMode.RNA,
-                    reg_layout=RegLayout.ZERO,
-                )
+                h8 = _cast_hif8(scaled)
                 vstore_pack(
                     payload_write,
                     segment * VECTOR_SEG,
@@ -1968,15 +2154,7 @@ class KvChain:
             kr_mask = update_mask(rope_dim, elem_bits=32)[0]
             kr_value = vload(kr_read, kr_offset)
             kr_scaled = vmul(kr_value, scale_vec, mask=full_mask())
-            kr_scaled = vmaxs(kr_scaled, -HIF8_MAX, mask=full_mask())
-            kr_scaled = vmins(kr_scaled, HIF8_MAX, mask=full_mask())
-            kr_h8 = vcast(
-                kr_scaled,
-                dtypes.hifloat8,
-                mask=full_mask(),
-                rounding=RoundingMode.RNA,
-                reg_layout=RegLayout.ZERO,
-            )
+            kr_h8 = _cast_hif8(kr_scaled)
             vstore_pack(
                 payload_write,
                 VECTOR_KV_LORA,
@@ -2256,8 +2434,9 @@ class QHeadBatch:
         start,
         stride,
         rows,
+        batch_heads,
     ):
-        groups = heads // self.batch_heads
+        groups = heads // batch_heads
         for item in cannbotdsl.range(start, rows * groups, stride):
             token = item // groups
             group = item % groups
@@ -2267,14 +2446,19 @@ class QHeadBatch:
             dst_heads = q2d[token : token + 1, 0 : heads * kvr].view((heads, kvr))
             sin_read = self.rope.load_table(rope_sin, token)
             cos_read = self.rope.load_table(rope_cos, token)
-            source = tile_slice(src_heads, (self.batch_heads, head_dim), (group, 0))
+            source = tile_slice(
+                src_heads,
+                make_tiler((batch_heads, head_dim), alignment=(1, 64)),
+                (group, 0),
+            )
             mem_copy(
-                self.src.next_write(), source[0 : self.batch_heads, nope_dim:head_dim]
+                tile_slice(self.src.next_write(), (batch_heads, VECTOR_SEG), (0, 0)),
+                source[0:batch_heads, nope_dim:head_dim],
             )
             src_read = self.src.next_read()
             with vf(mode="simd"):
                 zero = vdups(0.0, dtypes.float32, mask=full_mask())
-                for head in range_constexpr(self.batch_heads):
+                for head in range_constexpr(batch_heads):
                     value = vload_unpack(
                         src_read, head * VECTOR_SEG, unpack_mode=UnpackMode.B16_TO_B32
                     )
@@ -2294,7 +2478,7 @@ class QHeadBatch:
                     cos_high = vload(cos_read, HALF)
                     sin_low = vload(sin_read, 0)
                     sin_high = vload(sin_read, HALF)
-                    for head in range_constexpr(self.batch_heads):
+                    for head in range_constexpr(batch_heads):
                         (first, second) = vload_deinterleave(self.zpad, head * PAD_SEG)
                         lower = vsub(
                             vmul(first, cos_low, mask=half),
@@ -2338,7 +2522,7 @@ class QHeadBatch:
                     cos_high = vload(cos_read, HALF)
                     sin_low = vload(sin_read, 0)
                     sin_high = vload(sin_read, HALF)
-                    for head in range_constexpr(self.batch_heads):
+                    for head in range_constexpr(batch_heads):
                         first = vload(self.zpad, head * PAD_SEG)
                         second = vload(self.zpad, head * PAD_SEG + HALF)
                         lower = vsub(
@@ -2376,10 +2560,12 @@ class QHeadBatch:
                             pack_mode=PackMode.B32_TO_B16,
                         )
                     vmem_bar(mode="vst_vld")
-            destination = tile_slice(dst_heads, (self.batch_heads, kvr), (group, 0))
+            destination = tile_slice(
+                dst_heads, make_tiler((batch_heads, kvr), alignment=(1, 64)), (group, 0)
+            )
             mem_copy(
-                destination[0 : self.batch_heads, VECTOR_KV_LORA:kvr],
-                self.dst.next_read(),
+                destination[0:batch_heads, VECTOR_KV_LORA:kvr],
+                tile_slice(self.dst.next_read(), (batch_heads, VECTOR_SEG), (0, 0)),
             )
 
 
@@ -2390,10 +2576,12 @@ class QTailCopy:
         input_dtype=dtypes.float32,
         batch_capable=False,
         head_batch=ROPE_HEAD_BATCH,
+        batch_min_heads=0,
     ):
         self.bf16_input = input_dtype == dtypes.bfloat16
         self.batch_capable = batch_capable
         self.head_batch_size = head_batch
+        self.batch_min_heads = batch_min_heads
         if batch_capable:
             self.head_batch = QHeadBatch(head_batch)
         self.src = RingBuffer(
@@ -2485,22 +2673,57 @@ class QTailCopy:
         stride,
         rows,
     ):
-        if self.batch_capable:
-            if rows * (heads // self.head_batch_size) >= stride:
-                self.head_batch.process_rows_rope(
-                    q_proj,
-                    q2d,
-                    rope_sin,
-                    rope_cos,
-                    rope_mode,
-                    heads,
-                    nope_dim,
-                    head_dim,
-                    kvr,
-                    start,
-                    stride,
-                    rows,
-                )
+        if const_expr(self.batch_capable):
+            if heads >= self.batch_min_heads and heads % ROPE_HEAD_BATCH == 0:
+                if const_expr(self.head_batch_size == 8):
+                    if heads % 8 == 0:
+                        self.process_rows_rope_batch(
+                            q_proj,
+                            q2d,
+                            rope_sin,
+                            rope_cos,
+                            rope_mode,
+                            heads,
+                            nope_dim,
+                            head_dim,
+                            kvr,
+                            start,
+                            stride,
+                            rows,
+                            8,
+                        )
+                    else:
+                        self.process_rows_rope_batch(
+                            q_proj,
+                            q2d,
+                            rope_sin,
+                            rope_cos,
+                            rope_mode,
+                            heads,
+                            nope_dim,
+                            head_dim,
+                            kvr,
+                            start,
+                            stride,
+                            rows,
+                            ROPE_HEAD_BATCH,
+                        )
+                else:
+                    self.process_rows_rope_batch(
+                        q_proj,
+                        q2d,
+                        rope_sin,
+                        rope_cos,
+                        rope_mode,
+                        heads,
+                        nope_dim,
+                        head_dim,
+                        kvr,
+                        start,
+                        stride,
+                        rows,
+                        ROPE_HEAD_BATCH,
+                    )
             else:
                 self.process_rows_rope_scalar(
                     q_proj,
@@ -2516,6 +2739,55 @@ class QTailCopy:
                     stride,
                     rows,
                 )
+        else:
+            self.process_rows_rope_scalar(
+                q_proj,
+                q2d,
+                rope_sin,
+                rope_cos,
+                rope_mode,
+                heads,
+                nope_dim,
+                head_dim,
+                kvr,
+                start,
+                stride,
+                rows,
+            )
+
+    @jit
+    def process_rows_rope_batch(
+        self,
+        q_proj,
+        q2d,
+        rope_sin,
+        rope_cos,
+        rope_mode,
+        heads,
+        nope_dim,
+        head_dim,
+        kvr,
+        start,
+        stride,
+        rows,
+        batch_heads,
+    ):
+        if rows * (heads // batch_heads) >= stride:
+            self.head_batch.process_rows_rope(
+                q_proj,
+                q2d,
+                rope_sin,
+                rope_cos,
+                rope_mode,
+                heads,
+                nope_dim,
+                head_dim,
+                kvr,
+                start,
+                stride,
+                rows,
+                batch_heads,
+            )
         else:
             self.process_rows_rope_scalar(
                 q_proj,
@@ -2786,14 +3058,30 @@ class QAmaxStage:
         self.scalar = Buffer(MemLoc.UB, dtypes.float32, make_layout((1, 8)))
 
     @jit
-    def partial_amax(self, q_fp2d, ws_amax, heads, kvr, block, blocks, rows):
+    def partial_amax(
+        self, q_fp2d, ws_amax, heads, kvr, block, blocks, rows, accumulate=False
+    ):
         row_tiler = make_tiler((1, kvr), alignment=(1, VECTOR_SEG))
         ws_col = ws_amax.view((ws_amax.shape[0], 1))
         w_init = self.carry.next_write()
-        with vf(mode="simd"):
-            vstore(w_init, 0, vdups(0.0, dtypes.float32, mask=full_mask()), full_mask())
-            vstore_first(self.scalar, 0, vdups(0.0, dtypes.float32, mask=full_mask()))
-            vmem_bar(mode="vst_vld")
+        if accumulate:
+            mem_copy(
+                tile_slice(w_init, (1, 1), (0, 0)),
+                tile_slice(ws_col, (1, 1), (block, 0)),
+            )
+            mem_copy(
+                tile_slice(self.scalar, (1, 1), (0, 0)),
+                tile_slice(ws_col, (1, 1), (block, 0)),
+            )
+        else:
+            with vf(mode="simd"):
+                vstore(
+                    w_init, 0, vdups(0.0, dtypes.float32, mask=full_mask()), full_mask()
+                )
+                vstore_first(
+                    self.scalar, 0, vdups(0.0, dtypes.float32, mask=full_mask())
+                )
+                vmem_bar(mode="vst_vld")
         for r in cannbotdsl.range(block, rows, blocks):
             token = r // heads
             head = r % heads
@@ -2929,15 +3217,7 @@ class QGlobalQuant:
                         value, denom_vec, mask=full_mask(), precision_mode=True
                     )
                     normalized = vselect(zeros_vec, normalized, cond_mask=zero_full)
-                    normalized = vmaxs(normalized, -HIF8_MAX, mask=full_mask())
-                    normalized = vmins(normalized, HIF8_MAX, mask=full_mask())
-                    h8 = vcast(
-                        normalized,
-                        dtypes.hifloat8,
-                        mask=full_mask(),
-                        rounding=RoundingMode.RNA,
-                        reg_layout=RegLayout.ZERO,
-                    )
+                    h8 = _cast_hif8(normalized)
                     vstore_pack(
                         payload_write,
                         segment,
@@ -3094,6 +3374,7 @@ ROPE_QR_KERNEL_ARGUMENTS = (
     "qr",
     "ws_x_pad",
     "ws_qa_raw",
+    "ws_qa_fp32",
     "ws_kva_raw",
     "ws_q_proj",
     "ws_qb_aux",
@@ -3240,6 +3521,7 @@ M2_ROPE_QR_KERNEL_ARGUMENTS = (
     "qr",
     "ws_x_pad",
     "ws_qa_raw",
+    "ws_qa_fp32",
     "ws_kva_raw",
     "ws_q_proj",
     "ws_q_fp",
@@ -3393,6 +3675,7 @@ M3_ROPE_QR_KERNEL_ARGUMENTS = (
     "qr",
     "ws_x_pad",
     "ws_qa_raw",
+    "ws_qa_fp32",
     "ws_kva_raw",
     "ws_q_proj",
     "ws_q_fp",
@@ -3520,6 +3803,54 @@ M3_ROPE_QR_HOST_ANNOTATIONS = dict(M3_ROPE_QR_KERNEL_ANNOTATIONS)
 M3_ROPE_QR_HOST_ANNOTATIONS["core_num"] = dtypes.int64
 
 
+ROPE_QR_KERNEL_ARGUMENTS += (
+    "front_load_hint",
+    "qb_columns",
+    "qb_load_hint",
+    "wkb_load_hint",
+)
+ROPE_QR_KERNEL_ANNOTATIONS.update(
+    {
+        name: dtypes.int32
+        for name in ("front_load_hint", "qb_columns", "qb_load_hint", "wkb_load_hint")
+    }
+)
+ROPE_QR_HOST_ARGUMENTS = ROPE_QR_KERNEL_ARGUMENTS + ("core_num",)
+ROPE_QR_HOST_ANNOTATIONS = dict(ROPE_QR_KERNEL_ANNOTATIONS, core_num=dtypes.int64)
+
+
+M2_ROPE_QR_KERNEL_ARGUMENTS += (
+    "front_load_hint",
+    "qb_columns",
+    "qb_load_hint",
+    "wkb_load_hint",
+)
+M2_ROPE_QR_KERNEL_ANNOTATIONS.update(
+    {
+        name: dtypes.int32
+        for name in ("front_load_hint", "qb_columns", "qb_load_hint", "wkb_load_hint")
+    }
+)
+M2_ROPE_QR_HOST_ARGUMENTS = M2_ROPE_QR_KERNEL_ARGUMENTS + ("core_num",)
+M2_ROPE_QR_HOST_ANNOTATIONS = dict(M2_ROPE_QR_KERNEL_ANNOTATIONS, core_num=dtypes.int64)
+
+
+M3_ROPE_QR_KERNEL_ARGUMENTS += (
+    "front_load_hint",
+    "qb_columns",
+    "qb_load_hint",
+    "wkb_load_hint",
+)
+M3_ROPE_QR_KERNEL_ANNOTATIONS.update(
+    {
+        name: dtypes.int32
+        for name in ("front_load_hint", "qb_columns", "qb_load_hint", "wkb_load_hint")
+    }
+)
+M3_ROPE_QR_HOST_ARGUMENTS = M3_ROPE_QR_KERNEL_ARGUMENTS + ("core_num",)
+M3_ROPE_QR_HOST_ANNOTATIONS = dict(M3_ROPE_QR_KERNEL_ANNOTATIONS, core_num=dtypes.int64)
+
+
 def _surface_signature(names, annotations):
     def decorate(function):
         parameters = [
@@ -3540,6 +3871,1294 @@ def _surface_signature(names, annotations):
 
 
 # All modes use BF16 CQ and WQB output; every Matmul accumulates in FP32 L0C.
+# RoPE buffers are planned for the enabled path; runtime flags control execution.
+_SCRATCH_TOKEN_CAPACITY = 1024
+_SCRATCH_MIN_CHUNK_ROWS = 128
+_SCRATCH_TARGET_BYTES = 32 * 1024 * 1024
+
+
+def _scratch_token_rows(rows, meta):
+    if rows <= _SCRATCH_TOKEN_CAPACITY:
+        return rows
+    row_bytes = (
+        2 * max(_ceil_align(meta.q_lora, BN), _ceil_align(meta.rows_qb, BN))
+        + 2 * _ceil_align(meta.kvr, BN)
+        + 2 * meta.q_lora
+        + 2 * meta.dim
+    )
+    if meta.qkv_quant_mode in (2, 3):
+        row_bytes += 4 * meta.heads * meta.kvr
+    capacity = _SCRATCH_TOKEN_CAPACITY
+    while (
+        capacity > _SCRATCH_MIN_CHUNK_ROWS
+        and capacity * row_bytes > _SCRATCH_TARGET_BYTES
+    ):
+        capacity //= 2
+    return min(rows, capacity)
+
+
+def _recompute_global_q(meta, rows):
+    return (
+        meta.qkv_quant_mode == 3
+        and rows > _scratch_token_rows(rows, meta)
+        and rows * meta.heads * meta.kvr * ITEM_F32 > _SCRATCH_TARGET_BYTES
+        and (
+            meta.return_qr or meta.q_lora * ITEM_A16 < meta.heads * meta.kvr * ITEM_F32
+        )
+    )
+
+
+@jit
+def _chunk_rows_2d(tensor, rows):
+    return tile_slice(
+        tensor, make_tiler((rows, tensor.shape[1]), alignment=(1, 1)), (0, 0)
+    )
+
+
+@jit
+def _token_chunk(tensor, chunk, rows, capacity):
+    if const_expr(len(tensor.shape) == 1):
+        window = tile_slice(tensor, make_tiler((capacity,), alignment=(1,)), (chunk,))
+        return tile_slice(window, make_tiler((rows,), alignment=(1,)), (0,))
+    elif const_expr(len(tensor.shape) == 2):
+        window = tile_slice(
+            tensor,
+            make_tiler((capacity, tensor.shape[1]), alignment=(1, 1)),
+            (chunk, 0),
+        )
+        return _chunk_rows_2d(window, rows)
+    else:
+        window = tile_slice(
+            tensor,
+            make_tiler(
+                (capacity, tensor.shape[1], tensor.shape[2]), alignment=(1, 1, 1)
+            ),
+            (chunk, 0, 0),
+        )
+        return tile_slice(
+            window,
+            make_tiler((rows, tensor.shape[1], tensor.shape[2]), alignment=(1, 1, 1)),
+            (0, 0, 0),
+        )
+
+
+_QB_RUNTIME_WIDTHS = (96, 128, 192, 256)
+
+
+@jit
+def _qb_projection_path(
+    bm,
+    width,
+    load_hint,
+    allow_wide,
+    a_gm,
+    weight,
+    out_gm,
+    q_lora,
+    rows_qb,
+    m_tiles,
+    block,
+    blocks,
+):
+    onchip_rewind(reset_sync_id=True)
+    panel_k = (
+        (512 if width <= 192 else NZ_PANEL_K)
+        if bm <= QB_WIDE_PANEL_MAX_ROWS and q_lora != 640
+        else (
+            NZ_PANEL_K
+            if bm <= QB_MEDIUM_PANEL_MAX_ROWS and q_lora != 640 and allow_wide
+            else CUBE_BK
+        )
+    )
+    projection = NzProjection(bm, width, 1, weight_l2_hint=load_hint, panel_k=panel_k)
+    projection.project_owner(
+        a_gm, weight, out_gm, q_lora, rows_qb, m_tiles, block, blocks
+    )
+    cube_sync_all()
+    onchip_rewind(reset_sync_id=True)
+
+
+@jit
+def _qb_runtime_path(
+    bm,
+    columns,
+    load_hint,
+    allow_wide,
+    a_gm,
+    weight,
+    out_gm,
+    q_lora,
+    rows_qb,
+    m_tiles,
+    block,
+    blocks,
+):
+    # Structural if/elif exclusivity is required for Buffer-ID/address reuse.
+    if columns == 96:
+        _qb_projection_path(
+            bm,
+            96,
+            load_hint,
+            allow_wide,
+            a_gm,
+            weight,
+            out_gm,
+            q_lora,
+            rows_qb,
+            m_tiles,
+            block,
+            blocks,
+        )
+    elif columns == 128:
+        _qb_projection_path(
+            bm,
+            128,
+            load_hint,
+            allow_wide,
+            a_gm,
+            weight,
+            out_gm,
+            q_lora,
+            rows_qb,
+            m_tiles,
+            block,
+            blocks,
+        )
+    elif const_expr(allow_wide):
+        if columns == 192:
+            _qb_projection_path(
+                bm,
+                192,
+                load_hint,
+                allow_wide,
+                a_gm,
+                weight,
+                out_gm,
+                q_lora,
+                rows_qb,
+                m_tiles,
+                block,
+                blocks,
+            )
+        else:
+            _qb_projection_path(
+                bm,
+                256,
+                load_hint,
+                allow_wide,
+                a_gm,
+                weight,
+                out_gm,
+                q_lora,
+                rows_qb,
+                m_tiles,
+                block,
+                blocks,
+            )
+
+
+@jit
+def _qb_grouped_path(
+    bm, head_width, a_gm, weight, out_gm, q_lora, rows_qb, m_tiles, block, blocks
+):
+    onchip_rewind(reset_sync_id=True)
+    projection = QbFourHeads(bm, head_width, q_lora)
+    projection.project_owner(a_gm, weight, out_gm, rows_qb, m_tiles, block, blocks)
+    cube_sync_all()
+    onchip_rewind(reset_sync_id=True)
+
+
+# Dispatch outside the token loop so mutually exclusive schedules have
+# independent Buffer-ID lifetimes while sharing one Native entry.
+@jit
+def _run_all_profiles(
+    bm,
+    x,
+    wqa,
+    wqb,
+    wkva,
+    wkb,
+    norm_weight_qa,
+    norm_weight_kva,
+    kv_cache,
+    cache_index,
+    rope_sin,
+    rope_cos,
+    q,
+    qr,
+    ws_x_pad,
+    ws_qa_raw,
+    ws_qa_fp32,
+    ws_kva_raw,
+    ws_q_proj,
+    ws_qb_aux,
+    norm_eps,
+    qr_scale,
+    kvr_scale,
+    cache_mode,
+    rope_mode,
+    rope_active,
+    return_qr,
+    nz_active,
+    nz_wfront,
+    nz_wqb,
+    head_hint,
+    head_width,
+    scale_gm,
+    descale_q,
+    ws_q_fp,
+    is_fp8_tensor_quant,
+    ws_amax,
+    is_hif8_quant,
+    front_load_hint,
+    qb_columns,
+    qb_load_hint,
+    wkb_load_hint,
+):
+    if x.shape[0] <= 8:
+        if const_expr(nz_active):
+            if const_expr(wqa.shape[1] == 1536):
+                onchip_rewind(reset_sync_id=True)
+                _run_schedule(
+                    8,
+                    x,
+                    wqa,
+                    wqb,
+                    wkva,
+                    wkb,
+                    norm_weight_qa,
+                    norm_weight_kva,
+                    kv_cache,
+                    cache_index,
+                    rope_sin,
+                    rope_cos,
+                    q,
+                    qr,
+                    ws_x_pad,
+                    ws_qa_raw,
+                    ws_kva_raw,
+                    ws_q_proj,
+                    ws_qb_aux,
+                    norm_eps,
+                    qr_scale,
+                    kvr_scale,
+                    cache_mode,
+                    rope_mode,
+                    rope_active,
+                    return_qr,
+                    nz_active,
+                    48,
+                    nz_wqb,
+                    head_hint,
+                    head_width,
+                    scale_gm,
+                    descale_q,
+                    ws_q_fp,
+                    is_fp8_tensor_quant,
+                    ws_amax,
+                    is_hif8_quant,
+                    front_load_hint,
+                    qb_columns,
+                    qb_load_hint,
+                    wkb_load_hint,
+                )
+            elif const_expr(wqa.shape[1] == 640 or wqa.shape[1] == 1024):
+                onchip_rewind(reset_sync_id=True)
+                _run_schedule(
+                    8,
+                    x,
+                    wqa,
+                    wqb,
+                    wkva,
+                    wkb,
+                    norm_weight_qa,
+                    norm_weight_kva,
+                    kv_cache,
+                    cache_index,
+                    rope_sin,
+                    rope_cos,
+                    q,
+                    qr,
+                    ws_x_pad,
+                    ws_qa_raw,
+                    ws_kva_raw,
+                    ws_q_proj,
+                    ws_qb_aux,
+                    norm_eps,
+                    qr_scale,
+                    kvr_scale,
+                    cache_mode,
+                    rope_mode,
+                    rope_active,
+                    return_qr,
+                    nz_active,
+                    32,
+                    nz_wqb,
+                    head_hint,
+                    head_width,
+                    scale_gm,
+                    descale_q,
+                    ws_q_fp,
+                    is_fp8_tensor_quant,
+                    ws_amax,
+                    is_hif8_quant,
+                    front_load_hint,
+                    qb_columns,
+                    qb_load_hint,
+                    wkb_load_hint,
+                )
+            else:
+                onchip_rewind(reset_sync_id=True)
+                _run_schedule(
+                    8,
+                    x,
+                    wqa,
+                    wqb,
+                    wkva,
+                    wkb,
+                    norm_weight_qa,
+                    norm_weight_kva,
+                    kv_cache,
+                    cache_index,
+                    rope_sin,
+                    rope_cos,
+                    q,
+                    qr,
+                    ws_x_pad,
+                    ws_qa_raw,
+                    ws_kva_raw,
+                    ws_q_proj,
+                    ws_qb_aux,
+                    norm_eps,
+                    qr_scale,
+                    kvr_scale,
+                    cache_mode,
+                    rope_mode,
+                    rope_active,
+                    return_qr,
+                    nz_active,
+                    64,
+                    nz_wqb,
+                    head_hint,
+                    head_width,
+                    scale_gm,
+                    descale_q,
+                    ws_q_fp,
+                    is_fp8_tensor_quant,
+                    ws_amax,
+                    is_hif8_quant,
+                    front_load_hint,
+                    qb_columns,
+                    qb_load_hint,
+                    wkb_load_hint,
+                )
+        else:
+            onchip_rewind(reset_sync_id=True)
+            _run_schedule(
+                8,
+                x,
+                wqa,
+                wqb,
+                wkva,
+                wkb,
+                norm_weight_qa,
+                norm_weight_kva,
+                kv_cache,
+                cache_index,
+                rope_sin,
+                rope_cos,
+                q,
+                qr,
+                ws_x_pad,
+                ws_qa_fp32,
+                ws_kva_raw,
+                ws_q_proj,
+                ws_qb_aux,
+                norm_eps,
+                qr_scale,
+                kvr_scale,
+                cache_mode,
+                rope_mode,
+                rope_active,
+                return_qr,
+                nz_active,
+                64,
+                nz_wqb,
+                head_hint,
+                head_width,
+                scale_gm,
+                descale_q,
+                ws_q_fp,
+                is_fp8_tensor_quant,
+                ws_amax,
+                is_hif8_quant,
+                front_load_hint,
+                qb_columns,
+                qb_load_hint,
+                wkb_load_hint,
+            )
+    elif x.shape[0] <= 32:
+        if const_expr(
+            nz_active and kv_cache.dtype == dtypes.bfloat16 and (wqa.shape[1] == 1536)
+        ):
+            onchip_rewind(reset_sync_id=True)
+            _run_schedule(
+                32,
+                x,
+                wqa,
+                wqb,
+                wkva,
+                wkb,
+                norm_weight_qa,
+                norm_weight_kva,
+                kv_cache,
+                cache_index,
+                rope_sin,
+                rope_cos,
+                q,
+                qr,
+                ws_x_pad,
+                ws_qa_fp32,
+                ws_kva_raw,
+                ws_q_proj,
+                ws_qb_aux,
+                norm_eps,
+                qr_scale,
+                kvr_scale,
+                cache_mode,
+                rope_mode,
+                rope_active,
+                return_qr,
+                nz_active,
+                64,
+                nz_wqb,
+                head_hint,
+                head_width,
+                scale_gm,
+                descale_q,
+                ws_q_fp,
+                is_fp8_tensor_quant,
+                ws_amax,
+                is_hif8_quant,
+                front_load_hint,
+                qb_columns,
+                qb_load_hint,
+                wkb_load_hint,
+            )
+        else:
+            onchip_rewind(reset_sync_id=True)
+            _run_schedule(
+                32,
+                x,
+                wqa,
+                wqb,
+                wkva,
+                wkb,
+                norm_weight_qa,
+                norm_weight_kva,
+                kv_cache,
+                cache_index,
+                rope_sin,
+                rope_cos,
+                q,
+                qr,
+                ws_x_pad,
+                ws_qa_raw,
+                ws_kva_raw,
+                ws_q_proj,
+                ws_qb_aux,
+                norm_eps,
+                qr_scale,
+                kvr_scale,
+                cache_mode,
+                rope_mode,
+                rope_active,
+                return_qr,
+                nz_active,
+                64,
+                nz_wqb,
+                head_hint,
+                head_width,
+                scale_gm,
+                descale_q,
+                ws_q_fp,
+                is_fp8_tensor_quant,
+                ws_amax,
+                is_hif8_quant,
+                front_load_hint,
+                qb_columns,
+                qb_load_hint,
+                wkb_load_hint,
+            )
+    elif x.shape[0] <= 64:
+        if const_expr(
+            nz_active and kv_cache.dtype == dtypes.bfloat16 and (wqa.shape[1] == 1536)
+        ):
+            onchip_rewind(reset_sync_id=True)
+            _run_schedule(
+                64,
+                x,
+                wqa,
+                wqb,
+                wkva,
+                wkb,
+                norm_weight_qa,
+                norm_weight_kva,
+                kv_cache,
+                cache_index,
+                rope_sin,
+                rope_cos,
+                q,
+                qr,
+                ws_x_pad,
+                ws_qa_fp32,
+                ws_kva_raw,
+                ws_q_proj,
+                ws_qb_aux,
+                norm_eps,
+                qr_scale,
+                kvr_scale,
+                cache_mode,
+                rope_mode,
+                rope_active,
+                return_qr,
+                nz_active,
+                64,
+                nz_wqb,
+                head_hint,
+                head_width,
+                scale_gm,
+                descale_q,
+                ws_q_fp,
+                is_fp8_tensor_quant,
+                ws_amax,
+                is_hif8_quant,
+                front_load_hint,
+                qb_columns,
+                qb_load_hint,
+                wkb_load_hint,
+            )
+        else:
+            onchip_rewind(reset_sync_id=True)
+            _run_schedule(
+                64,
+                x,
+                wqa,
+                wqb,
+                wkva,
+                wkb,
+                norm_weight_qa,
+                norm_weight_kva,
+                kv_cache,
+                cache_index,
+                rope_sin,
+                rope_cos,
+                q,
+                qr,
+                ws_x_pad,
+                ws_qa_raw,
+                ws_kva_raw,
+                ws_q_proj,
+                ws_qb_aux,
+                norm_eps,
+                qr_scale,
+                kvr_scale,
+                cache_mode,
+                rope_mode,
+                rope_active,
+                return_qr,
+                nz_active,
+                64,
+                nz_wqb,
+                head_hint,
+                head_width,
+                scale_gm,
+                descale_q,
+                ws_q_fp,
+                is_fp8_tensor_quant,
+                ws_amax,
+                is_hif8_quant,
+                front_load_hint,
+                qb_columns,
+                qb_load_hint,
+                wkb_load_hint,
+            )
+    else:
+        onchip_rewind(reset_sync_id=True)
+        _run_schedule(
+            128,
+            x,
+            wqa,
+            wqb,
+            wkva,
+            wkb,
+            norm_weight_qa,
+            norm_weight_kva,
+            kv_cache,
+            cache_index,
+            rope_sin,
+            rope_cos,
+            q,
+            qr,
+            ws_x_pad,
+            ws_qa_raw,
+            ws_kva_raw,
+            ws_q_proj,
+            ws_qb_aux,
+            norm_eps,
+            qr_scale,
+            kvr_scale,
+            cache_mode,
+            rope_mode,
+            rope_active,
+            return_qr,
+            nz_active,
+            128,
+            nz_wqb,
+            head_hint,
+            head_width,
+            scale_gm,
+            descale_q,
+            ws_q_fp,
+            is_fp8_tensor_quant,
+            ws_amax,
+            is_hif8_quant,
+            front_load_hint,
+            qb_columns,
+            qb_load_hint,
+            wkb_load_hint,
+        )
+
+
+@jit
+def _run_schedule(
+    bm,
+    x,
+    wqa,
+    wqb,
+    wkva,
+    wkb,
+    norm_weight_qa,
+    norm_weight_kva,
+    kv_cache,
+    cache_index,
+    rope_sin,
+    rope_cos,
+    q,
+    qr,
+    ws_x_pad,
+    ws_qa_raw,
+    ws_kva_raw,
+    ws_q_proj,
+    ws_qb_aux,
+    norm_eps,
+    qr_scale,
+    kvr_scale,
+    cache_mode,
+    rope_mode,
+    rope_active,
+    return_qr,
+    nz_active,
+    nz_wfront,
+    nz_wqb,
+    head_hint,
+    head_width,
+    scale_gm,
+    descale_q,
+    ws_q_fp,
+    is_fp8_tensor_quant,
+    ws_amax,
+    is_hif8_quant,
+    front_load_hint,
+    qb_columns,
+    qb_load_hint,
+    wkb_load_hint,
+):
+    if const_expr(bm == 8):
+        if x.shape[0] == 1:
+            _run_schedule_impl(
+                1,
+                x,
+                wqa,
+                wqb,
+                wkva,
+                wkb,
+                norm_weight_qa,
+                norm_weight_kva,
+                kv_cache,
+                cache_index,
+                rope_sin,
+                rope_cos,
+                q,
+                qr,
+                ws_x_pad,
+                ws_qa_raw,
+                ws_kva_raw,
+                ws_q_proj,
+                ws_qb_aux,
+                norm_eps,
+                qr_scale,
+                kvr_scale,
+                cache_mode,
+                rope_mode,
+                rope_active,
+                return_qr,
+                nz_active,
+                nz_wfront,
+                nz_wqb,
+                head_hint,
+                head_width,
+                scale_gm,
+                descale_q,
+                ws_q_fp,
+                is_fp8_tensor_quant,
+                ws_amax,
+                is_hif8_quant,
+                front_load_hint,
+                qb_columns,
+                qb_load_hint,
+                wkb_load_hint,
+            )
+        else:
+            _run_schedule_impl(
+                8,
+                x,
+                wqa,
+                wqb,
+                wkva,
+                wkb,
+                norm_weight_qa,
+                norm_weight_kva,
+                kv_cache,
+                cache_index,
+                rope_sin,
+                rope_cos,
+                q,
+                qr,
+                ws_x_pad,
+                ws_qa_raw,
+                ws_kva_raw,
+                ws_q_proj,
+                ws_qb_aux,
+                norm_eps,
+                qr_scale,
+                kvr_scale,
+                cache_mode,
+                rope_mode,
+                rope_active,
+                return_qr,
+                nz_active,
+                nz_wfront,
+                nz_wqb,
+                head_hint,
+                head_width,
+                scale_gm,
+                descale_q,
+                ws_q_fp,
+                is_fp8_tensor_quant,
+                ws_amax,
+                is_hif8_quant,
+                front_load_hint,
+                qb_columns,
+                qb_load_hint,
+                wkb_load_hint,
+            )
+    elif const_expr(bm == 32):
+        if x.shape[0] <= 16:
+            _run_schedule_impl(
+                16,
+                x,
+                wqa,
+                wqb,
+                wkva,
+                wkb,
+                norm_weight_qa,
+                norm_weight_kva,
+                kv_cache,
+                cache_index,
+                rope_sin,
+                rope_cos,
+                q,
+                qr,
+                ws_x_pad,
+                ws_qa_raw,
+                ws_kva_raw,
+                ws_q_proj,
+                ws_qb_aux,
+                norm_eps,
+                qr_scale,
+                kvr_scale,
+                cache_mode,
+                rope_mode,
+                rope_active,
+                return_qr,
+                nz_active,
+                nz_wfront,
+                nz_wqb,
+                head_hint,
+                head_width,
+                scale_gm,
+                descale_q,
+                ws_q_fp,
+                is_fp8_tensor_quant,
+                ws_amax,
+                is_hif8_quant,
+                front_load_hint,
+                qb_columns,
+                qb_load_hint,
+                wkb_load_hint,
+            )
+        else:
+            _run_schedule_impl(
+                32,
+                x,
+                wqa,
+                wqb,
+                wkva,
+                wkb,
+                norm_weight_qa,
+                norm_weight_kva,
+                kv_cache,
+                cache_index,
+                rope_sin,
+                rope_cos,
+                q,
+                qr,
+                ws_x_pad,
+                ws_qa_raw,
+                ws_kva_raw,
+                ws_q_proj,
+                ws_qb_aux,
+                norm_eps,
+                qr_scale,
+                kvr_scale,
+                cache_mode,
+                rope_mode,
+                rope_active,
+                return_qr,
+                nz_active,
+                nz_wfront,
+                nz_wqb,
+                head_hint,
+                head_width,
+                scale_gm,
+                descale_q,
+                ws_q_fp,
+                is_fp8_tensor_quant,
+                ws_amax,
+                is_hif8_quant,
+                front_load_hint,
+                qb_columns,
+                qb_load_hint,
+                wkb_load_hint,
+            )
+    elif const_expr(bm == 128):
+        if x.shape[0] <= 128:
+            _run_schedule_impl(
+                128,
+                x,
+                wqa,
+                wqb,
+                wkva,
+                wkb,
+                norm_weight_qa,
+                norm_weight_kva,
+                kv_cache,
+                cache_index,
+                rope_sin,
+                rope_cos,
+                q,
+                qr,
+                ws_x_pad,
+                ws_qa_raw,
+                ws_kva_raw,
+                ws_q_proj,
+                ws_qb_aux,
+                norm_eps,
+                qr_scale,
+                kvr_scale,
+                cache_mode,
+                rope_mode,
+                rope_active,
+                return_qr,
+                nz_active,
+                64,
+                nz_wqb,
+                head_hint,
+                head_width,
+                scale_gm,
+                descale_q,
+                ws_q_fp,
+                is_fp8_tensor_quant,
+                ws_amax,
+                is_hif8_quant,
+                front_load_hint,
+                qb_columns,
+                qb_load_hint,
+                wkb_load_hint,
+            )
+        else:
+            _run_schedule_impl(
+                128,
+                x,
+                wqa,
+                wqb,
+                wkva,
+                wkb,
+                norm_weight_qa,
+                norm_weight_kva,
+                kv_cache,
+                cache_index,
+                rope_sin,
+                rope_cos,
+                q,
+                qr,
+                ws_x_pad,
+                ws_qa_raw,
+                ws_kva_raw,
+                ws_q_proj,
+                ws_qb_aux,
+                norm_eps,
+                qr_scale,
+                kvr_scale,
+                cache_mode,
+                rope_mode,
+                rope_active,
+                return_qr,
+                nz_active,
+                128,
+                nz_wqb,
+                head_hint,
+                head_width,
+                scale_gm,
+                descale_q,
+                ws_q_fp,
+                is_fp8_tensor_quant,
+                ws_amax,
+                is_hif8_quant,
+                front_load_hint,
+                qb_columns,
+                qb_load_hint,
+                wkb_load_hint,
+            )
+    else:
+        _run_schedule_impl(
+            bm,
+            x,
+            wqa,
+            wqb,
+            wkva,
+            wkb,
+            norm_weight_qa,
+            norm_weight_kva,
+            kv_cache,
+            cache_index,
+            rope_sin,
+            rope_cos,
+            q,
+            qr,
+            ws_x_pad,
+            ws_qa_raw,
+            ws_kva_raw,
+            ws_q_proj,
+            ws_qb_aux,
+            norm_eps,
+            qr_scale,
+            kvr_scale,
+            cache_mode,
+            rope_mode,
+            rope_active,
+            return_qr,
+            nz_active,
+            nz_wfront,
+            nz_wqb,
+            head_hint,
+            head_width,
+            scale_gm,
+            descale_q,
+            ws_q_fp,
+            is_fp8_tensor_quant,
+            ws_amax,
+            is_hif8_quant,
+            front_load_hint,
+            qb_columns,
+            qb_load_hint,
+            wkb_load_hint,
+        )
+
+
+@jit
+def _run_schedule_impl(
+    bm,
+    x,
+    wqa,
+    wqb,
+    wkva,
+    wkb,
+    norm_weight_qa,
+    norm_weight_kva,
+    kv_cache,
+    cache_index,
+    rope_sin,
+    rope_cos,
+    q,
+    qr,
+    ws_x_pad,
+    ws_qa_raw,
+    ws_kva_raw,
+    ws_q_proj,
+    ws_qb_aux,
+    norm_eps,
+    qr_scale,
+    kvr_scale,
+    cache_mode,
+    rope_mode,
+    rope_active,
+    return_qr,
+    nz_active,
+    nz_wfront,
+    nz_wqb,
+    head_hint,
+    head_width,
+    scale_gm,
+    descale_q,
+    ws_q_fp,
+    is_fp8_tensor_quant,
+    ws_amax,
+    is_hif8_quant,
+    front_load_hint,
+    qb_columns,
+    qb_load_hint,
+    wkb_load_hint,
+):
+    if const_expr(bm < 128 or not nz_active):
+        _run_phases(
+            bm,
+            x,
+            wqa,
+            wqb,
+            wkva,
+            wkb,
+            norm_weight_qa,
+            norm_weight_kva,
+            kv_cache,
+            cache_index,
+            rope_sin,
+            rope_cos,
+            q,
+            qr,
+            ws_x_pad,
+            ws_qa_raw,
+            ws_kva_raw,
+            ws_q_proj,
+            ws_qb_aux,
+            norm_eps,
+            qr_scale,
+            kvr_scale,
+            cache_mode,
+            rope_mode,
+            rope_active,
+            return_qr,
+            nz_active,
+            nz_wfront,
+            nz_wqb,
+            head_hint,
+            head_width,
+            scale_gm,
+            descale_q,
+            ws_q_fp,
+            is_fp8_tensor_quant,
+            ws_amax,
+            is_hif8_quant,
+            front_load_hint,
+            qb_columns,
+            qb_load_hint,
+            wkb_load_hint,
+        )
+    else:
+        if qb_columns == 96:
+            onchip_rewind(reset_sync_id=True)
+            _run_phases(
+                bm,
+                x,
+                wqa,
+                wqb,
+                wkva,
+                wkb,
+                norm_weight_qa,
+                norm_weight_kva,
+                kv_cache,
+                cache_index,
+                rope_sin,
+                rope_cos,
+                q,
+                qr,
+                ws_x_pad,
+                ws_qa_raw,
+                ws_kva_raw,
+                ws_q_proj,
+                ws_qb_aux,
+                norm_eps,
+                qr_scale,
+                kvr_scale,
+                cache_mode,
+                rope_mode,
+                rope_active,
+                return_qr,
+                nz_active,
+                nz_wfront,
+                nz_wqb,
+                head_hint,
+                head_width,
+                scale_gm,
+                descale_q,
+                ws_q_fp,
+                is_fp8_tensor_quant,
+                ws_amax,
+                is_hif8_quant,
+                front_load_hint,
+                96,
+                qb_load_hint,
+                wkb_load_hint,
+            )
+        elif qb_columns == 128:
+            onchip_rewind(reset_sync_id=True)
+            _run_phases(
+                bm,
+                x,
+                wqa,
+                wqb,
+                wkva,
+                wkb,
+                norm_weight_qa,
+                norm_weight_kva,
+                kv_cache,
+                cache_index,
+                rope_sin,
+                rope_cos,
+                q,
+                qr,
+                ws_x_pad,
+                ws_qa_raw,
+                ws_kva_raw,
+                ws_q_proj,
+                ws_qb_aux,
+                norm_eps,
+                qr_scale,
+                kvr_scale,
+                cache_mode,
+                rope_mode,
+                rope_active,
+                return_qr,
+                nz_active,
+                nz_wfront,
+                nz_wqb,
+                head_hint,
+                head_width,
+                scale_gm,
+                descale_q,
+                ws_q_fp,
+                is_fp8_tensor_quant,
+                ws_amax,
+                is_hif8_quant,
+                front_load_hint,
+                128,
+                qb_load_hint,
+                wkb_load_hint,
+            )
+        elif const_expr(kv_cache.dtype == dtypes.bfloat16):
+            if qb_columns == 192:
+                onchip_rewind(reset_sync_id=True)
+                _run_phases(
+                    bm,
+                    x,
+                    wqa,
+                    wqb,
+                    wkva,
+                    wkb,
+                    norm_weight_qa,
+                    norm_weight_kva,
+                    kv_cache,
+                    cache_index,
+                    rope_sin,
+                    rope_cos,
+                    q,
+                    qr,
+                    ws_x_pad,
+                    ws_qa_raw,
+                    ws_kva_raw,
+                    ws_q_proj,
+                    ws_qb_aux,
+                    norm_eps,
+                    qr_scale,
+                    kvr_scale,
+                    cache_mode,
+                    rope_mode,
+                    rope_active,
+                    return_qr,
+                    nz_active,
+                    nz_wfront,
+                    nz_wqb,
+                    head_hint,
+                    head_width,
+                    scale_gm,
+                    descale_q,
+                    ws_q_fp,
+                    is_fp8_tensor_quant,
+                    ws_amax,
+                    is_hif8_quant,
+                    front_load_hint,
+                    192,
+                    qb_load_hint,
+                    wkb_load_hint,
+                )
+            else:
+                onchip_rewind(reset_sync_id=True)
+                _run_phases(
+                    bm,
+                    x,
+                    wqa,
+                    wqb,
+                    wkva,
+                    wkb,
+                    norm_weight_qa,
+                    norm_weight_kva,
+                    kv_cache,
+                    cache_index,
+                    rope_sin,
+                    rope_cos,
+                    q,
+                    qr,
+                    ws_x_pad,
+                    ws_qa_raw,
+                    ws_kva_raw,
+                    ws_q_proj,
+                    ws_qb_aux,
+                    norm_eps,
+                    qr_scale,
+                    kvr_scale,
+                    cache_mode,
+                    rope_mode,
+                    rope_active,
+                    return_qr,
+                    nz_active,
+                    nz_wfront,
+                    nz_wqb,
+                    head_hint,
+                    head_width,
+                    scale_gm,
+                    descale_q,
+                    ws_q_fp,
+                    is_fp8_tensor_quant,
+                    ws_amax,
+                    is_hif8_quant,
+                    front_load_hint,
+                    256,
+                    qb_load_hint,
+                    wkb_load_hint,
+                )
+
+
 @jit
 def _run_phases(
     bm,
@@ -3571,24 +5190,363 @@ def _run_phases(
     nz_active,
     nz_wfront,
     nz_wqb,
+    head_hint,
+    head_width,
     scale_gm,
     descale_q,
     ws_q_fp,
     is_fp8_tensor_quant,
     ws_amax,
     is_hif8_quant,
+    front_load_hint=0,
+    qb_columns=128,
+    qb_load_hint=0,
+    wkb_load_hint=0,
+):
+    if const_expr(bm < 128):
+        _run_chunk(
+            bm,
+            x,
+            wqa,
+            wqb,
+            wkva,
+            wkb,
+            norm_weight_qa,
+            norm_weight_kva,
+            kv_cache,
+            cache_index,
+            rope_sin,
+            rope_cos,
+            q,
+            qr,
+            ws_x_pad,
+            ws_qa_raw,
+            ws_kva_raw,
+            ws_q_proj,
+            ws_qb_aux,
+            norm_eps,
+            qr_scale,
+            kvr_scale,
+            cache_mode,
+            rope_mode,
+            rope_active,
+            return_qr,
+            nz_active,
+            nz_wfront,
+            nz_wqb,
+            head_hint,
+            head_width,
+            scale_gm,
+            descale_q,
+            ws_q_fp,
+            is_fp8_tensor_quant,
+            ws_amax,
+            is_hif8_quant,
+            0,
+            front_load_hint,
+            qb_columns,
+            qb_load_hint,
+            wkb_load_hint,
+        )
+    else:
+        tokens = x.shape[0]
+        padding_slot = 0
+        if tokens % bm != 0:
+            padding_slot = 1
+        chunk_capacity = ws_q_proj.shape[0]
+        for start in cannbotdsl.range(0, tokens, chunk_capacity):
+            chunk = start // chunk_capacity
+            x_chunk = tile_slice(
+                x,
+                make_tiler((chunk_capacity, x.shape[1]), alignment=(1, 1)),
+                (chunk, 0),
+            )
+            valid = x_chunk.shape[0]
+            rows = (valid + bm - 1) // bm * bm
+            q_chunk = _token_chunk(q, chunk, rows, chunk_capacity)
+            cache_index_chunk = _token_chunk(cache_index, chunk, valid, chunk_capacity)
+            x_pad_chunk = _chunk_rows_2d(ws_x_pad, rows)
+            front_input = [x_chunk, x_pad_chunk][padding_slot]
+            qa_chunk = _chunk_rows_2d(ws_qa_raw, rows)
+            kva_chunk = _chunk_rows_2d(ws_kva_raw, rows)
+            q_proj_chunk = _chunk_rows_2d(ws_q_proj, rows)
+            qb_aux_index = 0
+            if return_qr:
+                qb_aux_index = chunk
+            qb_aux_chunk = _token_chunk(ws_qb_aux, qb_aux_index, rows, chunk_capacity)
+            # Empty views carry disabled optional inputs; only the runtime
+            # enabled branches access their storage.
+            sin_chunk = _token_chunk(rope_sin, chunk, valid, chunk_capacity)
+            cos_chunk = _token_chunk(rope_cos, chunk, valid, chunk_capacity)
+            qr_chunk = _token_chunk(qr, chunk, rows, chunk_capacity)
+            if const_expr(is_hif8_quant):
+                q_fp_index = 0
+                if ws_q_fp.shape[0] >= q.shape[0]:
+                    q_fp_index = chunk
+                q_fp_chunk = _token_chunk(ws_q_fp, q_fp_index, rows, chunk_capacity)
+                descale_chunk = descale_q
+            elif const_expr(is_fp8_tensor_quant):
+                q_fp_chunk = tile_slice(
+                    ws_q_fp,
+                    make_tiler(
+                        (rows, ws_q_fp.shape[1], ws_q_fp.shape[2]), alignment=(1, 1, 1)
+                    ),
+                    (0, 0, 0),
+                )
+                descale_chunk = _token_chunk(descale_q, chunk, valid, chunk_capacity)
+            else:
+                q_fp_chunk = None
+                descale_chunk = None
+            _run_chunk(
+                bm,
+                x_chunk,
+                wqa,
+                wqb,
+                wkva,
+                wkb,
+                norm_weight_qa,
+                norm_weight_kva,
+                kv_cache,
+                cache_index_chunk,
+                sin_chunk,
+                cos_chunk,
+                q_chunk,
+                qr_chunk,
+                front_input,
+                qa_chunk,
+                kva_chunk,
+                q_proj_chunk,
+                qb_aux_chunk,
+                norm_eps,
+                qr_scale,
+                kvr_scale,
+                cache_mode,
+                rope_mode,
+                rope_active,
+                return_qr,
+                nz_active,
+                nz_wfront,
+                nz_wqb,
+                head_hint,
+                head_width,
+                scale_gm,
+                descale_chunk,
+                q_fp_chunk,
+                is_fp8_tensor_quant,
+                ws_amax,
+                is_hif8_quant,
+                padding_slot,
+                front_load_hint,
+                qb_columns,
+                qb_load_hint,
+                wkb_load_hint,
+            )
+            if const_expr(is_hif8_quant):
+                if ws_q_fp.shape[0] < q.shape[0]:
+                    if get_subblock_id() == 0:
+                        QAmaxStage().partial_amax(
+                            q_fp_chunk.view((rows, q.shape[1] * q.shape[2])),
+                            ws_amax,
+                            q.shape[1],
+                            q.shape[2],
+                            get_block_idx(),
+                            get_block_num(),
+                            valid * q.shape[1],
+                            start != 0,
+                        )
+            # All readers finish before the next chunk overwrites the arena.
+            global_sync_all(flag_ids=(13, 14, 15))
+            onchip_rewind(reset_sync_id=True)
+    if const_expr(is_hif8_quant):
+        if ws_q_fp.shape[0] < q.shape[0]:
+            _recompute_global_q_chunks(
+                bm,
+                x,
+                wqb,
+                wkb,
+                ws_qb_aux,
+                ws_q_proj,
+                q,
+                ws_q_fp,
+                descale_q,
+                ws_amax,
+                rope_sin,
+                rope_cos,
+                rope_mode,
+                rope_active,
+                nz_active,
+                qb_columns,
+                qb_load_hint,
+                wkb_load_hint,
+            )
+        else:
+            block = get_block_idx()
+            blocks = get_block_num()
+            subblock = get_subblock_id()
+            owner = block * 2 + subblock
+            tokens = x.shape[0]
+            heads = wkb.shape[0]
+            kvr = q.shape[2]
+            ws_q_fp2d = ws_q_fp.view((ws_q_fp.shape[0], heads * kvr))
+            q2d = q.view((q.shape[0], heads * kvr))
+            amax_stage = QAmaxStage()
+            if subblock == 0:
+                amax_stage.partial_amax(
+                    ws_q_fp2d, ws_amax, heads, kvr, block, blocks, tokens * heads
+                )
+            global_sync_all(flag_ids=(13, 14, 15))
+            onchip_rewind(reset_sync_id=True)
+            global_quant = QGlobalQuant()
+            if owner < tokens * heads:
+                global_quant.quantize_rows(
+                    ws_q_fp2d,
+                    q2d,
+                    descale_q,
+                    ws_amax,
+                    heads,
+                    kvr,
+                    blocks,
+                    owner,
+                    blocks * 2,
+                    tokens * heads,
+                    block + subblock == 0,
+                )
+
+
+@jit
+def _recompute_global_q_chunks(
+    bm,
+    x,
+    wqb,
+    wkb,
+    qr_input,
+    ws_q_proj,
+    q,
+    ws_q_fp,
+    descale_q,
+    ws_amax,
+    rope_sin,
+    rope_cos,
+    rope_mode,
+    rope_active,
+    nz_active,
+    qb_columns,
+    qb_load_hint,
+    wkb_load_hint,
+):
+    tokens = x.shape[0]
+    capacity = ws_q_proj.shape[0]
+    block = get_block_idx()
+    blocks = get_block_num()
+    owner = block * 2 + get_subblock_id()
+    heads = wkb.shape[0]
+    kvr = q.shape[2]
+    for start in cannbotdsl.range(0, tokens, capacity):
+        chunk = start // capacity
+        valid = min(capacity, tokens - start)
+        rows = (valid + bm - 1) // bm * bm
+        qr_chunk = _token_chunk(qr_input, chunk, rows, capacity)
+        q_proj_chunk = _chunk_rows_2d(ws_q_proj, rows)
+        q_chunk = _token_chunk(q, chunk, rows, capacity)
+        q_fp_chunk = _token_chunk(ws_q_fp, 0, rows, capacity)
+        sin_chunk = _token_chunk(rope_sin, chunk, valid, capacity)
+        cos_chunk = _token_chunk(rope_cos, chunk, valid, capacity)
+        _project_q_chunk(
+            bm,
+            wqb,
+            wkb,
+            qr_chunk,
+            q_proj_chunk,
+            q_chunk,
+            q_fp_chunk,
+            descale_q,
+            sin_chunk,
+            cos_chunk,
+            rope_mode,
+            rope_active,
+            nz_active,
+            False,
+            qb_columns,
+            qb_load_hint,
+            wkb_load_hint,
+            False,
+            True,
+            valid,
+        )
+        if owner < valid * heads:
+            QGlobalQuant().quantize_rows(
+                q_fp_chunk.view((rows, heads * kvr)),
+                q_chunk.view((rows, heads * kvr)),
+                descale_q,
+                ws_amax,
+                heads,
+                kvr,
+                blocks,
+                owner,
+                blocks * 2,
+                valid * heads,
+                owner == 0,
+            )
+        global_sync_all(flag_ids=(13, 14, 15))
+        onchip_rewind(reset_sync_id=True)
+
+
+@jit
+def _run_chunk(
+    bm,
+    x,
+    wqa,
+    wqb,
+    wkva,
+    wkb,
+    norm_weight_qa,
+    norm_weight_kva,
+    kv_cache,
+    cache_index,
+    rope_sin,
+    rope_cos,
+    q,
+    qr,
+    ws_x_pad,
+    ws_qa_raw,
+    ws_kva_raw,
+    ws_q_proj,
+    ws_qb_aux,
+    norm_eps,
+    qr_scale,
+    kvr_scale,
+    cache_mode,
+    rope_mode,
+    rope_active,
+    return_qr,
+    nz_active,
+    nz_wfront,
+    nz_wqb,
+    head_hint,
+    head_width,
+    scale_gm,
+    descale_q,
+    ws_q_fp,
+    is_fp8_tensor_quant,
+    ws_amax,
+    is_hif8_quant,
+    input_padding=0,
+    front_load_hint=0,
+    qb_columns=128,
+    qb_load_hint=0,
+    wkb_load_hint=0,
 ):
     block = get_block_idx()
     blocks = get_block_num()
     subblock = get_subblock_id()
     tokens = x.shape[0]
     dim = x.shape[1]
-    q_lora = wqa.shape[0]
-    kvr = wkva.shape[0]
-    heads = wkb.shape[0]
+    q_lora = wqa.shape[1] if nz_active else wqa.shape[0]
+    kvr = wkva.shape[1] if nz_active else wkva.shape[0]
+    _heads = wkb.shape[0]
     nope_dim = wkb.shape[1]
-    head_dim = nope_dim + kvr - 512
-    rows_qb = wqb.shape[0]
+    _head_dim = nope_dim + kvr - 512
+    _rows_qb = wqb.shape[1] if nz_active else wqb.shape[0]
     m_tiles = ws_x_pad.shape[0] // bm
     owner = block * 2 + subblock
     if (
@@ -3655,7 +5613,7 @@ def _run_phases(
             and kv_cache.dtype == dtypes.bfloat16
         )
         if not direct_front:
-            if x.shape[0] != ws_x_pad.shape[0]:
+            if x.shape[0] != ws_x_pad.shape[0] or input_padding != 0:
                 input_pad = InputPad()
                 input_pad.run(x, ws_x_pad, tokens, owner, blocks * 2)
                 global_sync_all(flag_ids=(13, 14, 15))
@@ -3671,14 +5629,7 @@ def _run_phases(
             nz_wfront == 128,
             panel_k=front_panel,
             use_actual_rows=direct_front,
-            weight_l2_hint=(
-                L2_LOAD_NOTALLOC_KEEP
-                if nz_active
-                and bm <= 8
-                and kv_cache.dtype == dtypes.bfloat16
-                and heads >= WKB_STREAM_MIN_HEADS
-                else 0
-            ),
+            weight_l2_hint=front_load_hint,
         )
         if partial_front:
             mm1_projection.project_partial_front(
@@ -3717,36 +5668,22 @@ def _run_phases(
             )
         qa_norm = QaRmsNorm(partial_front)
         if owner < tokens:
-            if return_qr:
-                qa_norm.process_rows_bf16_qr(
-                    ws_qa_raw,
-                    norm_weight_qa,
-                    ws_qb_aux,
-                    qr,
-                    q_lora,
-                    norm_eps,
-                    qr_scale,
-                    owner,
-                    blocks * 2,
-                    tokens,
-                )
-            else:
-                qa_norm.process_rows_bf16(
-                    ws_qa_raw,
-                    norm_weight_qa,
-                    ws_qb_aux,
-                    q_lora,
-                    norm_eps,
-                    qr_scale,
-                    owner,
-                    blocks * 2,
-                    tokens,
-                )
+            qa_norm.process_rows_bf16(
+                ws_qa_raw,
+                norm_weight_qa,
+                ws_qb_aux,
+                q_lora,
+                norm_eps,
+                qr_scale,
+                owner,
+                blocks * 2,
+                tokens,
+            )
         qa_norm.zero_tail(ws_qb_aux, q_lora, tokens + owner, blocks * 2)
-    wkb2d_src = wkb.view((wkb.shape[0] * wkb.shape[1], wkb.shape[2]))
+    _wkb2d_src = wkb.view((wkb.shape[0] * wkb.shape[1], wkb.shape[2]))
     global_sync_all(flag_ids=(13, 14, 15))
     onchip_rewind(reset_sync_id=True)
-    kv_chain = KvChain(128, rope_active)
+    kv_chain = KvChain(128, True)
     if subblock == 0:
         if rope_active:
             kv_chain.process_rows_rope(
@@ -3781,55 +5718,127 @@ def _run_phases(
                 tokens,
                 cache_mode,
             )
+    _project_q_chunk(
+        bm,
+        wqb,
+        wkb,
+        ws_qb_aux,
+        ws_q_proj,
+        q,
+        ws_q_fp,
+        descale_q,
+        rope_sin,
+        rope_cos,
+        rope_mode,
+        rope_active,
+        nz_active,
+        kv_cache.dtype == dtypes.bfloat16,
+        qb_columns,
+        qb_load_hint,
+        wkb_load_hint,
+        is_fp8_tensor_quant,
+        is_hif8_quant,
+        tokens,
+    )
+
+
+@jit
+def _project_q_chunk(
+    bm,
+    wqb,
+    wkb,
+    qr_input,
+    ws_q_proj,
+    q,
+    ws_q_fp,
+    descale_q,
+    rope_sin,
+    rope_cos,
+    rope_mode,
+    rope_active,
+    nz_active,
+    bf16_cache,
+    qb_columns,
+    qb_load_hint,
+    wkb_load_hint,
+    is_fp8_tensor_quant,
+    is_hif8_quant,
+    tokens,
+):
+    block = get_block_idx()
+    blocks = get_block_num()
+    owner = block * 2 + get_subblock_id()
+    heads = wkb.shape[0]
+    nope_dim = wkb.shape[1]
+    kvr = q.shape[2]
+    head_dim = nope_dim + kvr - 512
+    q_lora = qr_input.shape[1]
+    rows_qb = heads * head_dim
+    m_tiles = ws_q_proj.shape[0] // bm
+    wkb2d_src = wkb.view((heads * nope_dim, 512))
     if nz_active:
-        if (
-            bm <= 16
-            and heads >= 96
-            and (q_lora == 1536 or q_lora == 2048)
-            and (rows_qb // heads == 192 or rows_qb // heads == 256)
-            and kv_cache.dtype == dtypes.bfloat16
-        ):
-            qb_grouped = QbFourHeads(bm, rows_qb // heads, q_lora)
-            qb_grouped.project_owner(
-                ws_qb_aux,
+        if const_expr(bm <= 16 and bf16_cache and (q_lora == 1536 or q_lora == 2048)):
+            if heads >= 96:
+                if head_dim == 192:
+                    _qb_grouped_path(
+                        bm,
+                        192,
+                        qr_input,
+                        wqb,
+                        ws_q_proj,
+                        q_lora,
+                        rows_qb,
+                        m_tiles,
+                        block,
+                        blocks,
+                    )
+                else:
+                    _qb_grouped_path(
+                        bm,
+                        256,
+                        qr_input,
+                        wqb,
+                        ws_q_proj,
+                        q_lora,
+                        rows_qb,
+                        m_tiles,
+                        block,
+                        blocks,
+                    )
+            else:
+                _qb_runtime_path(
+                    bm,
+                    qb_columns,
+                    qb_load_hint,
+                    True,
+                    qr_input,
+                    wqb,
+                    ws_q_proj,
+                    q_lora,
+                    rows_qb,
+                    m_tiles,
+                    block,
+                    blocks,
+                )
+        else:
+            _qb_runtime_path(
+                bm,
+                qb_columns,
+                qb_load_hint,
+                bf16_cache,
+                qr_input,
                 wqb,
                 ws_q_proj,
+                q_lora,
                 rows_qb,
                 m_tiles,
                 block,
                 blocks,
             )
-        else:
-            qb = NzProjection(
-                bm,
-                nz_wqb,
-                1,
-                weight_l2_hint=(
-                    4
-                    if 8 < bm <= 64
-                    and heads >= 96
-                    and kv_cache.dtype == dtypes.bfloat16
-                    else (2 if bm <= QB_WIDE_PANEL_MAX_ROWS and heads == 64 else 0)
-                ),
-                panel_k=(
-                    (512 if nz_wqb <= 192 else NZ_PANEL_K)
-                    if bm <= QB_WIDE_PANEL_MAX_ROWS and q_lora != 640
-                    else (
-                        NZ_PANEL_K
-                        if bm <= QB_MEDIUM_PANEL_MAX_ROWS
-                        and q_lora != 640
-                        and kv_cache.dtype == dtypes.bfloat16
-                        else CUBE_BK
-                    )
-                ),
-            )
-            qb.project_owner(
-                ws_qb_aux, wqb, ws_q_proj, q_lora, rows_qb, m_tiles, block, blocks
-            )
     else:
         qb_nd = NdProjection(bm, 1)
         qb_nd.project_owner(
-            ws_qb_aux, wqb, ws_q_proj, q_lora, rows_qb, m_tiles, block, blocks
+            qr_input, wqb, ws_q_proj, q_lora, rows_qb, m_tiles, block, blocks
         )
     global_sync_all(flag_ids=(13, 14, 15))
     onchip_rewind(reset_sync_id=True)
@@ -3838,7 +5847,7 @@ def _run_phases(
         ws_q_fp2d = ws_q_fp.view(
             (ws_q_fp.shape[0], ws_q_fp.shape[1] * ws_q_fp.shape[2])
         )
-        head_stage = QFpTailCopy(rope_active)
+        head_stage = QFpTailCopy(True)
         if kvr != 512 and owner < tokens:
             if rope_active:
                 head_stage.process_rows_rope(
@@ -3870,6 +5879,7 @@ def _run_phases(
         project_wkb(
             bm,
             nz_active and not is_fp8_tensor_quant,
+            wkb_load_hint,
             ws_q_proj,
             wkb2d_src,
             ws_q_fp2d,
@@ -3884,30 +5894,7 @@ def _run_phases(
         )
         global_sync_all(flag_ids=(13, 14, 15))
         onchip_rewind(reset_sync_id=True)
-        if is_hif8_quant:
-            amax_stage = QAmaxStage()
-            if subblock == 0:
-                amax_stage.partial_amax(
-                    ws_q_fp2d, ws_amax, heads, kvr, block, blocks, tokens * heads
-                )
-            global_sync_all(flag_ids=(13, 14, 15))
-            onchip_rewind(reset_sync_id=True)
-            global_quant = QGlobalQuant()
-            if owner < tokens * heads:
-                global_quant.quantize_rows(
-                    ws_q_fp2d,
-                    q2d,
-                    descale_q,
-                    ws_amax,
-                    heads,
-                    kvr,
-                    blocks,
-                    owner,
-                    blocks * 2,
-                    tokens * heads,
-                    block + subblock == 0,
-                )
-        elif is_fp8_tensor_quant:
+        if is_fp8_tensor_quant:
             descale_q2d = descale_q.view(
                 (descale_q.shape[0] * descale_q.shape[1], descale_q.shape[2])
             )
@@ -3925,16 +5912,12 @@ def _run_phases(
                 )
     else:
         tail_copy = QTailCopy(
-            rope_active,
+            True,
             ws_q_proj.dtype,
-            head_batch=8 if 8 <= bm <= 64 and heads % 8 == 0 else ROPE_HEAD_BATCH,
+            head_batch=8 if 8 <= bm <= 64 else ROPE_HEAD_BATCH,
             batch_capable=nz_active
-            and rope_active
-            and (
-                bm >= ROPE_BATCH_MIN_TILE_ROWS
-                or (bm >= 8 and heads >= 64 and kv_cache.dtype == dtypes.bfloat16)
-            )
-            and (heads % ROPE_HEAD_BATCH == 0),
+            and (bm >= ROPE_BATCH_MIN_TILE_ROWS or (bm >= 8 and bf16_cache)),
+            batch_min_heads=64 if bm < ROPE_BATCH_MIN_TILE_ROWS else 0,
         )
         if kvr != 512:
             if owner < tokens * heads:
@@ -3968,6 +5951,7 @@ def _run_phases(
         project_wkb(
             bm,
             nz_active,
+            wkb_load_hint,
             ws_q_proj,
             wkb2d_src,
             q2d,
@@ -3984,11 +5968,15 @@ def _run_phases(
 
 @kernel
 class MlaPrologKernel:
-    def __init__(self, bm, nz_active=False, nz_wfront=0, nz_wqb=0):
+    def __init__(
+        self, bm, nz_active=False, nz_wfront=0, nz_wqb=0, head_hint=0, head_width=0
+    ):
         self.bm = bm
         self.nz_active = nz_active
         self.nz_wfront = nz_wfront
         self.nz_wqb = nz_wqb
+        self.head_hint = head_hint
+        self.head_width = head_width
 
     @_surface_signature(KERNEL_ARGUMENTS, KERNEL_ANNOTATIONS)
     def __call__(self, *args):
@@ -4044,6 +6032,8 @@ class MlaPrologKernel:
             self.nz_active,
             self.nz_wfront,
             self.nz_wqb,
+            self.head_hint,
+            self.head_width,
             None,
             None,
             None,
@@ -4108,6 +6098,8 @@ class MlaPrologKernel:
             self.nz_active,
             self.nz_wfront,
             self.nz_wqb,
+            self.head_hint,
+            self.head_width,
             None,
             None,
             None,
@@ -4171,6 +6163,8 @@ class MlaPrologKernel:
             self.nz_active,
             self.nz_wfront,
             self.nz_wqb,
+            self.head_hint,
+            self.head_width,
             None,
             None,
             None,
@@ -4197,6 +6191,7 @@ class MlaPrologKernel:
             qr,
             ws_x_pad,
             ws_qa_raw,
+            ws_qa_fp32,
             ws_kva_raw,
             ws_q_proj,
             ws_qb_aux,
@@ -4205,8 +6200,12 @@ class MlaPrologKernel:
             kvr_scale,
             cache_mode,
             rope_mode,
+            front_load_hint,
+            qb_columns,
+            qb_load_hint,
+            wkb_load_hint,
         ) = args
-        _run_phases(
+        _run_all_profiles(
             self.bm,
             x,
             wqa,
@@ -4223,6 +6222,7 @@ class MlaPrologKernel:
             qr,
             ws_x_pad,
             ws_qa_raw,
+            ws_qa_fp32,
             ws_kva_raw,
             ws_q_proj,
             ws_qb_aux,
@@ -4231,17 +6231,23 @@ class MlaPrologKernel:
             kvr_scale,
             cache_mode,
             rope_mode,
-            True,
-            True,
+            rope_sin.shape[0] != 0,
+            qr.shape[0] != 0,
             self.nz_active,
             self.nz_wfront,
             self.nz_wqb,
+            self.head_hint,
+            self.head_width,
             None,
             None,
             None,
             False,
             None,
             False,
+            front_load_hint,
+            qb_columns,
+            qb_load_hint,
+            wkb_load_hint,
         )
 
     @_surface_signature(M2_KERNEL_ARGUMENTS, M2_KERNEL_ANNOTATIONS)
@@ -4301,6 +6307,8 @@ class MlaPrologKernel:
             self.nz_active,
             self.nz_wfront,
             self.nz_wqb,
+            self.head_hint,
+            self.head_width,
             quant_scale_kv,
             descale_q,
             ws_q_fp,
@@ -4368,6 +6376,8 @@ class MlaPrologKernel:
             self.nz_active,
             self.nz_wfront,
             self.nz_wqb,
+            self.head_hint,
+            self.head_width,
             quant_scale_kv,
             descale_q,
             ws_q_fp,
@@ -4434,6 +6444,8 @@ class MlaPrologKernel:
             self.nz_active,
             self.nz_wfront,
             self.nz_wqb,
+            self.head_hint,
+            self.head_width,
             quant_scale_kv,
             descale_q,
             ws_q_fp,
@@ -4462,6 +6474,7 @@ class MlaPrologKernel:
             qr,
             ws_x_pad,
             ws_qa_raw,
+            ws_qa_fp32,
             ws_kva_raw,
             ws_q_proj,
             ws_q_fp,
@@ -4471,8 +6484,12 @@ class MlaPrologKernel:
             kvr_scale,
             cache_mode,
             rope_mode,
+            front_load_hint,
+            qb_columns,
+            qb_load_hint,
+            wkb_load_hint,
         ) = args
-        _run_phases(
+        _run_all_profiles(
             self.bm,
             x,
             wqa,
@@ -4489,6 +6506,7 @@ class MlaPrologKernel:
             qr,
             ws_x_pad,
             ws_qa_raw,
+            ws_qa_fp32,
             ws_kva_raw,
             ws_q_proj,
             ws_qb_aux,
@@ -4497,17 +6515,23 @@ class MlaPrologKernel:
             kvr_scale,
             cache_mode,
             rope_mode,
-            True,
-            True,
+            rope_sin.shape[0] != 0,
+            qr.shape[0] != 0,
             self.nz_active,
             self.nz_wfront,
             self.nz_wqb,
+            self.head_hint,
+            self.head_width,
             quant_scale_kv,
             descale_q,
             ws_q_fp,
             True,
             None,
             False,
+            front_load_hint,
+            qb_columns,
+            qb_load_hint,
+            wkb_load_hint,
         )
 
     @_surface_signature(M3_KERNEL_ARGUMENTS, M3_KERNEL_ANNOTATIONS)
@@ -4568,6 +6592,8 @@ class MlaPrologKernel:
             self.nz_active,
             self.nz_wfront,
             self.nz_wqb,
+            self.head_hint,
+            self.head_width,
             quant_scale_kv,
             descale_q,
             ws_q_fp,
@@ -4636,6 +6662,8 @@ class MlaPrologKernel:
             self.nz_active,
             self.nz_wfront,
             self.nz_wqb,
+            self.head_hint,
+            self.head_width,
             quant_scale_kv,
             descale_q,
             ws_q_fp,
@@ -4703,6 +6731,8 @@ class MlaPrologKernel:
             self.nz_active,
             self.nz_wfront,
             self.nz_wqb,
+            self.head_hint,
+            self.head_width,
             quant_scale_kv,
             descale_q,
             ws_q_fp,
@@ -4731,6 +6761,7 @@ class MlaPrologKernel:
             qr,
             ws_x_pad,
             ws_qa_raw,
+            ws_qa_fp32,
             ws_kva_raw,
             ws_q_proj,
             ws_q_fp,
@@ -4741,8 +6772,12 @@ class MlaPrologKernel:
             kvr_scale,
             cache_mode,
             rope_mode,
+            front_load_hint,
+            qb_columns,
+            qb_load_hint,
+            wkb_load_hint,
         ) = args
-        _run_phases(
+        _run_all_profiles(
             self.bm,
             x,
             wqa,
@@ -4759,6 +6794,7 @@ class MlaPrologKernel:
             qr,
             ws_x_pad,
             ws_qa_raw,
+            ws_qa_fp32,
             ws_kva_raw,
             ws_q_proj,
             ws_qb_aux,
@@ -4767,17 +6803,23 @@ class MlaPrologKernel:
             kvr_scale,
             cache_mode,
             rope_mode,
-            True,
-            True,
+            rope_sin.shape[0] != 0,
+            qr.shape[0] != 0,
             self.nz_active,
             self.nz_wfront,
             self.nz_wqb,
+            self.head_hint,
+            self.head_width,
             quant_scale_kv,
             descale_q,
             ws_q_fp,
             False,
             ws_amax,
             True,
+            front_load_hint,
+            qb_columns,
+            qb_load_hint,
+            wkb_load_hint,
         )
 
 
@@ -4800,7 +6842,7 @@ class GlobalSplitFront:
         self.b_l1 = RingBuffer(
             MemLoc.L1,
             dtypes.bfloat16,
-            make_layout((self.width, 256)),
+            make_layout((256, self.width)),
             depth=2,
             data_format="nz",
         )
@@ -4815,7 +6857,7 @@ class GlobalSplitFront:
         )
 
         rows = x.shape[0]
-        tiles = weight.shape[0] // self.width
+        tiles = weight.shape[1] // self.width
         m_tiles = rows // self.bm
         panels = x.shape[1] // 256
         for task in cannbotdsl.range(block, m_tiles * tiles * 4, blocks):
@@ -4834,10 +6876,10 @@ class GlobalSplitFront:
                 )
                 mem_copy(
                     self.b_l1.next_write(),
-                    tile_slice(weight, (self.width, 256), (col, panel)),
+                    tile_slice(weight, (256, self.width), (panel, col)),
                 )
                 a = self.a_l1.next_read()
-                b = self.b_l1.next_read()
+                b = self.b_l1.next_read().permute(1, 0)
                 for inner in range_constexpr(2):
                     mem_copy(
                         self.a_l0.next_write(),
@@ -4981,8 +7023,6 @@ class GlobalSplitFront:
                 vmem_bar(mode="vst_vld")
             output = output_channel.next_read()
             mem_copy(tile_slice(cq, row_tiler, (token, 0)), output)
-            if return_qr:
-                mem_copy(tile_slice(qr, row_tiler, (token, 0)), output)
 
 
 class MlaPrologLauncher:
@@ -4990,14 +7030,9 @@ class MlaPrologLauncher:
         self.key = key
         self.dims = dims
         self.nz_active = key.fmt == "nz"
-        if self.nz_active:
-            self.nz_wfront = nz_front_tile_width(dims["q_lora"], dims["kvr"])
-            self.nz_wqb = key.qb_columns or nz_qb_tile_width(
-                dims["rows_qb"], dims["heads"], key.qkv_quant_mode
-            )
-        else:
-            self.nz_wfront = 0
-            self.nz_wqb = 0
+        self.head_hint = 0
+        self.head_width = 0
+        self.nz_wqb = 0
         self.nz_wfront = 128 if key.profile == 0 else 64
         if self.nz_active and 0 < key.profile <= 8:
             if dims["q_lora"] == 1536:
@@ -5010,108 +7045,168 @@ class MlaPrologLauncher:
     def run_preallocated(self, *args):
         core_num = args[-1]
         bm = self.dims["bm"]
-        MlaPrologKernel(bm, self.nz_active, self.nz_wfront, self.nz_wqb)[core_num](
-            *args[:-1]
-        )
+        MlaPrologKernel(
+            bm,
+            self.nz_active,
+            self.nz_wfront,
+            self.nz_wqb,
+            self.head_hint,
+            self.head_width,
+        )[core_num](*args[:-1])
 
     @host
     @_surface_signature(ROPE_HOST_ARGUMENTS, ROPE_HOST_ANNOTATIONS)
     def run_rope(self, *args):
         core_num = args[-1]
         bm = self.dims["bm"]
-        MlaPrologKernel(bm, self.nz_active, self.nz_wfront, self.nz_wqb)[
-            core_num
-        ].run_rope(*args[:-1])
+        MlaPrologKernel(
+            bm,
+            self.nz_active,
+            self.nz_wfront,
+            self.nz_wqb,
+            self.head_hint,
+            self.head_width,
+        )[core_num].run_rope(*args[:-1])
 
     @host
     @_surface_signature(QR_HOST_ARGUMENTS, QR_HOST_ANNOTATIONS)
     def run_qr(self, *args):
         core_num = args[-1]
         bm = self.dims["bm"]
-        MlaPrologKernel(bm, self.nz_active, self.nz_wfront, self.nz_wqb)[
-            core_num
-        ].run_qr(*args[:-1])
+        MlaPrologKernel(
+            bm,
+            self.nz_active,
+            self.nz_wfront,
+            self.nz_wqb,
+            self.head_hint,
+            self.head_width,
+        )[core_num].run_qr(*args[:-1])
 
     @host
     @_surface_signature(ROPE_QR_HOST_ARGUMENTS, ROPE_QR_HOST_ANNOTATIONS)
     def run_qr_rope(self, *args):
         core_num = args[-1]
         bm = self.dims["bm"]
-        MlaPrologKernel(bm, self.nz_active, self.nz_wfront, self.nz_wqb)[
-            core_num
-        ].run_qr_rope(*args[:-1])
+        MlaPrologKernel(
+            bm,
+            self.nz_active,
+            self.nz_wfront,
+            self.nz_wqb,
+            self.head_hint,
+            self.head_width,
+        )[core_num].run_qr_rope(*args[:-1])
 
     @host
     @_surface_signature(M2_HOST_ARGUMENTS, M2_HOST_ANNOTATIONS)
     def run_m2(self, *args):
         core_num = args[-1]
         bm = self.dims["bm"]
-        MlaPrologKernel(bm, self.nz_active, self.nz_wfront, self.nz_wqb)[
-            core_num
-        ].run_m2(*args[:-1])
+        MlaPrologKernel(
+            bm,
+            self.nz_active,
+            self.nz_wfront,
+            self.nz_wqb,
+            self.head_hint,
+            self.head_width,
+        )[core_num].run_m2(*args[:-1])
 
     @host
     @_surface_signature(M2_ROPE_HOST_ARGUMENTS, M2_ROPE_HOST_ANNOTATIONS)
     def run_m2_rope(self, *args):
         core_num = args[-1]
         bm = self.dims["bm"]
-        MlaPrologKernel(bm, self.nz_active, self.nz_wfront, self.nz_wqb)[
-            core_num
-        ].run_m2_rope(*args[:-1])
+        MlaPrologKernel(
+            bm,
+            self.nz_active,
+            self.nz_wfront,
+            self.nz_wqb,
+            self.head_hint,
+            self.head_width,
+        )[core_num].run_m2_rope(*args[:-1])
 
     @host
     @_surface_signature(M2_QR_HOST_ARGUMENTS, M2_QR_HOST_ANNOTATIONS)
     def run_m2_qr(self, *args):
         core_num = args[-1]
         bm = self.dims["bm"]
-        MlaPrologKernel(bm, self.nz_active, self.nz_wfront, self.nz_wqb)[
-            core_num
-        ].run_m2_qr(*args[:-1])
+        MlaPrologKernel(
+            bm,
+            self.nz_active,
+            self.nz_wfront,
+            self.nz_wqb,
+            self.head_hint,
+            self.head_width,
+        )[core_num].run_m2_qr(*args[:-1])
 
     @host
     @_surface_signature(M2_ROPE_QR_HOST_ARGUMENTS, M2_ROPE_QR_HOST_ANNOTATIONS)
     def run_m2_qr_rope(self, *args):
         core_num = args[-1]
         bm = self.dims["bm"]
-        MlaPrologKernel(bm, self.nz_active, self.nz_wfront, self.nz_wqb)[
-            core_num
-        ].run_m2_qr_rope(*args[:-1])
+        MlaPrologKernel(
+            bm,
+            self.nz_active,
+            self.nz_wfront,
+            self.nz_wqb,
+            self.head_hint,
+            self.head_width,
+        )[core_num].run_m2_qr_rope(*args[:-1])
 
     @host
     @_surface_signature(M3_HOST_ARGUMENTS, M3_HOST_ANNOTATIONS)
     def run_m3(self, *args):
         core_num = args[-1]
         bm = self.dims["bm"]
-        MlaPrologKernel(bm, self.nz_active, self.nz_wfront, self.nz_wqb)[
-            core_num
-        ].run_m3(*args[:-1])
+        MlaPrologKernel(
+            bm,
+            self.nz_active,
+            self.nz_wfront,
+            self.nz_wqb,
+            self.head_hint,
+            self.head_width,
+        )[core_num].run_m3(*args[:-1])
 
     @host
     @_surface_signature(M3_ROPE_HOST_ARGUMENTS, M3_ROPE_HOST_ANNOTATIONS)
     def run_m3_rope(self, *args):
         core_num = args[-1]
         bm = self.dims["bm"]
-        MlaPrologKernel(bm, self.nz_active, self.nz_wfront, self.nz_wqb)[
-            core_num
-        ].run_m3_rope(*args[:-1])
+        MlaPrologKernel(
+            bm,
+            self.nz_active,
+            self.nz_wfront,
+            self.nz_wqb,
+            self.head_hint,
+            self.head_width,
+        )[core_num].run_m3_rope(*args[:-1])
 
     @host
     @_surface_signature(M3_QR_HOST_ARGUMENTS, M3_QR_HOST_ANNOTATIONS)
     def run_m3_qr(self, *args):
         core_num = args[-1]
         bm = self.dims["bm"]
-        MlaPrologKernel(bm, self.nz_active, self.nz_wfront, self.nz_wqb)[
-            core_num
-        ].run_m3_qr(*args[:-1])
+        MlaPrologKernel(
+            bm,
+            self.nz_active,
+            self.nz_wfront,
+            self.nz_wqb,
+            self.head_hint,
+            self.head_width,
+        )[core_num].run_m3_qr(*args[:-1])
 
     @host
     @_surface_signature(M3_ROPE_QR_HOST_ARGUMENTS, M3_ROPE_QR_HOST_ANNOTATIONS)
     def run_m3_qr_rope(self, *args):
         core_num = args[-1]
         bm = self.dims["bm"]
-        MlaPrologKernel(bm, self.nz_active, self.nz_wfront, self.nz_wqb)[
-            core_num
-        ].run_m3_qr_rope(*args[:-1])
+        MlaPrologKernel(
+            bm,
+            self.nz_active,
+            self.nz_wfront,
+            self.nz_wqb,
+            self.head_hint,
+            self.head_width,
+        )[core_num].run_m3_qr_rope(*args[:-1])
 
 
 BN = 96
@@ -5145,7 +7240,7 @@ TOKEN_PROFILE_BOUNDS = {
 GENERIC_PROFILE = 0
 
 
-TOKEN_PROFILES = (1, 8, 16, 32, 64, 128, GENERIC_PROFILE)
+TOKEN_PROFILES = (8, 32, 64, GENERIC_PROFILE)
 
 
 L1_BYTES = 512 * 1024
@@ -5188,22 +7283,8 @@ ITEM_F32 = 4
 class CompileKey:
     fmt: str
     qkv_quant_mode: int
-    rope_active: bool
-    return_qr: bool
     profile: int
     shapes: tuple = ()
-    qb_columns: int = 0
-
-
-def _qb_columns_options(key):
-    if key.fmt != "nz" or key.qkv_quant_mode != 0 or not 0 < key.profile <= 8:
-        return (0,)
-    if not key.shapes:
-        return (0,)
-    _, _, kvr, heads, nope = key.shapes
-    rows_qb = heads * (nope + kvr - KV_LORA)
-    current = nz_qb_tile_width(rows_qb, heads, key.qkv_quant_mode)
-    return (0, CUBE_BK) if current > CUBE_BK and rows_qb % CUBE_BK == 0 else (0,)
 
 
 def _select_qb_columns(rows_qb, heads, cores):
@@ -5346,21 +7427,16 @@ _PROGRAM_LOCK = threading.Lock()
 
 
 def _dims_for(key):
-    if key.profile == GENERIC_PROFILE:
-        lower = 129
-        tokens = Dim("T", min=lower)
-        rows = (tokens + 127) // 128 * 128
-        bm = 128
-    else:
-        (lower, upper) = TOKEN_PROFILE_BOUNDS[key.profile]
-        tokens = Dim("T", min=lower, max=upper)
-        rows = key.profile
-        bm = key.profile
+    tokens = Dim("T", min=1)
+    rows = Dim("OutputRows", min=1)
+    scratch_rows = Dim("ScratchRows", min=1, max=_SCRATCH_TOKEN_CAPACITY)
+    bm = 128
     if key.fmt == "nz" and key.shapes:
-        (dim, q_lora, kvr, heads, nope) = key.shapes
-        heads = int(heads)
-        nope = int(nope)
-        rope_dim = kvr - 512
+        (dim, q_lora) = key.shapes
+        heads = Dim("N", min=1, max=128)
+        kvr = Dim("Kvr", min=512, max=576, multiple_of=64)
+        nope = Dim("Dn", min=128, max=256, multiple_of=64)
+        rope_dim = kvr - KV_LORA
     else:
         dim = Dim("Dm", min=1024, max=8192, multiple_of=256)
         q_lora = Dim("Ql", min=640, max=2048, multiple_of=128)
@@ -5377,6 +7453,7 @@ def _dims_for(key):
     return {
         "tokens": tokens,
         "rows": rows,
+        "scratch_rows": scratch_rows,
         "bm": bm,
         "dim": dim,
         "q_lora": q_lora,
@@ -5393,17 +7470,13 @@ def _dims_for(key):
 
 
 def build_program(key):
-    if type(key.qb_columns) is not int or key.qb_columns not in _qb_columns_options(
-        key
-    ):
-        raise ValueError(f"unsupported WQB column selection: {key}")
     if key.fmt not in ("nd", "nz"):
         raise ValueError(f"unsupported compile key: {key}")
     if key.fmt == "nz" and (not key.shapes):
         raise ValueError(
             f"unsupported compile key: {key} "
-            "(NZ keys require the static shape tuple "
-            "(dim, q_lora, kvr, heads, nope))"
+            "(NZ keys require the static resource tuple "
+            "(dim, q_lora))"
         )
     if key.qkv_quant_mode not in (0, 1, 2, 3):
         raise ValueError(f"unsupported compile key: {key}")
@@ -5413,51 +7486,20 @@ def build_program(key):
     front_width = 128 if key.profile == GENERIC_PROFILE else 64
     assert_nz_resource_budget(d["bm"], (front_width, 64), NZ_PANEL_K)
     if key.fmt == "nz":
-        assert_nz_resource_budget(
-            d["bm"],
-            (nz_qb_tile_width(d["rows_qb"], d["heads"], key.qkv_quant_mode),),
-            NZ_PANEL_K,
-        )
-    if key.profile == GENERIC_PROFILE:
-        resident_l1 = (128 * 1024 + 2 * 128 * BK + 2 * 128 * BK) * ITEM_A16
-        assert resident_l1 <= L1_BYTES, "resident front projection L1 budget exceeded"
-    if key.fmt == "nz":
-        assert_nz_resource_budget(
-            d["bm"],
-            (
-                nz_front_tile_width(d["q_lora"], d["kvr"]),
-                nz_qb_tile_width(d["rows_qb"], d["heads"], key.qkv_quant_mode),
-            ),
-        )
-    if key.fmt == "nz" and 0 < key.profile <= 8:
-        actual_width = key.qb_columns or nz_qb_tile_width(
-            d["rows_qb"], d["heads"], key.qkv_quant_mode
-        )
-        actual_panel = 512 if actual_width <= 192 and d["q_lora"] != 640 else 256
-        assert_nz_resource_budget(d["bm"], (64,), 512)
-        assert_nz_resource_budget(d["bm"], (actual_width,), actual_panel)
-    if (
-        key.fmt == "nz"
-        and 0 < key.profile <= 16
-        and key.qkv_quant_mode == 0
-        and d["q_lora"] in (1536, 2048)
-        and d["heads"] >= 96
-    ):
-        head_columns = d["rows_qb"] // d["heads"]
-        if head_columns in (192, 256):
-            physical_rows = (d["bm"] + 15) // 16 * 16
-            grouped_columns = QB_GROUP_HEADS * head_columns
-            l1_bytes = 2 * grouped_columns * CUBE_BK * ITEM_A16
-            l0a_bytes = physical_rows * d["q_lora"] * ITEM_A16
-            l0b_bytes = head_columns * CUBE_BK * ITEM_A16
-            l0c_bytes = physical_rows * grouped_columns * ITEM_F32
-            if (
-                l1_bytes > L1_BYTES
-                or l0a_bytes > L0A_BYTES
-                or l0b_bytes > L0B_BYTES
-                or l0c_bytes > L0C_BYTES
-            ):
-                raise ValueError("Four-head WQB resource budget exceeded")
+        for width in _QB_RUNTIME_WIDTHS:
+            if key.qkv_quant_mode == 0 or width <= CUBE_BK:
+                panel = (
+                    (512 if width <= 192 else NZ_PANEL_K)
+                    if 0 < key.profile <= 8 and d["q_lora"] != 640
+                    else (
+                        NZ_PANEL_K
+                        if 0 < key.profile <= 64
+                        and d["q_lora"] != 640
+                        and key.qkv_quant_mode == 0
+                        else CUBE_BK
+                    )
+                )
+                assert_nz_resource_budget(d["bm"], (width,), panel)
     rope_dim = d["kvr"] - KV_LORA
     cache_last_dim = (
         KV_LORA + 2 * rope_dim + DESCALE_TAIL_BYTES
@@ -5474,9 +7516,9 @@ def build_program(key):
     spec = TensorSpec
     if key.fmt == "nz":
         weight_specs = (
-            spec((d["q_lora"], d["dim"]), dtypes.bfloat16, storage_format="nz"),
-            spec((d["rows_qb"], d["q_lora"]), dtypes.bfloat16, storage_format="nz"),
-            spec((d["kvr"], d["dim"]), dtypes.bfloat16, storage_format="nz"),
+            spec((d["dim"], d["q_lora"]), dtypes.bfloat16, storage_format="nz"),
+            spec((d["q_lora"], d["rows_qb"]), dtypes.bfloat16, storage_format="nz"),
+            spec((d["dim"], d["kvr"]), dtypes.bfloat16, storage_format="nz"),
         )
     else:
         weight_specs = (
@@ -5484,7 +7526,7 @@ def build_program(key):
             spec((d["rows_qb"], d["q_lora"]), dtypes.bfloat16),
             spec((d["kvr"], d["dim"]), dtypes.bfloat16),
         )
-    qb_aux_spec = spec((d["rows"], d["q_lora"]), dtypes.bfloat16)
+    qb_aux_spec = spec((Dim("QrInputRows", min=1), d["q_lora"]), dtypes.bfloat16)
     launcher = MlaPrologLauncher(key, d)
     head_specs = (
         spec((d["tokens"], d["dim"]), dtypes.bfloat16),
@@ -5504,8 +7546,8 @@ def build_program(key):
     if key.qkv_quant_mode in (2, 3):
         head_specs += (spec((1,), dtypes.float32),)
     rope_specs = (
-        spec((d["tokens"], SEG), dtypes.bfloat16),
-        spec((d["tokens"], SEG), dtypes.bfloat16),
+        spec((Dim("RopeRows", min=0), SEG), dtypes.bfloat16),
+        spec((Dim("RopeRows", min=0), SEG), dtypes.bfloat16),
     )
     q_dtype = (
         dtypes.uint8
@@ -5520,42 +7562,43 @@ def build_program(key):
         if key.qkv_quant_mode == 3
         else spec((d["tokens"], d["heads"], 1), dtypes.float32)
     )
-    qr_spec = spec((d["tokens"], d["q_lora"]), dtypes.bfloat16)
-    global_front = (
-        key.fmt == "nz"
-        and key.qkv_quant_mode == 0
-        and 8 < key.profile <= 64
-        and key.shapes[1] == 1536
-    )
+    qr_spec = spec((Dim("QrRows", min=0), d["q_lora"]), dtypes.bfloat16)
     tail_specs = (q_spec,)
     if key.qkv_quant_mode in (2, 3):
         tail_specs += (descale_spec,)
-    if key.return_qr:
-        tail_specs += (qr_spec,)
+    tail_specs += (qr_spec,)
     tail_specs += (
-        spec((d["rows"], d["dim"]), dtypes.bfloat16),
+        spec((d["scratch_rows"], d["dim"]), dtypes.bfloat16),
+        spec(
+            (Dim("QaBf16Rows", min=0, max=_SCRATCH_TOKEN_CAPACITY), d["q_lora_pad"]),
+            dtypes.bfloat16,
+        ),
         spec(
             (
-                d["rows"]
-                * (
-                    4
-                    if global_front
-                    else (4 if key.fmt == "nd" and d["bm"] <= 8 else 1)
-                ),
+                Dim("QaFp32Rows", min=0, max=4 * _SCRATCH_TOKEN_CAPACITY),
                 d["q_lora_pad"],
             ),
-            dtypes.float32
-            if global_front or (key.fmt == "nd" and d["bm"] <= 8)
-            else dtypes.bfloat16,
+            dtypes.float32,
         ),
-        spec((d["rows"], d["kvr_pad"]), dtypes.bfloat16),
+        spec((d["scratch_rows"], d["kvr_pad"]), dtypes.bfloat16),
         spec(
-            (d["rows"], d["rows_qb_pad"]),
+            (d["scratch_rows"], d["rows_qb_pad"]),
             dtypes.bfloat16,
         ),
     )
     if key.qkv_quant_mode in (2, 3):
-        tail_specs += (spec((d["rows"], d["heads"], d["kvr"]), dtypes.float32),)
+        tail_specs += (
+            spec(
+                (
+                    Dim("QFpRows", min=1)
+                    if key.qkv_quant_mode == 3
+                    else d["scratch_rows"],
+                    d["heads"],
+                    d["kvr"],
+                ),
+                dtypes.float32,
+            ),
+        )
     if key.qkv_quant_mode == 3:
         amax_slots = Dim(
             "AmaxSlots", min=AMAX_VECTOR_LANES, multiple_of=AMAX_VECTOR_LANES
@@ -5568,38 +7611,40 @@ def build_program(key):
         dtypes.float32,
         dtypes.int64,
         dtypes.int64,
+        dtypes.int32,
+        dtypes.int32,
+        dtypes.int32,
+        dtypes.int32,
         dtypes.int64,
     )
-    if key.qkv_quant_mode == 3:
-        if key.rope_active:
-            entry = launcher.run_m3_qr_rope if key.return_qr else launcher.run_m3_rope
-            return cannbotdsl.compile(entry, *head_specs, *rope_specs, *tail_specs)
-        entry = launcher.run_m3_qr if key.return_qr else launcher.run_m3
-        return cannbotdsl.compile(entry, *head_specs, *tail_specs)
-    if key.qkv_quant_mode == 2:
-        if key.rope_active:
-            entry = launcher.run_m2_qr_rope if key.return_qr else launcher.run_m2_rope
-            return cannbotdsl.compile(entry, *head_specs, *rope_specs, *tail_specs)
-        entry = launcher.run_m2_qr if key.return_qr else launcher.run_m2
-        return cannbotdsl.compile(entry, *head_specs, *tail_specs)
-    if key.rope_active:
-        if key.return_qr:
-            return cannbotdsl.compile(
-                launcher.run_qr_rope, *head_specs, *rope_specs, *tail_specs
-            )
-        return cannbotdsl.compile(
-            launcher.run_rope, *head_specs, *rope_specs, *tail_specs
-        )
-    if key.return_qr:
-        return cannbotdsl.compile(launcher.run_qr, *head_specs, *tail_specs)
-    return cannbotdsl.compile(launcher.run_preallocated, *head_specs, *tail_specs)
+    entry = (
+        launcher.run_m3_qr_rope
+        if key.qkv_quant_mode == 3
+        else launcher.run_m2_qr_rope
+        if key.qkv_quant_mode == 2
+        else launcher.run_qr_rope
+    )
+    return cannbotdsl.compile(entry, *head_specs, *rope_specs, *tail_specs)
+
+
+def _native_dispatch_key(key):
+    return json.dumps(
+        (key.fmt, key.qkv_quant_mode, key.profile, key.shapes), separators=(",", ":")
+    )
 
 
 def get_program(key):
+    program = _PROGRAM_CACHE.get(key)
+    if program is not None:
+        return program
     with _PROGRAM_LOCK:
         program = _PROGRAM_CACHE.get(key)
         if program is None:
-            program = build_program(key)
+            program = _load_native_program(
+                __file__, "mla_prolog_v4", _native_dispatch_key(key)
+            )
+            if program is None:
+                program = build_program(key)
             _PROGRAM_CACHE[key] = program
         return program
 
@@ -5627,6 +7672,11 @@ class RopeMode(Enum):
     NO_ROPE = 0
     ROPE_INTERLEAVE_HALF = 1
     ROPE_HALF = 2
+
+
+_QKV_QUANT_MODE_VALUES = tuple(_m.value for _m in QkvQuantMode)
+_CACHE_MODE_VALUES = tuple(_m.value for _m in CacheMode)
+_ROPE_MODE_VALUES = tuple(_m.value for _m in RopeMode)
 
 
 def _validate_mode_enums(qkv_quant_mode, cache_mode, rope_mode):
@@ -5756,17 +7806,17 @@ def _validate(
             isinstance(weight, torch.Tensor) and weight.ndim == 2,
             f"{name} logical shape must be rank 2; rank-4 ND is not true NZ",
         )
-    rope_dim = wkva.shape[0] - 512
-    _require(
-        (nope_dim, rope_dim) in ((128, 64), (192, 64), (256, 0)), "illegal (Dn,Dr) pair"
-    )
-    _require(rope_dim != 0 or rope_mode == 0, "Dr=0 requires rope_mode=0")
     formats = tuple((torch_npu.get_npu_format(weight) for weight in (wqa, wqb, wkva)))
     _require(
         formats in ((2, 2, 2), (29, 29, 29)),
         "wqa/wqb/wkva must be uniformly ND or true NZ; no mixed Format",
     )
     nz = formats[0] == 29
+    rope_dim = wkva.shape[1 if nz else 0] - 512
+    _require(
+        (nope_dim, rope_dim) in ((128, 64), (192, 64), (256, 0)), "illegal (Dn,Dr) pair"
+    )
+    _require(rope_dim != 0 or rope_mode == 0, "Dr=0 requires rope_mode=0")
     device = x.device
     _tensor("x", x, (tokens, dim), torch.bfloat16, device)
     for name, weight, shape in (
@@ -5774,7 +7824,9 @@ def _validate(
         ("wqb", wqb, (heads * (nope_dim + rope_dim), q_lora)),
         ("wkva", wkva, (512 + rope_dim, dim)),
     ):
-        _tensor(name, weight, shape, torch.bfloat16, device, nz=nz)
+        _tensor(
+            name, weight, shape[::-1] if nz else shape, torch.bfloat16, device, nz=nz
+        )
     _tensor("wkb", wkb, (heads, nope_dim, 512), torch.bfloat16, device)
     _tensor("norm_weight_qa", norm_weight_qa, (q_lora,), torch.float32, device)
     _tensor("norm_weight_kva", norm_weight_kva, (512,), torch.float32, device)
@@ -5849,7 +7901,7 @@ def _core_num(x, meta):
     return min(int(info.cube_core_num), int(info.vector_core_num) // 2)
 
 
-def _empty_outputs(meta, device):
+def _output_specs(meta, q_rows=None):
     q_dtype = (
         torch.bfloat16
         if meta.qkv_quant_mode < 2
@@ -5857,18 +7909,174 @@ def _empty_outputs(meta, device):
         if meta.qkv_quant_mode == 2
         else torch.uint8
     )
-    q = torch.empty((meta.tokens, meta.heads, meta.kvr), dtype=q_dtype, device=device)
-    if meta.qkv_quant_mode < 2 or (meta.tokens == 0 and meta.qkv_quant_mode == 3):
-        descale = torch.empty((0,), dtype=torch.float32, device=device)
-    elif meta.qkv_quant_mode == 2:
-        descale = torch.empty(
-            (meta.tokens, meta.heads, 1), dtype=torch.float32, device=device
+    descale_shape = (
+        (0,)
+        if meta.qkv_quant_mode < 2 or (meta.tokens == 0 and meta.qkv_quant_mode == 3)
+        else (meta.tokens, meta.heads, 1)
+        if meta.qkv_quant_mode == 2
+        else (1,)
+    )
+    return (
+        ((meta.tokens if q_rows is None else q_rows, meta.heads, meta.kvr), q_dtype),
+        (descale_shape, torch.float32),
+        (
+            ((meta.tokens if q_rows is None else q_rows), meta.q_lora)
+            if meta.return_qr
+            else (0,),
+            torch.bfloat16,
+        ),
+    )
+
+
+def _empty_outputs(meta, device, q_rows=None):
+    return tuple(
+        torch.empty(shape, dtype=dtype, device=device)
+        for shape, dtype in _output_specs(meta, q_rows)
+    )
+
+
+_SCRATCH_ALIGNMENT_BYTES = 32
+
+
+@lru_cache(maxsize=256)
+def _scratch_layout(specs, reuse_groups=()):
+    groups = {slot: group for group in reuse_groups for slot in group}
+    sizes = [math.prod(shape) * dtype.itemsize for shape, dtype in specs]
+    cursor = 0
+    offsets = {}
+    layout = []
+    for slot, (shape, dtype) in enumerate(specs):
+        group = groups.get(slot, (slot,))
+        if group not in offsets:
+            cursor = _ceil_align(cursor, _SCRATCH_ALIGNMENT_BYTES)
+            offsets[group] = cursor
+            cursor += max(sizes[index] for index in group)
+        stride = []
+        count = 1
+        for extent in reversed(shape):
+            stride.append(count)
+            count *= extent
+        layout.append(
+            (shape, dtype, tuple(reversed(stride)), offsets[group] // dtype.itemsize)
         )
-    else:
-        descale = torch.empty((1,), dtype=torch.float32, device=device)
-    qr_shape = (meta.tokens, meta.q_lora) if meta.return_qr else (0,)
-    qr = torch.empty(qr_shape, dtype=torch.bfloat16, device=device)
-    return (q, descale, qr)
+    return _ceil_align(cursor, _SCRATCH_ALIGNMENT_BYTES), tuple(layout)
+
+
+def _allocate_scratch(specs, device, reuse_groups=()):
+    size, layout = _scratch_layout(specs, reuse_groups)
+    storage = torch.empty((size,), dtype=torch.uint8, device=device)
+    typed = {
+        dtype: storage.view(dtype)
+        for dtype in dict.fromkeys(dtype for _, dtype in specs)
+    }
+    return tuple(
+        typed[dtype].as_strided(shape, stride, typed[dtype].storage_offset() + offset)
+        for shape, dtype, stride, offset in layout
+    )
+
+
+def _scratch_reuse_groups(meta):
+    front_group = (0, 2)
+    groups = (front_group,)
+    # KVA cache consumption ends at the WQB join; mode2 Q is produced afterwards.
+    profile = token_profile(meta.tokens)
+    rows = _ceil_align(meta.tokens, 128) if profile == GENERIC_PROFILE else profile
+    if meta.qkv_quant_mode == 2 or _recompute_global_q(meta, rows):
+        groups += ((1, 4),)
+    return groups
+
+
+def _execution_scratch_specs(meta, core_num):
+    profile = token_profile(meta.tokens)
+    rows = _ceil_align(meta.tokens, 128) if profile == GENERIC_PROFILE else profile
+    scratch_rows = _scratch_token_rows(rows, meta)
+    ql_pad = _ceil_align(meta.q_lora, BN)
+    kvr_pad = _ceil_align(meta.kvr, BN)
+    rows_qb_pad = _ceil_align(meta.rows_qb, BN)
+    is_tensor_quantized = meta.qkv_quant_mode in (2, 3)
+    partial_front = meta.weight_format == "nd" and 0 < profile <= 8
+    global_front = (
+        meta.weight_format == "nz"
+        and meta.qkv_quant_mode == 0
+        and 8 < meta.tokens <= 64
+        and meta.q_lora == 1536
+    )
+    qa_shape = (scratch_rows * (4 if global_front or partial_front else 1), ql_pad)
+    qa_dtype = torch.float32 if global_front or partial_front else torch.bfloat16
+    specs = (
+        (qa_shape, qa_dtype),
+        ((scratch_rows, kvr_pad), torch.bfloat16),
+        ((scratch_rows, rows_qb_pad), torch.bfloat16),
+        (
+            (
+                (
+                    0
+                    if meta.return_qr
+                    else rows
+                    if _recompute_global_q(meta, rows)
+                    else scratch_rows
+                ),
+                meta.q_lora,
+            ),
+            torch.bfloat16,
+        ),
+    )
+    if is_tensor_quantized:
+        q_fp_rows = (
+            rows
+            if meta.qkv_quant_mode == 3 and not _recompute_global_q(meta, rows)
+            else scratch_rows
+        )
+        specs += (((q_fp_rows, meta.heads, meta.kvr), torch.float32),)
+    if meta.qkv_quant_mode == 3:
+        specs += (((_ceil_align(core_num, AMAX_VECTOR_LANES),), torch.float32),)
+    if rows != meta.tokens:
+        specs += (((scratch_rows, meta.dim), torch.bfloat16),)
+    return rows, specs
+
+
+def _compile_key(meta, core_num):
+    shapes = (meta.dim, meta.q_lora) if meta.weight_format == "nz" else ()
+    return CompileKey(meta.weight_format, meta.qkv_quant_mode, GENERIC_PROFILE, shapes)
+
+
+def _runtime_controls(meta, core_num):
+    if meta.weight_format != "nz":
+        return 0, 0, 0, 0
+    profile = token_profile(meta.tokens)
+    bm = 128 if profile == GENERIC_PROFILE else profile
+    columns = nz_qb_tile_width(meta.rows_qb, meta.heads, meta.qkv_quant_mode)
+    if meta.qkv_quant_mode == 0 and 0 < profile <= 8:
+        columns = _select_qb_columns(meta.rows_qb, meta.heads, core_num) or columns
+    front_hint = 4 if bm <= 8 and meta.qkv_quant_mode == 0 and meta.heads >= 64 else 0
+    qb_hint = (
+        4
+        if 8 < bm <= 64 and meta.qkv_quant_mode == 0 and meta.heads >= 96
+        else 2
+        if bm <= 8 and meta.heads == 64
+        else 0
+    )
+    wkb_hint = (
+        4
+        if meta.heads >= 96 and (bm <= 8 or bm <= 64 and meta.qkv_quant_mode != 2)
+        else 0
+    )
+    return front_hint, columns, qb_hint, wkb_hint
+
+
+def _qa_workspace_args(raw, norm_qa_matrix, qr_matrix):
+    # Only the selected QA dtype is accessed by the device schedule. Reuse
+    # already-needed views for the other slot; account for 96-column padding.
+    width = raw.shape[1]
+    if raw.dtype == torch.float32:
+        inactive = qr_matrix
+        if inactive.shape[1] != width:
+            inactive = inactive.as_strided((0, width), (width, 1))
+        return inactive, raw
+    inactive = norm_qa_matrix
+    if inactive.shape[1] != width:
+        inactive = inactive.as_strided((0, width), (width, 1))
+    return raw, inactive
 
 
 def _launch(
@@ -5891,89 +8099,53 @@ def _launch(
     cache_mode,
     rope_mode,
 ):
-    profile = token_profile(meta.tokens)
-    shape_key = (
-        (meta.dim, meta.q_lora, meta.kvr, meta.heads, meta.nope_dim)
-        if meta.weight_format == "nz"
-        else ()
-    )
-    key = CompileKey(
-        meta.weight_format,
-        meta.qkv_quant_mode,
-        meta.rope_active,
-        meta.return_qr,
-        profile,
-        shape_key,
-    )
     core_num = _core_num(x, meta)
-    if CUBE_BK in _qb_columns_options(key):
-        key = replace(
-            key, qb_columns=_select_qb_columns(meta.rows_qb, meta.heads, core_num)
-        )
+    key = _compile_key(meta, core_num)
     program = get_program(key)
-    rows = _ceil_align(meta.tokens, 128) if profile == GENERIC_PROFILE else profile
-    ql_pad = _ceil_align(meta.q_lora, BN)
-    kvr_pad = _ceil_align(meta.kvr, BN)
-    rows_qb_pad = _ceil_align(meta.rows_qb, BN)
+    rows, specs = _execution_scratch_specs(meta, core_num)
     is_tensor_quantized = meta.qkv_quant_mode in (2, 3)
-    (q, descale, qr) = _empty_outputs(meta, x.device)
-    q_root = (
-        q
-        if rows == meta.tokens
-        else torch.empty((rows, meta.heads, meta.kvr), dtype=q.dtype, device=x.device)
+    q_root, descale, qr = _empty_outputs(meta, x.device, rows)
+    scratch = iter(_allocate_scratch(specs, x.device, _scratch_reuse_groups(meta)))
+    ws_qa_raw, ws_kva_raw, ws_q_proj, ws_qb_aux = (
+        next(scratch),
+        next(scratch),
+        next(scratch),
+        next(scratch),
     )
-    ws_x_pad = (
-        x
-        if rows == meta.tokens
-        else torch.empty((rows, meta.dim), dtype=torch.bfloat16, device=x.device)
-    )
-    partial_front = meta.weight_format == "nd" and 0 < profile <= 8
-    global_front = (
-        meta.weight_format == "nz"
-        and meta.qkv_quant_mode == 0
-        and 8 < meta.tokens <= 64
-        and meta.q_lora == 1536
-    )
-    ws_qa_raw = torch.empty(
-        (rows * (4 if global_front else (4 if partial_front else 1)), ql_pad),
-        dtype=torch.float32 if global_front or partial_front else torch.bfloat16,
-        device=x.device,
-    )
-    ws_kva_raw = torch.empty((rows, kvr_pad), dtype=torch.bfloat16, device=x.device)
-    qb_output_dtype = torch.bfloat16
-    ws_q_proj = torch.empty((rows, rows_qb_pad), dtype=qb_output_dtype, device=x.device)
+    norm_qa_matrix = norm_weight_qa.view(1, -1)
+    qr_matrix = qr.view(-1, meta.q_lora)
+    if not meta.return_qr and _recompute_global_q(meta, rows):
+        qr_matrix = ws_qb_aux
+    if meta.return_qr:
+        ws_qb_aux = qr_matrix
+    ws_qa_bf16, ws_qa_fp32 = _qa_workspace_args(ws_qa_raw, norm_qa_matrix, qr_matrix)
     if is_tensor_quantized:
-        ws_q_fp = torch.empty(
-            (rows, meta.heads, meta.kvr), dtype=torch.float32, device=x.device
-        )
+        ws_q_fp = next(scratch)
     if meta.qkv_quant_mode == 3:
-        ws_amax = torch.empty(
-            (_ceil_align(core_num, AMAX_VECTOR_LANES),),
-            dtype=torch.float32,
-            device=x.device,
-        )
-    ws_qb_aux = torch.empty((rows, meta.q_lora), dtype=torch.bfloat16, device=x.device)
+        ws_amax = next(scratch)
+    ws_x_pad = next(scratch) if rows != meta.tokens else x[: specs[2][0][0]]
     launch_args = (
         x,
         wqa,
         wqb,
         wkva,
         wkb,
-        norm_weight_qa.view(1, -1),
+        norm_qa_matrix,
         norm_weight_kva.view(1, -1),
         kv_cache,
         cache_index,
     )
     if is_tensor_quantized:
         launch_args += (quant_scale_kv,)
-    if meta.rope_active:
-        launch_args += (rope_sin, rope_cos)
+    if not meta.rope_active:
+        rope_sin = qr.as_strided((0, SEG), (SEG, 1))
+        rope_cos = rope_sin
+    launch_args += (rope_sin, rope_cos)
     launch_args += (q_root,)
     if is_tensor_quantized:
         launch_args += (descale,)
-    if meta.return_qr:
-        launch_args += (qr,)
-    launch_args += (ws_x_pad, ws_qa_raw, ws_kva_raw, ws_q_proj)
+    launch_args += (qr_matrix,)
+    launch_args += (ws_x_pad, ws_qa_bf16, ws_qa_fp32, ws_kva_raw, ws_q_proj)
     if is_tensor_quantized:
         launch_args += (ws_q_fp,)
     if meta.qkv_quant_mode == 3:
@@ -5985,10 +8157,11 @@ def _launch(
         float(kvr_scale),
         int(cache_mode == CacheMode.PA_NZ),
         int(rope_mode),
+        *_runtime_controls(meta, core_num),
         core_num,
     )
     program(*launch_args)
-    return (q_root[: meta.tokens], descale, qr)
+    return (q_root[: meta.tokens], descale, qr[: meta.tokens])
 
 
 def _validate_quant_scale_value(quant_scale_kv):
@@ -6035,9 +8208,9 @@ def mla_prolog_v2_native(
 
     Args:
         x: BF16 ND input, (T, dim).
-        wqa: BF16 weight, logical (q_lora, dim).
-        wqb: BF16 weight, logical (N*(Dn+Dr), q_lora).
-        wkva: BF16 weight, logical (512+Dr, dim).
+        wqa: BF16 weight, ND (q_lora, dim), NZ (dim, q_lora).
+        wqb: BF16 weight, ND (N*(Dn+Dr), q_lora), NZ (q_lora, N*(Dn+Dr)).
+        wkva: BF16 weight, ND (512+Dr, dim), NZ (dim, 512+Dr).
             wqa/wqb/wkva must be all ND or all true NZ.
         wkb: BF16 ND weight, (N, Dn, 512).
         norm_weight_qa: FP32 gamma, (q_lora,).
@@ -6147,44 +8320,57 @@ def _native_nz_profiles():
 
 
 def _export_keys():
-    keys = []
-    for qkv_quant_mode in (0, 1, 2, 3):
-        for rope_active in (False, True):
-            for return_qr in (False, True):
-                for profile in TOKEN_PROFILES:
-                    keys.append(
-                        CompileKey(
-                            "nd", qkv_quant_mode, rope_active, return_qr, profile
-                        )
-                    )
+    keys = {}
+    for mode in (0, 1, 2, 3):
+        for profile in (GENERIC_PROFILE,):
+            keys[CompileKey("nd", mode, profile)] = None
     for dim, q_lora, heads, nope_dim, rope_dim in _native_nz_profiles():
-        for qkv_quant_mode in (0, 1, 2, 3):
-            for rope_active in (False, True) if rope_dim else (False,):
-                for return_qr in (False, True):
-                    for profile in TOKEN_PROFILES:
-                        keys.append(
-                            CompileKey(
-                                "nz",
-                                qkv_quant_mode,
-                                rope_active,
-                                return_qr,
-                                profile,
-                                (dim, q_lora, 512 + rope_dim, heads, nope_dim),
-                            )
+        for mode in (0, 1, 2, 3):
+            for rope in (False, True) if rope_dim else (False,):
+                for qr in (False, True):
+                    for profile in (GENERIC_PROFILE,):
+                        tokens = 129 if profile == GENERIC_PROFILE else profile
+                        meta = SimpleNamespace(
+                            tokens=tokens,
+                            dim=dim,
+                            q_lora=q_lora,
+                            kvr=KV_LORA + rope_dim,
+                            heads=heads,
+                            nope_dim=nope_dim,
+                            rows_qb=heads * (nope_dim + rope_dim),
+                            weight_format="nz",
+                            qkv_quant_mode=mode,
+                            rope_active=rope,
+                            return_qr=qr,
                         )
-    return tuple(
-        replace(key, qb_columns=columns)
-        for key in keys
-        for columns in _qb_columns_options(key)
-    )
+                        keys[_compile_key(meta, 1)] = None
+    return tuple(keys)
 
 
 # Native export uses the same compilation factory as direct and Torch execution.
 @export("mla_prolog_v4")
 def export_mla_prolog_v4():
+    session = current_collection()
+    source_sha = _native_sha(Path(__file__))
     for key in _export_keys():
-        program = build_program(key)
-        program.close()
+        compilations = []
+        with observe_compilations(
+            lambda artifact, source: compilations.append(artifact)
+        ):
+            program = build_program(key)
+        with program:
+            if session is not None:
+                if len(compilations) != 1:
+                    raise RuntimeError("MLA export must compile exactly one Program")
+                session.add_task_metadata(
+                    "mla_dispatch",
+                    dict(
+                        schema_version=1,
+                        compile_key=_native_dispatch_key(key),
+                        binary_key=compilations[0].binary_key,
+                        source_sha256=source_sha,
+                    ),
+                )
 
 
 def _close_programs():
@@ -6228,14 +8414,14 @@ _TORCH_SCHEMA = (
 # NPU dispatcher delegates to the same single-launch implementation; cache_mode is
 # serialized as an integer.
 def _validate_schema_modes(qkv_quant_mode, cache_mode, rope_mode):
-    for name, value, enum_type in (
-        ("qkv_quant_mode", qkv_quant_mode, QkvQuantMode),
-        ("cache_mode", cache_mode, CacheMode),
-        ("rope_mode", rope_mode, RopeMode),
+    for name, value, allowed in (
+        ("qkv_quant_mode", qkv_quant_mode, _QKV_QUANT_MODE_VALUES),
+        ("cache_mode", cache_mode, _CACHE_MODE_VALUES),
+        ("rope_mode", rope_mode, _ROPE_MODE_VALUES),
     ):
         if type(value) is not int:
             raise TypeError(f"{name} schema value must be int")
-        if value not in tuple(member.value for member in enum_type):
+        if value not in allowed:
             raise ValueError(f"{name} has unsupported schema value {value}")
 
 
@@ -6334,7 +8520,7 @@ def mla_prolog_v2_fake(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Describe fixed output slots without reading device data or launching DSL."""
     _validate_schema_modes(qkv_quant_mode, cache_mode, rope_mode)
-    (t, heads, dr) = (x.shape[0], wkb.shape[0], wkva.shape[0] - 512)
+    (t, heads, dr) = (x.shape[0], wkb.shape[0], 0 if wkb.shape[1] == 256 else 64)
     q_dtype = (
         torch.bfloat16
         if qkv_quant_mode < 2
