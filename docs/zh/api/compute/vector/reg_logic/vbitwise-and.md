@@ -31,7 +31,7 @@ vbitwise_and(lhs: RawVReg, rhs: RawVReg, *, mask: Mask) -> RawVReg
 
 **支持的元素数据类型：**
 
-`dtypes.int8`、`dtypes.uint8`、`dtypes.int16`、`dtypes.uint16`、`dtypes.int32`、`dtypes.uint32`。
+`dtypes.int8`、`dtypes.uint8`、`dtypes.int16`、`dtypes.uint16`、`dtypes.int32`、`dtypes.uint32`、`dtypes.int64`、`dtypes.uint64`、`dtypes.float16`、`dtypes.float32`、`dtypes.bfloat16`、`dtypes.float8_e4m3fn`、`dtypes.float8_e5m2`、`dtypes.float8_e8m0`。
 
 ## 返回值说明
 
