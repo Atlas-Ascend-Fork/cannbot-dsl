@@ -6,7 +6,7 @@ AI Core 上有三条计算路径，它们的编程模型完全不同。写算子
 | --- | --- | --- | --- | --- |
 | 矩阵计算 | AIC（Cube） | `PIPE_M` | L0A / L0B，结果在 L0C | [`matmul`](../api/compute/matrix/matmul.md) |
 | 矢量计算 | AIV（Vector） | `PIPE_V` | 矢量寄存器，经 UB 中转 | `with vf(mode="simd"):` 内的 `v*` 接口 |
-| 标量计算 | Scalar | `PIPE_S` | 标量寄存器、GM | [标量计算](../api/compute/scalar/index.md)接口 |
+| 标量计算 | Scalar | `PIPE_S` | 标量寄存器、GM | 标量计算接口 |
 
 矢量这一路还有第二种编程模式：`with vf(mode="simt"):`。它和 SIMD 跑在同一个 AIV 上，但编程模型完全不同，见[本章末尾的 SIMT 模式](./compute.md#simt-模式)。按官方定位，混合编程「以 SIMD 为主、SIMT 为辅」，所以本章主体仍讲 SIMD。
 
@@ -195,7 +195,7 @@ mask, _ = update_mask(64, 32)                       # 位置参数形式
 ```
 
 ::: danger
-支持 `mask` 参数的接口，`mask` 必须通过[掩码寄存器操作](../api/compute/vector/reg_mask/create-mask.md)接口**预先赋值**后再传入。未赋值的掩码寄存器内容不确定，会导致有效元素位置错误。
+支持 `mask` 参数的接口，`mask` 必须通过[掩码操作](../api/compute/vector/reg_mask/create-mask.md)接口**预先赋值**后再传入。未赋值的掩码寄存器内容不确定，会导致有效元素位置错误。
 :::
 
 ### 接口分类速查
@@ -214,7 +214,7 @@ mask, _ = update_mask(64, 32)                       # 位置参数形式
 | 选择 | `vselect(a, b, cond_mask=...)` |
 | 广播 | `vdup`、`vdups` |
 | 类型转换 | `vcast`、`vreinterpret`、`vceil`、`vfloor`、`vtrunc` |
-| 排布变换 | `vpack`、`vunpack`、`vinterleave`、`vdeinterleave`、`vmerge`、`vcompress`、`vsqueeze` |
+| 排布变换 | `vpack`、`vunpack`、`vinterleave`、`vdeinterleave`、`vmerge`、`vcompress`、`vunsqueeze` |
 | 掩码操作 | `full_mask`、`create_mask`、`update_mask`、`mask_counter`、`mask_and/or/xor/not` |
 | 索引 | `varange` |
 | 直方图 | `vhistogram_accumulate`、`vhistogram_frequency` |

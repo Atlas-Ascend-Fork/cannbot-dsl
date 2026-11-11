@@ -1,4 +1,5 @@
-# vsqueeze
+# vunsqueeze
+
 ## 产品支持情况
 
 - Ascend 950PR&950DT系列产品：支持
@@ -16,7 +17,7 @@
 ## 函数原型
 
 ```python
-vsqueeze(mask: Mask, dtype) -> RawVReg
+vunsqueeze(mask: Mask, dtype) -> RawVReg
 ```
 
 ## 参数说明
@@ -41,7 +42,7 @@ vsqueeze(mask: Mask, dtype) -> RawVReg
 
 ## 调用示例
 
-以下示例调用`vsqueeze`统计每个位置之前的有效掩码元素个数，并在Host侧校验结果。
+以下示例调用`vunsqueeze`统计每个位置之前的有效掩码元素个数，并在Host侧校验结果。
 
 ```python
 import torch
@@ -50,23 +51,23 @@ import torch_npu
 from cannbotdsl import Buffer, dtypes, host, make_layout, mem_copy
 from cannbotdsl.lang.kernel import kernel
 from cannbotdsl.lang.vf import vf
-from cannbotdsl.ops.reg import create_mask, full_mask, vsqueeze, vstore
+from cannbotdsl.ops.reg import create_mask, full_mask, vunsqueeze, vstore
 from cannbotdsl.tensor import MemLoc
 
 @kernel
-def _vsqueeze_kernel(dst):
+def _vunsqueeze_kernel(dst):
     out = Buffer(MemLoc.UB, dst.dtype, make_layout((128,)))
 
     res = out
     with vf(mode="simd"):
         mask = create_mask(pattern="vl32", elem_bits=16)
-        vstore(res, 0, vsqueeze(mask, dtypes.uint16), full_mask(elem_bits=16))
+        vstore(res, 0, vunsqueeze(mask, dtypes.uint16), full_mask(elem_bits=16))
 
     mem_copy(dst, out)
 
 @host
 def run(dst):
-    _vsqueeze_kernel[1](dst)
+    _vunsqueeze_kernel[1](dst)
 
 def main():
     dst = torch.empty((128,), dtype=torch.uint16, device="npu:0")
@@ -76,7 +77,7 @@ def main():
 
     expected = torch.tensor([min(i, 32) for i in range(128)], dtype=torch.int32)
     torch.testing.assert_close(dst.cpu().to(torch.int32), expected)
-    print("vsqueeze example passed")
+    print("vunsqueeze example passed")
     print(f"first={int(dst.cpu()[0])}, last={int(dst.cpu()[-1])}")
 
 if __name__ == "__main__":
@@ -86,6 +87,6 @@ if __name__ == "__main__":
 预期结果：
 
 ```text
-vsqueeze example passed
+vunsqueeze example passed
 first=0, last=32
 ```

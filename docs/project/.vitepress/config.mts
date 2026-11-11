@@ -1556,11 +1556,10 @@ const apiSidebar = [
         "items": [
           {
             "text": "原子计算",
-            "link": "/zh/api/compute/atomic",
+            "section": "/compute/atomic",
             "items": [
               {
                 "text": "标量原子操作",
-                "link": "/zh/api/compute/atomic/scalar_atomic",
                 "items": [
                   {
                     "text": "atomic_add",
@@ -1622,7 +1621,7 @@ const apiSidebar = [
           },
           {
             "text": "矩阵计算",
-            "link": "/zh/api/compute/matrix",
+            "section": "/compute/matrix",
             "items": [
               {
                 "text": "概述",
@@ -1672,7 +1671,6 @@ const apiSidebar = [
               },
               {
                 "text": "Mmad计算关键特性说明",
-                "link": "/zh/api/compute/matrix/key-features",
                 "items": [
                   {
                     "text": "GEMV",
@@ -1739,11 +1737,10 @@ const apiSidebar = [
           },
           {
             "text": "标量计算",
-            "link": "/zh/api/compute/scalar",
+            "section": "/compute/scalar",
             "items": [
               {
-                "text": "标量位操作",
-                "link": "/zh/api/compute/scalar/scalar_bit",
+                "text": "位运算",
                 "items": [
                   {
                     "text": "clear_nthbit",
@@ -1781,8 +1778,7 @@ const apiSidebar = [
                 "collapsed": true
               },
               {
-                "text": "标量类型转换",
-                "link": "/zh/api/compute/scalar/scalar_convert",
+                "text": "类型转换",
                 "items": [
                   {
                     "text": "cast",
@@ -1796,12 +1792,17 @@ const apiSidebar = [
                 "collapsed": true
               },
               {
-                "text": "load_bypass",
-                "link": "/zh/api/compute/scalar/scalar_load/load-bypass"
+                "text": "数据搬入",
+                "items": [
+                  {
+                    "text": "load_bypass",
+                    "link": "/zh/api/compute/scalar/scalar_load/load-bypass"
+                  }
+                ],
+                "collapsed": true
               },
               {
-                "text": "标量数据搬运",
-                "link": "/zh/api/compute/scalar/scalar_store",
+                "text": "数据搬出",
                 "items": [
                   {
                     "text": "cube_store_bypass",
@@ -1819,7 +1820,7 @@ const apiSidebar = [
           },
           {
             "text": "张量计算",
-            "link": "/zh/api/compute/tensor",
+            "section": "/compute/tensor",
             "items": [
               {
                 "text": "ceil_div",
@@ -1837,15 +1838,23 @@ const apiSidebar = [
             "collapsed": true
           },
           {
-            "text": "Reg 矢量计算",
-            "link": "/zh/api/compute/vector",
+            "text": "Reg矢量计算",
+            "section": "/compute/vector",
             "items": [
               {
+                "text": "矢量计算（概览）",
+                "link": "/zh/api/compute/vector/overview"
+              },
+              {
+                "text": "关键特性说明",
+                "link": "/zh/api/compute/vector/key-features"
+              },
+              {
                 "text": "Reg数据搬入",
-                "link": "/zh/api/compute/vector/load",
+                "section": "/compute/vector/load",
                 "items": [
                   {
-                    "text": "Reg数据搬入",
+                    "text": "概述",
                     "link": "/zh/api/compute/vector/load/overview"
                   },
                   {
@@ -1892,8 +1901,8 @@ const apiSidebar = [
                 "collapsed": true
               },
               {
-                "text": "Reg 算术计算",
-                "link": "/zh/api/compute/vector/reg_arith",
+                "text": "基础算术",
+                "section": "/compute/vector/reg_arith",
                 "items": [
                   {
                     "text": "vabs",
@@ -1979,8 +1988,8 @@ const apiSidebar = [
                 "collapsed": true
               },
               {
-                "text": "Reg 广播",
-                "link": "/zh/api/compute/vector/reg_broadcast",
+                "text": "广播操作",
+                "section": "/compute/vector/reg_broadcast",
                 "items": [
                   {
                     "text": "vdup",
@@ -1994,8 +2003,8 @@ const apiSidebar = [
                 "collapsed": true
               },
               {
-                "text": "Reg 比较",
-                "link": "/zh/api/compute/vector/reg_compare",
+                "text": "比较计算",
+                "section": "/compute/vector/reg_compare",
                 "items": [
                   {
                     "text": "veq",
@@ -2049,8 +2058,8 @@ const apiSidebar = [
                 "collapsed": true
               },
               {
-                "text": "Reg 类型转换",
-                "link": "/zh/api/compute/vector/reg_convert",
+                "text": "类型转换",
+                "section": "/compute/vector/reg_convert",
                 "items": [
                   {
                     "text": "RoundingMode",
@@ -2092,8 +2101,8 @@ const apiSidebar = [
                 "collapsed": true
               },
               {
-                "text": "Reg 融合计算",
-                "link": "/zh/api/compute/vector/reg_fused",
+                "text": "复合计算",
+                "section": "/compute/vector/reg_fused",
                 "items": [
                   {
                     "text": "vabs_sub",
@@ -2135,12 +2144,19 @@ const apiSidebar = [
                 "collapsed": true
               },
               {
-                "text": "vgather_reg",
-                "link": "/zh/api/compute/vector/reg_gather/vgather-reg"
+                "text": "聚合操作",
+                "section": "/compute/vector/reg_gather",
+                "items": [
+                  {
+                    "text": "vgather_reg",
+                    "link": "/zh/api/compute/vector/reg_gather/vgather-reg"
+                  }
+                ],
+                "collapsed": true
               },
               {
-                "text": "Reg 直方图",
-                "link": "/zh/api/compute/vector/reg_histogram",
+                "text": "直方图",
+                "section": "/compute/vector/reg_histogram",
                 "items": [
                   {
                     "text": "vhistogram_accumulate",
@@ -2154,12 +2170,19 @@ const apiSidebar = [
                 "collapsed": true
               },
               {
-                "text": "varange",
-                "link": "/zh/api/compute/vector/reg_index/varange"
+                "text": "索引操作",
+                "section": "/compute/vector/reg_index",
+                "items": [
+                  {
+                    "text": "varange",
+                    "link": "/zh/api/compute/vector/reg_index/varange"
+                  }
+                ],
+                "collapsed": true
               },
               {
-                "text": "Reg 逻辑运算",
-                "link": "/zh/api/compute/vector/reg_logic",
+                "text": "逻辑计算",
+                "section": "/compute/vector/reg_logic",
                 "items": [
                   {
                     "text": "mask_and",
@@ -2209,8 +2232,8 @@ const apiSidebar = [
                 "collapsed": true
               },
               {
-                "text": "Reg 掩码操作",
-                "link": "/zh/api/compute/vector/reg_mask",
+                "text": "掩码操作",
+                "section": "/compute/vector/reg_mask",
                 "items": [
                   {
                     "text": "create_mask",
@@ -2232,8 +2255,8 @@ const apiSidebar = [
                 "collapsed": true
               },
               {
-                "text": "Reg 重排与选择",
-                "link": "/zh/api/compute/vector/reg_permute_sel",
+                "text": "排布变换",
+                "section": "/compute/vector/reg_permute_sel",
                 "items": [
                   {
                     "text": "vcompress",
@@ -2272,8 +2295,8 @@ const apiSidebar = [
                     "link": "/zh/api/compute/vector/reg_permute_sel/vsqueeze-and-storeunalign"
                   },
                   {
-                    "text": "vsqueeze",
-                    "link": "/zh/api/compute/vector/reg_permute_sel/vsqueeze"
+                    "text": "vunsqueeze",
+                    "link": "/zh/api/compute/vector/reg_permute_sel/vunsqueeze"
                   },
                   {
                     "text": "vstore_unalign_begin",
@@ -2291,8 +2314,8 @@ const apiSidebar = [
                 "collapsed": true
               },
               {
-                "text": "Reg 归约计算",
-                "link": "/zh/api/compute/vector/reg_reduce",
+                "text": "归约计算",
+                "section": "/compute/vector/reg_reduce",
                 "items": [
                   {
                     "text": "vpair_reduce_sum",
@@ -2326,19 +2349,33 @@ const apiSidebar = [
                 "collapsed": true
               },
               {
-                "text": "vmem_bar",
-                "link": "/zh/api/compute/vector/reg_sync/vmem-bar"
+                "text": "同步控制",
+                "section": "/compute/vector/reg_sync",
+                "items": [
+                  {
+                    "text": "vmem_bar",
+                    "link": "/zh/api/compute/vector/reg_sync/vmem-bar"
+                  }
+                ],
+                "collapsed": true
               },
               {
-                "text": "vscatter",
-                "link": "/zh/api/compute/vector/scatter/vscatter"
+                "text": "Reg离散搬出",
+                "section": "/compute/vector/scatter",
+                "items": [
+                  {
+                    "text": "vscatter",
+                    "link": "/zh/api/compute/vector/scatter/vscatter"
+                  }
+                ],
+                "collapsed": true
               },
               {
                 "text": "Reg数据搬出",
-                "link": "/zh/api/compute/vector/store",
+                "section": "/compute/vector/store",
                 "items": [
                   {
-                    "text": "Reg数据搬出",
+                    "text": "概述",
                     "link": "/zh/api/compute/vector/store/overview"
                   },
                   {
@@ -2381,8 +2418,8 @@ const apiSidebar = [
                 "collapsed": true
               },
               {
-                "text": "UB Gather",
-                "link": "/zh/api/compute/vector/ub_gather",
+                "text": "Reg聚合搬入",
+                "section": "/compute/vector/ub_gather",
                 "items": [
                   {
                     "text": "vgather_datablock",
@@ -2394,14 +2431,6 @@ const apiSidebar = [
                   }
                 ],
                 "collapsed": true
-              },
-              {
-                "text": "关键特性说明",
-                "link": "/zh/api/compute/vector/key-features"
-              },
-              {
-                "text": "Reg 矢量计算",
-                "link": "/zh/api/compute/vector/overview"
               }
             ],
             "collapsed": true
@@ -2816,13 +2845,14 @@ const cleanedApiSidebar = cleanSidebar(apiSidebar)
 const normalizeApiSidebar = (sidebar: any[]) => {
   const root = sidebar[0]
   const items = root.items ?? []
-  const find = (list: any[], suffix: string) => list.find((item: any) => item.link?.endsWith(suffix))
+  const find = (list: any[], suffix: string) => list.find((item: any) => (item.link ?? item.section)?.endsWith(suffix))
   const remove = (list: any[], item: any) => list.filter((candidate: any) => candidate !== item)
   const withCleanLabels = (item: any): any => {
     const cleaned = typeof item.text === 'string' && item.text !== 'SIMT 接口'
       ? item.text.replace(/ 接口$/, '').replace(/^操作$/, '计算').replace(/^张量操作$/, '张量计算').replace(/^原子操作$/, '原子计算')
       : item.text
-    const overviewLabel = typeof item.link === 'string' && /\/overview\/?$/.test(item.link) && typeof cleaned === 'string' && !/简介|概览/.test(cleaned)
+    const isRegOverview = item.link?.startsWith('/zh/api/compute/vector/') && cleaned === '概述'
+    const overviewLabel = typeof item.link === 'string' && /\/overview\/?$/.test(item.link) && typeof cleaned === 'string' && !/简介|概览/.test(cleaned) && !isRegOverview
       ? `${cleaned}（概览）`
       : cleaned
     const conceptLabel = item.link?.endsWith('/control-flow/control-flow') && overviewLabel === '控制流'
@@ -2845,7 +2875,7 @@ const normalizeApiSidebar = (sidebar: any[]) => {
     if (!Array.isArray(item.items)) return item
     const children = item.items.map(orderForReading)
     // Matrix pages follow ASC's concepts, computation, features, then configuration order.
-    if (item.link === '/zh/api/compute/matrix') return { ...item, items: children }
+    if (item.section === '/compute/matrix') return { ...item, items: children }
     return {
       ...item,
       items: children
@@ -2859,7 +2889,7 @@ const normalizeApiSidebar = (sidebar: any[]) => {
     if (item.link === "/zh/api/data-structures/convolution/make-conv2d-spec") {
       return { ...item, items: item.items.map(removeParentLinks) }
     }
-    const { link: _link, ...group } = item
+    const { link: _link, section: _section, ...group } = item
     return { ...group, items: item.items.map(removeParentLinks) }
   }
 
@@ -2926,6 +2956,22 @@ const normalizeApiSidebar = (sidebar: any[]) => {
       find(computeItems, '/compute/matrix'),
       find(computeItems, '/compute/atomic'),
     ].filter(Boolean)
+    const vector = find(computeItems, '/compute/vector')
+    if (vector) {
+      // Follow ASC C API's category order, retaining any unlisted future groups.
+      const categoryOrder = [
+        'overview', 'key-features',
+        'load', 'ub_gather', 'store', 'scatter',
+        'reg_arith', 'reg_logic', 'reg_reduce', 'reg_gather',
+        'reg_broadcast', 'reg_fused', 'reg_compare', 'reg_permute_sel',
+        'reg_index', 'reg_histogram', 'reg_mask', 'reg_convert', 'reg_sync',
+      ]
+      const rank = (item: any) => {
+        const index = categoryOrder.indexOf((item.link ?? item.section)?.split('/').pop())
+        return index < 0 ? categoryOrder.length : index
+      }
+      vector.items = [...(vector.items ?? [])].sort((a, b) => rank(a) - rank(b))
+    }
   }
 
   const execution = find(items, '/execution')

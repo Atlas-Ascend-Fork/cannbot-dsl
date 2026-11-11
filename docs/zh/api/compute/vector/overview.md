@@ -86,4 +86,4 @@ first=1.0000, last=127.0000
 - Vector Function的流水类型为`[PIPE](../../execution/pipeline.md).V`，Vector Function内部如存在UB地址重叠或跨流水依赖，需要根据具体接口约束插入 [`vmem_bar`](./reg_sync/vmem-bar.md)。
 - Reg 矢量计算接口仅在AIV上生效，在非AIV上调用时不执行计算。
 - Reg 矢量计算接口需要在VF作用域内调用，不支持在核函数中直接调用。
-- 对于支持配置`mask`参数的Reg 矢量计算接口，`mask`需通过[掩码寄存器操作](./reg_mask/create-mask.md)接口预先赋值后再传入，未赋值的掩码寄存器内容不确定，会导致有效元素位置错误。
+- 对于支持配置`mask`参数的Reg 矢量计算接口，`mask`需通过[掩码操作](./reg_mask/create-mask.md)接口预先赋值后再传入，未赋值的掩码寄存器内容不确定，会导致有效元素位置错误。

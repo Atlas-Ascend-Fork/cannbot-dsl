@@ -104,7 +104,7 @@ matmul(dst: Tensor, lhs: Tensor, rhs: Tensor, *, bias: Tensor | None = None, ini
 - L0C Buffer大小为256KB，L0A Buffer和L0B Buffer大小均为64KB。BiasTable Buffer大小为4KB。矩阵的起始地址和占用空间不能超出对应Buffer的范围。
 - 申请矩阵存储空间时，需使用按照分形大小补齐后的数值进行申请：M、N分别向上补齐到16的倍数，K向上补齐到K0的倍数，K0的取值为`32B / sizeof(dtype)`，`dtype`为矩阵的数据类型。`lhs`、`rhs`、`dst`的shape即为矩阵的有效M、K、N值，补齐部分为无效数据，不参与结果矩阵有效区域的计算。
 - M、K、N的单位为元素，取值范围均为[0, 4095]。
-- 当M为1且`disable_gemv`为false时，将开启GEMV模式。此时从L0A Buffer读取矩阵A时按照ND格式读取，矩阵A需按照ND格式排布，起始地址仍需按照512字节对齐。
+- 当M为1且`disable_gemv`为false时，将开启[GEMV模式](./key-features-gemv.md)。此时从L0A Buffer读取矩阵A时按照ND格式读取，矩阵A需按照ND格式排布，起始地址仍需按照512字节对齐。
 
 ### UnitFlag约束
 
@@ -114,7 +114,7 @@ matmul(dst: Tensor, lhs: Tensor, rhs: Tensor, *, bias: Tensor | None = None, ini
 
 ### 特殊值/边界值约束
 
-- 注意，应避免nan输入，否则可能会产生执行报错；整数类型仅支持饱和模式。
+- 注意，应避免nan输入，否则可能会产生执行报错；整数类型仅支持[饱和模式](../vector/reg_convert/roundingmode.md#饱和模式与非饱和模式说明)。
 
 ## 调用示例
 

@@ -55,7 +55,7 @@
 | **AIC** | AI Cube | 矩阵乘加（MMAD） | [`matmul`](../api/compute/matrix/matmul.md) |
 | **AIV** | AI Vector | 逐元素/归约类矢量运算 | [Reg 矢量计算](../api/compute/vector/overview.md)（`vadd`、`vreduce_sum` 等） |
 
-此外每个核还有标量单元（Scalar），负责地址计算、循环控制和轻量位运算，对应[标量计算](../api/compute/scalar/index.md)接口。
+此外每个核还有标量单元（Scalar），负责地址计算、循环控制和轻量位运算，对应标量计算接口。
 
 AIV 上的矢量计算有**两种编程模式**，都用 `with vf(...)` 圈定：`mode="simd"`（默认，寄存器级 SIMD）和 `mode="simt"`（线程级）。本章和后面大部分内容讲的是 SIMD；SIMT 见[三类计算单元](./compute.md#simt-模式)。按官方架构白皮书的定位，混合编程「以 SIMD 为主、SIMT 为辅」——规则访存的 element-wise 计算用 SIMD，不规则控制流和 gather/scatter 用 SIMT。
 
