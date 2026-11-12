@@ -40,10 +40,9 @@ dst_n, cu_seqlens, experts_to_copy, src_n, vtopk = moonep_plan(
 形状约束：`E <= 1024`、`R <= 64`、`E % R == 0`；`S*K` 任意规模原生整除
 （分块粒度降档到 N 的因子，无尾补机制）。
 
-`verify` 缺省为 `False`：plan 返回路径零同步，接收布局不变量
-（`cu_seqlens[-1] == N`）延迟到下一个 moonep 算子尾部校验。调试或验收时
-可传 `verify=True`，plan 返回前同步校验，布局破坏立即报错，避免坏布局被
-下游消费；流水化生产路径会因此引入一次流同步，不应开启。
+plan 返回路径零同步：接收布局不变量（`cu_seqlens[-1] == N`）延迟到下一个
+moonep 算子尾部校验。测试/验收需要当场熔断时，显式调用
+`check_pending_overflow(context)`。
 
 ## 权重预取（prefetch_weight）
 

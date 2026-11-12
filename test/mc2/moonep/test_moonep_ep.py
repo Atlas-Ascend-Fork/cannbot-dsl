@@ -40,6 +40,8 @@ sys.path.insert(
 )
 
 from conftest import fill_and_repush  # noqa: E402
+
+_EPN = 32  # ElasticBuffer sizing 的 epn 上界（上游 #306 漏定义；test_e2e 同款常量）
 from moonep_golden import (  # noqa: E402
     RouteShape,
     make_router_inputs,

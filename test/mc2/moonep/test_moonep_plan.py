@@ -45,7 +45,10 @@ from moonep_golden import (  # noqa: E402
 )
 
 try:
-    from moonep_context import create_moonep_context  # noqa: F401
+    from moonep_context import (  # noqa: F401
+        check_pending_overflow,
+        create_moonep_context,
+    )
     from moonep_plan import moonep_plan  # noqa: F401
 
     _HAS_DSL_IMPL = True
@@ -68,6 +71,8 @@ _requires_ep = pytest.mark.skipif(
 )
 
 from prefetch_utils import _H, _init_ep_group  # noqa: E402
+
+_EPN = 32  # ElasticBuffer sizing 的 epn 上界（上游 #306 漏定义；test_e2e 同款常量）
 
 # (S, K, epn, mode, seed)：R 取运行时 world size，E = epn*R
 # 最小覆盖集：生产 shape / 非整除 N / 小 E / 大 E
@@ -190,7 +195,8 @@ def test_moonep_ep_dispatch_combine_vs_golden(num_tokens, top_k, epn, mode, seed
         .npu()
     )
     ctx = create_moonep_context()
-    dst_n, cu, etc, src_n, vtopk = moonep_plan(ctx, tpe_my, topk_my, verify=True)
+    dst_n, cu, etc, src_n, vtopk = moonep_plan(ctx, tpe_my, topk_my)
+    check_pending_overflow(ctx)
 
     buf = _get_ep_buf(world_size, num_tokens, top_k)
 
@@ -215,6 +221,39 @@ def test_moonep_ep_dispatch_combine_vs_golden(num_tokens, top_k, epn, mode, seed
     )
     # 权重回收：combined_topk_weights 应精确等于本 rank 路由权重
     assert torch.equal(out_w.cpu(), rw_my), f"回收权重不符（mode={mode}）"
+
+
+# ---------------------------------------------------------------------------
+# B < R 回归：实际启动块数小于 EP 组规模（R=64、可常驻核 56 的真机场景）
+# 时，Exchange 的 per-peer 发送必须按实际块数跨步覆盖全部远程 peer，
+# 否则其余 peer 等不到 ready flag，plan 挂死（检视意见 2026-11-10）。
+# 用 resident_blocks 打桩到 2 构造 B=2 < R 的本机可复现形态。
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.npu
+@_requires_dsl
+@_requires_ep
+def test_moonep_plan_blocks_lt_ranks(monkeypatch):
+    rank, world_size = _init_ep_group()
+    if world_size < 4:
+        pytest.skip("需 >=4 卡构造 B<R")
+    import moonep_plan as plan_mod
+
+    monkeypatch.setattr(plan_mod, "resident_blocks", lambda cap: 2)
+    num_tokens, top_k, epn = 64, 4, 4
+    shape = RouteShape(world_size, num_tokens, top_k, epn * world_size)
+    topk_all, _, _ = _make_case(shape, "balanced", 7)
+    topk_my = topk_all[rank].to(torch.int32).npu()
+    tpe_my = (
+        torch.bincount(topk_all[rank].flatten(), minlength=shape.num_experts)
+        .to(torch.int32)
+        .npu()
+    )
+    ctx = create_moonep_context()
+    res = plan_mod.moonep_plan(ctx, tpe_my, topk_my)
+    check_pending_overflow(ctx)  # 挂死会超时失败；同时校验布局不变量
+    assert int(res.cu_seqlens[-1]) == num_tokens * top_k
 
 
 # ---------------------------------------------------------------------------
@@ -246,7 +285,8 @@ def test_moonep_count_audit(num_tokens, top_k, epn, seed):
         .npu()
     )
     ctx = create_moonep_context()
-    moonep_plan.moonep_plan(ctx, tpe_my, topk_my, verify=True)
+    moonep_plan.moonep_plan(ctx, tpe_my, topk_my)
+    check_pending_overflow(ctx)
 
     _, tables = ctx.plan_workspace
     blocks = moonep_plan._plan_blocks(num_tokens * top_k, shape.num_experts)
