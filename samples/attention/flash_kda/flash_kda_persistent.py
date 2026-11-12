@@ -2048,7 +2048,7 @@ def persistent_flash_kda_fwd(
     v: torch.Tensor,
     g: torch.Tensor,
     beta: torch.Tensor,
-    metadata: torch.Tensor,
+    metadata: Optional[torch.Tensor],
     initial_state: Optional[torch.Tensor] = None,
     A_log: Optional[torch.Tensor] = None,
     dt_bias: Optional[torch.Tensor] = None,
@@ -2062,7 +2062,7 @@ def persistent_flash_kda_fwd(
     use_gate_in_kernel: bool = True,
     use_beta_sigmoid_in_kernel: bool = True,
     allow_neg_eigval: bool = False,
-    disable_recompute: bool = True,
+    disable_recompute: bool = False,
     lower_bound: Optional[float] = None,
     layout: str = "TND",
 ) -> Tuple[Optional[torch.Tensor], ...]:
@@ -2081,8 +2081,8 @@ def persistent_flash_kda_fwd(
     )
 
 
-@export("persistent_flash_kda_fwd")
-def export_persistent_flash_kda_fwd():
+@export("persistent_flash_kda")
+def export_persistent_flash_kda():
     """收集直接模板编译请求，不启动 Provider。"""
     try:
         fwd._get_compiled_kernel(TEMPLATE_PERSISTENT)

@@ -119,7 +119,7 @@ def flash_kda(
     use_gate_in_kernel=True,
     use_beta_sigmoid_in_kernel=True,
     allow_neg_eigval=False,
-    disable_recompute=True,
+    disable_recompute=False,
     lower_bound=None,
     layout="TND",
 ): ...
@@ -133,7 +133,7 @@ def flash_kda(
 | `v` | `[B,Nv,S,D]` | BF16 | 必选 | Value。 |
 | `g` | 与 `v` 相同 | BF16 / FP32 | 必选 | 原始 gate 或预处理的对数衰减；FP32 输入会转换为 BF16。 |
 | `beta` | `[B,Nv,S]` | BF16 / FP32 | 必选 | 原始 logits 或预处理 beta；核内激活使用 FP32 操作数。 |
-| `metadata` | `[M]` | int32 | 必选 | 由 `flash_kda_metadata` 生成的调度元数据。 |
+| `metadata` | `[M]` | int32 Tensor | 可选 | 调用时必须传入合法调度 Tensor，省略抛出 TypeError，显式传 None 抛出 ValueError。 |
 | `initial_state` | `[B,Nv,Dv,Dk]` | FP32 | 可选 | 可为 None，此时使用全零状态；已传入的状态必须符合规格。 |
 | `A_log` | `[Nv]` | FP32 / None | 条件必选 | 内核激活 gate 时必传；外部激活时可为 None。 |
 | `dt_bias` | `[Nv,Dk]` | FP32 / None | 可选 | gate 偏置；None 按零处理。 |
@@ -146,7 +146,7 @@ def flash_kda(
 | `use_gate_in_kernel` | 默认 True | bool | 可选 | False 时 g 已激活，忽略 `A_log`、`dt_bias`、`lower_bound`。 |
 | `use_beta_sigmoid_in_kernel` | 默认 True | bool | 可选 | True 执行 sigmoid；训练时由内部实现保存激活结果。 |
 | `allow_neg_eigval` | 默认 False | bool | 可选 | True 时 sigmoid beta 乘 2；要求开启 beta sigmoid。 |
-| `disable_recompute` | 默认 True | bool | 可选 | 控制训练前向的中间缓存保存；True 时保留用于避免重计算的内部缓存，不改变公开返回项。 |
+| `disable_recompute` | 默认 False | bool | 可选 | 控制训练前向的中间缓存保存；True 时保留用于避免重计算的内部缓存，不改变公开返回项。 |
 | `lower_bound` | 默认 None，数值范围 `[-5,0)` | int / float / None | 可选 | gate 开启时 None 使用 -exp(A_log) × softplus(g + dt_bias)，有限数值使用有界 sigmoid；关闭时忽略。 |
 | `layout` | `"BNSD"` / `"BSND"` / `"TND"` | str | 可选 | 默认 `TND`。 |
 
@@ -181,7 +181,7 @@ def flash_kda_metadata(
 
 `enable_grad=False` 用于推理，训练使用 True。主算子不会从 `enable_grad` 切换运行模式；切换模式、设备、设备有效核数、形状、布局或有效长度后重新生成 metadata。相同调度配置下可以复用 metadata。真实前向会阻塞回读 metadata 和给定的长度张量，校验本次调用的序列边界与调度；Meta/FakeTensor 只执行静态检查。尺寸、长度、连续性和 GQA 等非法参数抛出 `ValueError`。
 
-主算子的第六个必填输入为 `metadata`，可按位置或关键字传入；从 `scale` 开始的属性按关键字传入；`scale` 的签名默认值为 `128 ** -0.5`，显式传 None 时仍使用该缩放值。
+主算子的第六个输入 `metadata` 可按位置或关键字传入；省略时抛出 `TypeError`，显式传 None 时抛出 `ValueError: metadata is required`；从 `scale` 开始的属性按关键字传入；`scale` 的签名默认值为 `128 ** -0.5`，显式传 None 时仍使用该缩放值。
 
 ## 返回值说明
 

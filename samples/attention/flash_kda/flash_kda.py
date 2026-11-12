@@ -71,7 +71,7 @@ def compile_environment():
 
 @kernel(
     profile=cannbotdsl.ProfileSpec(
-        name="flash_kda_fwd", op_type="FlashKDAFwd",
+        name="flash_kda", op_type="FlashKDA",
         inputs=("gm_K", "gm_V", "gm_Q", "gm_beta", "gm_g", "gm_A_log", "gm_dt_bias", "gm_metadata",),
         outputs=(
             "gm_O",
@@ -171,7 +171,7 @@ class flash_kda_fwd_kernel:
 
 @kernel(
     profile=cannbotdsl.ProfileSpec(
-        name="staged_flash_kda_fwd", op_type="FlashKDAFwd",
+        name="staged_flash_kda", op_type="FlashKDA",
         inputs=("gm_K", "gm_V", "gm_Q", "gm_beta", "gm_g", "gm_A_log", "gm_dt_bias", "gm_metadata",),
         outputs=(
             "gm_O",
@@ -254,7 +254,7 @@ class staged_flash_kda_fwd_kernel:
 
 @kernel(
     profile=cannbotdsl.ProfileSpec(
-        name="persistent_flash_kda_fwd", op_type="FlashKDAFwd",
+        name="persistent_flash_kda", op_type="FlashKDA",
         inputs=("gm_K", "gm_V", "gm_Q", "gm_beta", "gm_g", "gm_A_log", "gm_dt_bias", "gm_metadata",),
         outputs=(
             "gm_O",
@@ -629,7 +629,7 @@ def _flash_kda_fwd_impl(
     v: torch.Tensor,
     g: torch.Tensor,
     beta: torch.Tensor,
-    metadata: torch.Tensor,
+    metadata: Optional[torch.Tensor],
     initial_state: Optional[torch.Tensor] = None,
     A_log: Optional[torch.Tensor] = None,
     dt_bias: Optional[torch.Tensor] = None,
@@ -643,7 +643,7 @@ def _flash_kda_fwd_impl(
     use_gate_in_kernel: bool = True,
     use_beta_sigmoid_in_kernel: bool = True,
     allow_neg_eigval: bool = False,
-    disable_recompute: bool = True,
+    disable_recompute: bool = False,
     lower_bound: Optional[float] = None,
     layout: str = "TND",
     internal_template: int = TEMPLATE_AUTO,
@@ -982,7 +982,7 @@ def flash_kda_fwd(
     v: torch.Tensor,
     g: torch.Tensor,
     beta: torch.Tensor,
-    metadata: torch.Tensor,
+    metadata: Optional[torch.Tensor],
     initial_state: Optional[torch.Tensor] = None,
     A_log: Optional[torch.Tensor] = None,
     dt_bias: Optional[torch.Tensor] = None,
@@ -996,7 +996,7 @@ def flash_kda_fwd(
     use_gate_in_kernel: bool = True,
     use_beta_sigmoid_in_kernel: bool = True,
     allow_neg_eigval: bool = False,
-    disable_recompute: bool = True,
+    disable_recompute: bool = False,
     lower_bound: Optional[float] = None,
     layout: str = "TND",
 ) -> Tuple[Optional[torch.Tensor], ...]:
@@ -1028,15 +1028,6 @@ def clear_caches():
         for compiled_kernel in _COMPILED_KERNEL.values():
             compiled_kernel.close()
         _COMPILED_KERNEL.clear()
-
-
-@export("flash_kda_fwd")
-def export_flash_kda_fwd():
-    """收集训练前向编译请求，不启动 Provider。"""
-    try:
-        _get_compiled_kernel()
-    finally:
-        clear_caches()
 
 
 def _meta_outputs(spec, value_shape, outputs):
@@ -1081,7 +1072,7 @@ def flash_kda(
     v: torch.Tensor,
     g: torch.Tensor,
     beta: torch.Tensor,
-    metadata: torch.Tensor,
+    metadata: Optional[torch.Tensor],
     initial_state: Optional[torch.Tensor] = None,
     A_log: Optional[torch.Tensor] = None,
     dt_bias: Optional[torch.Tensor] = None,
@@ -1095,7 +1086,7 @@ def flash_kda(
     use_gate_in_kernel: bool = True,
     use_beta_sigmoid_in_kernel: bool = True,
     allow_neg_eigval: bool = False,
-    disable_recompute: bool = True,
+    disable_recompute: bool = False,
     lower_bound: Optional[float] = None,
     layout: str = "TND",
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:

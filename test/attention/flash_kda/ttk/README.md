@@ -49,6 +49,16 @@ scale 默认 `128 ** (-0.5)`，显式传 None 也使用默认缩放；F06-005 �
 
 同目录的 `test_flash_kda.py` 以统一入口验证训练和推理结果，并保留共享实现中 `flash_kda_fwd` 的 16 项兼容接口检查；这些兼容检查不加载独立的旧算子目录。内部缓冲区白盒检查继续使用真实实现的 `FlashKDAFwd.run` 名称。
 
+## 默认值与缓存检查
+
+`disable_recompute` 默认 False，TTK 适配入口及 `assets/inputs.py` 的默认值与算子保持一致。CSV 显式配置 True/False 时使用该值；`omitted_attributes` 包含此属性时，真实调用省略该关键字，验证算子默认行为。
+
+训练时，`w/u/qg/kg/v_new/g_cumsum` 六项仅在 `disable_recompute=True` 时返回并检查 shape、dtype 和精度；False（包括默认调用）时必须为 None，不参与数值比较。此开关不关闭 out、已请求 final_state、Aqk/Akk、已启用归一化及 beta 激活结果的检查。推理时训练缓存始终为 None。
+
+原生动态精度用例保留省略参数的默认调用，继续检查两个入口的一致性、输入不变性及有效输出精度；小尺寸显式开关用例分别覆盖 staged/persistent 和 False/True。Meta 用例检查默认及显式两种取值的 16 槽返回协议，未启用项保留原槽位并断言 None。
+
+主算子的 `metadata` 注解为 `Optional[torch.Tensor]`，没有默认值：调用时仍需提供该参数，省略抛 TypeError，显式传 None 抛 ValueError；正例继续传入合法调度 Tensor。
+
 ## 性能用例配置
 
 `ttk_cases_profiling.csv` 保留 25 条用例：9 条推理、16 条训练；编号、shape、布局和预热/采样次数不变。下列参数在 CSV 中显式设置，`omitted_attributes` 为空，不依赖算子默认值。

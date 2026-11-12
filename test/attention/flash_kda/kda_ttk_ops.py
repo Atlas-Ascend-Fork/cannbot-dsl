@@ -1092,7 +1092,7 @@ def flash_kda(
     use_gate_in_kernel: bool = True,
     use_beta_sigmoid_in_kernel: bool = True,
     allow_neg_eigval: bool = False,
-    disable_recompute: bool = True,
+    disable_recompute: bool = False,
     lower_bound: Optional[float] = None,
     layout: str = "TND",
     # Test attributes below are consumed here, never forwarded to the DUT.

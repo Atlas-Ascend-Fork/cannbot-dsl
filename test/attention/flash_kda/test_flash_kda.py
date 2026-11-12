@@ -730,7 +730,7 @@ def _saved_golden(inputs, batch_idx, length, *, direct_u=False, shared_score_ref
     return (q_norm.bfloat16(), k_norm.bfloat16(), q_rstd, k_rstd, beta), matrices, extras
 
 
-def _assert_saved_shapes(saved, inputs, case):
+def _assert_saved_shapes(saved, inputs, case, *, disable_recompute):
     assert len(saved) == 14
     q_norm, k_norm, q_rstd, k_rstd, beta, aqk, akk, w, u, qg, kg, v_new, g_cumsum, h = (
         saved
@@ -754,11 +754,15 @@ def _assert_saved_shapes(saved, inputs, case):
     )
     chunk_prefix = (chunk_count, case.nv) if case.layout == "TND" else (len(case.lengths), chunk_count, case.nv)
     assert aqk.shape == akk.shape == chunk_prefix + (CHUNK_SIZE, CHUNK_SIZE)
-    assert g_cumsum.shape == chunk_prefix + (CHUNK_SIZE, SUPPORTED_HEAD_DIM)
-    assert all(value.shape == public_v.shape for value in (w, u, qg, kg, v_new)), (
-        [tuple(value.shape) for value in (w, u, qg, kg, v_new)],
-        tuple(public_v.shape),
-    )
+    if disable_recompute:
+        assert all(isinstance(value, torch.Tensor) for value in (w, u, qg, kg, v_new, g_cumsum))
+        assert g_cumsum.shape == chunk_prefix + (CHUNK_SIZE, SUPPORTED_HEAD_DIM)
+        assert all(value.shape == public_v.shape for value in (w, u, qg, kg, v_new)), (
+            [tuple(value.shape) for value in (w, u, qg, kg, v_new)],
+            tuple(public_v.shape),
+        )
+    else:
+        assert all(value is None for value in (w, u, qg, kg, v_new, g_cumsum))
     if case.layout == "TND":
         state_shape = (
             _DYNAMIC_STAGED._tnd_state_chunk_capacity(storage_length, len(case.lengths)),
@@ -771,9 +775,13 @@ def _assert_saved_shapes(saved, inputs, case):
     assert h.shape == state_shape
 
 
-def _saved_actual_tokens(saved, case):
+def _saved_actual_tokens(saved, case, *, disable_recompute):
     actual = []
     for index, value in enumerate(saved[:-1]):
+        if 7 <= index < 13 and not disable_recompute:
+            assert value is None
+            actual.append(None)
+            continue
         assert value.dtype == (
             LOW_DTYPE if index in (0, 1, 5, 6, 7, 8, 9, 10, 11) else torch.float32
         )
@@ -790,9 +798,9 @@ def _saved_actual_tokens(saved, case):
     return actual
 
 
-def _assert_saved_precision(saved, inputs, case, *, direct_u=False, shared_score_reference=False):
-    _assert_saved_shapes(saved, inputs, case)
-    actual = _saved_actual_tokens(saved, case)
+def _assert_saved_precision(saved, inputs, case, *, disable_recompute, direct_u=False, shared_score_reference=False):
+    _assert_saved_shapes(saved, inputs, case, disable_recompute=disable_recompute)
+    actual = _saved_actual_tokens(saved, case, disable_recompute=disable_recompute)
     h = saved[-1]
     for batch_idx, length in enumerate(case.lengths):
         token_golden, matrices, extras = _saved_golden(
@@ -814,11 +822,12 @@ def _assert_saved_precision(saved, inputs, case, *, direct_u=False, shared_score
                 assert torch.count_nonzero(torch.triu(tile.float(), diagonal=1)) == 0
             tile = actual[6][batch_idx][..., slice(start, start + rows), :rows]
             assert torch.equal(tile.diagonal(dim1=-2, dim2=-1), torch.ones_like(tile.diagonal(dim1=-2, dim2=-1)))
-        for index, expected in zip(range(7, 13), extras[:-1]):
-            torch.testing.assert_close(
-                actual[index][batch_idx].float(), expected.float(), atol=_TOL, rtol=_TOL,
-                msg=lambda msg: f"saved {index} cache mismatch: {msg}",
-            )
+        if disable_recompute:
+            for index, expected in zip(range(7, 13), extras[:-1]):
+                torch.testing.assert_close(
+                    actual[index][batch_idx].float(), expected.float(), atol=_TOL, rtol=_TOL,
+                    msg=lambda msg: f"saved {index} cache mismatch: {msg}",
+                )
         chunk_count = (length + CHUNK_SIZE - 1) // CHUNK_SIZE
         if case.layout == "TND":
             token_start = sum(case.lengths[:batch_idx])
@@ -836,13 +845,14 @@ def _assert_saved_precision(saved, inputs, case, *, direct_u=False, shared_score
 class _DynamicForwardResult:
     output: torch.Tensor
     state: torch.Tensor
-    saved: list[torch.Tensor]
+    saved: list[torch.Tensor | None]
     metadata: torch.Tensor
     initial_state: torch.Tensor
     initial_state_before: torch.Tensor
 
 
-def _run_dynamic_forward(inputs, case, template, *, whitebox):
+def _run_dynamic_forward(inputs, case, template, *, whitebox, disable_recompute=None):
+    # None means omit the keyword to exercise the operator default (False).
     q, k, v, g, beta = (tensor.npu() for tensor in _dynamic_layout_inputs(inputs, case))
     cu_seqlens = None
     if case.has_cu:
@@ -874,6 +884,8 @@ def _run_dynamic_forward(inputs, case, template, *, whitebox):
     before = [value.cpu().clone() for value in args if isinstance(value, torch.Tensor)]
     kw = dict(initial_state=initial_state, A_log=args[7], dt_bias=args[8], scale=inputs.scale_value,
               lower_bound=inputs.lower_bound, layout=case.layout, cu_seqlens=cu_seqlens, output_final_state=True)
+    if disable_recompute is not None:
+        kw["disable_recompute"] = disable_recompute
     with torch.inference_mode(False):
         out = _DYNAMIC_KDA.flash_kda(q, k, v, g, beta, metadata=metadata, **kw)
         # The compatible full-forward entry lives in this same unified module.
@@ -940,7 +952,9 @@ def _assert_dynamic_output_golden(result, case, golden_outputs, golden_state):
         )
 
 
-def _assert_dynamic_precision_case(case, *, whitebox=False, compare_output_golden=True, template="auto"):
+def _assert_dynamic_precision_case(
+    case, *, whitebox=False, compare_output_golden=True, template="auto", disable_recompute=None,
+):
     require_npu()
     inputs, golden_outputs, golden_state = _make_dynamic_case(case)
     if whitebox and case.has_cu and case.layout != "TND":
@@ -949,7 +963,9 @@ def _assert_dynamic_precision_case(case, *, whitebox=False, compare_output_golde
         for batch, length in enumerate(case.lengths):
             for tensor in (inputs.q, inputs.k, inputs.v, inputs.g, inputs.beta_brc):
                 tensor[batch, :, length:] = float("nan")
-    result = _run_dynamic_forward(inputs, case, template, whitebox=whitebox)
+    result = _run_dynamic_forward(
+        inputs, case, template, whitebox=whitebox, disable_recompute=disable_recompute,
+    )
     saved, metadata = result.saved, result.metadata
     initial_state_before = result.initial_state_before
     selected_template = int(metadata[_DYNAMIC_METADATA.HEADER_TEMPLATE].item())
@@ -962,7 +978,7 @@ def _assert_dynamic_precision_case(case, *, whitebox=False, compare_output_golde
     )
     _assert_saved_precision(
         saved, inputs, case, direct_u=selected_template == _DYNAMIC_METADATA.TEMPLATE_PERSISTENT,
-        shared_score_reference=shared_score_reference,
+        shared_score_reference=shared_score_reference, disable_recompute=disable_recompute is True,
     )
     if case.layout == "TND":
         state_h = saved[-1].cpu()
@@ -991,8 +1007,6 @@ def test_meta_training_outputs_and_forward_compatibility(layout):
     metadata = torch.empty(128, device="meta", dtype=torch.int32)
     cu = torch.empty(batch + 1, device="meta", dtype=torch.int32) if layout == "TND" else None
     kwargs = dict(layout=layout, cu_seqlens=cu, use_gate_in_kernel=False)
-    with pytest.raises(TypeError, match="metadata"):
-        _DYNAMIC_KDA.flash_kda(v, v, v, v, beta, **kwargs)
     for inference in (False, True):
         for final_state in (False, True):
             for intermediate_states in (False, True):
@@ -1005,17 +1019,43 @@ def test_meta_training_outputs_and_forward_compatibility(layout):
                 assert result[0].shape == shape and result[0].dtype == LOW_DTYPE
                 assert (result[1] is not None) == final_state
                 assert (result[2] is not None) == (inference and intermediate_states)
-    # Retain cache-layout coverage for the compatible forward entry.
-    for op in (
-        _DYNAMIC_KDA.flash_kda_fwd,
-        _DYNAMIC_STAGED.staged_flash_kda_fwd,
-        _DYNAMIC_PERSISTENT.persistent_flash_kda_fwd,
-    ):
-        result = op(v, v, v, v, beta, metadata, **kwargs)
+    def check_forward_result(result, *, inference, disable_recompute):
         assert len(result) == 16 and result[0].is_meta
-        assert result[0].shape == v.shape
-        for cache in result[5:10]:
-            assert cache.shape == shape and cache.dtype == LOW_DTYPE
+        assert result[0].shape == v.shape and result[0].dtype == LOW_DTYPE
+        assert result[1:3] == (None, None)
+        assert all((value is not None) == (not inference) for value in result[3:5])
+        assert all((value is not None) == (not inference) for value in result[11:16])
+        if inference or not disable_recompute:
+            assert all(value is None for value in result[5:11])
+        else:
+            for cache in result[5:10]:
+                assert cache.shape == shape and cache.dtype == LOW_DTYPE
+            chunks = (
+                _DYNAMIC_STAGED._tnd_state_chunk_capacity(length, batch)
+                if layout == "TND" else (length + CHUNK_SIZE - 1) // CHUNK_SIZE
+            )
+            prefix = (chunks, heads) if layout == "TND" else (batch, chunks, heads)
+            assert result[10].shape == prefix + (CHUNK_SIZE, SUPPORTED_HEAD_DIM)
+            assert result[10].dtype == torch.float32
+
+    for op in (_DYNAMIC_KDA.flash_kda, _DYNAMIC_KDA.flash_kda_fwd):
+        with pytest.raises(TypeError, match="metadata"):
+            op(v, v, v, v, beta, **kwargs)
+        with pytest.raises(ValueError, match="metadata is required"):
+            op(v, v, v, v, beta, None, **kwargs)
+    for inference in (False, True):
+        with torch.inference_mode(inference):
+            # Really omit the keyword to check the unified entry's new default.
+            default_result = _DYNAMIC_KDA.flash_kda_fwd(v, v, v, v, beta, metadata, **kwargs)
+            check_forward_result(default_result, inference=inference, disable_recompute=False)
+            for op in (
+                _DYNAMIC_KDA.flash_kda_fwd,
+                _DYNAMIC_STAGED.staged_flash_kda_fwd,
+                _DYNAMIC_PERSISTENT.persistent_flash_kda_fwd,
+            ):
+                for disable_recompute in (False, True):
+                    result = op(v, v, v, v, beta, metadata, disable_recompute=disable_recompute, **kwargs)
+                    check_forward_result(result, inference=inference, disable_recompute=disable_recompute)
 
 
 def test_public_gate_chunks_preserves_fp32_at_packed_boundaries():
@@ -1074,6 +1114,16 @@ def test_forward_meta_validates_tensor_inputs():
 @pytest.mark.parametrize("case", _DYNAMIC_FAST_CASES, ids=lambda case: case.case_id)
 def test_flash_kda_dynamic_precision(case, template):
     _assert_dynamic_precision_case(case, template=template)
+
+
+@pytest.mark.npu
+@pytest.mark.parametrize("template", ("staged", "persistent"))
+@pytest.mark.parametrize("disable_recompute", (False, True), ids=("recompute", "save_caches"))
+def test_flash_kda_recompute_modes(disable_recompute, template):
+    # Keep the full shape pool on the default; explicit modes use a small case.
+    _assert_dynamic_precision_case(
+        _DYNAMIC_FAST_CASES[0], template=template, disable_recompute=disable_recompute,
+    )
 
 
 def teardown_module():

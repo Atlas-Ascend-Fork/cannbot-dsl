@@ -32,7 +32,8 @@
           "@flash_kda/source/flash_kda.py",
           "@flash_kda/source/flash_kda_metadata.py",
           "@flash_kda/source/flash_kda_staged.py",
-          "@flash_kda/source/flash_kda_persistent.py"
+          "@flash_kda/source/flash_kda_persistent.py",
+          "@flash_kda/source/flash_kda_validation.py"
         ]
       }
     },

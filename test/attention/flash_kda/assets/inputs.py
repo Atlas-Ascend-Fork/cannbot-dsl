@@ -30,7 +30,7 @@ OPERATOR_DEFAULTS = {
     "use_gate_in_kernel": True,
     "use_beta_sigmoid_in_kernel": True,
     "allow_neg_eigval": False,
-    "disable_recompute": True,
+    "disable_recompute": False,
     "output_final_state": False,
     "return_intermediate_states": False,
     "scale": 128 ** (-0.5),
