@@ -39,7 +39,7 @@ conv2d_load_fmap(dst: Tensor, src: Tensor, tile: Conv2dTile, *, l2_cache_ctl: in
 
 ## 调用示例
 
-将一块 `(1, 16, 4, 4)` 的 NCHW 特征图加载到 L1，再经 UB 读回，校验其 NC1HWC0 排布；本例不执行卷积计算。
+将一块 `(1, 16, 2, 8)` 的 NCHW 特征图加载到 L1，再经 UB 读回，校验其 NC1HWC0 排布；本例不执行卷积计算。
 
 ```python
 # Copyright (c) 2026 Huawei Technologies Co., Ltd.
@@ -53,8 +53,8 @@ import cannbotdsl as cb
 def load_fmap(x: cb.Tensor, y: cb.Tensor):
     spec = cb.make_conv2d_spec(
         dtype=cb.dtypes.float16,
-        input_shape=(1, 16, 4, 4),
-        filter_shape=(16, 16, 1, 1),
+        input_shape=(1, 16, 2, 8),
+        filter_shape=(32, 16, 1, 1),
     )
     tile = spec.tile(tile=(16, 16, 16), coord=(0, 0, 0))
     fmap = cb.make_conv2d_fmap_l1(cb.dtypes.float16, spec, tile=(16, 16))
@@ -73,11 +73,11 @@ def run(x: cb.Tensor, y: cb.Tensor):
 
 
 def main():
-    x = torch.arange(256, dtype=torch.float16).reshape(1, 16, 4, 4)
+    x = torch.arange(256, dtype=torch.float16).reshape(1, 16, 2, 8)
     y = torch.empty(256, dtype=torch.float16, device="npu")
     run(x.npu(), y)
     torch.npu.synchronize()
-    expected = x.reshape(1, 1, 16, 4, 4).permute(0, 1, 3, 4, 2).contiguous()
+    expected = x.reshape(1, 1, 16, 2, 8).permute(0, 1, 3, 4, 2).contiguous()
     torch.testing.assert_close(y.cpu(), expected.reshape(-1), rtol=0, atol=0)
     print("conv2d_load_fmap example passed")
 

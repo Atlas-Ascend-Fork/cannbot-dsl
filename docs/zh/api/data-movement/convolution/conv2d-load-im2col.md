@@ -34,7 +34,7 @@ conv2d_load_im2col(dst: Tensor, src: Tensor, tile: Conv2dTile) -> None
 
 ## 调用示例
 
-将 `(1, 16, 4, 4)` 特征图按 3×3 窗口、步长 1、四周补零 1 展开到 L0A，得到 16 个输出位置、每个位置 144 个元素。为校验结果，将展开矩阵乘单位矩阵后写回 GM，不执行完整卷积。
+将 `(1, 16, 2, 9)` 特征图按 3×2 窗口、步长 1、上下各补零 1 展开到 L0A，得到 16 个输出位置、每个位置 96 个元素。为校验结果，将展开矩阵乘单位矩阵后写回 GM，不执行完整卷积。
 
 ```python
 # Copyright (c) 2026 Huawei Technologies Co., Ltd.
@@ -48,20 +48,20 @@ import cannbotdsl as cb
 def expand(x: cb.Tensor, identity: cb.Tensor, y: cb.Tensor):
     spec = cb.make_conv2d_spec(
         dtype=cb.dtypes.float16,
-        input_shape=(1, 16, 4, 4),
-        filter_shape=(16, 16, 3, 3),
-        padding=(1, 1, 1, 1),
+        input_shape=(1, 16, 2, 9),
+        filter_shape=(32, 16, 3, 2),
+        padding=(1, 1, 0, 0),
     )
     tile = spec.tile(tile=(16, 16, 16), coord=(0, 0, 0))
     fmap = cb.make_conv2d_fmap_l1(cb.dtypes.float16, spec, tile=(16, 16))
-    a = cb.Buffer(cb.MemLoc.L0A, cb.dtypes.float16, cb.make_layout((16, 144)))
+    a = cb.Buffer(cb.MemLoc.L0A, cb.dtypes.float16, cb.make_layout((16, 96)))
     cb.conv2d_load_fmap(fmap, x, tile)
     cb.conv2d_load_im2col(tile.l0a_view(a), fmap, tile)
 
     # L0A 无直接写回 GM 的通路，乘单位矩阵以读回展开结果。
-    b_l1 = cb.Buffer(cb.MemLoc.L1, cb.dtypes.float16, cb.make_layout((144, 144)))
-    b = cb.Buffer(cb.MemLoc.L0B, cb.dtypes.float16, cb.make_layout((144, 144)))
-    c = cb.Buffer(cb.MemLoc.L0C, cb.dtypes.float32, cb.make_layout((16, 144)))
+    b_l1 = cb.Buffer(cb.MemLoc.L1, cb.dtypes.float16, cb.make_layout((96, 96)))
+    b = cb.Buffer(cb.MemLoc.L0B, cb.dtypes.float16, cb.make_layout((96, 96)))
+    c = cb.Buffer(cb.MemLoc.L0C, cb.dtypes.float32, cb.make_layout((16, 96)))
     cb.mem_copy(b_l1, identity)
     cb.mem_copy(b, b_l1)
     cb.matmul(c, a, b, init=True)
@@ -74,13 +74,13 @@ def run(x: cb.Tensor, identity: cb.Tensor, y: cb.Tensor):
 
 
 def main():
-    x = torch.arange(256).reshape(1, 16, 4, 4).remainder(100).half()
-    y = torch.empty((16, 144), dtype=torch.float32, device="npu")
-    run(x.npu(), torch.eye(144, dtype=torch.float16, device="npu"), y)
+    x = torch.arange(288).reshape(1, 16, 2, 9).remainder(100).half()
+    y = torch.empty((16, 96), dtype=torch.float32, device="npu")
+    run(x.npu(), torch.eye(96, dtype=torch.float16, device="npu"), y)
     torch.npu.synchronize()
     # unfold 为通道优先；调整为卷积核高、宽、输入通道的顺序。
-    expected = torch.nn.functional.unfold(x.float(), kernel_size=3, padding=1)
-    expected = expected.reshape(16, 3, 3, 16).permute(3, 1, 2, 0).reshape(16, 144)
+    expected = torch.nn.functional.unfold(x.float(), kernel_size=(3, 2), padding=(1, 0))
+    expected = expected.reshape(16, 3, 2, 16).permute(3, 1, 2, 0).reshape(16, 96)
     torch.testing.assert_close(y.cpu(), expected, rtol=0, atol=0)
     print("conv2d_load_im2col example passed")
 

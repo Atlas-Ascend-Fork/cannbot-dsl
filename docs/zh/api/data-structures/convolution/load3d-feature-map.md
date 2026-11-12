@@ -24,9 +24,9 @@ Load3DFeatureMap(
 
 | 参数 | 输入/输出 | 说明 |
 | --- | --- | --- |
-| height | 输入 | 输入特征图高度，1～32767，单位为行，不含 padding。 |
-| width | 输入 | 输入特征图宽度，1～32767，单位为列，不含 padding。 |
-| channels | 输入 | 逻辑输入通道数，0～65535；0 表示空搬运。令 C0=32/元素字节数：8 位类型余数允许 0、4、8、16，16 位允许 0、4、8，32 位允许 0、4；余数指 channels%C0。 |
+| height | 输入 | 行输入特征图高度，1～32767，不含 padding。 |
+| width | 输入 | 列输入特征图宽度，1～32767，不含 padding。 |
+| channels | 输入 | 源操作数的通道数，取值范围：channelSize∈[0, 65535]。<br> 对于half，channelSize除16的余数应当为0，4或8。<br>对于int8_t和uint8_t，channelSize除32的余数应当为0，4，8或16。<br>对于int4b_t，channelSize为8，16，32，N*64，N*64+8，N*64+16，N*64+32，N为正整数。 |
 | pad_top | 输入 | 上边界补值行数，0～255。 |
 | pad_bottom | 输入 | 下边界补值行数，0～255。 |
 | pad_left | 输入 | 左边界补值列数，0～255。 |
@@ -42,50 +42,4 @@ Load3DFeatureMap(
 
 ## 调用示例
 
-以下示例展开 L1 特征图，通过单位矩阵乘法读回结果并校验。
-
-```python
-# Copyright (c) 2026 Huawei Technologies Co., Ltd.
-# Licensed under the CANN Open Software License Agreement Version 2.0.
-import cannbotdsl as cb
-import torch
-import torch_npu
-
-@cb.kernel
-def kernel(src: cb.Tensor, eye: cb.Tensor, out: cb.Tensor):
-    fmap = cb.Buffer(cb.MemLoc.L1, cb.dtypes.float16, cb.make_layout((256,)), data_format="nd")
-    identity = cb.Buffer(cb.MemLoc.L1, cb.dtypes.float16, cb.make_layout((16, 16)))
-    a = cb.Buffer(cb.MemLoc.L0A, cb.dtypes.float16, cb.make_layout((16, 16)))
-    b = cb.Buffer(cb.MemLoc.L0B, cb.dtypes.float16, cb.make_layout((16, 16)))
-    c = cb.Buffer(cb.MemLoc.L0C, cb.dtypes.float32, cb.make_layout((16, 16)))
-    cb.mem_copy(fmap, src)
-    cb.mem_copy(identity, eye)
-    cb.load3d(a, fmap,
-        feature=cb.Load3DFeatureMap(height=4, width=4, channels=16),
-        window=cb.Load3DWindow(m_extent=16, k_extent=16),
-        destination=cb.Load3DDestination(k_stride_fractals=1),
-        repeat=cb.Load3DRepeat(count=1), padding=cb.Load3DPadding.value(0))
-    cb.mem_copy(b, identity)
-    cb.matmul(c, a, b, init=True)
-    cb.mem_copy(out, c)
-
-@cb.host
-def launch(src: cb.Tensor, eye: cb.Tensor, out: cb.Tensor):
-    kernel[1](src, eye, out)
-
-def main():
-    matrix = torch.arange(256, dtype=torch.float16).reshape(16, 16)
-    # One C1 plane: (C1, H, W, C0) = (1, 4, 4, 16).
-    src = matrix.flatten().to("npu:0")
-    eye = torch.eye(16, dtype=torch.float16, device="npu:0")
-    out = torch.empty((16, 16), dtype=torch.float32, device="npu:0")
-    launch(src, eye, out)
-    torch.npu.synchronize()
-    torch.testing.assert_close(out.cpu(), matrix.float(), rtol=0, atol=0)
-    print("load3d example passed")
-
-if __name__ == "__main__":
-    main()
-```
-
-预期结果：校验通过，输出 `load3d example passed`。
+见 [load3d 调用示例](../../data-movement/convolution/load3d.md#调用示例)。

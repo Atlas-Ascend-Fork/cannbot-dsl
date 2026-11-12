@@ -39,55 +39,54 @@ conv2d_store_output(dst: Tensor, src: Tensor, tile: Conv2dTile, *, l2_cache_ctl:
 
 ## 调用示例
 
-用矩阵乘生成一个 16×16 的 L0C 结果块，再调用 `conv2d_store_output` 写入形状为 `(1, 16, 4, 4)` 的 NCHW 输出，校验输出位置和通道的对应关系。本例不执行完整卷积。
+下例完成一个 1×1 卷积计算块。输入高、宽为 2、8，输入、输出通道数分别为 16、32。矩阵乘完成后，`conv2d_store_output` 将 L0C 结果写回 NCHW 输出。
 
 ```python
 # Copyright (c) 2026 Huawei Technologies Co., Ltd.
 # Licensed under the CANN Open Software License Agreement Version 2.0.
+import cannbotdsl as cb
 import torch
 import torch_npu
-import cannbotdsl as cb
 
 
 @cb.kernel
-def store_output(x: cb.Tensor, identity: cb.Tensor, y: cb.Tensor):
+def conv2d(x: cb.Tensor, weight: cb.Tensor, output: cb.Tensor):
+    dtype = cb.dtypes.float16
     spec = cb.make_conv2d_spec(
-        dtype=cb.dtypes.float16,
-        input_shape=(1, 16, 4, 4),
-        filter_shape=(16, 16, 1, 1),
+        dtype=dtype, input_shape=(1, 16, 2, 8), filter_shape=(32, 16, 1, 1)
     )
-    tile = spec.tile(tile=(16, 16, 16), coord=(0, 0, 0))
-    a_l1 = cb.Buffer(cb.MemLoc.L1, cb.dtypes.float16, cb.make_layout((16, 16)))
-    b_l1 = cb.Buffer(cb.MemLoc.L1, cb.dtypes.float16, cb.make_layout((16, 16)))
-    a = cb.Buffer(cb.MemLoc.L0A, cb.dtypes.float16, cb.make_layout((16, 16)))
-    b = cb.Buffer(cb.MemLoc.L0B, cb.dtypes.float16, cb.make_layout((16, 16)))
-    c = cb.Buffer(cb.MemLoc.L0C, cb.dtypes.float32, cb.make_layout((16, 16)))
-    # 乘单位矩阵，生成数值已知的 L0C 结果：行是输出位置，列是输出通道。
-    cb.mem_copy(a_l1, x)
-    cb.mem_copy(b_l1, identity)
-    cb.mem_copy(a, a_l1)
-    cb.mem_copy(b, b_l1)
-    cb.matmul(c, a, b, init=True)
-    cb.conv2d_store_output(y, tile.l0c_view(c), tile)
+    tile = spec.tile(tile=(16, 32, 16), coord=(0, 0, 0))
+    fmap = cb.make_conv2d_fmap_l1(dtype, spec, tile=(16, 16))
+    weights = cb.Buffer(cb.MemLoc.L1, dtype, cb.make_layout((32, 16))).permute(1, 0)
+    a = cb.Buffer(cb.MemLoc.L0A, dtype, cb.make_layout((16, 16)))
+    b = cb.Buffer(cb.MemLoc.L0B, dtype, cb.make_layout((32, 16))).permute(1, 0)
+    c = cb.Buffer(cb.MemLoc.L0C, cb.dtypes.float32, cb.make_layout((16, 32)))
+
+    cb.conv2d_load_fmap(fmap, x, tile)
+    cb.conv2d_load_filter(weights, weight, tile)
+    a_view = tile.l0a_view(a)
+    b_view = tile.l0b_view(b)
+    c_view = tile.l0c_view(c)
+    cb.conv2d_load_im2col(a_view, fmap, tile)
+    cb.mem_copy(b_view, tile.l1b_view(weights))
+    cb.matmul(c_view, a_view, b_view, init=True)
+    cb.conv2d_store_output(output, c_view, tile)
 
 
 @cb.host
-def run(x: cb.Tensor, identity: cb.Tensor, y: cb.Tensor):
-    store_output[1](x, identity, y)
-
-
-def main():
-    x = torch.arange(256, dtype=torch.float16).reshape(16, 16)
-    y = torch.empty((1, 16, 4, 4), dtype=torch.float16, device="npu")
-    run(x.npu(), torch.eye(16, dtype=torch.float16, device="npu"), y)
-    torch.npu.synchronize()
-    expected = x.T.contiguous().reshape(1, 16, 4, 4)
-    torch.testing.assert_close(y.cpu(), expected, rtol=0, atol=0)
-    print("conv2d_store_output example passed")
+def run(x: cb.Tensor, weight: cb.Tensor, output: cb.Tensor):
+    conv2d[1](x, weight, output)
 
 
 if __name__ == "__main__":
-    main()
+    x = ((torch.arange(256).reshape(1, 16, 2, 8) % 13 - 6) / 8).half()
+    w = ((torch.arange(512).reshape(32, 16, 1, 1) % 7 - 3) / 8).half()
+    y = torch.empty((1, 32, 2, 8), dtype=torch.float16, device="npu")
+    run(x.npu(), w.npu(), y)
+    torch.npu.synchronize()
+    expected = torch.nn.functional.conv2d(x.float(), w.float()).half()
+    torch.testing.assert_close(y.cpu(), expected, rtol=0, atol=0)
+    print("Conv2dTile example passed")
 ```
 
-预期结果：NCHW 输出与参考结果一致，输出 `conv2d_store_output example passed`。
+预期结果为形状 `(1, 32, 2, 8)` 的输出，与 CPU 参考结果逐元素一致，并打印 `Conv2dTile example passed`。

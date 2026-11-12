@@ -79,7 +79,70 @@ load3d(
 
 ## 调用示例
 
-以下示例展开 L1 特征图，通过单位矩阵乘法读回结果并校验。
+### 二维卷积
+
+下例用一次 `load3d` 和一次 `matmul` 完成单块 3×2 二维卷积。输入为 NHWC `(1, 2, 9, 16)`，权重为 OHWI `(32, 3, 2, 16)`。本例的 16 个输入通道恰好组成一个 C0 块，因此输入可按原有 NHWC 顺序展平后搬入 L1。多通道块输入须先按 NC1HWC0 组织。
+
+将权重的核高、核宽和输入通道展平为 K 轴，得到权重矩阵 B，形状为 `(32, 96)`。与此同时，`load3d` 将输入窗口展开为矩阵 A，形状为 `(16, 96)`。A 的每一行对应一个输出空间位置，B 的每一行对应一个输出通道，两者都按卷积核高、宽和输入通道的顺序排列 K 轴。
+
+`matmul(c, a, b)` 计算 A 与 B 的逻辑转置的乘积，即 `(16, 96) × (96, 32) → (16, 32)`。结果 C 的每个元素是一个输入窗口与一个输出通道权重的点积，行对应输出空间位置，列对应输出通道。用 `mem_copy` 写回 GM 后，按 NHWC `(1, 2, 8, 32)` 读取并校验。
+
+<!-- example: conv2d_example.py -->
+
+```python
+# Copyright (c) 2026 Huawei Technologies Co., Ltd.
+# Licensed under the CANN Open Software License Agreement Version 2.0.
+import torch
+import torch.nn.functional as F
+import torch_npu
+import cannbotdsl as cbd
+from cannbotdsl import MemLoc, dtypes, make_layout
+
+@cbd.kernel
+def conv2d(x: cbd.Tensor, weight: cbd.Tensor, y: cbd.Tensor):
+    # One NHWC batch, H=2, W=9, C=16; for C1=1 its payload is NC1HWC0.
+    feature = cbd.Buffer(MemLoc.L1, dtypes.float16, make_layout((288,)), data_format="nd")
+    weights = cbd.Buffer(MemLoc.L1, dtypes.float16, make_layout((32, 96)))
+    a = cbd.Buffer(MemLoc.L0A, dtypes.float16, make_layout((16, 96)))
+    b = cbd.Buffer(MemLoc.L0B, dtypes.float16, make_layout((32, 96)))
+    c = cbd.Buffer(MemLoc.L0C, dtypes.float32, make_layout((16, 32)))
+    cbd.mem_copy(feature, x)
+    cbd.mem_copy(weights, weight)
+    cbd.mem_copy(b, weights)
+    cbd.load3d(a, feature,
+        feature=cbd.Load3DFeatureMap(height=2, width=9, channels=16,
+            pad_top=1, pad_bottom=1, pad_left=0, pad_right=0),
+        window=cbd.Load3DWindow(m_extent=16, k_extent=96), filter=(3, 2))
+    cbd.matmul(c, a, b)
+    cbd.mem_copy(y, c)
+
+@cbd.host
+def run(x: cbd.Tensor, weight: cbd.Tensor, y: cbd.Tensor):
+    conv2d[1](x, weight, y)
+
+def main():
+    assert torch.npu.is_available(), "NPU is required"
+    x = ((torch.arange(288).reshape(1, 2, 9, 16) % 13 - 6).float() / 8).half()
+    w = ((torch.arange(32 * 3 * 2 * 16).reshape(32, 3, 2, 16) % 11 - 5).float() / 8).half()
+    expected = F.conv2d(x.permute(0, 3, 1, 2).float(), w.permute(0, 3, 1, 2).float(), padding=(1, 0))
+    y = torch.empty((16, 32), dtype=torch.float32, device="npu")
+    run(x.flatten().npu(), w.reshape(32, 96).npu(), y)
+    torch.npu.synchronize()
+    torch.testing.assert_close(y.cpu().reshape(1, 2, 8, 32), expected.permute(0, 2, 3, 1), rtol=0, atol=0)
+    print("conv2d example passed")
+
+if __name__ == "__main__":
+    main()
+```
+<!-- end-example -->
+
+预期结果：输出 `conv2d example passed`。
+
+### 三维卷积
+
+输入采用 NCDHW，形状为 `(1, 16, 4, 2, 9)`。权重采用 `[O, I, Kd, Kh, Kw]`，形状为 `(32, 16, 2, 3, 2)`。步长均为 1，仅在高度方向上下各补 1。输出有 3 个深度平面，每个平面包含 16 个空间位置和 32 个输出通道。
+
+Host 先将输入和权重按深度分片整理为连续存储。kernel 对每个输出深度位置依次加载两张输入平面及对应权重，展开高、宽方向的窗口，累加到同一个 L0C 结果块。两次矩阵乘完成后写回该深度平面，Host 将结果整理为 NCDHW 后进行校验。
 
 ```python
 # Copyright (c) 2026 Huawei Technologies Co., Ltd.
@@ -88,41 +151,60 @@ import cannbotdsl as cb
 import torch
 import torch_npu
 
+
 @cb.kernel
-def kernel(src: cb.Tensor, eye: cb.Tensor, out: cb.Tensor):
-    fmap = cb.Buffer(cb.MemLoc.L1, cb.dtypes.float16, cb.make_layout((256,)), data_format="nd")
-    identity = cb.Buffer(cb.MemLoc.L1, cb.dtypes.float16, cb.make_layout((16, 16)))
-    a = cb.Buffer(cb.MemLoc.L0A, cb.dtypes.float16, cb.make_layout((16, 16)))
-    b = cb.Buffer(cb.MemLoc.L0B, cb.dtypes.float16, cb.make_layout((16, 16)))
-    c = cb.Buffer(cb.MemLoc.L0C, cb.dtypes.float32, cb.make_layout((16, 16)))
-    cb.mem_copy(fmap, src)
-    cb.mem_copy(identity, eye)
-    cb.load3d(a, fmap,
-        feature=cb.Load3DFeatureMap(height=4, width=4, channels=16),
-        window=cb.Load3DWindow(m_extent=16, k_extent=16),
-        destination=cb.Load3DDestination(k_stride_fractals=1),
-        repeat=cb.Load3DRepeat(count=1), padding=cb.Load3DPadding.value(0))
-    cb.mem_copy(b, identity)
-    cb.matmul(c, a, b, init=True)
-    cb.mem_copy(out, c)
+def conv3d(x: cb.Tensor, weight: cb.Tensor, y: cb.Tensor):
+    dtype = cb.dtypes.float16
+    fmap = cb.Buffer(cb.MemLoc.L1, dtype, cb.make_layout((288,)), data_format="nd")
+    w_l1 = cb.Buffer(cb.MemLoc.L1, dtype, cb.make_layout((32, 96)))
+    a = cb.Buffer(cb.MemLoc.L0A, dtype, cb.make_layout((16, 96)))
+    b = cb.Buffer(cb.MemLoc.L0B, dtype, cb.make_layout((32, 96)))
+    c = cb.Buffer(cb.MemLoc.L0C, cb.dtypes.float32, cb.make_layout((16, 32)))
+
+    # 输入深度为 4，核深度为 2，深度步长为 1，无深度填充
+    # 输出深度为 (4 - 2) // 1 + 1 = 3
+    for od in range(3):
+        # 核深度为 2，每个输出深度位置累加两张输入平面的贡献
+        for kd in range(2):
+            # 深度步长为 1。每次加载一张输入平面和一片核权重
+            depth = od + kd
+            cb.mem_copy(fmap, x[depth * 288:(depth + 1) * 288])
+            cb.mem_copy(w_l1, weight[kd * 32:(kd + 1) * 32, None])
+            cb.mem_copy(b, w_l1)
+            cb.load3d(
+                a, fmap,
+                feature=cb.Load3DFeatureMap(
+                    height=2, width=9, channels=16, pad_top=1, pad_bottom=1
+                ),
+                window=cb.Load3DWindow(m_extent=16, k_extent=96),
+                filter=(3, 2),
+            )
+            # 第一片初始化 L0C，第二片累加到同一块。
+            cb.matmul(c, a, b, init=(kd == 0))
+        cb.mem_copy(y[od * 16:(od + 1) * 16, None], c)
+
 
 @cb.host
-def launch(src: cb.Tensor, eye: cb.Tensor, out: cb.Tensor):
-    kernel[1](src, eye, out)
+def run(x: cb.Tensor, weight: cb.Tensor, y: cb.Tensor):
+    conv3d[1](x, weight, y)
 
-def main():
-    matrix = torch.arange(256, dtype=torch.float16).reshape(16, 16)
-    # One C1 plane: (C1, H, W, C0) = (1, 4, 4, 16).
-    src = matrix.flatten().to("npu:0")
-    eye = torch.eye(16, dtype=torch.float16, device="npu:0")
-    out = torch.empty((16, 16), dtype=torch.float32, device="npu:0")
-    launch(src, eye, out)
-    torch.npu.synchronize()
-    torch.testing.assert_close(out.cpu(), matrix.float(), rtol=0, atol=0)
-    print("load3d example passed")
 
 if __name__ == "__main__":
-    main()
+    # x: (1, 16, 4, 2, 9)，依次为批次、输入通道、深度、高、宽
+    x = ((torch.arange(1152).reshape(1, 16, 4, 2, 9) % 13 - 6) / 8).half()
+    # w: (32, 16, 2, 3, 2)，依次为输出通道、输入通道、核深度、核高、核宽
+    w = ((torch.arange(6144).reshape(32, 16, 2, 3, 2) % 7 - 3) / 8).half()
+    # planes: (1152,)，由 (1, 4, 2, 9, 16) 按批次、深度、高、宽、输入通道顺序展平；每 2 × 9 × 16 = 288 个连续元素对应一个深度平面
+    planes = x.permute(0, 2, 3, 4, 1).contiguous().view(-1)
+    # weights: (64, 96)，行由核深度和输出通道合并（2 × 32），列由核高、核宽和输入通道合并（3 × 2 × 16）
+    weights = w.permute(2, 0, 3, 4, 1).contiguous().view(64, 96)
+    out = torch.empty((48, 32), dtype=torch.float32, device="npu")
+    run(planes.npu(), weights.npu(), out)
+    torch.npu.synchronize()
+    y = out.cpu().reshape(1, 3, 2, 8, 32).permute(0, 4, 1, 2, 3)
+    expected = torch.nn.functional.conv3d(x.float(), w.float(), padding=(0, 1, 0))
+    torch.testing.assert_close(y, expected, rtol=0, atol=0)
+    print("conv3d example passed")
 ```
 
-预期结果：校验通过，输出 `load3d example passed`。
+预期输出形状为 `(1, 32, 3, 2, 8)`。逐元素校验通过后打印 `conv3d example passed`。

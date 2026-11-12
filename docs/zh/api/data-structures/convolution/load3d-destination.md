@@ -54,7 +54,7 @@ def kernel(src: cb.Tensor, eye: cb.Tensor, out: cb.Tensor):
     cb.mem_copy(fmap, src)
     cb.mem_copy(identity, eye)
     cb.load3d(a, fmap,
-        feature=cb.Load3DFeatureMap(height=4, width=4, channels=16),
+        feature=cb.Load3DFeatureMap(height=2, width=8, channels=16),
         window=cb.Load3DWindow(m_extent=16, k_extent=16),
         destination=cb.Load3DDestination(k_stride_fractals=1),
         repeat=cb.Load3DRepeat(count=1), padding=cb.Load3DPadding.value(0))
@@ -68,7 +68,7 @@ def launch(src: cb.Tensor, eye: cb.Tensor, out: cb.Tensor):
 
 def main():
     matrix = torch.arange(256, dtype=torch.float16).reshape(16, 16)
-    # One C1 plane: (C1, H, W, C0) = (1, 4, 4, 16).
+    # One C1 plane: (C1, H, W, C0) = (1, 2, 8, 16).
     src = matrix.flatten().to("npu:0")
     eye = torch.eye(16, dtype=torch.float16, device="npu:0")
     out = torch.empty((16, 16), dtype=torch.float32, device="npu:0")
