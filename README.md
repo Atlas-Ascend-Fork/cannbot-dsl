@@ -11,7 +11,7 @@
 
 > **2026-11-05**
 >
-> - **✅ 支持 Kimi K3 / K3.1**：本仓算子集已覆盖相关算子，包括 [`block_attn_res_update_rms_norm`](samples/vector/block_attn_res_update_rms_norm)、[`flash_kda`](samples/attention/flash_kda)、[`flash_kda_cp_preprocess`](samples/attention/flash_kda_cp_preprocess)、[`flash_kda_cp_main`](samples/attention/flash_kda_cp_main)、[`fused_recurrent_kda`](samples/attention/fused_recurrent_kda_snapshot)、[`fused_recurrent_kda_replayssm`](samples/attention/fused_recurrent_kda_replayssm)、[`mega_recurrent_kda`](samples/attention/mega_recurrent_kda)、[`mega_recurrent_kda_replayssm`](samples/attention/mega_recurrent_kda_replayssm)、[`commit_recurrent_kda_replayssm`](samples/attention/commit_recurrent_kda_replayssm)、[`mla_prolog_bf16`](samples/attention/mla_prolog)、[`quant_mla_prolog`](samples/attention/quant_mla_prolog)。
+> - **✅ 支持 Kimi K3 / K3.1**：本仓算子集已覆盖相关算子，包括 [`block_attn_res_update_rms_norm`](samples/vector/block_attn_res_update_rms_norm)、[`flash_kda`](samples/attention/flash_kda)、[`flash_kda_cp_preprocess`](samples/attention/flash_kda_cp_preprocess)、[`flash_kda_cp_main`](samples/attention/flash_kda_cp_main)、[`fused_recurrent_kda`](samples/attention/fused_recurrent_kda_snapshot)、[`fused_recurrent_kda_replayssm`](samples/attention/fused_recurrent_kda_replayssm)、[`mega_recurrent_kda`](samples/attention/mega_recurrent_kda)、[`commit_recurrent_kda`](samples/attention/commit_recurrent_kda)、[`mla_prolog_bf16`](samples/attention/mla_prolog_v4)、[`quant_mla_prolog`](samples/attention/quant_mla_prolog)。
 
 > **2026-10-30**
 >

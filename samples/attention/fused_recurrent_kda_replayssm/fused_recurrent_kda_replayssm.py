@@ -774,7 +774,7 @@ def fused_recurrent_kda_replayssm(
         torch.Tensor: BF16 candidate outputs with the same layout/shape as g.
 
     Notes:
-        Call commit_recurrent_kda_replayssm with the previous accepted prefix
+        Call commit_recurrent_kda with the previous accepted prefix
         before this verify overwrites the records. The working recurrence is
         FP32; only the exported U/K records are rounded to FP16. TND records
         use per-batch capacity S and leave the unused suffix unchanged.

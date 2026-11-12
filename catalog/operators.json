@@ -236,27 +236,20 @@
       "native": {
         "export": "mega_recurrent_kda",
         "sources": [
-          "@mega_recurrent_kda/source/mega_recurrent_kda.py"
+          "@mega_recurrent_kda/source/mega_recurrent_kda.py",
+          "@mega_recurrent_kda/source/mega_recurrent_kda_common.py",
+          "@mega_recurrent_kda/source/mega_recurrent_kda_frontend.py",
+          "@mega_recurrent_kda/source/mega_recurrent_kda_backend.py"
         ]
       }
     },
-    "mega_recurrent_kda_replayssm": {
-      "source": "samples/attention/mega_recurrent_kda_replayssm",
-      "test": "test/attention/mega_recurrent_kda_replayssm",
+    "commit_recurrent_kda": {
+      "source": "samples/attention/commit_recurrent_kda",
+      "test": "test/attention/commit_recurrent_kda",
       "native": {
-        "export": "mega_recurrent_kda_replayssm",
+        "export": "commit_recurrent_kda",
         "sources": [
-          "@mega_recurrent_kda_replayssm/source/mega_recurrent_kda_replayssm.py"
-        ]
-      }
-    },
-    "commit_recurrent_kda_replayssm": {
-      "source": "samples/attention/commit_recurrent_kda_replayssm",
-      "test": "test/attention/commit_recurrent_kda_replayssm",
-      "native": {
-        "export": "commit_recurrent_kda_replayssm",
-        "sources": [
-          "@commit_recurrent_kda_replayssm/source/commit_recurrent_kda_replayssm.py"
+          "@commit_recurrent_kda/source/commit_recurrent_kda.py"
         ]
       }
     },
@@ -407,8 +400,7 @@
     "fused_recurrent_kda_snapshot",
     "fused_recurrent_kda_replayssm",
     "mega_recurrent_kda",
-    "mega_recurrent_kda_replayssm",
-    "commit_recurrent_kda_replayssm",
+    "commit_recurrent_kda",
     "quant_mla_prolog",
     "mla_prolog_v4",
     "moonep",
@@ -464,8 +456,7 @@
       "fused_recurrent_kda_snapshot",
       "fused_recurrent_kda_replayssm",
       "mega_recurrent_kda",
-      "mega_recurrent_kda_replayssm",
-      "commit_recurrent_kda_replayssm",
+      "commit_recurrent_kda",
       "quant_mla_prolog",
       "mla_prolog_v4",
       "gather_v2",
@@ -617,25 +608,14 @@
         ]
       },
       {
-        "name": "mega_recurrent_kda_replayssm",
-        "enabled": false,
-        "watch": [
-          "@mega_recurrent_kda_replayssm/source",
-          "@mega_recurrent_kda_replayssm/test"
-        ],
-        "tests": [
-          "@mega_recurrent_kda_replayssm/test"
-        ]
-      },
-      {
-        "name": "commit_recurrent_kda_replayssm",
+        "name": "commit_recurrent_kda",
         "enabled": true,
         "watch": [
-          "@commit_recurrent_kda_replayssm/source",
-          "@commit_recurrent_kda_replayssm/test"
+          "@commit_recurrent_kda/source",
+          "@commit_recurrent_kda/test"
         ],
         "tests": [
-          "@commit_recurrent_kda_replayssm/test"
+          "@commit_recurrent_kda/test"
         ]
       },
       {
@@ -1069,8 +1049,7 @@
           "@fused_recurrent_kda_snapshot/test",
           "@fused_recurrent_kda_replayssm/test",
           "@mega_recurrent_kda/test",
-          "@mega_recurrent_kda_replayssm/test",
-          "@commit_recurrent_kda_replayssm/test",
+          "@commit_recurrent_kda/test",
           "@quant_mla_prolog/test"
         ]
       },

@@ -6,62 +6,27 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 
-# fmt: off
-
-"""One mixed MegaKDA kernel for TP4/8/16, model batch 1..32 and stream-controlled cores.
-
-The original public API is preserved. The current stream quota selects the
-8/16/24/28/32 AIC grid; TP, batch and schedules share one compiled entry and
-one Native variant. Calls sharing cached workspace must be serialized.
-"""
+"""Mega KDA 公开入口、TP 调度、内核下发与导出。"""
 
 from __future__ import annotations
-from cannbotdsl import from_tensor
-
-import dataclasses
-import math
-from typing import NamedTuple
 
 import cannbotdsl
+import ctypes
+import functools
+import math
+import sys
+import threading
 import torch
-from cannbotdsl import PIPE, MemLoc, Tensor, TensorSpec, dtypes, make_layout
+from cannbotdsl import MemLoc, PIPE, Tensor, TensorSpec, dtypes, make_layout
 from cannbotdsl.aot import export
 from cannbotdsl.buffer import Buffer
 from cannbotdsl.lang.constexpr import const_expr
-from cannbotdsl.lang.control_flow import range as dsl_range
 from cannbotdsl.lang.host import host
 from cannbotdsl.lang.jit import jit
 from cannbotdsl.lang.kernel import kernel
-from cannbotdsl.lang.vf import vf
 from cannbotdsl.ops.arch import get_block_idx, get_block_num, get_subblock_id
 from cannbotdsl.ops.matmul import matmul
 from cannbotdsl.ops.memcpy import copy_options, mem_copy
-from cannbotdsl.ops.reg import (
-    PackMode,
-    UnpackMode,
-    update_mask,
-    vadd,
-    vadds,
-    vcast,
-    vdiv,
-    vdup,
-    vdups,
-    vexp,
-    vload,
-    vload_broadcast,
-    vload_unpack,
-    vmadd,
-    vmem_bar,
-    vmul,
-    vmuls,
-    vneg,
-    vreduce_sum,
-    vsqrt,
-    vstore,
-    vstore_first,
-    vstore_pack,
-    vsub,
-)
 from cannbotdsl.ops.sync import (
     cube_sync_all,
     cube_sync_block_arrive,
@@ -71,1062 +36,841 @@ from cannbotdsl.ops.sync import (
     vec_sync_all,
     vec_sync_block_arrive,
     vec_sync_block_wait,
-    vec_sync_notify,
-    vec_sync_wait,
 )
 from cannbotdsl.ring_buffer import RingBuffer
-from cannbotdsl.tensor import ceil_div, idx2crd, make_tiler, tile_slice
+from cannbotdsl.tensor import ceil_div, from_tensor, tile_slice
+from types import ModuleType
+from typing import NamedTuple
 
-TILE = 128
-HIDDEN_SIZE = 7168
-VL = 64
-D_SEGMENTS = TILE // VL
-CONV_KERNEL = 4
-BATCH_TILE = 16
-BETA_TILE = 16
-OPROJ_KC = 256
-OPROJ_KS = 64
-PROJECTION_KC = 256
-PROJECTION_KS = 128
-CONV_RAW_V_TO_MTE3_EVENT = 2
-KDA_STATE_KEY_UNROLL = 4
-KDA_STATE_UPDATE_UNROLL = 2
-
-
-class _CompiledLaunch:
-    __slots__ = ("fn", "workspace", "workspace_views", "norm_exchange")
-
-    def __init__(
-        self,
-        fn,
-        workspace: torch.Tensor,
-        workspace_views: tuple[torch.Tensor, ...],
-        norm_exchange: torch.Tensor):
-        self.fn = fn
-        self.workspace = workspace
-        self.workspace_views = workspace_views
-        self.norm_exchange = norm_exchange
-
-
-class _MegaCall(NamedTuple):
-    """Host inputs in the original public argument order; never passed to the kernel."""
-
-    hidden_states: torch.Tensor
-    qkv_weight: torch.Tensor
-    decay_a_weight: torch.Tensor
-    decay_b_weight: torch.Tensor
-    beta_weight: torch.Tensor
-    output_gate_weight: torch.Tensor
-    output_norm_weight: torch.Tensor
-    output_weight: torch.Tensor
-    conv_weight: torch.Tensor
-    conv_state: torch.Tensor
-    recurrent_state: torch.Tensor
-    conv_indices: torch.Tensor
-    ssm_indices: torch.Tensor
-    conv_accepted: torch.Tensor
-    accepted: torch.Tensor
-    a_log: torch.Tensor
-    dt_bias: torch.Tensor
-    scale: float
-    lower_bound: float
-    rms_norm_eps: float
-
-
-def publish_vector_grid_to_cube(vector_flag: int, cube_flag: int, ack_flag: int):
-    """Acknowledge slot receipt before AIV flag reuse, then project concurrently."""
-    vec_sync_block_arrive(PIPE.MTE3, vector_flag, mode=2)
-    cube_sync_block_wait(PIPE.S, vector_flag, mode=2)
-    cube_sync_block_arrive(PIPE.MTE3, ack_flag, mode=2)
-    vec_sync_block_wait(PIPE.S, ack_flag, mode=2)
-    cube_sync_block_arrive(PIPE.FIXPIPE, cube_flag, mode=0)
-    cube_sync_block_wait(PIPE.S, cube_flag, mode=0)
-
-
-def publish_batch_group_vector_grid_to_cube(vector_flag: int, cube_flag: int):
-    """Publish ordered AIV MTE3 writes to every AIC without a return broadcast."""
-    vec_sync_block_arrive(PIPE.MTE3, vector_flag, mode=2)
-    cube_sync_block_wait(PIPE.S, vector_flag, mode=2)
-    cube_sync_block_arrive(PIPE.FIXPIPE, cube_flag, mode=0)
-    cube_sync_block_wait(PIPE.S, cube_flag, mode=0)
-
-
-class _ProjectionOperations:
-    """Projection operations shared by stages with independent buffer layouts."""
-
-    projection_fp32: object
-
-    @jit
-    def matmul_hidden(self, hidden_gm: Tensor, weight_gm: Tensor, output_tile, k_tiles):
-        """Compute ``hidden @ weight.T`` from model-layout ``[out,in]``."""
-        accumulator = from_tensor(self.l0c.next_write(), layout=make_layout(self.l0c_shape), data_format="nz")
-        if const_expr(self.tile_width == BETA_TILE):
-            beta_l1 = Buffer(
-                MemLoc.L1,
-                weight_gm.dtype,
-                weight_gm.layout,
-                physical_layout=weight_gm.physical_layout,
-            )
-            mem_copy(beta_l1, weight_gm, options=copy_options(l2_cache_ctl=self.weight_l2_cache_ctl))
-        for kc_idx in range(k_tiles * TILE // PROJECTION_KC):
-            a_l1_slot = from_tensor(self.a_l1.next_write(), layout=make_layout(self.a_l1_shape), data_format="nz")
-            mem_copy(a_l1_slot, tile_slice(hidden_gm, (self.row_capacity, PROJECTION_KC), (0, kc_idx)),
-                options=copy_options(l2_cache_ctl=self.input_l2_cache_ctl))
-            if const_expr(self.tile_width == BETA_TILE):
-                self._accumulate_panel(
-                    accumulator, a_l1_slot, beta_l1, kc_idx * (PROJECTION_KC // PROJECTION_KS), kc_idx == 0)
-            else:
-                b_l1_slot = self.b_l1.next_write()
-                mem_copy(b_l1_slot, tile_slice(weight_gm, (self.tile_width, PROJECTION_KC), (output_tile, kc_idx)),
-                    options=copy_options(l2_cache_ctl=self.weight_l2_cache_ctl))
-                self._accumulate_panel(accumulator, a_l1_slot, b_l1_slot, 0, kc_idx == 0)
-
-    @jit
-    def _accumulate_panel(self, accumulator, a_l1_slot, b_l1_slot, first_k, init):
-        for ks_idx in range(PROJECTION_KC // PROJECTION_KS):
-            l0a_slot = from_tensor(self.l0a.next_write(), layout=make_layout(self.l0a_shape), data_format="nz")
-            l0b_slot = self.l0b.next_write()
-            mem_copy(l0a_slot, tile_slice(a_l1_slot, (self.row_capacity, PROJECTION_KS), (0, ks_idx)))
-            mem_copy(l0b_slot, tile_slice(b_l1_slot, (self.tile_width, PROJECTION_KS), (0, first_k + ks_idx)))
-            matmul(accumulator, l0a_slot, l0b_slot, init=init and ks_idx == 0)
-
-    @jit
-    def matmul_resident(self, resident_l1, weight_l1):
-        """Compute one K=128 projection from a resident BF16 L1 tile."""
-        accumulator = from_tensor(self.l0c.next_write(), layout=make_layout(self.l0c_shape), data_format="nz")
-        for ks_idx in range(TILE // PROJECTION_KS):
-            l0a_slot = from_tensor(self.l0a.next_write(), layout=make_layout(self.l0a_shape), data_format='nz')
-            l0a_slot_source = tile_slice(resident_l1, (self.row_capacity, PROJECTION_KS), (0, ks_idx))
-            l0a_slot = l0a_slot[tuple(map(slice, l0a_slot_source.shape))]
-            mem_copy(l0a_slot, l0a_slot_source)
-            l0b_slot = self.l0b.next_write()
-            l0b_slot_source = tile_slice(weight_l1, (self.tile_width, PROJECTION_KS), (0, ks_idx))
-            l0b_slot = l0b_slot[tuple(map(slice, l0b_slot_source.shape))]
-            mem_copy(l0b_slot, l0b_slot_source)
-            matmul(accumulator, l0a_slot, l0b_slot, init=ks_idx == 0)
-
-    @jit
-    def acquire_result(self):
-        """Send L0C to both paired AIVs and hold the FP32 half tile."""
-        mem_copy(self.projection_half, from_tensor(self.l0c.next_read(), layout=make_layout(self.l0c_shape), data_format="nz").partition(dim=0))
-        self.projection_fp32 = self.projection_half
-
-    @jit
-    def cast_result(self):
-        """Send L0C to both paired AIVs and cast each AIV half."""
-        self.acquire_result()
-        with vf(mode="simd"):
-            full, _ = update_mask(VL, elem_bits=32)
-            for segment in range(self.row_block * self.tile_width // VL):
-                offset = segment * VL
-                projected = vload(self.projection_fp32, offset)
-                projected_bf16 = vcast(projected, dtypes.bfloat16, mask=full)
-                vstore_pack(self.projection_bf16, offset, projected_bf16, full, pack_mode=PackMode.B32_TO_B16)
-        vec_sync_all()
-
-    @jit
-    def project(self, hidden_gm: Tensor, weight_gm: Tensor, n_idx, k_tiles):
-        """Compute one output tile and cast its AIV half."""
-        self.matmul_hidden(hidden_gm, weight_gm, n_idx, k_tiles)
-        self.cast_result()
-
-    @jit
-    def project_to_gm(self, hidden_gm, weight_gm, workspace_tile, n_idx, k_tiles):
-        """Round a complete projection to BF16 in Fixpipe without an AIV cast."""
-        self.matmul_hidden(hidden_gm, weight_gm, n_idx, k_tiles)
-        self.publish_result(workspace_tile)
-
-    @jit
-    def publish_result(self, workspace_tile):
-        mem_copy(workspace_tile[0:self.row_count, 0:self.tile_width], from_tensor(self.l0c.next_read(), layout=make_layout(self.l0c_shape), data_format="nz"))
-
-    def publish(self, workspace_tile, subblock_idx):
-        out_half = tile_slice(
-            workspace_tile, make_tiler((self.row_block, self.tile_width), alignment=(1, 1)), (subblock_idx, 0))
-        mem_copy(out_half, self.projection_bf16)
-
-    def publish_source(self, workspace_tile, source, subblock_idx):
-        out_half = tile_slice(
-            workspace_tile, make_tiler((self.row_block, self.tile_width), alignment=(1, 1)), (subblock_idx, 0))
-        mem_copy(out_half, source)
+if __package__:
+    from .mega_recurrent_kda_backend import (
+        KDA_STATE_KEY_UNROLL,
+        KDA_STATE_UPDATE_UNROLL,
+        GridScheduleBackendOperations,
+        OutputGateStage,
+        OutputProjectionStage,
+        RecurrentKDAStage,
+        RecurrentStage,
+        S4PipelinedBackendSchedule,
+        SequenceRecurrentStage,
+        TP16S4BackendSchedule,
+        TP4BackendSchedule,
+        TP4HeadPanelBackend,
+        TP4S4BackendSchedule,
+        TP4TPScheduleBackendOperations,
+        TP8BackendSchedule,
+        TP8HeadPanelBackend,
+        TP8TPScheduleBackendOperations,
+        _DelayedGateProjection,
+        _HeadStreamOutput,
+        _RawGateContext,
+        _RawRecurrentContext,
+        _TiledOutputProjectionStage,
+        _head_stream_persistent_raw_round,
+        _run_raw_recurrent_item,
+        _store_raw_gated_item,
+        publish_batch_group_vector_grid_to_cube,
+        publish_vector_grid_to_cube,
+        run_recurrent_wave,
+        run_s4_raw_item,
+    )
+    from .mega_recurrent_kda_common import (
+        BETA_TILE,
+        BATCH_TILE,
+        CONV_KERNEL,
+        D,
+        HIDDEN_SIZE,
+        MODEL_HEAD_COUNT,
+        OPROJ_KC,
+        OPROJ_KS,
+        QKV_PANEL_COUNT,
+        ReplayPool,
+        S4_SEQUENCE_LENGTH,
+        S8_SEQUENCE_LENGTH,
+        Schedule,
+        TILE,
+        TP16_HEADS,
+        TP16_TP_DEGREE,
+        TP4_HEADS,
+        TP4_TP_DEGREE,
+        TP8_HEADS,
+        TP8_TP_DEGREE,
+        _CheckpointPool,
+        _ConvPool,
+        _checkpoint_batches,
+        _checkpoint_head,
+        _mega_workspace_views,
+        _pack_conv_weights,
+        _physical_span,
+        replay_batches,
+    )
+    from .mega_recurrent_kda_frontend import (
+        Core32ProjectionSchedule,
+        MultiCoreProjectionSchedule,
+        ProjectionScheduleOperationsFrontendOperations,
+        S4ProjectionScheduleFrontendOperations,
+        S4ProjectionStage,
+        SequenceConvStage,
+        _accurate_auxiliary_projection,
+        _auxiliary_twofold_projection,
+        _twofold_qkv_projection,
+        prepare_optimized_precision,
+        SequenceProjectionStage,
+        TP16GridScheduleFrontendOperations,
+        TP16S4AuxiliarySchedule,
+        TP4AuxiliaryScheduleFrontendOperations,
+        TP4GridScheduleFrontendOperations,
+        TP4S4AuxiliarySchedule,
+        TP8AuxiliaryScheduleFrontendOperations,
+        TP8S4AuxiliarySchedule,
+        TPScheduleFrontendOperations,
+        TailMaskedCore32ProjectionSchedule,
+    )
+else:
+    from mega_recurrent_kda_backend import (
+        KDA_STATE_KEY_UNROLL,
+        KDA_STATE_UPDATE_UNROLL,
+        GridScheduleBackendOperations,
+        OutputGateStage,
+        OutputProjectionStage,
+        RecurrentKDAStage,
+        RecurrentStage,
+        S4PipelinedBackendSchedule,
+        SequenceRecurrentStage,
+        TP16S4BackendSchedule,
+        TP4BackendSchedule,
+        TP4HeadPanelBackend,
+        TP4S4BackendSchedule,
+        TP4TPScheduleBackendOperations,
+        TP8BackendSchedule,
+        TP8HeadPanelBackend,
+        TP8TPScheduleBackendOperations,
+        _DelayedGateProjection,
+        _HeadStreamOutput,
+        _RawGateContext,
+        _RawRecurrentContext,
+        _TiledOutputProjectionStage,
+        _head_stream_persistent_raw_round,
+        _run_raw_recurrent_item,
+        _store_raw_gated_item,
+        publish_batch_group_vector_grid_to_cube,
+        publish_vector_grid_to_cube,
+        run_recurrent_wave,
+        run_s4_raw_item,
+    )
+    from mega_recurrent_kda_common import (
+        BETA_TILE,
+        BATCH_TILE,
+        CONV_KERNEL,
+        D,
+        HIDDEN_SIZE,
+        MODEL_HEAD_COUNT,
+        OPROJ_KC,
+        OPROJ_KS,
+        QKV_PANEL_COUNT,
+        ReplayPool,
+        S4_SEQUENCE_LENGTH,
+        S8_SEQUENCE_LENGTH,
+        Schedule,
+        TILE,
+        TP16_HEADS,
+        TP16_TP_DEGREE,
+        TP4_HEADS,
+        TP4_TP_DEGREE,
+        TP8_HEADS,
+        TP8_TP_DEGREE,
+        _CheckpointPool,
+        _ConvPool,
+        _checkpoint_batches,
+        _checkpoint_head,
+        _mega_workspace_views,
+        _pack_conv_weights,
+        _physical_span,
+        replay_batches,
+    )
+    from mega_recurrent_kda_frontend import (
+        Core32ProjectionSchedule,
+        MultiCoreProjectionSchedule,
+        ProjectionScheduleOperationsFrontendOperations,
+        S4ProjectionScheduleFrontendOperations,
+        S4ProjectionStage,
+        SequenceConvStage,
+        _accurate_auxiliary_projection,
+        _auxiliary_twofold_projection,
+        _twofold_qkv_projection,
+        prepare_optimized_precision,
+        SequenceProjectionStage,
+        TP16GridScheduleFrontendOperations,
+        TP16S4AuxiliarySchedule,
+        TP4AuxiliaryScheduleFrontendOperations,
+        TP4GridScheduleFrontendOperations,
+        TP4S4AuxiliarySchedule,
+        TP8AuxiliaryScheduleFrontendOperations,
+        TP8S4AuxiliarySchedule,
+        TPScheduleFrontendOperations,
+        TailMaskedCore32ProjectionSchedule,
+    )
 
 
-class ProjectionStage(_ProjectionOperations):
-    """Cube projection over all BSH rows and paired-AIV publication."""
+# 模型维度与 TP 映射
+# 下发几何及固定长调度参数。
+VALID_CORES = (8, 16, 24, 28, 32)
+MAIN_TEMPLATES = (
+    (32, 384),
+    (64, 384),
+    (128, 384),
+    (32, 256),
+    (128, 256),
+    (256, 256),
+    (64, 256),
+)
 
-    def __init__(
-        self,
-        row_count: int = TILE,
-        input_l2_cache_ctl: int = 0,
-        weight_l2_cache_ctl: int = 0,
-        tile_width: int = TILE,
-        row_capacity: int = 128):
-        self.row_count = row_count
-        self.row_capacity = int(row_capacity)
-        self.tile_width = int(tile_width)
-        self.row_block = self.row_count // 2
-        self.input_l2_cache_ctl = int(input_l2_cache_ctl)
-        self.weight_l2_cache_ctl = int(weight_l2_cache_ctl)
-        self.a_l1 = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((self.row_capacity * PROJECTION_KC,)), depth=2, data_format="nd")
-        self.a_l1_shape = (self.row_count, PROJECTION_KC)
-        if self.tile_width != BETA_TILE:
-            self.b_l1 = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((self.tile_width, PROJECTION_KC)), depth=2)
-        self.l0a = RingBuffer(MemLoc.L0A, dtypes.bfloat16, make_layout((self.row_capacity * PROJECTION_KS,)), depth=2, data_format="nd")
-        self.l0a_shape = (self.row_count, PROJECTION_KS)
-        self.l0b = RingBuffer(MemLoc.L0B, dtypes.bfloat16, make_layout((self.tile_width, PROJECTION_KS)), depth=2)
-        self.l0c = RingBuffer(MemLoc.L0C, dtypes.float32, make_layout((self.row_capacity * self.tile_width,)), depth=2, data_format="nd")
-        self.l0c_shape = (self.row_count, self.tile_width)
-        self.projection_half = RingBuffer(MemLoc.UB, dtypes.float32, make_layout((self.row_capacity // 2 * self.tile_width,)), depth=1).next_write().view(
-            (self.row_block, self.tile_width),
-        )
-        self.projection_bf16 = Buffer(
-            MemLoc.UB,
-            dtypes.bfloat16,
-            make_layout((self.row_capacity // 2 * self.tile_width,)),
-        ).view(self.row_block, self.tile_width)
-        self.projection_fp32: object
+S4_DELAYED_ITEMS_PER_LANE = 6
+S4_DELAYED_RAW_ROW_COUNT = S4_DELAYED_ITEMS_PER_LANE * S4_SEQUENCE_LENGTH
+S4_GATE_PROJECTION_READY_FLAG = 6
+
+HEAD_STREAM_BATCH_COUNT = 32
+HEAD_STREAM_LANE_COUNT = 64
+HEAD_STREAM_ROUNDS = TP8_HEADS * HEAD_STREAM_BATCH_COUNT // HEAD_STREAM_LANE_COUNT
+GATE_PROJECTION_TASK_COUNT = 2 * TP8_HEADS
+
+RECURRENT_CORES_PER_CORE_GROUP = 12
+COMPACT_RECURRENT_CORE_COUNT = 2 * RECURRENT_CORES_PER_CORE_GROUP
+COMPACT_CORES_PER_MODEL_BATCH = 24
+DELAYED_GATE_TASK_COUNT = 4 * TP16_HEADS
+
+SUPPORTED_HEAD_COUNTS = (TP16_HEADS, TP8_HEADS, TP4_HEADS)
+
+# 固定长度融合路径与支持的 AIC 配额
 
 
-class _ResidentN384ProjectionStage:
-    """M128xN384 projection that reuses each hidden panel for three outputs."""
+def _shared_kda_call_state():
+    """在独立加载的 KDA 模块之间共享调用锁和事件状态。"""
+    key = "_cannbotdsl_kda_call_state"
+    state = sys.modules.get(key)
+    if state is None:
+        candidate = ModuleType(key)
+        candidate.call_lock = threading.RLock()
+        candidate.pending = {"event": None, "keep": None}
+        state = sys.modules.setdefault(key, candidate)
+    return state
 
-    def __init__(
-        self,
-        input_l2_cache_ctl: int = 0,
-        weight_l2_cache_ctl: int = 0):
-        self.input_l2_cache_ctl = int(input_l2_cache_ctl)
-        self.weight_l2_cache_ctl = int(weight_l2_cache_ctl)
-        self.a_l1 = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((TILE, PROJECTION_KC)), depth=2)
-        self.a_l1_shape = (TILE, PROJECTION_KC)
-        self.b_l1 = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((3 * TILE, PROJECTION_KC)), depth=2)
-        self.l0a = RingBuffer(MemLoc.L0A, dtypes.bfloat16, make_layout((TILE, PROJECTION_KS)), depth=2)
-        self.l0a_shape = (TILE, PROJECTION_KS)
-        self.l0b = RingBuffer(MemLoc.L0B, dtypes.bfloat16, make_layout((TILE, PROJECTION_KS)), depth=2)
-        self.l0c0 = RingBuffer(MemLoc.L0C, dtypes.float32, make_layout((TILE, TILE)), depth=1).next_write()
-        self.l0c1 = RingBuffer(MemLoc.L0C, dtypes.float32, make_layout((TILE, TILE)), depth=1).next_write()
-        self.l0c2 = RingBuffer(MemLoc.L0C, dtypes.float32, make_layout((TILE, TILE)), depth=1).next_write()
-        self.projection_half0 = RingBuffer(
-            MemLoc.UB,
-            dtypes.float32,
-            make_layout((TILE // 2, TILE)),
-            depth=1,
-        ).next_write()
-        self.projection_half1 = RingBuffer(
-            MemLoc.UB,
-            dtypes.float32,
-            make_layout((TILE // 2, TILE)),
-            depth=1,
-        ).next_write()
-        self.projection_half2 = RingBuffer(
-            MemLoc.UB,
-            dtypes.float32,
-            make_layout((TILE // 2, TILE)),
-            depth=1,
-        ).next_write()
-        self.projection_bf16 = Buffer(MemLoc.UB, dtypes.bfloat16, make_layout((TILE // 2, TILE)))
-        self.projection_fp32: object
 
-    @jit
-    def matmul_hidden3(self, hidden_gm, weight_gm, m_group, n_macro, k_tiles):
-        for kc_idx in range(k_tiles * TILE // PROJECTION_KC):
-            a_l1_slot = from_tensor(self.a_l1.next_write(), layout=make_layout(self.a_l1_shape), data_format="nz")
-            mem_copy(a_l1_slot, tile_slice(hidden_gm, (TILE, PROJECTION_KC), (m_group, kc_idx)),
-                options=copy_options(l2_cache_ctl=self.input_l2_cache_ctl))
-            b_l1_slot = self.b_l1.next_write()
-            mem_copy(b_l1_slot, tile_slice(weight_gm, (3 * TILE, PROJECTION_KC), (n_macro, kc_idx)),
-                options=copy_options(l2_cache_ctl=self.weight_l2_cache_ctl))
-            for ks_idx in range(PROJECTION_KC // PROJECTION_KS):
-                l0a_slot = from_tensor(self.l0a.next_write(), layout=make_layout(self.l0a_shape), data_format='nz')
-                l0a_slot_source_2 = tile_slice(a_l1_slot, (TILE, PROJECTION_KS), (0, ks_idx))
-                l0a_slot = l0a_slot[tuple(map(slice, l0a_slot_source_2.shape))]
-                mem_copy(l0a_slot, l0a_slot_source_2)
-                l0b_slot = self.l0b.next_write()
-                l0b_slot_source_5 = tile_slice(b_l1_slot, (TILE, PROJECTION_KS), (0, ks_idx))
-                l0b_slot = l0b_slot[tuple(map(slice, l0b_slot_source_5.shape))]
-                mem_copy(l0b_slot, l0b_slot_source_5)
-                matmul(self.l0c0, l0a_slot, l0b_slot, init=kc_idx == 0 and ks_idx == 0)
-                if kc_idx == k_tiles * TILE // PROJECTION_KC - 1 and ks_idx == PROJECTION_KC // PROJECTION_KS - 1:
-                    mem_copy(self.projection_half0, self.l0c0.partition(dim=0))
-                l0b_slot = self.l0b.next_write()
-                l0b_slot_source_6 = tile_slice(b_l1_slot, (TILE, PROJECTION_KS), (1, ks_idx))
-                l0b_slot = l0b_slot[tuple(map(slice, l0b_slot_source_6.shape))]
-                mem_copy(l0b_slot, l0b_slot_source_6)
-                matmul(self.l0c1, l0a_slot, l0b_slot, init=kc_idx == 0 and ks_idx == 0)
-                if kc_idx == k_tiles * TILE // PROJECTION_KC - 1 and ks_idx == PROJECTION_KC // PROJECTION_KS - 1:
-                    mem_copy(self.projection_half1, self.l0c1.partition(dim=0))
-                l0b_slot = self.l0b.next_write()
-                l0b_slot_source_7 = tile_slice(b_l1_slot, (TILE, PROJECTION_KS), (2, ks_idx))
-                l0b_slot = l0b_slot[tuple(map(slice, l0b_slot_source_7.shape))]
-                mem_copy(l0b_slot, l0b_slot_source_7)
-                matmul(self.l0c2, l0a_slot, l0b_slot, init=kc_idx == 0 and ks_idx == 0)
-                if kc_idx == k_tiles * TILE // PROJECTION_KC - 1 and ks_idx == PROJECTION_KC // PROJECTION_KS - 1:
-                    mem_copy(self.projection_half2, self.l0c2.partition(dim=0))
+_kda_call_state = _shared_kda_call_state()
+_call_lock = _kda_call_state.call_lock
+_pending = _kda_call_state.pending
 
-    @jit
-    def acquire_result0(self):
-        self.projection_fp32 = self.projection_half0
 
-    @jit
-    def acquire_result1(self):
-        self.projection_fp32 = self.projection_half1
-
-    @jit
-    def acquire_result2(self):
-        self.projection_fp32 = self.projection_half2
-
-    @jit
-    def cast_result(self):
-        with vf(mode="simd"):
-            full, _ = update_mask(VL, elem_bits=32)
-            for segment in range(TILE // 2 * TILE // VL):
-                offset = segment * VL
-                value = vcast(vload(self.projection_fp32, offset), dtypes.bfloat16, mask=full)
-                vstore_pack(self.projection_bf16, offset, value, full, pack_mode=PackMode.B32_TO_B16)
+class InputValidation:
+    """负责参数和存储约束校验。"""
 
     @staticmethod
-    def publish(workspace_gm, m_group, output_head, subblock_idx, source):
-        whole_tile = tile_slice(workspace_gm, (TILE, TILE), (m_group, output_head))
-        out_half = tile_slice(whole_tile, make_tiler((TILE // 2, TILE), alignment=(1, 1)), (subblock_idx, 0))
-        mem_copy(out_half, source)
-
-
-class GateDecayProjectionStage:
-    """Share one hidden K128 walk across gate heads 3..5 and decay Fa."""
-
-    def __init__(
-        self,
-        input_l2_cache_ctl: int = 0,
-        weight_l2_cache_ctl: int = 0):
-        self.input_l2_cache_ctl = int(input_l2_cache_ctl)
-        self.weight_l2_cache_ctl = int(weight_l2_cache_ctl)
-        self.a_l1 = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((TILE, TILE)), depth=2)
-        self.a_l1_shape = (TILE, TILE)
-        self.g_l1 = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((3 * TILE, TILE)), depth=2)
-        self.fa_weight_l1 = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((TILE, TILE)), depth=2)
-        self.l0a = RingBuffer(MemLoc.L0A, dtypes.bfloat16, make_layout((TILE, TILE)), depth=2)
-        self.l0a_shape = (TILE, TILE)
-        self.l0b = RingBuffer(MemLoc.L0B, dtypes.bfloat16, make_layout((TILE, TILE)), depth=2)
-        self.l0c0 = RingBuffer(MemLoc.L0C, dtypes.float32, make_layout((TILE, TILE)), depth=1).next_write()
-        self.l0c1 = RingBuffer(MemLoc.L0C, dtypes.float32, make_layout((TILE, TILE)), depth=1).next_write()
-        self.l0c2 = RingBuffer(MemLoc.L0C, dtypes.float32, make_layout((TILE, TILE)), depth=1).next_write()
-        self.l0c_fa = RingBuffer(MemLoc.L0C, dtypes.float32, make_layout((TILE, TILE)), depth=1).next_write()
-        self.fa_l1 = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((TILE, TILE)), depth=1).next_write()
-        self.fb_l1 = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((TILE, TILE)), depth=1).next_write()
-
-    @jit
-    def matmul_hidden3_fa(self, hidden_gm, gate_weight_gm, fa_weight_gm, m_group, k_tiles):
-        for k_idx in range(k_tiles):
-            a_l1_slot = from_tensor(self.a_l1.next_write(), layout=make_layout(self.a_l1_shape), data_format="nz")
-            mem_copy(a_l1_slot, tile_slice(hidden_gm, (TILE, TILE), (m_group, k_idx)), options=copy_options(l2_cache_ctl=self.input_l2_cache_ctl))
-            g_l1_slot = self.g_l1.next_write()
-            mem_copy(g_l1_slot, tile_slice(gate_weight_gm, (3 * TILE, TILE), (1, k_idx)),
-                options=copy_options(l2_cache_ctl=self.weight_l2_cache_ctl))
-            fa_weight_l1_slot = self.fa_weight_l1.next_write()
-            mem_copy(fa_weight_l1_slot, tile_slice(fa_weight_gm, (TILE, TILE), (0, k_idx)),
-                options=copy_options(l2_cache_ctl=self.weight_l2_cache_ctl))
-            l0a_slot = from_tensor(self.l0a.next_write(), layout=make_layout(self.l0a_shape), data_format='nz')
-            l0a_slot = l0a_slot[tuple(map(slice, a_l1_slot.shape))]
-            mem_copy(l0a_slot, a_l1_slot)
-            l0b_slot = self.l0b.next_write()
-            l0b_slot_source_2 = tile_slice(g_l1_slot, (TILE, TILE), (0, 0))
-            l0b_slot = l0b_slot[tuple(map(slice, l0b_slot_source_2.shape))]
-            mem_copy(l0b_slot, l0b_slot_source_2)
-            matmul(self.l0c0, l0a_slot, l0b_slot, init=k_idx == 0)
-            l0b_slot = self.l0b.next_write()
-            l0b_slot_source_3 = tile_slice(g_l1_slot, (TILE, TILE), (1, 0))
-            l0b_slot = l0b_slot[tuple(map(slice, l0b_slot_source_3.shape))]
-            mem_copy(l0b_slot, l0b_slot_source_3)
-            matmul(self.l0c1, l0a_slot, l0b_slot, init=k_idx == 0)
-            l0b_slot = self.l0b.next_write()
-            l0b_slot_source_4 = tile_slice(g_l1_slot, (TILE, TILE), (2, 0))
-            l0b_slot = l0b_slot[tuple(map(slice, l0b_slot_source_4.shape))]
-            mem_copy(l0b_slot, l0b_slot_source_4)
-            matmul(self.l0c2, l0a_slot, l0b_slot, init=k_idx == 0)
-            l0b_slot = self.l0b.next_write()
-            l0b_slot = l0b_slot[tuple(map(slice, fa_weight_l1_slot.shape))]
-            mem_copy(l0b_slot, fa_weight_l1_slot)
-            matmul(self.l0c_fa, l0a_slot, l0b_slot, init=k_idx == 0)
-
-    @jit
-    def _publish_l0c(self, workspace_gm, source_l0c, m_group, output_head, subblock_idx):
-        whole_tile = tile_slice(workspace_gm, (TILE, TILE), (m_group, output_head))
-        mem_copy(whole_tile, source_l0c)
-
-    @jit
-    def publish_gate(self, output_gate_workspace_gm, m_group, subblock_idx):
-        self._publish_l0c(output_gate_workspace_gm, self.l0c0, m_group, 3, subblock_idx)
-        self._publish_l0c(output_gate_workspace_gm, self.l0c1, m_group, 4, subblock_idx)
-        self._publish_l0c(output_gate_workspace_gm, self.l0c2, m_group, 5, subblock_idx)
-
-    @jit
-    def project_fb(self, decay_workspace_gm, fb_weight_gm, m_group, subblock_idx):
-        mem_copy(self.fa_l1, self.l0c_fa)
-        for output_head in range(6):
-            mem_copy(self.fb_l1, tile_slice(fb_weight_gm, (TILE, TILE), (output_head, 0)),
-                options=copy_options(l2_cache_ctl=self.weight_l2_cache_ctl))
-            l0a_slot = from_tensor(self.l0a.next_write(), layout=make_layout(self.l0a_shape), data_format='nz')
-            l0a_slot = l0a_slot[tuple(map(slice, self.fa_l1.shape))]
-            mem_copy(l0a_slot, self.fa_l1)
-            l0b_slot = self.l0b.next_write()
-            l0b_slot = l0b_slot[tuple(map(slice, self.fb_l1.shape))]
-            mem_copy(l0b_slot, self.fb_l1)
-            matmul(self.l0c_fa, l0a_slot, l0b_slot, init=True)
-            self._publish_l0c(decay_workspace_gm, self.l0c_fa, m_group, output_head, subblock_idx)
-
-
-class LowRankDecayStage:
-    """Keep ``f_a`` in L1 and execute six dependent ``f_b`` tiles."""
-
-    def __init__(
-        self,
-        projection_stage: ProjectionStage,
-        num_heads: int):
-        self.projection_stage = projection_stage
-        self.num_heads = int(num_heads)
-        self.fa_l1 = from_tensor(RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((self.projection_stage.row_capacity * TILE,)), depth=1, data_format="nd").next_write(), layout=make_layout((self.projection_stage.row_count, TILE)), data_format="nz")
-        self.fb_l1 = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((TILE, TILE)), depth=1).next_write()
-
-    @jit
-    def project(self, decay_workspace_gm: Tensor, hidden_gm: Tensor, fa_weight_gm: Tensor, fb_weight_gm: Tensor,
-        k_tiles, subblock_idx):
-        """Compute ``f_b(f_a(hidden))`` without a GM intermediate."""
-        self.projection_stage.matmul_hidden(hidden_gm, fa_weight_gm, 0, k_tiles)
-        fa_result = from_tensor(self.projection_stage.l0c.next_read(), layout=make_layout(self.projection_stage.l0c_shape), data_format="nz")
-        mem_copy(self.fa_l1, fa_result)
-        for output_head in range(self.num_heads):
-            mem_copy(self.fb_l1, tile_slice(fb_weight_gm, (TILE, TILE), (output_head, 0)),
-                options=copy_options(l2_cache_ctl=self.projection_stage.weight_l2_cache_ctl))
-            self.projection_stage.matmul_resident(self.fa_l1, self.fb_l1)
-            self.projection_stage.publish_result(
-                tile_slice(decay_workspace_gm, (self.projection_stage.row_capacity, TILE), (0, output_head)))
-            vec_sync_all()
-
-
-class ConvSiluStage:
-    """K=4 depthwise causal Conv1D and SiLU in the same AIV pipeline."""
-
-    def __init__(
-        self,
-        seq_len: int,
-        row_block: int,
-        row_capacity: int = 64):
-        self.seq_len = seq_len
-        self.row_block = row_block
-        self.window = Buffer(MemLoc.UB, dtypes.bfloat16, make_layout((CONV_KERNEL, TILE)))
-        self.weight = Buffer(MemLoc.UB, dtypes.bfloat16, make_layout((3 * CONV_KERNEL, TILE)))
-        self.output_bf16 = Buffer(MemLoc.UB, dtypes.bfloat16, make_layout((row_capacity * TILE,))).view(self.row_block, TILE)
-        self.raw_bf16 = Buffer(MemLoc.UB, dtypes.bfloat16, make_layout((row_capacity * TILE,))).view(self.row_block, TILE)
-        self.weight_ch = RingBuffer(MemLoc.UB, dtypes.bfloat16, make_layout((CONV_KERNEL, TILE)), depth=1).next_write()
-
-    @jit
-    def install_history(self, history_ub):
-        mem_copy(tile_slice(self.window, (3, TILE), (0, 0)), history_ub)
-        vec_sync_all()
-
-    @jit
-    def load_weight(self, weight_gm):
-        mem_copy(self.weight_ch, weight_gm)
-        mem_copy(tile_slice(self.weight, (CONV_KERNEL, TILE), (0, 0)), self.weight_ch)
-        vec_sync_all()
-
-    @jit
-    def convolve_sequence(self, local_batch: int, raw_projection, weight_ub):
-        with vf(mode="simd"):
-            full, _ = update_mask(VL, elem_bits=32)
-            for segment in range(TILE // VL):
-                off = segment * VL
-                x0_bf16 = vload_unpack(self.window, off, unpack_mode=UnpackMode.B16_TO_B32)
-                x0 = vcast(x0_bf16, dtypes.float32, mask=full)
-                x1_bf16 = vload_unpack(self.window, TILE + off, unpack_mode=UnpackMode.B16_TO_B32)
-                x1 = vcast(x1_bf16, dtypes.float32, mask=full)
-                x2_bf16 = vload_unpack(self.window, 2 * TILE + off, unpack_mode=UnpackMode.B16_TO_B32)
-                x2 = vcast(x2_bf16, dtypes.float32, mask=full)
-                w0_bf16 = vload_unpack(weight_ub, off, unpack_mode=UnpackMode.B16_TO_B32)
-                w0 = vcast(w0_bf16, dtypes.float32, mask=full)
-                w1_bf16 = vload_unpack(weight_ub, TILE + off, unpack_mode=UnpackMode.B16_TO_B32)
-                w1 = vcast(w1_bf16, dtypes.float32, mask=full)
-                w2_bf16 = vload_unpack(weight_ub, 2 * TILE + off, unpack_mode=UnpackMode.B16_TO_B32)
-                w2 = vcast(w2_bf16, dtypes.float32, mask=full)
-                w3_bf16 = vload_unpack(weight_ub, 3 * TILE + off, unpack_mode=UnpackMode.B16_TO_B32)
-                w3 = vcast(w3_bf16, dtypes.float32, mask=full)
-                for token in range(self.seq_len):
-                    local_row = local_batch * self.seq_len + token
-                    raw_offset = local_row * TILE
-                    x3 = vload(raw_projection, raw_offset + off)
-                    x3_bf16 = vcast(x3, dtypes.bfloat16, mask=full)
-                    product1 = vmul(x1, w1, mask=full)
-                    product01 = vmadd(x0, w0, product1, mask=full)
-                    product3 = vmul(x3, w3, mask=full)
-                    product23 = vmadd(x2, w2, product3, mask=full)
-                    acc = vadd(product01, product23, mask=full)
-                    negative_acc = vneg(acc, mask=full)
-                    exp_value = vexp(negative_acc, mask=full)
-                    denominator = vadds(exp_value, 1.0, mask=full)
-                    activated = vdiv(acc, denominator, mask=full)
-                    activated_bf16 = vcast(activated, dtypes.bfloat16, mask=full)
-                    output_offset = raw_offset + off
-                    vstore_pack(self.output_bf16, output_offset, activated_bf16, full, pack_mode=PackMode.B32_TO_B16)
-                    vstore_pack(self.raw_bf16, output_offset, x3_bf16, full, pack_mode=PackMode.B32_TO_B16)
-                    x0 = x1
-                    x1 = x2
-                    x2 = vcast(x3_bf16, dtypes.float32, mask=full)
-                final_x0 = vcast(x0, dtypes.bfloat16, mask=full)
-                final_x1 = vcast(x1, dtypes.bfloat16, mask=full)
-                final_x2 = vcast(x2, dtypes.bfloat16, mask=full)
-                vstore_pack(self.window, off, final_x0, full, pack_mode=PackMode.B32_TO_B16)
-                vstore_pack(self.window, TILE + off, final_x1, full, pack_mode=PackMode.B32_TO_B16)
-                vstore_pack(self.window, 2 * TILE + off, final_x2, full, pack_mode=PackMode.B32_TO_B16)
-            vmem_bar("vst_vld")
-
-    @jit
-    def zero_sequence(self, local_batch: int):
-        with vf(mode="simd"):
-            full_bf16, _ = update_mask(TILE, elem_bits=16)
-            zero = vdups(0.0, dtypes.bfloat16, mask=full_bf16)
-            for token in range(self.seq_len):
-                local_row = local_batch * self.seq_len + token
-                vstore(self.output_bf16, local_row * TILE, zero, full_bf16)
-            vmem_bar("vst_vld")
-
-
-class RecurrentKDAStage:
-    """Snapshot delta-rule recurrence for one complete value head."""
-
-    def __init__(
-        self,
-        row_block: int,
-        num_heads: int,
-        state_key_unroll: int = KDA_STATE_KEY_UNROLL,
-        state_update_unroll: int = KDA_STATE_UPDATE_UNROLL,
-        state_store_l2_cache_ctl: int = 0):
-        self.store_policy = state_store_l2_cache_ctl
-        self.row_block = row_block
-        self.num_heads = int(num_heads)
-        self.state_key_unroll = int(state_key_unroll)
-        self.state_update_unroll = int(state_update_unroll)
-        self.state = RingBuffer(MemLoc.UB, dtypes.float32, make_layout((self.row_block, TILE)), depth=1).next_write()
-        self.state_snapshot = RingBuffer(MemLoc.UB, dtypes.float32, make_layout((self.row_block, TILE)), depth=2)
-        self.key = Buffer(MemLoc.UB, dtypes.float32, make_layout((1, TILE)))
-        self.query = Buffer(MemLoc.UB, dtypes.float32, make_layout((1, TILE)))
-        self.decay_exp = Buffer(MemLoc.UB, dtypes.float32, make_layout((1, TILE)))
-        self.ub_value = Buffer(MemLoc.UB, dtypes.float32, make_layout((1, self.row_block)))
-        self.ub_beta = Buffer(MemLoc.UB, dtypes.float32, make_layout((1, VL)))
-        self.out = Buffer(MemLoc.UB, dtypes.float32, make_layout((1, self.row_block)))
-        self.value = RingBuffer(MemLoc.UB, dtypes.bfloat16, make_layout((1, self.row_block)), depth=2)
-        self.state_key_sums = Buffer(MemLoc.UB, dtypes.float32, make_layout((1, self.row_block)))
-        self.delta_row = Buffer(MemLoc.UB, dtypes.float32, make_layout((1, self.row_block)))
-        self.raw_query = RingBuffer(MemLoc.UB, dtypes.bfloat16, make_layout((1, TILE)), depth=2)
-        self.raw_key = RingBuffer(MemLoc.UB, dtypes.bfloat16, make_layout((1, TILE)), depth=2)
-        self.raw_g = RingBuffer(MemLoc.UB, dtypes.bfloat16, make_layout((1, TILE)), depth=2)
-        self.raw_beta = RingBuffer(MemLoc.UB, dtypes.bfloat16, make_layout((1, VL)), depth=2)
-        self.dt_bias = Buffer(MemLoc.UB, dtypes.float32, make_layout((self.num_heads, TILE)))
-        self.a_log = Buffer(MemLoc.UB, dtypes.float32, make_layout((self.num_heads,)))
-
-    def load_gate_params(self, a_log_gm, dt_bias_gm):
-        mem_copy(self.a_log, a_log_gm)
-        mem_copy(self.dt_bias, dt_bias_gm)
-
-    def load_state(self, state_gm):
-        mem_copy(self.state, state_gm, options=copy_options(l2_cache_ctl=2))
-
-    def prefetch_inputs(self, raw_key_gm, raw_query_gm, raw_g_gm, value_gm, raw_beta_gm):
-        mem_copy(self.raw_query.next_write(), raw_query_gm)
-        mem_copy(self.raw_key.next_write(), raw_key_gm)
-        mem_copy(self.raw_g.next_write(), raw_g_gm)
-        mem_copy(tile_slice(self.raw_beta.next_write(), (1, 1), (0, 0)), raw_beta_gm)
-        mem_copy(self.value.next_write(), value_gm)
-
-    @jit
-    def normalize_qk(self, scale_value: float):
-        raw_query_slot = self.raw_query.next_read()
-        raw_key_slot = self.raw_key.next_read()
-        with vf(mode="simd"):
-            full, _ = update_mask(VL, elem_bits=32)
-            query_pre_bf16 = vload_unpack(raw_query_slot, 0, unpack_mode=UnpackMode.B16_TO_B32)
-            query_pre = vcast(query_pre_bf16, dtypes.float32, mask=full)
-            query_post_bf16 = vload_unpack(raw_query_slot, VL, unpack_mode=UnpackMode.B16_TO_B32)
-            query_post = vcast(query_post_bf16, dtypes.float32, mask=full)
-            key_pre_bf16 = vload_unpack(raw_key_slot, 0, unpack_mode=UnpackMode.B16_TO_B32)
-            key_pre = vcast(key_pre_bf16, dtypes.float32, mask=full)
-            key_post_bf16 = vload_unpack(raw_key_slot, VL, unpack_mode=UnpackMode.B16_TO_B32)
-            key_post = vcast(key_post_bf16, dtypes.float32, mask=full)
-            query_pre_square = vmul(query_pre, query_pre, mask=full)
-            query_pre_sum = vreduce_sum(query_pre_square, mask=full)
-            query_post_square = vmul(query_post, query_post, mask=full)
-            query_post_sum = vreduce_sum(query_post_square, mask=full)
-            key_pre_square = vmul(key_pre, key_pre, mask=full)
-            key_pre_sum = vreduce_sum(key_pre_square, mask=full)
-            key_post_square = vmul(key_post, key_post, mask=full)
-            key_post_sum = vreduce_sum(key_post_square, mask=full)
-            lane0, _ = update_mask(1, elem_bits=32)
-            query_sum = vadd(query_pre_sum, query_post_sum, mask=lane0)
-            key_sum = vadd(key_pre_sum, key_post_sum, mask=lane0)
-            query_sum_eps = vadds(query_sum, 1e-06, mask=lane0)
-            query_norm = vsqrt(query_sum_eps, mask=lane0)
-            key_sum_eps = vadds(key_sum, 1e-06, mask=lane0)
-            key_norm = vsqrt(key_sum_eps, mask=lane0)
-            full, _ = update_mask(VL, elem_bits=32)
-            query_denom = vdup(query_norm, mask=full)
-            key_denom = vdup(key_norm, mask=full)
-            query_pre = vdiv(query_pre, query_denom, mask=full)
-            query_pre = vmuls(query_pre, scale_value, mask=full)
-            vstore(self.query, 0, query_pre, full)
-            query_post = vdiv(query_post, query_denom, mask=full)
-            query_post = vmuls(query_post, scale_value, mask=full)
-            vstore(self.query, VL, query_post, full)
-            key_pre = vdiv(key_pre, key_denom, mask=full)
-            vstore(self.key, 0, key_pre, full)
-            key_post = vdiv(key_post, key_denom, mask=full)
-            vstore(self.key, VL, key_post, full)
-
-    @jit
-    def activate_g_beta(self, lower_bound: float, value_head):
-        raw_g_slot = self.raw_g.next_read()
-        raw_beta_slot = self.raw_beta.next_read()
-        value_slot = self.value.next_read()
-        with vf(mode="simd"):
-            full, _ = update_mask(VL, elem_bits=32)
-            one = vdups(1.0, dtypes.float32)
-            alpha = vload_broadcast(self.a_log, value_head)
-            alpha = vexp(alpha, mask=full)
-            negative_alpha = vneg(alpha, mask=full)
-            gate_offset = value_head * TILE
-            raw_gate_pre_bf16 = vload_unpack(raw_g_slot, 0, unpack_mode=UnpackMode.B16_TO_B32)
-            raw_gate_pre = vcast(raw_gate_pre_bf16, dtypes.float32, mask=full)
-            raw_gate_post_bf16 = vload_unpack(raw_g_slot, VL, unpack_mode=UnpackMode.B16_TO_B32)
-            raw_gate_post = vcast(raw_gate_post_bf16, dtypes.float32, mask=full)
-            gate_bias_pre = vload(self.dt_bias, gate_offset)
-            gate_pre = vadd(raw_gate_pre, gate_bias_pre, mask=full)
-            gate_pre = vmul(negative_alpha, gate_pre, mask=full)
-            gate_bias_post = vload(self.dt_bias, gate_offset + VL)
-            gate_post = vadd(raw_gate_post, gate_bias_post, mask=full)
-            gate_post = vmul(negative_alpha, gate_post, mask=full)
-            activated_pre = vexp(gate_pre, mask=full)
-            activated_pre = vadds(activated_pre, 1.0, mask=full)
-            activated_pre = vdiv(one, activated_pre, mask=full)
-            activated_pre = vmuls(activated_pre, lower_bound, mask=full)
-            activated_post = vexp(gate_post, mask=full)
-            activated_post = vadds(activated_post, 1.0, mask=full)
-            activated_post = vdiv(one, activated_post, mask=full)
-            activated_post = vmuls(activated_post, lower_bound, mask=full)
-            decay_exp_pre = vexp(activated_pre, mask=full)
-            vstore(self.decay_exp, 0, decay_exp_pre, full)
-            decay_exp_post = vexp(activated_post, mask=full)
-            vstore(self.decay_exp, VL, decay_exp_post, full)
-            beta_logit_bf16 = vload_unpack(raw_beta_slot, 0, unpack_mode=UnpackMode.B16_TO_B32)
-            beta_logit = vcast(beta_logit_bf16, dtypes.float32, mask=full)
-            beta = vneg(beta_logit, mask=full)
-            beta = vexp(beta, mask=full)
-            beta = vadds(beta, 1.0, mask=full)
-            beta = vdiv(one, beta, mask=full)
-            vstore(self.ub_beta, 0, beta, full)
-            value_bf16 = vload_unpack(value_slot, 0, unpack_mode=UnpackMode.B16_TO_B32)
-            value = vcast(value_bf16, dtypes.float32, mask=full)
-            vstore(self.ub_value, 0, value, full)
-            value_post_bf16 = vload_unpack(value_slot, VL, unpack_mode=UnpackMode.B16_TO_B32)
-            value_post = vcast(value_post_bf16, dtypes.float32, mask=full)
-            vstore(self.ub_value, VL, value_post, full)
-
-    @jit
-    def recur_step(self):
-        state_snapshot_slot = self.state_snapshot.next_write()
-        with vf(mode="simd"):
-            mask, _ = update_mask(VL, elem_bits=32)
-            decay_pre = vload(self.decay_exp, 0)
-            decay_post = vload(self.decay_exp, VL)
-            key_pre = vload(self.key, 0)
-            key_post = vload(self.key, VL)
-            decay_key_pre = vmul(decay_pre, key_pre, mask=mask)
-            decay_key_post = vmul(decay_post, key_post, mask=mask)
-            for dv in dsl_range(0, self.row_block, 1, unroll=self.state_key_unroll):
-                offset = dv * TILE
-                state_key_pre = vload(self.state, offset)
-                state_key_post = vload(self.state, offset + VL)
-                state_key = vmul(state_key_pre, decay_key_pre, mask=mask)
-                state_key = vmadd(state_key_post, decay_key_post, state_key, mask=mask)
-                state_key_sum = vreduce_sum(state_key, mask=mask)
-                vstore_first(self.state_key_sums, dv, state_key_sum)
-        with vf(mode="simd"):
-            mask, _ = update_mask(VL, elem_bits=32)
-            beta = vload_broadcast(self.ub_beta, 0)
-            value_pre = vload(self.ub_value, 0)
-            state_key_sum_pre = vload(self.state_key_sums, 0)
-            residual_pre = vsub(value_pre, state_key_sum_pre, mask=mask)
-            delta_pre = vmul(residual_pre, beta, mask=mask)
-            vstore(self.delta_row, 0, delta_pre, mask)
-            value_post = vload(self.ub_value, VL)
-            state_key_sum_post = vload(self.state_key_sums, VL)
-            residual_post = vsub(value_post, state_key_sum_post, mask=mask)
-            delta_post = vmul(residual_post, beta, mask=mask)
-            vstore(self.delta_row, VL, delta_post, mask)
-        with vf(mode="simd"):
-            mask, _ = update_mask(VL, elem_bits=32)
-            decay_pre = vload(self.decay_exp, 0)
-            decay_post = vload(self.decay_exp, VL)
-            key_pre = vload(self.key, 0)
-            key_post = vload(self.key, VL)
-            query_pre = vload(self.query, 0)
-            query_post = vload(self.query, VL)
-            for dv in dsl_range(0, self.row_block, 1, unroll=self.state_update_unroll):
-                offset = dv * TILE
-                delta = vload_broadcast(self.delta_row, dv)
-                state_pre = vload(self.state, offset)
-                update_pre = vmul(delta, key_pre, mask=mask)
-                state_pre = vmul(state_pre, decay_pre, mask=mask)
-                state_pre = vadd(state_pre, update_pre, mask=mask)
-                state_post = vload(self.state, offset + VL)
-                update_post = vmul(delta, key_post, mask=mask)
-                state_post = vmul(state_post, decay_post, mask=mask)
-                state_post = vadd(state_post, update_post, mask=mask)
-                vstore(self.state, offset, state_pre, mask)
-                vstore(self.state, offset + VL, state_post, mask)
-                vstore(state_snapshot_slot, offset, state_pre, mask)
-                vstore(state_snapshot_slot, offset + VL, state_post, mask)
-                output_pre = vmul(state_pre, query_pre, mask=mask)
-                output_post = vmul(state_post, query_post, mask=mask)
-                output = vadd(output_pre, output_post, mask=mask)
-                output = vreduce_sum(output, mask=mask)
-                vstore_first(self.out, dv, output)
-
-    def store_state(self, state_gm):
-        mem_copy(state_gm, self.state_snapshot.next_read(), options=copy_options(l2_cache_ctl=self.store_policy))
-
-
-class OutputGateStage:
-    """RMSNorm and sigmoid output gate for one complete value head."""
-
-    def __init__(self):
-        self.gamma_fp32 = Buffer(MemLoc.UB, dtypes.float32, make_layout((TILE,)))
-        self.gate_input = RingBuffer(MemLoc.UB, dtypes.bfloat16, make_layout((1, TILE)), depth=2)
-        self.output = RingBuffer(MemLoc.UB, dtypes.bfloat16, make_layout((1, TILE)), depth=2)
-        self.raw_fp32 = Buffer(MemLoc.UB, dtypes.float32, make_layout((1, TILE)))
-        self.local_sum = Buffer(MemLoc.UB, dtypes.float32, make_layout((1, 8)))
-
-    @jit
-    def load_gamma(self, output_norm_weight_gm: Tensor):
-        mem_copy(self.gamma_fp32, output_norm_weight_gm)
-
-    def issue_gate(self, gate_gm):
-        mem_copy(self.gate_input.next_write(), gate_gm)
-
-    @jit
-    def prepare_local_sum(self, recurrent_output):
-        """Keep the complete recurrent output in FP32 and reduce its RMS sum."""
-        with vf(mode="simd"):
-            full, _ = update_mask(VL, elem_bits=32)
-            eight, _ = update_mask(8, elem_bits=32)
-            zero = vdups(0.0, dtypes.float32)
-            vstore(self.local_sum, 0, zero, eight)
-            raw_pre = vload(recurrent_output, 0)
-            vstore(self.raw_fp32, 0, raw_pre, full)
-            square_pre = vmul(raw_pre, raw_pre, mask=full)
-            sum_pre = vreduce_sum(square_pre, mask=full)
-            vstore_first(self.local_sum, 0, sum_pre)
-            raw_post = vload(recurrent_output, VL)
-            vstore(self.raw_fp32, VL, raw_post, full)
-            square_post = vmul(raw_post, raw_post, mask=full)
-            sum_post = vreduce_sum(square_post, mask=full)
-            vstore_first(self.local_sum, 1, sum_post)
-
-    @jit
-    def apply_and_store(self, output_gm, rms_norm_eps: float):
-        """Apply FP32 RMSNorm and sigmoid, then publish final BF16."""
-        gate_input_slot = self.gate_input.next_read()
-        output_slot = self.output.next_write()
-        with vf(mode="simd"):
-            full, _ = update_mask(VL, elem_bits=32)
-            one = vdups(1.0, dtypes.float32)
-            sum_pre = vload_broadcast(self.local_sum, 0)
-            sum_post = vload_broadcast(self.local_sum, 1)
-            total_sum = vadd(sum_pre, sum_post, mask=full)
-            mean_square = vmuls(total_sum, 1.0 / TILE, mask=full)
-            mean_square = vadds(mean_square, rms_norm_eps, mask=full)
-            root_mean_square = vsqrt(mean_square, mask=full)
-            inverse_rms = vdiv(one, root_mean_square, mask=full)
-            for segment in range(D_SEGMENTS):
-                offset = segment * VL
-                raw = vload(self.raw_fp32, offset)
-                gamma = vload(self.gamma_fp32, offset)
-                normalized = vmul(raw, inverse_rms, mask=full)
-                normalized = vmul(normalized, gamma, mask=full)
-                gate_bf16 = vload_unpack(gate_input_slot, offset, unpack_mode=UnpackMode.B16_TO_B32)
-                gate = vcast(gate_bf16, dtypes.float32, mask=full)
-                activated_gate = vneg(gate, mask=full)
-                activated_gate = vexp(activated_gate, mask=full)
-                activated_gate = vadds(activated_gate, 1.0, mask=full)
-                activated_gate = vdiv(one, activated_gate, mask=full)
-                final_output = vmul(normalized, activated_gate, mask=full)
-                final_bf16 = vcast(final_output, dtypes.bfloat16, mask=full)
-                vstore_pack(output_slot, offset, final_bf16, full, pack_mode=PackMode.B32_TO_B16)
-        mem_copy(output_gm, output_slot)
-
-
-@jit
-def _recurrent_item_index(item, batch_size: int, num_heads: int, nb_group_batch: int):
-    """Order heads before batches within each complete OProj publication block.
-
-    The last block uses its actual batch count, so no padded task can read or
-    overwrite another request's state. Publication counters remain task ordinals.
-    """
-    group_tasks = nb_group_batch * num_heads
-    group_start = item // group_tasks * nb_group_batch
-    group_batch = batch_size - group_start
-    if group_batch > nb_group_batch:
-        group_batch = nb_group_batch
-    offset = item % group_tasks
-    batch = group_start + offset % group_batch
-    head = offset // group_batch
-    return batch * num_heads + head
-
-
-@jit
-def prefetch_recurrent_item(recurrent_stage, output_gate_stage, q_workspace_gm, k_workspace_gm, v_workspace_gm,
-    decay_workspace_gm, output_gate_workspace_gm, beta_workspace_gm, item, batch_size: int, seq_len: int,
-    num_heads: int, row_block: int, nb_group_batch: int = 1):
-    """Issue token-0 inputs for one complete batch/head item."""
-    batch_index, value_head = idx2crd(
-        _recurrent_item_index(item, batch_size, num_heads, nb_group_batch), [batch_size, num_heads])
-    base = batch_index * seq_len
-    recurrent_stage.prefetch_inputs(tile_slice(k_workspace_gm, (1, TILE), (base, value_head)),
-        tile_slice(q_workspace_gm, (1, TILE), (base, value_head)),
-        tile_slice(decay_workspace_gm, (1, TILE), (base, value_head)),
-        tile_slice(v_workspace_gm, (1, row_block), (base, value_head)),
-        tile_slice(beta_workspace_gm, (1, 1), (base, value_head)))
-    output_gate_stage.issue_gate(tile_slice(output_gate_workspace_gm, (1, row_block), (base, value_head)))
-
-
-@jit
-def prefetch_recurrent_state(recurrent_stage, initial_state_gm, state_indices_gm, accepted_gm, item, batch_size: int,
-    seq_len: int, num_heads: int, row_block: int, nb_group_batch: int = 1):
-    """Issue the initial-state load for one complete batch/head item."""
-    batch_index, value_head = idx2crd(
-        _recurrent_item_index(item, batch_size, num_heads, nb_group_batch), [batch_size, num_heads])
-    base = batch_index * seq_len
-    accepted = dtypes.int64(accepted_gm[batch_index])
-    initial_token = base + accepted - 1 if accepted > 0 else base
-    initial_state_index = dtypes.int64(state_indices_gm[initial_token])
-    recurrent_stage.load_state(
-        tile_slice(initial_state_gm[initial_state_index, value_head, None, None], (row_block, TILE), (0, 0)))
-
-
-@jit
-def run_recurrent_wave(recurrent_stage, output_gate_stage, q_workspace_gm, k_workspace_gm, v_workspace_gm,
-    decay_workspace_gm, output_gate_workspace_gm, beta_workspace_gm, initial_state_gm, final_state_gm,
-    state_indices_gm, accepted_gm, item_start, item_end, batch_size: int, seq_len: int, num_heads: int, row_block: int,
-    scale_value: float, lower_bound: float, rms_norm_eps: float, defer_final_snapshot: bool = False,
-    first_inputs_prefetched: bool = False, first_state_prefetched: bool = False, next_item_stride: int = 0,
-    nb_group_batch: int = 1):
-    """Run NB tasks and carry the same order into token/state prefetch."""
-    for item in range(item_start, item_end):
-        batch_index, value_head = idx2crd(
-        _recurrent_item_index(item, batch_size, num_heads, nb_group_batch), [batch_size, num_heads])
-        base = batch_index * seq_len
-        accepted = dtypes.int64(accepted_gm[batch_index])
-        initial_token = base + accepted - 1 if accepted > 0 else base
-        initial_state_index = dtypes.int64(state_indices_gm[initial_token])
-        if not const_expr(first_inputs_prefetched):
-            prefetch_recurrent_item(recurrent_stage, output_gate_stage, q_workspace_gm, k_workspace_gm, v_workspace_gm,
-                decay_workspace_gm, output_gate_workspace_gm, beta_workspace_gm, item, batch_size, seq_len, num_heads,
-                row_block, nb_group_batch=nb_group_batch)
-        if not const_expr(first_state_prefetched):
-            recurrent_stage.load_state(
-                tile_slice(initial_state_gm[initial_state_index, value_head, None, None], (row_block, TILE), (0, 0)))
-        for token in range(seq_len):
-            recurrent_stage.normalize_qk(scale_value)
-            recurrent_stage.activate_g_beta(lower_bound, value_head)
-            if token + 1 < seq_len:
-                next_row = base + token + 1
-                recurrent_stage.prefetch_inputs(tile_slice(k_workspace_gm, (1, TILE), (next_row, value_head)),
-                    tile_slice(q_workspace_gm, (1, TILE), (next_row, value_head)),
-                    tile_slice(decay_workspace_gm, (1, TILE), (next_row, value_head)),
-                    tile_slice(v_workspace_gm, (1, row_block), (next_row, value_head)),
-                    tile_slice(beta_workspace_gm, (1, 1), (next_row, value_head)))
-                output_gate_stage.issue_gate(
-                    tile_slice(output_gate_workspace_gm, (1, row_block), (next_row, value_head)))
-            recurrent_stage.recur_step()
-            output_gate_stage.prepare_local_sum(recurrent_stage.out)
-            output_gate_stage.apply_and_store(
-                tile_slice(q_workspace_gm, (1, row_block), (base + token, value_head)), rms_norm_eps)
-            if next_item_stride > 0:
-                if token + 1 == seq_len:
-                    next_item = item + next_item_stride
-                    if next_item < batch_size * num_heads:
-                        prefetch_recurrent_item(recurrent_stage, output_gate_stage, q_workspace_gm, k_workspace_gm,
-                            v_workspace_gm, decay_workspace_gm, output_gate_workspace_gm, beta_workspace_gm, next_item,
-                            batch_size, seq_len, num_heads, row_block, nb_group_batch=nb_group_batch)
-                        prefetch_recurrent_state(recurrent_stage, initial_state_gm, state_indices_gm, accepted_gm,
-                            next_item, batch_size, seq_len, num_heads, row_block, nb_group_batch=nb_group_batch)
-            if not defer_final_snapshot or token + 1 < seq_len:
-                snapshot_index = dtypes.int64(state_indices_gm[base + token])
-                recurrent_stage.store_state(
-                    tile_slice(final_state_gm[snapshot_index, value_head, None, None], (row_block, TILE), (0, 0)))
-
-
-class _TiledOutputProjectionStage:
-    """Shared output projection with compile-time tile mapping and buffer sizes."""
-
-    def __init__(
-        self,
-        tile_width: int = 128,
-        row_count: int = TILE,
-        input_l2_cache_ctl: int = 0,
-        weight_l2_cache_ctl: int = 0,
-        store_l2_cache_ctl: int = 0,
-        tiles_per_core: int = 2,
-        *,
-        kc: int = OPROJ_KC,
-        resident_input: bool = False,
-        resident_weight: bool = False,
-        tile_stride: int = 1,
-        l0c_depth: int = 1,
-        row_capacity: int = 64):
-        self.tiles_per_core = int(tiles_per_core)
-        self.tile_width = int(tile_width)
-        self.row_count = row_count
-        self.input_l2_cache_ctl = int(input_l2_cache_ctl)
-        self.weight_l2_cache_ctl = int(weight_l2_cache_ctl)
-        self.store_l2_cache_ctl = int(store_l2_cache_ctl)
-        self.kc = int(kc)
-        self.resident_input = resident_input
-        self.resident_weight = resident_weight
-        self.tile_stride = int(tile_stride)
-        self.row_capacity = int(row_capacity)
-        self.ks = OPROJ_KS
-        if self.resident_weight:
-            self.resident_weight_rows = self.tile_width * self.tiles_per_core
-            self.b_l1 = Buffer(MemLoc.L1, dtypes.bfloat16, make_layout((self.resident_weight_rows, 6 * TILE)))
+    def require(condition, message):
+        if isinstance(condition, bool):
+            if not condition:
+                raise ValueError(message)
         else:
-            self.b_l1 = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((self.tile_width, self.kc)), depth=2)
-        self.a_l1 = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((self.row_capacity * (768 if self.resident_input else self.kc),)), depth=1 if self.resident_input else 2, data_format="nd")
-        self.a_l1_shape = (self.row_count, 768 if self.resident_input else self.kc)
-        self.l0a = RingBuffer(MemLoc.L0A, dtypes.bfloat16, make_layout((self.row_capacity * self.ks,)), depth=2, data_format="nd")
-        self.l0a_shape = (self.row_count, self.ks)
-        self.l0b = RingBuffer(MemLoc.L0B, dtypes.bfloat16, make_layout((self.tile_width, self.ks)), depth=2)
-        self.l0c = RingBuffer(MemLoc.L0C, dtypes.float32, make_layout((self.row_capacity * self.tile_width,)), depth=l0c_depth, data_format="nd")
-        self.l0c_shape = (self.row_count, self.tile_width)
+            torch._check(condition, lambda: message)
 
-    @jit
-    def prefetch_weight(self, weight_gm: Tensor):
-        """Keep this AIC's complete output-width-by-K768 Weight-NZ shard in L1."""
-        if const_expr(self.resident_weight):
-            resident_shards = ceil_div(weight_gm.shape[0], self.resident_weight_rows)
-            if get_block_idx() < resident_shards:
-                mem_copy(self.b_l1, tile_slice(weight_gm, (self.resident_weight_rows, 6 * TILE), (get_block_idx(), 0)),
-                    options=copy_options(l2_cache_ctl=self.weight_l2_cache_ctl))
-
-    @jit
-    def project(self, out_gm: Tensor, gated_workspace_gm: Tensor, weight_gm: Tensor, k_tiles: int, row_tile: int):
-        """Compute each AIC's assigned output tiles."""
-        tile_count = ceil_div(out_gm.shape[1], self.tile_width)
-        wave_start = row_tile * self.row_count
-        wave_end = wave_start + self.row_count
-        gated_wave = gated_workspace_gm[wave_start:wave_end, None]
-        out_wave = out_gm[wave_start:wave_end, None]
-        if const_expr(self.resident_input):
-            resident_a = from_tensor(self.a_l1.next_write(), layout=make_layout(self.a_l1_shape), data_format="nz")
-            mem_copy(resident_a, tile_slice(gated_wave, (self.row_capacity, 768), (0, 0)),
-                options=copy_options(l2_cache_ctl=self.input_l2_cache_ctl))
-        first_tile = get_block_idx() * self.tiles_per_core
-        for local_tile in range(self.tiles_per_core):
-            if const_expr(self.resident_input):
-                output_tile = get_block_idx() * self.tiles_per_core + local_tile
-            elif const_expr(self.tile_stride != 1):
-                output_tile = get_block_idx() + local_tile * self.tile_stride
-            else:
-                output_tile = first_tile + local_tile
-            if output_tile < tile_count:
-                accumulator = from_tensor(self.l0c.next_write(), layout=make_layout(self.l0c_shape), data_format="nz")
-                for kc_idx in range(k_tiles * TILE // self.kc):
-                    if const_expr(self.resident_input):
-                        a_panel = tile_slice(resident_a, (self.row_capacity, self.kc), (0, kc_idx))
-                    else:
-                        a_panel = from_tensor(self.a_l1.next_write(), layout=make_layout(self.a_l1_shape), data_format="nz")
-                        mem_copy(a_panel, tile_slice(gated_wave, (self.row_capacity, self.kc), (0, kc_idx)),
-                            options=copy_options(l2_cache_ctl=self.input_l2_cache_ctl))
-                    if const_expr(self.resident_weight):
-                        b_panel = tile_slice(self.b_l1, (self.tile_width, self.kc), (local_tile, kc_idx))
-                    else:
-                        b_panel = self.b_l1.next_write()
-                        mem_copy(b_panel, tile_slice(weight_gm, (self.tile_width, self.kc), (output_tile, kc_idx)),
-                            options=copy_options(l2_cache_ctl=self.weight_l2_cache_ctl))
-                    for ks_idx in range(self.kc // self.ks):
-                        l0a_slot = from_tensor(self.l0a.next_write(), layout=make_layout(self.l0a_shape), data_format='nz')
-                        l0a_slot_source_5 = tile_slice(a_panel, (self.row_capacity, self.ks), (0, ks_idx))
-                        l0a_slot = l0a_slot[tuple(map(slice, l0a_slot_source_5.shape))]
-                        mem_copy(l0a_slot, l0a_slot_source_5)
-                        l0b_slot = self.l0b.next_write()
-                        l0b_slot_source_14 = tile_slice(b_panel, (self.tile_width, self.ks), (0, ks_idx))
-                        l0b_slot = l0b_slot[tuple(map(slice, l0b_slot_source_14.shape))]
-                        mem_copy(l0b_slot, l0b_slot_source_14)
-                        matmul(accumulator, l0a_slot, l0b_slot, init=kc_idx == 0 and ks_idx == 0)
-                mem_copy(tile_slice(out_wave, (self.row_capacity, self.tile_width), (0, output_tile)), accumulator,
-                    options=copy_options(l2_cache_ctl=self.store_l2_cache_ctl))
-
-
-class BetaZSharedStage:
-    """Share one hidden KC load between the last gate head and Beta."""
-
-    def __init__(
-        self,
-        rows,
-        input_l2_cache_ctl=0,
-        weight_l2_cache_ctl=0):
-        self.input_l2_cache_ctl = int(input_l2_cache_ctl)
-        self.weight_l2_cache_ctl = int(weight_l2_cache_ctl)
-        self.rows = rows
-        self.half = rows // 2
-        self.a = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((128 * 256,)), depth=2, data_format="nd")
-        self.a_shape = (rows, 256)
-        self.z = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((128, 256)), depth=2)
-        self.la = RingBuffer(MemLoc.L0A, dtypes.bfloat16, make_layout((128 * 128,)), depth=2, data_format="nd")
-        self.la_shape = (rows, 128)
-        self.lz = RingBuffer(MemLoc.L0B, dtypes.bfloat16, make_layout((128, 128)), depth=1).next_write()
-        self.lb = RingBuffer(MemLoc.L0B, dtypes.bfloat16, make_layout((16, 128)), depth=2)
-        self.cz = from_tensor(RingBuffer(MemLoc.L0C, dtypes.float32, make_layout((128 * 128,)), depth=1, data_format="nd").next_write(), layout=make_layout((rows, 128)), data_format="nz")
-        self.cb = from_tensor(RingBuffer(MemLoc.L0C, dtypes.float32, make_layout((128 * 16,)), depth=1, data_format="nd").next_write(), layout=make_layout((rows, 16)), data_format="nz")
-
-    @jit
-    def project(self, hidden_gm, z_weight_gm, beta_weight_gm, z_gm, beta_gm, subblock):
-        beta_l1 = Buffer(
-            MemLoc.L1,
-            beta_weight_gm.dtype,
-            beta_weight_gm.layout,
-            physical_layout=beta_weight_gm.physical_layout,
+    @staticmethod
+    def tensor_metadata(name, tensor, shape, dtype, device):
+        if not isinstance(tensor, torch.Tensor):
+            raise TypeError(f"{name} must be a torch.Tensor")
+        shape_label = {
+            "hidden_states": "[B,seq_len,H] or [total_tokens,H]",
+            "qkv_projection_weight": "[3*P,H]",
+            "decay_projection_a_weight": "[D,H]",
+            "decay_projection_b_weight": "[P,D]",
+            "beta_projection_weight": "[N,H]",
+            "output_gate_projection_weight": "[P,H]",
+            "output_norm_weight": "[D]",
+            "output_projection_weight": "[H,P]",
+            "state_indices": "[B]",
+            "conv_num_accepted_tokens": "[B]",
+            "num_accepted_tokens": "[B]",
+            "A_log": "[N]",
+            "dt_bias": "[N,D]",
+            "cu_seqlens": "[B+1]",
+            "conv1d_weight": "[4,3*P], [3,N,4,D], or [3,4,D]",
+            "replay_u": "[block_num,N,S,D]",
+            "replay_k": "[block_num,N,S,D]",
+            "replay_decay": "[block_num,N,S,D]",
+        }.get(name, str(shape))
+        InputValidation.require(
+            tensor.ndim == len(shape), f"{name} must have shape {shape_label}"
         )
-        mem_copy(beta_l1, beta_weight_gm, options=copy_options(l2_cache_ctl=self.weight_l2_cache_ctl))
-        for kc in range(HIDDEN_SIZE // PROJECTION_KC):
-            a_slot = from_tensor(self.a.next_write(), layout=make_layout(self.a_shape), data_format="nz")
-            mem_copy(a_slot, tile_slice(hidden_gm, (128, 256), (0, kc)), options=copy_options(l2_cache_ctl=self.input_l2_cache_ctl))
-            z_slot = self.z.next_write()
-            mem_copy(z_slot, tile_slice(z_weight_gm, (128, 256), (5, kc)),
-                options=copy_options(l2_cache_ctl=self.weight_l2_cache_ctl))
-            for ks in range(2):
-                la_slot = from_tensor(self.la.next_write(), layout=make_layout(self.la_shape), data_format='nz')
-                la_slot_source = tile_slice(a_slot, (128, 128), (0, ks))
-                la_slot = la_slot[tuple(map(slice, la_slot_source.shape))]
-                mem_copy(la_slot, la_slot_source)
-                mem_copy(self.lz, tile_slice(z_slot, (128, 128), (0, ks)))
-                matmul(self.cz, la_slot, self.lz, init=kc == 0 and ks == 0)
-                lb_slot = self.lb.next_write()
-                mem_copy(lb_slot, tile_slice(beta_l1, (16, 128), (0, kc * 2 + ks)))
-                matmul(self.cb, la_slot, lb_slot, init=kc == 0 and ks == 0)
-        mem_copy(z_gm[0:self.rows, None], self.cz)
-        mem_copy(beta_gm[0:self.rows, None], self.cb)
-        cube_sync_all()
+        for actual, expected in zip(tensor.shape, shape):
+            if expected is not None:
+                InputValidation.require(
+                    actual == expected, f"{name} must have shape {shape_label}"
+                )
+        label = {
+            torch.float16: "FP16",
+            torch.float32: "FP32",
+            torch.bfloat16: "BF16",
+            torch.int32: "int32",
+            torch.int64: "int64",
+        }[dtype]
+        if name == "hidden_states":
+            InputValidation.require(
+                tensor.dtype == torch.bfloat16 and tensor.is_contiguous(),
+                "hidden_states must be contiguous BF16",
+            )
+        InputValidation.require(
+            tensor.dtype == dtype, f"{name} must have dtype {label}"
+        )
+        InputValidation.require(
+            tensor.layout == torch.strided, f"{name} must have strided layout"
+        )
+        InputValidation.require(tensor.is_contiguous(), f"{name} must be contiguous")
+        InputValidation.require(
+            tensor.device == device, f"{name} must share the input device"
+        )
+        InputValidation.require(
+            not tensor.is_neg() and (not tensor.is_conj()),
+            f"{name} must resolve negative/conjugate view bits",
+        )
+
+    @staticmethod
+    def runtime_scalars(scale, lower_bound, rms_norm_eps):
+        values = []
+        for name, value in (
+            ("scale", scale),
+            ("lower_bound", lower_bound),
+            ("rms_norm_eps", rms_norm_eps),
+        ):
+            value = float(value)
+            narrowed = ctypes.c_float(value).value
+            InputValidation.require(
+                math.isfinite(value) and math.isfinite(narrowed),
+                f"{name} must be finite and representable as FP32",
+            )
+            values.append(narrowed)
+        InputValidation.require(
+            -5.0 <= float(lower_bound) <= 0.0, "lower_bound must be in [-5,0]"
+        )
+        InputValidation.require(
+            float(rms_norm_eps) > 0.0 and values[2] > 0.0,
+            "rms_norm_eps must be finite and positive after FP32 conversion",
+        )
+        InputValidation.require(
+            values[2] >= float.fromhex("0x1.0p-126"),
+            "rms_norm_eps must be a normal FP32 value (>= 2**-126); subnormal epsilon is flushed to zero",
+        )
+        return tuple(values)
+
+    @staticmethod
+    def state_pool_metadata(name, tensor, shape, dtype, device):
+        if not isinstance(tensor, torch.Tensor):
+            raise TypeError(f"{name} must be a torch.Tensor")
+        shape_label = (
+            "[block_num,L,3*P]"
+            if name == "conv_state"
+            else "[block_num,N,D,D]"
+            if name == "checkpoint_state"
+            else "[block_num,N,S,D]"
+        )
+        InputValidation.require(
+            tensor.ndim == len(shape), f"{name} must have shape {shape_label}"
+        )
+        for actual, expected in zip(tensor.shape, shape):
+            if expected is not None:
+                InputValidation.require(
+                    actual == expected, f"{name} must have shape {shape_label}"
+                )
+        InputValidation.require(
+            tensor.dtype == dtype, f"{name} must have dtype {dtype}"
+        )
+        InputValidation.require(
+            tensor.layout == torch.strided and tensor.device == device,
+            f"{name} must share input device and strided layout",
+        )
+        expected = 1
+        for axis in range(tensor.ndim - 1, 0, -1):
+            InputValidation.require(
+                tensor.stride(axis) == expected,
+                f"{name} only axis 0 may be non-contiguous",
+            )
+            expected = expected * tensor.shape[axis]
+        InputValidation.require(
+            tensor.stride(0) >= expected,
+            f"{name} axis-0 stride must not overlap paged-state blocks",
+        )
+        InputValidation.require(
+            not tensor.is_neg() and (not tensor.is_conj()),
+            f"{name} must resolve view bits",
+        )
+
+    @staticmethod
+    def _records(a, batch, heads, device):
+        u = a["replay_u"]
+        if not isinstance(u, torch.Tensor):
+            raise TypeError("replay_u must be a torch.Tensor")
+        InputValidation.require(u.ndim == 4, "replay_u must be [block_num,N,S,D]")
+        blocks = a["checkpoint_state"].shape[0]
+        InputValidation.require(
+            (blocks > 0) & (batch > 0) & (batch <= blocks),
+            "batch must be in [1,block_num]",
+        )
+        capacity = u.shape[2]
+        InputValidation.require(capacity > 0, "record S capacity must be positive")
+        for name, dtype in (
+            ("replay_u", torch.float32),
+            ("replay_k", torch.float16),
+            ("replay_decay", torch.float32),
+        ):
+            InputValidation.state_pool_metadata(
+                name, a[name], (blocks, heads, capacity, D), dtype, device
+            )
+        return capacity
+
+    @staticmethod
+    def mega_metadata(a):
+        x = a["hidden_states"]
+        if not isinstance(x, torch.Tensor):
+            raise TypeError("hidden_states must be a torch.Tensor")
+        InputValidation.require(x.ndim in (2, 3), "hidden_states must be BSH or TH")
+        cu = a.get("cu_seqlens")
+        if x.ndim == 3:
+            InputValidation.require(cu is None, "cu_seqlens must be None for BSH input")
+            batch, sequence, width = x.shape
+            InputValidation.require(sequence > 0, "BSH seq_len must be positive")
+        else:
+            if not isinstance(cu, torch.Tensor):
+                raise TypeError("cu_seqlens is required for TH input")
+            InputValidation.require(
+                cu.ndim == 1 and cu.shape[0] >= 2, "cu_seqlens must be [B+1]"
+            )
+            InputValidation.require(
+                cu.dtype in (torch.int32, torch.int64),
+                "cu_seqlens must be int32 or int64",
+            )
+            InputValidation.tensor_metadata(
+                "cu_seqlens", cu, cu.shape, cu.dtype, x.device
+            )
+            batch = cu.shape[0] - 1
+            width = x.shape[1]
+            InputValidation.require(x.shape[0] > 0, "TH token count must be positive")
+        InputValidation.require(width == HIDDEN_SIZE, "hidden_states requires H=7168")
+        InputValidation.tensor_metadata(
+            "hidden_states", x, x.shape, torch.bfloat16, x.device
+        )
+        beta = a["beta_projection_weight"]
+        if not isinstance(beta, torch.Tensor):
+            raise TypeError("beta_projection_weight must be a torch.Tensor")
+        InputValidation.require(beta.ndim == 2, "beta_projection_weight must be [N,H]")
+        n = beta.shape[0]
+        InputValidation.require(
+            (n == TP16_HEADS) | (n == TP8_HEADS) | (n == TP4_HEADS),
+            "TP4/8/16 requires N=24/12/6",
+        )
+        p = n * D
+        device = x.device
+        entries = [
+            ("qkv_projection_weight", (3 * p, HIDDEN_SIZE), torch.bfloat16),
+            ("decay_projection_a_weight", (D, HIDDEN_SIZE), torch.bfloat16),
+            ("decay_projection_b_weight", (p, D), torch.bfloat16),
+            ("beta_projection_weight", (n, HIDDEN_SIZE), torch.bfloat16),
+            ("output_gate_projection_weight", (p, HIDDEN_SIZE), torch.bfloat16),
+            ("output_norm_weight", (D,), torch.float32),
+            ("output_projection_weight", (HIDDEN_SIZE, p), torch.bfloat16),
+            ("state_indices", (batch,), torch.int32),
+            ("conv_num_accepted_tokens", (batch,), torch.int32),
+            ("A_log", (n,), torch.float32),
+            ("dt_bias", (n, D), torch.float32),
+        ]
+        for name, shape, dt in entries:
+            InputValidation.tensor_metadata(name, a[name], shape, dt, device)
+        conv = a["conv_state"]
+        checkpoint = a["checkpoint_state"]
+        InputValidation.state_pool_metadata(
+            "conv_state", conv, (None, None, 3 * p), torch.bfloat16, device
+        )
+        InputValidation.state_pool_metadata(
+            "checkpoint_state",
+            checkpoint,
+            (conv.shape[0], n, D, D),
+            torch.float32,
+            device,
+        )
+        InputValidation.require(
+            conv.shape[0] > 0 and conv.shape[1] >= 3,
+            "paged-state block count must be positive and conv L >= 3",
+        )
+        capacity = InputValidation._records(a, batch, n, device)
+        if x.ndim == 3:
+            InputValidation.require(
+                capacity >= x.shape[1], "replay S capacity must cover BSH seq_len"
+            )
+            InputValidation.require(
+                conv.shape[1] >= x.shape[1] + 2, "conv_state L must be >= seq_len+2"
+            )
+        w = a["conv1d_weight"]
+        if not isinstance(w, torch.Tensor):
+            raise TypeError("conv1d_weight must be a torch.Tensor")
+        InputValidation.require(
+            tuple(w.shape)
+            in ((CONV_KERNEL, 3 * p), (3, n, CONV_KERNEL, D), (3, CONV_KERNEL, D)),
+            "invalid conv1d_weight shape",
+        )
+        InputValidation.tensor_metadata(
+            "conv1d_weight", w, w.shape, torch.bfloat16, device
+        )
+        InputValidation.runtime_scalars(a["scale"], a["lower_bound"], a["rms_norm_eps"])
+        for name in ("conv_state", "replay_u", "replay_k", "replay_decay"):
+            InputValidation.require(
+                not a[name].requires_grad,
+                f"{name} is an inference-only writable buffer",
+            )
+        return {
+            name: value for name, value in a.items() if isinstance(value, torch.Tensor)
+        }
+
+    @staticmethod
+    def _bounded(values, low, high, name, message=None):
+        if any((v < low or v > high for v in values)):
+            raise ValueError(message or f"{name} values must be in [{low},{high}]")
+
+    @staticmethod
+    def validate_mega_values(a):
+        batch = a["state_indices"].numel()
+        x = a["hidden_states"]
+        if x.ndim == 3:
+            prefix = [i * x.shape[1] for i in range(batch + 1)]
+        else:
+            prefix = a["cu_seqlens"].detach().cpu().tolist()
+        if torch.npu.is_current_stream_capturing():
+            return prefix
+        tokens = x.numel() // HIDDEN_SIZE
+        InputValidation.require(
+            prefix[0] == 0 and prefix[-1] == tokens,
+            "cu_seqlens must start at 0 and end at T",
+        )
+        InputValidation.require(
+            all((x < y for x, y in zip(prefix, prefix[1:]))),
+            "cu_seqlens must be strictly increasing; every sequence length must be positive",
+        )
+        InputValidation.require(
+            tokens < 2**31, "token count exceeds int32 cu_seqlens capacity"
+        )
+        lengths = [y - x for x, y in zip(prefix, prefix[1:])]
+        InputValidation.require(
+            max(lengths) <= a["replay_u"].shape[2],
+            "replay S capacity must cover every sequence length",
+        )
+        InputValidation.require(
+            max(lengths) + 2 <= a["conv_state"].shape[1],
+            "conv_state L must cover every sequence length + 2",
+        )
+        indices = a["state_indices"].detach().cpu().tolist()
+        InputValidation._bounded(
+            indices, 0, a["conv_state"].shape[0] - 1, "state_indices"
+        )
+        InputValidation.require(
+            len(indices) == len(set(indices)),
+            "state_indices must be distinct across batch, including slot 0",
+        )
+        counts = a["conv_num_accepted_tokens"].detach().cpu().tolist()
+        InputValidation._bounded(
+            counts, 0, a["conv_state"].shape[1] - 2, "conv_num_accepted_tokens"
+        )
+        return prefix
+
+    @staticmethod
+    def validate_aliases(tensors, writable):
+        spans = {}
+        for name, tensor in tensors.items():
+            InputValidation.require(
+                tensor.device.type != "meta",
+                "physical alias validation requires real tensors",
+            )
+            start = tensor.data_ptr()
+            size = tensor.numel() * tensor.element_size()
+            if name in (
+                "conv_state",
+                "checkpoint_state",
+                "replay_u",
+                "replay_k",
+                "replay_decay",
+            ):
+                width = tensor[0].numel() * tensor.element_size()
+                ranges = [
+                    (
+                        start + i * tensor.stride(0) * tensor.element_size(),
+                        start + i * tensor.stride(0) * tensor.element_size() + width,
+                    )
+                    for i in range(tensor.shape[0])
+                ]
+            else:
+                if tensor.device.type in ("npu", "privateuseone"):
+                    import torch_npu
+
+                    if torch_npu.get_npu_format(tensor) == 29:
+                        size = (
+                            int(torch_npu.get_storage_size(tensor))
+                            * tensor.element_size()
+                        )
+                ranges = [(start, start + size)]
+            spans[name] = ranges
+        names = tuple(tensors)
+        for i, left in enumerate(names):
+            for right in names[i + 1 :]:
+                if left not in writable and right not in writable:
+                    continue
+                if tensors[left].device != tensors[right].device:
+                    continue
+                x = y = 0
+                a = spans[left]
+                b = spans[right]
+                while x < len(a) and y < len(b):
+                    if a[x][0] < b[y][1] and b[y][0] < a[x][1]:
+                        raise ValueError(f"writable buffer overlap: {left} and {right}")
+                    if a[x][1] <= b[y][0]:
+                        x += 1
+                    else:
+                        y += 1
+
+    @staticmethod
+    def real_boundary(tensors, writable):
+        for name, tensor in tensors.items():
+            InputValidation.require(
+                tensor.device.type in ("npu", "privateuseone"),
+                f"{name} requires NPU inputs",
+            )
+            InputValidation.require(
+                type(tensor) is torch.Tensor,
+                f"{name} must be an exact Tensor; detach Parameter inputs",
+            )
+        InputValidation.validate_aliases(tensors, writable)
+        import torch_npu
+
+        nz_weights = (
+            "qkv_projection_weight",
+            "decay_projection_a_weight",
+            "decay_projection_b_weight",
+            "beta_projection_weight",
+            "output_gate_projection_weight",
+            "output_projection_weight",
+        )
+        for name, tensor in tensors.items():
+            if name not in nz_weights:
+                InputValidation.require(
+                    torch_npu.get_npu_format(tensor) in (0, 2),
+                    f"{name} requires ND storage; paged-state addressing does not support blocked physical formats",
+                )
+        if "hidden_states" in tensors:
+            for name in (
+                "qkv_projection_weight",
+                "decay_projection_a_weight",
+                "decay_projection_b_weight",
+                "beta_projection_weight",
+                "output_gate_projection_weight",
+                "output_projection_weight",
+            ):
+                InputValidation.require(
+                    torch_npu.get_npu_format(tensors[name]) == 29,
+                    f"{name} requires BF16 FRACTAL_NZ storage",
+                )
+            return resolve_core_count(tensors["hidden_states"])
 
 
-class _GridSchedule:
-    """Compile-time branch configuration with one shared KDA wave schedule."""
+class KDAExecutionGuard:
+    """负责调用同步和异步资源生命周期保护。"""
 
-    def __init__(
+    @staticmethod
+    def serialized(function):
+        @functools.wraps(function)
+        def checked(*args, **kwargs):
+            ref = (
+                args[0]
+                if args
+                else kwargs.get("hidden_states", kwargs.get("checkpoint_state"))
+            )
+            if not isinstance(ref, torch.Tensor) or ref.device.type not in (
+                "npu",
+                "privateuseone",
+            ):
+                return function(*args, **kwargs)
+            device = ref.device
+            with torch.npu.device(device):
+                if torch.npu.is_current_stream_capturing():
+                    with _call_lock:
+                        return function(*args, **kwargs)
+                with _call_lock:
+                    if _pending["event"] is not None:
+                        _pending["event"].synchronize()
+                        _pending["event"] = None
+                        _pending["keep"] = None
+                    result = None
+                    try:
+                        result = function(*args, **kwargs)
+                        return result
+                    finally:
+                        event = torch.npu.Event()
+                        event.record(torch.npu.current_stream(device))
+                        _pending["event"] = event
+                        _pending["keep"] = (args, kwargs, result)
+
+        return checked
+
+
+def resolve_core_count(ref):
+    """查询硬件和当前流的有效配额，校验后返回支持的最大 AIC 核数。"""
+    if ref.device.type not in ("npu", "privateuseone"):
+        raise ValueError("mega_recurrent_kda requires an NPU tensor")
+    hardware = torch.npu.get_device_properties(ref.device)
+    info = cannbotdsl.get_platform_info(stream=torch.npu.current_stream(ref.device))
+    cube_count = min(int(hardware.cube_core_num), int(info.cube_core_num))
+    vector_count = min(int(hardware.vector_core_num), int(info.vector_core_num))
+    effective_quota = min(cube_count, vector_count // 2)
+    InputValidation.require(
+        effective_quota >= max(VALID_CORES) or effective_quota in VALID_CORES,
+        f"AIC quota {effective_quota} is not supported; use 8/16/24/28/32 or a full stream with at least 32 AIC and 64 AIV",
+    )
+    return max(core for core in VALID_CORES if core <= effective_quota)
+
+
+class _MainGeometry(NamedTuple):
+    cost: int
+    jobs: int
+    rounds: int
+    input_bytes: int
+    weight_bytes: int
+    padded_rows: int
+
+
+def main_geometry(rows, heads, cores, tile_m, tile_n):
+    """平衡各核的行计算量与重复投影准备开销。
+
+    每个波次按一个 head 宽度计入准备开销。N384 要求完整的行分块；
+    N256 对最后一个行分块使用掩码。字节数表示逻辑搬运量的估计值。
+    """
+    groups = (rows + tile_m - 1) // tile_m
+    jobs = groups * (4 * heads * D // tile_n)
+    rounds = (jobs + cores - 1) // cores
+    a_bytes = jobs * tile_m * HIDDEN_SIZE * 2
+    w_bytes = groups * 4 * heads * D * HIDDEN_SIZE * 2
+    cost = rounds * (tile_m + D)
+    if tile_n == 384 and rows % tile_m:
+        cost = 1 << 60
+    return _MainGeometry(cost, jobs, rounds, a_bytes, w_bytes, groups * tile_m)
+
+
+def _tile_rows(rows, tile_rows, ragged):
+    return (
+        min(tile_rows, 1 << (rows - 1).bit_length())
+        if ragged
+        else math.gcd(rows, tile_rows)
+    )
+
+
+class _S4StagedPipeline:
+    """三个阶段对象由各 TP 创建，统一维护阶段间的同步边界。"""
+
+    @jit
+    def execute(
         self,
-        block_num: int,
-        hidden_size: int,
-        num_heads: int):
+        out,
+        q,
+        k,
+        v,
+        decay,
+        gate,
+        beta,
+        fa,
+        norm,
+        x,
+        wqkv,
+        wa,
+        wb,
+        wbeta,
+        wz,
+        gamma,
+        wo,
+        alog,
+        bias,
+        initial,
+        replay_u,
+        replay_k,
+        replay_decay,
+        conv,
+        indices,
+        accepted,
+        wc,
+        scale,
+        lower,
+        eps,
+        rows,
+        width,
+        policy,
+        output_rows,
+    ):
+        self.main.main(
+            q, k, v, gate, x, wqkv, wz, conv, indices, accepted, wc, rows, width, policy
+        )
+        global_sync_all()
+        onchip_rewind(reset_sync_id=True)
+        self.auxiliary.execute(decay, beta, fa, x, wa, wb, wbeta, output_rows, policy)
+        self.backend.execute(
+            out,
+            q,
+            k,
+            v,
+            decay,
+            gate,
+            beta,
+            gamma,
+            wo,
+            alog,
+            bias,
+            initial,
+            replay_u,
+            replay_k,
+            replay_decay,
+            scale,
+            lower,
+            eps,
+            output_rows,
+            policy,
+        )
+
+
+TP4_SHORT_SCHEDULE = {
+    "main_rows": 32,
+    "main_width": 384,
+    "auxiliary_rows": 32,
+    "main_weight_l2_cache_ctl": 4,
+    "state_store_l2_cache_ctl": 0,
+    "state_load_l2_cache_ctl": 2,
+    "fa_width": 64,
+}
+
+
+TP4_LARGE_SCHEDULE = {
+    "ragged_output": True,
+    "ragged_main": True,
+    "main_rows": 256,
+    "auxiliary_rows": 0,
+    "main_width": 256,
+    "split_fb": True,
+    "publish_rows": 128,
+    "resident_output_weight": True,
+    "state_update_unroll": 2,
+    "main_weight_l2_cache_ctl": 0,
+    "state_store_l2_cache_ctl": 4,
+    "state_load_l2_cache_ctl": 2,
+}
+
+
+class TP4GridSchedule(TP4GridScheduleFrontendOperations):
+    """使用编译期分支配置，并共用一套 KDA 波次调度。"""
+
+    def __init__(self, block_num: int, hidden_size: int, num_heads: int):
         self.state_store_l2_cache_ctl = 0
         self.block_num = block_num
         self.hidden_size = hidden_size
         self.num_heads = num_heads
+        self.projection_groups = 8
         self.batch_tile = BATCH_TILE
         self.qkv_block_count = 3 * num_heads
         self.output_gate_block_count = num_heads
@@ -1137,8 +881,3526 @@ class _GridSchedule:
         self.output_tile_width = {8: 128, 16: 256, 24: 256, 28: 256, 32: 256}[block_num]
         activation_channel_bytes = 2 * 64 * OPROJ_KC * 2
         self.output_weight_resident = (
-            self.output_tile_width * self.output_tiles_per_core * num_heads * TILE * 2 + activation_channel_bytes
-            <= cannbotdsl.get_mem_size("l1"))
+            self.output_tile_width * self.output_tiles_per_core * num_heads * TILE * 2
+            + activation_channel_bytes
+            <= cannbotdsl.get_mem_size("l1")
+        )
+        self.projection_input_l2_cache_ctl = 0
+        self.projection_weight_l2_cache_ctl = 4
+        self.batch_groups: object
+        self.seq_len: object
+        self.row_count: object
+        self.projection_row_block: object
+        self.recurrent_wave_rows: object
+
+
+class TP4TPSchedule(
+    TPScheduleFrontendOperations, TP4TPScheduleBackendOperations, TP4GridSchedule
+):
+    def __init__(self, num_heads, rows, auxiliary_rows, publish_rows, config):
+        super().__init__(32, HIDDEN_SIZE, num_heads)
+        self.main_rows = rows
+        self.auxiliary_rows = auxiliary_rows
+        self.publish_rows = publish_rows
+        self.config = config
+        self.seq_len = S8_SEQUENCE_LENGTH
+
+
+class TP4ProjectionScheduleOperations(
+    ProjectionScheduleOperationsFrontendOperations, TP4TPSchedule
+):
+    """为两种投影调度共用构造逻辑和 Conv 预取操作。"""
+
+    def __init__(self, heads, rows, width):
+        config = Schedule(
+            main_rows=rows,
+            main_width=width,
+            ragged_main=width == 256,
+            split_fb=True,
+            ragged_output=True,
+        )
+        super().__init__(heads, rows, 32, 64, config)
+        self.heads = heads
+        self.projection_groups = 4 * heads // 3
+        self.row_capacity = rows
+
+
+class TP4AuxiliarySchedule(TP4AuxiliaryScheduleFrontendOperations, TP4TPSchedule):
+    def __init__(self, heads, rows):
+        super().__init__(heads, 32, rows, 64, Schedule(split_fb=True))
+        self.heads = heads
+
+
+class TP4S4ProjectionSchedule(
+    S4ProjectionScheduleFrontendOperations, TP4ProjectionScheduleOperations
+):
+    """仅处理有效行的 S4 QKV/Conv 融合，复用当前 PA 数据面板消费逻辑。"""
+
+    def __init__(self, heads):
+        super().__init__(heads, 128, 384)
+        self.seq_len = S4_SEQUENCE_LENGTH
+
+
+class TP4S4MultiCoreSchedule(_S4StagedPipeline):
+    """通用 S4 融合，支持 TP4/8/16 和 8/16/24/28/32 AIC。"""
+
+    def __init__(self, heads):
+        self.main = TP4S4ProjectionSchedule(heads)
+        self.auxiliary = TP4S4AuxiliarySchedule(heads)
+        self.backend = TP4S4BackendSchedule(heads)
+
+
+class TP4PhaseSchedule(TP4TPSchedule):
+    """保留经过实测的输出分块几何，并共用运行时缓存控制。"""
+
+    @jit
+    def _configure_recurrent(self, _recurrent_stage):
+        _recurrent_stage.store_policy = self.store_policy
+        _recurrent_stage.load_policy = self.load_policy
+
+
+class _TP4S8Core32Stage:
+    def __init__(self):
+        self.head_backend = TP4HeadPanelBackend(TP4_HEADS)
+        self.main384 = Core32ProjectionSchedule(TP4_HEADS, 128, 384)
+        self.main256 = Core32ProjectionSchedule(TP4_HEADS, 256, 256)
+        self.aux0 = TP4TPSchedule(TP4_HEADS, 128, 32, 64, Schedule(fa_width=64))
+        self.aux1 = TP4TPSchedule(TP4_HEADS, 128, 32, 64, Schedule(fa_width=128))
+        self.back0 = TP4PhaseSchedule(
+            TP4_HEADS, 128, 64, 32, Schedule(publish_rows=32, ragged_output=False)
+        )
+        self.back1 = TP4PhaseSchedule(
+            TP4_HEADS, 128, 64, 64, Schedule(publish_rows=64, ragged_output=False)
+        )
+        self.back2 = TP4PhaseSchedule(
+            TP4_HEADS, 128, 64, 128, Schedule(publish_rows=128, ragged_output=True)
+        )
+        self.back3 = TP4PhaseSchedule(
+            TP4_HEADS, 128, 64, 256, Schedule(publish_rows=256, ragged_output=True)
+        )
+
+    @jit
+    def execute(
+        self,
+        out,
+        q,
+        k,
+        v,
+        decay,
+        gate,
+        beta,
+        fa,
+        norm,
+        x,
+        wqkv,
+        wa,
+        wb,
+        wbeta,
+        wz,
+        gamma,
+        wo,
+        alog,
+        bias,
+        initial,
+        replay_u,
+        replay_k,
+        replay_decay,
+        conv,
+        state_indices,
+        conv_accepted,
+        wc,
+        scale,
+        lower,
+        eps,
+    ):
+        mb = replay_decay.indices.shape[0] // 4
+        main_policy = dtypes.int32(4)
+        if mb > 8:
+            main_policy = dtypes.int32(0)
+        store_policy = dtypes.int32(0)
+        if mb >= 4:
+            store_policy = dtypes.int32(4)
+        load_policy = dtypes.int32(2)
+        main_rows = 256
+        if mb == 1:
+            main_rows = 32
+        elif mb == 2:
+            main_rows = 64
+        elif mb == 3 or mb == 4:
+            main_rows = 128
+        use384 = mb == 1 or mb == 2 or mb == 4
+        # 对齐的 M128/N384 分块能够形成完整的投影波次。
+        if mb >= 8 and out.shape[0] % 128 == 0:
+            main_rows = 128
+            use384 = True
+        self.main256.main_policy = main_policy
+        self.main256.main(
+            q,
+            k,
+            v,
+            gate,
+            x,
+            wqkv,
+            wz,
+            conv,
+            state_indices,
+            conv_accepted,
+            wc,
+            TP4_HEADS,
+            main_rows,
+            not use384,
+        )
+        self.main384.main_policy = main_policy
+        self.main384.main(
+            q,
+            k,
+            v,
+            gate,
+            x,
+            wqkv,
+            wz,
+            conv,
+            state_indices,
+            conv_accepted,
+            wc,
+            TP4_HEADS,
+            main_rows,
+            use384,
+        )
+        cube_sync_all()
+        onchip_rewind(reset_sync_id=True)
+        if mb == 1:
+            self.aux0.frontend_auxiliary(decay, beta, fa, x, wa, wb, wbeta)
+        else:
+            self.aux1.frontend_auxiliary(decay, beta, fa, x, wa, wb, wbeta)
+        global_sync_all()
+        onchip_rewind(reset_sync_id=True)
+        self.aux0.frontend_fb(decay, fa, wb)
+        global_sync_all()
+        onchip_rewind(reset_sync_id=True)
+        if mb == 1:
+            self.head_backend.backend(
+                out,
+                q,
+                k,
+                v,
+                decay,
+                gate,
+                beta,
+                gamma,
+                wo,
+                alog,
+                bias,
+                initial,
+                replay_u,
+                replay_k,
+                replay_decay,
+                scale,
+                lower,
+                eps,
+            )
+        elif mb == 2 or mb == 4:
+            self.back1.store_policy = store_policy
+            self.back1.load_policy = load_policy
+            self.back1.backend(
+                out,
+                q,
+                k,
+                v,
+                decay,
+                gate,
+                beta,
+                gamma,
+                wo,
+                alog,
+                bias,
+                initial,
+                replay_u,
+                replay_k,
+                replay_decay,
+                scale,
+                lower,
+                eps,
+            )
+        elif mb == 3 or mb >= 16:
+            self.back2.store_policy = store_policy
+            self.back2.load_policy = load_policy
+            self.back2.backend(
+                out,
+                q,
+                k,
+                v,
+                decay,
+                gate,
+                beta,
+                gamma,
+                wo,
+                alog,
+                bias,
+                initial,
+                replay_u,
+                replay_k,
+                replay_decay,
+                scale,
+                lower,
+                eps,
+            )
+        else:
+            self.back3.store_policy = store_policy
+            self.back3.load_policy = load_policy
+            self.back3.backend(
+                out,
+                q,
+                k,
+                v,
+                decay,
+                gate,
+                beta,
+                gamma,
+                wo,
+                alog,
+                bias,
+                initial,
+                replay_u,
+                replay_k,
+                replay_decay,
+                scale,
+                lower,
+                eps,
+            )
+
+
+class TP4DelayedProjectionSchedule:
+    """对完整的大行块重叠执行门控投影与递推。"""
+
+    def __init__(self, heads):
+        self.heads = heads
+        self.zrows = 128
+        self.publish_rows = 128
+        self.window_rows = self.publish_rows
+        self.minimum_rows = 4 * self.publish_rows
+        self.main = Core32ProjectionSchedule(heads, 128, 384)
+        self.main.projection_groups = heads
+        self.aux = TP4TPSchedule(heads, 128, 32, 128, Schedule(publish_rows=128))
+
+    @jit
+    def execute(
+        self,
+        out,
+        q,
+        k,
+        v,
+        decay,
+        gate,
+        beta,
+        fa,
+        norm,
+        x,
+        wqkv,
+        wa,
+        wb,
+        wbeta,
+        wz,
+        gamma,
+        wo,
+        alog,
+        bias,
+        initial,
+        replay_u,
+        replay_k,
+        replay_decay,
+        conv,
+        state_indices,
+        conv_accepted,
+        wc,
+        scale,
+        lower,
+        eps,
+        plan_rows,
+        plan_width,
+        plan_policy,
+    ):
+        self.main.main_policy = dtypes.int32(0)
+        self.main.main(
+            q,
+            k,
+            v,
+            gate,
+            x,
+            wqkv,
+            wz,
+            conv,
+            state_indices,
+            conv_accepted,
+            wc,
+            self.heads,
+            128,
+        )
+        cube_sync_all()
+        onchip_rewind(reset_sync_id=True)
+        self.aux.frontend_auxiliary(decay, beta, fa, x, wa, wb, wbeta)
+        global_sync_all()
+        onchip_rewind(reset_sync_id=True)
+        self.aux.frontend_fb(decay, fa, wb)
+        global_sync_all()
+        onchip_rewind(reset_sync_id=True)
+        context = _RawRecurrentContext(
+            q,
+            k,
+            v,
+            initial.accurate_decay,
+            beta,
+            initial,
+            replay_u,
+            replay_k,
+            replay_decay,
+            scale,
+            lower,
+        )
+        for chunk in range(x.shape[0] // self.publish_rows):
+            config = Schedule(state_load_l2_cache_ctl=2)
+            recurrent = RecurrentStage(128, self.heads, config, state_buffer_depth=1)
+            output_gate = OutputGateStage()
+            raw = Buffer(
+                MemLoc.UB,
+                dtypes.float32,
+                make_layout(
+                    (ceil_div(self.publish_rows // 8 * self.heads, 64) * 8, 128)
+                ),
+            )
+            gate_context = _RawGateContext(q, gate, raw, eps)
+            zstage = _DelayedGateProjection(self.zrows, 0, 0, row_capacity=self.zrows)
+            recurrent.load_gate_params(alog, bias)
+            output_gate.load_gamma(gamma)
+            for ztask in range(
+                get_block_idx(),
+                self.publish_rows // self.zrows * self.heads,
+                get_block_num(),
+            ):
+                head = ztask // (self.publish_rows // self.zrows)
+                rowpart = ztask % (self.publish_rows // self.zrows)
+                zstage.project_to_gm(
+                    tile_slice(
+                        x,
+                        (self.zrows, HIDDEN_SIZE),
+                        (chunk * (self.publish_rows // self.zrows) + rowpart, 0),
+                    ),
+                    wz,
+                    tile_slice(
+                        gate,
+                        (self.zrows, 128),
+                        (chunk * (self.publish_rows // self.zrows) + rowpart, head),
+                    ),
+                    head,
+                    56,
+                )
+            first = get_block_idx() * 2 + get_subblock_id()
+            for item in range(first, self.publish_rows // 8 * self.heads, 64):
+                batch = chunk * (self.publish_rows // 8) + item % (
+                    self.publish_rows // 8
+                )
+                head = item // (self.publish_rows // 8)
+                _run_raw_recurrent_item(recurrent, context, batch, head, raw, item)
+            cube_sync_block_arrive(PIPE.FIXPIPE, 0, mode=0)
+            cube_sync_block_wait(PIPE.S, 0, mode=0)
+            cube_sync_block_arrive(PIPE.FIXPIPE, 1, mode=2)
+            vec_sync_block_wait(PIPE.S, 1, mode=2)
+            for item in range(first, self.publish_rows // 8 * self.heads, 64):
+                batch = chunk * (self.publish_rows // 8) + item % (
+                    self.publish_rows // 8
+                )
+                head = item // (self.publish_rows // 8)
+                _store_raw_gated_item(output_gate, gate_context, batch, head, item)
+            publish_vector_grid_to_cube(3, 4, ack_flag=5)
+            onchip_rewind(reset_sync_id=True)
+            output = OutputProjectionStage(
+                256,
+                self.publish_rows,
+                kc=256,
+                tiles_per_core=1,
+                resident_weight=False,
+                row_capacity=self.publish_rows,
+                num_heads=self.heads,
+            )
+            output.project(out, q, wo, self.heads, chunk)
+            cube_sync_all()
+            vec_sync_all()
+            onchip_rewind(reset_sync_id=True)
+
+
+class S4GateProjection(_DelayedGateProjection):
+    """仅计算逻辑有效 M48/M64 行的 Z 投影，不分配仅用于类型转换的 Vector 缓冲区。"""
+
+    matmul_hidden = S4ProjectionStage.matmul_hidden
+    accumulate_panel = S4ProjectionStage.accumulate_panel
+
+
+class S4DelayedGateSchedule:
+    """TP4 模型 batch 为 3/4、使用 32 AIC 时，在 UB 中重叠执行 Z 投影与递推。"""
+
+    def __init__(self):
+        self.main = TP4S4ProjectionSchedule(TP4_HEADS)
+        self.auxiliary = TP4S4AuxiliarySchedule(TP4_HEADS)
+        self.backend = TP4S4BackendSchedule(TP4_HEADS)
+
+    @jit
+    def execute(
+        self,
+        out,
+        q,
+        k,
+        v,
+        decay,
+        gate,
+        beta,
+        fa,
+        norm,
+        x,
+        wqkv,
+        wa,
+        wb,
+        wbeta,
+        wz,
+        gamma,
+        wo,
+        alog,
+        bias,
+        initial,
+        replay_u,
+        replay_k,
+        replay_decay,
+        conv,
+        indices,
+        accepted,
+        wc,
+        scale,
+        lower,
+        eps,
+        rows,
+        width,
+        policy,
+        output_rows,
+    ):
+        self.main.main(
+            q,
+            k,
+            v,
+            gate,
+            x,
+            wqkv,
+            wz,
+            conv,
+            indices,
+            accepted,
+            wc,
+            rows,
+            width,
+            policy,
+            qkv_only=True,
+        )
+        global_sync_all()
+        onchip_rewind(reset_sync_id=True)
+        self.auxiliary.execute(decay, beta, fa, x, wa, wb, wbeta, output_rows, policy)
+        # Cube 生成 Z 时，配对 Vector 引擎保留 KDA 的 FP32 原始输出。
+        # B12/B16、N24 时，每个 AIV 最多处理六个任务，即 24 行。
+        projection = S4GateProjection(x.shape[0], 0, 4, row_capacity=64)
+        for head in range(get_block_idx(), TP4_HEADS, get_block_num()):
+            projection.project_to_gm(
+                x, wz, gate[None, head * 128 : (head + 1) * 128], head, 56
+            )
+        raw = Buffer(
+            MemLoc.UB, dtypes.float32, make_layout((S4_DELAYED_RAW_ROW_COUNT, 128))
+        )
+        recurrent = RecurrentStage(128, TP4_HEADS, Schedule(state_load_l2_cache_ctl=4))
+        output_gate = OutputGateStage()
+        recurrent.load_gate_params(alog, bias)
+        output_gate.load_gamma(gamma)
+        context = _RawRecurrentContext(
+            q,
+            k,
+            v,
+            initial.accurate_decay,
+            beta,
+            initial,
+            replay_u,
+            replay_k,
+            replay_decay,
+            scale,
+            lower,
+        )
+        first = get_block_idx() * 2 + get_subblock_id()
+        for item in range(first, replay_u.indices.shape[0] * TP4_HEADS, 64):
+            run_s4_raw_item(
+                recurrent, context, item // TP4_HEADS, item % TP4_HEADS, raw, item
+            )
+        # 配对 Vector 加载门控数据前，先完成全部 Cube Z 写入。
+        # 这些标志仅用于 S4 分支，不改变 S8 的同步协议。
+        cube_sync_block_arrive(PIPE.FIXPIPE, S4_GATE_PROJECTION_READY_FLAG, mode=0)
+        cube_sync_block_wait(PIPE.S, S4_GATE_PROJECTION_READY_FLAG, mode=0)
+        cube_sync_block_arrive(PIPE.FIXPIPE, 7, mode=2)
+        vec_sync_block_wait(PIPE.S, 7, mode=2)
+        for item in range(first, replay_u.indices.shape[0] * TP4_HEADS, 64):
+            batch = item // TP4_HEADS
+            head = item % TP4_HEADS
+            output_gate.issue_gate(tile_slice(gate, (1, 128), (batch * 4, head)))
+            for token in range(4):
+                if token + 1 < 4:
+                    output_gate.issue_gate(
+                        tile_slice(gate, (1, 128), (batch * 4 + token + 1, head))
+                    )
+                output_gate.apply_and_store(
+                    tile_slice(q, (1, 128), (batch * 4 + token, head)),
+                    eps,
+                    tile_slice(raw, (1, 128), (item // 64 * 4 + token, 0)),
+                )
+        publish_vector_grid_to_cube(3, 4, ack_flag=5)
+        onchip_rewind(reset_sync_id=True)
+        self.backend.project_output(out, q, wo, output_rows, policy)
+        global_sync_all()
+
+
+def _tp4_intermediate_schedule(num_heads, model_batch):
+    rows = model_batch * (MODEL_HEAD_COUNT // num_heads) * S8_SEQUENCE_LENGTH
+    if rows <= 128 and rows & (rows - 1) == 0:
+        options = dict(main_rows=128, main_width=384)
+    else:
+        # 递推工作占主导时，TP8 按较小的数据块发布结果。
+        publish_rows = 256
+        options = dict(
+            main_rows=256,
+            main_width=256,
+            ragged_main=True,
+            ragged_output=True,
+            publish_rows=publish_rows,
+        )
+    physical_rows = _tile_rows(rows, options["main_rows"], options.get("ragged_main"))
+    options["main_weight_l2_cache_ctl"] = 0 if rows > physical_rows else 4
+    options["state_store_l2_cache_ctl"] = 4 if model_batch >= 4 else 0
+    return Schedule(**options)
+
+
+def _tp4_default_schedule(num_heads, model_batch):
+    """根据 TP 和模型 batch 选择分块与缓存策略。"""
+    if num_heads != TP4_HEADS or not 1 <= model_batch <= 32:
+        raise ValueError(f"requires N={TP4_HEADS} and model_batch=1..32")
+    if model_batch > 16:
+        return Schedule(**TP4_LARGE_SCHEDULE)
+    if model_batch in (1, 16):
+        options = TP4_SHORT_SCHEDULE if model_batch == 1 else TP4_LARGE_SCHEDULE
+        return Schedule(**options)
+    return _tp4_intermediate_schedule(num_heads, model_batch)
+
+
+def _tp4_select_main(rows, heads, cores):
+    if heads != TP4_HEADS or cores not in VALID_CORES:
+        raise ValueError("unsupported heads or AIC quota")
+    return min(
+        range(len(MAIN_TEMPLATES)),
+        key=lambda i: main_geometry(rows, heads, cores, *MAIN_TEMPLATES[i]).cost,
+    )
+
+
+def _tp4_core32_geometry(model_batch, heads, rows):
+    config = _tp4_default_schedule(heads, model_batch)
+    aligned = model_batch >= 8 and rows % 128 == 0
+    return dict(
+        main_m=128
+        if aligned
+        else _tile_rows(rows, config.main_rows, config.ragged_main),
+        main_n=384 if aligned else config.main_width,
+        auxiliary_rows=math.gcd(
+            rows,
+            config.auxiliary_rows or (MODEL_HEAD_COUNT // heads) * S8_SEQUENCE_LENGTH,
+        ),
+        publish_rows=_tile_rows(rows, config.publish_rows, config.ragged_output),
+    )
+
+
+def _tp4_core32_plan(model_batch, tp):
+    rows = model_batch * tp * S8_SEQUENCE_LENGTH
+    heads = MODEL_HEAD_COUNT // tp
+    geometry = _tp4_core32_geometry(model_batch, heads, rows)
+    lanes = 64
+    return dict(
+        model_batch=model_batch,
+        tp=tp,
+        cores=32,
+        rows=rows,
+        heads=heads,
+        main_id=-1,
+        **geometry,
+        main_geometry=main_geometry(
+            rows, heads, 32, geometry["main_m"], geometry["main_n"]
+        ),
+        kda_waves=(MODEL_HEAD_COUNT * model_batch + lanes - 1) // lanes,
+        vector_lanes=lanes,
+        output_width=256,
+        output="nb_head_panels" if model_batch == 1 else ("measured32_stream"),
+        mode="specialized32",
+    )
+
+
+def _tp4_output_policy(rows, heads, cores):
+    if rows * heads == 768:
+        return "nb_head_panels"
+    if rows in (32, 64):
+        return "short32" if rows == 32 else "short64"
+    return "stream256_r128"
+
+
+def _tp4_plan(model_batch, tp, cores):
+    if tp != TP4_TP_DEGREE or not 1 <= model_batch <= 32 or cores not in VALID_CORES:
+        raise ValueError("requires TP4, model batch 1..32, AIC 8/16/24/28/32")
+    rows = model_batch * tp * S8_SEQUENCE_LENGTH
+    heads = MODEL_HEAD_COUNT // tp
+    if cores == 32:
+        return _tp4_core32_plan(model_batch, tp)
+    i = _tp4_select_main(rows, heads, cores)
+    m, n = MAIN_TEMPLATES[i]
+    return dict(
+        model_batch=model_batch,
+        tp=tp,
+        cores=cores,
+        rows=rows,
+        heads=heads,
+        main_id=i,
+        main_m=m,
+        main_n=n,
+        main_geometry=main_geometry(rows, heads, cores, m, n),
+        kda_waves=(MODEL_HEAD_COUNT * model_batch + 2 * cores - 1) // (2 * cores),
+        auxiliary_rows=math.gcd(rows, 128),
+        output=_tp4_output_policy(rows, heads, cores),
+        weight_policy=0 if rows > m else 4,
+    )
+
+
+class TP4S8DefaultStage:
+    def __init__(self, heads):
+        self.heads = heads
+        self.main384 = MultiCoreProjectionSchedule(heads, 128, 384)
+        self.main256 = MultiCoreProjectionSchedule(heads, 256, 256)
+        self.aux32 = TP4AuxiliarySchedule(heads, 32)
+        self.aux64 = TP4AuxiliarySchedule(heads, 64)
+        self.aux128 = TP4AuxiliarySchedule(heads, 128)
+        self.backend = TP4BackendSchedule(heads)
+        self.head_backend = TP4HeadPanelBackend(heads)
+        self.fast32 = _TP4S8Core32Stage()
+
+    @jit
+    def execute(
+        self,
+        out,
+        q,
+        k,
+        v,
+        decay,
+        gate,
+        beta,
+        fa,
+        norm,
+        x,
+        wqkv,
+        wa,
+        wb,
+        wbeta,
+        wz,
+        gamma,
+        wo,
+        alog,
+        bias,
+        initial,
+        replay_u,
+        replay_k,
+        replay_decay,
+        conv,
+        state_indices,
+        conv_accepted,
+        wc,
+        scale,
+        lower,
+        eps,
+        plan_rows,
+        plan_width,
+        plan_policy,
+    ):
+        if get_block_num() == 32:
+            self.fast32.execute(
+                out,
+                q,
+                k,
+                v,
+                decay,
+                gate,
+                beta,
+                fa,
+                norm,
+                x,
+                wqkv,
+                wa,
+                wb,
+                wbeta,
+                wz,
+                gamma,
+                wo,
+                alog[0 : self.heads,],
+                bias[0 : self.heads, None],
+                initial,
+                replay_u,
+                replay_k,
+                replay_decay,
+                conv,
+                state_indices,
+                conv_accepted,
+                wc,
+                scale,
+                lower,
+                eps,
+            )
+        else:
+            n = self.heads
+            logical_rows = plan_rows
+            if plan_width == 384:
+                self.main384.main(
+                    q,
+                    k,
+                    v,
+                    gate,
+                    x,
+                    wqkv,
+                    wz,
+                    conv,
+                    state_indices,
+                    conv_accepted,
+                    wc,
+                    n,
+                    logical_rows,
+                    plan_policy,
+                )
+            else:
+                self.main256.main(
+                    q,
+                    k,
+                    v,
+                    gate,
+                    x,
+                    wqkv,
+                    wz,
+                    conv,
+                    state_indices,
+                    conv_accepted,
+                    wc,
+                    n,
+                    logical_rows,
+                    plan_policy,
+                )
+            global_sync_all()
+            onchip_rewind(reset_sync_id=True)
+            if x.shape[0] % 128 == 0:
+                self.aux128.execute(decay, beta, fa, x, wa, wb, wbeta)
+            elif x.shape[0] % 64 == 0:
+                self.aux64.execute(decay, beta, fa, x, wa, wb, wbeta)
+            else:
+                self.aux32.execute(decay, beta, fa, x, wa, wb, wbeta)
+            global_sync_all()
+            onchip_rewind(reset_sync_id=True)
+            if replay_decay.indices.shape[0] * n == MODEL_HEAD_COUNT:
+                self.head_backend.backend(
+                    out,
+                    q,
+                    k,
+                    v,
+                    decay,
+                    gate,
+                    beta,
+                    gamma,
+                    wo,
+                    alog[0:n,],
+                    bias[0:n, None],
+                    initial,
+                    replay_u,
+                    replay_k,
+                    replay_decay,
+                    scale,
+                    lower,
+                    eps,
+                )
+            else:
+                self.backend.backend(
+                    out,
+                    q,
+                    k,
+                    v,
+                    decay,
+                    gate,
+                    beta,
+                    gamma,
+                    wo,
+                    alog,
+                    bias,
+                    initial,
+                    replay_u,
+                    replay_k,
+                    replay_decay,
+                    scale,
+                    lower,
+                    eps,
+                    wbeta,
+                )
+        global_sync_all()
+
+
+class TP4S8Dispatch(TP4S8DefaultStage):
+    def __init__(self, heads):
+        super().__init__(heads)
+        self.delayed = TP4DelayedProjectionSchedule(heads)
+
+    @jit
+    def execute(
+        self,
+        out,
+        q,
+        k,
+        v,
+        decay,
+        gate,
+        beta,
+        fa,
+        norm,
+        x,
+        wqkv,
+        wa,
+        wb,
+        wbeta,
+        wz,
+        gamma,
+        wo,
+        alog,
+        bias,
+        initial,
+        replay_u,
+        replay_k,
+        replay_decay,
+        conv,
+        state_indices,
+        conv_accepted,
+        wc,
+        scale,
+        lower,
+        eps,
+        plan_rows,
+        plan_width,
+        plan_policy,
+        prefer_stream,
+    ):
+        q = q.view((q.shape[0], self.heads * TILE))
+        k = k.view((k.shape[0], self.heads * TILE))
+        v = v.view((v.shape[0], self.heads * TILE))
+        decay = decay.view((decay.shape[0], self.heads * TILE))
+        gate = gate.view((gate.shape[0], self.heads * TILE))
+        beta = beta.view(
+            (beta.shape[0], ((self.heads + BETA_TILE - 1) // BETA_TILE) * BETA_TILE)
+        )
+        alog = alog.view((self.heads,))
+        bias = bias.view((self.heads, TILE))
+        conv = _ConvPool(
+            conv.data,
+            conv.stride0,
+            conv.length,
+            3 * self.heads * TILE,
+            conv.accurate_raw,
+        )
+        wc = wc.view((3, self.heads, CONV_KERNEL, TILE))
+        if (
+            get_block_num() == 32
+            and x.shape[0] % self.delayed.window_rows == 0
+            and (x.shape[0] >= self.delayed.minimum_rows)
+        ):
+            self.delayed.execute(
+                out,
+                q,
+                k,
+                v,
+                decay,
+                gate,
+                beta,
+                fa,
+                norm,
+                x,
+                wqkv,
+                wa,
+                wb,
+                wbeta,
+                wz,
+                gamma,
+                wo,
+                alog,
+                bias,
+                initial,
+                replay_u,
+                replay_k,
+                replay_decay,
+                conv,
+                state_indices,
+                conv_accepted,
+                wc,
+                scale,
+                lower,
+                eps,
+                plan_rows,
+                plan_width,
+                plan_policy,
+            )
+            global_sync_all()
+        else:
+            TP4S8DefaultStage.execute(
+                self,
+                out,
+                q,
+                k,
+                v,
+                decay,
+                gate,
+                beta,
+                fa,
+                norm,
+                x,
+                wqkv,
+                wa,
+                wb,
+                wbeta,
+                wz,
+                gamma,
+                wo,
+                alog,
+                bias,
+                initial,
+                replay_u,
+                replay_k,
+                replay_decay,
+                conv,
+                state_indices,
+                conv_accepted,
+                wc,
+                scale,
+                lower,
+                eps,
+                plan_rows,
+                plan_width,
+                plan_policy,
+            )
+
+
+def _tp4_plan_s4(model_batch, tp, cores):
+    """采用保守的源码调度策略，不依赖实测性能查找表。"""
+    if tp != TP4_TP_DEGREE or not 1 <= model_batch <= 32 or cores not in VALID_CORES:
+        raise ValueError("S4 requires TP4, model batch 1..32, AIC 8/16/24/28/32")
+    total_rows = model_batch * tp * S4_SEQUENCE_LENGTH
+    main_rows = math.gcd(total_rows, 128)
+    width = 384
+    if total_rows >= 512 and total_rows % 256 == 0:
+        main_rows, width = 256, 256
+    template = 0
+    if cores == 32 and model_batch in (3, 4):
+        template = 2
+    return dict(
+        main_rows=main_rows,
+        width=width,
+        policy=4 if total_rows <= 128 else 0,
+        template=template,
+    )
+
+
+class TP4TPOptimizedKernel:
+    """实现单个 TP，为 S8 和 S4 分别缓存编译后的可调用对象。"""
+
+    def __init__(self, sequence):
+        self.sequence = sequence
+        if sequence == S8_SEQUENCE_LENGTH:
+            self.stage = TP4S8Dispatch(TP4_HEADS)
+        else:
+            self.stage = TP4S4MultiCoreSchedule(TP4_HEADS)
+            self.delayed = S4DelayedGateSchedule()
+
+    @kernel(
+        profile=cannbotdsl.ProfileSpec(
+            name="mega_recurrent_kda_tp4",
+            op_type="MegaRecurrentKDA",
+            outputs=("out", "replay_u", "replay_k", "replay_decay"),
+            inouts=("conv",),
+        )
+    )
+    def device(
+        self,
+        out,
+        q,
+        k,
+        v,
+        decay,
+        gate,
+        beta,
+        fa,
+        norm,
+        x,
+        wqkv,
+        wa,
+        wb,
+        wbeta,
+        wz,
+        gamma,
+        wo,
+        alog,
+        bias,
+        checkpoint,
+        conv,
+        indices,
+        accepted,
+        wc,
+        replay_u,
+        replay_k,
+        replay_decay,
+        checkpoint_stride0,
+        conv_stride0,
+        conv_length,
+        u_stride0,
+        k_stride0,
+        decay_stride0,
+        record_s,
+        scale,
+        lower,
+        eps,
+        main_rows,
+        width,
+        policy,
+        selector,
+        accurate_raw,
+        accurate_decay,
+    ):
+        initial = _CheckpointPool(
+            checkpoint, indices, checkpoint_stride0, accurate_decay
+        )
+        conv = _ConvPool(
+            conv, conv_stride0, conv_length, 3 * TP4_HEADS * TILE, accurate_raw
+        )
+        u = ReplayPool(replay_u, indices, u_stride0, TP4_HEADS, record_s)
+        rk = ReplayPool(replay_k, indices, k_stride0, TP4_HEADS, record_s)
+        rd = ReplayPool(replay_decay, indices, decay_stride0, TP4_HEADS, record_s)
+        if const_expr(self.sequence == S8_SEQUENCE_LENGTH):
+            self.stage.execute(
+                out,
+                q,
+                k,
+                v,
+                decay,
+                gate,
+                beta,
+                fa,
+                norm,
+                x,
+                wqkv,
+                wa,
+                wb,
+                wbeta,
+                wz,
+                gamma,
+                wo,
+                alog,
+                bias,
+                initial,
+                u,
+                rk,
+                rd,
+                conv,
+                indices,
+                accepted,
+                wc,
+                scale,
+                lower,
+                eps,
+                main_rows,
+                width,
+                policy,
+                selector,
+            )
+        else:
+            output_rows = main_rows if main_rows <= 128 else 128
+            if selector == 2:
+                self.delayed.execute(
+                    out,
+                    q,
+                    k,
+                    v,
+                    decay,
+                    gate,
+                    beta,
+                    fa,
+                    norm,
+                    x,
+                    wqkv,
+                    wa,
+                    wb,
+                    wbeta,
+                    wz,
+                    gamma,
+                    wo,
+                    alog,
+                    bias,
+                    initial,
+                    u,
+                    rk,
+                    rd,
+                    conv,
+                    indices,
+                    accepted,
+                    wc,
+                    scale,
+                    lower,
+                    eps,
+                    main_rows,
+                    width,
+                    policy,
+                    output_rows,
+                )
+            else:
+                self.stage.execute(
+                    out,
+                    q,
+                    k,
+                    v,
+                    decay,
+                    gate,
+                    beta,
+                    fa,
+                    norm,
+                    x,
+                    wqkv,
+                    wa,
+                    wb,
+                    wbeta,
+                    wz,
+                    gamma,
+                    wo,
+                    alog,
+                    bias,
+                    initial,
+                    u,
+                    rk,
+                    rd,
+                    conv,
+                    indices,
+                    accepted,
+                    wc,
+                    scale,
+                    lower,
+                    eps,
+                    main_rows,
+                    width,
+                    policy,
+                    output_rows,
+                )
+
+    @host
+    def run(
+        self,
+        out,
+        q,
+        k,
+        v,
+        decay,
+        gate,
+        beta,
+        fa,
+        norm,
+        x,
+        wqkv,
+        wa,
+        wb,
+        wbeta,
+        wz,
+        gamma,
+        wo,
+        alog,
+        bias,
+        checkpoint,
+        conv,
+        indices,
+        accepted,
+        wc,
+        replay_u,
+        replay_k,
+        replay_decay,
+        checkpoint_stride0,
+        conv_stride0,
+        conv_length,
+        u_stride0,
+        k_stride0,
+        decay_stride0,
+        record_s,
+        scale,
+        lower,
+        eps,
+        main_rows,
+        width,
+        policy,
+        selector,
+        cores,
+        accurate_raw,
+        accurate_decay,
+    ):
+        self.device[cores](
+            out,
+            q,
+            k,
+            v,
+            decay,
+            gate,
+            beta,
+            fa,
+            norm,
+            x,
+            wqkv,
+            wa,
+            wb,
+            wbeta,
+            wz,
+            gamma,
+            wo,
+            alog,
+            bias,
+            checkpoint,
+            conv,
+            indices,
+            accepted,
+            wc,
+            replay_u,
+            replay_k,
+            replay_decay,
+            checkpoint_stride0,
+            conv_stride0,
+            conv_length,
+            u_stride0,
+            k_stride0,
+            decay_stride0,
+            record_s,
+            scale,
+            lower,
+            eps,
+            main_rows,
+            width,
+            policy,
+            selector,
+            accurate_raw,
+            accurate_decay,
+        )
+
+
+class TP4VariableLengthKDAKernel:
+    """当前 TP 的变长兜底内核，PA 记录池使用各自独立的步长。"""
+
+    @kernel
+    def project(self, out, x, weight):
+        onchip_rewind(reset_sync_id=True)
+        stage = SequenceProjectionStage()
+        stage.project(out, x, weight)
+
+    @kernel
+    def convolve(self, out, raw, conv, indices, accepted, cu, weight, conv_stride0):
+        onchip_rewind(reset_sync_id=True)
+        stage = SequenceConvStage()
+        stage.convolve(out, raw, conv, indices, accepted, cu, weight, conv_stride0)
+
+    @kernel
+    def recurrent(
+        self,
+        out,
+        convout,
+        decay,
+        beta,
+        z,
+        gamma,
+        alog,
+        bias,
+        checkpoint,
+        indices,
+        cu,
+        replay_u,
+        replay_k,
+        replay_decay,
+        checkpoint_stride0,
+        u_stride0,
+        k_stride0,
+        decay_stride0,
+        record_s,
+        scale,
+        lower,
+        eps,
+    ):
+        onchip_rewind(reset_sync_id=True)
+        u = ReplayPool(replay_u, indices, u_stride0, TP4_HEADS, record_s)
+        rk = ReplayPool(replay_k, indices, k_stride0, TP4_HEADS, record_s)
+        rd = ReplayPool(replay_decay, indices, decay_stride0, TP4_HEADS, record_s)
+        stage = SequenceRecurrentStage(TP4_HEADS)
+        stage.replay(
+            out,
+            convout,
+            decay,
+            beta,
+            z,
+            gamma,
+            alog,
+            bias,
+            checkpoint,
+            indices,
+            cu,
+            u,
+            rk,
+            rd,
+            checkpoint_stride0,
+            scale,
+            lower,
+            eps,
+        )
+
+    @host
+    def run(
+        self,
+        out,
+        x,
+        wqkv,
+        wa,
+        wb,
+        wbeta,
+        wz,
+        gamma,
+        wo,
+        wc,
+        conv,
+        checkpoint,
+        indices,
+        accepted,
+        cu,
+        alog,
+        bias,
+        replay_u,
+        replay_k,
+        replay_decay,
+        raw,
+        fa,
+        decay,
+        beta,
+        z,
+        convolved,
+        gated,
+        conv_stride0,
+        checkpoint_stride0,
+        u_stride0,
+        k_stride0,
+        decay_stride0,
+        record_s,
+        scale,
+        lower,
+        eps,
+        cores,
+    ):
+        self.project[cores](z, x, wz)
+        self.convolve[2 * cores](
+            convolved, raw, conv, indices, accepted, cu, wc, conv_stride0
+        )
+        self.recurrent[2 * cores](
+            gated,
+            convolved,
+            decay,
+            beta,
+            z,
+            gamma,
+            alog,
+            bias,
+            checkpoint,
+            indices,
+            cu,
+            replay_u,
+            replay_k,
+            replay_decay,
+            checkpoint_stride0,
+            u_stride0,
+            k_stride0,
+            decay_stride0,
+            record_s,
+            scale,
+            lower,
+            eps,
+        )
+        self.project[cores](out, gated, wo)
+
+
+TP8_SHORT_SCHEDULE = {
+    "main_rows": 128,
+    "main_width": 384,
+    "auxiliary_rows": 32,
+    "main_weight_l2_cache_ctl": 4,
+    "state_store_l2_cache_ctl": 0,
+    "state_load_l2_cache_ctl": 2,
+    "fa_width": 32,
+}
+
+
+TP8_LARGE_SCHEDULE = {
+    "ragged_output": True,
+    "ragged_main": True,
+    "main_rows": 256,
+    "auxiliary_rows": 0,
+    "main_width": 256,
+    "split_fb": True,
+    "publish_rows": 128,
+    "resident_output_weight": True,
+    "state_update_unroll": 2,
+    "main_weight_l2_cache_ctl": 0,
+    "state_store_l2_cache_ctl": 4,
+    "state_load_l2_cache_ctl": 4,
+}
+
+
+class TP8TPSchedule(
+    TPScheduleFrontendOperations, TP8TPScheduleBackendOperations, TP4GridSchedule
+):
+    def __init__(self, num_heads, rows, auxiliary_rows, publish_rows, config):
+        super().__init__(32, HIDDEN_SIZE, num_heads)
+        self.main_rows = rows
+        self.auxiliary_rows = auxiliary_rows
+        self.publish_rows = publish_rows
+        self.config = config
+        self.seq_len = S8_SEQUENCE_LENGTH
+
+
+class TP8ProjectionScheduleOperations(
+    ProjectionScheduleOperationsFrontendOperations, TP8TPSchedule
+):
+    """为两种投影调度共用构造逻辑和 Conv 预取操作。"""
+
+    def __init__(self, heads, rows, width):
+        config = Schedule(
+            main_rows=rows,
+            main_width=width,
+            ragged_main=width == 256,
+            split_fb=True,
+            ragged_output=True,
+        )
+        super().__init__(heads, rows, 32, 64, config)
+        self.heads = heads
+        self.projection_groups = 4 * heads // 3
+        self.row_capacity = rows
+
+
+class TP8AuxiliarySchedule(TP8AuxiliaryScheduleFrontendOperations, TP8TPSchedule):
+    def __init__(self, heads, rows):
+        super().__init__(heads, 32, rows, 64, Schedule(split_fb=True))
+        self.heads = heads
+
+
+class TP8S4ProjectionSchedule(
+    S4ProjectionScheduleFrontendOperations, TP8ProjectionScheduleOperations
+):
+    """仅处理有效行的 S4 QKV/Conv 融合，复用当前 PA 数据面板消费逻辑。"""
+
+    def __init__(self, heads):
+        super().__init__(heads, 128, 384)
+        self.seq_len = S4_SEQUENCE_LENGTH
+
+
+class TP8S4MultiCoreSchedule(_S4StagedPipeline):
+    """通用 S4 融合，支持 TP4/8/16 和 8/16/24/28/32 AIC。"""
+
+    def __init__(self, heads, pipelined=False):
+        self.main = TP8S4ProjectionSchedule(heads)
+        self.auxiliary = TP8S4AuxiliarySchedule(heads, pipelined=pipelined)
+        self.backend = (
+            S4PipelinedBackendSchedule(heads)
+            if pipelined
+            else TP4S4BackendSchedule(heads)
+        )
+
+
+class TP8PhaseSchedule(TP8TPSchedule):
+    """保留经过实测的输出分块几何，并共用运行时缓存控制。"""
+
+    @jit
+    def _configure_recurrent(self, _recurrent_stage):
+        _recurrent_stage.store_policy = self.store_policy
+        _recurrent_stage.load_policy = self.load_policy
+
+
+class _TP8S8Core32Stage:
+    def __init__(self):
+        self.head_backend = TP8HeadPanelBackend(TP8_HEADS)
+        self.main384 = Core32ProjectionSchedule(TP8_HEADS, 128, 384)
+        self.main256 = Core32ProjectionSchedule(TP8_HEADS, 256, 256)
+        self.aux0 = TP8TPSchedule(TP8_HEADS, 128, 32, 64, Schedule(fa_width=32))
+        self.aux1 = TP8TPSchedule(
+            TP8_HEADS,
+            128,
+            64,
+            64,
+            Schedule(fa_width=128, auxiliary_weight_l2_cache_ctl=0),
+        )
+        self.aux64 = TP8TPSchedule(TP8_HEADS, 128, 64, 64, Schedule(fa_width=64))
+        self.back0 = TP8PhaseSchedule(
+            TP8_HEADS, 128, 64, 64, Schedule(publish_rows=64, ragged_output=False)
+        )
+        self.back1 = TP8PhaseSchedule(
+            TP8_HEADS, 128, 64, 256, Schedule(publish_rows=256, ragged_output=True)
+        )
+        self.back2 = TP8PhaseSchedule(
+            TP8_HEADS,
+            128,
+            64,
+            64,
+            Schedule(publish_rows=64, ragged_output=True, output_kc=256),
+        )
+
+    @jit
+    def execute(
+        self,
+        out,
+        q,
+        k,
+        v,
+        decay,
+        gate,
+        beta,
+        fa,
+        norm,
+        x,
+        wqkv,
+        wa,
+        wb,
+        wbeta,
+        wz,
+        gamma,
+        wo,
+        alog,
+        bias,
+        initial,
+        replay_u,
+        replay_k,
+        replay_decay,
+        conv,
+        state_indices,
+        conv_accepted,
+        wc,
+        scale,
+        lower,
+        eps,
+    ):
+        mb = replay_decay.indices.shape[0] // 8
+        main_policy = dtypes.int32(4)
+        if mb > 4:
+            main_policy = dtypes.int32(1)
+        store_policy = dtypes.int32(0)
+        if mb >= 4:
+            store_policy = dtypes.int32(4)
+        load_policy = dtypes.int32(2)
+        if mb >= 16:
+            load_policy = dtypes.int32(4)
+        main_rows = 256
+        if mb == 1:
+            main_rows = 64
+        elif mb == 2:
+            main_rows = 128
+        use384 = mb <= 2
+        # 对齐的 M128/N384 分块能够形成完整的投影波次。
+        if mb >= 8 and out.shape[0] % 128 == 0:
+            main_rows = 128
+            use384 = True
+        self.main256.main_policy = main_policy
+        self.main256.main(
+            q,
+            k,
+            v,
+            gate,
+            x,
+            wqkv,
+            wz,
+            conv,
+            state_indices,
+            conv_accepted,
+            wc,
+            TP8_HEADS,
+            main_rows,
+            not use384,
+        )
+        self.main384.main_policy = main_policy
+        self.main384.main(
+            q,
+            k,
+            v,
+            gate,
+            x,
+            wqkv,
+            wz,
+            conv,
+            state_indices,
+            conv_accepted,
+            wc,
+            TP8_HEADS,
+            main_rows,
+            use384,
+        )
+        cube_sync_all()
+        onchip_rewind(reset_sync_id=True)
+        if mb == 1:
+            self.aux0.frontend_auxiliary(decay, beta, fa, x, wa, wb, wbeta)
+        elif x.shape[0] // 64 * 3 <= get_block_num():
+            # 每个核只保留一种 Beta/Fa 分块几何；N64 能占满更多波次位置。
+            self.aux64.frontend_auxiliary(decay, beta, fa, x, wa, wb, wbeta)
+        else:
+            self.aux1.frontend_auxiliary(decay, beta, fa, x, wa, wb, wbeta)
+        global_sync_all()
+        onchip_rewind(reset_sync_id=True)
+        if mb == 1:
+            self.aux0.frontend_fb(decay, fa, wb)
+        elif x.shape[0] // 64 * 3 <= get_block_num():
+            self.aux64.frontend_fb(decay, fa, wb)
+        else:
+            self.aux1.frontend_fb(decay, fa, wb)
+        global_sync_all()
+        onchip_rewind(reset_sync_id=True)
+        if mb == 1:
+            self.head_backend.backend(
+                out,
+                q,
+                k,
+                v,
+                decay,
+                gate,
+                beta,
+                gamma,
+                wo,
+                alog,
+                bias,
+                initial,
+                replay_u,
+                replay_k,
+                replay_decay,
+                scale,
+                lower,
+                eps,
+            )
+        elif mb == 2 or mb == 5:
+            self.back0.store_policy = store_policy
+            self.back0.load_policy = load_policy
+            self.back0.backend(
+                out,
+                q,
+                k,
+                v,
+                decay,
+                gate,
+                beta,
+                gamma,
+                wo,
+                alog,
+                bias,
+                initial,
+                replay_u,
+                replay_k,
+                replay_decay,
+                scale,
+                lower,
+                eps,
+            )
+        # 前面的分支已处理 1、2、5，因此这里只剩 3、4、6、7。
+        elif mb < 8:
+            self.back1.store_policy = store_policy
+            self.back1.load_policy = load_policy
+            self.back1.backend(
+                out,
+                q,
+                k,
+                v,
+                decay,
+                gate,
+                beta,
+                gamma,
+                wo,
+                alog,
+                bias,
+                initial,
+                replay_u,
+                replay_k,
+                replay_decay,
+                scale,
+                lower,
+                eps,
+            )
+        else:
+            self.back2.store_policy = store_policy
+            self.back2.load_policy = load_policy
+            self.back2.backend(
+                out,
+                q,
+                k,
+                v,
+                decay,
+                gate,
+                beta,
+                gamma,
+                wo,
+                alog,
+                bias,
+                initial,
+                replay_u,
+                replay_k,
+                replay_decay,
+                scale,
+                lower,
+                eps,
+            )
+
+
+class _TP8S8Core32TailStage(_TP8S8Core32Stage):
+    def __init__(self):
+        super().__init__()
+        self.heads = TP8_HEADS
+        self.main384 = TailMaskedCore32ProjectionSchedule(TP8_HEADS, 128, 384)
+
+    @jit
+    def execute(
+        self,
+        out,
+        q,
+        k,
+        v,
+        decay,
+        gate,
+        beta,
+        fa,
+        norm,
+        x,
+        wqkv,
+        wa,
+        wb,
+        wbeta,
+        wz,
+        gamma,
+        wo,
+        alog,
+        bias,
+        initial,
+        replay_u,
+        replay_k,
+        replay_decay,
+        conv,
+        state_indices,
+        conv_accepted,
+        wc,
+        scale,
+        lower,
+        eps,
+    ):
+        mb = replay_decay.indices.shape[0] // 8
+        store_policy = dtypes.int32(0)
+        load_policy = dtypes.int32(2)
+        # TP8 的 N384 投影有 16 个列任务，两个 M 组占满一个 32 Cube 波次；
+        # 将每组的有效行数向上对齐到 64。
+        target_m_groups = 32 // (4 * self.heads // 3)
+        main_rows = ceil_div(x.shape[0], target_m_groups * 64) * 64
+        self.main384.main_policy = dtypes.int32(4)
+        self.main384.main(
+            q,
+            k,
+            v,
+            gate,
+            x,
+            wqkv,
+            wz,
+            conv,
+            state_indices,
+            conv_accepted,
+            wc,
+            TP8_HEADS,
+            main_rows,
+        )
+        cube_sync_all()
+        onchip_rewind(reset_sync_id=True)
+        if mb == 1:
+            self.aux0.frontend_auxiliary(decay, beta, fa, x, wa, wb, wbeta)
+        elif x.shape[0] // 64 * 3 <= get_block_num():
+            # 每个核只保留一种 Beta/Fa 分块几何；N64 能占满更多波次位置。
+            self.aux64.frontend_auxiliary(decay, beta, fa, x, wa, wb, wbeta)
+        else:
+            self.aux1.frontend_auxiliary(decay, beta, fa, x, wa, wb, wbeta)
+        global_sync_all()
+        onchip_rewind(reset_sync_id=True)
+        if mb == 1:
+            self.aux0.frontend_fb(decay, fa, wb)
+        elif x.shape[0] // 64 * 3 <= get_block_num():
+            self.aux64.frontend_fb(decay, fa, wb)
+        else:
+            self.aux1.frontend_fb(decay, fa, wb)
+        global_sync_all()
+        onchip_rewind(reset_sync_id=True)
+        if mb == 1:
+            self.head_backend.backend(
+                out,
+                q,
+                k,
+                v,
+                decay,
+                gate,
+                beta,
+                gamma,
+                wo,
+                alog,
+                bias,
+                initial,
+                replay_u,
+                replay_k,
+                replay_decay,
+                scale,
+                lower,
+                eps,
+            )
+        elif mb == 2 or mb == 5:
+            self.back0.store_policy = store_policy
+            self.back0.load_policy = load_policy
+            self.back0.backend(
+                out,
+                q,
+                k,
+                v,
+                decay,
+                gate,
+                beta,
+                gamma,
+                wo,
+                alog,
+                bias,
+                initial,
+                replay_u,
+                replay_k,
+                replay_decay,
+                scale,
+                lower,
+                eps,
+            )
+        # 前面的分支已处理 1、2、5，因此这里只剩 3、4、6、7。
+        elif mb < 8:
+            self.back1.store_policy = store_policy
+            self.back1.load_policy = load_policy
+            self.back1.backend(
+                out,
+                q,
+                k,
+                v,
+                decay,
+                gate,
+                beta,
+                gamma,
+                wo,
+                alog,
+                bias,
+                initial,
+                replay_u,
+                replay_k,
+                replay_decay,
+                scale,
+                lower,
+                eps,
+            )
+        else:
+            self.back2.store_policy = store_policy
+            self.back2.load_policy = load_policy
+            self.back2.backend(
+                out,
+                q,
+                k,
+                v,
+                decay,
+                gate,
+                beta,
+                gamma,
+                wo,
+                alog,
+                bias,
+                initial,
+                replay_u,
+                replay_k,
+                replay_decay,
+                scale,
+                lower,
+                eps,
+            )
+
+
+class S4ParallelSchedule:
+    """TP8、B8/B16、32 AIC：30 个 QKV/Z 执行核，另两个核分别计算 beta 和融合的 Fa/Fb。"""
+
+    def __init__(self):
+        self.main = TP8S4ProjectionSchedule(TP8_HEADS)
+        self.auxiliary = TP8S4AuxiliarySchedule(TP8_HEADS)
+        self.backend = TP4S4BackendSchedule(TP8_HEADS)
+
+    @jit
+    def execute(
+        self,
+        out,
+        q,
+        k,
+        v,
+        decay,
+        gate,
+        beta,
+        fa,
+        norm,
+        x,
+        wqkv,
+        wa,
+        wb,
+        wbeta,
+        wz,
+        gamma,
+        wo,
+        alog,
+        bias,
+        initial,
+        replay_u,
+        replay_k,
+        replay_decay,
+        conv,
+        indices,
+        accepted,
+        wc,
+        scale,
+        lower,
+        eps,
+        rows,
+        width,
+        policy,
+        output_rows,
+    ):
+        if get_block_idx() < 30:
+            for head in range(get_block_idx(), 48, 30):
+                self.main.panel(
+                    q,
+                    k,
+                    v,
+                    gate,
+                    x,
+                    wqkv,
+                    wz,
+                    conv,
+                    indices,
+                    accepted,
+                    wc,
+                    0,
+                    head,
+                    rows,
+                    policy,
+                )
+        cube_sync_all()
+        vec_sync_all()
+        if get_block_idx() == 30:
+            self.auxiliary.beta_panel(beta, x, wbeta, 0, rows, policy)
+        if get_block_idx() == 31:
+            self.auxiliary.decay_panel(decay, x, wa, wb, 0, rows, policy)
+        global_sync_all()
+        onchip_rewind(reset_sync_id=True)
+        self.backend.execute(
+            out,
+            q,
+            k,
+            v,
+            decay,
+            gate,
+            beta,
+            gamma,
+            wo,
+            alog,
+            bias,
+            initial,
+            replay_u,
+            replay_k,
+            replay_decay,
+            scale,
+            lower,
+            eps,
+            output_rows,
+            policy,
+        )
+
+
+class TP8DelayedProjectionSchedule:
+    """对完整的大行块重叠执行门控投影与递推。"""
+
+    def __init__(self, heads):
+        self.heads = heads
+        self.zrows = 128
+        self.publish_rows = 256
+        self.window_rows = self.publish_rows
+        self.minimum_rows = 4 * self.publish_rows
+        self.main = Core32ProjectionSchedule(heads, 128, 384)
+        self.main.projection_groups = heads
+        self.aux = TP8TPSchedule(heads, 128, 64, 128, Schedule(publish_rows=128))
+        self.aux64 = TP8TPSchedule(
+            heads, 128, 128, 128, Schedule(publish_rows=128, fa_width=64)
+        )
+        self.aux128 = TP8TPSchedule(
+            heads,
+            128,
+            128,
+            128,
+            Schedule(publish_rows=128, auxiliary_weight_l2_cache_ctl=0),
+        )
+
+    @jit
+    def execute(
+        self,
+        out,
+        q,
+        k,
+        v,
+        decay,
+        gate,
+        beta,
+        fa,
+        norm,
+        x,
+        wqkv,
+        wa,
+        wb,
+        wbeta,
+        wz,
+        gamma,
+        wo,
+        alog,
+        bias,
+        initial,
+        replay_u,
+        replay_k,
+        replay_decay,
+        conv,
+        state_indices,
+        conv_accepted,
+        wc,
+        scale,
+        lower,
+        eps,
+        plan_rows,
+        plan_width,
+        plan_policy,
+    ):
+        self.main.main_policy = dtypes.int32(1)
+        self.main.main(
+            q,
+            k,
+            v,
+            gate,
+            x,
+            wqkv,
+            wz,
+            conv,
+            state_indices,
+            conv_accepted,
+            wc,
+            self.heads,
+            128,
+        )
+        cube_sync_all()
+        onchip_rewind(reset_sync_id=True)
+        if x.shape[0] // 128 * 3 <= get_block_num():
+            self.aux64.frontend_auxiliary(decay, beta, fa, x, wa, wb, wbeta)
+        else:
+            self.aux128.frontend_auxiliary(decay, beta, fa, x, wa, wb, wbeta)
+        global_sync_all()
+        onchip_rewind(reset_sync_id=True)
+        if x.shape[0] // 128 * 3 <= get_block_num():
+            self.aux64.frontend_fb(decay, fa, wb)
+        else:
+            self.aux128.frontend_fb(decay, fa, wb)
+        global_sync_all()
+        onchip_rewind(reset_sync_id=True)
+        context = _RawRecurrentContext(
+            q,
+            k,
+            v,
+            initial.accurate_decay,
+            beta,
+            initial,
+            replay_u,
+            replay_k,
+            replay_decay,
+            scale,
+            lower,
+        )
+        for chunk in range(x.shape[0] // self.publish_rows):
+            config = Schedule(state_load_l2_cache_ctl=4)
+            recurrent = RecurrentStage(128, self.heads, config, state_buffer_depth=2)
+            output_gate = OutputGateStage()
+            raw = Buffer(
+                MemLoc.UB,
+                dtypes.float32,
+                make_layout(
+                    (ceil_div(self.publish_rows // 8 * self.heads, 64) * 8, 128)
+                ),
+            )
+            gate_context = _RawGateContext(q, gate, raw, eps)
+            zstage = _DelayedGateProjection(self.zrows, 0, 0, row_capacity=self.zrows)
+            recurrent.load_gate_params(alog, bias)
+            output_gate.load_gamma(gamma)
+            for ztask in range(
+                get_block_idx(),
+                self.publish_rows // self.zrows * self.heads,
+                get_block_num(),
+            ):
+                head = ztask // (self.publish_rows // self.zrows)
+                rowpart = ztask % (self.publish_rows // self.zrows)
+                zstage.project_to_gm(
+                    tile_slice(
+                        x,
+                        (self.zrows, HIDDEN_SIZE),
+                        (chunk * (self.publish_rows // self.zrows) + rowpart, 0),
+                    ),
+                    wz,
+                    tile_slice(
+                        gate,
+                        (self.zrows, 128),
+                        (chunk * (self.publish_rows // self.zrows) + rowpart, head),
+                    ),
+                    head,
+                    56,
+                )
+            first = get_block_idx() * 2 + get_subblock_id()
+            if first < self.publish_rows // 8 * self.heads:
+                first_batch = chunk * (self.publish_rows // 8) + first % (
+                    self.publish_rows // 8
+                )
+                first_head = first // (self.publish_rows // 8)
+                recurrent.load_state(
+                    tile_slice(
+                        _checkpoint_head(initial, first_batch, first_head),
+                        (128, 128),
+                        (0, 0),
+                    )
+                )
+            for item in range(first, self.publish_rows // 8 * self.heads, 64):
+                batch = chunk * (self.publish_rows // 8) + item % (
+                    self.publish_rows // 8
+                )
+                head = item // (self.publish_rows // 8)
+                next_item = item + 64
+                next_batch = chunk * (self.publish_rows // 8) + next_item % (
+                    self.publish_rows // 8
+                )
+                next_head = next_item // (self.publish_rows // 8)
+                _run_raw_recurrent_item(
+                    recurrent,
+                    context,
+                    batch,
+                    head,
+                    raw,
+                    item,
+                    checkpoint_prefetched=True,
+                    next_batch=next_batch,
+                    next_head=next_head,
+                    next_valid=next_item < self.publish_rows // 8 * self.heads,
+                )
+            cube_sync_block_arrive(PIPE.FIXPIPE, 0, mode=0)
+            cube_sync_block_wait(PIPE.S, 0, mode=0)
+            cube_sync_block_arrive(PIPE.FIXPIPE, 1, mode=2)
+            vec_sync_block_wait(PIPE.S, 1, mode=2)
+            for item in range(first, self.publish_rows // 8 * self.heads, 64):
+                batch = chunk * (self.publish_rows // 8) + item % (
+                    self.publish_rows // 8
+                )
+                head = item // (self.publish_rows // 8)
+                _store_raw_gated_item(output_gate, gate_context, batch, head, item)
+            publish_vector_grid_to_cube(3, 4, ack_flag=5)
+            onchip_rewind(reset_sync_id=True)
+            output = OutputProjectionStage(
+                224,
+                self.publish_rows,
+                kc=256,
+                tiles_per_core=1,
+                resident_weight=False,
+                row_capacity=self.publish_rows,
+                num_heads=self.heads,
+            )
+            output.project(out, q, wo, self.heads, chunk)
+            cube_sync_all()
+            vec_sync_all()
+            onchip_rewind(reset_sync_id=True)
+
+
+class _HeadStreamSchedule(TP8DelayedProjectionSchedule):
+    def __init__(self, warmup):
+        super().__init__(TP8_HEADS)
+        self.warmup = warmup
+
+    @jit
+    def execute(
+        self,
+        out,
+        q,
+        k,
+        v,
+        decay,
+        gate,
+        beta,
+        fa,
+        norm,
+        x,
+        wqkv,
+        wa,
+        wb,
+        wbeta,
+        wz,
+        gamma,
+        wo,
+        alog,
+        bias,
+        initial,
+        replay_u,
+        replay_k,
+        replay_decay,
+        conv,
+        state_indices,
+        conv_accepted,
+        wc,
+        scale,
+        lower,
+        eps,
+        plan_rows,
+        plan_width,
+        plan_policy,
+    ):
+        self.main.main_policy = dtypes.int32(1)
+        self.main.main(
+            q,
+            k,
+            v,
+            gate,
+            x,
+            wqkv,
+            wz,
+            conv,
+            state_indices,
+            conv_accepted,
+            wc,
+            self.heads,
+            128,
+        )
+        # Fa/Beta 读取 X，并通过 Fixpipe 发布结果，不复用 Conv 的 UB。
+        # 在此处排空 Cube 存储；辅助计算后的网格屏障
+        # 还会确保 Conv 完成，后端才能消费 Q/K/V。
+        cube_sync_all()
+        onchip_rewind(reset_sync_id=True)
+        if x.shape[0] // 128 * 3 <= get_block_num():
+            self.aux64.frontend_auxiliary(decay, beta, fa, x, wa, wb, wbeta)
+        else:
+            self.aux128.frontend_auxiliary(decay, beta, fa, x, wa, wb, wbeta)
+        global_sync_all()
+        onchip_rewind(reset_sync_id=True)
+        if x.shape[0] // 128 * 3 <= get_block_num():
+            self.aux64.frontend_fb(decay, fa, wb)
+        else:
+            self.aux128.frontend_fb(decay, fa, wb)
+        global_sync_all()
+        onchip_rewind(reset_sync_id=True)
+        context = _RawRecurrentContext(
+            q,
+            k,
+            v,
+            initial.accurate_decay,
+            beta,
+            initial,
+            replay_u,
+            replay_k,
+            replay_decay,
+            scale,
+            lower,
+        )
+        recurrent = RecurrentStage(
+            128, TP8_HEADS, Schedule(state_load_l2_cache_ctl=4), state_buffer_depth=2
+        )
+        output_gate = OutputGateStage()
+        raw = Buffer(MemLoc.UB, dtypes.float32, make_layout((48, 128)))
+        gate_context = _RawGateContext(q, gate, raw, eps)
+        recurrent.load_gate_params(alog, bias)
+        output_gate.load_gamma(gamma)
+        first = get_block_idx() * 2 + get_subblock_id()
+        recurrent.load_state(
+            tile_slice(
+                _checkpoint_head(initial, first % 32, first // 32), (128, 128), (0, 0)
+            )
+        )
+        for chunk in range(x.shape[0] // 256):
+            # 持久 UB 对象保持有效。Z 和 OProj 仅复用 Cube 存储，
+            # 并在每次重置前沿用原有的显式排空操作。
+            zstage = _DelayedGateProjection(128, 0, 0, row_capacity=128)
+            for ztask in range(get_block_idx(), GATE_PROJECTION_TASK_COUNT, 32):
+                head = ztask // 2
+                rowpart = ztask % 2
+                zstage.project_to_gm(
+                    tile_slice(x, (128, HIDDEN_SIZE), (chunk * 2 + rowpart, 0)),
+                    wz,
+                    tile_slice(gate, (128, 128), (chunk * 2 + rowpart, head)),
+                    head,
+                    56,
+                )
+            for row in range(self.warmup):
+                _head_stream_persistent_raw_round(
+                    recurrent, context, raw, first, row, chunk
+                )
+            # 输出缓冲区取得 Z 的 Cube 地址前，Z 存储的生命周期已经结束。
+            cube_sync_block_arrive(PIPE.FIXPIPE, 0, mode=0)
+            cube_sync_block_wait(PIPE.S, 0, mode=0)
+            cube_sync_all()
+            onchip_rewind(reset_sync_id=True)
+            output = _HeadStreamOutput()
+            output.prefetch_panel(wo, 0)
+            cube_sync_block_arrive(PIPE.FIXPIPE, 15, mode=2)
+            vec_sync_block_wait(PIPE.S, 15, mode=2)
+            for row in range(HEAD_STREAM_ROUNDS):
+                if row >= self.warmup:
+                    _head_stream_persistent_raw_round(
+                        recurrent, context, raw, first, row, chunk
+                    )
+                item = first + row * 64
+                batch = chunk * 32 + item % 32
+                head = item // 32
+                _store_raw_gated_item(output_gate, gate_context, batch, head, item)
+                # 使用独立标志，避免在同一个数据块内执行反向确认。
+                vec_sync_block_arrive(PIPE.MTE3, 2 + row, mode=2)
+                cube_sync_block_wait(PIPE.S, 2 + row, mode=2)
+                cube_sync_block_arrive(PIPE.FIXPIPE, 8 + row, mode=0)
+                cube_sync_block_wait(PIPE.S, 8 + row, mode=0)
+                output.accumulate_panel(q, row, chunk)
+                if row + 1 < HEAD_STREAM_ROUNDS:
+                    output.prefetch_panel(wo, row + 1)
+            output.finish(out, chunk)
+            cube_sync_all()
+            vec_sync_all()
+            onchip_rewind(reset_sync_id=True)
+
+
+@jit
+def _execute_stream_prefix_tail(
+    stages,
+    out,
+    q,
+    k,
+    v,
+    decay,
+    gate,
+    beta,
+    fa,
+    norm,
+    x,
+    wqkv,
+    wa,
+    wb,
+    wbeta,
+    wz,
+    gamma,
+    wo,
+    alog,
+    bias,
+    initial,
+    replay_u,
+    replay_k,
+    replay_decay,
+    conv,
+    state_indices,
+    conv_accepted,
+    wc,
+    scale,
+    lower,
+    eps,
+    plan_rows,
+    plan_width,
+    plan_policy,
+):
+    prefix_rows = x.shape[0] // 256 * 256
+    prefix_batch = prefix_rows // 8
+    total_rows = x.shape[0]
+    total_batch = initial.indices.shape[0]
+    stages.delayed.execute(
+        out[0:prefix_rows, None],
+        q[0:prefix_rows, None],
+        k[0:prefix_rows, None],
+        v[0:prefix_rows, None],
+        decay[0:prefix_rows, None],
+        gate[0:prefix_rows, None],
+        beta[0:prefix_rows, None],
+        fa[0:prefix_rows, None],
+        norm,
+        x[0:prefix_rows, None],
+        wqkv,
+        wa,
+        wb,
+        wbeta,
+        wz,
+        gamma,
+        wo,
+        alog,
+        bias,
+        _checkpoint_batches(initial, 0, prefix_batch),
+        replay_batches(replay_u, 0, prefix_batch),
+        replay_batches(replay_k, 0, prefix_batch),
+        replay_batches(replay_decay, 0, prefix_batch),
+        conv,
+        state_indices[0:prefix_batch,],
+        conv_accepted[0:prefix_batch,],
+        wc,
+        scale,
+        lower,
+        eps,
+        plan_rows,
+        plan_width,
+        plan_policy,
+    )
+    # 必须先完成前缀的全部发布与消费，尾部存储或同步标识
+    # 才能复用任何片上地址或通道。
+    global_sync_all(flag_ids=(1, 14, 0))
+    cube_sync_all()
+    vec_sync_all()
+    onchip_rewind(reset_sync_id=True)
+    # Conv 池始终使用全局坐标。只有 batch 索引向量以及
+    # 互不重叠的状态、replay 和行视图会偏移到尾部。
+    stages.tail32.execute(
+        out[prefix_rows:total_rows, None],
+        q[prefix_rows:total_rows, None],
+        k[prefix_rows:total_rows, None],
+        v[prefix_rows:total_rows, None],
+        decay[prefix_rows:total_rows, None],
+        gate[prefix_rows:total_rows, None],
+        beta[prefix_rows:total_rows, None],
+        fa[prefix_rows:total_rows, None],
+        norm,
+        x[prefix_rows:total_rows, None],
+        wqkv,
+        wa,
+        wb,
+        wbeta,
+        wz,
+        gamma,
+        wo,
+        alog,
+        bias,
+        _checkpoint_batches(initial, prefix_batch, total_batch),
+        replay_batches(replay_u, prefix_batch, total_batch),
+        replay_batches(replay_k, prefix_batch, total_batch),
+        replay_batches(replay_decay, prefix_batch, total_batch),
+        _ConvPool(
+            conv.data,
+            conv.stride0,
+            conv.length,
+            conv.width,
+            conv.accurate_raw[prefix_rows:total_rows, None],
+        ),
+        state_indices[prefix_batch:total_batch,],
+        conv_accepted[prefix_batch:total_batch,],
+        wc,
+        scale,
+        lower,
+        eps,
+    )
+    global_sync_all()
+
+
+def _tp8_intermediate_schedule(num_heads, model_batch):
+    rows = model_batch * (MODEL_HEAD_COUNT // num_heads) * S8_SEQUENCE_LENGTH
+    if rows <= 128 and rows & (rows - 1) == 0:
+        options = dict(main_rows=128, main_width=384)
+    else:
+        # 递推工作占主导时，TP8 按较小的数据块发布结果。
+        publish_rows = 256
+        publish_rows = 128 if model_batch >= 8 else (64 if model_batch == 5 else 256)
+        options = dict(
+            main_rows=256,
+            main_width=256,
+            ragged_main=True,
+            ragged_output=True,
+            publish_rows=publish_rows,
+        )
+    physical_rows = _tile_rows(rows, options["main_rows"], options.get("ragged_main"))
+    options["main_weight_l2_cache_ctl"] = 0 if rows > physical_rows else 4
+    options["state_store_l2_cache_ctl"] = 4 if model_batch >= 4 else 0
+    return Schedule(**options)
+
+
+def _tp8_default_schedule(num_heads, model_batch):
+    """根据 TP 和模型 batch 选择分块与缓存策略。"""
+    if num_heads != TP8_HEADS or not 1 <= model_batch <= 32:
+        raise ValueError(f"requires N={TP8_HEADS} and model_batch=1..32")
+    if model_batch > 16:
+        return Schedule(**TP8_LARGE_SCHEDULE)
+    if model_batch in (1, 16):
+        options = TP8_SHORT_SCHEDULE if model_batch == 1 else TP8_LARGE_SCHEDULE
+        return Schedule(**options)
+    return _tp8_intermediate_schedule(num_heads, model_batch)
+
+
+def _tp8_select_main(rows, heads, cores):
+    if heads != TP8_HEADS or cores not in VALID_CORES:
+        raise ValueError("unsupported heads or AIC quota")
+    return min(
+        range(len(MAIN_TEMPLATES)),
+        key=lambda i: main_geometry(rows, heads, cores, *MAIN_TEMPLATES[i]).cost,
+    )
+
+
+def _tp8_core32_geometry(model_batch, heads, rows):
+    config = _tp8_default_schedule(heads, model_batch)
+    aligned = model_batch >= 8 and rows % 128 == 0
+    return dict(
+        main_m=128
+        if aligned
+        else _tile_rows(rows, config.main_rows, config.ragged_main),
+        main_n=384 if aligned else config.main_width,
+        auxiliary_rows=math.gcd(
+            rows,
+            config.auxiliary_rows or (MODEL_HEAD_COUNT // heads) * S8_SEQUENCE_LENGTH,
+        ),
+        publish_rows=_tile_rows(rows, config.publish_rows, config.ragged_output),
+    )
+
+
+def _tp8_core32_plan(model_batch, tp):
+    rows = model_batch * tp * S8_SEQUENCE_LENGTH
+    heads = MODEL_HEAD_COUNT // tp
+    geometry = _tp8_core32_geometry(model_batch, heads, rows)
+    lanes = 64
+    return dict(
+        model_batch=model_batch,
+        tp=tp,
+        cores=32,
+        rows=rows,
+        heads=heads,
+        main_id=-1,
+        **geometry,
+        main_geometry=main_geometry(
+            rows, heads, 32, geometry["main_m"], geometry["main_n"]
+        ),
+        kda_waves=(MODEL_HEAD_COUNT * model_batch + lanes - 1) // lanes,
+        vector_lanes=lanes,
+        output_width=256,
+        output="nb_head_panels" if model_batch == 1 else ("measured32_stream"),
+        mode="specialized32",
+    )
+
+
+def _tp8_output_policy(rows, heads, cores):
+    if rows * heads == 768:
+        return "nb_head_panels"
+    if rows in (32, 64):
+        return "short32" if rows == 32 else "short64"
+    return "input128_r128"
+
+
+def _tp8_plan(model_batch, tp, cores):
+    if tp != TP8_TP_DEGREE or not 1 <= model_batch <= 32 or cores not in VALID_CORES:
+        raise ValueError("requires TP8, model batch 1..32, AIC 8/16/24/28/32")
+    rows = model_batch * tp * S8_SEQUENCE_LENGTH
+    heads = MODEL_HEAD_COUNT // tp
+    if cores == 32:
+        return _tp8_core32_plan(model_batch, tp)
+    i = _tp8_select_main(rows, heads, cores)
+    m, n = MAIN_TEMPLATES[i]
+    return dict(
+        model_batch=model_batch,
+        tp=tp,
+        cores=cores,
+        rows=rows,
+        heads=heads,
+        main_id=i,
+        main_m=m,
+        main_n=n,
+        main_geometry=main_geometry(rows, heads, cores, m, n),
+        kda_waves=(MODEL_HEAD_COUNT * model_batch + 2 * cores - 1) // (2 * cores),
+        auxiliary_rows=math.gcd(rows, 128),
+        output=_tp8_output_policy(rows, heads, cores),
+        weight_policy=0 if rows > m else 4,
+    )
+
+
+class TP8S8DefaultStage:
+    def __init__(self, heads):
+        self.heads = heads
+        self.main384 = MultiCoreProjectionSchedule(heads, 128, 384)
+        self.main256 = MultiCoreProjectionSchedule(heads, 256, 256)
+        self.aux32 = TP8AuxiliarySchedule(heads, 32)
+        self.aux64 = TP8AuxiliarySchedule(heads, 64)
+        self.aux128 = TP8AuxiliarySchedule(heads, 128)
+        self.backend = TP8BackendSchedule(heads)
+        self.head_backend = TP8HeadPanelBackend(heads)
+        self.fast32 = _TP8S8Core32Stage()
+
+    @jit
+    def execute(
+        self,
+        out,
+        q,
+        k,
+        v,
+        decay,
+        gate,
+        beta,
+        fa,
+        norm,
+        x,
+        wqkv,
+        wa,
+        wb,
+        wbeta,
+        wz,
+        gamma,
+        wo,
+        alog,
+        bias,
+        initial,
+        replay_u,
+        replay_k,
+        replay_decay,
+        conv,
+        state_indices,
+        conv_accepted,
+        wc,
+        scale,
+        lower,
+        eps,
+        plan_rows,
+        plan_width,
+        plan_policy,
+    ):
+        if get_block_num() == 32:
+            self.fast32.execute(
+                out,
+                q,
+                k,
+                v,
+                decay,
+                gate,
+                beta,
+                fa,
+                norm,
+                x,
+                wqkv,
+                wa,
+                wb,
+                wbeta,
+                wz,
+                gamma,
+                wo,
+                alog[0 : self.heads,],
+                bias[0 : self.heads, None],
+                initial,
+                replay_u,
+                replay_k,
+                replay_decay,
+                conv,
+                state_indices,
+                conv_accepted,
+                wc,
+                scale,
+                lower,
+                eps,
+            )
+        else:
+            n = self.heads
+            logical_rows = plan_rows
+            if plan_width == 384:
+                self.main384.main(
+                    q,
+                    k,
+                    v,
+                    gate,
+                    x,
+                    wqkv,
+                    wz,
+                    conv,
+                    state_indices,
+                    conv_accepted,
+                    wc,
+                    n,
+                    logical_rows,
+                    plan_policy,
+                )
+            else:
+                self.main256.main(
+                    q,
+                    k,
+                    v,
+                    gate,
+                    x,
+                    wqkv,
+                    wz,
+                    conv,
+                    state_indices,
+                    conv_accepted,
+                    wc,
+                    n,
+                    logical_rows,
+                    plan_policy,
+                )
+            global_sync_all()
+            onchip_rewind(reset_sync_id=True)
+            if x.shape[0] % 128 == 0:
+                self.aux128.execute(decay, beta, fa, x, wa, wb, wbeta)
+            elif x.shape[0] % 64 == 0:
+                self.aux64.execute(decay, beta, fa, x, wa, wb, wbeta)
+            else:
+                self.aux32.execute(decay, beta, fa, x, wa, wb, wbeta)
+            global_sync_all()
+            onchip_rewind(reset_sync_id=True)
+            if replay_decay.indices.shape[0] * n == MODEL_HEAD_COUNT:
+                self.head_backend.backend(
+                    out,
+                    q,
+                    k,
+                    v,
+                    decay,
+                    gate,
+                    beta,
+                    gamma,
+                    wo,
+                    alog[0:n,],
+                    bias[0:n, None],
+                    initial,
+                    replay_u,
+                    replay_k,
+                    replay_decay,
+                    scale,
+                    lower,
+                    eps,
+                )
+            else:
+                self.backend.backend(
+                    out,
+                    q,
+                    k,
+                    v,
+                    decay,
+                    gate,
+                    beta,
+                    gamma,
+                    wo,
+                    alog,
+                    bias,
+                    initial,
+                    replay_u,
+                    replay_k,
+                    replay_decay,
+                    scale,
+                    lower,
+                    eps,
+                    wbeta,
+                )
+        global_sync_all()
+
+
+class TP8S8Dispatch(TP8S8DefaultStage):
+    def __init__(self, heads):
+        super().__init__(heads)
+        self.delayed = _HeadStreamSchedule(5)
+        self.tail32 = _TP8S8Core32TailStage()
+
+    @jit
+    def execute(
+        self,
+        out,
+        q,
+        k,
+        v,
+        decay,
+        gate,
+        beta,
+        fa,
+        norm,
+        x,
+        wqkv,
+        wa,
+        wb,
+        wbeta,
+        wz,
+        gamma,
+        wo,
+        alog,
+        bias,
+        initial,
+        replay_u,
+        replay_k,
+        replay_decay,
+        conv,
+        state_indices,
+        conv_accepted,
+        wc,
+        scale,
+        lower,
+        eps,
+        plan_rows,
+        plan_width,
+        plan_policy,
+        prefer_stream,
+    ):
+        q = q.view((q.shape[0], self.heads * TILE))
+        k = k.view((k.shape[0], self.heads * TILE))
+        v = v.view((v.shape[0], self.heads * TILE))
+        decay = decay.view((decay.shape[0], self.heads * TILE))
+        gate = gate.view((gate.shape[0], self.heads * TILE))
+        beta = beta.view(
+            (beta.shape[0], ((self.heads + BETA_TILE - 1) // BETA_TILE) * BETA_TILE)
+        )
+        alog = alog.view((self.heads,))
+        bias = bias.view((self.heads, TILE))
+        conv = _ConvPool(
+            conv.data,
+            conv.stride0,
+            conv.length,
+            3 * self.heads * TILE,
+            conv.accurate_raw,
+        )
+        wc = wc.view((3, self.heads, CONV_KERNEL, TILE))
+        if (
+            get_block_num() == 32
+            and x.shape[0] % self.delayed.window_rows == 0
+            and (x.shape[0] >= self.delayed.minimum_rows or (prefer_stream != 0))
+        ):
+            self.delayed.execute(
+                out,
+                q,
+                k,
+                v,
+                decay,
+                gate,
+                beta,
+                fa,
+                norm,
+                x,
+                wqkv,
+                wa,
+                wb,
+                wbeta,
+                wz,
+                gamma,
+                wo,
+                alog,
+                bias,
+                initial,
+                replay_u,
+                replay_k,
+                replay_decay,
+                conv,
+                state_indices,
+                conv_accepted,
+                wc,
+                scale,
+                lower,
+                eps,
+                plan_rows,
+                plan_width,
+                plan_policy,
+            )
+            global_sync_all(flag_ids=(1, 14, 0))
+        elif (
+            get_block_num() == 32
+            and x.shape[0] >= self.delayed.minimum_rows
+            and (x.shape[0] % 256 != 0)
+        ):
+            _execute_stream_prefix_tail(
+                self,
+                out,
+                q,
+                k,
+                v,
+                decay,
+                gate,
+                beta,
+                fa,
+                norm,
+                x,
+                wqkv,
+                wa,
+                wb,
+                wbeta,
+                wz,
+                gamma,
+                wo,
+                alog,
+                bias,
+                initial,
+                replay_u,
+                replay_k,
+                replay_decay,
+                conv,
+                state_indices,
+                conv_accepted,
+                wc,
+                scale,
+                lower,
+                eps,
+                plan_rows,
+                plan_width,
+                plan_policy,
+            )
+        else:
+            TP8S8DefaultStage.execute(
+                self,
+                out,
+                q,
+                k,
+                v,
+                decay,
+                gate,
+                beta,
+                fa,
+                norm,
+                x,
+                wqkv,
+                wa,
+                wb,
+                wbeta,
+                wz,
+                gamma,
+                wo,
+                alog,
+                bias,
+                initial,
+                replay_u,
+                replay_k,
+                replay_decay,
+                conv,
+                state_indices,
+                conv_accepted,
+                wc,
+                scale,
+                lower,
+                eps,
+                plan_rows,
+                plan_width,
+                plan_policy,
+            )
+
+
+def _tp8_prefer_streamed_main(rows, heads, cores, normal_m, normal_n):
+    """比较完整主投影波次的开销；此结果用于运行时选择，不作为编译缓存键。"""
+    if cores != 32 or rows % 256:
+        return 0
+    normal_jobs = ((rows + normal_m - 1) // normal_m) * (4 * heads * TILE // normal_n)
+    delayed_jobs = rows // 128 * heads
+    normal_work = ((normal_jobs + cores - 1) // cores) * normal_m * normal_n
+    delayed_work = ((delayed_jobs + cores - 1) // cores) * 128 * 384
+    return int(delayed_work < normal_work)
+
+
+def _tp8_plan_s4(model_batch, tp, cores):
+    """采用保守的源码调度策略，不依赖实测性能查找表。"""
+    if tp != TP8_TP_DEGREE or not 1 <= model_batch <= 32 or cores not in VALID_CORES:
+        raise ValueError("S4 requires TP8, model batch 1..32, AIC 8/16/24/28/32")
+    total_rows = model_batch * tp * S4_SEQUENCE_LENGTH
+    main_rows = math.gcd(total_rows, 128)
+    width = 384
+    if total_rows >= 512 and total_rows % 256 == 0:
+        main_rows, width = 256, 256
+    template = 0
+    if cores == 32:
+        if model_batch <= 2:
+            main_rows, width, template = total_rows, 128, 1
+        elif model_batch in (8, 16):
+            main_rows, width, template = 128, 384, 2
+
+    return dict(
+        main_rows=main_rows,
+        width=width,
+        policy=4 if total_rows <= 128 else 0,
+        template=template,
+    )
+
+
+class TP8TPOptimizedKernel:
+    """实现单个 TP，为 S8 和 S4 分别缓存编译后的可调用对象。"""
+
+    def __init__(self, sequence):
+        self.sequence = sequence
+        if sequence == S8_SEQUENCE_LENGTH:
+            self.stage = TP8S8Dispatch(TP8_HEADS)
+        else:
+            self.stage = TP8S4MultiCoreSchedule(TP8_HEADS)
+            self.parallel = S4ParallelSchedule()
+            self.pipelined = TP8S4MultiCoreSchedule(TP8_HEADS, pipelined=True)
+
+    @kernel(
+        profile=cannbotdsl.ProfileSpec(
+            name="mega_recurrent_kda_tp8",
+            op_type="MegaRecurrentKDA",
+            outputs=("out", "replay_u", "replay_k", "replay_decay"),
+            inouts=("conv",),
+        )
+    )
+    def device(
+        self,
+        out,
+        q,
+        k,
+        v,
+        decay,
+        gate,
+        beta,
+        fa,
+        norm,
+        x,
+        wqkv,
+        wa,
+        wb,
+        wbeta,
+        wz,
+        gamma,
+        wo,
+        alog,
+        bias,
+        checkpoint,
+        conv,
+        indices,
+        accepted,
+        wc,
+        replay_u,
+        replay_k,
+        replay_decay,
+        checkpoint_stride0,
+        conv_stride0,
+        conv_length,
+        u_stride0,
+        k_stride0,
+        decay_stride0,
+        record_s,
+        scale,
+        lower,
+        eps,
+        main_rows,
+        width,
+        policy,
+        selector,
+        accurate_raw,
+        accurate_decay,
+    ):
+        initial = _CheckpointPool(
+            checkpoint, indices, checkpoint_stride0, accurate_decay
+        )
+        conv = _ConvPool(
+            conv, conv_stride0, conv_length, 3 * TP8_HEADS * TILE, accurate_raw
+        )
+        u = ReplayPool(replay_u, indices, u_stride0, TP8_HEADS, record_s)
+        rk = ReplayPool(replay_k, indices, k_stride0, TP8_HEADS, record_s)
+        rd = ReplayPool(replay_decay, indices, decay_stride0, TP8_HEADS, record_s)
+        if const_expr(self.sequence == S8_SEQUENCE_LENGTH):
+            self.stage.execute(
+                out,
+                q,
+                k,
+                v,
+                decay,
+                gate,
+                beta,
+                fa,
+                norm,
+                x,
+                wqkv,
+                wa,
+                wb,
+                wbeta,
+                wz,
+                gamma,
+                wo,
+                alog,
+                bias,
+                initial,
+                u,
+                rk,
+                rd,
+                conv,
+                indices,
+                accepted,
+                wc,
+                scale,
+                lower,
+                eps,
+                main_rows,
+                width,
+                policy,
+                selector,
+            )
+        else:
+            output_rows = main_rows if main_rows <= 128 else 128
+            if selector == 1:
+                self.parallel.execute(
+                    out,
+                    q,
+                    k,
+                    v,
+                    decay,
+                    gate,
+                    beta,
+                    fa,
+                    norm,
+                    x,
+                    wqkv,
+                    wa,
+                    wb,
+                    wbeta,
+                    wz,
+                    gamma,
+                    wo,
+                    alog,
+                    bias,
+                    initial,
+                    u,
+                    rk,
+                    rd,
+                    conv,
+                    indices,
+                    accepted,
+                    wc,
+                    scale,
+                    lower,
+                    eps,
+                    main_rows,
+                    width,
+                    policy,
+                    output_rows,
+                )
+            elif selector == 2:
+                self.pipelined.execute(
+                    out,
+                    q,
+                    k,
+                    v,
+                    decay,
+                    gate,
+                    beta,
+                    fa,
+                    norm,
+                    x,
+                    wqkv,
+                    wa,
+                    wb,
+                    wbeta,
+                    wz,
+                    gamma,
+                    wo,
+                    alog,
+                    bias,
+                    initial,
+                    u,
+                    rk,
+                    rd,
+                    conv,
+                    indices,
+                    accepted,
+                    wc,
+                    scale,
+                    lower,
+                    eps,
+                    main_rows,
+                    width,
+                    policy,
+                    output_rows,
+                )
+            else:
+                self.stage.execute(
+                    out,
+                    q,
+                    k,
+                    v,
+                    decay,
+                    gate,
+                    beta,
+                    fa,
+                    norm,
+                    x,
+                    wqkv,
+                    wa,
+                    wb,
+                    wbeta,
+                    wz,
+                    gamma,
+                    wo,
+                    alog,
+                    bias,
+                    initial,
+                    u,
+                    rk,
+                    rd,
+                    conv,
+                    indices,
+                    accepted,
+                    wc,
+                    scale,
+                    lower,
+                    eps,
+                    main_rows,
+                    width,
+                    policy,
+                    output_rows,
+                )
+
+    @host
+    def run(
+        self,
+        out,
+        q,
+        k,
+        v,
+        decay,
+        gate,
+        beta,
+        fa,
+        norm,
+        x,
+        wqkv,
+        wa,
+        wb,
+        wbeta,
+        wz,
+        gamma,
+        wo,
+        alog,
+        bias,
+        checkpoint,
+        conv,
+        indices,
+        accepted,
+        wc,
+        replay_u,
+        replay_k,
+        replay_decay,
+        checkpoint_stride0,
+        conv_stride0,
+        conv_length,
+        u_stride0,
+        k_stride0,
+        decay_stride0,
+        record_s,
+        scale,
+        lower,
+        eps,
+        main_rows,
+        width,
+        policy,
+        selector,
+        cores,
+        accurate_raw,
+        accurate_decay,
+    ):
+        self.device[cores](
+            out,
+            q,
+            k,
+            v,
+            decay,
+            gate,
+            beta,
+            fa,
+            norm,
+            x,
+            wqkv,
+            wa,
+            wb,
+            wbeta,
+            wz,
+            gamma,
+            wo,
+            alog,
+            bias,
+            checkpoint,
+            conv,
+            indices,
+            accepted,
+            wc,
+            replay_u,
+            replay_k,
+            replay_decay,
+            checkpoint_stride0,
+            conv_stride0,
+            conv_length,
+            u_stride0,
+            k_stride0,
+            decay_stride0,
+            record_s,
+            scale,
+            lower,
+            eps,
+            main_rows,
+            width,
+            policy,
+            selector,
+            accurate_raw,
+            accurate_decay,
+        )
+
+
+class TP8VariableLengthKDAKernel:
+    """当前 TP 的变长兜底内核，PA 记录池使用各自独立的步长。"""
+
+    @kernel
+    def project(self, out, x, weight):
+        onchip_rewind(reset_sync_id=True)
+        stage = SequenceProjectionStage()
+        stage.project(out, x, weight)
+
+    @kernel
+    def convolve(self, out, raw, conv, indices, accepted, cu, weight, conv_stride0):
+        onchip_rewind(reset_sync_id=True)
+        stage = SequenceConvStage()
+        stage.convolve(out, raw, conv, indices, accepted, cu, weight, conv_stride0)
+
+    @kernel
+    def recurrent(
+        self,
+        out,
+        convout,
+        decay,
+        beta,
+        z,
+        gamma,
+        alog,
+        bias,
+        checkpoint,
+        indices,
+        cu,
+        replay_u,
+        replay_k,
+        replay_decay,
+        checkpoint_stride0,
+        u_stride0,
+        k_stride0,
+        decay_stride0,
+        record_s,
+        scale,
+        lower,
+        eps,
+    ):
+        onchip_rewind(reset_sync_id=True)
+        u = ReplayPool(replay_u, indices, u_stride0, TP8_HEADS, record_s)
+        rk = ReplayPool(replay_k, indices, k_stride0, TP8_HEADS, record_s)
+        rd = ReplayPool(replay_decay, indices, decay_stride0, TP8_HEADS, record_s)
+        stage = SequenceRecurrentStage(TP8_HEADS)
+        stage.replay(
+            out,
+            convout,
+            decay,
+            beta,
+            z,
+            gamma,
+            alog,
+            bias,
+            checkpoint,
+            indices,
+            cu,
+            u,
+            rk,
+            rd,
+            checkpoint_stride0,
+            scale,
+            lower,
+            eps,
+        )
+
+    @host
+    def run(
+        self,
+        out,
+        x,
+        wqkv,
+        wa,
+        wb,
+        wbeta,
+        wz,
+        gamma,
+        wo,
+        wc,
+        conv,
+        checkpoint,
+        indices,
+        accepted,
+        cu,
+        alog,
+        bias,
+        replay_u,
+        replay_k,
+        replay_decay,
+        raw,
+        fa,
+        decay,
+        beta,
+        z,
+        convolved,
+        gated,
+        conv_stride0,
+        checkpoint_stride0,
+        u_stride0,
+        k_stride0,
+        decay_stride0,
+        record_s,
+        scale,
+        lower,
+        eps,
+        cores,
+    ):
+        self.project[cores](z, x, wz)
+        self.convolve[2 * cores](
+            convolved, raw, conv, indices, accepted, cu, wc, conv_stride0
+        )
+        self.recurrent[2 * cores](
+            gated,
+            convolved,
+            decay,
+            beta,
+            z,
+            gamma,
+            alog,
+            bias,
+            checkpoint,
+            indices,
+            cu,
+            replay_u,
+            replay_k,
+            replay_decay,
+            checkpoint_stride0,
+            u_stride0,
+            k_stride0,
+            decay_stride0,
+            record_s,
+            scale,
+            lower,
+            eps,
+        )
+        self.project[cores](out, gated, wo)
+
+
+class TP16GridSchedule(
+    TP16GridScheduleFrontendOperations, GridScheduleBackendOperations
+):
+    """使用编译期分支配置，并共用一套 KDA 波次调度。"""
+
+    def __init__(self, block_num: int, hidden_size: int, num_heads: int):
+        self.state_store_l2_cache_ctl = 0
+        self.block_num = block_num
+        self.hidden_size = hidden_size
+        self.num_heads = num_heads
+        self.projection_groups = 8
+        self.batch_tile = BATCH_TILE
+        self.qkv_block_count = 3 * num_heads
+        self.output_gate_block_count = num_heads
+        self.beta_block = self.qkv_block_count + num_heads
+        self.low_rank_block = self.beta_block + 1
+        self.recurrent_wave_count = 2
+        self.output_tiles_per_core = {8: 7, 16: 2, 24: 2, 28: 1, 32: 1}[block_num]
+        self.output_tile_width = {8: 128, 16: 256, 24: 256, 28: 256, 32: 256}[block_num]
+        activation_channel_bytes = 2 * 64 * OPROJ_KC * 2
+        self.output_weight_resident = (
+            self.output_tile_width * self.output_tiles_per_core * num_heads * TILE * 2
+            + activation_channel_bytes
+            <= cannbotdsl.get_mem_size("l1")
+        )
         self.projection_input_l2_cache_ctl = 0
         self.projection_weight_l2_cache_ctl = 4
         self.batch_groups: object
@@ -1148,713 +4410,101 @@ class _GridSchedule:
         self.recurrent_wave_rows: object
 
     @jit
-    def _run_qkvg_task(self, projection_stage: ProjectionStage, conv_stage: ConvSiluStage, hidden_gm: Tensor,
-        q_workspace_gm: Tensor, k_workspace_gm: Tensor, v_workspace_gm: Tensor, output_gate_workspace_gm: Tensor,
-        qkv_weight_gm: Tensor, output_gate_weight_gm: Tensor, conv_state_gm: Tensor, conv_state_indices_gm: Tensor,
-        conv_accepted_gm: Tensor, conv_weight_gm: Tensor, projection_kind, projection_head, batch_start, batch_count,
-        subblock_idx, k_tiles):
-        """Run one complete QKV+Conv or gate projection task."""
-        if projection_kind == 0:
-            projection_stage.matmul_hidden(hidden_gm, qkv_weight_gm, projection_head, k_tiles)
-            batches_per_subblock = batch_count // 2
-            selected_history = Buffer(MemLoc.UB, dtypes.bfloat16, make_layout((batches_per_subblock * (CONV_KERNEL - 1), TILE)))
-            for candidate_head in range(3 * self.num_heads):
-                if projection_head == candidate_head:
-                    projection = candidate_head // self.num_heads
-                    value_head = candidate_head - projection * self.num_heads
-                    conv_stage.load_weight(
-                        tile_slice(conv_weight_gm[projection, value_head, None, None], (CONV_KERNEL, TILE), (0, 0)))
-                    for local_batch in range(batches_per_subblock):
-                        batch_index = batch_start + subblock_idx * batches_per_subblock + local_batch
-                        cache_index = dtypes.int64(conv_state_indices_gm[batch_index])
-                        conv_accepted = dtypes.int64(conv_accepted_gm[batch_index])
-                        history_offset = conv_accepted - 1 if conv_accepted > 0 else 0
-                        if cache_index != 0:
-                            state_view = conv_state_gm[cache_index, None, None]
-                            for history_row in range(CONV_KERNEL - 1):
-                                mem_copy(
-                                    tile_slice(
-                                        selected_history, (1, TILE),
-                                            (local_batch * (CONV_KERNEL - 1) + history_row, 0)),
-                                    tile_slice(state_view, (1, TILE), (history_offset + history_row, candidate_head)))
-            projection_stage.acquire_result()
-            for candidate_head in range(3 * self.num_heads):
-                if projection_head == candidate_head:
-                    for local_batch in range(batches_per_subblock):
-                        batch_index = batch_start + subblock_idx * batches_per_subblock + local_batch
-                        cache_index = dtypes.int64(conv_state_indices_gm[batch_index])
-                        if cache_index == 0:
-                            conv_stage.zero_sequence(local_batch)
-                        else:
-                            history_view = tile_slice(selected_history, (CONV_KERNEL - 1, TILE), (local_batch, 0))
-                            conv_stage.install_history(history_view)
-                            state_view = conv_state_gm[cache_index, None, None]
-                            for cache_row in range(2):
-                                mem_copy(
-                                    tile_slice(state_view, (1, TILE), (cache_row, candidate_head)),
-                                    tile_slice(history_view, (1, TILE), (cache_row + 1, 0)))
-                            conv_stage.convolve_sequence(local_batch, projection_stage.projection_fp32,
-                                tile_slice(conv_stage.weight, (CONV_KERNEL, TILE), (0, 0)))
-                    vec_sync_notify(PIPE.V, PIPE.MTE3, CONV_RAW_V_TO_MTE3_EVENT)
-                    vec_sync_wait(PIPE.V, PIPE.MTE3, CONV_RAW_V_TO_MTE3_EVENT)
-                    for local_batch in range(batches_per_subblock):
-                        batch_index = batch_start + subblock_idx * batches_per_subblock + local_batch
-                        cache_index = dtypes.int64(conv_state_indices_gm[batch_index])
-                        if cache_index != 0:
-                            state_view = conv_state_gm[cache_index, None, None]
-                            for cache_token in range(self.seq_len):
-                                mem_copy(
-                                    tile_slice(state_view, (1, TILE), (cache_token + 2, candidate_head)),
-                                    tile_slice(
-                                        conv_stage.raw_bf16, (1, TILE), (local_batch * self.seq_len + cache_token, 0)))
-            vec_sync_all()
-            if projection_head < self.num_heads:
-                projection_stage.publish_source(
-                    tile_slice(q_workspace_gm, (projection_stage.row_capacity, TILE), (0, projection_head)),
-                    conv_stage.output_bf16, subblock_idx)
-            elif projection_head < 2 * self.num_heads:
-                projection_stage.publish_source(
-                    tile_slice(
-                        k_workspace_gm, (projection_stage.row_capacity, TILE), (0, projection_head - self.num_heads)),
-                    conv_stage.output_bf16,
-                    subblock_idx)
-            else:
-                projection_stage.publish_source(
-                    tile_slice(
-                        v_workspace_gm, (projection_stage.row_capacity, TILE), (0,
-                            projection_head - 2 * self.num_heads)),
-                    conv_stage.output_bf16,
-                    subblock_idx)
-        else:
-            projection_stage.project(hidden_gm, output_gate_weight_gm, projection_head, k_tiles)
-            projection_stage.publish(
-                tile_slice(output_gate_workspace_gm, (projection_stage.row_capacity, TILE), (0, projection_head)),
-                subblock_idx)
-        vec_sync_all()
-
-    @jit
-    def _run_frontend_main_task(self, projection_stage: ProjectionStage, conv_stage: ConvSiluStage,
-        low_rank_stage: LowRankDecayStage, q_workspace_gm: Tensor, k_workspace_gm: Tensor, v_workspace_gm: Tensor,
-        decay_workspace_gm: Tensor, output_gate_workspace_gm: Tensor, hidden_gm: Tensor, qkv_weight_gm: Tensor,
-        fa_weight_gm: Tensor, fb_weight_gm: Tensor, output_gate_weight_gm: Tensor, conv_state_gm: Tensor,
-        conv_state_indices_gm: Tensor, conv_accepted_gm: Tensor, conv_weight_gm: Tensor, projection_kind,
-        projection_head, batch_start, batch_count, subblock_idx, k_tiles):
-        rows = projection_stage.row_capacity
-        row_tile = batch_start // batch_count
-        hidden_tile = make_tiler((rows, self.hidden_size), alignment=(16, 16))
-        qkv_tile = make_tiler((rows, self.num_heads * TILE), alignment=(16, 16))
-        if projection_kind < 2:
-            self._run_qkvg_task(projection_stage, conv_stage, tile_slice(hidden_gm, hidden_tile, (row_tile, 0)),
-                tile_slice(q_workspace_gm, qkv_tile, (row_tile, 0)),
-                tile_slice(k_workspace_gm, qkv_tile, (row_tile, 0)),
-                tile_slice(v_workspace_gm, qkv_tile, (row_tile, 0)),
-                tile_slice(output_gate_workspace_gm, qkv_tile, (row_tile, 0)), qkv_weight_gm, output_gate_weight_gm,
-                conv_state_gm, conv_state_indices_gm, conv_accepted_gm, conv_weight_gm, projection_kind,
-                projection_head, batch_start, batch_count, subblock_idx, k_tiles)
-        else:
-            low_rank_stage.project(tile_slice(decay_workspace_gm, qkv_tile, (row_tile, 0)),
-                tile_slice(hidden_gm, hidden_tile, (row_tile, 0)), fa_weight_gm, fb_weight_gm, k_tiles, subblock_idx)
-
-    @jit
-    def _prefetch_n384_panel(self, conv_stage: ConvSiluStage, selected_history, conv_state_gm: Tensor,
-        conv_state_indices_gm: Tensor, conv_accepted_gm: Tensor, conv_weight_gm: Tensor, n_macro, batch_base,
-        batches_per_subblock, panel):
-        """Fetch one panel's Conv metadata while its projection is in flight."""
-        logical_n = n_macro * 3 + panel
-        if logical_n < 3 * self.num_heads:
-            projection = logical_n // self.num_heads
-            value_head = logical_n - projection * self.num_heads
-            mem_copy(
-                tile_slice(conv_stage.weight, (CONV_KERNEL, TILE), (panel, 0)),
-                tile_slice(conv_weight_gm[projection, value_head, None, None], (CONV_KERNEL, TILE), (0, 0)))
-            for local_batch in range(batches_per_subblock):
-                batch_index = batch_base + local_batch
-                cache_index = dtypes.int64(conv_state_indices_gm[batch_index])
-                conv_accepted = dtypes.int64(conv_accepted_gm[batch_index])
-                history_offset = conv_accepted - 1 if conv_accepted > 0 else 0
-                if cache_index != 0:
-                    state_view = conv_state_gm[cache_index, None, None]
-                    mem_copy(
-                        tile_slice(selected_history, (CONV_KERNEL - 1, TILE), (local_batch, 0)),
-                        tile_slice(state_view[None, history_offset: history_offset + CONV_KERNEL - 1, None],
-                            (CONV_KERNEL - 1, TILE), (0, logical_n)))
-
-    @jit
-    def _consume_n384_panel(self, projection_stage: _ResidentN384ProjectionStage, conv_stage: ConvSiluStage,
-        selected_history, weight_ub, q_workspace_gm: Tensor, k_workspace_gm: Tensor, v_workspace_gm: Tensor,
-        output_gate_workspace_gm: Tensor, conv_state_gm: Tensor, conv_state_indices_gm: Tensor, m_group, n_macro,
-        batch_base, batches_per_subblock, subblock_idx, panel):
-        """Consume one resident N128 accumulator while Cube holds the other two."""
-        logical_n = n_macro * 3 + panel
-        if logical_n < 3 * self.num_heads:
-            projection = logical_n // self.num_heads
-            value_head = logical_n - projection * self.num_heads
-            for local_batch in range(batches_per_subblock):
-                batch_index = batch_base + local_batch
-                cache_index = dtypes.int64(conv_state_indices_gm[batch_index])
-                if cache_index == 0:
-                    conv_stage.zero_sequence(local_batch)
-                else:
-                    history_view = tile_slice(selected_history, (CONV_KERNEL - 1, TILE), (local_batch, 0))
-                    conv_stage.install_history(history_view)
-                    state_view = conv_state_gm[cache_index, None, None]
-                    mem_copy(
-                        tile_slice(state_view[None, 0:2, None], (2, TILE), (0, logical_n)),
-                        tile_slice(history_view[1:3, None], (2, TILE), (0, 0)))
-                    conv_stage.convolve_sequence(local_batch, projection_stage.projection_fp32, weight_ub)
-                    vec_sync_notify(PIPE.V, PIPE.MTE3, CONV_RAW_V_TO_MTE3_EVENT)
-                    vec_sync_wait(PIPE.V, PIPE.MTE3, CONV_RAW_V_TO_MTE3_EVENT)
-                    mem_copy(
-                        tile_slice(state_view[None, 2: 2 + self.seq_len, None], (self.seq_len, TILE), (0, logical_n)),
-                        tile_slice(conv_stage.raw_bf16, (self.seq_len, TILE), (local_batch, 0)))
-            vec_sync_all()
-            if projection == 0:
-                projection_stage.publish(q_workspace_gm, m_group, value_head, subblock_idx, conv_stage.output_bf16)
-            elif projection == 1:
-                projection_stage.publish(k_workspace_gm, m_group, value_head, subblock_idx, conv_stage.output_bf16)
-            else:
-                projection_stage.publish(v_workspace_gm, m_group, value_head, subblock_idx, conv_stage.output_bf16)
-        else:
-            gate_head = logical_n - 3 * self.num_heads
-            projection_stage.cast_result()
-            vec_sync_all()
-            projection_stage.publish(
-                output_gate_workspace_gm, m_group, gate_head, subblock_idx, projection_stage.projection_bf16)
-        vec_sync_all()
-
-    @jit
-    def _consume_n384_triplet(self, projection_stage: _ResidentN384ProjectionStage, conv_stage: ConvSiluStage,
-        selected_history, q_workspace_gm: Tensor, k_workspace_gm: Tensor, v_workspace_gm: Tensor,
-        output_gate_workspace_gm: Tensor, conv_state_gm: Tensor, conv_state_indices_gm: Tensor,
-        conv_accepted_gm: Tensor, conv_weight_gm: Tensor, m_group, n_macro, batch_base, batches_per_subblock,
-        subblock_idx):
-        history0 = tile_slice(selected_history, (batches_per_subblock * (CONV_KERNEL - 1), TILE), (0, 0))
-        history1 = tile_slice(selected_history, (batches_per_subblock * (CONV_KERNEL - 1), TILE), (1, 0))
-        history2 = tile_slice(selected_history, (batches_per_subblock * (CONV_KERNEL - 1), TILE), (2, 0))
-        weight0 = tile_slice(conv_stage.weight, (CONV_KERNEL, TILE), (0, 0))
-        weight1 = tile_slice(conv_stage.weight, (CONV_KERNEL, TILE), (1, 0))
-        weight2 = tile_slice(conv_stage.weight, (CONV_KERNEL, TILE), (2, 0))
-        self._prefetch_n384_panel(conv_stage, history0, conv_state_gm, conv_state_indices_gm, conv_accepted_gm,
-            conv_weight_gm, n_macro, batch_base, batches_per_subblock, 0)
-        self._prefetch_n384_panel(conv_stage, history1, conv_state_gm, conv_state_indices_gm, conv_accepted_gm,
-            conv_weight_gm, n_macro, batch_base, batches_per_subblock, 1)
-        self._prefetch_n384_panel(conv_stage, history2, conv_state_gm, conv_state_indices_gm, conv_accepted_gm,
-            conv_weight_gm, n_macro, batch_base, batches_per_subblock, 2)
-        vec_sync_all()
-        projection_stage.acquire_result0()
-        self._consume_n384_panel(projection_stage, conv_stage, history0, weight0, q_workspace_gm, k_workspace_gm,
-            v_workspace_gm, output_gate_workspace_gm, conv_state_gm, conv_state_indices_gm, m_group, n_macro,
-            batch_base, batches_per_subblock, subblock_idx, 0)
-        projection_stage.acquire_result1()
-        self._consume_n384_panel(projection_stage, conv_stage, history1, weight1, q_workspace_gm, k_workspace_gm,
-            v_workspace_gm, output_gate_workspace_gm, conv_state_gm, conv_state_indices_gm, m_group, n_macro,
-            batch_base, batches_per_subblock, subblock_idx, 1)
-        projection_stage.acquire_result2()
-        self._consume_n384_panel(projection_stage, conv_stage, history2, weight2, q_workspace_gm, k_workspace_gm,
-            v_workspace_gm, output_gate_workspace_gm, conv_state_gm, conv_state_indices_gm, m_group, n_macro,
-            batch_base, batches_per_subblock, subblock_idx, 2)
-
-    @jit
-    def _frontend_adaptive_n384(self, q_workspace_gm: Tensor, k_workspace_gm: Tensor, v_workspace_gm: Tensor,
-        decay_workspace_gm: Tensor, output_gate_workspace_gm: Tensor, hidden_gm: Tensor, qkv_weight_gm: Tensor,
-        fa_weight_gm: Tensor, fb_weight_gm: Tensor, output_gate_weight_gm: Tensor, conv_state_gm: Tensor,
-        conv_state_indices_gm: Tensor, conv_accepted_gm: Tensor, conv_weight_gm: Tensor):
-        """Balance every group's eight M128xN384 tasks across the launch grid."""
-        block_idx = get_block_idx()
-        block_num = self.block_num
-        subblock_idx = get_subblock_id()
-        k_tiles = ceil_div(hidden_gm.shape[1], TILE)
-        task_count = self.batch_groups * 8
-        batches_per_subblock = BATCH_TILE // 2
-        for task_idx in range(block_idx, task_count, block_num):
-            n_macro = task_idx // self.batch_groups
-            m_group = task_idx - n_macro * self.batch_groups
-            batch_base = m_group * BATCH_TILE + subblock_idx * batches_per_subblock
-            onchip_rewind(reset_sync_id=True)
-            if n_macro == 7 and task_count <= block_num:
-                projection_stage = GateDecayProjectionStage(
-                    self.projection_input_l2_cache_ctl, self.projection_weight_l2_cache_ctl)
-                projection_stage.matmul_hidden3_fa(hidden_gm, output_gate_weight_gm, fa_weight_gm, m_group, k_tiles)
-                projection_stage.publish_gate(output_gate_workspace_gm, m_group, subblock_idx)
-                projection_stage.project_fb(decay_workspace_gm, fb_weight_gm, m_group, subblock_idx)
-            else:
-                projection_stage = _ResidentN384ProjectionStage(
-                    self.projection_input_l2_cache_ctl, self.projection_weight_l2_cache_ctl)
-                conv_stage = ConvSiluStage(self.seq_len, TILE // 2)
-                selected_history = Buffer(
-                    MemLoc.UB,
-                    dtypes.bfloat16,
-                    make_layout((3 * batches_per_subblock * (CONV_KERNEL - 1), TILE)),
-                )
-                if n_macro < 6:
-                    projection_stage.matmul_hidden3(hidden_gm, qkv_weight_gm, m_group, n_macro, k_tiles)
-                else:
-                    projection_stage.matmul_hidden3(hidden_gm, output_gate_weight_gm, m_group, n_macro - 6, k_tiles)
-                self._consume_n384_triplet(projection_stage, conv_stage, selected_history, q_workspace_gm,
-                    k_workspace_gm, v_workspace_gm, output_gate_workspace_gm, conv_state_gm, conv_state_indices_gm,
-                    conv_accepted_gm, conv_weight_gm, m_group, n_macro, batch_base, batches_per_subblock, subblock_idx)
-
-    @jit
-    def _frontend_adaptive_auxiliary(self, decay_workspace_gm: Tensor, beta_workspace_gm: Tensor, hidden_gm: Tensor,
-        fa_weight_gm: Tensor, fb_weight_gm: Tensor, beta_weight_gm: Tensor):
-        """Place Beta and multi-wave decay tasks on the lightest AICs."""
-        block_idx = get_block_idx()
-        block_num = self.block_num
-        subblock_idx = get_subblock_id()
-        task_count = self.batch_groups * 8
-        extra_task_cores = task_count % block_num
-        aux_start = block_num - 8 if extra_task_cores == 0 else extra_task_cores
-        aux_slot = (block_idx - aux_start + block_num) % block_num
-        auxiliary_count = self.batch_groups if task_count <= block_num else 2 * self.batch_groups
-        k_tiles = ceil_div(hidden_gm.shape[1], TILE)
-        for auxiliary_idx in range(aux_slot, auxiliary_count, block_num):
-            onchip_rewind(reset_sync_id=True)
-            if auxiliary_idx < self.batch_groups:
-                m_group = auxiliary_idx
-                beta_stage = ProjectionStage(row_count=TILE, row_capacity=TILE, tile_width=BETA_TILE,
-                    input_l2_cache_ctl=self.projection_input_l2_cache_ctl,
-                    weight_l2_cache_ctl=self.projection_weight_l2_cache_ctl)
-                beta_stage.project_to_gm(tile_slice(hidden_gm, (TILE, self.hidden_size), (m_group, 0)), beta_weight_gm,
-                    tile_slice(beta_workspace_gm, (TILE, BETA_TILE), (m_group, 0)), 0, k_tiles)
-                vec_sync_all()
-            else:
-                m_group = auxiliary_idx - self.batch_groups
-                projection_stage = ProjectionStage(row_count=TILE, row_capacity=TILE,
-                    input_l2_cache_ctl=self.projection_input_l2_cache_ctl,
-                    weight_l2_cache_ctl=self.projection_weight_l2_cache_ctl)
-                low_rank_stage = LowRankDecayStage(projection_stage, self.num_heads)
-                low_rank_stage.project(tile_slice(decay_workspace_gm, (TILE, self.num_heads * TILE), (m_group, 0)),
-                    tile_slice(hidden_gm, (TILE, self.hidden_size), (m_group, 0)), fa_weight_gm, fb_weight_gm, k_tiles,
-                    subblock_idx)
-
-    @jit
-    def _frontend_tail(self, q_workspace_gm: Tensor, k_workspace_gm: Tensor, v_workspace_gm: Tensor,
-        decay_workspace_gm: Tensor, output_gate_workspace_gm: Tensor, beta_workspace_gm: Tensor, hidden_gm: Tensor,
-        qkv_weight_gm: Tensor, fa_weight_gm: Tensor, fb_weight_gm: Tensor, beta_weight_gm: Tensor,
-        output_gate_weight_gm: Tensor, accepted_gm: Tensor, conv_state_gm: Tensor, conv_state_indices_gm: Tensor,
-        conv_accepted_gm: Tensor, conv_weight_gm: Tensor):
-        """Exact host-model task order; cores progress without a grid barrier."""
-        self.seq_len = 8
-        self.row_count = 128
-        self.projection_row_block = 64
-        block_idx = get_block_idx()
-        subblock_idx = get_subblock_id()
-        groups = accepted_gm.shape[0] // 16
-        k_tiles = ceil_div(hidden_gm.shape[1], TILE)
-        frontend_weight_l2_cache_ctl = 1
-        full_qkv_count = 32 if groups == 2 else groups * 18
-        full_gate_count = 0 if groups == 2 else 7 if groups == 3 else 20
-        full_stage = ProjectionStage(row_count=128, row_capacity=128,
-            input_l2_cache_ctl=self.projection_input_l2_cache_ctl, weight_l2_cache_ctl=frontend_weight_l2_cache_ctl)
-        full_conv = ConvSiluStage(8, 64, row_capacity=64)
-        full_decay = LowRankDecayStage(full_stage, self.num_heads)
-        for local_round in range(groups - 1):
-            ordinal = local_round * 32 + block_idx
-            projection_kind = 0
-            logical = ordinal
-            if ordinal >= full_qkv_count:
-                projection_kind = 1
-                logical = ordinal - full_qkv_count
-                if logical >= full_gate_count:
-                    projection_kind = 2
-                    logical = logical - full_gate_count
-            projection_head = logical // groups
-            group = logical % groups
-            self._run_frontend_main_task(full_stage, full_conv, full_decay, q_workspace_gm, k_workspace_gm,
-                v_workspace_gm, decay_workspace_gm, output_gate_workspace_gm, hidden_gm, qkv_weight_gm, fa_weight_gm,
-                fb_weight_gm, output_gate_weight_gm, conv_state_gm, conv_state_indices_gm, conv_accepted_gm,
-                conv_weight_gm, projection_kind, projection_head, group * 16, 16, subblock_idx, k_tiles)
-        cube_sync_all()
-        vec_sync_all()
-        onchip_rewind(reset_sync_id=True)
-        if groups == 2 or (groups == 3 and block_idx < 12):
-            half_stage = ProjectionStage(row_count=64, row_capacity=64,
-                input_l2_cache_ctl=self.projection_input_l2_cache_ctl,
-                weight_l2_cache_ctl=frontend_weight_l2_cache_ctl)
-            half_conv = ConvSiluStage(8, 32, row_capacity=32)
-            half_decay = LowRankDecayStage(half_stage, self.num_heads)
-            projection_kind = 1
-            logical = block_idx // 2 + 7
-            if groups == 2:
-                if block_idx < 8:
-                    projection_kind = 0
-                    logical = block_idx // 2 + 32
-                elif block_idx < 28:
-                    logical = (block_idx - 8) // 2
-                else:
-                    projection_kind = 2
-                    logical = (block_idx - 28) // 2
-            projection_head = logical // groups
-            group = logical % groups
-            batch_start = group * 16 + block_idx % 2 * 8
-            self._run_frontend_main_task(half_stage, half_conv, half_decay, q_workspace_gm, k_workspace_gm,
-                v_workspace_gm, decay_workspace_gm, output_gate_workspace_gm, hidden_gm, qkv_weight_gm, fa_weight_gm,
-                fb_weight_gm, output_gate_weight_gm, conv_state_gm, conv_state_indices_gm, conv_accepted_gm,
-                conv_weight_gm, projection_kind, projection_head, batch_start, 8, subblock_idx, k_tiles)
-            cube_sync_all()
-            vec_sync_all()
-        onchip_rewind(reset_sync_id=True)
-        quarter_core = 0 if groups == 2 else 12 if groups == 3 else 8
-        quarter_count = 8 if groups == 2 else 20 if groups == 3 else 16
-        if block_idx >= quarter_core and block_idx < quarter_core + quarter_count:
-            quarter_stage = ProjectionStage(row_count=32, row_capacity=32,
-                input_l2_cache_ctl=self.projection_input_l2_cache_ctl,
-                weight_l2_cache_ctl=frontend_weight_l2_cache_ctl)
-            piece = block_idx - quarter_core
-            first_gate = 10 if groups == 2 else 13 if groups == 3 else 20
-            logical = first_gate + piece // 4
-            projection_head = logical // groups
-            group = logical % groups
-            row_tile = group * 4 + piece % 4
-            quarter_stage.project(tile_slice(hidden_gm, (32, self.hidden_size), (row_tile, 0)), output_gate_weight_gm,
-                projection_head, k_tiles)
-            quarter_stage.publish(
-                tile_slice(output_gate_workspace_gm, (32, TILE), (row_tile, projection_head)), subblock_idx)
-            cube_sync_all()
-            vec_sync_all()
-        onchip_rewind(reset_sync_id=True)
-        beta_group = -1
-        if groups == 2:
-            if block_idx >= 8 and block_idx < 10:
-                beta_group = block_idx - 8
-        elif groups == 3:
-            if block_idx >= 12 and block_idx <= 20 and (block_idx % 4 == 0):
-                beta_group = (block_idx - 12) // 4
-        elif block_idx >= 24 and block_idx < 28:
-            beta_group = block_idx - 24
-        if beta_group >= 0:
-            beta_stage = ProjectionStage(row_count=128, row_capacity=128, tile_width=BETA_TILE,
-                input_l2_cache_ctl=self.projection_input_l2_cache_ctl,
-                weight_l2_cache_ctl=frontend_weight_l2_cache_ctl)
-            beta_stage.project_to_gm(tile_slice(hidden_gm, (128, self.hidden_size), (beta_group, 0)), beta_weight_gm,
-                tile_slice(beta_workspace_gm, (128, BETA_TILE), (beta_group, 0)), 0, k_tiles)
-
-    @jit
-    def _frontend_flat_m128(self, q_workspace_gm: Tensor, k_workspace_gm: Tensor, v_workspace_gm: Tensor,
-        decay_workspace_gm: Tensor, output_gate_workspace_gm: Tensor, beta_workspace_gm: Tensor, hidden_gm: Tensor,
-        qkv_weight_gm: Tensor, fa_weight_gm: Tensor, fb_weight_gm: Tensor, beta_weight_gm: Tensor,
-        output_gate_weight_gm: Tensor, accepted_gm: Tensor, conv_state_gm: Tensor, conv_state_indices_gm: Tensor,
-        conv_accepted_gm: Tensor, conv_weight_gm: Tensor):
-        self.seq_len = 8
-        self.row_count = 128
-        self.projection_row_block = 64
-        block_idx = get_block_idx()
-        subblock_idx = get_subblock_id()
-        block_num = self.block_num
-        k_tiles = ceil_div(hidden_gm.shape[1], TILE)
-        groups = accepted_gm.shape[0] // BATCH_TILE
-        task_count = groups * 24
-        round_count = ceil_div(task_count, block_num)
-        hidden_tile = make_tiler((128, self.hidden_size), alignment=(16, 16))
-        qkv_tile = make_tiler((128, self.num_heads * TILE), alignment=(16, 16))
-        beta_tile = make_tiler((128, BETA_TILE), alignment=(16, 16))
-        projection_stage = ProjectionStage(row_count=128, input_l2_cache_ctl=self.projection_input_l2_cache_ctl,
-            weight_l2_cache_ctl=self.projection_weight_l2_cache_ctl, row_capacity=128)
-        conv_stage = ConvSiluStage(self.seq_len, 64, row_capacity=64)
-        for local_round in range(round_count):
-            task = local_round * block_num + block_idx
-            if task < task_count:
-                group = task // 24
-                projection = task - group * 24
-                batch_start = group * 16
-                self._run_qkvg_task(projection_stage, conv_stage, tile_slice(hidden_gm, hidden_tile, (group, 0)),
-                    tile_slice(q_workspace_gm, qkv_tile, (group, 0)), tile_slice(k_workspace_gm, qkv_tile, (group, 0)),
-                    tile_slice(v_workspace_gm, qkv_tile, (group, 0)),
-                    tile_slice(output_gate_workspace_gm, qkv_tile, (group, 0)), qkv_weight_gm, output_gate_weight_gm,
-                    conv_state_gm, conv_state_indices_gm, conv_accepted_gm, conv_weight_gm,
-                    projection_kind=0 if projection < 18 else 1,
-                    projection_head=projection if projection < 18 else projection - 18, batch_start=batch_start,
-                    batch_count=16, subblock_idx=subblock_idx, k_tiles=k_tiles)
-        cube_sync_all()
-        onchip_rewind(reset_sync_id=True)
-        aux_kind = -1
-        aux_group = 0
-        tail_tasks = task_count % get_block_num()
-        aux_start = 2 if tail_tasks == 0 else tail_tasks + 2
-        beta_gap = groups if tail_tasks == 0 else 0
-        beta_start = aux_start + groups + beta_gap
-        if block_idx >= aux_start and block_idx < aux_start + groups:
-            aux_kind = 0
-            aux_group = block_idx - aux_start
-        elif block_idx >= beta_start and block_idx < beta_start + groups:
-            aux_kind = 1
-            aux_group = block_idx - beta_start
-        if aux_kind == 0:
-            auxiliary_stage = ProjectionStage(row_count=128, row_capacity=128,
-                input_l2_cache_ctl=self.projection_input_l2_cache_ctl,
-                weight_l2_cache_ctl=self.projection_weight_l2_cache_ctl)
-            low_rank_stage = LowRankDecayStage(auxiliary_stage, self.num_heads)
-            low_rank_stage.project(tile_slice(decay_workspace_gm, qkv_tile, (aux_group, 0)),
-                tile_slice(hidden_gm, hidden_tile, (aux_group, 0)), fa_weight_gm, fb_weight_gm, k_tiles, subblock_idx)
-        elif aux_kind == 1:
-            beta_stage = ProjectionStage(row_count=128, row_capacity=128, tile_width=BETA_TILE,
-                input_l2_cache_ctl=self.projection_input_l2_cache_ctl,
-                weight_l2_cache_ctl=self.projection_weight_l2_cache_ctl)
-            beta_stage.project_to_gm(tile_slice(hidden_gm, hidden_tile, (aux_group, 0)), beta_weight_gm,
-                tile_slice(beta_workspace_gm, beta_tile, (aux_group, 0)), 0, k_tiles)
-
-    @jit
-    def _frontend_24_single_group(self, q_workspace_gm, k_workspace_gm, v_workspace_gm, decay_workspace_gm,
-        output_gate_workspace_gm, beta_workspace_gm, fa_workspace_gm, norm_exchange_gm, hidden_gm, qkv_weight_gm,
-        fa_weight_gm, fb_weight_gm, beta_weight_gm, output_gate_weight_gm, conv_state_gm, conv_state_indices_gm,
-        conv_accepted_gm, conv_weight_gm):
-        block_idx = get_block_idx()
-        subblock_idx = get_subblock_id()
-        k_tiles = ceil_div(hidden_gm.shape[1], TILE)
-        if block_idx < 18:
-            vec_sync_block_arrive(PIPE.MTE3, 0, mode=0)
-            vec_sync_block_arrive(PIPE.MTE3, 3, mode=0)
-            vec_sync_block_arrive(PIPE.MTE3, 4, mode=0)
-            projection_stage = ProjectionStage(
-                self.row_count, self.projection_input_l2_cache_ctl, self.projection_weight_l2_cache_ctl)
-            conv_stage = ConvSiluStage(self.seq_len, self.projection_row_block)
-            self._run_qkvg_task(projection_stage, conv_stage, hidden_gm, q_workspace_gm, k_workspace_gm,
-                v_workspace_gm, output_gate_workspace_gm, qkv_weight_gm, output_gate_weight_gm, conv_state_gm,
-                conv_state_indices_gm, conv_accepted_gm, conv_weight_gm, 0, block_idx, 0, BATCH_TILE, subblock_idx,
-                k_tiles)
-            vec_sync_block_wait(PIPE.S, 0, mode=0)
-            vec_sync_block_wait(PIPE.S, 3, mode=0)
-            vec_sync_block_wait(PIPE.S, 4, mode=0)
-        else:
-            onchip_rewind(reset_sync_id=True)
-            if block_idx < 23:
-                vec_sync_block_arrive(PIPE.MTE3, 0, mode=0)
-                vec_sync_block_arrive(PIPE.MTE3, 4, mode=0)
-                vec_sync_block_wait(PIPE.S, 0, mode=0)
-                vec_sync_block_arrive(PIPE.MTE3, 1, mode=2)
-                cube_sync_block_wait(PIPE.S, 1, mode=2)
-                projection_stage = ProjectionStage(
-                    self.row_count, self.projection_input_l2_cache_ctl, self.projection_weight_l2_cache_ctl)
-                first_kc = (block_idx - 18) * 6 if block_idx < 21 else 18 + (block_idx - 21) * 5
-                kc_count = 6 if block_idx < 21 else 5
-                accumulator = from_tensor(projection_stage.l0c.next_write(), layout=make_layout(projection_stage.l0c_shape), data_format="nz")
-                for local_kc in range(kc_count):
-                    kc = first_kc + local_kc
-                    a_slot = from_tensor(projection_stage.a_l1.next_write(), layout=make_layout(projection_stage.a_l1_shape), data_format="nz")
-                    b_slot = projection_stage.b_l1.next_write()
-                    mem_copy(a_slot, tile_slice(hidden_gm, (128, 256), (0, kc)),
-                        options=copy_options(l2_cache_ctl=self.projection_input_l2_cache_ctl))
-                    mem_copy(b_slot, tile_slice(fa_weight_gm, (128, 256), (0, kc)),
-                        options=copy_options(l2_cache_ctl=self.projection_weight_l2_cache_ctl))
-                    for ks in range(2):
-                        a_input = from_tensor(projection_stage.l0a.next_write(), layout=make_layout(projection_stage.l0a_shape), data_format="nz")
-                        b_input = projection_stage.l0b.next_write()
-                        mem_copy(a_input, tile_slice(a_slot, (128, 128), (0, ks)))
-                        mem_copy(b_input, tile_slice(b_slot, (128, 128), (0, ks)))
-                        matmul(accumulator, a_input, b_input, init=local_kc == 0 and ks == 0)
-                mem_copy(norm_exchange_gm, from_tensor(projection_stage.l0c.next_read(), layout=make_layout(projection_stage.l0c_shape), data_format="nz"), options=copy_options(atomic_add=True))
-                cube_sync_block_arrive(PIPE.FIXPIPE, 2, mode=2)
-                vec_sync_block_wait(PIPE.S, 2, mode=2)
-                vec_sync_block_arrive(PIPE.MTE3, 3, mode=0)
-                vec_sync_block_wait(PIPE.S, 4, mode=0)
-                vec_sync_block_arrive(PIPE.MTE3, 5, mode=2)
-                projection_stage.project(hidden_gm, output_gate_weight_gm, block_idx - 18, k_tiles)
-                projection_stage.publish(
-                    tile_slice(output_gate_workspace_gm, (128, 128), (0, block_idx - 18)), subblock_idx)
-                vec_sync_all()
-                cube_sync_block_wait(PIPE.S, 5, mode=2)
-                f_l1 = from_tensor(RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((128 * 128,)), depth=1, data_format="nd").next_write(), layout=make_layout((self.row_count, 128)), data_format="nz")
-                fb_l1 = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((128, 128)), depth=1).next_write()
-                mem_copy(f_l1, fa_workspace_gm)
-                mem_copy(fb_l1, tile_slice(fb_weight_gm, (128, 128), (block_idx - 18, 0)))
-                projection_stage.matmul_resident(f_l1, fb_l1)
-                projection_stage.publish_result(tile_slice(decay_workspace_gm, (128, 128), (0, block_idx - 18)))
-                vec_sync_all()
-                vec_sync_block_wait(PIPE.S, 3, mode=0)
-            else:
-                acc_half = Buffer(MemLoc.UB, dtypes.float32, make_layout((64 * 128,))).view(self.projection_row_block, 128)
-                f_half = Buffer(MemLoc.UB, dtypes.bfloat16, make_layout((64 * 128,))).view(self.projection_row_block, 128)
-                with vf(mode="simd"):
-                    full, _ = update_mask(VL, elem_bits=32)
-                    zero = vdups(0.0, dtypes.float32, mask=full)
-                    for segment in range(self.projection_row_block * 128 // VL):
-                        vstore(acc_half, segment * VL, zero, full)
-                vec_sync_all()
-                mem_copy(
-                    tile_slice(norm_exchange_gm, make_tiler((self.projection_row_block, 128), alignment=(1, 1)),
-                        (subblock_idx, 0)),
-                    acc_half)
-                vec_sync_block_arrive(PIPE.MTE3, 0, mode=0)
-                vec_sync_block_arrive(PIPE.MTE3, 3, mode=0)
-                vec_sync_block_wait(PIPE.S, 3, mode=0)
-                mem_copy(
-                    acc_half,
-                    tile_slice(norm_exchange_gm, make_tiler((self.projection_row_block, 128), alignment=(1, 1)),
-                        (subblock_idx, 0)))
-                vec_sync_all()
-                with vf(mode="simd"):
-                    full, _ = update_mask(VL, elem_bits=32)
-                    for segment in range(self.projection_row_block * 128 // VL):
-                        offset = segment * VL
-                        value = vcast(vload(acc_half, offset), dtypes.bfloat16, mask=full)
-                        vstore_pack(f_half, offset, value, full, pack_mode=PackMode.B32_TO_B16)
-                vec_sync_all()
-                mem_copy(
-                    tile_slice(fa_workspace_gm, make_tiler((self.projection_row_block, 128), alignment=(1, 1)),
-                        (subblock_idx, 0)),
-                    f_half)
-                vec_sync_block_arrive(PIPE.MTE3, 4, mode=0)
-                vec_sync_block_wait(PIPE.S, 4, mode=0)
-                vec_sync_block_arrive(PIPE.MTE3, 5, mode=2)
-                fused = BetaZSharedStage(
-                    self.row_count, self.projection_input_l2_cache_ctl, self.projection_weight_l2_cache_ctl)
-                fused.project(hidden_gm, output_gate_weight_gm, beta_weight_gm,
-                    tile_slice(output_gate_workspace_gm, (128, 128), (0, 5)), beta_workspace_gm, subblock_idx)
-                cube_sync_block_wait(PIPE.S, 5, mode=2)
-                onchip_rewind(reset_sync_id=True)
-                projection_stage = ProjectionStage(
-                    self.row_count, self.projection_input_l2_cache_ctl, self.projection_weight_l2_cache_ctl)
-                f_l1 = from_tensor(RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((128 * 128,)), depth=1, data_format="nd").next_write(), layout=make_layout((self.row_count, 128)), data_format="nz")
-                fb_l1 = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((128, 128)), depth=1).next_write()
-                mem_copy(f_l1, fa_workspace_gm)
-                mem_copy(fb_l1, tile_slice(fb_weight_gm, (128, 128), (5, 0)))
-                projection_stage.matmul_resident(f_l1, fb_l1)
-                projection_stage.publish_result(tile_slice(decay_workspace_gm, (128, 128), (0, 5)))
-                vec_sync_all()
-                vec_sync_block_wait(PIPE.S, 0, mode=0)
-
-    @jit
-    def _frontend_large(self, out_gm: Tensor, q_workspace_gm: Tensor, k_workspace_gm: Tensor, v_workspace_gm: Tensor,
-        decay_workspace_gm: Tensor, output_gate_workspace_gm: Tensor, beta_workspace_gm: Tensor,
-        fa_workspace_gm: Tensor, norm_exchange_gm: Tensor, hidden_gm: Tensor, qkv_weight_gm: Tensor,
-        fa_weight_gm: Tensor, fb_weight_gm: Tensor, beta_weight_gm: Tensor, output_gate_weight_gm: Tensor,
-        output_norm_weight_gm: Tensor, o_proj_weight_gm: Tensor, a_log_gm: Tensor, dt_bias_gm: Tensor,
-        initial_state_gm: Tensor, final_state_gm: Tensor, state_indices_gm: Tensor, accepted_gm: Tensor,
-        conv_state_gm: Tensor, conv_state_indices_gm: Tensor, conv_accepted_gm: Tensor, conv_weight_gm: Tensor,
-        scale_value: float, lower_bound: float, rms_norm_eps: float):
-        self.row_count = hidden_gm.shape[0]
+    def _execute_compact_s8(
+        self,
+        out_gm: Tensor,
+        q_workspace_gm: Tensor,
+        k_workspace_gm: Tensor,
+        v_workspace_gm: Tensor,
+        decay_workspace_gm: Tensor,
+        output_gate_workspace_gm: Tensor,
+        beta_workspace_gm: Tensor,
+        fa_workspace_gm: Tensor,
+        norm_exchange_gm: Tensor,
+        hidden_gm: Tensor,
+        qkv_weight_gm: Tensor,
+        fa_weight_gm: Tensor,
+        fb_weight_gm: Tensor,
+        beta_weight_gm: Tensor,
+        output_gate_weight_gm: Tensor,
+        output_norm_weight_gm: Tensor,
+        o_proj_weight_gm: Tensor,
+        a_log_gm: Tensor,
+        dt_bias_gm: Tensor,
+        initial_state_gm: Tensor,
+        replay_u_gm: ReplayPool,
+        replay_k_gm: ReplayPool,
+        replay_decay_gm: ReplayPool,
+        conv_state_gm,
+        conv_state_indices_gm: Tensor,
+        conv_accepted_gm: Tensor,
+        conv_weight_gm: Tensor,
+        scale_value: float,
+        lower_bound: float,
+        rms_norm_eps: float,
+    ):
+        self.batch_groups = replay_decay_gm.indices.shape[0] // BATCH_TILE
+        self.seq_len = S8_SEQUENCE_LENGTH
+        self.row_count = replay_decay_gm.indices.shape[0] * self.seq_len
         self.projection_row_block = self.row_count // 2
-        self.recurrent_wave_rows = self.row_count // self.recurrent_wave_count
-        batches_per_subblock = self.batch_tile // 2
-        block_idx = get_block_idx()
-        block_num = get_block_num()
-        subblock_idx = get_subblock_id()
-        n_tiles = self.qkv_block_count
-        k_tiles = ceil_div(hidden_gm.shape[1], TILE)
-        if const_expr(self.block_num == 32):
-            group_idx = block_idx // 16
-            local_idx = block_idx % 16
-            block_idx = (
-                group_idx * 9 + local_idx
-                if local_idx < 9
-                else (
-                    18 + group_idx * 3 + local_idx - 9
-                    if local_idx < 12
-                    else 24 + group_idx
-                    if local_idx == 12
-                    else 26 + group_idx * 3 + local_idx - 13))
-        if block_idx == self.beta_block:
-            beta_stage = ProjectionStage(self.row_count, self.projection_input_l2_cache_ctl,
-                self.projection_weight_l2_cache_ctl, tile_width=BETA_TILE)
-            beta_stage.project_to_gm(hidden_gm, beta_weight_gm, beta_workspace_gm, 0, k_tiles)
-        else:
-            onchip_rewind(reset_sync_id=True)
-            projection_stage = ProjectionStage(
-                self.row_count, self.projection_input_l2_cache_ctl, self.projection_weight_l2_cache_ctl)
-            low_rank_stage = LowRankDecayStage(projection_stage, self.num_heads)
-            conv_stage = ConvSiluStage(self.seq_len, self.projection_row_block)
-            selected_history = Buffer(MemLoc.UB, dtypes.bfloat16, make_layout((batches_per_subblock * (CONV_KERNEL - 1), TILE)))
-            for n_idx in range(block_idx, n_tiles, block_num):
-                projection_stage.matmul_hidden(hidden_gm, qkv_weight_gm, n_idx, k_tiles)
-                for projection_head in range(3 * self.num_heads):
-                    if n_idx == projection_head:
-                        projection = projection_head // self.num_heads
-                        value_head = projection_head - projection * self.num_heads
-                        channel_tile = projection * self.num_heads + value_head
-                        conv_stage.load_weight(
-                            tile_slice(conv_weight_gm[projection, value_head, None, None], (CONV_KERNEL, TILE), (0, 0)))
-                        for local_batch in range(batches_per_subblock):
-                            batch_index = subblock_idx * batches_per_subblock + local_batch
-                            cache_index = dtypes.int64(conv_state_indices_gm[batch_index])
-                            conv_accepted = dtypes.int64(conv_accepted_gm[batch_index])
-                            history_offset = conv_accepted - 1 if conv_accepted > 0 else 0
-                            if cache_index != 0:
-                                state_view = conv_state_gm[cache_index, None, None]
-                                for history_row in range(CONV_KERNEL - 1):
-                                    mem_copy(
-                                        tile_slice(selected_history, (1, TILE),
-                                            (local_batch * (CONV_KERNEL - 1) + history_row, 0)),
-                                        tile_slice(state_view, (1, TILE), (history_offset + history_row, channel_tile)))
-                projection_stage.acquire_result()
-                for projection_head in range(3 * self.num_heads):
-                    if n_idx == projection_head:
-                        projection = projection_head // self.num_heads
-                        for local_batch in range(batches_per_subblock):
-                            batch_index = subblock_idx * batches_per_subblock + local_batch
-                            cache_index = dtypes.int64(conv_state_indices_gm[batch_index])
-                            if cache_index == 0:
-                                conv_stage.zero_sequence(local_batch)
-                            else:
-                                history_view = tile_slice(selected_history, (CONV_KERNEL - 1, TILE), (local_batch, 0))
-                                conv_stage.install_history(history_view)
-                                state_view = conv_state_gm[cache_index, None, None]
-                                for cache_row in range(2):
-                                    mem_copy(
-                                        tile_slice(state_view, (1, TILE), (cache_row, projection_head)),
-                                        tile_slice(history_view, (1, TILE), (cache_row + 1, 0)))
-                                conv_stage.convolve_sequence(local_batch, projection_stage.projection_fp32,
-                                    tile_slice(conv_stage.weight, (CONV_KERNEL, TILE), (0, 0)))
-                        vec_sync_notify(PIPE.V, PIPE.MTE3, CONV_RAW_V_TO_MTE3_EVENT)
-                        vec_sync_wait(PIPE.V, PIPE.MTE3, CONV_RAW_V_TO_MTE3_EVENT)
-                        for local_batch in range(batches_per_subblock):
-                            batch_index = subblock_idx * batches_per_subblock + local_batch
-                            cache_index = dtypes.int64(conv_state_indices_gm[batch_index])
-                            if cache_index != 0:
-                                state_view = conv_state_gm[cache_index, None, None]
-                                for cache_token in range(self.seq_len):
-                                    mem_copy(
-                                        tile_slice(state_view, (1, TILE), (cache_token + 2, projection_head)),
-                                        tile_slice(conv_stage.raw_bf16, (1, TILE),
-                                            (local_batch * self.seq_len + cache_token, 0)))
-                vec_sync_all()
-                if n_idx < self.num_heads:
-                    projection_stage.publish_source(
-                        tile_slice(q_workspace_gm, (128, TILE), (0, n_idx)), conv_stage.output_bf16, subblock_idx)
-                elif n_idx < 2 * self.num_heads:
-                    projection_stage.publish_source(
-                        tile_slice(k_workspace_gm, (128, TILE), (0, n_idx - self.num_heads)), conv_stage.output_bf16,
-                        subblock_idx)
-                else:
-                    projection_stage.publish_source(
-                        tile_slice(v_workspace_gm, (128, TILE), (0, n_idx - 2 * self.num_heads)),
-                        conv_stage.output_bf16, subblock_idx)
-            if block_idx >= self.qkv_block_count and block_idx < self.beta_block:
-                output_head = block_idx - self.qkv_block_count
-                projection_stage.project(hidden_gm, output_gate_weight_gm, output_head, k_tiles)
-                projection_stage.publish(
-                    tile_slice(output_gate_workspace_gm, (128, TILE), (0, output_head)), subblock_idx)
-            if block_idx == self.low_rank_block:
-                low_rank_stage.project(decay_workspace_gm, hidden_gm, fa_weight_gm, fb_weight_gm, k_tiles, subblock_idx)
-
-    @jit
-    def _execute_compact_s8(self, out_gm: Tensor, q_workspace_gm: Tensor, k_workspace_gm: Tensor,
-        v_workspace_gm: Tensor, decay_workspace_gm: Tensor, output_gate_workspace_gm: Tensor,
-        beta_workspace_gm: Tensor, fa_workspace_gm: Tensor, norm_exchange_gm: Tensor, hidden_gm: Tensor,
-        qkv_weight_gm: Tensor, fa_weight_gm: Tensor, fb_weight_gm: Tensor, beta_weight_gm: Tensor,
-        output_gate_weight_gm: Tensor, output_norm_weight_gm: Tensor, o_proj_weight_gm: Tensor, a_log_gm: Tensor,
-        dt_bias_gm: Tensor, initial_state_gm: Tensor, final_state_gm: Tensor, state_indices_gm: Tensor,
-        accepted_gm: Tensor, conv_state_gm: Tensor, conv_state_indices_gm: Tensor, conv_accepted_gm: Tensor,
-        conv_weight_gm: Tensor, scale_value: float, lower_bound: float, rms_norm_eps: float):
-        self.batch_groups = accepted_gm.shape[0] // BATCH_TILE
-        self.seq_len = 8
-        self.row_count = accepted_gm.shape[0] * self.seq_len
-        self.projection_row_block = self.row_count // 2
-        recurrent_items = accepted_gm.shape[0] * self.num_heads
+        recurrent_items = replay_decay_gm.indices.shape[0] * self.num_heads
         recurrent_lanes = min(48, 2 * self.block_num)
         recurrent_wave_count = ceil_div(recurrent_items, recurrent_lanes)
         self.recurrent_wave_rows = self.row_count // recurrent_wave_count
         if const_expr(self.block_num == 24):
-            self._frontend_24_single_group(q_workspace_gm, k_workspace_gm, v_workspace_gm, decay_workspace_gm,
-                output_gate_workspace_gm, beta_workspace_gm, fa_workspace_gm, norm_exchange_gm, hidden_gm,
-                qkv_weight_gm, fa_weight_gm, fb_weight_gm, beta_weight_gm, output_gate_weight_gm, conv_state_gm,
-                conv_state_indices_gm, conv_accepted_gm, conv_weight_gm)
+            self._frontend_24_single_group(
+                q_workspace_gm,
+                k_workspace_gm,
+                v_workspace_gm,
+                decay_workspace_gm,
+                output_gate_workspace_gm,
+                beta_workspace_gm,
+                fa_workspace_gm,
+                norm_exchange_gm,
+                hidden_gm,
+                qkv_weight_gm,
+                fa_weight_gm,
+                fb_weight_gm,
+                beta_weight_gm,
+                output_gate_weight_gm,
+                conv_state_gm,
+                conv_state_indices_gm,
+                conv_accepted_gm,
+                conv_weight_gm,
+            )
         else:
-            self._frontend_large(out_gm, q_workspace_gm, k_workspace_gm, v_workspace_gm, decay_workspace_gm,
-                output_gate_workspace_gm, beta_workspace_gm, fa_workspace_gm, norm_exchange_gm, hidden_gm,
-                qkv_weight_gm, fa_weight_gm, fb_weight_gm, beta_weight_gm, output_gate_weight_gm,
-                output_norm_weight_gm, o_proj_weight_gm, a_log_gm, dt_bias_gm, initial_state_gm, final_state_gm,
-                state_indices_gm, accepted_gm, conv_state_gm, conv_state_indices_gm, conv_accepted_gm, conv_weight_gm,
-                scale_value, lower_bound, rms_norm_eps)
+            self._frontend_large(
+                out_gm,
+                q_workspace_gm,
+                k_workspace_gm,
+                v_workspace_gm,
+                decay_workspace_gm,
+                output_gate_workspace_gm,
+                beta_workspace_gm,
+                fa_workspace_gm,
+                norm_exchange_gm,
+                hidden_gm,
+                qkv_weight_gm,
+                fa_weight_gm,
+                fb_weight_gm,
+                beta_weight_gm,
+                output_gate_weight_gm,
+                output_norm_weight_gm,
+                o_proj_weight_gm,
+                a_log_gm,
+                dt_bias_gm,
+                initial_state_gm,
+                replay_u_gm,
+                replay_k_gm,
+                replay_decay_gm,
+                conv_state_gm,
+                conv_state_indices_gm,
+                conv_accepted_gm,
+                conv_weight_gm,
+                scale_value,
+                lower_bound,
+                rms_norm_eps,
+            )
         global_sync_all()
         onchip_rewind(reset_sync_id=True)
         state_row_block = TILE
@@ -1863,15 +4513,32 @@ class _GridSchedule:
         if const_expr(self.block_num == 32):
             group_idx = block_idx // 16
             local_idx = block_idx % 16
-            block_idx = group_idx * 12 + local_idx if local_idx < 12 else 24 + group_idx * 4 + local_idx - 12
+            block_idx = (
+                group_idx * RECURRENT_CORES_PER_CORE_GROUP + local_idx
+                if local_idx < RECURRENT_CORES_PER_CORE_GROUP
+                else COMPACT_RECURRENT_CORE_COUNT
+                + group_idx * 4
+                + local_idx
+                - RECURRENT_CORES_PER_CORE_GROUP
+            )
         recurrent_active = block_idx < recurrent_lanes // 2
-        recurrent_stage = RecurrentKDAStage(state_row_block, self.num_heads, state_key_unroll=KDA_STATE_KEY_UNROLL,
-            state_update_unroll=KDA_STATE_UPDATE_UNROLL, state_store_l2_cache_ctl=self.state_store_l2_cache_ctl)
+        recurrent_stage = RecurrentKDAStage(
+            state_row_block,
+            self.num_heads,
+            state_key_unroll=KDA_STATE_KEY_UNROLL,
+            state_update_unroll=KDA_STATE_UPDATE_UNROLL,
+        )
         output_gate_stage = OutputGateStage()
-        output_projection_stage = _TiledOutputProjectionStage(self.output_tile_width, self.recurrent_wave_rows,
-            kc=OPROJ_KS * 2 if self.output_weight_resident else OPROJ_KC, tiles_per_core=self.output_tiles_per_core,
-            resident_input=False, resident_weight=self.output_weight_resident,
-            tile_stride=24 if self.block_num == 24 else 1, l0c_depth=2 if self.block_num == 24 else 1)
+        output_projection_stage = _TiledOutputProjectionStage(
+            self.output_tile_width,
+            self.recurrent_wave_rows,
+            kc=OPROJ_KS * 2 if self.output_weight_resident else OPROJ_KC,
+            tiles_per_core=self.output_tiles_per_core,
+            resident_input=False,
+            resident_weight=self.output_weight_resident,
+            tile_stride=24 if self.block_num == 24 else 1,
+            l0c_depth=2 if self.block_num == 24 else 1,
+        )
         if const_expr(self.output_weight_resident):
             output_projection_stage.prefetch_weight(o_proj_weight_gm)
         if recurrent_active:
@@ -1881,132 +4548,222 @@ class _GridSchedule:
             item_start = wave * recurrent_lanes + block_idx * 2 + subblock_idx
             item_count = 1
             if recurrent_active:
-                run_recurrent_wave(recurrent_stage, output_gate_stage, q_workspace_gm, k_workspace_gm, v_workspace_gm,
-                    decay_workspace_gm, output_gate_workspace_gm, beta_workspace_gm, initial_state_gm, final_state_gm,
-                    state_indices_gm, accepted_gm, item_start, item_start + item_count, accepted_gm.shape[0],
-                    self.seq_len, self.num_heads, state_row_block, scale_value, lower_bound, rms_norm_eps,
-                        nb_group_batch=self.recurrent_wave_rows // self.seq_len)
+                run_recurrent_wave(
+                    recurrent_stage,
+                    output_gate_stage,
+                    q_workspace_gm,
+                    k_workspace_gm,
+                    v_workspace_gm,
+                    initial_state_gm.accurate_decay,
+                    output_gate_workspace_gm,
+                    beta_workspace_gm,
+                    initial_state_gm,
+                    replay_u_gm,
+                    replay_k_gm,
+                    replay_decay_gm,
+                    item_start,
+                    item_start + item_count,
+                    replay_decay_gm.indices.shape[0],
+                    self.seq_len,
+                    self.num_heads,
+                    state_row_block,
+                    scale_value,
+                    lower_bound,
+                    rms_norm_eps,
+                    nb_group_batch=self.recurrent_wave_rows // self.seq_len,
+                )
             publish_batch_group_vector_grid_to_cube(3 + wave * 2, 4 + wave * 2)
-            output_projection_stage.project(out_gm, q_workspace_gm, o_proj_weight_gm, self.num_heads, wave)
+            output_projection_stage.project(
+                out_gm, q_workspace_gm, o_proj_weight_gm, self.num_heads, wave
+            )
 
     @jit
-    def _run_backend_stream(self, out_gm: Tensor, q_workspace_gm: Tensor, k_workspace_gm: Tensor,
-        v_workspace_gm: Tensor, decay_workspace_gm: Tensor, output_gate_workspace_gm: Tensor,
-        beta_workspace_gm: Tensor, fa_workspace_gm: Tensor, norm_exchange_gm: Tensor, hidden_gm: Tensor,
-        qkv_weight_gm: Tensor, fa_weight_gm: Tensor, fb_weight_gm: Tensor, beta_weight_gm: Tensor,
-        output_gate_weight_gm: Tensor, output_norm_weight_gm: Tensor, o_proj_weight_gm: Tensor, a_log_gm: Tensor,
-        dt_bias_gm: Tensor, initial_state_gm: Tensor, final_state_gm: Tensor, state_indices_gm: Tensor,
-        accepted_gm: Tensor, conv_state_gm: Tensor, conv_state_indices_gm: Tensor, conv_accepted_gm: Tensor,
-        conv_weight_gm: Tensor, scale_value: float, lower_bound: float, rms_norm_eps: float):
-        batch_size = accepted_gm.shape[0]
-        total = batch_size * 6
-        slot_capacity = 2 * get_block_num()
-        slot_count = ceil_div(total, slot_capacity)
-        chunk_rows = 8 * self.seq_len
-        block_idx = get_block_idx()
-        subblock_idx = get_subblock_id()
-        recurrent_stage = RecurrentKDAStage(TILE, self.num_heads, state_key_unroll=KDA_STATE_KEY_UNROLL,
-            state_update_unroll=KDA_STATE_UPDATE_UNROLL, state_store_l2_cache_ctl=self.state_store_l2_cache_ctl)
-        output_gate_stage = OutputGateStage()
-        if const_expr(self.block_num == 8):
-            output_projection_stage = _TiledOutputProjectionStage(self.output_tile_width, chunk_rows, kc=384,
-                tiles_per_core=self.output_tiles_per_core, row_capacity=64, resident_input=True, resident_weight=False,
-                tile_stride=1, l0c_depth=2)
-        elif const_expr(self.block_num == 16 or self.block_num == 24):
-            output_projection_stage = _TiledOutputProjectionStage(self.output_tile_width, chunk_rows, kc=384,
-                tiles_per_core=self.output_tiles_per_core, row_capacity=64, resident_input=False,
-                resident_weight=False, tile_stride=self.block_num, l0c_depth=2)
-        else:
-            output_projection_stage = _TiledOutputProjectionStage(self.output_tile_width, chunk_rows, kc=384,
-                tiles_per_core=self.output_tiles_per_core, row_capacity=64, resident_input=False, resident_weight=True,
-                tile_stride=1, l0c_depth=1)
-        output_projection_stage.prefetch_weight(o_proj_weight_gm)
-        recurrent_stage.load_gate_params(a_log_gm, dt_bias_gm)
-        output_gate_stage.load_gamma(output_norm_weight_gm)
-        first_item = block_idx * 2 + subblock_idx
-        if first_item < total:
-            prefetch_recurrent_item(recurrent_stage, output_gate_stage, q_workspace_gm, k_workspace_gm, v_workspace_gm,
-                decay_workspace_gm, output_gate_workspace_gm, beta_workspace_gm, first_item, batch_size, self.seq_len,
-                6, TILE, nb_group_batch=chunk_rows // self.seq_len)
-            prefetch_recurrent_state(recurrent_stage, initial_state_gm, state_indices_gm, accepted_gm, first_item,
-                batch_size, self.seq_len, 6, TILE, nb_group_batch=chunk_rows // self.seq_len)
-        for slot in range(slot_count):
-            item = slot * slot_capacity + block_idx * 2 + subblock_idx
-            if item < total:
-                run_recurrent_wave(recurrent_stage, output_gate_stage, q_workspace_gm, k_workspace_gm, v_workspace_gm,
-                    decay_workspace_gm, output_gate_workspace_gm, beta_workspace_gm, initial_state_gm, final_state_gm,
-                    state_indices_gm, accepted_gm, item, item + 1, batch_size, self.seq_len, 6, TILE, scale_value,
-                    lower_bound, rms_norm_eps, defer_final_snapshot=True, first_inputs_prefetched=True,
-                    first_state_prefetched=True, next_item_stride=2 * self.block_num,
-                        nb_group_batch=chunk_rows // self.seq_len)
-            completed_before = slot * slot_capacity if slot * slot_capacity < total else total
-            completed_after = (slot + 1) * slot_capacity if (slot + 1) * slot_capacity < total else total
-            ready_before = completed_before // 48
-            ready_after = completed_after // 48
-            publish_vector_grid_to_cube(3, 4, ack_flag=5)
-            if item < total:
-                batch_index, value_head = idx2crd(
-                    _recurrent_item_index(item, batch_size, 6, chunk_rows // self.seq_len), [batch_size, 6])
-                final_row = batch_index * self.seq_len + self.seq_len - 1
-                snapshot_index = dtypes.int64(state_indices_gm[final_row])
-                recurrent_stage.store_state(
-                    tile_slice(final_state_gm[snapshot_index, value_head, None, None], (TILE, TILE), (0, 0)))
-            for chunk in range(ready_before, ready_after):
-                output_projection_stage.project(out_gm, q_workspace_gm, o_proj_weight_gm, k_tiles=6, row_tile=chunk)
-            onchip_rewind(reset_sync_id=True)
-
-    @jit
-    def _execute_task_pool_s8(self, out_gm: Tensor, q_workspace_gm: Tensor, k_workspace_gm: Tensor,
-        v_workspace_gm: Tensor, decay_workspace_gm: Tensor, output_gate_workspace_gm: Tensor,
-        beta_workspace_gm: Tensor, fa_workspace_gm: Tensor, norm_exchange_gm: Tensor, hidden_gm: Tensor,
-        qkv_weight_gm: Tensor, fa_weight_gm: Tensor, fb_weight_gm: Tensor, beta_weight_gm: Tensor,
-        output_gate_weight_gm: Tensor, output_norm_weight_gm: Tensor, o_proj_weight_gm: Tensor, a_log_gm: Tensor,
-        dt_bias_gm: Tensor, initial_state_gm: Tensor, final_state_gm: Tensor, state_indices_gm: Tensor,
-        accepted_gm: Tensor, conv_state_gm: Tensor, conv_state_indices_gm: Tensor, conv_accepted_gm: Tensor,
-        conv_weight_gm: Tensor, scale_value: float, lower_bound: float, rms_norm_eps: float):
-        self.batch_groups = accepted_gm.shape[0] // BATCH_TILE
-        self.seq_len = 8
+    def _execute_task_pool_s8(
+        self,
+        out_gm: Tensor,
+        q_workspace_gm: Tensor,
+        k_workspace_gm: Tensor,
+        v_workspace_gm: Tensor,
+        decay_workspace_gm: Tensor,
+        output_gate_workspace_gm: Tensor,
+        beta_workspace_gm: Tensor,
+        fa_workspace_gm: Tensor,
+        norm_exchange_gm: Tensor,
+        hidden_gm: Tensor,
+        qkv_weight_gm: Tensor,
+        fa_weight_gm: Tensor,
+        fb_weight_gm: Tensor,
+        beta_weight_gm: Tensor,
+        output_gate_weight_gm: Tensor,
+        output_norm_weight_gm: Tensor,
+        o_proj_weight_gm: Tensor,
+        a_log_gm: Tensor,
+        dt_bias_gm: Tensor,
+        state_gm: Tensor,
+        replay_u_gm: ReplayPool,
+        replay_k_gm: ReplayPool,
+        replay_decay_gm: ReplayPool,
+        conv_state_gm,
+        conv_state_indices_gm: Tensor,
+        conv_accepted_gm: Tensor,
+        conv_weight_gm: Tensor,
+        scale_value: float,
+        lower_bound: float,
+        rms_norm_eps: float,
+    ):
+        self.batch_groups = replay_decay_gm.indices.shape[0] // BATCH_TILE
+        self.seq_len = S8_SEQUENCE_LENGTH
         self.row_count = 128
         self.projection_row_block = 64
         self.recurrent_wave_rows = 64
+        # 一个 N384 任务包含三个 N128 数据面板；当每个 batch 组的八个任务
+        # 至少能占满启动网格的四分之三时，选择此任务布局。
         n384_task_count = self.batch_groups * 8
         use_n384 = n384_task_count * 4 >= self.block_num * 3
         use_32core_g2_tail = self.batch_groups == 2 and self.block_num == 32
+
         if use_n384:
-            self._frontend_adaptive_n384(q_workspace_gm, k_workspace_gm, v_workspace_gm, decay_workspace_gm,
-                output_gate_workspace_gm, hidden_gm, qkv_weight_gm, fa_weight_gm, fb_weight_gm, output_gate_weight_gm,
-                conv_state_gm, conv_state_indices_gm, conv_accepted_gm, conv_weight_gm)
+            onchip_rewind(reset_sync_id=True)
+            self._frontend_adaptive_n384(
+                q_workspace_gm,
+                k_workspace_gm,
+                v_workspace_gm,
+                decay_workspace_gm,
+                output_gate_workspace_gm,
+                hidden_gm,
+                qkv_weight_gm,
+                fa_weight_gm,
+                fb_weight_gm,
+                output_gate_weight_gm,
+                conv_state_gm,
+                conv_state_indices_gm,
+                conv_accepted_gm,
+                conv_weight_gm,
+            )
+            # 在重置通道标识并转入辅助任务前，必须排空 Cube 流水线。
+            # 此时 Vector 侧已没有尚未结束的生产者或消费者。
             cube_sync_all()
             onchip_rewind(reset_sync_id=True)
             self._frontend_adaptive_auxiliary(
-                decay_workspace_gm, beta_workspace_gm, hidden_gm, fa_weight_gm, fb_weight_gm, beta_weight_gm)
+                decay_workspace_gm,
+                beta_workspace_gm,
+                hidden_gm,
+                fa_weight_gm,
+                fb_weight_gm,
+                beta_weight_gm,
+            )
         elif use_32core_g2_tail:
-            self._frontend_tail(q_workspace_gm, k_workspace_gm, v_workspace_gm, decay_workspace_gm,
-                output_gate_workspace_gm, beta_workspace_gm, hidden_gm, qkv_weight_gm, fa_weight_gm, fb_weight_gm,
-                beta_weight_gm, output_gate_weight_gm, accepted_gm, conv_state_gm, conv_state_indices_gm,
-                conv_accepted_gm, conv_weight_gm)
+            onchip_rewind(reset_sync_id=True)
+            self._frontend_tail(
+                q_workspace_gm,
+                k_workspace_gm,
+                v_workspace_gm,
+                decay_workspace_gm,
+                output_gate_workspace_gm,
+                beta_workspace_gm,
+                hidden_gm,
+                qkv_weight_gm,
+                fa_weight_gm,
+                fb_weight_gm,
+                beta_weight_gm,
+                output_gate_weight_gm,
+                replay_decay_gm,
+                conv_state_gm,
+                conv_state_indices_gm,
+                conv_accepted_gm,
+                conv_weight_gm,
+            )
         else:
-            self._frontend_flat_m128(q_workspace_gm, k_workspace_gm, v_workspace_gm, decay_workspace_gm,
-                output_gate_workspace_gm, beta_workspace_gm, hidden_gm, qkv_weight_gm, fa_weight_gm, fb_weight_gm,
-                beta_weight_gm, output_gate_weight_gm, accepted_gm, conv_state_gm, conv_state_indices_gm,
-                conv_accepted_gm, conv_weight_gm)
+            onchip_rewind(reset_sync_id=True)
+            self._frontend_flat_m128(
+                q_workspace_gm,
+                k_workspace_gm,
+                v_workspace_gm,
+                decay_workspace_gm,
+                output_gate_workspace_gm,
+                beta_workspace_gm,
+                hidden_gm,
+                qkv_weight_gm,
+                fa_weight_gm,
+                fb_weight_gm,
+                beta_weight_gm,
+                output_gate_weight_gm,
+                replay_decay_gm,
+                conv_state_gm,
+                conv_state_indices_gm,
+                conv_accepted_gm,
+                conv_weight_gm,
+            )
         global_sync_all()
         onchip_rewind(reset_sync_id=True)
-        self._run_backend_stream(out_gm, q_workspace_gm, k_workspace_gm, v_workspace_gm, decay_workspace_gm,
-            output_gate_workspace_gm, beta_workspace_gm, fa_workspace_gm, norm_exchange_gm, hidden_gm, qkv_weight_gm,
-            fa_weight_gm, fb_weight_gm, beta_weight_gm, output_gate_weight_gm, output_norm_weight_gm, o_proj_weight_gm,
-            a_log_gm, dt_bias_gm, initial_state_gm, final_state_gm, state_indices_gm, accepted_gm, conv_state_gm,
-            conv_state_indices_gm, conv_accepted_gm, conv_weight_gm, scale_value, lower_bound, rms_norm_eps)
+
+        self._run_backend_stream(
+            out_gm,
+            q_workspace_gm,
+            k_workspace_gm,
+            v_workspace_gm,
+            decay_workspace_gm,
+            output_gate_workspace_gm,
+            beta_workspace_gm,
+            fa_workspace_gm,
+            norm_exchange_gm,
+            hidden_gm,
+            qkv_weight_gm,
+            fa_weight_gm,
+            fb_weight_gm,
+            beta_weight_gm,
+            output_gate_weight_gm,
+            output_norm_weight_gm,
+            o_proj_weight_gm,
+            a_log_gm,
+            dt_bias_gm,
+            state_gm,
+            replay_u_gm,
+            replay_k_gm,
+            replay_decay_gm,
+            conv_state_gm,
+            conv_state_indices_gm,
+            conv_accepted_gm,
+            conv_weight_gm,
+            scale_value,
+            lower_bound,
+            rms_norm_eps,
+        )
 
     @jit
-    def execute(self, out_gm: Tensor, q_workspace_gm: Tensor, k_workspace_gm: Tensor, v_workspace_gm: Tensor,
-        decay_workspace_gm: Tensor, output_gate_workspace_gm: Tensor, beta_workspace_gm: Tensor,
-        fa_workspace_gm: Tensor, norm_exchange_gm: Tensor, hidden_gm: Tensor, qkv_weight_gm: Tensor,
-        fa_weight_gm: Tensor, fb_weight_gm: Tensor, beta_weight_gm: Tensor, output_gate_weight_gm: Tensor,
-        output_norm_weight_gm: Tensor, o_proj_weight_gm: Tensor, a_log_gm: Tensor, dt_bias_gm: Tensor,
-        initial_state_gm: Tensor, final_state_gm: Tensor, state_indices_gm: Tensor, accepted_gm: Tensor,
-        conv_state_gm: Tensor, conv_state_indices_gm: Tensor, conv_accepted_gm: Tensor, conv_weight_gm: Tensor,
-        scale_value: float, lower_bound: float, rms_norm_eps: float):
+    def execute(
+        self,
+        out_gm: Tensor,
+        q_workspace_gm: Tensor,
+        k_workspace_gm: Tensor,
+        v_workspace_gm: Tensor,
+        decay_workspace_gm: Tensor,
+        output_gate_workspace_gm: Tensor,
+        beta_workspace_gm: Tensor,
+        fa_workspace_gm: Tensor,
+        norm_exchange_gm: Tensor,
+        hidden_gm: Tensor,
+        qkv_weight_gm: Tensor,
+        fa_weight_gm: Tensor,
+        fb_weight_gm: Tensor,
+        beta_weight_gm: Tensor,
+        output_gate_weight_gm: Tensor,
+        output_norm_weight_gm: Tensor,
+        o_proj_weight_gm: Tensor,
+        a_log_gm: Tensor,
+        dt_bias_gm: Tensor,
+        initial_state_gm: Tensor,
+        replay_u_gm: ReplayPool,
+        replay_k_gm: ReplayPool,
+        replay_decay_gm: ReplayPool,
+        conv_state_gm,
+        conv_state_indices_gm: Tensor,
+        conv_accepted_gm: Tensor,
+        conv_weight_gm: Tensor,
+        scale_value: float,
+        lower_bound: float,
+        rms_norm_eps: float,
+    ):
         execution_args = (
             out_gm,
             q_workspace_gm,
@@ -2028,2659 +4785,1576 @@ class _GridSchedule:
             a_log_gm,
             dt_bias_gm,
             initial_state_gm,
-            final_state_gm,
-            state_indices_gm,
-            accepted_gm,
+            replay_u_gm,
+            replay_k_gm,
+            replay_decay_gm,
             conv_state_gm,
             conv_state_indices_gm,
             conv_accepted_gm,
             conv_weight_gm,
             scale_value,
             lower_bound,
-            rms_norm_eps,)
-        batch_groups = accepted_gm.shape[0] // BATCH_TILE
-        frontend_panel_tasks = batch_groups * (self.qkv_block_count + self.output_gate_block_count)
+            rms_norm_eps,
+        )
+        batch_groups = replay_decay_gm.indices.shape[0] // BATCH_TILE
+        frontend_panel_tasks = batch_groups * (
+            self.qkv_block_count + self.output_gate_block_count
+        )
         if const_expr(self.block_num >= 24) and frontend_panel_tasks <= self.block_num:
             self._execute_compact_s8(*execution_args)
         else:
             self._execute_task_pool_s8(*execution_args)
 
 
-def _pack_conv_weights(conv1d_weight: torch.Tensor, num_heads: int) -> torch.Tensor:
-    """Pack supported layouts into contiguous [QKV, head, tap, channel] order.
-
-    Canonical weights are reused; head-shared and tap-major weights are
-    materialized on each call so updates to the input are always observed.
-    """
-    if tuple(conv1d_weight.shape) == (3, num_heads, CONV_KERNEL, TILE):
-        return conv1d_weight
-    if tuple(conv1d_weight.shape) == (3, CONV_KERNEL, TILE):
-        return conv1d_weight[:, None, :, :].expand(3, num_heads, CONV_KERNEL, TILE).contiguous()
-    if tuple(conv1d_weight.shape) == (CONV_KERNEL, 3 * num_heads * TILE):
-        return conv1d_weight.view(CONV_KERNEL, 3, num_heads, TILE).permute(1, 2, 0, 3).contiguous()
-    raise ValueError("conv1d_weight must be [3,N,4,128], [3,4,128], or [4,3*N*128]")
-
-
-def _validate_runtime_scalars(scale: float, lower_bound: float, rms_norm_eps: float) -> tuple[float, float, float]:
-    scale_value = float(scale)
-    lower_bound_value = float(lower_bound)
-    rms_norm_eps_value = float(rms_norm_eps)
-    if not math.isfinite(scale_value):
-        raise ValueError("scale must be finite")
-    if not -5.0 <= lower_bound_value <= 0.0:
-        raise ValueError("lower_bound must be in [-5,0]")
-    if not math.isfinite(rms_norm_eps_value) or rms_norm_eps_value <= 0.0:
-        raise ValueError("rms_norm_eps must be finite and positive")
-    return (scale_value, lower_bound_value, rms_norm_eps_value)
-
-
-def _validate_mega_weight_shapes(call, shape):
-    hidden_size, num_heads = shape
-    qkv_weight, decay_a_weight, decay_b_weight = call.qkv_weight, call.decay_a_weight, call.decay_b_weight
-    output_gate_weight = call.output_gate_weight
-    output_norm_weight, output_weight = call.output_norm_weight, call.output_weight
-    shape_checks = (
-        (tuple(qkv_weight.shape) == (3 * num_heads * TILE, hidden_size),
-            "qkv_projection_weight must be [3*N*128,H]",),
-        (tuple(decay_a_weight.shape) == (TILE, hidden_size),
-            "decay_projection_a_weight must be [128,H]",),
-        (tuple(decay_b_weight.shape) == (num_heads * TILE, TILE),
-            "decay_projection_b_weight must be [N*128,128]",),
-        (tuple(output_gate_weight.shape) == (num_heads * TILE, hidden_size),
-            "output_gate_projection_weight must be [N*128,H]",),
-        (tuple(output_norm_weight.shape) == (TILE,), "output_norm_weight must be [128]"),
-        (tuple(output_weight.shape) == (hidden_size, num_heads * TILE),
-            "output_projection_weight must be [H,N*128]",),)
-    for condition, message in shape_checks:
-        if not condition:
-            raise ValueError(message)
-
-
-def _validate_mega_weight_properties(hidden_states, bf16_tensors, output_norm_weight):
-    for name, tensor in bf16_tensors:
-        if tensor.dtype != torch.bfloat16:
-            raise ValueError(f"{name} must be BF16")
-        if tensor.device != hidden_states.device:
-            raise ValueError(f"{name} must be on the hidden_states device")
-        if not tensor.is_contiguous():
-            raise ValueError(f"{name} must be contiguous")
-    if output_norm_weight.dtype != torch.float32:
-        raise ValueError("output_norm_weight must be FP32")
-    if output_norm_weight.device != hidden_states.device:
-        raise ValueError("output_norm_weight must be on the hidden_states device")
-    if not output_norm_weight.is_contiguous():
-        raise ValueError("output_norm_weight must be contiguous")
-
-
-def _validate_mega_state_shapes(batch_size, seq_len, num_heads, conv_state, recurrent_state):
-    conv_shape_error = (
-        conv_state.ndim != 3
-        or int(conv_state.shape[0]) < 1
-        or int(conv_state.shape[1]) < seq_len + CONV_KERNEL - 2
-        or (int(conv_state.shape[2]) != 3 * num_heads * TILE))
-    if conv_shape_error:
-        raise ValueError("conv_state must be [pool,state_length,3*N*128] with state_length >= S+2")
-    if conv_state.dtype != torch.bfloat16 or not conv_state.is_contiguous():
-        raise ValueError("conv_state must be contiguous BF16")
-    if recurrent_state.ndim != 4 or tuple(recurrent_state.shape[1:]) != (num_heads, TILE, TILE):
-        raise ValueError("recurrent_state must be [pool,N,128,128]")
-    if int(recurrent_state.shape[0]) < batch_size * seq_len:
-        raise ValueError("recurrent state pool needs at least B*S slots")
-    if recurrent_state.dtype != torch.float32 or not recurrent_state.is_contiguous():
-        raise ValueError("recurrent_state must be contiguous FP32")
-
-
-def _validate_mega_states(call, shape):
-    batch_size, seq_len, num_heads = shape
-    hidden_states, conv_state, recurrent_state = call.hidden_states, call.conv_state, call.recurrent_state
-    a_log, dt_bias = call.a_log, call.dt_bias
-    _validate_mega_state_shapes(batch_size, seq_len, num_heads, conv_state, recurrent_state)
-    if tuple(a_log.shape) != (num_heads,) or a_log.dtype != torch.float32:
-        raise ValueError("A_log must be FP32 [N]")
-    if tuple(dt_bias.shape) != (num_heads, TILE) or dt_bias.dtype != torch.float32:
-        raise ValueError("dt_bias must be FP32 [N,128]")
-    state_tensors = (conv_state, recurrent_state, a_log, dt_bias)
-    if any(tensor.device != hidden_states.device for tensor in state_tensors):
-        raise ValueError("all inputs must share one device")
-    if any(not tensor.is_contiguous() for tensor in (a_log, dt_bias)):
-        raise ValueError("A_log and dt_bias must be contiguous")
-
-
-def _validate_mega_indices(device, batch_size, seq_len, index_tensors):
-    expected = {
-        "conv_state_indices": (batch_size,),
-        "ssm_state_indices": (batch_size * seq_len,),
-        "conv_num_accepted_tokens": (batch_size,),
-        "num_accepted_tokens": (batch_size,),
-    }
-    for name, tensor in index_tensors:
-        expected_shape = expected.get(name)
-        if expected_shape is None:
-            raise KeyError(f"unsupported index tensor: {name}")
-        if tuple(tensor.shape) != expected_shape:
-            suffix = "B*S" if name == "ssm_state_indices" else "B"
-            raise ValueError(f"{name} must be [{suffix}]")
-        if tensor.dtype != torch.int32:
-            raise ValueError(f"{name} must be int32")
-        if tensor.device != device or not tensor.is_contiguous():
-            raise ValueError(f"{name} must be contiguous on the input device")
-
-
-def _mega_workspace_views(workspace, row_count, widths):
-    regions = torch.split(workspace, [row_count * width for width in widths])
-    views = []
-    for region, width in zip(regions, widths):
-        views.append(region.view(row_count, width))
-    return tuple(views)
-
-
-CORE_NUM = 32
-
-
-class _Projection384Operations:
-    """Projection operations shared by stages with independent buffer layouts."""
-
-    projection_fp32: object
-
-    @jit
-    def matmul_hidden3(self, hidden_gm, weight_gm, m_group, n_macro, k_tiles):
-        for kc_idx in range(k_tiles * TILE // PROJECTION_KC):
-            a_l1_slot = from_tensor(self.a_l1.next_write(), layout=make_layout(self.a_l1_shape), data_format="nz")
-            mem_copy(a_l1_slot, tile_slice(hidden_gm, (self.rows, PROJECTION_KC), (m_group, kc_idx)),
-                options=copy_options(l2_cache_ctl=self.input_l2_cache_ctl))
-            b_l1_slot = self.b_l1.next_write()
-            mem_copy(b_l1_slot, tile_slice(weight_gm, (3 * TILE, PROJECTION_KC), (n_macro, kc_idx)),
-                options=copy_options(l2_cache_ctl=self.weight_l2_cache_ctl))
-            for ks_idx in range(PROJECTION_KC // PROJECTION_KS):
-                l0a_slot = from_tensor(self.l0a.next_write(), layout=make_layout(self.l0a_shape), data_format='nz')
-                l0a_slot_source_3 = tile_slice(a_l1_slot, (self.rows, PROJECTION_KS), (0, ks_idx))
-                l0a_slot = l0a_slot[tuple(map(slice, l0a_slot_source_3.shape))]
-                mem_copy(l0a_slot, l0a_slot_source_3)
-                l0b_slot = self.l0b.next_write()
-                l0b_slot_source_8 = tile_slice(b_l1_slot, (TILE, PROJECTION_KS), (0, ks_idx))
-                l0b_slot = l0b_slot[tuple(map(slice, l0b_slot_source_8.shape))]
-                mem_copy(l0b_slot, l0b_slot_source_8)
-                matmul(self.l0c0, l0a_slot, l0b_slot, init=kc_idx == 0 and ks_idx == 0)
-                if kc_idx == k_tiles * TILE // PROJECTION_KC - 1 and ks_idx == PROJECTION_KC // PROJECTION_KS - 1:
-                    mem_copy(self.projection_half0, self.l0c0.partition(dim=0))
-                l0b_slot = self.l0b.next_write()
-                l0b_slot_source_9 = tile_slice(b_l1_slot, (TILE, PROJECTION_KS), (1, ks_idx))
-                l0b_slot = l0b_slot[tuple(map(slice, l0b_slot_source_9.shape))]
-                mem_copy(l0b_slot, l0b_slot_source_9)
-                matmul(self.l0c1, l0a_slot, l0b_slot, init=kc_idx == 0 and ks_idx == 0)
-                if kc_idx == k_tiles * TILE // PROJECTION_KC - 1 and ks_idx == PROJECTION_KC // PROJECTION_KS - 1:
-                    mem_copy(self.projection_half1, self.l0c1.partition(dim=0))
-                l0b_slot = self.l0b.next_write()
-                l0b_slot_source_10 = tile_slice(b_l1_slot, (TILE, PROJECTION_KS), (2, ks_idx))
-                l0b_slot = l0b_slot[tuple(map(slice, l0b_slot_source_10.shape))]
-                mem_copy(l0b_slot, l0b_slot_source_10)
-                matmul(self.l0c2, l0a_slot, l0b_slot, init=kc_idx == 0 and ks_idx == 0)
-                if kc_idx == k_tiles * TILE // PROJECTION_KC - 1 and ks_idx == PROJECTION_KC // PROJECTION_KS - 1:
-                    mem_copy(self.projection_half2, self.l0c2.partition(dim=0))
-
-    @jit
-    def acquire_result0(self):
-        self.projection_fp32 = self.projection_half0
-
-    @jit
-    def acquire_result1(self):
-        self.projection_fp32 = self.projection_half1
-
-    @jit
-    def acquire_result2(self):
-        self.projection_fp32 = self.projection_half2
-
-    @jit
-    def cast_result(self):
-        with vf(mode="simd"):
-            full, _ = update_mask(VL, elem_bits=32)
-            for segment in range(self.rows // 2 * TILE // VL):
-                offset = segment * VL
-                value = vcast(vload(self.projection_fp32, offset), dtypes.bfloat16, mask=full)
-                vstore_pack(self.projection_bf16, offset, value, full, pack_mode=PackMode.B32_TO_B16)
-
-    @jit
-    def publish(self, workspace_gm, m_group, output_head, subblock_idx, source):
-        if const_expr(self.allow_tail):
-            start = m_group * self.rows + subblock_idx * (self.rows // 2)
-            valid = workspace_gm.shape[0] - start
-            if valid > self.rows // 2:
-                valid = self.rows // 2
-            if valid > 0:
-                mem_copy(
-                    workspace_gm[start: start + valid, output_head * TILE: (output_head + 1) * TILE],
-                    source[0:valid, None])
-        else:
-            self.publish_full(workspace_gm, m_group, output_head, subblock_idx, source)
-
-    def publish_full(self, workspace_gm, m_group, output_head, subblock_idx, source):
-        whole_tile = tile_slice(workspace_gm, (self.rows, TILE), (m_group, output_head))
-        out_half = tile_slice(whole_tile, make_tiler((self.rows // 2, TILE), alignment=(1, 1)), (subblock_idx, 0))
-        mem_copy(out_half, source)
-
-
-class _BaseProjection384(_Projection384Operations):
-    """MxN384 projection that reuses each hidden panel for three outputs."""
-
-    def __init__(
-        self,
-        rows=128,
-        input_l2_cache_ctl=0,
-        weight_l2_cache_ctl=0):
-        self.rows = int(rows)
-        self.allow_tail = False
-        self.input_l2_cache_ctl = int(input_l2_cache_ctl)
-        self.weight_l2_cache_ctl = int(weight_l2_cache_ctl)
-        self.a_l1 = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((self.rows, PROJECTION_KC)), depth=2)
-        self.a_l1_shape = (self.rows, PROJECTION_KC)
-        self.b_l1 = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((3 * TILE, PROJECTION_KC)), depth=2)
-        self.l0a = RingBuffer(MemLoc.L0A, dtypes.bfloat16, make_layout((self.rows, PROJECTION_KS)), depth=2)
-        self.l0a_shape = (self.rows, PROJECTION_KS)
-        self.l0b = RingBuffer(MemLoc.L0B, dtypes.bfloat16, make_layout((TILE, PROJECTION_KS)), depth=2)
-        self.l0c0 = RingBuffer(MemLoc.L0C, dtypes.float32, make_layout((self.rows, TILE)), depth=1).next_write()
-        self.l0c1 = RingBuffer(MemLoc.L0C, dtypes.float32, make_layout((self.rows, TILE)), depth=1).next_write()
-        self.l0c2 = RingBuffer(MemLoc.L0C, dtypes.float32, make_layout((self.rows, TILE)), depth=1).next_write()
-        self.projection_half0 = RingBuffer(
-            MemLoc.UB,
-            dtypes.float32,
-            make_layout((self.rows // 2, TILE)),
-            depth=1,
-        ).next_write()
-        self.projection_half1 = RingBuffer(
-            MemLoc.UB,
-            dtypes.float32,
-            make_layout((self.rows // 2, TILE)),
-            depth=1,
-        ).next_write()
-        self.projection_half2 = RingBuffer(
-            MemLoc.UB,
-            dtypes.float32,
-            make_layout((self.rows // 2, TILE)),
-            depth=1,
-        ).next_write()
-        self.projection_bf16 = Buffer(MemLoc.UB, dtypes.bfloat16, make_layout((self.rows // 2, TILE)))
-        self.projection_fp32: object
-
-
-class _BaseProjection256(_Projection384Operations):
-    """Two N128 accumulators, including the M256 L0C capacity boundary."""
-
-    def __init__(
-        self,
-        rows,
-        allow_tail=False):
-        self.rows = int(rows)
-        self.allow_tail = bool(allow_tail)
-        self.input_l2_cache_ctl = 0
-        self.weight_l2_cache_ctl = 4
-        self.a_l1 = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((rows, 256)), depth=2)
-        self.a_l1_shape = (rows, 256)
-        self.b_l1 = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((256, 256)), depth=2)
-        self.l0a = RingBuffer(MemLoc.L0A, dtypes.bfloat16, make_layout((rows, 64)), depth=2)
-        self.l0a_shape = (rows, 64)
-        self.l0b = RingBuffer(MemLoc.L0B, dtypes.bfloat16, make_layout((128, 64)), depth=2)
-        self.l0c0 = RingBuffer(MemLoc.L0C, dtypes.float32, make_layout((rows, 128)), depth=1).next_write()
-        self.l0c1 = RingBuffer(MemLoc.L0C, dtypes.float32, make_layout((rows, 128)), depth=1).next_write()
-        self.half = RingBuffer(MemLoc.UB, dtypes.float32, make_layout((rows // 2, 128)), depth=1)
-        self.half_shape = (rows // 2, 128)
-        self.projection_bf16 = Buffer(MemLoc.UB, dtypes.bfloat16, make_layout((rows // 2, 128)))
-
-    @jit
-    def matmul_hidden2(self, x, w, group, macro):
-        for kc in range(28):
-            a = from_tensor(self.a_l1.next_write(), layout=make_layout(self.a_l1_shape), data_format="nz")
-            b = self.b_l1.next_write()
-            if const_expr(self.allow_tail):
-                valid = x.shape[0] - group * self.rows
-                if valid > self.rows:
-                    valid = self.rows
-                mem_copy(a[0:valid, None], x[group * self.rows: group * self.rows + valid, kc * 256: (kc + 1) * 256],
-                    options=copy_options(l2_cache_ctl=0))
-            else:
-                mem_copy(a, tile_slice(x, (self.rows, 256), (group, kc)), options=copy_options(l2_cache_ctl=0))
-            mem_copy(b, tile_slice(w, (256, 256), (macro, kc)),
-                options=copy_options(l2_cache_ctl=self.weight_l2_cache_ctl))
-            for ks in range(4):
-                l0a = from_tensor(self.l0a.next_write(), layout=make_layout(self.l0a_shape), data_format='nz')
-                l0a_source = tile_slice(a, (self.rows, 64), (0, ks))
-                l0a = l0a[tuple(map(slice, l0a_source.shape))]
-                mem_copy(l0a, l0a_source)
-                l0b = self.l0b.next_write()
-                l0b_source = tile_slice(b, (128, 64), (0, ks))
-                l0b = l0b[tuple(map(slice, l0b_source.shape))]
-                mem_copy(l0b, l0b_source)
-                matmul(self.l0c0, l0a, l0b, init=kc == 0 and ks == 0)
-                l0b = self.l0b.next_write()
-                l0b_source_2 = tile_slice(b, (128, 64), (1, ks))
-                l0b = l0b[tuple(map(slice, l0b_source_2.shape))]
-                mem_copy(l0b, l0b_source_2)
-                matmul(self.l0c1, l0a, l0b, init=kc == 0 and ks == 0)
-
-    @jit
-    def acquire_result0(self):
-        self.projection_fp32 = self.half.next_write().view(self.half_shape)
-        mem_copy(self.projection_fp32, self.l0c0.partition(dim=0))
-
-    @jit
-    def acquire_result1(self):
-        self.projection_fp32 = self.half.next_write().view(self.half_shape)
-        mem_copy(self.projection_fp32, self.l0c1.partition(dim=0))
-
-
-class OutputProjectionStage:
-    """Shared output projection with compile-time tile mapping and buffer sizes."""
-
-    def __init__(
-        self,
-        tile_width: int = 128,
-        row_count: int = TILE,
-        input_l2_cache_ctl: int = 0,
-        weight_l2_cache_ctl: int = 0,
-        store_l2_cache_ctl: int = 0,
-        tiles_per_core: int = 2,
-        *,
-        kc: int = OPROJ_KC,
-        resident_input: bool = False,
-        resident_weight: bool = False,
-        tile_stride: int = 1,
-        l0c_depth: int = 1,
-        row_capacity: int = 64,
-        num_heads: int = 6,
-        allow_tail: bool = False):
-        self.allow_tail = bool(allow_tail)
-        self.num_heads = int(num_heads)
-        self.tiles_per_core = int(tiles_per_core)
-        self.tile_width = int(tile_width)
-        self.row_count = row_count
-        self.input_l2_cache_ctl = int(input_l2_cache_ctl)
-        self.weight_l2_cache_ctl = int(weight_l2_cache_ctl)
-        self.store_l2_cache_ctl = int(store_l2_cache_ctl)
-        self.kc = int(kc)
-        self.resident_input = resident_input
-        self.resident_weight = resident_weight
-        self.tile_stride = int(tile_stride)
-        self.row_capacity = int(row_capacity)
-        self.ks = OPROJ_KS
-        if self.resident_weight:
-            self.resident_weight_rows = self.tile_width * self.tiles_per_core
-            self.b_l1 = Buffer(
-                MemLoc.L1,
-                dtypes.bfloat16,
-                make_layout((self.resident_weight_rows, self.num_heads * TILE)),
-            )
-        else:
-            self.b_l1 = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((self.tile_width, self.kc)), depth=2)
-        self.a_l1 = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((self.row_capacity * (self.num_heads * TILE if self.resident_input else self.kc),)), depth=1 if self.resident_input else 2, data_format="nd")
-        self.a_l1_shape = (self.row_count, self.num_heads * TILE if self.resident_input else self.kc)
-        self.l0a = RingBuffer(MemLoc.L0A, dtypes.bfloat16, make_layout((self.row_capacity * self.ks,)), depth=2, data_format="nd")
-        self.l0a_shape = (self.row_count, self.ks)
-        self.l0b = RingBuffer(MemLoc.L0B, dtypes.bfloat16, make_layout((self.tile_width, self.ks)), depth=2)
-        self.l0c = RingBuffer(MemLoc.L0C, dtypes.float32, make_layout((self.row_capacity * self.tile_width,)), depth=l0c_depth, data_format="nd")
-        self.l0c_shape = (self.row_count, self.tile_width)
-
-    @jit
-    def prefetch_weight(self, weight_gm: Tensor):
-        """Keep this AIC's complete output-width-by-K768 Weight-NZ shard in L1."""
-        if const_expr(self.resident_weight):
-            resident_shards = ceil_div(weight_gm.shape[0], self.resident_weight_rows)
-            if get_block_idx() < resident_shards:
-                mem_copy(self.b_l1, tile_slice(weight_gm, (self.resident_weight_rows, self.num_heads * TILE),
-                    (get_block_idx(), 0)), options=copy_options(l2_cache_ctl=self.weight_l2_cache_ctl))
-
-    @jit
-    def project(self, out_gm: Tensor, gated_workspace_gm: Tensor, weight_gm: Tensor, k_tiles: int, row_tile: int):
-        """Compute each AIC's assigned output tiles."""
-        tile_count = ceil_div(out_gm.shape[1], self.tile_width)
-        wave_start = row_tile * self.row_count
-        wave_end = wave_start + self.row_count
-        if const_expr(self.allow_tail):
-            if wave_end > out_gm.shape[0]:
-                wave_end = out_gm.shape[0]
-        valid = wave_end - wave_start
-        gated_wave = gated_workspace_gm[wave_start:wave_end, None]
-        out_wave = out_gm[wave_start:wave_end, None]
-        if const_expr(self.resident_input):
-            resident_a = from_tensor(self.a_l1.next_write(), layout=make_layout(self.a_l1_shape), data_format="nz")
-            mem_copy(resident_a, tile_slice(gated_wave, (self.row_capacity, self.num_heads * TILE), (0, 0)),
-                options=copy_options(l2_cache_ctl=self.input_l2_cache_ctl))
-        first_tile = get_block_idx() * self.tiles_per_core
-        for local_tile in range(self.tiles_per_core):
-            if const_expr(self.resident_input):
-                output_tile = get_block_idx() * self.tiles_per_core + local_tile
-            elif const_expr(self.tile_stride != 1):
-                output_tile = get_block_idx() + local_tile * self.tile_stride
-            else:
-                output_tile = first_tile + local_tile
-            if output_tile < tile_count:
-                accumulator = from_tensor(self.l0c.next_write(), layout=make_layout(self.l0c_shape), data_format="nz")
-                for kc_idx in range(k_tiles * TILE // self.kc):
-                    if const_expr(self.resident_input):
-                        a_panel = tile_slice(resident_a, (self.row_capacity, self.kc), (0, kc_idx))
-                    else:
-                        a_panel = from_tensor(self.a_l1.next_write(), layout=make_layout(self.a_l1_shape), data_format="nz")
-                        if const_expr(self.allow_tail):
-                            mem_copy(a_panel[0:valid, None], gated_wave[None, kc_idx * self.kc: (kc_idx + 1) * self.kc],
-                                options=copy_options(l2_cache_ctl=self.input_l2_cache_ctl))
-                        else:
-                            mem_copy(a_panel, tile_slice(gated_wave, (self.row_capacity, self.kc), (0, kc_idx)),
-                                options=copy_options(l2_cache_ctl=self.input_l2_cache_ctl))
-                    if const_expr(self.resident_weight):
-                        b_panel = tile_slice(self.b_l1, (self.tile_width, self.kc), (local_tile, kc_idx))
-                    else:
-                        b_panel = self.b_l1.next_write()
-                        mem_copy(b_panel, tile_slice(weight_gm, (self.tile_width, self.kc), (output_tile, kc_idx)),
-                            options=copy_options(l2_cache_ctl=self.weight_l2_cache_ctl))
-                    for ks_idx in range(self.kc // self.ks):
-                        l0a_slot = from_tensor(self.l0a.next_write(), layout=make_layout(self.l0a_shape), data_format='nz')
-                        l0a_slot_source_6 = tile_slice(a_panel, (self.row_capacity, self.ks), (0, ks_idx))
-                        l0a_slot = l0a_slot[tuple(map(slice, l0a_slot_source_6.shape))]
-                        mem_copy(l0a_slot, l0a_slot_source_6)
-                        l0b_slot = self.l0b.next_write()
-                        l0b_slot_source_15 = tile_slice(b_panel, (self.tile_width, self.ks), (0, ks_idx))
-                        l0b_slot = l0b_slot[tuple(map(slice, l0b_slot_source_15.shape))]
-                        mem_copy(l0b_slot, l0b_slot_source_15)
-                        matmul(accumulator, l0a_slot, l0b_slot, init=kc_idx == 0 and ks_idx == 0)
-                if const_expr(self.allow_tail):
-                    if valid < self.row_count:
-                        for row in range(valid // 32):
-                            mem_copy(tile_slice(out_wave, (32, self.tile_width), (row, output_tile)),
-                                tile_slice(accumulator, (32, self.tile_width), (row, 0)),
-                                options=copy_options(l2_cache_ctl=self.store_l2_cache_ctl))
-                    else:
-                        mem_copy(tile_slice(out_wave, (self.row_capacity, self.tile_width), (0, output_tile)),
-                            accumulator, options=copy_options(l2_cache_ctl=self.store_l2_cache_ctl))
-                else:
-                    mem_copy(tile_slice(out_wave, (self.row_capacity, self.tile_width), (0, output_tile)), accumulator,
-                        options=copy_options(l2_cache_ctl=self.store_l2_cache_ctl))
-
-
-@dataclasses.dataclass(frozen=True)
-class Schedule:
-    """Compile-time geometry and cache policies for each TP and batch."""
-
-    ragged_output: bool = False
-    ragged_main: bool = False
-    main_rows: int = 128
-    auxiliary_rows: int = 0
-    main_width: int = 384
-    split_fb: bool = True
-    publish_rows: int = 64
-    resident_output_weight: bool = True
-    state_update_unroll: int = 2
-    main_weight_l2_cache_ctl: int = 4
-    state_store_l2_cache_ctl: int = 4
-    state_load_l2_cache_ctl: int = 2
-    fa_width: int = 128
-
-    def __post_init__(self):
-        if self.fa_width not in (32, 64, 128):
-            raise ValueError("unsupported Fa partition width")
-        if self.fa_width != 128 and (not self.split_fb):
-            raise ValueError("partitioned Fa requires split_fb")
-        if self.main_weight_l2_cache_ctl not in (0, 4):
-            raise ValueError("main_weight_l2_cache_ctl must be 0 or 4")
-        if self.state_store_l2_cache_ctl not in (0, 4):
-            raise ValueError("state_store_l2_cache_ctl must be 0 or 4")
-        if self.state_load_l2_cache_ctl not in (0, 2, 4):
-            raise ValueError("state_load_l2_cache_ctl must be 0, 2 or 4")
-        if self.ragged_main and self.main_width != 256:
-            raise ValueError("ragged_main requires N256")
-        if self.main_width not in (128, 256, 384):
-            raise ValueError("main_width must be 128,256,384")
-        if self.main_rows not in (32, 64, 128, 256):
-            raise ValueError("main_rows must be 32,64,128,256")
-        if self.main_rows == 256 and self.main_width != 256:
-            raise ValueError("M256 requires the N256 projection stage")
-        if self.auxiliary_rows not in (0, 16, 32, 64, 128):
-            raise ValueError("auxiliary_rows must be 0,16,32,64,128")
-        if self.publish_rows not in (16, 32, 64, 128, 256):
-            raise ValueError("publish_rows must be 16,32,64,128,256")
-        if self.state_update_unroll not in (1, 2, 4):
-            raise ValueError("state_update_unroll must be 1,2,4")
-
-
-class BetaProjectionStage(_ProjectionOperations):
-    def __init__(
-        self,
-        rows,
-        input_l2_cache_ctl=0,
-        weight_l2_cache_ctl=0,
-        tile_width=16,
-        row_capacity=128):
-        self.row_count = int(rows)
-        self.row_capacity = int(row_capacity)
-        self.tile_width = int(tile_width)
-        self.row_block = self.row_count // 2
-        self.input_l2_cache_ctl = int(input_l2_cache_ctl)
-        self.weight_l2_cache_ctl = int(weight_l2_cache_ctl)
-        self.a_l1 = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((rows, 128)), depth=2)
-        self.a_l1_shape = (rows, 128)
-        self.l0a = RingBuffer(MemLoc.L0A, dtypes.bfloat16, make_layout((rows, 64)), depth=2)
-        self.l0a_shape = (rows, 64)
-        self.l0b = RingBuffer(MemLoc.L0B, dtypes.bfloat16, make_layout((tile_width, 64)), depth=2)
-        self.l0c = RingBuffer(MemLoc.L0C, dtypes.float32, make_layout((rows, tile_width)), depth=2)
-        self.l0c_shape = (rows, tile_width)
-
-    @jit
-    def matmul_hidden(self, hidden_gm, weight_gm, output_tile, k_tiles):
-        accumulator = from_tensor(self.l0c.next_write(), layout=make_layout(self.l0c_shape), data_format="nz")
-        beta_l1 = Buffer(
-            MemLoc.L1,
-            weight_gm.dtype,
-            weight_gm.layout,
-            physical_layout=weight_gm.physical_layout,
+@jit
+def _run_tp16_grid(
+    grid,
+    out,
+    q,
+    k,
+    v,
+    decay,
+    gate,
+    beta,
+    fa,
+    norm,
+    x,
+    wqkv,
+    wa,
+    wb,
+    wbeta,
+    wz,
+    gamma,
+    wo,
+    alog,
+    bias,
+    initial,
+    replay_u,
+    replay_k,
+    replay_decay,
+    conv,
+    state_indices,
+    conv_accepted,
+    wc,
+    scale,
+    lower,
+    eps,
+):
+    """B16 的紧凑缓冲区保持静态形状，更大的 batch 沿用原有任务池。"""
+    if replay_decay.indices.shape[0] == 16:
+        grid.execute(
+            out[0:128, None],
+            q[0:128, None],
+            k[0:128, None],
+            v[0:128, None],
+            decay[0:128, None],
+            gate[0:128, None],
+            beta[0:128, None],
+            fa[0:128, None],
+            norm,
+            x[0:128, None],
+            wqkv,
+            wa,
+            wb,
+            wbeta,
+            wz,
+            gamma,
+            wo,
+            alog,
+            bias,
+            initial,
+            replay_batches(replay_u, 0, 16),
+            replay_batches(replay_k, 0, 16),
+            replay_batches(replay_decay, 0, 16),
+            conv,
+            state_indices[0:16,],
+            conv_accepted[0:16,],
+            wc,
+            scale,
+            lower,
+            eps,
         )
-        mem_copy(beta_l1, weight_gm, options=copy_options(l2_cache_ctl=self.weight_l2_cache_ctl))
-        for kc_idx in range(k_tiles):
-            a = from_tensor(self.a_l1.next_write(), layout=make_layout(self.a_l1_shape), data_format="nz")
-            mem_copy(a, tile_slice(hidden_gm, (self.row_capacity, 128), (0, kc_idx)), options=copy_options(l2_cache_ctl=self.input_l2_cache_ctl))
-            for ks_idx in range(2):
-                l0a = from_tensor(self.l0a.next_write(), layout=make_layout(self.l0a_shape), data_format="nz")
-                l0b = self.l0b.next_write()
-                mem_copy(l0a, tile_slice(a, (self.row_capacity, 64), (0, ks_idx)))
-                mem_copy(l0b, tile_slice(beta_l1, (self.tile_width, 64), (0, kc_idx * 2 + ks_idx)))
-                matmul(accumulator, l0a, l0b, init=kc_idx == 0 and ks_idx == 0)
+    else:
+        grid._execute_task_pool_s8(
+            out,
+            q,
+            k,
+            v,
+            decay,
+            gate,
+            beta,
+            fa,
+            norm,
+            x,
+            wqkv,
+            wa,
+            wb,
+            wbeta,
+            wz,
+            gamma,
+            wo,
+            alog,
+            bias,
+            initial,
+            replay_u,
+            replay_k,
+            replay_decay,
+            conv,
+            state_indices,
+            conv_accepted,
+            wc,
+            scale,
+            lower,
+            eps,
+        )
 
 
-class FaResident(BetaProjectionStage):
-    @jit
-    def matmul_hidden(self, hidden_gm, weight_gm, output_tile, k_tiles):
-        accumulator = from_tensor(self.l0c.next_write(), layout=make_layout(self.l0c_shape), data_format="nz")
-        wb = Buffer(MemLoc.L1, dtypes.bfloat16, make_layout((self.tile_width, HIDDEN_SIZE)))
-        mem_copy(wb, weight_gm, options=copy_options(l2_cache_ctl=0))
-        for kc in range(k_tiles):
-            a = from_tensor(self.a_l1.next_write(), layout=make_layout(self.a_l1_shape), data_format="nz")
-            mem_copy(a, tile_slice(hidden_gm, (self.row_count, 128), (0, kc)))
-            for ks in range(2):
-                la = from_tensor(self.l0a.next_write(), layout=make_layout(self.l0a_shape), data_format="nz")
-                lb = self.l0b.next_write()
-                mem_copy(la, tile_slice(a, (self.row_count, 64), (0, ks)))
-                mem_copy(lb, tile_slice(wb, (self.tile_width, 64), (0, kc * 2 + ks)))
-                matmul(accumulator, la, lb, init=kc == 0 and ks == 0)
-
-
-class RecurrentStage(RecurrentKDAStage):
-    """Preserve live-state/snapshot double buffering with explicit cache policies."""
-
-    def __init__(
-        self,
-        row_block,
-        num_heads,
-        config):
-        super().__init__(row_block, num_heads, state_key_unroll=4, state_update_unroll=config.state_update_unroll)
-        self.store_policy = config.state_store_l2_cache_ctl
-        self.load_policy = config.state_load_l2_cache_ctl
-
-    def load_state(self, state_gm):
-        mem_copy(self.state, state_gm, options=copy_options(l2_cache_ctl=self.load_policy))
-
-
-class TPSchedule(_GridSchedule):
-    def __init__(
-        self,
-        num_heads,
-        rows,
-        auxiliary_rows,
-        publish_rows,
-        config):
+class TP16TPSchedule(TP16GridSchedule):
+    def __init__(self, num_heads, rows, auxiliary_rows, publish_rows, config):
         super().__init__(32, HIDDEN_SIZE, num_heads)
         self.main_rows = rows
         self.auxiliary_rows = auxiliary_rows
         self.publish_rows = publish_rows
         self.config = config
-        self.seq_len = 8
-
-    @jit
-    def _consume_n384_panel(self, projection_stage: _BaseProjection384, conv_stage: ConvSiluStage, selected_history,
-        weight_ub, q_workspace_gm: Tensor, k_workspace_gm: Tensor, v_workspace_gm: Tensor,
-        output_gate_workspace_gm: Tensor, conv_state_gm: Tensor, conv_state_indices_gm: Tensor, m_group, n_macro,
-        batch_base, batches_per_subblock, subblock_idx, panel):
-        """Consume one resident N128 accumulator while Cube holds the other two."""
-        logical_n = n_macro * 3 + panel
-        if logical_n < 3 * self.num_heads:
-            projection = logical_n // self.num_heads
-            value_head = logical_n - projection * self.num_heads
-            for local_batch in range(batches_per_subblock):
-                batch_index = batch_base + local_batch
-                if batch_index < conv_state_indices_gm.shape[0]:
-                    cache_index = dtypes.int64(conv_state_indices_gm[batch_index])
-                    if cache_index == 0:
-                        conv_stage.zero_sequence(local_batch)
-                    else:
-                        history_view = tile_slice(selected_history, (CONV_KERNEL - 1, TILE), (local_batch, 0))
-                        conv_stage.install_history(history_view)
-                        state_view = conv_state_gm[cache_index, None, None]
-                        mem_copy(
-                            tile_slice(state_view[None, 0:2, None], (2, TILE), (0, logical_n)),
-                            tile_slice(history_view[1:3, None], (2, TILE), (0, 0)))
-                        conv_stage.convolve_sequence(local_batch, projection_stage.projection_fp32, weight_ub)
-                        vec_sync_notify(PIPE.V, PIPE.MTE3, CONV_RAW_V_TO_MTE3_EVENT)
-                        vec_sync_wait(PIPE.V, PIPE.MTE3, CONV_RAW_V_TO_MTE3_EVENT)
-                        mem_copy(
-                            tile_slice(
-                                state_view[None, 2: 2 + self.seq_len, None], (self.seq_len, TILE), (0, logical_n)),
-                            tile_slice(conv_stage.raw_bf16, (self.seq_len, TILE), (local_batch, 0)))
-            vec_sync_all()
-            if projection == 0:
-                projection_stage.publish(q_workspace_gm, m_group, value_head, subblock_idx, conv_stage.output_bf16)
-            elif projection == 1:
-                projection_stage.publish(k_workspace_gm, m_group, value_head, subblock_idx, conv_stage.output_bf16)
-            else:
-                projection_stage.publish(v_workspace_gm, m_group, value_head, subblock_idx, conv_stage.output_bf16)
-        else:
-            gate_head = logical_n - 3 * self.num_heads
-            projection_stage.cast_result()
-            vec_sync_all()
-            projection_stage.publish(
-                output_gate_workspace_gm, m_group, gate_head, subblock_idx, projection_stage.projection_bf16)
-        vec_sync_all()
-
-    @jit
-    def _prefetch_n256_panel(self, conv_stage: ConvSiluStage, selected_history, conv_state_gm: Tensor,
-        conv_state_indices_gm: Tensor, conv_accepted_gm: Tensor, conv_weight_gm: Tensor, n_macro, batch_base,
-        batches_per_subblock, panel):
-        """Fetch one panel's Conv metadata while its projection is in flight."""
-        logical_n = n_macro * 2 + panel
-        if logical_n < 3 * self.num_heads:
-            projection = logical_n // self.num_heads
-            value_head = logical_n - projection * self.num_heads
-            mem_copy(
-                tile_slice(conv_stage.weight, (CONV_KERNEL, TILE), (panel, 0)),
-                tile_slice(conv_weight_gm[projection, value_head, None, None], (CONV_KERNEL, TILE), (0, 0)))
-            for local_batch in range(batches_per_subblock):
-                batch_index = batch_base + local_batch
-                if batch_index < conv_state_indices_gm.shape[0]:
-                    cache_index = dtypes.int64(conv_state_indices_gm[batch_index])
-                    conv_accepted = dtypes.int64(conv_accepted_gm[batch_index])
-                    history_offset = conv_accepted - 1 if conv_accepted > 0 else 0
-                    if cache_index != 0:
-                        state_view = conv_state_gm[cache_index, None, None]
-                        mem_copy(
-                            tile_slice(selected_history, (CONV_KERNEL - 1, TILE), (local_batch, 0)),
-                            tile_slice(state_view[None, history_offset: history_offset + CONV_KERNEL - 1, None],
-                                (CONV_KERNEL - 1, TILE), (0, logical_n)))
-
-    @jit
-    def frontend_main(self, q, k, v, gate, x, wqkv, wz, conv, conv_indices, conv_accepted, wc):
-        groups = (
-            ceil_div(x.shape[0], self.main_rows)
-            if const_expr(self.config.ragged_main)
-            else x.shape[0] // self.main_rows)
-        subblock = get_subblock_id()
-        if const_expr(self.config.main_width == 256):
-            task_count = groups * (2 * self.num_heads)
-            batches = self.main_rows // 16
-            for task in range(get_block_idx(), task_count, 32):
-                macro = task // groups
-                group = task % groups
-                onchip_rewind(reset_sync_id=True)
-                projection = _BaseProjection256(self.main_rows, self.config.ragged_main)
-                projection.weight_l2_cache_ctl = self.config.main_weight_l2_cache_ctl
-                convolution = ConvSiluStage(8, self.main_rows // 2, self.main_rows // 2)
-                history = Buffer(MemLoc.UB, dtypes.bfloat16, make_layout((2 * batches * 3, 128)))
-                batch_base = group * (self.main_rows // 8) + subblock * batches
-                if macro < 3 * self.num_heads // 2:
-                    projection.matmul_hidden2(x, wqkv, group, macro)
-                else:
-                    projection.matmul_hidden2(x, wz, group, macro - 3 * self.num_heads // 2)
-                h0 = tile_slice(history, (batches * 3, 128), (0, 0))
-                h1 = tile_slice(history, (batches * 3, 128), (1, 0))
-                self._prefetch_n256_panel(
-                    convolution, h0, conv, conv_indices, conv_accepted, wc, macro, batch_base, batches, 0)
-                self._prefetch_n256_panel(
-                    convolution, h1, conv, conv_indices, conv_accepted, wc, macro, batch_base, batches, 1)
-                vec_sync_all()
-                projection.acquire_result0()
-                self._consume_n384_panel(projection, convolution, h0, tile_slice(convolution.weight, (4, 128), (0, 0)),
-                    q, k, v, gate, conv, conv_indices, group, 0, batch_base, batches, subblock, macro * 2)
-                projection.acquire_result1()
-                self._consume_n384_panel(projection, convolution, h1, tile_slice(convolution.weight, (4, 128), (1, 0)),
-                    q, k, v, gate, conv, conv_indices, group, 0, batch_base, batches, subblock, macro * 2 + 1)
-        elif const_expr(self.config.main_width == 384):
-            task_count = groups * (4 * self.num_heads // 3)
-            for task in range(get_block_idx(), task_count, CORE_NUM):
-                macro = task // groups
-                group = task % groups
-                onchip_rewind(reset_sync_id=True)
-                projection = _BaseProjection384(self.main_rows, 0, self.config.main_weight_l2_cache_ctl)
-                convolution = ConvSiluStage(8, self.main_rows // 2, self.main_rows // 2)
-                batches = self.main_rows // 16
-                history = Buffer(MemLoc.UB, dtypes.bfloat16, make_layout((3 * batches * 3, TILE)))
-                if macro < self.num_heads:
-                    projection.matmul_hidden3(x, wqkv, group, macro, 56)
-                else:
-                    projection.matmul_hidden3(x, wz, group, macro - self.num_heads, 56)
-                self._consume_n384_triplet(projection, convolution, history, q, k, v, gate, conv, conv_indices,
-                    conv_accepted, wc, group, macro, group * (self.main_rows // 8) + subblock * batches, batches,
-                    subblock)
-        else:
-            for task in range(get_block_idx(), groups * 4 * self.num_heads, CORE_NUM):
-                head = task // groups
-                group = task % groups
-                onchip_rewind(reset_sync_id=True)
-                projection = ProjectionStage(
-                    self.main_rows, 0, self.config.main_weight_l2_cache_ctl, row_capacity=self.main_rows)
-                convolution = ConvSiluStage(8, self.main_rows // 2, self.main_rows // 2)
-                self._run_qkvg_task(projection, convolution, tile_slice(x, (self.main_rows, HIDDEN_SIZE), (group, 0)),
-                    tile_slice(q, (self.main_rows, self.num_heads * TILE), (group, 0)),
-                    tile_slice(k, (self.main_rows, self.num_heads * TILE), (group, 0)),
-                    tile_slice(v, (self.main_rows, self.num_heads * TILE), (group, 0)),
-                    tile_slice(gate, (self.main_rows, self.num_heads * TILE), (group, 0)), wqkv, wz, conv,
-                    conv_indices, conv_accepted, wc, 0 if head < 3 * self.num_heads else 1,
-                    head if head < 3 * self.num_heads else head - 3 * self.num_heads, group * (self.main_rows // 8),
-                    self.main_rows // 8, subblock, 56)
-
-    @jit
-    def frontend_auxiliary_partitioned(self, decay, beta, fa, x, wa, wb, wbeta):
-        groups = x.shape[0] // self.auxiliary_rows
-        for task in range(get_block_idx(), groups * (1 + 128 // self.config.fa_width), 32):
-            onchip_rewind(reset_sync_id=True)
-            group = task % groups
-            part = task // groups
-            hidden = tile_slice(x, (self.auxiliary_rows, HIDDEN_SIZE), (group, 0))
-            if part == 0:
-                stage = BetaProjectionStage(self.auxiliary_rows, 0, 0, tile_width=(self.num_heads + 15) // 16 * 16,
-                    row_capacity=self.auxiliary_rows)
-                stage.project_to_gm(hidden, wbeta,
-                    tile_slice(beta, (self.auxiliary_rows, (self.num_heads + 15) // 16 * 16), (group, 0)), 0, 56)
-            else:
-                if const_expr(self.config.fa_width <= 32):
-                    stage = FaResident(
-                        self.auxiliary_rows, 0, 0, tile_width=self.config.fa_width, row_capacity=self.auxiliary_rows)
-                else:
-                    stage = ProjectionStage(
-                        self.auxiliary_rows, 0, 0, tile_width=self.config.fa_width, row_capacity=self.auxiliary_rows)
-                stage.project_to_gm(hidden, tile_slice(wa, (self.config.fa_width, HIDDEN_SIZE), (part - 1, 0)),
-                    tile_slice(fa, (self.auxiliary_rows, self.config.fa_width), (group, part - 1)), 0, 56)
-            vec_sync_all()
-
-    @jit
-    def frontend_auxiliary(self, decay, beta, fa, x, wa, wb, wbeta):
-        # A single task per core preserves the original concurrent Beta/Fa work.
-        # A second task may change its L0A geometry; drain the entire grid there.
-        groups = x.shape[0] // self.auxiliary_rows
-        if groups * (1 + 128 // self.config.fa_width) <= CORE_NUM:
-            self._frontend_auxiliary_concurrent(decay, beta, fa, x, wa, wb, wbeta)
-        else:
-            self._frontend_auxiliary_separate(decay, beta, fa, x, wa, wb, wbeta)
-
-    @jit
-    def _frontend_auxiliary_concurrent(self, decay, beta, fa, x, wa, wb, wbeta):
-        if const_expr(self.config.fa_width != 128):
-            self.frontend_auxiliary_partitioned(decay, beta, fa, x, wa, wb, wbeta)
-        else:
-            groups = x.shape[0] // self.auxiliary_rows
-            subblock = get_subblock_id()
-            for task in range(get_block_idx(), 2 * groups, CORE_NUM):
-                onchip_rewind(reset_sync_id=True)
-                group = task % groups
-                hidden = tile_slice(x, (self.auxiliary_rows, HIDDEN_SIZE), (group, 0))
-                if task < groups:
-                    stage = BetaProjectionStage(self.auxiliary_rows, 0, 4, tile_width=(self.num_heads + 15) // 16 * 16,
-                        row_capacity=self.auxiliary_rows)
-                    stage.project_to_gm(hidden, wbeta,
-                        tile_slice(beta, (self.auxiliary_rows, (self.num_heads + 15) // 16 * 16), (group, 0)), 0, 56)
-                    vec_sync_all()
-                else:
-                    stage = ProjectionStage(self.auxiliary_rows, 0, 4, row_capacity=self.auxiliary_rows)
-                    if const_expr(self.config.split_fb):
-                        stage.project_to_gm(hidden, wa, tile_slice(fa, (self.auxiliary_rows, TILE), (group, 0)), 0, 56)
-                        vec_sync_all()
-                    else:
-                        low_rank = LowRankDecayStage(stage, self.num_heads)
-                        low_rank.project(tile_slice(decay, (self.auxiliary_rows, self.num_heads * TILE), (group, 0)),
-                            hidden, wa, wb, 56, subblock)
-
-    @jit
-    def _frontend_auxiliary_separate(self, decay, beta, fa, x, wa, wb, wbeta):
-        if const_expr(self.config.fa_width != 128):
-            self.frontend_auxiliary_partitioned(decay, beta, fa, x, wa, wb, wbeta)
-        else:
-            groups = x.shape[0] // self.auxiliary_rows
-            subblock = get_subblock_id()
-            for group in range(get_block_idx(), groups, CORE_NUM):
-                onchip_rewind(reset_sync_id=True)
-                stage = BetaProjectionStage(self.auxiliary_rows, 0, 4, tile_width=(self.num_heads + 15) // 16 * 16,
-                    row_capacity=self.auxiliary_rows)
-                hidden = tile_slice(x, (self.auxiliary_rows, HIDDEN_SIZE), (group, 0))
-                stage.project_to_gm(hidden, wbeta,
-                    tile_slice(beta, (self.auxiliary_rows, (self.num_heads + 15) // 16 * 16), (group, 0)), 0, 56)
-                vec_sync_all()
-            global_sync_all()
-            onchip_rewind(reset_sync_id=True)
-            for group in range(get_block_idx(), groups, CORE_NUM):
-                onchip_rewind(reset_sync_id=True)
-                stage = ProjectionStage(self.auxiliary_rows, 0, 4, row_capacity=self.auxiliary_rows)
-                hidden = tile_slice(x, (self.auxiliary_rows, HIDDEN_SIZE), (group, 0))
-                if const_expr(self.config.split_fb):
-                    stage.project_to_gm(hidden, wa, tile_slice(fa, (self.auxiliary_rows, TILE), (group, 0)), 0, 56)
-                    vec_sync_all()
-                else:
-                    low_rank = LowRankDecayStage(stage, self.num_heads)
-                    low_rank.project(tile_slice(decay, (self.auxiliary_rows, self.num_heads * TILE), (group, 0)),
-                        hidden, wa, wb, 56, subblock)
-
-    @jit
-    def frontend_fb(self, decay, fa, wb):
-        groups = fa.shape[0] // self.auxiliary_rows
-        for task in range(get_block_idx(), groups * self.num_heads, CORE_NUM):
-            group = task // self.num_heads
-            head = task % self.num_heads
-            onchip_rewind(reset_sync_id=True)
-            stage = ProjectionStage(self.auxiliary_rows, 0, 0, row_capacity=self.auxiliary_rows)
-            a = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((self.auxiliary_rows, TILE)), depth=1).next_write()
-            b = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((TILE, TILE)), depth=1).next_write()
-            mem_copy(a, tile_slice(fa, (self.auxiliary_rows, TILE), (group, 0)))
-            mem_copy(b, tile_slice(wb, (TILE, TILE), (head, 0)))
-            stage.matmul_resident(a, b)
-            stage.publish_result(tile_slice(decay, (self.auxiliary_rows, TILE), (group, head)))
-            vec_sync_all()
-
-    @jit
-    def _configure_recurrent(self, _recurrent_stage):
-        """Static schedules use the policies installed by the stage constructor."""
-        return
-
-    @jit
-    def backend(self, out, q, k, v, decay, gate, beta, gamma, wo, alog, bias, initial, final, indices, accepted, scale,
-        lower, eps):
-        total = accepted.shape[0] * self.num_heads
-        slots = ceil_div(total, 64)
-        recurrent = RecurrentStage(128, self.num_heads, self.config)
-        self._configure_recurrent(recurrent)
-        output_gate = OutputGateStage()
-        resident = self.config.resident_output_weight and self.num_heads == 6
-        kc = 384 if self.publish_rows <= 64 else 256
-        if self.publish_rows == 256 and resident:
-            kc = 128
-        output = OutputProjectionStage(self.output_tile_width, self.publish_rows, kc=kc, tiles_per_core=1,
-            resident_weight=resident, row_capacity=self.publish_rows, num_heads=self.num_heads,
-            allow_tail=self.config.ragged_output)
-        output.prefetch_weight(wo)
-        recurrent.load_gate_params(alog, bias)
-        output_gate.load_gamma(gamma)
-        first = get_block_idx() * 2 + get_subblock_id()
-        if first < total:
-            prefetch_recurrent_item(
-                recurrent, output_gate, q, k, v, decay, gate, beta, first, accepted.shape[0], 8,
-                    self.num_heads, 128, nb_group_batch=self.publish_rows // 8)
-            prefetch_recurrent_state(
-                recurrent, initial, indices, accepted, first, accepted.shape[0], 8, self.num_heads, 128,
-                    nb_group_batch=self.publish_rows // 8)
-        for slot in range(slots):
-            item = slot * 64 + first
-            if item < total:
-                run_recurrent_wave(recurrent, output_gate, q, k, v, decay, gate, beta, initial, final, indices,
-                    accepted, item, item + 1, accepted.shape[0], 8, self.num_heads, 128, scale, lower, eps,
-                    defer_final_snapshot=True, first_inputs_prefetched=True, first_state_prefetched=True,
-                    next_item_stride=64, nb_group_batch=self.publish_rows // 8)
-            before = slot * 64
-            after = (slot + 1) * 64 if (slot + 1) * 64 < total else total
-            jobs = self.publish_rows // 8 * self.num_heads
-            ready_before = before // jobs
-            ready_after = after // jobs
-            if const_expr(self.config.ragged_output):
-                if after == total:
-                    ready_after = ceil_div(after, jobs)
-            publish_vector_grid_to_cube(3, 4, ack_flag=5)
-            if item < total:
-                batch, head = idx2crd(
-                    _recurrent_item_index(item, accepted.shape[0], self.num_heads, self.publish_rows // 8),
-                    [accepted.shape[0], self.num_heads])
-                index = dtypes.int64(indices[batch * 8 + 7])
-                recurrent.store_state(tile_slice(final[index, head, None, None], (128, 128), (0, 0)))
-            for chunk in range(ready_before, ready_after):
-                output.project(out, q, wo, self.num_heads, chunk)
-            onchip_rewind(reset_sync_id=True)
+        self.seq_len = S8_SEQUENCE_LENGTH
 
 
-def _validate_mega_hidden(hidden_states, beta_weight):
-    if hidden_states.ndim != 3 or hidden_states.shape[1] != 8:
-        raise ValueError("mega_recurrent_kda requires S=8 and hidden_states [B,8,7168]")
-    if beta_weight.ndim != 2:
-        raise ValueError("hidden_states must be [B,8,7168], beta weight [N,7168]")
-    b, s, h = map(int, hidden_states.shape)
-    n = int(beta_weight.shape[0])
-    if n not in (6, 12, 24):
-        raise ValueError("TP4/8/16 requires N=24/12/6")
-    tp = 96 // n
-    if h != 7168 or b % tp or (not tp <= b <= 32 * tp):
-        raise ValueError("requires S8,H7168; extended TP4/8/16 model_batch=1..32")
-    if hidden_states.dtype != torch.bfloat16 or not hidden_states.is_contiguous():
-        raise ValueError("hidden_states must be contiguous BF16")
-    if beta_weight.shape[1] != 7168:
-        raise ValueError("beta weight must have H=7168")
-    return (b, s, h, n)
+class TP16ProjectionScheduleOperations(
+    ProjectionScheduleOperationsFrontendOperations, TP16TPSchedule
+):
+    """为两种投影调度共用构造逻辑和 Conv 预取操作。"""
 
-
-@dataclasses.dataclass(frozen=True)
-class _Core32TaskSchedule(Schedule):
-    """Use the existing 32-core S8 task pool where it wins at short batches."""
-
-    state_store_l2_cache_ctl: int = 0
-
-
-_SHORT_SCHEDULES = {
-    24: {
-        "main_rows": 32,
-        "main_width": 384,
-        "auxiliary_rows": 32,
-        "main_weight_l2_cache_ctl": 4,
-        "state_store_l2_cache_ctl": 0,
-        "state_load_l2_cache_ctl": 2,
-        "fa_width": 64, },
-    12: {
-        "main_rows": 128,
-        "main_width": 384,
-        "auxiliary_rows": 32,
-        "main_weight_l2_cache_ctl": 4,
-        "state_store_l2_cache_ctl": 0,
-        "state_load_l2_cache_ctl": 2,
-        "fa_width": 32, },
-    6: {"task_pool32": True}, }
-
-_LARGE_SCHEDULES = {
-    heads: dict(ragged_output=True, ragged_main=True, main_rows=256, auxiliary_rows=0, main_width=256,
-        split_fb=True, publish_rows=128 if heads == 24 else 64, resident_output_weight=True,
-        state_update_unroll=2, main_weight_l2_cache_ctl=0, state_store_l2_cache_ctl=4,
-        state_load_l2_cache_ctl=4 if heads == 12 else 2)
-    for heads in (24, 12, 6)}
-
-
-def _tp16_schedule(model_batch):
-    if not 1 <= model_batch <= 32:
-        raise ValueError("TP16 requires model_batch=1..32")
-    if model_batch == 1:
-        return _Core32TaskSchedule()
-    if model_batch == 2:
-        # 32 M64xN384 jobs fill the grid; resident N32 Fa has 20 jobs.
-        return Schedule(main_rows=64, main_width=384, auxiliary_rows=64, publish_rows=64,
-            main_weight_l2_cache_ctl=0, state_store_l2_cache_ctl=0, fa_width=32)
-    # Retain the original N384 task pool and its fused short-batch Fa/Fb.
-    return _Core32TaskSchedule(main_weight_l2_cache_ctl=0, state_store_l2_cache_ctl=4 if model_batch >= 7 else 0)
-
-
-def _intermediate_schedule(num_heads, model_batch):
-    rows = model_batch * (96 // num_heads) * 8
-    if rows <= 128 and rows & (rows - 1) == 0:
-        options = dict(main_rows=128, main_width=384)
-    else:
-        # TP8 publishes smaller chunks when recurrent work dominates.
-        publish_rows = 64 if num_heads == 12 and (model_batch == 5 or model_batch >= 9) else 256
-        options = dict(main_rows=256, main_width=256, ragged_main=True, ragged_output=True,
-            publish_rows=publish_rows)
-    physical_rows = _tile_rows(rows, options["main_rows"], options.get("ragged_main"))
-    options["main_weight_l2_cache_ctl"] = 0 if rows > physical_rows else 4
-    options["state_store_l2_cache_ctl"] = 4 if model_batch >= 4 else 0
-    return Schedule(**options)
-
-
-def default_schedule(num_heads, model_batch):
-    """Select tile and cache policies for TP and model batch."""
-    if num_heads == 6:
-        return _tp16_schedule(model_batch)
-    if num_heads in (12, 24) and 17 <= model_batch <= 32:
-        return Schedule(**_LARGE_SCHEDULES[num_heads])
-    if num_heads not in (6, 12, 24) or not 1 <= model_batch <= 16:
-        raise ValueError("requires N=24/12/6 and model_batch=1..16")
-    if model_batch in (1, 16):
-        options = (_SHORT_SCHEDULES if model_batch == 1 else _LARGE_SCHEDULES)[num_heads]
-        if options.get("task_pool32"):
-            return _Core32TaskSchedule()
-        return Schedule(**options)
-    return _intermediate_schedule(num_heads, model_batch)
-
-
-class _Core32ProjectionOperations(_Projection384Operations):
-    """Projection operations shared by stages with independent buffer layouts."""
-
-    @jit
-    def _copy_projection_weight(self, dst, src):
-        mem_copy(dst, src, options=copy_options(l2_cache_ctl=self.weight_l2_cache_ctl))
-
-    @jit
-    def matmul_hidden3(self, hidden_gm, weight_gm, m_group, n_macro, k_tiles):
-        for kc_idx in range(k_tiles * TILE // PROJECTION_KC):
-            a_l1_slot = from_tensor(self.a_l1.next_write(), layout=make_layout(self.a_l1_shape), data_format="nz")
-            mem_copy(a_l1_slot, tile_slice(hidden_gm, make_tiler((self.rows, PROJECTION_KC), alignment=(16, 16)),
-                (m_group, kc_idx)), options=copy_options(l2_cache_ctl=self.input_l2_cache_ctl))
-            b_l1_slot = self.b_l1.next_write()
-            self._copy_projection_weight(b_l1_slot,
-                tile_slice(weight_gm, (3 * TILE, PROJECTION_KC), (n_macro, kc_idx)))
-            for ks_idx in range(PROJECTION_KC // PROJECTION_KS):
-                l0a_slot = from_tensor(self.l0a.next_write(), layout=make_layout(self.l0a_shape), data_format='nz')
-                l0a_slot_source_4 = tile_slice(a_l1_slot, (128, 128), (0, ks_idx * PROJECTION_KS // 128))[0:self.rows, None]
-                l0a_slot = l0a_slot[tuple(map(slice, l0a_slot_source_4.shape))]
-                mem_copy(l0a_slot, l0a_slot_source_4)
-                l0b_slot = self.l0b.next_write()
-                l0b_slot_source_11 = tile_slice(b_l1_slot, (TILE, PROJECTION_KS), (0, ks_idx))
-                l0b_slot = l0b_slot[tuple(map(slice, l0b_slot_source_11.shape))]
-                mem_copy(l0b_slot, l0b_slot_source_11)
-                matmul(self.l0c0, l0a_slot, l0b_slot, init=kc_idx == 0 and ks_idx == 0)
-                if kc_idx == k_tiles * TILE // PROJECTION_KC - 1 and ks_idx == PROJECTION_KC // PROJECTION_KS - 1:
-                    mem_copy(self.projection_half0, self.l0c0.partition(dim=0))
-                l0b_slot = self.l0b.next_write()
-                l0b_slot_source_12 = tile_slice(b_l1_slot, (TILE, PROJECTION_KS), (1, ks_idx))
-                l0b_slot = l0b_slot[tuple(map(slice, l0b_slot_source_12.shape))]
-                mem_copy(l0b_slot, l0b_slot_source_12)
-                matmul(self.l0c1, l0a_slot, l0b_slot, init=kc_idx == 0 and ks_idx == 0)
-                if kc_idx == k_tiles * TILE // PROJECTION_KC - 1 and ks_idx == PROJECTION_KC // PROJECTION_KS - 1:
-                    mem_copy(self.projection_half1, self.l0c1.partition(dim=0))
-                l0b_slot = self.l0b.next_write()
-                l0b_slot_source_13 = tile_slice(b_l1_slot, (TILE, PROJECTION_KS), (2, ks_idx))
-                l0b_slot = l0b_slot[tuple(map(slice, l0b_slot_source_13.shape))]
-                mem_copy(l0b_slot, l0b_slot_source_13)
-                matmul(self.l0c2, l0a_slot, l0b_slot, init=kc_idx == 0 and ks_idx == 0)
-                if kc_idx == k_tiles * TILE // PROJECTION_KC - 1 and ks_idx == PROJECTION_KC // PROJECTION_KS - 1:
-                    mem_copy(self.projection_half2, self.l0c2.partition(dim=0))
-
-
-    def publish_full(self, workspace_gm, m_group, output_head, subblock_idx, source):
-        whole_tile = tile_slice(workspace_gm, make_tiler((self.rows, TILE), alignment=(16, 16)), (m_group, output_head))
-        out_half = tile_slice(whole_tile, make_tiler((self.rows // 2, TILE), alignment=(1, 1)), (subblock_idx, 0))
-        mem_copy(out_half, source)
-
-
-    @jit
-    def matmul_hidden2(self, x, w, group, macro):
-        for kc in range(28):
-            a = from_tensor(self.a_l1.next_write(), layout=make_layout(self.a_l1_shape), data_format="nz")
-            b = self.b_l1.next_write()
-            if const_expr(self.allow_tail):
-                valid = x.shape[0] - group * self.rows
-                if valid > self.rows:
-                    valid = self.rows
-                mem_copy(a[0:valid, None], x[group * self.rows: group * self.rows + valid,
-                    kc * 256: (kc + 1) * 256,], options=copy_options(l2_cache_ctl=0))
-            else:
-                mem_copy(a, tile_slice(x, make_tiler((self.rows, 256), alignment=(16, 16)), (group, kc)),
-                    options=copy_options(l2_cache_ctl=0))
-            self._copy_projection_weight(b, tile_slice(w, (256, 256), (macro, kc)))
-            for ks in range(4):
-                l0a = from_tensor(self.l0a.next_write(), layout=make_layout(self.l0a_shape), data_format='nz')
-                l0a_source_2 = tile_slice(a, (256, 64), (0, ks * 64 // 64))[0:self.rows, None]
-                l0a = l0a[tuple(map(slice, l0a_source_2.shape))]
-                mem_copy(l0a, l0a_source_2)
-                l0b = self.l0b.next_write()
-                l0b_source_3 = tile_slice(b, (128, 64), (0, ks))
-                l0b = l0b[tuple(map(slice, l0b_source_3.shape))]
-                mem_copy(l0b, l0b_source_3)
-                matmul(self.l0c0, l0a, l0b, init=kc == 0 and ks == 0)
-                l0b = self.l0b.next_write()
-                l0b_source_4 = tile_slice(b, (128, 64), (1, ks))
-                l0b = l0b[tuple(map(slice, l0b_source_4.shape))]
-                mem_copy(l0b, l0b_source_4)
-                matmul(self.l0c1, l0a, l0b, init=kc == 0 and ks == 0)
-
-
-class _Core32Projection384(_Core32ProjectionOperations):
-    """Logical M32/64/128 with fixed M128 on-chip capacities."""
-
-    def __init__(
-        self,
-        rows=128,
-        input_l2_cache_ctl=0,
-        weight_l2_cache_ctl=0):
-        self.rows = rows
-        self.allow_tail = False
-        self.input_l2_cache_ctl = int(input_l2_cache_ctl)
-        self.weight_l2_cache_ctl = int(weight_l2_cache_ctl)
-        self.a_l1 = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((128 * PROJECTION_KC,)), depth=2, data_format="nd")
-        self.a_l1_shape = (self.rows, PROJECTION_KC)
-        self.b_l1 = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((3 * TILE, PROJECTION_KC)), depth=2)
-        self.l0a = RingBuffer(MemLoc.L0A, dtypes.bfloat16, make_layout((128 * PROJECTION_KS,)), depth=2, data_format="nd")
-        self.l0a_shape = (self.rows, PROJECTION_KS)
-        self.l0b = RingBuffer(MemLoc.L0B, dtypes.bfloat16, make_layout((TILE, PROJECTION_KS)), depth=2)
-        self.l0c0 = from_tensor(RingBuffer(MemLoc.L0C, dtypes.float32, make_layout((128 * TILE,)), depth=1, data_format="nd").next_write(), layout=make_layout((self.rows, TILE)), data_format="nz")
-        self.l0c1 = from_tensor(RingBuffer(MemLoc.L0C, dtypes.float32, make_layout((128 * TILE,)), depth=1, data_format="nd").next_write(), layout=make_layout((self.rows, TILE)), data_format="nz")
-        self.l0c2 = from_tensor(RingBuffer(MemLoc.L0C, dtypes.float32, make_layout((128 * TILE,)), depth=1, data_format="nd").next_write(), layout=make_layout((self.rows, TILE)), data_format="nz")
-        self.projection_half0 = RingBuffer(MemLoc.UB, dtypes.float32, make_layout(((128 // 2) * TILE,)), depth=1).next_write().view((self.rows // 2, TILE))
-        self.projection_half1 = RingBuffer(MemLoc.UB, dtypes.float32, make_layout(((128 // 2) * TILE,)), depth=1).next_write().view((self.rows // 2, TILE))
-        self.projection_half2 = RingBuffer(MemLoc.UB, dtypes.float32, make_layout(((128 // 2) * TILE,)), depth=1).next_write().view((self.rows // 2, TILE))
-        self.projection_bf16 = Buffer(MemLoc.UB, dtypes.bfloat16, make_layout((128 // 2 * TILE,))).view(self.rows // 2, TILE)
-        self.projection_fp32: object
-
-
-class _Core32Projection256(_Core32ProjectionOperations):
-    """Logical M32/64/128/256 with fixed M256 capacities and masked tails."""
-
-    def __init__(
-        self,
-        rows,
-        allow_tail=False):
-        self.rows = rows
-        self.allow_tail = bool(allow_tail)
-        self.input_l2_cache_ctl = 0
-        self.weight_l2_cache_ctl = 4
-        self.a_l1 = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((256 * 256,)), depth=2, data_format="nd")
-        self.a_l1_shape = (rows, 256)
-        self.b_l1 = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((256, 256)), depth=2)
-        self.l0a = RingBuffer(MemLoc.L0A, dtypes.bfloat16, make_layout((256 * 64,)), depth=2, data_format="nd")
-        self.l0a_shape = (rows, 64)
-        self.l0b = RingBuffer(MemLoc.L0B, dtypes.bfloat16, make_layout((128, 64)), depth=2)
-        self.l0c0 = from_tensor(RingBuffer(MemLoc.L0C, dtypes.float32, make_layout((256 * 128,)), depth=1, data_format="nd").next_write(), layout=make_layout((rows, 128)), data_format="nz")
-        self.l0c1 = from_tensor(RingBuffer(MemLoc.L0C, dtypes.float32, make_layout((256 * 128,)), depth=1, data_format="nd").next_write(), layout=make_layout((rows, 128)), data_format="nz")
-        self.half = RingBuffer(MemLoc.UB, dtypes.float32, make_layout(((256 // 2) * 128,)), depth=1)
-        self.half_shape = (rows // 2, 128)
-        self.projection_bf16 = Buffer(MemLoc.UB, dtypes.bfloat16, make_layout((256 // 2 * 128,))).view(rows // 2, 128)
-
-
-    @jit
-    def acquire_result0(self):
-        self.projection_fp32 = self.half.next_write().view(self.half_shape)
-        mem_copy(self.projection_fp32, self.l0c0.partition(dim=0))
-
-    @jit
-    def acquire_result1(self):
-        self.projection_fp32 = self.half.next_write().view(self.half_shape)
-        mem_copy(self.projection_fp32, self.l0c1.partition(dim=0))
-
-
-class _ProjectionScheduleOperations(TPSchedule):
-    """Shared constructor and Conv prefetches for both projection schedules."""
-
-    def __init__(
-        self,
-        heads,
-        rows,
-        width):
-        config = Schedule(main_rows=rows, main_width=width, ragged_main=width == 256, split_fb=True, ragged_output=True)
+    def __init__(self, heads, rows, width):
+        config = Schedule(
+            main_rows=rows,
+            main_width=width,
+            ragged_main=width == 256,
+            split_fb=True,
+            ragged_output=True,
+        )
         super().__init__(heads, rows, 32, 64, config)
         self.heads = heads
+        self.projection_groups = 4 * heads // 3
         self.row_capacity = rows
 
+
+class TP16S4ProjectionSchedule(
+    S4ProjectionScheduleFrontendOperations, TP16ProjectionScheduleOperations
+):
+    """仅处理有效行的 S4 QKV/Conv 融合，复用当前 PA 数据面板消费逻辑。"""
+
+    def __init__(self, heads):
+        super().__init__(heads, 128, 384)
+        self.seq_len = S4_SEQUENCE_LENGTH
+
+
+class TP16S4MultiCoreSchedule(_S4StagedPipeline):
+    """通用 S4 融合，支持 TP4/8/16 和 8/16/24/28/32 AIC。"""
+
+    def __init__(self, heads):
+        self.main = TP16S4ProjectionSchedule(heads)
+        self.auxiliary = TP16S4AuxiliarySchedule(heads)
+        self.backend = TP16S4BackendSchedule(heads)
+
+
+class _ResidentDelayedZResources:
+    """复用 OProj 临时空间，同时将完整 Wo 分片保留在 L1。"""
+
+    def __init__(self):
+        self.output = _TiledOutputProjectionStage(
+            256,
+            64,
+            kc=256,
+            tiles_per_core=1,
+            row_capacity=64,
+            resident_input=False,
+            resident_weight=True,
+            l0c_depth=1,
+        )
+        self.z_weight = RingBuffer(
+            MemLoc.L1, dtypes.bfloat16, make_layout((128, 128)), depth=2
+        )
+        self.z_l0a = RingBuffer(
+            MemLoc.L0A, dtypes.bfloat16, make_layout((128, 128)), depth=1
+        )
+
     @jit
-    def _prefetch_n384_panel(self, conv_stage: ConvSiluStage, selected_history, conv_state_gm: Tensor,
-        conv_state_indices_gm: Tensor, conv_accepted_gm: Tensor, conv_weight_gm: Tensor, n_macro, batch_base,
-        batches_per_subblock, panel):
-        """Fetch one panel's Conv metadata while its projection is in flight."""
-        logical_n = n_macro * 3 + panel
-        if logical_n < 3 * self.num_heads:
-            projection = logical_n // self.num_heads
-            value_head = logical_n - projection * self.num_heads
+    def project_z(self, gate, x, weight, row, head):
+        accumulator = from_tensor(
+            from_tensor(
+                self.output.l0c.next_write(),
+                layout=make_layout(self.output.l0c_shape),
+                data_format="nz",
+            ),
+            layout=make_layout((128, 128)),
+            data_format="nz",
+        )
+        for kc in range(56):
+            a = from_tensor(
+                from_tensor(
+                    self.output.a_l1.next_write(),
+                    layout=make_layout(self.output.a_l1_shape),
+                    data_format="nz",
+                ),
+                layout=make_layout((128, 128)),
+                data_format="nz",
+            )
+            b = self.z_weight.next_write()
             mem_copy(
-                tile_slice(conv_stage.weight, (CONV_KERNEL, TILE), (panel, 0)),
-                tile_slice(conv_weight_gm[projection, value_head, None, None], (CONV_KERNEL, TILE), (0, 0)))
-            for local_batch in range(batches_per_subblock):
-                batch_index = batch_base + local_batch
-                cache_index = dtypes.int64(conv_state_indices_gm[batch_index])
-                conv_accepted = dtypes.int64(conv_accepted_gm[batch_index])
-                history_offset = conv_accepted - 1 if conv_accepted > 0 else 0
-                if cache_index != 0:
-                    state_view = conv_state_gm[cache_index, None, None]
-                    mem_copy(
-                        tile_slice(selected_history, (CONV_KERNEL - 1, TILE), (local_batch, 0)),
-                        tile_slice(
-                            state_view[
-                                None,
-                                history_offset: history_offset + CONV_KERNEL - 1,
-                                None,],
-                            (CONV_KERNEL - 1, TILE),
-                            (0, logical_n)))
-
-    @jit
-    def _prefetch_n256_panel(self, conv_stage: ConvSiluStage, selected_history, conv_state_gm: Tensor,
-        conv_state_indices_gm: Tensor, conv_accepted_gm: Tensor, conv_weight_gm: Tensor, n_macro, batch_base,
-        batches_per_subblock, panel):
-        """Fetch one panel's Conv metadata while its projection is in flight."""
-        logical_n = n_macro * 2 + panel
-        if logical_n < 3 * self.num_heads:
-            projection = logical_n // self.num_heads
-            value_head = logical_n - projection * self.num_heads
+                a,
+                tile_slice(x, (128, 128), (row, kc)),
+                options=copy_options(l2_cache_ctl=0),
+            )
             mem_copy(
-                tile_slice(conv_stage.weight, (CONV_KERNEL, TILE), (panel, 0)),
-                tile_slice(conv_weight_gm[projection, value_head, None, None], (CONV_KERNEL, TILE), (0, 0)))
-            for local_batch in range(batches_per_subblock):
-                batch_index = batch_base + local_batch
-                if batch_index < conv_state_indices_gm.shape[0]:
-                    cache_index = dtypes.int64(conv_state_indices_gm[batch_index])
-                    conv_accepted = dtypes.int64(conv_accepted_gm[batch_index])
-                    history_offset = conv_accepted - 1 if conv_accepted > 0 else 0
-                    if cache_index != 0:
-                        state_view = conv_state_gm[cache_index, None, None]
-                        mem_copy(
-                            tile_slice(selected_history, (CONV_KERNEL - 1, TILE), (local_batch, 0)),
-                            tile_slice(
-                                state_view[
-                                    None,
-                                    history_offset: history_offset + CONV_KERNEL - 1,
-                                    None,],
-                                (CONV_KERNEL - 1, TILE),
-                                (0, logical_n)))
+                b,
+                tile_slice(weight, (128, 128), (head, kc)),
+                options=copy_options(l2_cache_ctl=1),
+            )
+            l0a = self.z_l0a.next_write()
+            l0a = l0a[tuple(map(slice, a.shape))]
+            mem_copy(l0a, a)
+            l0b = from_tensor(
+                self.output.l0b.next_write(),
+                layout=make_layout((128, 128)),
+                data_format="nz",
+            )
+            mem_copy(l0b, b)
+            matmul(accumulator, l0a, l0b, init=kc == 0)
+        mem_copy(tile_slice(gate, (128, 128), (row, head)), accumulator)
 
 
-    @jit
-    def _consume_n384_triplet(self, projection_stage: _Projection384Operations, conv_stage: ConvSiluStage,
-        selected_history, q_workspace_gm: Tensor, k_workspace_gm: Tensor, v_workspace_gm: Tensor,
-        output_gate_workspace_gm: Tensor, conv_state_gm: Tensor, conv_state_indices_gm: Tensor,
-        conv_accepted_gm: Tensor, conv_weight_gm: Tensor, m_group, n_macro, batch_base, batches_per_subblock,
-        subblock_idx):
-        history0 = selected_history[
-            0 * (batches_per_subblock * (CONV_KERNEL - 1)): (0 + 1) * (batches_per_subblock * (CONV_KERNEL - 1)),
-            0 * TILE: (0 + 1) * TILE,]
-        history1 = selected_history[
-            1 * (batches_per_subblock * (CONV_KERNEL - 1)): (1 + 1) * (batches_per_subblock * (CONV_KERNEL - 1)),
-            0 * TILE: (0 + 1) * TILE,]
-        history2 = selected_history[
-            2 * (batches_per_subblock * (CONV_KERNEL - 1)): (2 + 1) * (batches_per_subblock * (CONV_KERNEL - 1)),
-            0 * TILE: (0 + 1) * TILE,]
-        weight0 = tile_slice(conv_stage.weight, (CONV_KERNEL, TILE), (0, 0))
-        weight1 = tile_slice(conv_stage.weight, (CONV_KERNEL, TILE), (1, 0))
-        weight2 = tile_slice(conv_stage.weight, (CONV_KERNEL, TILE), (2, 0))
-        self._prefetch_n384_panel(conv_stage, history0, conv_state_gm, conv_state_indices_gm, conv_accepted_gm,
-            conv_weight_gm, n_macro, batch_base, batches_per_subblock, 0)
-        self._prefetch_n384_panel(conv_stage, history1, conv_state_gm, conv_state_indices_gm, conv_accepted_gm,
-            conv_weight_gm, n_macro, batch_base, batches_per_subblock, 1)
-        self._prefetch_n384_panel(conv_stage, history2, conv_state_gm, conv_state_indices_gm, conv_accepted_gm,
-            conv_weight_gm, n_macro, batch_base, batches_per_subblock, 2)
-        vec_sync_all()
-        projection_stage.acquire_result0()
-        self._consume_n384_panel(projection_stage, conv_stage, history0, weight0, q_workspace_gm, k_workspace_gm,
-            v_workspace_gm, output_gate_workspace_gm, conv_state_gm, conv_state_indices_gm, m_group, n_macro,
-            batch_base, batches_per_subblock, subblock_idx, 0)
-        projection_stage.acquire_result1()
-        self._consume_n384_panel(projection_stage, conv_stage, history1, weight1, q_workspace_gm, k_workspace_gm,
-            v_workspace_gm, output_gate_workspace_gm, conv_state_gm, conv_state_indices_gm, m_group, n_macro,
-            batch_base, batches_per_subblock, subblock_idx, 1)
-        projection_stage.acquire_result2()
-        self._consume_n384_panel(projection_stage, conv_stage, history2, weight2, q_workspace_gm, k_workspace_gm,
-            v_workspace_gm, output_gate_workspace_gm, conv_state_gm, conv_state_indices_gm, m_group, n_macro,
-            batch_base, batches_per_subblock, subblock_idx, 2)
+class _ResidentDelayedZSchedule(TP16GridSchedule):
+    def __init__(self, block_num, hidden_size, num_heads):
+        super().__init__(block_num, hidden_size, num_heads)
+        self.projection_groups = QKV_PANEL_COUNT
+        self.window_rows = 512
+        self.minimum_rows = 8 * self.window_rows
+        self.projection_weight_l2_cache_ctl = 1
 
     @jit
-    def _consume_n384_panel(self, projection_stage: _Projection384Operations, conv_stage: ConvSiluStage,
-        selected_history, weight_ub, q_workspace_gm: Tensor, k_workspace_gm: Tensor, v_workspace_gm: Tensor,
-        output_gate_workspace_gm: Tensor, conv_state_gm: Tensor, conv_state_indices_gm: Tensor, m_group, n_macro,
-        batch_base, batches_per_subblock, subblock_idx, panel):
-        """Consume one resident N128 accumulator while Cube holds the other two."""
-        logical_n = n_macro * 3 + panel
-        if logical_n < 3 * self.num_heads:
-            projection = logical_n // self.num_heads
-            value_head = logical_n - projection * self.num_heads
-            for local_batch in range(batches_per_subblock):
-                batch_index = batch_base + local_batch
-                if batch_index < conv_state_indices_gm.shape[0]:
-                    cache_index = dtypes.int64(conv_state_indices_gm[batch_index])
-                    if cache_index == 0:
-                        conv_stage.zero_sequence(local_batch)
-                    else:
-                        history_view = tile_slice(selected_history, (CONV_KERNEL - 1, TILE), (local_batch, 0))
-                        conv_stage.install_history(history_view)
-                        state_view = conv_state_gm[cache_index, None, None]
-                        mem_copy(
-                            tile_slice(state_view[None, 0:2, None], (2, TILE), (0, logical_n)),
-                            tile_slice(history_view[1:3, None], (2, TILE), (0, 0)))
-                        conv_stage.convolve_sequence(local_batch, projection_stage.projection_fp32, weight_ub)
-                        vec_sync_notify(PIPE.V, PIPE.MTE3, CONV_RAW_V_TO_MTE3_EVENT)
-                        vec_sync_wait(PIPE.V, PIPE.MTE3, CONV_RAW_V_TO_MTE3_EVENT)
-                        mem_copy(
-                            tile_slice(
-                                state_view[None, 2: 2 + self.seq_len, None], (self.seq_len, TILE), (0, logical_n)),
-                            tile_slice(conv_stage.raw_bf16, (self.seq_len, TILE), (local_batch, 0)))
-            vec_sync_all()
-            if projection == 0:
-                projection_stage.publish(q_workspace_gm, m_group, value_head, subblock_idx, conv_stage.output_bf16)
-            elif projection == 1:
-                projection_stage.publish(k_workspace_gm, m_group, value_head, subblock_idx, conv_stage.output_bf16)
-            else:
-                projection_stage.publish(v_workspace_gm, m_group, value_head, subblock_idx, conv_stage.output_bf16)
-        else:
-            gate_head = logical_n - 3 * self.num_heads
-            projection_stage.cast_result()
-            vec_sync_all()
-            projection_stage.publish(
-                output_gate_workspace_gm, m_group, gate_head, subblock_idx, projection_stage.projection_bf16)
-        vec_sync_all()
-
-
-class _Core32ProjectionSchedule(_ProjectionScheduleOperations):
-
-    @jit
-    def main(self, q, k, v, gate, x, wqkv, wz, conv, conv_indices, conv_accepted, wc, n, logical_rows, enabled=True):
-        # Keep the selected main stage open through the shared auxiliary phase.
-        # A surrounding width branch forces an early cross-core channel drain.
-        self.enabled = enabled
-        self.main_rows = logical_rows
-        self.num_heads = self.heads
-        self.frontend_main(q, k, v, gate, x, wqkv, wz, conv, conv_indices, conv_accepted, wc)
-
-    @jit
-    def frontend_main(self, q, k, v, gate, x, wqkv, wz, conv, conv_indices, conv_accepted, wc):
-        groups = (
-            ceil_div(x.shape[0], self.main_rows)
-            if const_expr(self.config.ragged_main)
-            else x.shape[0] // self.main_rows)
-        subblock = get_subblock_id()
-        if const_expr(self.config.main_width == 256):
-            task_count = groups * (2 * self.num_heads)
-            if not self.enabled:
-                task_count = 0
-            batches = self.main_rows // 16
-            for task in range(get_block_idx(), task_count, get_block_num()):
-                macro = task // groups
-                group = task % groups
-                onchip_rewind(reset_sync_id=True)
-                projection = _Core32Projection256(self.main_rows, self.config.ragged_main)
-                projection.weight_l2_cache_ctl = self.main_policy
-                convolution = ConvSiluStage(8, self.main_rows // 2, self.row_capacity // 2)
-                history = Buffer(
-                    MemLoc.UB,
-                    dtypes.bfloat16,
-                    make_layout((3 * (self.row_capacity // 16) * 3 * TILE,)),
-                ).view(2 * batches * 3, 128)
-                batch_base = group * (self.main_rows // 8) + subblock * batches
-                if macro < 3 * self.num_heads // 2:
-                    projection.matmul_hidden2(x, wqkv, group, macro)
-                else:
-                    projection.matmul_hidden2(x, wz, group, macro - 3 * self.num_heads // 2)
-                h0 = history[0 * (batches * 3): (0 + 1) * (batches * 3), 0 * 128: (0 + 1) * 128]
-                h1 = history[1 * (batches * 3): (1 + 1) * (batches * 3), 0 * 128: (0 + 1) * 128]
-                self._prefetch_n256_panel(
-                    convolution, h0, conv, conv_indices, conv_accepted, wc, macro, batch_base, batches, 0)
-                self._prefetch_n256_panel(
-                    convolution, h1, conv, conv_indices, conv_accepted, wc, macro, batch_base, batches, 1)
-                vec_sync_all()
-                projection.acquire_result0()
-                self._consume_n384_panel(projection, convolution, h0, tile_slice(convolution.weight, (4, 128), (0, 0)),
-                    q, k, v, gate, conv, conv_indices, group, 0, batch_base, batches, subblock, macro * 2)
-                projection.acquire_result1()
-                self._consume_n384_panel(projection, convolution, h1, tile_slice(convolution.weight, (4, 128), (1, 0)),
-                    q, k, v, gate, conv, conv_indices, group, 0, batch_base, batches, subblock, macro * 2 + 1)
-        elif const_expr(self.config.main_width == 384):
-            task_count = groups * (4 * self.num_heads // 3)
-            if not self.enabled:
-                task_count = 0
-            for task in range(get_block_idx(), task_count, get_block_num()):
-                macro = task // groups
-                group = task % groups
-                onchip_rewind(reset_sync_id=True)
-                projection = _Core32Projection384(self.main_rows, 0, self.config.main_weight_l2_cache_ctl)
-                projection.weight_l2_cache_ctl = self.main_policy
-                convolution = ConvSiluStage(8, self.main_rows // 2, self.row_capacity // 2)
-                batches = self.main_rows // 16
-                history = Buffer(
-                    MemLoc.UB,
-                    dtypes.bfloat16,
-                    make_layout((3 * (self.row_capacity // 16) * 3 * TILE,)),
-                ).view(3 * batches * 3, TILE)
-                if macro < self.num_heads:
-                    projection.matmul_hidden3(x, wqkv, group, macro, 56)
-                else:
-                    projection.matmul_hidden3(x, wz, group, macro - self.num_heads, 56)
-                self._consume_n384_triplet(projection, convolution, history, q, k, v, gate, conv, conv_indices,
-                    conv_accepted, wc, group, macro, group * (self.main_rows // 8) + subblock * batches, batches,
-                    subblock)
-        else:
-            for task in range(get_block_idx(), groups * 4 * self.num_heads, get_block_num()):
-                head = task // groups
-                group = task % groups
-                onchip_rewind(reset_sync_id=True)
-                projection = ProjectionStage(
-                    self.main_rows, 0, self.config.main_weight_l2_cache_ctl, row_capacity=self.main_rows)
-                projection.weight_l2_cache_ctl = self.main_policy
-                convolution = ConvSiluStage(8, self.main_rows // 2, self.row_capacity // 2)
-                self._run_qkvg_task(
-                    projection,
-                    convolution,
-                    tile_slice(x, make_tiler((self.main_rows, HIDDEN_SIZE), alignment=(16, 16)), (group, 0)),
-                    tile_slice(q, make_tiler((self.main_rows, self.num_heads * TILE), alignment=(16, 16)), (group, 0)),
-                    tile_slice(k, make_tiler((self.main_rows, self.num_heads * TILE), alignment=(16, 16)), (group, 0)),
-                    tile_slice(v, make_tiler((self.main_rows, self.num_heads * TILE), alignment=(16, 16)), (group, 0)),
-                    tile_slice(
-                        gate, make_tiler((self.main_rows, self.num_heads * TILE), alignment=(16, 16)), (group, 0)),
-                    wqkv,
-                    wz,
-                    conv,
-                    conv_indices,
-                    conv_accepted,
-                    wc,
-                    0 if head < 3 * self.num_heads else 1,
-                    head if head < 3 * self.num_heads else head - 3 * self.num_heads,
-                    group * (self.main_rows // 8),
-                    self.main_rows // 8,
-                    subblock,
-                    56)
-
-
-class _HeadOutputStage:
-    """Retain output partial sums for up to four column tiles per AIC."""
-
-    def __init__(
+    def execute(
         self,
-        rows,
-        heads):
-        self.rows = rows
-        self.heads = heads
-        self.a_l1 = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((rows, TILE)), depth=2)
-        self.a_l1_shape = (rows, TILE)
-        self.b_l1 = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((256, TILE)), depth=2)
-        self.l0a = RingBuffer(MemLoc.L0A, dtypes.bfloat16, make_layout((rows, OPROJ_KS)), depth=2)
-        self.l0a_shape = (rows, OPROJ_KS)
-        self.l0b = RingBuffer(MemLoc.L0B, dtypes.bfloat16, make_layout((256, OPROJ_KS)), depth=2)
-        self.c0 = RingBuffer(MemLoc.L0C, dtypes.float32, make_layout((rows, 256)), depth=1).next_write()
-        self.c1 = RingBuffer(MemLoc.L0C, dtypes.float32, make_layout((rows, 256)), depth=1).next_write()
-        self.c2 = RingBuffer(MemLoc.L0C, dtypes.float32, make_layout((rows, 256)), depth=1).next_write()
-        self.c3 = RingBuffer(MemLoc.L0C, dtypes.float32, make_layout((rows, 256)), depth=1).next_write()
-
-    @jit
-    def _accumulate_tile(self, tensors, accumulator, column, head_range):
-        out, gated, weight = tensors
-        first_head, last_head = head_range
-        if column < HIDDEN_SIZE // 256:
-            for head in range(first_head, last_head):
-                a = from_tensor(self.a_l1.next_write(), layout=make_layout(self.a_l1_shape), data_format="nz")
-                b = self.b_l1.next_write()
-                mem_copy(a, tile_slice(gated, (self.rows, TILE), (0, head)))
-                mem_copy(b, tile_slice(weight, (256, TILE), (column, head)))
-                for ks in range(TILE // OPROJ_KS):
-                    la = from_tensor(self.l0a.next_write(), layout=make_layout(self.l0a_shape), data_format="nz")
-                    lb = self.l0b.next_write()
-                    mem_copy(la, tile_slice(a, (self.rows, OPROJ_KS), (0, ks)))
-                    mem_copy(lb, tile_slice(b, (256, OPROJ_KS), (0, ks)))
-                    matmul(accumulator, la, lb, init=head == 0 and ks == 0)
-            if last_head == self.heads:
-                mem_copy(tile_slice(out, (self.rows, 256), (0, column)), accumulator)
-
-    @jit
-    def accumulate(self, out, gated, weight, first_head, last_head):
-        tensors = (out, gated, weight)
-        head_range = (first_head, last_head)
-        column = get_block_idx()
-        stride = get_block_num()
-        self._accumulate_tile(tensors, self.c0, column, head_range)
-        self._accumulate_tile(tensors, self.c1, column + stride, head_range)
-        self._accumulate_tile(tensors, self.c2, column + 2 * stride, head_range)
-        self._accumulate_tile(tensors, self.c3, column + 3 * stride, head_range)
-
-
-class _HeadPanelBackend:
-    """Overlap small-batch NB recurrence with output K-panel accumulation."""
-
-    def __init__(
-        self,
-        heads,
-        store_policy=4):
-        self.heads = heads
-        self.rows = 64 if heads == 12 else 32
-        self.config = Schedule(state_store_l2_cache_ctl=store_policy)
-
-    @jit
-    def backend(self, out, q, k, v, decay, gate, beta, gamma, wo, alog, bias, initial, final, indices, accepted, scale, lower, eps):
-        batch = accepted.shape[0]
-        stride = 2 * get_block_num()
-        total = batch * self.heads
-        recurrent = RecurrentStage(128, self.heads, self.config)
-        output_gate = OutputGateStage()
-        output = _HeadOutputStage(self.rows, self.heads)
-        recurrent.load_gate_params(alog, bias)
-        output_gate.load_gamma(gamma)
-        first = 2 * get_block_idx() + get_subblock_id()
-        for slot in range(ceil_div(total, stride)):
-            nb_item = slot * stride + first
-            batch_index = nb_item % batch
-            head = nb_item // batch
-            if nb_item < total:
-                run_recurrent_wave(recurrent, output_gate, q, k, v, decay, gate, beta, initial, final,
-                    indices, accepted, nb_item, nb_item + 1, batch, 8, self.heads, 128, scale, lower, eps,
-                    defer_final_snapshot=True, nb_group_batch=batch)
-            ready = (slot + 1) * stride
-            if ready > total:
-                ready = total
-            publish_vector_grid_to_cube(3, 4, ack_flag=5)
-            if nb_item < total:
-                index = dtypes.int64(indices[batch_index * 8 + 7])
-                recurrent.store_state(tile_slice(final[index, head, None, None], (128, 128), (0, 0)))
-            output.accumulate(out, q, wo, slot * stride // batch, ready // batch)
-            # Keep the Cube accumulator alive across head-group publications.
-        onchip_rewind(reset_sync_id=True)
-
-
-class _PhaseSchedule(TPSchedule):
-    """Keep measured output geometry while sharing runtime cache controls."""
-
-    @jit
-    def _configure_recurrent(self, _recurrent_stage):
-        _recurrent_stage.store_policy = self.store_policy
-        _recurrent_stage.load_policy = self.load_policy
-
-
-class _TP16N384Schedule(_GridSchedule):
-    @jit
-    def execute(self, out_gm: Tensor, q_workspace_gm: Tensor, k_workspace_gm: Tensor, v_workspace_gm: Tensor,
-        decay_workspace_gm: Tensor, output_gate_workspace_gm: Tensor, beta_workspace_gm: Tensor,
-        fa_workspace_gm: Tensor, norm_exchange_gm: Tensor, hidden_gm: Tensor, qkv_weight_gm: Tensor,
-        fa_weight_gm: Tensor, fb_weight_gm: Tensor, beta_weight_gm: Tensor, output_gate_weight_gm: Tensor,
-        output_norm_weight_gm: Tensor, o_proj_weight_gm: Tensor, a_log_gm: Tensor, dt_bias_gm: Tensor,
-        initial_state_gm: Tensor, final_state_gm: Tensor, state_indices_gm: Tensor, accepted_gm: Tensor,
-        conv_state_gm: Tensor, conv_state_indices_gm: Tensor, conv_accepted_gm: Tensor, conv_weight_gm: Tensor,
-        scale_value: float, lower_bound: float, rms_norm_eps: float):
-        self.batch_groups = accepted_gm.shape[0] // BATCH_TILE
-        self.seq_len = 8
+        out,
+        q,
+        k,
+        v,
+        decay,
+        gate,
+        beta,
+        fa,
+        norm,
+        x,
+        wqkv,
+        wa,
+        wb,
+        wbeta,
+        wz,
+        gamma,
+        wo,
+        alog,
+        bias,
+        initial,
+        replay_u,
+        replay_k,
+        replay_decay,
+        conv,
+        state_indices,
+        conv_accepted,
+        wc,
+        scale,
+        lower,
+        eps,
+        plan_rows,
+        plan_width,
+        plan_policy,
+    ):
+        self.batch_groups = replay_decay.indices.shape[0] // 16
+        self.seq_len = S8_SEQUENCE_LENGTH
         self.row_count = 128
         self.projection_row_block = 64
         self.recurrent_wave_rows = 64
-        self._frontend_adaptive_n384(q_workspace_gm, k_workspace_gm, v_workspace_gm, decay_workspace_gm,
-            output_gate_workspace_gm, hidden_gm, qkv_weight_gm, fa_weight_gm, fb_weight_gm, output_gate_weight_gm,
-            conv_state_gm, conv_state_indices_gm, conv_accepted_gm, conv_weight_gm)
-        cube_sync_all()
-        onchip_rewind(reset_sync_id=True)
-        self._frontend_adaptive_auxiliary(
-            decay_workspace_gm, beta_workspace_gm, hidden_gm, fa_weight_gm, fb_weight_gm, beta_weight_gm)
-        global_sync_all()
-        onchip_rewind(reset_sync_id=True)
-        self._run_backend_stream(out_gm, q_workspace_gm, k_workspace_gm, v_workspace_gm, decay_workspace_gm,
-            output_gate_workspace_gm, beta_workspace_gm, fa_workspace_gm, norm_exchange_gm, hidden_gm, qkv_weight_gm,
-            fa_weight_gm, fb_weight_gm, beta_weight_gm, output_gate_weight_gm, output_norm_weight_gm, o_proj_weight_gm,
-            a_log_gm, dt_bias_gm, initial_state_gm, final_state_gm, state_indices_gm, accepted_gm, conv_state_gm,
-            conv_state_indices_gm, conv_accepted_gm, conv_weight_gm, scale_value, lower_bound, rms_norm_eps)
-
-
-class _Runtime32Logic:
-    def __init__(self):
-        self.compact = _GridSchedule(32, HIDDEN_SIZE, 6)
-        self.task = _TP16N384Schedule(32, HIDDEN_SIZE, 6)
-        self.task.projection_weight_l2_cache_ctl = 0
-        config = Schedule(main_rows=64, main_width=384, auxiliary_rows=64, publish_rows=64, main_weight_l2_cache_ctl=0,
-            state_store_l2_cache_ctl=0, fa_width=32)
-        self.short = TPSchedule(6, 64, 64, 64, config)
-
-    @jit
-    def execute(self, out_gm: Tensor, q_workspace_gm: Tensor, k_workspace_gm: Tensor, v_workspace_gm: Tensor,
-        decay_workspace_gm: Tensor, output_gate_workspace_gm: Tensor, beta_workspace_gm: Tensor,
-        fa_workspace_gm: Tensor, norm_exchange_gm: Tensor, hidden_gm: Tensor, qkv_weight_gm: Tensor,
-        fa_weight_gm: Tensor, fb_weight_gm: Tensor, beta_weight_gm: Tensor, output_gate_weight_gm: Tensor,
-        output_norm_weight_gm: Tensor, o_proj_weight_gm: Tensor, a_log_gm: Tensor, dt_bias_gm: Tensor,
-        initial_state_gm: Tensor, final_state_gm: Tensor, state_indices_gm: Tensor, accepted_gm: Tensor,
-        conv_state_gm: Tensor, conv_state_indices_gm: Tensor, conv_accepted_gm: Tensor, conv_weight_gm: Tensor,
-        scale_value: float, lower_bound: float, rms_norm_eps: float):
-        if accepted_gm.shape[0] == 16:
-            self.compact.execute(out_gm[0:128, None], q_workspace_gm[0:128, None], k_workspace_gm[0:128, None],
-                v_workspace_gm[0:128, None], decay_workspace_gm[0:128, None], output_gate_workspace_gm[0:128, None],
-                beta_workspace_gm[0:128, None], fa_workspace_gm[0:128, None], norm_exchange_gm, hidden_gm[0:128, None],
-                qkv_weight_gm, fa_weight_gm, fb_weight_gm, beta_weight_gm, output_gate_weight_gm,
-                output_norm_weight_gm, o_proj_weight_gm, a_log_gm, dt_bias_gm, initial_state_gm, final_state_gm,
-                state_indices_gm[0:128,], accepted_gm[0:16,], conv_state_gm, conv_state_indices_gm[0:16,],
-                conv_accepted_gm[0:16,], conv_weight_gm, scale_value, lower_bound, rms_norm_eps)
-        elif accepted_gm.shape[0] == 32:
-            self._short(out_gm[0:256, None], q_workspace_gm[0:256, None], k_workspace_gm[0:256, None],
-                v_workspace_gm[0:256, None], decay_workspace_gm[0:256, None], output_gate_workspace_gm[0:256, None],
-                beta_workspace_gm[0:256, None], fa_workspace_gm[0:256, None], norm_exchange_gm, hidden_gm[0:256, None],
-                qkv_weight_gm, fa_weight_gm, fb_weight_gm, beta_weight_gm, output_gate_weight_gm,
-                output_norm_weight_gm, o_proj_weight_gm, a_log_gm, dt_bias_gm, initial_state_gm, final_state_gm,
-                state_indices_gm[0:256,], accepted_gm[0:32,], conv_state_gm, conv_state_indices_gm[0:32,],
-                conv_accepted_gm[0:32,], conv_weight_gm, scale_value, lower_bound, rms_norm_eps)
-        else:
-            policy = dtypes.int32(0)
-            if accepted_gm.shape[0] >= 112:
-                policy = dtypes.int32(4)
-            self.task.state_store_l2_cache_ctl = policy
-            self.task.execute(out_gm, q_workspace_gm, k_workspace_gm, v_workspace_gm, decay_workspace_gm,
-                output_gate_workspace_gm, beta_workspace_gm, fa_workspace_gm, norm_exchange_gm, hidden_gm,
-                qkv_weight_gm, fa_weight_gm, fb_weight_gm, beta_weight_gm, output_gate_weight_gm,
-                output_norm_weight_gm, o_proj_weight_gm, a_log_gm, dt_bias_gm, initial_state_gm, final_state_gm,
-                state_indices_gm, accepted_gm, conv_state_gm, conv_state_indices_gm, conv_accepted_gm, conv_weight_gm,
-                scale_value, lower_bound, rms_norm_eps)
-
-    @jit
-    def _short(self, out_gm: Tensor, q_workspace_gm: Tensor, k_workspace_gm: Tensor, v_workspace_gm: Tensor,
-        decay_workspace_gm: Tensor, output_gate_workspace_gm: Tensor, beta_workspace_gm: Tensor,
-        fa_workspace_gm: Tensor, norm_exchange_gm: Tensor, hidden_gm: Tensor, qkv_weight_gm: Tensor,
-        fa_weight_gm: Tensor, fb_weight_gm: Tensor, beta_weight_gm: Tensor, output_gate_weight_gm: Tensor,
-        output_norm_weight_gm: Tensor, o_proj_weight_gm: Tensor, a_log_gm: Tensor, dt_bias_gm: Tensor,
-        initial_state_gm: Tensor, final_state_gm: Tensor, state_indices_gm: Tensor, accepted_gm: Tensor,
-        conv_state_gm: Tensor, conv_state_indices_gm: Tensor, conv_accepted_gm: Tensor, conv_weight_gm: Tensor,
-        scale_value: float, lower_bound: float, rms_norm_eps: float):
-        self.short.frontend_main(q_workspace_gm, k_workspace_gm, v_workspace_gm, output_gate_workspace_gm, hidden_gm,
-            qkv_weight_gm, output_gate_weight_gm, conv_state_gm, conv_state_indices_gm, conv_accepted_gm,
-            conv_weight_gm)
-        cube_sync_all()
-        onchip_rewind(reset_sync_id=True)
-        self.short.frontend_auxiliary(decay_workspace_gm, beta_workspace_gm, fa_workspace_gm, hidden_gm, fa_weight_gm,
-            fb_weight_gm, beta_weight_gm)
-        global_sync_all()
-        onchip_rewind(reset_sync_id=True)
-        self.short.frontend_fb(decay_workspace_gm, fa_workspace_gm, fb_weight_gm)
-        global_sync_all()
-        onchip_rewind(reset_sync_id=True)
-        self.short.backend(out_gm, q_workspace_gm, k_workspace_gm, v_workspace_gm, decay_workspace_gm,
-            output_gate_workspace_gm, beta_workspace_gm, output_norm_weight_gm, o_proj_weight_gm, a_log_gm, dt_bias_gm,
-            initial_state_gm, final_state_gm, state_indices_gm, accepted_gm, scale_value, lower_bound, rms_norm_eps)
-
-
-class _TP12Logic:
-    def __init__(self):
-        self.head_backend = _HeadPanelBackend(12, store_policy=0)
-        self.main384 = _Core32ProjectionSchedule(12, 128, 384)
-        self.main256 = _Core32ProjectionSchedule(12, 256, 256)
-        self.aux0 = TPSchedule(12, 128, 32, 64, Schedule(fa_width=32))
-        self.aux1 = TPSchedule(12, 128, 64, 64, Schedule(fa_width=128))
-        self.back0 = _PhaseSchedule(
-            12, 128, 64, 64, Schedule(publish_rows=64, ragged_output=False))
-        self.back1 = _PhaseSchedule(
-            12, 128, 64, 256, Schedule(publish_rows=256, ragged_output=True))
-        self.back2 = _PhaseSchedule(
-            12, 128, 64, 256, Schedule(publish_rows=256, ragged_output=True))
-        self.back3 = _PhaseSchedule(
-            12, 128, 64, 64, Schedule(publish_rows=64, ragged_output=False))
-
-    @jit
-    def execute(self, out, q, k, v, decay, gate, beta, fa, norm, x, wqkv, wa, wb, wbeta, wz, gamma, wo, alog, bias,
-        initial, final, indices, accepted, conv, conv_indices, conv_accepted, wc, scale, lower, eps):
-        mb = accepted.shape[0] // 8
-        main_policy = dtypes.int32(4)
-        if mb > 4:
-            main_policy = dtypes.int32(0)
-        store_policy = dtypes.int32(0)
-        if mb >= 4:
-            store_policy = dtypes.int32(4)
-        load_policy = dtypes.int32(2)
-        if mb >= 16:
-            load_policy = dtypes.int32(4)
-        main_rows = 256
-        if mb == 1:
-            main_rows = 64
-        elif mb == 2:
-            main_rows = 128
-        use384 = mb <= 2
-        # Aligned M128/N384 tiles fill complete projection waves.
-        if mb >= 8 and out.shape[0] % 128 == 0:
-            main_rows = 128
-            use384 = True
-        self.main256.main_policy = main_policy
-        self.main256.main(q, k, v, gate, x, wqkv, wz, conv, conv_indices, conv_accepted, wc, 12, main_rows, not use384)
-        self.main384.main_policy = main_policy
-        self.main384.main(q, k, v, gate, x, wqkv, wz, conv, conv_indices, conv_accepted, wc, 12, main_rows, use384)
-        # Close paired projection credits before the auxiliary phase reuses their IDs.
-        global_sync_all()
-        onchip_rewind(reset_sync_id=True)
-        if mb == 1:
-            self.aux0.frontend_auxiliary(decay, beta, fa, x, wa, wb, wbeta)
-        else:
-            self.aux1.frontend_auxiliary(decay, beta, fa, x, wa, wb, wbeta)
-        global_sync_all()
-        onchip_rewind(reset_sync_id=True)
-        if mb == 1:
-            self.aux0.frontend_fb(decay, fa, wb)
-        else:
-            self.aux1.frontend_fb(decay, fa, wb)
-        global_sync_all()
-        onchip_rewind(reset_sync_id=True)
-        if mb == 1:
-            self.head_backend.backend(out, q, k, v, decay, gate, beta, gamma, wo, alog, bias, initial,
-                final, indices, accepted, scale, lower, eps)
-        elif mb == 2 or mb == 5:
-            self.back0.store_policy = store_policy
-            self.back0.load_policy = load_policy
-            self.back0.backend(out, q, k, v, decay, gate, beta, gamma, wo, alog, bias, initial, final, indices,
-                accepted, scale, lower, eps)
-        # The preceding branch handles 1, 2 and 5; this leaves 3, 4, 6 and 7.
-        elif mb < 8:
-            self.back1.store_policy = store_policy
-            self.back1.load_policy = load_policy
-            self.back1.backend(out, q, k, v, decay, gate, beta, gamma, wo, alog, bias, initial, final, indices,
-                accepted, scale, lower, eps)
-        elif mb == 8:
-            self.back2.store_policy = store_policy
-            self.back2.load_policy = load_policy
-            self.back2.backend(out, q, k, v, decay, gate, beta, gamma, wo, alog, bias, initial, final, indices,
-                accepted, scale, lower, eps)
-        else:
-            self.back3.store_policy = store_policy
-            self.back3.load_policy = load_policy
-            self.back3.backend(out, q, k, v, decay, gate, beta, gamma, wo, alog, bias, initial, final, indices,
-                accepted, scale, lower, eps)
-
-
-class _TP24Logic:
-    def __init__(self):
-        self.head_backend = _HeadPanelBackend(24, store_policy=0)
-        self.main384 = _Core32ProjectionSchedule(24, 128, 384)
-        self.main256 = _Core32ProjectionSchedule(24, 256, 256)
-        self.aux0 = TPSchedule(24, 128, 32, 64, Schedule(fa_width=64))
-        self.aux1 = TPSchedule(24, 128, 32, 64, Schedule(fa_width=128))
-        self.back0 = _PhaseSchedule(
-            24, 128, 64, 32, Schedule(publish_rows=32, ragged_output=False))
-        self.back1 = _PhaseSchedule(
-            24, 128, 64, 64, Schedule(publish_rows=64, ragged_output=False))
-        self.back2 = _PhaseSchedule(
-            24, 128, 64, 128, Schedule(publish_rows=128, ragged_output=True))
-        self.back2.output_tile_width = 224
-        self.back3 = _PhaseSchedule(
-            24, 128, 64, 256, Schedule(publish_rows=256, ragged_output=True))
-
-    @jit
-    def execute(self, out, q, k, v, decay, gate, beta, fa, norm, x, wqkv, wa, wb, wbeta, wz, gamma, wo, alog, bias,
-        initial, final, indices, accepted, conv, conv_indices, conv_accepted, wc, scale, lower, eps):
-        mb = accepted.shape[0] // 4
-        main_policy = dtypes.int32(4)
-        if mb > 8:
-            main_policy = dtypes.int32(0)
-        store_policy = dtypes.int32(0)
-        if mb >= 4:
-            store_policy = dtypes.int32(4)
-        load_policy = dtypes.int32(2)
-        main_rows = 256
-        if mb == 1:
-            main_rows = 32
-        elif mb == 2:
-            main_rows = 64
-        elif mb == 3 or mb == 4:
-            main_rows = 128
-        use384 = mb == 1 or mb == 2 or mb == 4
-        # Aligned M128/N384 tiles fill complete projection waves.
-        if mb >= 8 and out.shape[0] % 128 == 0:
-            main_rows = 128
-            use384 = True
-        self.main256.main_policy = main_policy
-        self.main256.main(q, k, v, gate, x, wqkv, wz, conv, conv_indices, conv_accepted, wc, 24, main_rows, not use384)
-        self.main384.main_policy = main_policy
-        self.main384.main(q, k, v, gate, x, wqkv, wz, conv, conv_indices, conv_accepted, wc, 24, main_rows, use384)
-        # Close paired projection credits before the auxiliary phase reuses their IDs.
-        global_sync_all()
-        onchip_rewind(reset_sync_id=True)
-        if mb == 1:
-            self.aux0.frontend_auxiliary(decay, beta, fa, x, wa, wb, wbeta)
-        else:
-            self.aux1.frontend_auxiliary(decay, beta, fa, x, wa, wb, wbeta)
-        global_sync_all()
-        onchip_rewind(reset_sync_id=True)
-        self.aux0.frontend_fb(decay, fa, wb)
-        global_sync_all()
-        onchip_rewind(reset_sync_id=True)
-        if mb == 1:
-            self.head_backend.backend(out, q, k, v, decay, gate, beta, gamma, wo, alog, bias, initial,
-                final, indices, accepted, scale, lower, eps)
-        elif mb == 2 or mb == 4:
-            self.back1.store_policy = store_policy
-            self.back1.load_policy = load_policy
-            self.back1.backend(out, q, k, v, decay, gate, beta, gamma, wo, alog, bias, initial, final, indices,
-                accepted, scale, lower, eps)
-        elif mb == 3 or mb >= 16:
-            self.back2.store_policy = store_policy
-            self.back2.load_policy = load_policy
-            self.back2.backend(out, q, k, v, decay, gate, beta, gamma, wo, alog, bias, initial, final, indices,
-                accepted, scale, lower, eps)
-        else:
-            self.back3.store_policy = store_policy
-            self.back3.load_policy = load_policy
-            self.back3.backend(out, q, k, v, decay, gate, beta, gamma, wo, alog, bias, initial, final, indices,
-                accepted, scale, lower, eps)
-
-
-VALID_CORES = (8, 16, 24, 28, 32)
-MAIN_TEMPLATES = (
-    (32, 384),
-    (64, 384),
-    (128, 384),
-    (32, 256),
-    (128, 256),
-    (256, 256),
-    (64, 256),)
-
-
-class _MainGeometry(NamedTuple):
-    cost: int
-    jobs: int
-    rounds: int
-    input_bytes: int
-    weight_bytes: int
-    padded_rows: int
-
-
-def main_geometry(rows, heads, cores, tile_m, tile_n):
-    """Balance each core's row work and repeated projection setup.
-
-    Charge one head-width of setup per wave. N384 requires complete row tiles;
-    N256 masks the final row tile. Byte counts are logical traffic estimates.
-    """
-    groups = (rows + tile_m - 1) // tile_m
-    jobs = groups * (4 * heads * 128 // tile_n)
-    rounds = (jobs + cores - 1) // cores
-    a_bytes = jobs * tile_m * 7168 * 2
-    w_bytes = groups * 4 * heads * 128 * 7168 * 2
-    cost = rounds * (tile_m + 128)
-    if tile_n == 384 and rows % tile_m:
-        cost = 1 << 60
-    return _MainGeometry(cost, jobs, rounds, a_bytes, w_bytes, groups * tile_m)
-
-
-def select_main(rows, heads, cores):
-    if heads not in (6, 12, 24) or cores not in VALID_CORES:
-        raise ValueError("unsupported heads or AIC quota")
-    return min(range(len(MAIN_TEMPLATES)), key=lambda i: main_geometry(rows, heads, cores, *MAIN_TEMPLATES[i]).cost)
-
-
-def _tile_rows(rows, tile_rows, ragged):
-    return min(tile_rows, 1 << (rows - 1).bit_length()) if ragged else math.gcd(rows, tile_rows)
-
-
-def _core32_geometry(model_batch, heads, rows):
-    if heads == 6:
-        return dict(main_m=64 if model_batch == 2 else 128, main_n=128 if model_batch == 1 else 384,
-            auxiliary_rows=64 if model_batch == 2 else 128, publish_rows=64)
-    config = default_schedule(heads, model_batch)
-    aligned = model_batch >= 8 and rows % 128 == 0
-    return dict(main_m=128 if aligned else _tile_rows(rows, config.main_rows, config.ragged_main),
-        main_n=384 if aligned else config.main_width,
-        auxiliary_rows=math.gcd(rows, config.auxiliary_rows or (96 // heads) * 8),
-        publish_rows=_tile_rows(rows, config.publish_rows, config.ragged_output))
-
-
-def _core32_plan(model_batch, tp):
-    rows = model_batch * tp * 8
-    heads = 96 // tp
-    geometry = _core32_geometry(model_batch, heads, rows)
-    lanes = 48 if heads == 6 and model_batch == 1 else 64
-    return dict(model_batch=model_batch, tp=tp, cores=32, rows=rows, heads=heads, main_id=-1, **geometry,
-        main_geometry=main_geometry(rows, heads, 32, geometry["main_m"], geometry["main_n"]),
-        kda_waves=(96 * model_batch + lanes - 1) // lanes, vector_lanes=lanes, output_width=256,
-        output="nb_head_panels" if model_batch == 1 and heads != 6 else (
-            "weight256_r64" if heads == 6 else "measured32_stream"),
-        mode="specialized32_compact" if heads == 6 and model_batch == 1 else "specialized32")
-
-
-def _output_policy(rows, heads, cores):
-    if heads != 6 and rows * heads == 768:
-        return "nb_head_panels"
-    if rows in (32, 64):
-        return "short32" if rows == 32 else "short64"
-    if heads == 6:
-        return "weight256_r64" if cores >= 28 else "input128_r256"
-    return "input128_r128" if heads == 12 else "stream256_r128"
-
-
-def plan(model_batch, tp, cores):
-    if tp not in (4, 8, 16) or not 1 <= model_batch <= 32 or cores not in VALID_CORES:
-        raise ValueError("requires TP4/8/16, model batch1..32, AIC8/16/24/28/32")
-    if cores == 32:
-        return _core32_plan(model_batch, tp)
-    rows = model_batch * tp * 8
-    heads = 96 // tp
-    i = select_main(rows, heads, cores)
-    m, n = MAIN_TEMPLATES[i]
-    return dict(model_batch=model_batch, tp=tp, cores=cores, rows=rows, heads=heads, main_id=i, main_m=m, main_n=n,
-        main_geometry=main_geometry(rows, heads, cores, m, n),
-        kda_waves=(96 * model_batch + 2 * cores - 1) // (2 * cores),
-        auxiliary_rows=math.gcd(rows, 128), output=_output_policy(rows, heads, cores),
-        weight_policy=0 if rows > m else 4)
-
-
-class DynamicRecurrentStage(RecurrentStage):
-    def __init__(self):
-        super().__init__(128, 24, Schedule())
-
-    @jit
-    def load_gate_params(self, a_log_gm, dt_bias_gm):
-        n = a_log_gm.shape[0]
-        mem_copy(self.a_log[0:n,], a_log_gm)
-        mem_copy(self.dt_bias[0:n, None], dt_bias_gm)
-
-
-class DynamicBetaStage(BetaProjectionStage):
-    @jit
-    def matmul_hidden(self, hidden_gm, weight_gm, output_tile, k_tiles):
-        accumulator = from_tensor(self.l0c.next_write(), layout=make_layout(self.l0c_shape), data_format="nz")
-        beta_l1 = Buffer(
-            MemLoc.L1,
-            weight_gm.dtype,
-            weight_gm.layout,
-            physical_layout=weight_gm.physical_layout,
+        self._frontend_adaptive_n384(
+            q,
+            k,
+            v,
+            decay,
+            gate,
+            x,
+            wqkv,
+            wa,
+            wb,
+            wz,
+            conv,
+            state_indices,
+            conv_accepted,
+            wc,
         )
-        mem_copy(beta_l1, weight_gm, options=copy_options(l2_cache_ctl=self.weight_l2_cache_ctl))
-        for kc_idx in range(k_tiles):
-            a = from_tensor(self.a_l1.next_write(), layout=make_layout(self.a_l1_shape), data_format="nz")
-            mem_copy(a, tile_slice(hidden_gm, (self.row_capacity, 128), (0, kc_idx)), options=copy_options(l2_cache_ctl=self.input_l2_cache_ctl))
-            for ks_idx in range(2):
-                l0a = from_tensor(self.l0a.next_write(), layout=make_layout(self.l0a_shape), data_format="nz")
-                l0b = self.l0b.next_write()
-                mem_copy(l0a, tile_slice(a, (self.row_capacity, 64), (0, ks_idx)))
-                mem_copy(l0b, tile_slice(beta_l1, (self.tile_width, 64), (0, kc_idx * 2 + ks_idx)))
-                matmul(accumulator, l0a, l0b, init=kc_idx == 0 and ks_idx == 0)
-
-
-@jit
-def _copy_weight_with_policy(dst, src, policy):
-    if policy == 0:
-        mem_copy(dst, src, options=copy_options(l2_cache_ctl=0))
-    else:
-        mem_copy(dst, src, options=copy_options(l2_cache_ctl=4))
-
-
-class _DynamicProjectionOperations(_Core32ProjectionOperations):
-    """Use the shared projections with runtime-selected weight cache policy."""
-
-    @jit
-    def _copy_projection_weight(self, dst, src):
-        _copy_weight_with_policy(dst, src, self.weight_l2_cache_ctl)
-
-
-class N384ProjectionStage(_DynamicProjectionOperations):
-    def __init__(
-        self,
-        rows=128,
-        input_l2_cache_ctl=0,
-        weight_l2_cache_ctl=0):
-        self.rows = rows
-        self.allow_tail = False
-        self.input_l2_cache_ctl = int(input_l2_cache_ctl)
-        self.weight_l2_cache_ctl = int(weight_l2_cache_ctl)
-        self.a_l1 = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((128 * PROJECTION_KC,)), depth=2, data_format="nd")
-        self.a_l1_shape = (self.rows, PROJECTION_KC)
-        self.b_l1 = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((3 * TILE, PROJECTION_KC)), depth=2)
-        self.l0a = RingBuffer(MemLoc.L0A, dtypes.bfloat16, make_layout((128 * PROJECTION_KS,)), depth=2, data_format="nd")
-        self.l0a_shape = (self.rows, PROJECTION_KS)
-        self.l0b = RingBuffer(MemLoc.L0B, dtypes.bfloat16, make_layout((TILE, PROJECTION_KS)), depth=2)
-        self.l0c0 = from_tensor(RingBuffer(MemLoc.L0C, dtypes.float32, make_layout((128 * TILE,)), depth=1, data_format="nd").next_write(), layout=make_layout((self.rows, TILE)), data_format="nz")
-        self.l0c1 = from_tensor(RingBuffer(MemLoc.L0C, dtypes.float32, make_layout((128 * TILE,)), depth=1, data_format="nd").next_write(), layout=make_layout((self.rows, TILE)), data_format="nz")
-        self.l0c2 = from_tensor(RingBuffer(MemLoc.L0C, dtypes.float32, make_layout((128 * TILE,)), depth=1, data_format="nd").next_write(), layout=make_layout((self.rows, TILE)), data_format="nz")
-        self.projection_half0 = RingBuffer(MemLoc.UB, dtypes.float32, make_layout(((128 // 2) * TILE,)), depth=1).next_write().view((self.rows // 2, TILE))
-        self.projection_half1 = RingBuffer(MemLoc.UB, dtypes.float32, make_layout(((128 // 2) * TILE,)), depth=1).next_write().view((self.rows // 2, TILE))
-        self.projection_half2 = RingBuffer(MemLoc.UB, dtypes.float32, make_layout(((128 // 2) * TILE,)), depth=1).next_write().view((self.rows // 2, TILE))
-        self.projection_bf16 = Buffer(MemLoc.UB, dtypes.bfloat16, make_layout((128 // 2 * TILE,))).view(self.rows // 2, TILE)
-        self.projection_fp32: object
-
-
-class N256ProjectionStage(_DynamicProjectionOperations):
-    def __init__(
-        self,
-        rows,
-        allow_tail=False):
-        self.rows = rows
-        self.allow_tail = bool(allow_tail)
-        self.input_l2_cache_ctl = 0
-        self.weight_l2_cache_ctl = 4
-        self.a_l1 = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((256 * 256,)), depth=2, data_format="nd")
-        self.a_l1_shape = (rows, 256)
-        self.b_l1 = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((256, 256)), depth=2)
-        self.l0a = RingBuffer(MemLoc.L0A, dtypes.bfloat16, make_layout((256 * 64,)), depth=2, data_format="nd")
-        self.l0a_shape = (rows, 64)
-        self.l0b = RingBuffer(MemLoc.L0B, dtypes.bfloat16, make_layout((128, 64)), depth=2)
-        self.l0c0 = from_tensor(RingBuffer(MemLoc.L0C, dtypes.float32, make_layout((256 * 128,)), depth=1, data_format="nd").next_write(), layout=make_layout((rows, 128)), data_format="nz")
-        self.l0c1 = from_tensor(RingBuffer(MemLoc.L0C, dtypes.float32, make_layout((256 * 128,)), depth=1, data_format="nd").next_write(), layout=make_layout((rows, 128)), data_format="nz")
-        self.half = RingBuffer(MemLoc.UB, dtypes.float32, make_layout(((256 // 2) * 128,)), depth=1)
-        self.half_shape = (rows // 2, 128)
-        self.projection_bf16 = Buffer(MemLoc.UB, dtypes.bfloat16, make_layout((256 // 2 * 128,))).view(rows // 2, 128)
-
-
-    @jit
-    def acquire_result0(self):
-        self.projection_fp32 = self.half.next_write().view(self.half_shape)
-        mem_copy(self.projection_fp32, self.l0c0.partition(dim=0))
-
-    @jit
-    def acquire_result1(self):
-        self.projection_fp32 = self.half.next_write().view(self.half_shape)
-        mem_copy(self.projection_fp32, self.l0c1.partition(dim=0))
-
-
-class MultiCoreSchedule(_ProjectionScheduleOperations):
-
-    @jit
-    def main(self, q, k, v, gate, x, wqkv, wz, conv, conv_indices, conv_accepted, wc, n, logical_rows, policy=4):
-        self.main_policy = policy
-        self.main_rows = logical_rows
-        self.num_heads = self.heads
-        self.frontend_main(q, k, v, gate, x, wqkv, wz, conv, conv_indices, conv_accepted, wc)
-
-    @jit
-    def frontend_main(self, q, k, v, gate, x, wqkv, wz, conv, conv_indices, conv_accepted, wc):
-        groups = (
-            ceil_div(x.shape[0], self.main_rows)
-            if const_expr(self.config.ragged_main)
-            else x.shape[0] // self.main_rows)
-        subblock = get_subblock_id()
-        if const_expr(self.config.main_width == 256):
-            task_count = groups * (2 * self.num_heads)
-            batches = self.main_rows // 16
-            for task in range(get_block_idx(), task_count, get_block_num()):
-                macro = task // groups
-                group = task % groups
-                onchip_rewind(reset_sync_id=True)
-                projection = N256ProjectionStage(self.main_rows, self.config.ragged_main)
-                projection.weight_l2_cache_ctl = self.main_policy
-                convolution = ConvSiluStage(8, self.main_rows // 2, self.row_capacity // 2)
-                history = Buffer(
-                    MemLoc.UB,
-                    dtypes.bfloat16,
-                    make_layout((3 * (self.row_capacity // 16) * 3 * TILE,)),
-                ).view(2 * batches * 3, 128)
-                batch_base = group * (self.main_rows // 8) + subblock * batches
-                if macro < 3 * self.num_heads // 2:
-                    projection.matmul_hidden2(x, wqkv, group, macro)
-                else:
-                    projection.matmul_hidden2(x, wz, group, macro - 3 * self.num_heads // 2)
-                h0 = history[0 * (batches * 3): (0 + 1) * (batches * 3), 0 * 128: (0 + 1) * 128]
-                h1 = history[1 * (batches * 3): (1 + 1) * (batches * 3), 0 * 128: (0 + 1) * 128]
-                self._prefetch_n256_panel(
-                    convolution, h0, conv, conv_indices, conv_accepted, wc, macro, batch_base, batches, 0)
-                self._prefetch_n256_panel(
-                    convolution, h1, conv, conv_indices, conv_accepted, wc, macro, batch_base, batches, 1)
-                vec_sync_all()
-                projection.acquire_result0()
-                self._consume_n384_panel(projection, convolution, h0, tile_slice(convolution.weight, (4, 128), (0, 0)),
-                    q, k, v, gate, conv, conv_indices, group, 0, batch_base, batches, subblock, macro * 2)
-                projection.acquire_result1()
-                self._consume_n384_panel(projection, convolution, h1, tile_slice(convolution.weight, (4, 128), (1, 0)),
-                    q, k, v, gate, conv, conv_indices, group, 0, batch_base, batches, subblock, macro * 2 + 1)
-        elif const_expr(self.config.main_width == 384):
-            task_count = groups * (4 * self.num_heads // 3)
-            for task in range(get_block_idx(), task_count, get_block_num()):
-                macro = task // groups
-                group = task % groups
-                onchip_rewind(reset_sync_id=True)
-                projection = N384ProjectionStage(self.main_rows, 0, self.config.main_weight_l2_cache_ctl)
-                projection.weight_l2_cache_ctl = self.main_policy
-                convolution = ConvSiluStage(8, self.main_rows // 2, self.row_capacity // 2)
-                batches = self.main_rows // 16
-                history = Buffer(
-                    MemLoc.UB,
-                    dtypes.bfloat16,
-                    make_layout((3 * (self.row_capacity // 16) * 3 * TILE,)),
-                ).view(3 * batches * 3, TILE)
-                if macro < self.num_heads:
-                    projection.matmul_hidden3(x, wqkv, group, macro, 56)
-                else:
-                    projection.matmul_hidden3(x, wz, group, macro - self.num_heads, 56)
-                self._consume_n384_triplet(projection, convolution, history, q, k, v, gate, conv, conv_indices,
-                    conv_accepted, wc, group, macro, group * (self.main_rows // 8) + subblock * batches, batches,
-                    subblock)
-        else:
-            for task in range(get_block_idx(), groups * 4 * self.num_heads, get_block_num()):
-                head = task // groups
-                group = task % groups
-                onchip_rewind(reset_sync_id=True)
-                projection = ProjectionStage(
-                    self.main_rows, 0, self.config.main_weight_l2_cache_ctl, row_capacity=self.main_rows)
-                convolution = ConvSiluStage(8, self.main_rows // 2, self.row_capacity // 2)
-                self._run_qkvg_task(
-                    projection,
-                    convolution,
-                    tile_slice(x, make_tiler((self.main_rows, HIDDEN_SIZE), alignment=(16, 16)), (group, 0)),
-                    tile_slice(q, make_tiler((self.main_rows, self.num_heads * TILE), alignment=(16, 16)), (group, 0)),
-                    tile_slice(k, make_tiler((self.main_rows, self.num_heads * TILE), alignment=(16, 16)), (group, 0)),
-                    tile_slice(v, make_tiler((self.main_rows, self.num_heads * TILE), alignment=(16, 16)), (group, 0)),
-                    tile_slice(
-                        gate, make_tiler((self.main_rows, self.num_heads * TILE), alignment=(16, 16)), (group, 0)),
-                    wqkv,
-                    wz,
-                    conv,
-                    conv_indices,
-                    conv_accepted,
-                    wc,
-                    0 if head < 3 * self.num_heads else 1,
-                    head if head < 3 * self.num_heads else head - 3 * self.num_heads,
-                    group * (self.main_rows // 8),
-                    self.main_rows // 8,
-                    subblock,
-                    56)
-
-
-class AuxiliarySchedule(TPSchedule):
-    def __init__(
-        self,
-        heads,
-        rows):
-        super().__init__(heads, 32, rows, 64, Schedule(split_fb=True))
-        self.heads = heads
-
-    @jit
-    def beta_tasks(self, beta, x, wbeta, width):
-        groups = x.shape[0] // self.auxiliary_rows
-        for group in range(get_block_idx(), groups, get_block_num()):
-            onchip_rewind(reset_sync_id=True)
-            stage = DynamicBetaStage(self.auxiliary_rows, 0, 4, tile_width=width, row_capacity=self.auxiliary_rows)
-            stage.project_to_gm(
-                tile_slice(x, make_tiler((self.auxiliary_rows, HIDDEN_SIZE), alignment=(16, 16)), (group, 0)), wbeta,
-                tile_slice(beta, make_tiler((self.auxiliary_rows, width), alignment=(16, 16)), (group, 0)), 0, 56)
-            vec_sync_all()
-
-    @jit
-    def execute(self, decay, beta, fa, x, wa, wb, wbeta):
-        self.num_heads = self.heads
-        if self.num_heads == 24:
-            self.beta_tasks(beta, x, wbeta, 32)
-        else:
-            self.beta_tasks(beta, x, wbeta, 16)
+        cube_sync_all()
+        onchip_rewind(reset_sync_id=True)
+        self._frontend_adaptive_auxiliary(decay, beta, x, wa, wb, wbeta)
         global_sync_all()
         onchip_rewind(reset_sync_id=True)
-        groups = x.shape[0] // self.auxiliary_rows
-        for group in range(get_block_idx(), groups, get_block_num()):
-            onchip_rewind(reset_sync_id=True)
-            stage = ProjectionStage(self.auxiliary_rows, 0, 4, row_capacity=self.auxiliary_rows)
-            stage.project_to_gm(
-                tile_slice(x, make_tiler((self.auxiliary_rows, HIDDEN_SIZE), alignment=(16, 16)), (group, 0)), wa,
-                tile_slice(fa, make_tiler((self.auxiliary_rows, TILE), alignment=(16, 16)), (group, 0)), 0, 56)
-            vec_sync_all()
-        global_sync_all()
-        onchip_rewind(reset_sync_id=True)
-        self.frontend_fb(decay, fa, wb)
-
-    @jit
-    def frontend_fb(self, decay, fa, wb):
-        groups = fa.shape[0] // self.auxiliary_rows
-        for task in range(get_block_idx(), groups * self.num_heads, get_block_num()):
-            group = task // self.num_heads
-            head = task % self.num_heads
-            onchip_rewind(reset_sync_id=True)
-            stage = ProjectionStage(self.auxiliary_rows, 0, 0, row_capacity=self.auxiliary_rows)
-            a = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((self.auxiliary_rows, TILE)), depth=1).next_write()
-            b = RingBuffer(MemLoc.L1, dtypes.bfloat16, make_layout((TILE, TILE)), depth=1).next_write()
-            mem_copy(a, tile_slice(fa, make_tiler((self.auxiliary_rows, TILE), alignment=(16, 16)), (group, 0)))
-            mem_copy(b, tile_slice(wb, (TILE, TILE), (head, 0)))
-            stage.matmul_resident(a, b)
-            stage.publish_result(
-                tile_slice(decay, make_tiler((self.auxiliary_rows, TILE), alignment=(16, 16)), (group, head)))
-            vec_sync_all()
-
-
-class DynamicOutputStage(OutputProjectionStage):
-    @jit
-    def project(self, out_gm, gated_workspace_gm, weight_gm, k_tiles, row_tile):
-        tile_count = ceil_div(out_gm.shape[1], self.tile_width)
-        wave_start = row_tile * self.row_count
-        valid = out_gm.shape[0] - wave_start
-        if valid > self.row_count:
-            valid = self.row_count
-        gated_wave = gated_workspace_gm[wave_start: wave_start + valid, None]
-        out_wave = out_gm[wave_start: wave_start + valid, None]
-        if const_expr(self.resident_input):
-            resident_a = from_tensor(self.a_l1.next_write(), layout=make_layout(self.a_l1_shape), data_format="nz")
-            mem_copy(resident_a[0:valid, None], gated_wave[None, 0: self.num_heads * TILE])
-        for output_tile in range(get_block_idx(), tile_count, get_block_num()):
-            accumulator = from_tensor(self.l0c.next_write(), layout=make_layout(self.l0c_shape), data_format="nz")
-            for kc_idx in range(k_tiles * TILE // self.kc):
-                if const_expr(self.resident_input):
-                    a_panel = tile_slice(resident_a, (self.row_capacity, self.kc), (0, kc_idx))
-                else:
-                    a_panel = from_tensor(self.a_l1.next_write(), layout=make_layout(self.a_l1_shape), data_format="nz")
-                    mem_copy(a_panel[0:valid, None], gated_wave[None, kc_idx * self.kc: (kc_idx + 1) * self.kc])
-                if const_expr(self.resident_weight):
-                    b_panel = tile_slice(self.b_l1, (self.tile_width, self.kc), (0, kc_idx))
-                else:
-                    b_panel = self.b_l1.next_write()
-                    mem_copy(b_panel, tile_slice(weight_gm, (self.tile_width, self.kc), (output_tile, kc_idx)))
-                for ks in range(self.kc // self.ks):
-                    a = from_tensor(self.l0a.next_write(), layout=make_layout(self.l0a_shape), data_format="nz")
-                    b = self.l0b.next_write()
-                    mem_copy(a, tile_slice(a_panel, (self.row_capacity, self.ks), (0, ks)))
-                    mem_copy(b, tile_slice(b_panel, (self.tile_width, self.ks), (0, ks)))
-                    matmul(accumulator, a, b, init=kc_idx == 0 and ks == 0)
-            if valid < self.row_count:
-                for row in range(valid // 32):
-                    mem_copy(tile_slice(out_wave, (32, self.tile_width), (row, output_tile)), tile_slice(accumulator,
-                        (32, self.tile_width), (row, 0)))
-            else:
-                mem_copy(tile_slice(out_wave, (self.row_capacity, self.tile_width), (0, output_tile)), accumulator)
-            cube_sync_all()
-
-
-class BackendSchedule:
-    def __init__(
-        self,
-        heads):
-        self.heads = heads
-
-    @jit
-    def project_template(self, out, q, wo, n, chunk, width, rows, heads, resident_input, resident_weight):
-        # Complete the previous Cube phase before declaring this branch's resources.
-        cube_sync_all()
-        onchip_rewind(reset_sync_id=True)
-        output = DynamicOutputStage(width, rows, kc=384 if resident_weight else 256, row_capacity=rows,
-            allow_tail=True, num_heads=heads, resident_input=resident_input, resident_weight=resident_weight,
-            tiles_per_core=1)
-        if const_expr(resident_weight):
-            if chunk == 0:
-                output.prefetch_weight(wo)
-        output.project(out, q, wo, n, chunk)
-        cube_sync_all()
-        onchip_rewind(reset_sync_id=True)
-
-    @jit
-    def project_output(self, out, q, wo, n, chunk):
-        if q.shape[0] == 32:
-            self.project_template(out, q, wo, n, chunk, 256, 32, 24, False, False)
-        elif q.shape[0] == 64:
-            self.project_template(out, q, wo, n, chunk, 256, 64, 24, False, False)
-        elif n == 6:
-            if get_block_num() >= 28:
-                self.project_template(out, q, wo, n, chunk, 256, 64, 6, False, True)
-            else:
-                self.project_template(out, q, wo, n, chunk, 128, 256, 6, True, False)
-        elif n == 12:
-            self.project_template(out, q, wo, n, chunk, 128, 128, 12, True, False)
-        else:
-            self.project_template(out, q, wo, n, chunk, 256, 128, 24, False, False)
-        # Complete every template arm on the common chunk-loop backedge.
-        cube_sync_all()
-
-    @jit
-    def backend(self, out, q, k, v, decay, gate, beta, gamma, wo, alog, bias, initial, final, indices, accepted, scale,
-        lower, eps, beta_weight):
-        n = self.heads
-        core_count = get_block_num()
-        stride = 2 * core_count
-        total = accepted.shape[0] * n
-        slots = ceil_div(total, stride)
-        recurrent = DynamicRecurrentStage()
+        resources = _ResidentDelayedZResources()
+        recurrent = RecurrentKDAStage(
+            128, TP16_HEADS, state_key_unroll=4, state_update_unroll=2
+        )
         output_gate = OutputGateStage()
-        publish_rows = 128
-        if q.shape[0] == 32:
-            publish_rows = 32
-        elif q.shape[0] == 64 or (n == 6 and core_count >= 28):
-            publish_rows = 64
-        elif n == 6:
-            publish_rows = 256
+        raw = Buffer(MemLoc.UB, dtypes.float32, make_layout((48, 128)))
+        resources.output.prefetch_weight(wo)
         recurrent.load_gate_params(alog, bias)
         output_gate.load_gamma(gamma)
         first = get_block_idx() * 2 + get_subblock_id()
-        if first < total:
-            prefetch_recurrent_item(
-                recurrent, output_gate, q, k, v, decay, gate, beta, first, accepted.shape[0], 8, n, 128,
-                    nb_group_batch=publish_rows // 8)
-            prefetch_recurrent_state(recurrent, initial, indices, accepted, first, accepted.shape[0], 8, n, 128,
-                nb_group_batch=publish_rows // 8)
-        for slot in range(slots):
-            item = slot * stride + first
-            if item < total:
-                run_recurrent_wave(recurrent, output_gate, q, k, v, decay, gate, beta, initial, final, indices,
-                    accepted, item, item + 1, accepted.shape[0], 8, n, 128, scale, lower, eps,
-                    defer_final_snapshot=True, first_inputs_prefetched=True, first_state_prefetched=True,
-                    next_item_stride=stride, nb_group_batch=publish_rows // 8)
-            before = slot * stride
-            after = (slot + 1) * stride if (slot + 1) * stride < total else total
-            jobs = publish_rows // 8 * n
-            ready_before = before // jobs
-            ready_after = after // jobs
-            if after == total:
-                ready_after = ceil_div(after, jobs)
+        context = _RawRecurrentContext(
+            q,
+            k,
+            v,
+            initial.accurate_decay,
+            beta,
+            initial,
+            replay_u,
+            replay_k,
+            replay_decay,
+            scale,
+            lower,
+        )
+        gate_context = _RawGateContext(q, gate, raw, eps)
+        for chunk in range(x.shape[0] // 512):
+            for ztask in range(
+                get_block_idx(), DELAYED_GATE_TASK_COUNT, get_block_num()
+            ):
+                resources.project_z(
+                    gate, x, wz, chunk * 4 + ztask // TP16_HEADS, ztask % TP16_HEADS
+                )
+            for item in range(first, 384, 64):
+                batch = chunk * 64 + item % 64
+                head = item // 64
+                _run_raw_recurrent_item(recurrent, context, batch, head, raw, item)
+            cube_sync_block_arrive(PIPE.FIXPIPE, 0, mode=0)
+            cube_sync_block_wait(PIPE.S, 0, mode=0)
+            cube_sync_block_arrive(PIPE.FIXPIPE, 1, mode=2)
+            vec_sync_block_wait(PIPE.S, 1, mode=2)
+            for item in range(first, 384, 64):
+                batch = chunk * 64 + item % 64
+                head = item // 64
+                _store_raw_gated_item(output_gate, gate_context, batch, head, item)
             publish_vector_grid_to_cube(3, 4, ack_flag=5)
-            if item < total:
-                batch, head = idx2crd(
-                    _recurrent_item_index(item, accepted.shape[0], n, publish_rows // 8), [accepted.shape[0], n])
-                index = dtypes.int64(indices[batch * 8 + 7])
-                recurrent.store_state(tile_slice(final[index, head, None, None], (128, 128), (0, 0)))
-            for chunk in range(ready_before, ready_after):
-                self.project_output(out, q, wo, n, chunk)
+            for piece in range(8):
+                resources.output.project(out, q, wo, TP16_HEADS, chunk * 8 + piece)
             cube_sync_all()
+            vec_sync_all()
             onchip_rewind(reset_sync_id=True)
 
 
-class TPStages:
-    def __init__(
-        self,
-        heads):
+def _tp16_plan(model_batch, tp, cores):
+    if tp != TP16_TP_DEGREE or not 1 <= model_batch <= 32 or cores not in VALID_CORES:
+        raise ValueError("requires TP16, model batch 1..32, AIC 8/16/24/28/32")
+    rows = model_batch * tp * S8_SEQUENCE_LENGTH
+    heads = MODEL_HEAD_COUNT // tp
+    compact = cores >= 24 and COMPACT_CORES_PER_MODEL_BATCH * model_batch <= cores
+    width = 384 if not compact and model_batch * 32 >= cores * 3 else 128
+    return dict(
+        model_batch=model_batch,
+        tp=tp,
+        cores=cores,
+        rows=rows,
+        heads=heads,
+        main_m=128,
+        main_n=width,
+        main_geometry=main_geometry(rows, heads, cores, 128, width),
+        auxiliary_rows=128,
+        kda_waves=(MODEL_HEAD_COUNT * model_batch + 2 * cores - 1) // (2 * cores),
+        output="tp16_grid_r64",
+        weight_policy=4 if cores == 32 and model_batch == 1 else 1,
+    )
+
+
+class TP16S8DefaultStage:
+    def __init__(self, heads):
         self.heads = heads
-        self.main384 = MultiCoreSchedule(heads, 128, 384)
-        self.main256 = MultiCoreSchedule(heads, 256, 256)
-        self.aux32 = AuxiliarySchedule(heads, 32)
-        self.aux64 = AuxiliarySchedule(heads, 64)
-        self.aux128 = AuxiliarySchedule(heads, 128)
-        self.backend = BackendSchedule(heads)
-        self.head_backend = _HeadPanelBackend(heads)
-        if heads == 6:
-            self.fast32 = _Runtime32Logic()
-        elif heads == 12:
-            self.fast32 = _TP12Logic()
-        else:
-            self.fast32 = _TP24Logic()
+        self.grid8 = TP16GridSchedule(8, HIDDEN_SIZE, TP16_HEADS)
+        self.grid16 = TP16GridSchedule(16, HIDDEN_SIZE, TP16_HEADS)
+        self.grid24 = TP16GridSchedule(24, HIDDEN_SIZE, TP16_HEADS)
+        self.grid28 = TP16GridSchedule(28, HIDDEN_SIZE, TP16_HEADS)
+        self.grid32 = TP16GridSchedule(32, HIDDEN_SIZE, TP16_HEADS)
+        self.compact32 = TP16GridSchedule(32, HIDDEN_SIZE, TP16_HEADS)
+        for grid in (self.grid8, self.grid16, self.grid24, self.grid28, self.grid32):
+            grid.projection_weight_l2_cache_ctl = 1
 
     @jit
-    def execute(self, out, q, k, v, decay, gate, beta, fa, norm, x, wqkv, wa, wb, wbeta, wz, gamma, wo, alog, bias,
-        initial, final, indices, accepted, conv, conv_indices, conv_accepted, wc, scale, lower, eps, plan_rows,
-        plan_width, plan_policy):
-        if get_block_num() == 32:
-            self.fast32.execute(out, q, k, v, decay, gate, beta, fa, norm, x, wqkv, wa, wb, wbeta, wz, gamma, wo,
-                alog[0: self.heads,], bias[0: self.heads, None], initial, final, indices, accepted, conv,
-                conv_indices, conv_accepted, wc, scale, lower, eps)
-        else:
-            n = self.heads
-            logical_rows = plan_rows
-            if plan_width == 384:
-                self.main384.main(
-                    q, k, v, gate, x, wqkv, wz, conv, conv_indices, conv_accepted, wc, n, logical_rows, plan_policy)
-            else:
-                self.main256.main(
-                    q, k, v, gate, x, wqkv, wz, conv, conv_indices, conv_accepted, wc, n, logical_rows, plan_policy)
-            global_sync_all()
+    def execute(
+        self,
+        out,
+        q,
+        k,
+        v,
+        decay,
+        gate,
+        beta,
+        fa,
+        norm,
+        x,
+        wqkv,
+        wa,
+        wb,
+        wbeta,
+        wz,
+        gamma,
+        wo,
+        alog,
+        bias,
+        initial,
+        replay_u,
+        replay_k,
+        replay_decay,
+        conv,
+        state_indices,
+        conv_accepted,
+        wc,
+        scale,
+        lower,
+        eps,
+        plan_rows,
+        plan_width,
+        plan_policy,
+    ):
+        arguments = (
+            out,
+            q,
+            k,
+            v,
+            decay,
+            gate,
+            beta,
+            fa,
+            norm,
+            x,
+            wqkv,
+            wa,
+            wb,
+            wbeta,
+            wz,
+            gamma,
+            wo,
+            alog[0:TP16_HEADS,],
+            bias[0:TP16_HEADS, None],
+            initial,
+            replay_u,
+            replay_k,
+            replay_decay,
+            conv,
+            state_indices,
+            conv_accepted,
+            wc,
+            scale,
+            lower,
+            eps,
+        )
+        if get_block_num() == 8:
             onchip_rewind(reset_sync_id=True)
-            if x.shape[0] % 128 == 0:
-                self.aux128.execute(decay, beta, fa, x, wa, wb, wbeta)
-            elif x.shape[0] % 64 == 0:
-                self.aux64.execute(decay, beta, fa, x, wa, wb, wbeta)
-            else:
-                self.aux32.execute(decay, beta, fa, x, wa, wb, wbeta)
-            global_sync_all()
+            _run_tp16_grid(self.grid8, *arguments)
+        elif get_block_num() == 16:
             onchip_rewind(reset_sync_id=True)
-            if n != 6 and accepted.shape[0] * n == 96:
-                self.head_backend.backend(out, q, k, v, decay, gate, beta, gamma, wo, alog[0:n,], bias[0:n, None],
-                    initial, final, indices, accepted, scale, lower, eps)
-            else:
-                self.backend.backend(out, q, k, v, decay, gate, beta, gamma, wo, alog, bias, initial, final, indices,
-                    accepted, scale, lower, eps, wbeta)
-        global_sync_all()
-
-
-class MegaRecurrentKDAKernel:
-    def __init__(self):
-        self.tp6 = TPStages(6)
-        self.tp12 = TPStages(12)
-        self.tp24 = TPStages(24)
-
-    @kernel
-    def kernel(self, out, q, k, v, decay, gate, beta, fa, norm, x, wqkv6, wqkv12, wqkv24, wa, wb6, wb12, wb24, wbeta6,
-        wbeta12, wbeta24, wz6, wz12, wz24, gamma, wo6, wo12, wo24, alog, bias, initial, final, indices, accepted, conv,
-        conv_indices, conv_accepted, wc, scale, lower, eps, plan_rows, plan_width, plan_policy):
-        n = alog.shape[0]
-        if n == 6:
-            self.tp6.execute(out, q, k, v, decay, gate, beta, fa, norm, x, wqkv6, wa, wb6, wbeta6, wz6, gamma, wo6,
-                alog, bias, initial, final, indices, accepted, conv, conv_indices, conv_accepted, wc, scale, lower,
-                eps, plan_rows, plan_width, plan_policy)
-        elif n == 12:
-            self.tp12.execute(out, q, k, v, decay, gate, beta, fa, norm, x, wqkv12, wa, wb12, wbeta12, wz12, gamma,
-                wo12, alog, bias, initial, final, indices, accepted, conv, conv_indices, conv_accepted, wc, scale,
-                lower, eps, plan_rows, plan_width, plan_policy)
+            _run_tp16_grid(self.grid16, *arguments)
+        elif get_block_num() == 24:
+            onchip_rewind(reset_sync_id=True)
+            _run_tp16_grid(self.grid24, *arguments)
+        elif get_block_num() == 28:
+            onchip_rewind(reset_sync_id=True)
+            _run_tp16_grid(self.grid28, *arguments)
+        elif replay_decay.indices.shape[0] == 16:
+            onchip_rewind(reset_sync_id=True)
+            _run_tp16_grid(self.compact32, *arguments)
         else:
-            self.tp24.execute(out, q, k, v, decay, gate, beta, fa, norm, x, wqkv24, wa, wb24, wbeta24, wz24, gamma,
-                wo24, alog, bias, initial, final, indices, accepted, conv, conv_indices, conv_accepted, wc, scale,
-                lower, eps, plan_rows, plan_width, plan_policy)
+            onchip_rewind(reset_sync_id=True)
+            self.grid32._execute_task_pool_s8(*arguments)
+
+
+class TP16S8Dispatch(TP16S8DefaultStage):
+    def __init__(self, heads):
+        super().__init__(heads)
+        self.delayed = _ResidentDelayedZSchedule(32, HIDDEN_SIZE, TP16_HEADS)
+
+    @jit
+    def execute(
+        self,
+        out,
+        q,
+        k,
+        v,
+        decay,
+        gate,
+        beta,
+        fa,
+        norm,
+        x,
+        wqkv,
+        wa,
+        wb,
+        wbeta,
+        wz,
+        gamma,
+        wo,
+        alog,
+        bias,
+        initial,
+        replay_u,
+        replay_k,
+        replay_decay,
+        conv,
+        state_indices,
+        conv_accepted,
+        wc,
+        scale,
+        lower,
+        eps,
+        plan_rows,
+        plan_width,
+        plan_policy,
+        prefer_stream,
+    ):
+        q = q.view((q.shape[0], self.heads * TILE))
+        k = k.view((k.shape[0], self.heads * TILE))
+        v = v.view((v.shape[0], self.heads * TILE))
+        decay = decay.view((decay.shape[0], self.heads * TILE))
+        gate = gate.view((gate.shape[0], self.heads * TILE))
+        beta = beta.view(
+            (beta.shape[0], ((self.heads + BETA_TILE - 1) // BETA_TILE) * BETA_TILE)
+        )
+        alog = alog.view((self.heads,))
+        bias = bias.view((self.heads, TILE))
+        conv = _ConvPool(
+            conv.data,
+            conv.stride0,
+            conv.length,
+            3 * self.heads * TILE,
+            conv.accurate_raw,
+        )
+        wc = wc.view((3, self.heads, CONV_KERNEL, TILE))
+        if (
+            get_block_num() == 32
+            and x.shape[0] % self.delayed.window_rows == 0
+            and (x.shape[0] >= self.delayed.minimum_rows)
+        ):
+            self.delayed.execute(
+                out,
+                q,
+                k,
+                v,
+                decay,
+                gate,
+                beta,
+                fa,
+                norm,
+                x,
+                wqkv,
+                wa,
+                wb,
+                wbeta,
+                wz,
+                gamma,
+                wo,
+                alog,
+                bias,
+                initial,
+                replay_u,
+                replay_k,
+                replay_decay,
+                conv,
+                state_indices,
+                conv_accepted,
+                wc,
+                scale,
+                lower,
+                eps,
+                plan_rows,
+                plan_width,
+                plan_policy,
+            )
+            global_sync_all()
+        else:
+            TP16S8DefaultStage.execute(
+                self,
+                out,
+                q,
+                k,
+                v,
+                decay,
+                gate,
+                beta,
+                fa,
+                norm,
+                x,
+                wqkv,
+                wa,
+                wb,
+                wbeta,
+                wz,
+                gamma,
+                wo,
+                alog,
+                bias,
+                initial,
+                replay_u,
+                replay_k,
+                replay_decay,
+                conv,
+                state_indices,
+                conv_accepted,
+                wc,
+                scale,
+                lower,
+                eps,
+                plan_rows,
+                plan_width,
+                plan_policy,
+            )
+
+
+def _tp16_plan_s4(model_batch, tp, cores):
+    """采用保守的源码调度策略，不依赖实测性能查找表。"""
+    if tp != TP16_TP_DEGREE or not 1 <= model_batch <= 32 or cores not in VALID_CORES:
+        raise ValueError("S4 requires TP16, model batch 1..32, AIC 8/16/24/28/32")
+    total_rows = model_batch * tp * S4_SEQUENCE_LENGTH
+    main_rows = math.gcd(total_rows, 128)
+    width = 128 if total_rows <= 128 else 384
+    template = 0
+
+    return dict(
+        main_rows=main_rows,
+        width=width,
+        policy=4 if total_rows <= 128 else 0,
+        template=template,
+    )
+
+
+class TP16TPOptimizedKernel:
+    """实现单个 TP，为 S8 和 S4 分别缓存编译后的可调用对象。"""
+
+    def __init__(self, sequence):
+        self.sequence = sequence
+        if sequence == S8_SEQUENCE_LENGTH:
+            self.stage = TP16S8Dispatch(TP16_HEADS)
+        else:
+            self.stage = TP16S4MultiCoreSchedule(TP16_HEADS)
+
+    @kernel(
+        profile=cannbotdsl.ProfileSpec(
+            name="mega_recurrent_kda_tp16",
+            op_type="MegaRecurrentKDA",
+            outputs=("out", "replay_u", "replay_k", "replay_decay"),
+            inouts=("conv",),
+        )
+    )
+    def device(
+        self,
+        out,
+        q,
+        k,
+        v,
+        decay,
+        gate,
+        beta,
+        fa,
+        norm,
+        x,
+        wqkv,
+        wa,
+        wb,
+        wbeta,
+        wz,
+        gamma,
+        wo,
+        alog,
+        bias,
+        checkpoint,
+        conv,
+        indices,
+        accepted,
+        wc,
+        replay_u,
+        replay_k,
+        replay_decay,
+        checkpoint_stride0,
+        conv_stride0,
+        conv_length,
+        u_stride0,
+        k_stride0,
+        decay_stride0,
+        record_s,
+        scale,
+        lower,
+        eps,
+        main_rows,
+        width,
+        policy,
+        selector,
+        accurate_raw,
+        accurate_decay,
+    ):
+        initial = _CheckpointPool(
+            checkpoint, indices, checkpoint_stride0, accurate_decay
+        )
+        conv = _ConvPool(
+            conv, conv_stride0, conv_length, 3 * TP16_HEADS * TILE, accurate_raw
+        )
+        u = ReplayPool(replay_u, indices, u_stride0, TP16_HEADS, record_s)
+        rk = ReplayPool(replay_k, indices, k_stride0, TP16_HEADS, record_s)
+        rd = ReplayPool(replay_decay, indices, decay_stride0, TP16_HEADS, record_s)
+        if const_expr(self.sequence == S8_SEQUENCE_LENGTH):
+            self.stage.execute(
+                out,
+                q,
+                k,
+                v,
+                decay,
+                gate,
+                beta,
+                fa,
+                norm,
+                x,
+                wqkv,
+                wa,
+                wb,
+                wbeta,
+                wz,
+                gamma,
+                wo,
+                alog,
+                bias,
+                initial,
+                u,
+                rk,
+                rd,
+                conv,
+                indices,
+                accepted,
+                wc,
+                scale,
+                lower,
+                eps,
+                main_rows,
+                width,
+                policy,
+                selector,
+            )
+        else:
+            output_rows = main_rows if main_rows <= 128 else 128
+            self.stage.execute(
+                out,
+                q,
+                k,
+                v,
+                decay,
+                gate,
+                beta,
+                fa,
+                norm,
+                x,
+                wqkv,
+                wa,
+                wb,
+                wbeta,
+                wz,
+                gamma,
+                wo,
+                alog,
+                bias,
+                initial,
+                u,
+                rk,
+                rd,
+                conv,
+                indices,
+                accepted,
+                wc,
+                scale,
+                lower,
+                eps,
+                main_rows,
+                width,
+                policy,
+                output_rows,
+            )
 
     @host
-    def run(self, out, q, k, v, decay, gate, beta, fa, norm, x, wqkv6, wqkv12, wqkv24, wa, wb6, wb12, wb24, wbeta6,
-        wbeta12, wbeta24, wz6, wz12, wz24, gamma, wo6, wo12, wo24, alog, bias, initial, final, indices, accepted, conv,
-        conv_indices, conv_accepted, wc, scale, lower, eps, plan_rows, plan_width, plan_policy, launch_cores):
-        self.kernel[launch_cores](out, q, k, v, decay, gate, beta, fa, norm, x, wqkv6, wqkv12, wqkv24, wa, wb6,
-            wb12, wb24, wbeta6, wbeta12, wbeta24, wz6, wz12, wz24, gamma, wo6, wo12, wo24, alog, bias, initial,
-            final, indices, accepted, conv, conv_indices, conv_accepted, wc, scale, lower, eps, plan_rows, plan_width,
-            plan_policy)
+    def run(
+        self,
+        out,
+        q,
+        k,
+        v,
+        decay,
+        gate,
+        beta,
+        fa,
+        norm,
+        x,
+        wqkv,
+        wa,
+        wb,
+        wbeta,
+        wz,
+        gamma,
+        wo,
+        alog,
+        bias,
+        checkpoint,
+        conv,
+        indices,
+        accepted,
+        wc,
+        replay_u,
+        replay_k,
+        replay_decay,
+        checkpoint_stride0,
+        conv_stride0,
+        conv_length,
+        u_stride0,
+        k_stride0,
+        decay_stride0,
+        record_s,
+        scale,
+        lower,
+        eps,
+        main_rows,
+        width,
+        policy,
+        selector,
+        cores,
+        accurate_raw,
+        accurate_decay,
+    ):
+        self.device[cores](
+            out,
+            q,
+            k,
+            v,
+            decay,
+            gate,
+            beta,
+            fa,
+            norm,
+            x,
+            wqkv,
+            wa,
+            wb,
+            wbeta,
+            wz,
+            gamma,
+            wo,
+            alog,
+            bias,
+            checkpoint,
+            conv,
+            indices,
+            accepted,
+            wc,
+            replay_u,
+            replay_k,
+            replay_decay,
+            checkpoint_stride0,
+            conv_stride0,
+            conv_length,
+            u_stride0,
+            k_stride0,
+            decay_stride0,
+            record_s,
+            scale,
+            lower,
+            eps,
+            main_rows,
+            width,
+            policy,
+            selector,
+            accurate_raw,
+            accurate_decay,
+        )
 
 
-def specification():
-    """All dimensions affecting TP or batch remain dynamic in one contract."""
-    n = cannbotdsl.Dim("heads", min=6, max=24, multiple_of=6)
-    b = cannbotdsl.Dim("batch", min=4, max=512, multiple_of=4)
-    rows = 8 * b
-    p = 128 * n
-    beta_width = 16 * ((n + 15) // 16)
-    conv_pool = cannbotdsl.Dim("conv_pool")
-    tokens = cannbotdsl.Dim("conv_tokens", min=10)
-    pool = cannbotdsl.Dim("state_pool")
-    bf, fp = (dtypes.bfloat16, dtypes.float32)
+class TP16VariableLengthKDAKernel:
+    """当前 TP 的变长兜底内核，PA 记录池使用各自独立的步长。"""
+
+    @kernel
+    def project(self, out, x, weight):
+        onchip_rewind(reset_sync_id=True)
+        stage = SequenceProjectionStage()
+        stage.project(out, x, weight)
+
+    @kernel
+    def convolve(self, out, raw, conv, indices, accepted, cu, weight, conv_stride0):
+        onchip_rewind(reset_sync_id=True)
+        stage = SequenceConvStage()
+        stage.convolve(out, raw, conv, indices, accepted, cu, weight, conv_stride0)
+
+    @kernel
+    def recurrent(
+        self,
+        out,
+        convout,
+        decay,
+        beta,
+        z,
+        gamma,
+        alog,
+        bias,
+        checkpoint,
+        indices,
+        cu,
+        replay_u,
+        replay_k,
+        replay_decay,
+        checkpoint_stride0,
+        u_stride0,
+        k_stride0,
+        decay_stride0,
+        record_s,
+        scale,
+        lower,
+        eps,
+    ):
+        onchip_rewind(reset_sync_id=True)
+        u = ReplayPool(replay_u, indices, u_stride0, TP16_HEADS, record_s)
+        rk = ReplayPool(replay_k, indices, k_stride0, TP16_HEADS, record_s)
+        rd = ReplayPool(replay_decay, indices, decay_stride0, TP16_HEADS, record_s)
+        stage = SequenceRecurrentStage(TP16_HEADS)
+        stage.replay(
+            out,
+            convout,
+            decay,
+            beta,
+            z,
+            gamma,
+            alog,
+            bias,
+            checkpoint,
+            indices,
+            cu,
+            u,
+            rk,
+            rd,
+            checkpoint_stride0,
+            scale,
+            lower,
+            eps,
+        )
+
+    @host
+    def run(
+        self,
+        out,
+        x,
+        wqkv,
+        wa,
+        wb,
+        wbeta,
+        wz,
+        gamma,
+        wo,
+        wc,
+        conv,
+        checkpoint,
+        indices,
+        accepted,
+        cu,
+        alog,
+        bias,
+        replay_u,
+        replay_k,
+        replay_decay,
+        raw,
+        fa,
+        decay,
+        beta,
+        z,
+        convolved,
+        gated,
+        conv_stride0,
+        checkpoint_stride0,
+        u_stride0,
+        k_stride0,
+        decay_stride0,
+        record_s,
+        scale,
+        lower,
+        eps,
+        cores,
+    ):
+        self.project[cores](z, x, wz)
+        self.convolve[2 * cores](
+            convolved, raw, conv, indices, accepted, cu, wc, conv_stride0
+        )
+        self.recurrent[2 * cores](
+            gated,
+            convolved,
+            decay,
+            beta,
+            z,
+            gamma,
+            alog,
+            bias,
+            checkpoint,
+            indices,
+            cu,
+            replay_u,
+            replay_k,
+            replay_decay,
+            checkpoint_stride0,
+            u_stride0,
+            k_stride0,
+            decay_stride0,
+            record_s,
+            scale,
+            lower,
+            eps,
+        )
+        self.project[cores](out, gated, wo)
+
+
+def _optimized_specification(sequence, heads, tp):
+    b = cannbotdsl.Dim("batch", min=tp, max=32 * tp, multiple_of=tp)
+    rows = sequence * b
+    p = heads * D
+    beta_width = ((heads + BETA_TILE - 1) // BETA_TILE) * BETA_TILE
+    cp = cannbotdsl.Dim("checkpoint_span", min=1)
+    cv = cannbotdsl.Dim("conv_span", min=1)
+    us = cannbotdsl.Dim("replay_u_span", min=1)
+    ks = cannbotdsl.Dim("replay_k_span", min=1)
+    ds = cannbotdsl.Dim("replay_decay_span", min=1)
+    bf, fp = dtypes.bfloat16, dtypes.float32
+
+    def nd(shape, dt=bf):
+        return TensorSpec(shape, dt)
+
+    def nz(shape):
+        return TensorSpec(shape, bf, storage_format="nz")
+
     return (
-        TensorSpec((rows, HIDDEN_SIZE), bf),
-        *(TensorSpec((rows, p), bf) for _ in range(5)),
-        TensorSpec((rows, beta_width), bf),
-        TensorSpec((rows, 128), bf),
-        TensorSpec((128, 128), fp),
-        TensorSpec((rows, HIDDEN_SIZE), bf),
-        *(TensorSpec((3 * 128 * h, HIDDEN_SIZE), bf, storage_format="nz") for h in (6, 12, 24)),
-        TensorSpec((128, HIDDEN_SIZE), bf, storage_format="nz"),
-        *(TensorSpec((128 * h, 128), bf, storage_format="nz") for h in (6, 12, 24)),
-        *(TensorSpec((h, HIDDEN_SIZE), bf, storage_format="nz") for h in (6, 12, 24)),
-        *(TensorSpec((128 * h, HIDDEN_SIZE), bf, storage_format="nz") for h in (6, 12, 24)),
-        TensorSpec((128,), fp),
-        *(TensorSpec((HIDDEN_SIZE, 128 * heads), bf, storage_format="nz") for heads in (6, 12, 24)),
-        TensorSpec((n,), fp),
-        TensorSpec((n, 128), fp),
-        TensorSpec((pool, n, 128, 128), fp),
-        TensorSpec((pool, n, 128, 128), fp),
-        TensorSpec((rows,), dtypes.int32),
-        TensorSpec((b,), dtypes.int32),
-        TensorSpec((conv_pool, tokens, 3 * p), bf),
-        TensorSpec((b,), dtypes.int32),
-        TensorSpec((b,), dtypes.int32),
-        TensorSpec((3, n, 4, 128), bf),
-        fp,
-        fp,
-        fp,
+        nd((rows, HIDDEN_SIZE)),
+        *(nd((rows, p)) for _ in range(5)),
+        nd((rows, beta_width)),
+        nd((rows, D)),
+        nd((D, D), fp),
+        nd((rows, HIDDEN_SIZE)),
+        nz((3 * p, HIDDEN_SIZE)),
+        nz((D, HIDDEN_SIZE)),
+        nz((p, D)),
+        nz((heads, HIDDEN_SIZE)),
+        nz((p, HIDDEN_SIZE)),
+        nd((D,), fp),
+        nz((HIDDEN_SIZE, p)),
+        nd((heads,), fp),
+        nd((heads, D), fp),
+        nd((cp,), fp),
+        nd((cv,)),
+        nd((b,), dtypes.int32),
+        nd((b,), dtypes.int32),
+        nd((3, heads, CONV_KERNEL, D)),
+        nd((us,), fp),
+        nd((ks,), dtypes.float16),
+        nd((ds,), fp),
+        # checkpoint 和 Conv 步长、Conv 长度、U/K/decay 步长及记录长度 S。
         dtypes.int64,
         dtypes.int64,
         dtypes.int64,
-        dtypes.int64,)
+        dtypes.int64,
+        dtypes.int64,
+        dtypes.int64,
+        dtypes.int64,
+        # 缩放系数、门控下界和 RMSNorm epsilon。
+        dtypes.float32,
+        dtypes.float32,
+        dtypes.float32,
+        # 主投影行数、列宽、缓存策略、路径选择器和启动核数。
+        dtypes.int64,
+        dtypes.int64,
+        dtypes.int64,
+        dtypes.int64,
+        dtypes.int64,
+        nd((rows, 3 * p), fp),
+        nd((rows, p)),
+    )
 
 
-_COMPILED_FNS = {}
-_LAUNCHES = {}
+def _variable_specification(heads):
+    t = cannbotdsl.Dim("rows", min=TILE, multiple_of=TILE)
+    b = cannbotdsl.Dim("batch", min=1)
+    cp = cannbotdsl.Dim("checkpoint_span", min=1)
+    cv = cannbotdsl.Dim("conv_span", min=1)
+    us = cannbotdsl.Dim("replay_u_span", min=1)
+    ks = cannbotdsl.Dim("replay_k_span", min=1)
+    ds = cannbotdsl.Dim("replay_decay_span", min=1)
+    p = heads * D
+    bf, fp = dtypes.bfloat16, dtypes.float32
+
+    def nd(shape, dt=bf):
+        return TensorSpec(shape, dt)
+
+    def nz(shape):
+        return TensorSpec(shape, bf, storage_format="nz")
+
+    return (
+        nd((t, HIDDEN_SIZE)),
+        nd((t, HIDDEN_SIZE)),
+        nz((3 * p, HIDDEN_SIZE)),
+        nz((D, HIDDEN_SIZE)),
+        nz((p, D)),
+        nz((TILE, HIDDEN_SIZE)),
+        nz((p, HIDDEN_SIZE)),
+        nd((D,), fp),
+        nz((HIDDEN_SIZE, p)),
+        nd((CONV_KERNEL, 3 * p)),
+        nd((cv,)),
+        nd((cp,), fp),
+        nd((b,), dtypes.int32),
+        nd((b,), dtypes.int32),
+        nd((b + 1,), dtypes.int32),
+        nd((heads,), fp),
+        nd((heads, D), fp),
+        nd((us,), fp),
+        nd((ks,), dtypes.float16),
+        nd((ds,), fp),
+        nd((t, 3 * p), fp),
+        nd((t, D)),
+        nd((t, p)),
+        nd((t, TILE)),
+        nd((t, p)),
+        nd((t, 3 * p)),
+        nd((t, p)),
+        # Conv、checkpoint、U、K、decay 步长及记录长度 S。
+        dtypes.int64,
+        dtypes.int64,
+        dtypes.int64,
+        dtypes.int64,
+        dtypes.int64,
+        dtypes.int64,
+        # 缩放系数、门控下界、RMSNorm epsilon 和启动核数。
+        dtypes.float32,
+        dtypes.float32,
+        dtypes.float32,
+        dtypes.int64,
+    )
 
 
-def compiled_entry(device):
-    device = torch.device(device)
-    key = ("megakda_unified_dynamic_logical_m", device)
-    if key not in _COMPILED_FNS:
-        op = MegaRecurrentKDAKernel()
-        _COMPILED_FNS[key] = cannbotdsl.compile(op.run, *specification())
-    return _COMPILED_FNS[key]
+def _compiled_handle(impl, sequence, device):
+    """从当前 TP 实例的缓存取句柄，首次使用时编译。"""
+    key = (sequence, device)
+    if key not in impl._compiled:
+        impl._compiled[key] = impl._compile(sequence)
+    return impl._compiled[key]
 
 
-def _require_core_stream(ref, cores):
-    if cores not in VALID_CORES:
-        raise ValueError("AIC quota must be 8,16,24,28 or32")
-    info = cannbotdsl.get_platform_info(stream=torch.npu.current_stream(ref.device))
-    if int(info.cube_core_num) < cores or int(info.vector_core_num) < 2 * cores:
-        raise ValueError(f"stream needs at least {cores} AIC and {2 * cores} AIV")
+class _TPImplementation:
+    """按 TP 保存计划、内核工厂和 Host 缓存。"""
+
+    def __init__(self, heads, tp, plan, plan_s4, optimized_kernel, variable_kernel):
+        self.heads = heads
+        self.tp = tp
+        self.plan = plan
+        self.plan_s4 = plan_s4
+        self.optimized_kernel = optimized_kernel
+        self.variable_kernel = variable_kernel
+        self._compiled = {}
+        self._workspaces = {}
+
+    def _compile(self, sequence):
+        if sequence:
+            run = self.optimized_kernel(sequence).run
+            spec = _optimized_specification(sequence, self.heads, self.tp)
+        else:
+            run = self.variable_kernel().run
+            spec = _variable_specification(self.heads)
+        return cannbotdsl.compile(run, *spec)
+
+    def compiled_handle(self, sequence, device):
+        return _compiled_handle(self, sequence, device)
+
+    def execute_optimized(self, a, batch, sequence, cores):
+        rows = batch * sequence
+        x = a["hidden_states"].view(rows, HIDDEN_SIZE)
+        key = (sequence, batch, x.device)
+        if key not in self._workspaces:
+            beta_width = ((self.heads + BETA_TILE - 1) // BETA_TILE) * BETA_TILE
+            widths = (self.heads * D,) * 5 + (beta_width, D)
+            workspace = torch.empty(
+                rows * sum(widths), dtype=torch.bfloat16, device=x.device
+            )
+            views = _mega_workspace_views(workspace, rows, widths)
+            norm = torch.empty((D, D), dtype=torch.float32, device=x.device)
+            self._workspaces[key] = (views, norm)
+        views, norm = self._workspaces[key]
+
+        accurate_raw, accurate_decay, precision_keep = prepare_optimized_precision(
+            x, a, self.heads, cores
+        )
+        model_batch = batch // self.tp
+        if sequence == S8_SEQUENCE_LENGTH:
+            selected = self.plan(model_batch, self.tp, cores)
+            main_m, main_n = selected["main_m"], selected["main_n"]
+            prefer_stream = 0
+            if self.tp == TP8_TP_DEGREE:
+                prefer_stream = _tp8_prefer_streamed_main(
+                    rows, self.heads, cores, main_m, main_n
+                )
+            geometry = (main_m, main_n, selected.get("weight_policy", 4), prefer_stream)
+        else:
+            selected = self.plan_s4(model_batch, self.tp, cores)
+            geometry = (
+                selected["main_rows"],
+                selected["width"],
+                selected["policy"],
+                selected["template"],
+            )
+
+        out = torch.empty((rows, HIDDEN_SIZE), dtype=torch.bfloat16, device=x.device)
+        self.compiled_handle(sequence, x.device)(
+            out,
+            *views,
+            norm,
+            x,
+            a["qkv_projection_weight"],
+            a["decay_projection_a_weight"],
+            a["decay_projection_b_weight"],
+            a["beta_projection_weight"],
+            a["output_gate_projection_weight"],
+            a["output_norm_weight"],
+            a["output_projection_weight"],
+            a["A_log"],
+            a["dt_bias"],
+            _physical_span(a["checkpoint_state"]),
+            _physical_span(a["conv_state"]),
+            a["state_indices"],
+            a["conv_num_accepted_tokens"],
+            _pack_conv_weights(a["conv1d_weight"], self.heads),
+            _physical_span(a["replay_u"]),
+            _physical_span(a["replay_k"]),
+            _physical_span(a["replay_decay"]),
+            a["checkpoint_state"].stride(0),
+            a["conv_state"].stride(0),
+            a["conv_state"].shape[1],
+            a["replay_u"].stride(0),
+            a["replay_k"].stride(0),
+            a["replay_decay"].stride(0),
+            a["replay_u"].shape[2],
+            a["scale"],
+            a["lower_bound"],
+            a["rms_norm_eps"],
+            *geometry,
+            cores,
+            accurate_raw,
+            accurate_decay,
+        )
+        return out.view(a["hidden_states"].shape), (
+            views,
+            norm,
+            out,
+            accurate_raw,
+            accurate_decay,
+            precision_keep,
+        )
+
+    def execute_variable(self, a, prefix, cores):
+        import torch_npu
+
+        x = a["hidden_states"]
+        total = prefix[-1]
+        p = self.heads * D
+        rows = ((total + TILE - 1) // TILE) * TILE
+        padded = torch.zeros((rows, HIDDEN_SIZE), dtype=torch.bfloat16, device=x.device)
+        padded[:total].copy_(x.reshape(total, HIDDEN_SIZE))
+        beta_weight = torch.zeros(
+            (TILE, HIDDEN_SIZE), dtype=torch.bfloat16, device=x.device
+        )
+        beta_weight[: self.heads].copy_(
+            torch_npu.npu_format_cast(a["beta_projection_weight"], 2)
+        )
+        beta_weight = torch_npu.npu_format_cast(beta_weight, 29)
+        if x.ndim == 3:
+            sequence_length = x.shape[1]
+            cu = torch.arange(
+                0,
+                total + sequence_length,
+                sequence_length,
+                dtype=torch.int32,
+                device=x.device,
+            )
+        else:
+            cu = torch.tensor(prefix, dtype=torch.int32, device=x.device)
+        wc = a["conv1d_weight"]
+        conv_shape = (CONV_KERNEL, 3 * p)
+        if tuple(wc.shape) != conv_shape:
+            wc = (
+                _pack_conv_weights(wc, self.heads)
+                .permute(2, 0, 1, 3)
+                .reshape(*conv_shape)
+                .contiguous()
+            )
+
+        def work(width, dtype=torch.bfloat16):
+            return torch.empty((rows, width), dtype=dtype, device=x.device)
+
+        out = work(HIDDEN_SIZE)
+        raw = work(3 * p, torch.float32)
+        qkv_keep = _twofold_qkv_projection(x, a["qkv_projection_weight"], raw, cores)
+        fa, decay, decay_keep = _accurate_auxiliary_projection(
+            padded,
+            a["decay_projection_a_weight"],
+            a["decay_projection_b_weight"],
+            cores,
+        )
+        beta, beta_keep = _auxiliary_twofold_projection(padded, beta_weight, cores)
+        z = work(p)
+        convolved = work(3 * p)
+        gated = work(p)
+        self.compiled_handle(0, x.device)(
+            out,
+            padded,
+            a["qkv_projection_weight"],
+            a["decay_projection_a_weight"],
+            a["decay_projection_b_weight"],
+            beta_weight,
+            a["output_gate_projection_weight"],
+            a["output_norm_weight"],
+            a["output_projection_weight"],
+            wc,
+            _physical_span(a["conv_state"]),
+            _physical_span(a["checkpoint_state"]),
+            a["state_indices"],
+            a["conv_num_accepted_tokens"],
+            cu,
+            a["A_log"],
+            a["dt_bias"],
+            _physical_span(a["replay_u"]),
+            _physical_span(a["replay_k"]),
+            _physical_span(a["replay_decay"]),
+            raw,
+            fa,
+            decay,
+            beta,
+            z,
+            convolved,
+            gated,
+            a["conv_state"].stride(0),
+            a["checkpoint_state"].stride(0),
+            a["replay_u"].stride(0),
+            a["replay_k"].stride(0),
+            a["replay_decay"].stride(0),
+            a["replay_u"].shape[2],
+            a["scale"],
+            a["lower_bound"],
+            a["rms_norm_eps"],
+            cores,
+        )
+        keep = (
+            padded,
+            beta_weight,
+            cu,
+            wc,
+            raw,
+            fa,
+            decay,
+            beta,
+            z,
+            convolved,
+            gated,
+            out,
+            qkv_keep,
+            decay_keep,
+            beta_keep,
+        )
+        return out[:total].view(x.shape), keep
+
+    def export_kernels(self):
+        for sequence in (S8_SEQUENCE_LENGTH, S4_SEQUENCE_LENGTH, 0):
+            self._compile(sequence).close()
 
 
-_UNUSED_WEIGHTS = {}
+def _make_implementation_lookup():
+    instances = {}
+    lock = threading.Lock()
+
+    def implementation(heads):
+        # 查询和构造共用一把锁，确保同一 TP 只初始化一次。
+        with lock:
+            impl = instances.get(heads)
+            if impl is not None:
+                return impl
+
+            if heads == TP4_HEADS:
+                impl = _TPImplementation(
+                    TP4_HEADS,
+                    TP4_TP_DEGREE,
+                    _tp4_plan,
+                    _tp4_plan_s4,
+                    TP4TPOptimizedKernel,
+                    TP4VariableLengthKDAKernel,
+                )
+            elif heads == TP8_HEADS:
+                impl = _TPImplementation(
+                    TP8_HEADS,
+                    TP8_TP_DEGREE,
+                    _tp8_plan,
+                    _tp8_plan_s4,
+                    TP8TPOptimizedKernel,
+                    TP8VariableLengthKDAKernel,
+                )
+            elif heads == TP16_HEADS:
+                impl = _TPImplementation(
+                    TP16_HEADS,
+                    TP16_TP_DEGREE,
+                    _tp16_plan,
+                    _tp16_plan_s4,
+                    TP16TPOptimizedKernel,
+                    TP16VariableLengthKDAKernel,
+                )
+            else:
+                raise ValueError("TP4/8/16 requires N=24/12/6")
+            instances[heads] = impl
+            return impl
+
+    return implementation
 
 
-def _unused_weight_slot(weight, heads, role):
-    import torch_npu
-
-    key = (weight.device, heads, role)
-    if key not in _UNUSED_WEIGHTS:
-        p = 128 * heads
-        shapes = {"wqkv": (3 * p, HIDDEN_SIZE), "wb": (p, 128), "wbeta": (heads, HIDDEN_SIZE),
-            "wz": (p, HIDDEN_SIZE), "wo": (HIDDEN_SIZE, p)}
-        shape = shapes.get(role)
-        if shape is None:
-            raise ValueError(f"unsupported weight slot role: {role}")
-        _UNUSED_WEIGHTS[key] = torch_npu.empty_with_format(
-            shape, dtype=torch.bfloat16, device=weight.device, acl_format=29)
-    return _UNUSED_WEIGHTS[key]
+implementation = _make_implementation_lookup()
 
 
-def _weight_slots(weight, n, role):
-    """Route an unchanged NZ weight; unused ABI slots only allocate storage.
+def _execute_mega(arguments):
+    tensors = InputValidation.mega_metadata(arguments)
+    cores = InputValidation.real_boundary(
+        tensors, ("conv_state", "replay_u", "replay_k", "replay_decay")
+    )
+    prefix = InputValidation.validate_mega_values(arguments)
+    lengths = [end - start for start, end in zip(prefix, prefix[1:])]
+    batch = len(lengths)
+    heads = arguments["beta_projection_weight"].shape[0]
+    tp = MODEL_HEAD_COUNT // heads
+    module = implementation(heads)
+    if (
+        batch % tp == 0
+        and 1 <= batch // tp <= 32
+        and all(length == S8_SEQUENCE_LENGTH for length in lengths)
+    ):
+        globals()["_last_backend"] = "optimized_s8"
+        result, keep = module.execute_optimized(
+            arguments, batch, S8_SEQUENCE_LENGTH, cores
+        )
+    elif (
+        batch % tp == 0
+        and 1 <= batch // tp <= 32
+        and all(length == S4_SEQUENCE_LENGTH for length in lengths)
+    ):
+        globals()["_last_backend"] = "optimized_s4"
+        result, keep = module.execute_optimized(
+            arguments, batch, S4_SEQUENCE_LENGTH, cores
+        )
+    else:
+        globals()["_last_backend"] = "variable_length"
+        result, keep = module.execute_variable(arguments, prefix, cores)
+    globals()["_workspace_keep"] = keep
+    return result
 
-    Three static slots avoid unsupported dynamic NZ subtiles without another
-    Native variant or data copies. A TP sweep retains about 370 MiB of storage.
+
+@KDAExecutionGuard.serialized
+def mega_recurrent_kda(
+    hidden_states: torch.Tensor,
+    qkv_projection_weight: torch.Tensor,
+    decay_projection_a_weight: torch.Tensor,
+    decay_projection_b_weight: torch.Tensor,
+    beta_projection_weight: torch.Tensor,
+    output_gate_projection_weight: torch.Tensor,
+    output_norm_weight: torch.Tensor,
+    output_projection_weight: torch.Tensor,
+    conv1d_weight: torch.Tensor,
+    conv_state: torch.Tensor,
+    checkpoint_state: torch.Tensor,
+    replay_u: torch.Tensor,
+    replay_k: torch.Tensor,
+    replay_decay: torch.Tensor,
+    state_indices: torch.Tensor,
+    conv_num_accepted_tokens: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    scale: float,
+    lower_bound: float,
+    rms_norm_eps: float = 1e-5,
+    cu_seqlens: torch.Tensor | None = None,
+):
+    """通过 PA 状态池和记录池回放 BSH/TH 序列。
+
+    所有池均有 block_num 个块，并通过 state_indices[b] 寻址。
+    仅第 0 轴允许非连续，各池独立使用自己的 stride(0)。
+    replay 形状为 [block_num,N,S,D]；U、K、decay 分别为 FP32、FP16、FP32。
+    当前 D=128。S 表示记录的 token 容量，必须覆盖每个请求的序列长度。
+    块 0 是有效块，checkpoint_state 保持只读。
+    返回 (out,conv_state,replay_u,replay_k,replay_decay)，后四项与同名输入互为别名。
     """
-    return tuple(weight if heads == n else _unused_weight_slot(weight, heads, role) for heads in (6, 12, 24))
-
-
-def _invoke_multicore_launch(launch, output, call, scalars, geometry):
-    b, s, h = map(int, call.hidden_states.shape)
-    n = int(call.beta_weight.shape[0])
-    weights = (
-        *_weight_slots(call.qkv_weight, n, "wqkv"),
-        call.decay_a_weight,
-        *_weight_slots(call.decay_b_weight, n, "wb"),
-        *_weight_slots(call.beta_weight, n, "wbeta"),
-        *_weight_slots(call.output_gate_weight, n, "wz"),
-        call.output_norm_weight,
-        *_weight_slots(call.output_weight, n, "wo"),
-        call.a_log,
-        call.dt_bias,)
-    scale, lower, eps, cores = scalars
-    launch.fn(output, *launch.workspace_views, launch.norm_exchange, call.hidden_states.view(b * s, h), *weights,
-        call.recurrent_state, call.recurrent_state, call.ssm_indices, call.accepted, call.conv_state,
-        call.conv_indices, call.conv_accepted, _pack_conv_weights(call.conv_weight, n), scale, lower, eps, *geometry,
-        cores)
-
-
-def _prepare_mega_launch(hidden_states, b, s, n):
-    key = (n, b, hidden_states.device)
-    launch = _LAUNCHES.get(key)
-    if launch is None:
-        widths = (n * 128,) * 5 + ((n + 15) // 16 * 16, 128)
-        workspace = torch.empty(b * s * sum(widths), dtype=torch.bfloat16, device=hidden_states.device)
-        launch = _CompiledLaunch(compiled_entry(hidden_states.device), workspace,
-            _mega_workspace_views(workspace, b * s, widths),
-            torch.empty(128, 128, dtype=torch.float32, device=hidden_states.device))
-        _LAUNCHES[key] = launch
-    return launch
-
-
-def _execute_mega_call(call):
-    b, s, h, n = _validate_mega_hidden(call.hidden_states, call.beta_weight)
-    scalars = _validate_runtime_scalars(call.scale, call.lower_bound, call.rms_norm_eps)
-    _validate_mega_weight_shapes(call, (h, n))
-    _validate_mega_weight_properties(call.hidden_states,
-        tuple((f"weight_{i}", call[i]) for i in (1, 2, 3, 4, 5, 7, 8)), call.output_norm_weight)
-    _validate_mega_states(call, (b, s, n))
-    indices = (("conv_state_indices", call.conv_indices), ("ssm_state_indices", call.ssm_indices),
-        ("conv_num_accepted_tokens", call.conv_accepted), ("num_accepted_tokens", call.accepted))
-    _validate_mega_indices(call.hidden_states.device, b, s, indices)
-    info = cannbotdsl.get_platform_info(stream=torch.npu.current_stream(call.hidden_states.device))
-    core_num = min(int(info.cube_core_num), 32)
-    _require_core_stream(call.hidden_states, core_num)
-    launch = _prepare_mega_launch(call.hidden_states, b, s, n)
-    out = torch.empty(b * s, h, dtype=torch.bfloat16, device=call.hidden_states.device)
-    selected = plan(b // (96 // n), 96 // n, core_num)
-    _invoke_multicore_launch(launch, out, call, (*scalars, core_num),
-        (selected["main_m"], selected["main_n"], selected.get("weight_policy", 4)))
-    return out.view(b, s, h)
-
-
-def mega_recurrent_kda(hidden_states, qkv_projection_weight, decay_projection_a_weight, decay_projection_b_weight,
-    beta_projection_weight, output_gate_projection_weight, output_norm_weight, output_projection_weight, conv1d_weight,
-    conv_state, recurrent_state, conv_state_indices, ssm_state_indices, conv_num_accepted_tokens, num_accepted_tokens,
-    A_log, dt_bias, scale, lower_bound, rms_norm_eps=1e-05):
-    """Run fused QKV projection, causal Conv1D, recurrent KDA, gating, and output projection.
-
-    Args:
-        hidden_states (torch.Tensor): BF16, contiguous, shape ``[B,8,H]``;
-            ``B = model_batch * TP``, ``model_batch`` is in ``[1,32]``,
-            ``TP`` is 4, 8, or 16, and ``H = 7168``.
-        qkv_projection_weight (torch.Tensor): BF16 FRACTAL_NZ allocation-root
-            tensor, shape ``[3*P,H]``, with output channels in
-            ``[Q(P) | K(P) | V(P)]`` order.
-        decay_projection_a_weight (torch.Tensor): BF16 FRACTAL_NZ allocation-root
-            tensor, shape ``[D,H] = [128,7168]``; first decay projection, whose
-            intermediate result is rounded to BF16.
-        decay_projection_b_weight (torch.Tensor): BF16 FRACTAL_NZ allocation-root
-            tensor, shape ``[P,D]``; second decay projection.
-        beta_projection_weight (torch.Tensor): BF16 FRACTAL_NZ allocation-root
-            tensor, shape ``[N,H]``; produces one beta logit per head.
-        output_gate_projection_weight (torch.Tensor): BF16 FRACTAL_NZ
-            allocation-root tensor, shape ``[P,H]``; produces the
-            output gate logits.
-        output_norm_weight (torch.Tensor): FP32, contiguous, shape ``[D] = [128]``; RMSNorm weight shared by all heads.
-        output_projection_weight (torch.Tensor): BF16 FRACTAL_NZ allocation-root
-            tensor, shape ``[H,P]``; maps the gated head outputs
-            back to hidden channels.
-        conv1d_weight (torch.Tensor): BF16, contiguous, preferably shape
-            ``[3,N,4,D]`` in Q/K/V, head, tap, channel order; also
-            accepts ``[4,3*P]`` or head-shared ``[3,4,D]``, which are converted
-            on every call without caching.
-        conv_state (torch.Tensor): BF16, contiguous, shape ``[C,L,3*P]`` with
-            ``C >= 1`` and ``L >= S+2``; pooled Conv history updated in place,
-            with slot 0 reserved as an immutable null slot.
-        recurrent_state (torch.Tensor): FP32, contiguous, shape ``[R,N,D,D]``
-            in pool, head, value-row, key-column order, with ``R >= B*S``.
-            Selected recurrent snapshots are updated in place.
-        conv_state_indices (torch.Tensor): INT32, contiguous, shape ``[B]``;
-            values in ``[0,C)`` select Conv slots, and 0 skips Conv state
-            reads/writes and produces zero Conv output.
-        ssm_state_indices (torch.Tensor): INT32, contiguous, shape ``[B*S]``;
-            values in ``[0,R)`` select recurrent snapshots in batch-major token
-            order; slot 0 is valid.
-        conv_num_accepted_tokens (torch.Tensor): INT32, contiguous, shape
-            ``[B]``; nonnegative counts select Conv history at
-            ``offset = max(count-1,0)``; each non-null slot requires
-            ``offset+3 <= L``.
-        num_accepted_tokens (torch.Tensor): INT32, contiguous, shape ``[B]``;
-            counts in ``[0,S]`` select the initial recurrent state at
-            ``ssm_state_indices[b*S + max(count-1,0)]``.
-        A_log (torch.Tensor): FP32, contiguous, shape ``[N]``; per-head logarithmic decay parameters.
-        dt_bias (torch.Tensor): FP32, contiguous, shape ``[N,D]``; per-channel decay bias.
-        scale (float): Required finite query scale, passed as a runtime FP32
-            scalar; use ``128 ** -0.5`` for the usual scaling.
-        lower_bound (float): Required decay gate lower bound in ``[-5,0]``, passed as a runtime FP32 scalar.
-        rms_norm_eps (float): Finite positive output RMSNorm epsilon, defaulting
-            to ``1e-5`` and passed as a runtime FP32 scalar; Q/K normalization
-            keeps epsilon 1e-6.
-    Returns:
-        torch.Tensor: Contiguous BF16 output with shape ``[B,S,H]`` on the input
-            device; ``conv_state`` and ``recurrent_state`` are also updated in
-            place.
-
-    Notes:
-        * ``N = 96/TP``, ``D = 128``, ``P = N*D``, and Conv kernel size is 4; only BSH input layout is supported.
-        * All tensors must be contiguous and on the same NPU, with the shapes
-          and dtypes above; the six projection weights use FRACTAL_NZ storage
-          with output-channel-first logical layout. Pass allocation-root exact
-          tensors; detach Parameter weights before calling.
-        * All S proposal tokens are evaluated; accepted counts choose initial
-          history/state and do not truncate the output sequence.
-        * A non-null Conv slot receives the last two selected history rows at
-          ``[0:2]`` and raw projected QKV at ``[2:S+2]``; other rows and
-          unselected slots remain unchanged.
-        * Each recurrent snapshot after token t is written to
-          ``ssm_state_indices[b*S+t]``; unselected slots remain unchanged.
-        * Nonzero Conv indices must be distinct across batch items, and recurrent
-          slots used by different batch items must not overlap; index/count
-          values must satisfy the bounds above and are not copied to the host
-          for validation.
-        * B and pool extents are runtime dimensions within these bounds; changing
-          them reuses the compiled callable and resizes scratch storage as needed.
-        * One compiled callable is retained per device. Scratch storage is
-          cached per device and shape. Overlapping calls require external
-          serialization.
-        * The current stream quota selects 8/16/24/28/32 AIC blocks, capped
-          at 32, with twice as many AIV blocks. One compiled mixed kernel
-          serves these launch counts;
-          ``get_block_num()`` selects its schedule inside the kernel.
-    """
-    call = _MegaCall(hidden_states, qkv_projection_weight, decay_projection_a_weight, decay_projection_b_weight,
-        beta_projection_weight, output_gate_projection_weight, output_norm_weight, output_projection_weight,
-        conv1d_weight, conv_state, recurrent_state, conv_state_indices, ssm_state_indices, conv_num_accepted_tokens,
-        num_accepted_tokens, A_log, dt_bias, scale, lower_bound, rms_norm_eps)
-    return _execute_mega_call(call)
+    out = _execute_mega(locals().copy())
+    return out, conv_state, replay_u, replay_k, replay_decay
 
 
 @export("mega_recurrent_kda")
 def export_mega_recurrent_kda():
-    handle = cannbotdsl.compile(MegaRecurrentKDAKernel().run, *specification())
-    handle.close()
+    """统一导出三个 TP 的 S8、S4 和变长内核，各变体仅导出一次。"""
+    for heads in SUPPORTED_HEAD_COUNTS:
+        implementation(heads).export_kernels()
 
 
-_GRAPH_LIBRARY = torch.library.Library("cannbotdsl_mega_recurrent_kda", "DEF")
-
-_GRAPH_LIBRARY.define(
-    "mega_recurrent_kda("
-    "Tensor hidden_states, "
-    "Tensor qkv_projection_weight, "
-    "Tensor decay_projection_a_weight, "
-    "Tensor decay_projection_b_weight, "
-    "Tensor beta_projection_weight, "
-    "Tensor output_gate_projection_weight, "
-    "Tensor output_norm_weight, "
-    "Tensor output_projection_weight, "
-    "Tensor conv1d_weight, "
-    "Tensor(a!) conv_state, "
-    "Tensor(b!) recurrent_state, "
-    "Tensor conv_state_indices, "
-    "Tensor ssm_state_indices, "
-    "Tensor conv_num_accepted_tokens, "
-    "Tensor num_accepted_tokens, "
-    "Tensor A_log, "
-    "Tensor dt_bias, "
-    "float scale, "
-    "float lower_bound, "
-    "float rms_norm_eps=1e-5) -> Tensor")
+_graph_library = torch.library.Library("cannbotdsl_mega_recurrent_kda", "DEF")
 
 
-@torch.library.impl(_GRAPH_LIBRARY, "mega_recurrent_kda", "Meta")
-def _multicore_meta(*args):
-    b, s, h, n = _validate_mega_hidden(args[0], args[4])
-    plan(b // (96 // n), 96 // n, 32)
-    return torch.empty_like(args[0], device="meta")
+_graph_library.define(
+    "mega_recurrent_kda(Tensor hidden_states, Tensor qkv_projection_weight, "
+    "Tensor decay_projection_a_weight, Tensor decay_projection_b_weight, Tensor beta_projection_weight, "
+    "Tensor output_gate_projection_weight, Tensor output_norm_weight, Tensor output_projection_weight, "
+    "Tensor conv1d_weight, Tensor(a!) conv_state, Tensor checkpoint_state, Tensor(b!) replay_u, "
+    "Tensor(c!) replay_k, Tensor(d!) replay_decay, Tensor state_indices, Tensor conv_num_accepted_tokens, "
+    "Tensor A_log, Tensor dt_bias, float scale, float lower_bound, float rms_norm_eps=1e-5, "
+    "Tensor? cu_seqlens=None) -> (Tensor, Tensor(a!), Tensor(b!), Tensor(c!), Tensor(d!))"
+)
 
 
-torch.library.impl(_GRAPH_LIBRARY, "mega_recurrent_kda", "PrivateUse1")(mega_recurrent_kda)
+@torch.library.impl(_graph_library, "mega_recurrent_kda", "Meta")
+def _mega_recurrent_kda_meta(
+    hidden_states,
+    qkv_projection_weight,
+    decay_projection_a_weight,
+    decay_projection_b_weight,
+    beta_projection_weight,
+    output_gate_projection_weight,
+    output_norm_weight,
+    output_projection_weight,
+    conv1d_weight,
+    conv_state,
+    checkpoint_state,
+    replay_u,
+    replay_k,
+    replay_decay,
+    state_indices,
+    conv_num_accepted_tokens,
+    A_log,
+    dt_bias,
+    scale,
+    lower_bound,
+    rms_norm_eps=1e-5,
+    cu_seqlens=None,
+):
+    InputValidation.mega_metadata(locals())
+    return (
+        torch.empty_like(hidden_states, device="meta"),
+        conv_state,
+        replay_u,
+        replay_k,
+        replay_decay,
+    )
+
+
+@torch.library.impl(_graph_library, "mega_recurrent_kda", "PrivateUse1")
+def _mega_recurrent_kda_privateuse1(*args, **kwargs):
+    return mega_recurrent_kda(*args, **kwargs)
+
 
 mega_recurrent_kda_op = torch.ops.cannbotdsl_mega_recurrent_kda.mega_recurrent_kda
 
 
 torch.compiler.substitute_in_graph(mega_recurrent_kda, can_constant_fold_through=False)(
-    lambda *args, **kwargs: mega_recurrent_kda_op(*args, **kwargs))
+    lambda *args, **kwargs: mega_recurrent_kda_op(*args, **kwargs)
+)

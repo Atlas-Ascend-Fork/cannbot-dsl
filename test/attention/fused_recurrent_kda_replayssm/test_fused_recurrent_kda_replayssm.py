@@ -17,7 +17,7 @@ from cannbotdsl import get_platform_info
 from _samples_path import load_sample
 
 SAMPLE = "attention/fused_recurrent_kda_replayssm/fused_recurrent_kda_replayssm.py"
-COMMIT_SAMPLE = "attention/commit_recurrent_kda_replayssm/commit_recurrent_kda_replayssm.py"
+COMMIT_SAMPLE = "attention/commit_recurrent_kda/commit_recurrent_kda.py"
 DIM = 128
 SENTINEL = -7.0
 
@@ -69,7 +69,10 @@ def _reference(inputs):
     key = key.float()
     query = query * torch.rsqrt(query.square().sum(-1, keepdim=True) + 1e-6)
     key = key * torch.rsqrt(key.square().sum(-1, keepdim=True) + 1e-6)
-    decay = torch.exp(-5.0 * torch.sigmoid(a_log.exp()[None, None, :, None] * (gate.float() + dt_bias)))
+    decay = torch.exp(
+        -5.0
+        * torch.sigmoid(a_log.exp()[None, None, :, None] * (gate.float() + dt_bias))
+    )
     output = torch.zeros_like(value)
     records_u = torch.full_like(value, SENTINEL, dtype=torch.float16)
     records_k = torch.full_like(value, SENTINEL, dtype=torch.float16)
@@ -80,11 +83,14 @@ def _reference(inputs):
         states = [state.clone()]
         for token in range(length):
             state *= decay[batch, token].unsqueeze(-2)
-            delta = (value[batch, token].float() - (state * key[batch, token].unsqueeze(-2)).sum(-1)) * beta[
-                batch, token
-            ].float().sigmoid()
+            delta = (
+                value[batch, token].float()
+                - (state * key[batch, token].unsqueeze(-2)).sum(-1)
+            ) * beta[batch, token].float().sigmoid()
             state += delta.unsqueeze(-1) * key[batch, token].unsqueeze(-2)
-            output[batch, token] = ((state * query[batch, token].unsqueeze(-2)).sum(-1) * DIM**-0.5).bfloat16()
+            output[batch, token] = (
+                (state * query[batch, token].unsqueeze(-2)).sum(-1) * DIM**-0.5
+            ).bfloat16()
             records_u[batch, token] = delta.half()
             records_k[batch, token] = key[batch, token].half()
             records_decay[batch, token] = decay[batch, token]
@@ -98,7 +104,9 @@ def _pack_layout(inputs, layout):
     gate, beta, lengths = inputs.gate, inputs.beta, inputs.lengths
     # Dense layouts contain the common sequence; records keep a sentinel suffix.
     if layout != "TND":
-        query, key, value, gate, beta = (tensor[:, : lengths[0]] for tensor in (query, key, value, gate, beta))
+        query, key, value, gate, beta = (
+            tensor[:, : lengths[0]] for tensor in (query, key, value, gate, beta)
+        )
     mixed = torch.cat((query, key, value), dim=2)
     if layout == "BSND":
         return mixed.flatten(2).contiguous(), gate.contiguous(), beta.contiguous(), None
@@ -109,43 +117,82 @@ def _pack_layout(inputs, layout):
             beta.transpose(1, 2).contiguous(),
             None,
         )
-    packed = [torch.cat([x[b, :length] for b, length in enumerate(lengths)], dim=0) for x in (mixed, gate, beta)]
+    packed = [
+        torch.cat([x[b, :length] for b, length in enumerate(lengths)], dim=0)
+        for x in (mixed, gate, beta)
+    ]
     cu = torch.tensor([0, *torch.tensor(lengths).cumsum(0).tolist()], dtype=torch.int32)
-    return packed[0].flatten(1).contiguous(), packed[1].contiguous(), packed[2].contiguous(), cu
+    return (
+        packed[0].flatten(1).contiguous(),
+        packed[1].contiguous(),
+        packed[2].contiguous(),
+        cu,
+    )
 
 
 def _check_output(output, expected, layout, lengths):
     if layout == "TND":
-        expected = torch.cat([expected[batch, :length] for batch, length in enumerate(lengths)], dim=0)
+        expected = torch.cat(
+            [expected[batch, :length] for batch, length in enumerate(lengths)], dim=0
+        )
     else:
         expected = expected[:, : lengths[0]]
         if layout == "BNSD":
             expected = expected.transpose(1, 2)
     assert output.dtype == torch.bfloat16
-    torch.testing.assert_close(output.cpu().float(), expected.float(), atol=0.005, rtol=0.005)
+    torch.testing.assert_close(
+        output.cpu().float(), expected.float(), atol=0.005, rtol=0.005
+    )
 
 
 def _check_records(records, references, lengths):
     for actual, reference in zip(records, references):
-        torch.testing.assert_close(actual.cpu().float(), reference.float(), atol=0.005, rtol=0.005)
+        torch.testing.assert_close(
+            actual.cpu().float(), reference.float(), atol=0.005, rtol=0.005
+        )
         for batch, length in enumerate(lengths):
-            torch.testing.assert_close(actual.cpu()[batch, length:], reference[batch, length:], atol=0, rtol=0)
+            torch.testing.assert_close(
+                actual.cpu()[batch, length:], reference[batch, length:], atol=0, rtol=0
+            )
 
 
 def _check_commit(commit, state, records, snapshots, control):
-    # Commit consumes exactly the FP16 U/K and FP32 decay records from verify.
     accepted, cores = control
     checkpoint = state.cpu()
     committed = state.clone()
-    commit.commit_recurrent_kda_replayssm(
-        committed, *records, torch.tensor(accepted, dtype=torch.int32, device="npu"), block_num=cores
+    # Allocate the PA layout explicitly: contiguous() can retain a singleton head stride.
+    commit_records = []
+    for record, dtype in zip(records, (torch.float32, torch.float16, torch.float32)):
+        transposed = record.transpose(1, 2)
+        pool = torch.empty(transposed.shape, dtype=dtype, device=record.device)
+        pool.copy_(transposed)
+        commit_records.append(pool)
+    slots = torch.arange(committed.shape[0], dtype=torch.int32, device="npu")
+    accepted_tokens = torch.tensor(accepted, dtype=torch.int32, device="npu")
+    if cores is None:
+        commit.commit_recurrent_kda(committed, *commit_records, accepted_tokens, slots)
+        torch.npu.synchronize()
+    else:
+        stream = torch.npu.Stream(device=committed.device)
+        stream.wait_stream(torch.npu.current_stream(committed.device))
+        torch.npu.set_stream_limit(stream, cube_num=cores, vector_num=2 * cores)
+        try:
+            with torch.npu.stream(stream):
+                commit.commit_recurrent_kda(
+                    committed, *commit_records, accepted_tokens, slots
+                )
+            stream.synchronize()
+        finally:
+            torch.npu.reset_stream_limit(stream)
+    expected_state = torch.stack(
+        [snapshots[batch][count] for batch, count in enumerate(accepted)]
     )
-    torch.npu.synchronize()
-    expected_state = torch.stack([snapshots[batch][count] for batch, count in enumerate(accepted)])
     torch.testing.assert_close(committed.cpu(), expected_state, atol=0.005, rtol=0.005)
     for batch, count in enumerate(accepted):
         if count == 0:
-            torch.testing.assert_close(committed.cpu()[batch], checkpoint[batch], atol=0, rtol=0)
+            torch.testing.assert_close(
+                committed.cpu()[batch], checkpoint[batch], atol=0, rtol=0
+            )
 
 
 def _precision_case(layout, heads, lengths, accepted, cores):
@@ -161,7 +208,9 @@ def _precision_case(layout, heads, lengths, accepted, cores):
         stream = torch.npu.current_stream(mixed.device)
         available_cores = get_platform_info(stream=stream).cube_core_num
         if cores > available_cores:
-            pytest.skip(f"requires {cores} AIC cores; current stream exposes {available_cores}")
+            pytest.skip(
+                f"requires {cores} AIC cores; current stream exposes {available_cores}"
+            )
     expected = _reference(inputs)
     records = [
         torch.full(inputs.query.shape, SENTINEL, dtype=dtype, device="npu")
@@ -197,7 +246,9 @@ def _precision_case(layout, heads, lengths, accepted, cores):
     [
         pytest.param("BSND", 1, (8,), (8,), 24, id="bsnd-small-row-24-cores"),
         pytest.param("BNSD", 17, (9, 9), (0, 9), 8, id="bnsd-full-row-multiwave"),
-        pytest.param("TND", 8, (5, 1, 3), (5, 0, 2), None, id="tnd-medium-row-variable-length"),
+        pytest.param(
+            "TND", 8, (5, 1, 3), (5, 0, 2), None, id="tnd-medium-row-variable-length"
+        ),
     ],
 )
 def test_precision_layouts_and_commit(layout, heads, lengths, accepted, cores):

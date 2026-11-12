@@ -10,8 +10,7 @@
     "fused_recurrent_kda_snapshot",
     "fused_recurrent_kda_replayssm",
     "mega_recurrent_kda",
-    "mega_recurrent_kda_replayssm",
-    "commit_recurrent_kda_replayssm",
+    "commit_recurrent_kda",
     "quant_mla_prolog"
   ]
 }

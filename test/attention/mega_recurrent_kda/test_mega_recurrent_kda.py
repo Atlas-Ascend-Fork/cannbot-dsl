@@ -6,122 +6,163 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 
-"""Independent precision test for the stream-controlled Mega KDA.
 
-The independent CPU golden checks outputs, workspaces, and all state snapshots.
-Run the parametrized NPU cases serially. Absolute and relative tolerances are 5e-3.
+"""Independent CPU precision and parameterized PA/TH contract tests.
+
+Run this file with pytest after enabling the required NPU runtime.
+Use -m functional / -m interception; Commit also retains -m companion.
+Logs/provenance are collected by the external validation command, not test helpers.
 """
 
 from __future__ import annotations
-
-import dataclasses
-from typing import NamedTuple
-
+import fcntl
+import sys
+from pathlib import Path
 import pytest
 import torch
 
-from _samples_path import load_sample
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-SAMPLE = "attention/mega_recurrent_kda/mega_recurrent_kda.py"
+
+@pytest.fixture(scope="session")
+def npu_session(request):
+    # Register torch.npu when backend autoload is disabled.
+    import torch_npu  # noqa: F401
+
+    if getattr(request.config, "_kda_device0_lock", None) is None:
+        path = Path("/var/lock/cannbot-ci/npu-test.lock.device-0")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handle = path.open("a")
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            torch.npu.set_device(0)
+            torch.npu.init()
+            assert torch.npu.is_available()
+        except BaseException:
+            handle.close()
+            raise
+        request.config._kda_device0_lock = handle
+        request.addfinalizer(lambda: (torch.npu.synchronize(), handle.close()))
+
+
+@pytest.fixture(autouse=True)
+def require_real_npu(request):
+    if request.node.get_closest_marker("npu"):
+        request.getfixturevalue("npu_session")
+
+
+HEAD_DIM = 128
+CONV_KERNEL_SIZE = 4
+QK_RMS_EPSILON = 1e-6
+
+_FP64 = torch.float64
+_FP32 = torch.float32
+_BF16 = torch.bfloat16
+
+
+def _fp32_runtime_scalar(value) -> float:
+    return float(torch.tensor(float(value), dtype=_FP32).item())
+
+
+_QK_RMS_EPSILON_FP32 = _fp32_runtime_scalar(QK_RMS_EPSILON)
+
+
+def _require(condition: bool, message: str) -> None:
+    if not condition:
+        raise ValueError(f"mega_recurrent_kda cpu_hp peer: {message}")
+
+
+def _project(
+    value: torch.Tensor, weight: torch.Tensor, output_dtype: torch.dtype
+) -> torch.Tensor:
+    accumulated = torch.matmul(value.to(_FP64), weight.to(_FP64).transpose(-1, -2))
+    return accumulated.to(output_dtype)
+
+
+def _causal_conv1d_silu(
+    raw_qkv: torch.Tensor,
+    conv1d_weight: torch.Tensor,
+    conv_state: torch.Tensor,
+    conv_state_indices: torch.Tensor,
+    conv_num_accepted_tokens: torch.Tensor,
+):
+    if raw_qkv.ndim != 3:
+        raise ValueError("mega_recurrent_kda cpu_hp peer: raw_qkv must be [B,S,3*P]")
+    batch_size, seq_len, channels = map(int, raw_qkv.shape)
+    _require(
+        tuple(conv1d_weight.shape) == (CONV_KERNEL_SIZE, channels),
+        "conv1d_weight must be [4,3*P]",
+    )
+    _require(
+        conv_state.ndim == 3 and int(conv_state.shape[2]) == channels,
+        "conv_state must be [pool,state_length,3*P]",
+    )
+    _require(
+        int(conv_state.shape[1]) >= seq_len + CONV_KERNEL_SIZE - 2,
+        "conv_state state_length must be at least S+2",
+    )
+    _require(
+        tuple(conv_state_indices.shape) == (batch_size,),
+        "conv_state_indices must be [B]",
+    )
+    _require(
+        tuple(conv_num_accepted_tokens.shape) == (batch_size,),
+        "conv_num_accepted_tokens must be [B]",
+    )
+
+    convolved = torch.zeros((batch_size, seq_len, channels), dtype=_BF16)
+    conv_state_new = conv_state.clone()
+    filter_fp64 = conv1d_weight.to(_FP64)
+
+    for batch_index in range(batch_size):
+        cache_index = int(conv_state_indices[batch_index])
+        if cache_index == 0:
+            continue
+        accepted = int(conv_num_accepted_tokens[batch_index])
+        offset = max(accepted - 1, 0)
+        history_stop = offset + CONV_KERNEL_SIZE - 1
+        history = conv_state[cache_index, offset:history_stop].to(_FP64)
+        _require(
+            int(history.shape[0]) == CONV_KERNEL_SIZE - 1,
+            "accepted Conv history exceeds state_length",
+        )
+        for token in range(seq_len):
+            current = raw_qkv[batch_index, token].to(_FP64)
+            window = torch.cat((history, current.unsqueeze(0)), dim=0)
+            taps = window * filter_fp64
+            convolved_fp64 = taps[0] + taps[1] + (taps[2] + taps[3])
+            convolved[batch_index, token] = (
+                convolved_fp64 * torch.sigmoid(convolved_fp64)
+            ).to(_BF16)
+            history = torch.cat(
+                (history[1:], current.to(_BF16).to(_FP64).unsqueeze(0)), dim=0
+            )
+        selected = conv_state[cache_index, offset:history_stop]
+        conv_state_new[cache_index, :2].copy_(selected[1:])
+        proposal_stop = 2 + seq_len
+        conv_state_new[cache_index, 2:proposal_stop].copy_(raw_qkv[batch_index])
+    return convolved, conv_state_new
+
+
 HEAD_DIM = 128
 CONV_KERNEL_SIZE = 4
 RMS_EPSILON = 1e-6
-NZ_WEIGHT_ARGUMENTS = (1, 2, 3, 4, 5, 7)
 
 
-@dataclasses.dataclass
-class MegaRecurrentKDAWeights:
-    """TP-local weights in the layouts consumed by the public operator."""
-
-    qkv_projection_weight: torch.Tensor
-    decay_projection_a_weight: torch.Tensor
-    decay_projection_b_weight: torch.Tensor
-    beta_projection_weight: torch.Tensor
-    output_gate_projection_weight: torch.Tensor
-    output_norm_weight: torch.Tensor
-    output_projection_weight: torch.Tensor
-    conv1d_weight: torch.Tensor
-    a_log: torch.Tensor
-    dt_bias: torch.Tensor
-
-
-@dataclasses.dataclass
-class MegaRecurrentKDAGolden:
-    """Outputs and intermediate values used by precision tests."""
-
-    output: torch.Tensor
-    raw_qkv: torch.Tensor
-    convolved_qkv: torch.Tensor
-    decay_a: torch.Tensor
-    raw_decay: torch.Tensor
-    raw_beta: torch.Tensor
-    raw_output_gate: torch.Tensor
-    recurrent_output: torch.Tensor
-    gated_output: torch.Tensor
-    conv_state: torch.Tensor
-    recurrent_state: torch.Tensor
-
-
-class _RecurrentCase(NamedTuple):
-    convolved_qkv: torch.Tensor
-    raw_decay: torch.Tensor
-    raw_beta: torch.Tensor
-    recurrent_state: torch.Tensor
-    ssm_state_indices: torch.Tensor
-    num_accepted_tokens: torch.Tensor
-    a_log: torch.Tensor
-    dt_bias: torch.Tensor
-    scale: float
-    lower_bound: float
-
-
-class _GoldenCase(NamedTuple):
-    hidden_states: torch.Tensor
-    weights: MegaRecurrentKDAWeights
-    conv_state: torch.Tensor
-    recurrent_state: torch.Tensor
-    conv_state_indices: torch.Tensor
-    ssm_state_indices: torch.Tensor
-    conv_num_accepted_tokens: torch.Tensor
-    num_accepted_tokens: torch.Tensor
-    scale: float
-    lower_bound: float
-    rms_norm_eps: float
-
-
-class _CpuArguments(NamedTuple):
-    hidden_states: torch.Tensor
-    qkv_projection_weight: torch.Tensor
-    decay_projection_a_weight: torch.Tensor
-    decay_projection_b_weight: torch.Tensor
-    beta_projection_weight: torch.Tensor
-    output_gate_projection_weight: torch.Tensor
-    output_norm_weight: torch.Tensor
-    output_projection_weight: torch.Tensor
-    conv1d_weight: torch.Tensor
-    conv_state: torch.Tensor
-    recurrent_state: torch.Tensor
-    conv_state_indices: torch.Tensor
-    ssm_state_indices: torch.Tensor
-    conv_num_accepted_tokens: torch.Tensor
-    num_accepted_tokens: torch.Tensor
-    a_log: torch.Tensor
-    dt_bias: torch.Tensor
-
-
-def _linear(value: torch.Tensor, weight: torch.Tensor, output_dtype: torch.dtype) -> torch.Tensor:
+def _linear(
+    value: torch.Tensor, weight: torch.Tensor, output_dtype: torch.dtype
+) -> torch.Tensor:
     result = torch.matmul(value.float(), weight.float().transpose(-1, -2))
     return result.to(output_dtype)
 
 
-def run_model_native_causal_conv1d_silu(raw_qkv: torch.Tensor, conv1d_weight: torch.Tensor, conv_state: torch.Tensor,
-    conv_state_indices: torch.Tensor, conv_num_accepted_tokens: torch.Tensor) -> torch.Tensor:
-    """Run pooled K=4 Conv with the raw-FP32/BF16-history boundary.
-
-    ``conv_state_indices == 0`` denotes the immutable null slot. All proposal
-    tokens are evaluated; the accepted count chooses the three history rows
-    from the model-native speculative cache.
-    """
+def run_causal_conv1d_silu(
+    raw_qkv: torch.Tensor,
+    conv1d_weight: torch.Tensor,
+    conv_state: torch.Tensor,
+    conv_state_indices: torch.Tensor,
+    conv_num_accepted_tokens: torch.Tensor,
+) -> torch.Tensor:
     if raw_qkv.ndim != 3:
         raise ValueError("raw_qkv must be [B,S,3*P]")
     batch_size, seq_len, channels = map(int, raw_qkv.shape)
@@ -135,6 +176,7 @@ def run_model_native_causal_conv1d_silu(raw_qkv: torch.Tensor, conv1d_weight: to
         raise ValueError("conv_state_indices must be [B]")
     if tuple(conv_num_accepted_tokens.shape) != (batch_size,):
         raise ValueError("conv_num_accepted_tokens must be [B]")
+
     result = torch.zeros_like(raw_qkv, dtype=torch.bfloat16)
     original_state = conv_state.clone()
     filter_fp32 = conv1d_weight.float()
@@ -153,8 +195,12 @@ def run_model_native_causal_conv1d_silu(raw_qkv: torch.Tensor, conv1d_weight: to
             window = torch.cat((history, current.unsqueeze(0)), dim=0)
             products = window * filter_fp32
             convolved = products[0] + products[1] + (products[2] + products[3])
-            result[batch_index, token] = torch.nn.functional.silu(convolved).to(torch.bfloat16)
-            history = torch.cat((history[1:], current.to(torch.bfloat16).float().unsqueeze(0)), dim=0)
+            result[batch_index, token] = torch.nn.functional.silu(convolved).to(
+                torch.bfloat16
+            )
+            history = torch.cat(
+                (history[1:], current.to(torch.bfloat16).float().unsqueeze(0)), dim=0
+            )
         selected = original_state[cache_index, offset:history_stop]
         conv_state[cache_index, :2].copy_(selected[1:])
         proposal_stop = 2 + seq_len
@@ -162,250 +208,365 @@ def run_model_native_causal_conv1d_silu(raw_qkv: torch.Tensor, conv1d_weight: to
     return result
 
 
-def _run_pooled_recurrent(case: _RecurrentCase) -> torch.Tensor:
-    (convolved_qkv,
-        raw_decay,
-        raw_beta,
-        recurrent_state,
-        ssm_state_indices,
-        num_accepted_tokens,
-        a_log,
-        dt_bias,
-        scale,
-        lower_bound,
-    ) = case
-    batch_size, seq_len, _, num_heads, head_dim = convolved_qkv.shape
-    query = convolved_qkv[:, :, 0].float()
-    key = convolved_qkv[:, :, 1].float()
-    value = convolved_qkv[:, :, 2].float()
-    query *= torch.rsqrt(query.square().sum(dim=-1, keepdim=True) + RMS_EPSILON)
-    key *= torch.rsqrt(key.square().sum(dim=-1, keepdim=True) + RMS_EPSILON)
-    decay = float(lower_bound) * torch.sigmoid(
-        torch.exp(a_log.float()).view(1, 1, num_heads, 1)
-        * (raw_decay.float() + dt_bias.float().view(1, 1, num_heads, head_dim)))
-    beta = torch.sigmoid(raw_beta.float())
-    output = torch.empty(batch_size, seq_len, num_heads, head_dim, dtype=torch.float32, device=convolved_qkv.device)
-    state_indices = ssm_state_indices.reshape(batch_size, seq_len)
-    for batch_index in range(batch_size):
-        accepted = int(num_accepted_tokens[batch_index])
-        initial_token = accepted - 1 if accepted > 0 else 0
-        current = recurrent_state[int(state_indices[batch_index, initial_token])].float().clone()
-        for token in range(seq_len):
-            current *= torch.exp(decay[batch_index, token]).unsqueeze(-2)
-            key_value = (current * key[batch_index, token].unsqueeze(-2)).sum(dim=-1)
-            delta = (value[batch_index, token] - key_value) * beta[batch_index, token].unsqueeze(-1)
-            current += delta.unsqueeze(-1) * key[batch_index, token].unsqueeze(-2)
-            output[batch_index, token] = (current * query[batch_index, token].unsqueeze(-2)).sum(dim=-1) * float(scale)
-            recurrent_state[int(state_indices[batch_index, token])].copy_(current.to(recurrent_state.dtype))
-    return output
-
-
-def run_mega_recurrent_kda_golden(case: _GoldenCase) -> MegaRecurrentKDAGolden:
-    """Run the full fragment on CPU without calling production helpers."""
-    (hidden_states,
-        weights,
+@torch.no_grad()
+def _dense_baseline_fp32(
+    hidden_states,
+    qkv_projection_weight,
+    decay_projection_a_weight,
+    decay_projection_b_weight,
+    beta_projection_weight,
+    output_gate_projection_weight,
+    output_norm_weight,
+    output_projection_weight,
+    conv1d_weight,
+    conv_state,
+    recurrent_state,
+    replay_u,
+    replay_k,
+    replay_decay,
+    conv_state_indices,
+    conv_num_accepted_tokens,
+    A_log,
+    dt_bias,
+    scale=128**-0.5,
+    lower_bound=-5.0,
+    rms_norm_eps=1e-5,
+    **kwargs,
+):
+    t = (
+        hidden_states,
+        qkv_projection_weight,
+        decay_projection_a_weight,
+        decay_projection_b_weight,
+        beta_projection_weight,
+        output_gate_projection_weight,
+        output_norm_weight,
+        output_projection_weight,
+        conv1d_weight,
         conv_state,
         recurrent_state,
+        replay_u,
+        replay_k,
+        replay_decay,
         conv_state_indices,
-        ssm_state_indices,
         conv_num_accepted_tokens,
-        num_accepted_tokens,
-        scale,
-        lower_bound,
-        rms_norm_eps,
-    ) = case
-    assert hidden_states.device.type == "cpu", "golden must use independent CPU arithmetic"
-    batch_size, seq_len, hidden_size = map(int, hidden_states.shape)
-    num_heads = int(weights.beta_projection_weight.shape[0])
-    projection_size = num_heads * HEAD_DIM
-    raw_qkv = _linear(hidden_states, weights.qkv_projection_weight, torch.float32)
-    convolved_flat = run_model_native_causal_conv1d_silu(raw_qkv, weights.conv1d_weight, conv_state,
-        conv_state_indices, conv_num_accepted_tokens)
-    convolved_qkv = convolved_flat.view(batch_size, seq_len, 3, num_heads, HEAD_DIM)
-    decay_a = _linear(hidden_states, weights.decay_projection_a_weight, torch.bfloat16)
-    raw_decay = _linear(decay_a, weights.decay_projection_b_weight, torch.bfloat16).view(
-        batch_size, seq_len, num_heads, HEAD_DIM)
-    raw_beta = _linear(hidden_states, weights.beta_projection_weight, torch.bfloat16).view(
-        batch_size, seq_len, num_heads)
-    raw_output_gate = _linear(hidden_states, weights.output_gate_projection_weight, torch.bfloat16).view(
-        batch_size, seq_len, num_heads, HEAD_DIM)
-    recurrent_output = _run_pooled_recurrent(
-        _RecurrentCase(convolved_qkv, raw_decay, raw_beta, recurrent_state, ssm_state_indices, num_accepted_tokens,
-            weights.a_log, weights.dt_bias, scale, lower_bound))
-    inverse_rms = torch.rsqrt(recurrent_output.square().mean(dim=-1, keepdim=True) + float(rms_norm_eps))
-    normalized = recurrent_output * inverse_rms * weights.output_norm_weight.float()
-    gated_output = (normalized * torch.sigmoid(raw_output_gate.float())).to(torch.bfloat16)
-    output = _linear(gated_output.view(batch_size, seq_len, projection_size), weights.output_projection_weight,
-        torch.bfloat16).view(batch_size, seq_len, hidden_size)
-    return MegaRecurrentKDAGolden(output=output, raw_qkv=raw_qkv, convolved_qkv=convolved_qkv, decay_a=decay_a,
-        raw_decay=raw_decay, raw_beta=raw_beta, raw_output_gate=raw_output_gate, recurrent_output=recurrent_output,
-        gated_output=gated_output, conv_state=conv_state, recurrent_state=recurrent_state)
+        A_log,
+        dt_bias,
+    )
+    b, s, h = t[0].shape
+    n = t[4].shape[0]
+    project = _linear
+    conv = t[9].clone()
+    qkv = run_causal_conv1d_silu(
+        project(t[0], t[1], torch.float32), t[8], conv, t[14], t[15]
+    ).view(b, s, 3, n, 128)
+    q, k, v = (qkv[:, :, i].float() for i in range(3))
+    q *= torch.rsqrt(q.square().sum(-1, keepdim=True) + 1e-6)
+    k *= torch.rsqrt(k.square().sum(-1, keepdim=True) + 1e-6)
+    raw_decay = project(project(t[0], t[2], torch.bfloat16), t[3], torch.bfloat16).view(
+        b, s, n, 128
+    )
+    decay = torch.exp(
+        lower_bound
+        * torch.sigmoid(
+            torch.exp(t[16]).view(1, 1, n, 1)
+            * (raw_decay.float() + t[17].view(1, 1, n, 128))
+        )
+    )
+    beta = torch.sigmoid(project(t[0], t[4], torch.bfloat16).float())
+    gate = project(t[0], t[5], torch.bfloat16).view(b, s, n, 128)
+    current = t[10].clone()
+    u = torch.empty((b, s, n, 128), dtype=torch.float32)
+    recurrent = torch.empty((b, s, n, 128))
+    for token in range(s):
+        current *= decay[:, token].unsqueeze(-2)
+        delta = (v[:, token] - (current * k[:, token].unsqueeze(-2)).sum(-1)) * beta[
+            :, token
+        ].unsqueeze(-1)
+        u[:, token] = delta.to(torch.float32)
+        current += delta.unsqueeze(-1) * k[:, token].unsqueeze(-2)
+        recurrent[:, token] = (current * q[:, token].unsqueeze(-2)).sum(-1) * scale
+    normalized = (
+        recurrent
+        * torch.rsqrt(recurrent.square().mean(-1, keepdim=True) + rms_norm_eps)
+        * t[6].float()
+    )
+    gated = (normalized * torch.sigmoid(gate.float())).to(torch.bfloat16)
+    out = project(gated.flatten(2), t[7], torch.bfloat16)
+    return [out, conv, u, k.to(torch.float16), decay]
 
 
-def _make_cpu_arguments(batch_size, seq_len, seed, num_heads=6):
-    generator = torch.Generator().manual_seed(seed)
-    hidden_size, head_dim = (7168, 128)
-    projection_size = num_heads * head_dim
+@torch.no_grad()
+def _dense_golden_fp64(
+    hidden_states,
+    qkv_projection_weight,
+    decay_projection_a_weight,
+    decay_projection_b_weight,
+    beta_projection_weight,
+    output_gate_projection_weight,
+    output_norm_weight,
+    output_projection_weight,
+    conv1d_weight,
+    conv_state,
+    recurrent_state,
+    replay_u,
+    replay_k,
+    replay_decay,
+    conv_state_indices,
+    conv_num_accepted_tokens,
+    A_log,
+    dt_bias,
+    scale=128**-0.5,
+    lower_bound=-5.0,
+    rms_norm_eps=1e-5,
+    **kwargs,
+):
+    t = (
+        hidden_states,
+        qkv_projection_weight,
+        decay_projection_a_weight,
+        decay_projection_b_weight,
+        beta_projection_weight,
+        output_gate_projection_weight,
+        output_norm_weight,
+        output_projection_weight,
+        conv1d_weight,
+        conv_state,
+        recurrent_state,
+        replay_u,
+        replay_k,
+        replay_decay,
+        conv_state_indices,
+        conv_num_accepted_tokens,
+        A_log,
+        dt_bias,
+    )
+    assert all(x.device.type == "cpu" for x in t)
+    scale, lower_bound, rms_norm_eps = map(
+        _fp32_runtime_scalar, (scale, lower_bound, rms_norm_eps)
+    )
+    b, s, h = t[0].shape
+    n = t[4].shape[0]
+    f64 = torch.float64
+    bf16 = torch.bfloat16
+    project = _project
+    raw_qkv = project(t[0], t[1], torch.float32)
+    qkv, conv = _causal_conv1d_silu(raw_qkv, t[8], t[9], t[14], t[15])
+    qkv = qkv.view(b, s, 3, n, 128)
+    q, k, v = (qkv[:, :, i].to(f64) for i in range(3))
+    q = q * torch.rsqrt(q.square().sum(-1, keepdim=True) + _QK_RMS_EPSILON_FP32)
+    k = k * torch.rsqrt(k.square().sum(-1, keepdim=True) + _QK_RMS_EPSILON_FP32)
+    raw_decay = project(project(t[0], t[2], bf16), t[3], bf16).view(b, s, n, 128)
+    decay = torch.exp(
+        lower_bound
+        * torch.sigmoid(
+            torch.exp(t[16].to(f64)).view(1, 1, n, 1)
+            * (raw_decay.to(f64) + t[17].to(f64).view(1, 1, n, 128))
+        )
+    )
+    beta = torch.sigmoid(project(t[0], t[4], bf16).to(f64))
+    gate = project(t[0], t[5], bf16).view(b, s, n, 128)
+    current = t[10].to(f64).clone()
+    recurrent = torch.empty((b, s, n, 128), dtype=f64)
+    u = torch.empty((b, s, n, 128), dtype=torch.float32)
+    for token in range(s):
+        current = current * decay[:, token].unsqueeze(-2)
+        delta = (v[:, token] - (current * k[:, token].unsqueeze(-2)).sum(-1)) * beta[
+            :, token
+        ].unsqueeze(-1)
+        u[:, token] = delta.to(
+            torch.float32
+        )  # record storage does not round the register carry
+        current = current + delta.unsqueeze(-1) * k[:, token].unsqueeze(-2)
+        recurrent[:, token] = (current * q[:, token].unsqueeze(-2)).sum(-1) * scale
+    normalized = (
+        recurrent
+        * torch.rsqrt(recurrent.square().mean(-1, keepdim=True) + rms_norm_eps)
+        * t[6].to(f64)
+    )
+    gated = (normalized * torch.sigmoid(gate.to(f64))).to(bf16)
+    out = project(gated.flatten(2), t[7], bf16)
+    return [out, conv, u, k.to(torch.float16), decay.to(torch.float32)]
 
-    def randn(shape, dtype=torch.bfloat16, scale=0.02):
-        return (torch.randn(shape, generator=generator) * scale).to(dtype)
 
-    conv_indices = torch.randperm(batch_size, generator=generator).int() + 1
-    conv_indices[::7] = 0
-    state_indices = torch.randperm(batch_size * seq_len, generator=generator).int() + 1
-    accepted = torch.arange(batch_size, dtype=torch.int32) % (seq_len + 1)
-    return _CpuArguments(
-        randn((batch_size, seq_len, hidden_size)),
-        randn((3 * projection_size, hidden_size)),
-        randn((head_dim, hidden_size)),
-        randn((projection_size, head_dim)),
-        randn((num_heads, hidden_size)),
-        randn((projection_size, hidden_size)),
-        randn((head_dim,), torch.float32, scale=0.2),
-        randn((hidden_size, projection_size)),
-        randn((4, 3 * projection_size)),
-        randn((batch_size + 1, seq_len + 2, 3 * projection_size)),
-        randn((batch_size * seq_len + 1, num_heads, head_dim, head_dim), torch.float32, scale=0.002),
-        conv_indices,
+@torch.no_grad()
+def _reference_run_impl(
+    hidden_states,
+    qkv_projection_weight,
+    decay_projection_a_weight,
+    decay_projection_b_weight,
+    beta_projection_weight,
+    output_gate_projection_weight,
+    output_norm_weight,
+    output_projection_weight,
+    conv1d_weight,
+    conv_state,
+    checkpoint_state,
+    replay_u,
+    replay_k,
+    replay_decay,
+    state_indices,
+    conv_num_accepted_tokens,
+    A_log,
+    dt_bias,
+    scale=128**-0.5,
+    lower_bound=-5.0,
+    rms_norm_eps=1e-5,
+    cu_seqlens=None,
+    *,
+    fp64=True,
+):
+    t = [
+        hidden_states,
+        qkv_projection_weight,
+        decay_projection_a_weight,
+        decay_projection_b_weight,
+        beta_projection_weight,
+        output_gate_projection_weight,
+        output_norm_weight,
+        output_projection_weight,
+        conv1d_weight,
+        conv_state,
+        checkpoint_state,
+        replay_u,
+        replay_k,
+        replay_decay,
         state_indices,
-        accepted,
-        (seq_len - accepted).contiguous(),
-        randn((num_heads,), torch.float32, scale=0.1),
-        randn((num_heads, head_dim), torch.float32, scale=0.1))
+        conv_num_accepted_tokens,
+        A_log,
+        dt_bias,
+    ]
+    assert all(x.device.type == "cpu" for x in t)
+    n = t[4].shape[0]
+    p = n * 128
+    b = state_indices.numel()
+    x = hidden_states.reshape(-1, 7168)
+    prefix = (
+        cu_seqlens.tolist()
+        if cu_seqlens is not None
+        else [i * hidden_states.shape[1] for i in range(b + 1)]
+    )
+    conv = conv_state.clone()
+    u = replay_u.clone()
+    k = replay_k.clone()
+    decay = replay_decay.clone()
+    out = []
+    wc = conv1d_weight
+    if wc.shape != (4, 3 * p):
+        if wc.ndim == 3:
+            wc = wc[:, None, :, :].expand(3, n, 4, 128)
+        wc = wc.permute(2, 0, 1, 3).reshape(4, 3 * p).contiguous()
+    dense = _dense_golden_fp64 if fp64 else _dense_baseline_fp32
+    compute_dtype = torch.float64 if fp64 else torch.float32
+    x = x.to(compute_dtype)
+    immutable = [v.to(compute_dtype) for v in t[1:9]]
+    wc = wc.to(compute_dtype)
+    for batch in range(b):
+        slot = int(state_indices[batch])
+        start, end = prefix[batch : batch + 2]
+        length = end - start
+        pool = torch.zeros((2, conv.shape[1], 3 * p), dtype=conv.dtype)
+        pool[1].copy_(conv_state[slot])
+        args = [
+            x[start:end].unsqueeze(0),
+            *immutable,
+            pool,
+            checkpoint_state[slot].unsqueeze(0),
+            torch.empty((1, length, n, 128), dtype=torch.float32),
+            torch.empty((1, length, n, 128), dtype=torch.float16),
+            torch.empty((1, length, n, 128), dtype=torch.float32),
+            torch.ones(1, dtype=torch.int32),
+            conv_num_accepted_tokens[batch : batch + 1],
+            A_log,
+            dt_bias,
+        ]
+        args[8] = wc
+        result = dense(*args, scale, lower_bound, rms_norm_eps)
+        out.append(result[0].squeeze(0))
+        conv[slot].copy_(result[1][1])
+        for target, value in zip((u, k, decay), result[2:]):
+            target[slot, :, :length].copy_(value[0].transpose(0, 1))
+    return torch.cat(out).view(hidden_states.shape), conv, u, k, decay
 
 
-def _to_npu_arguments(arguments):
-    torch_npu = pytest.importorskip("torch_npu")
-    actual = [value.to("npu") for value in arguments]
-    for index in NZ_WEIGHT_ARGUMENTS:
-        actual[index] = torch_npu.npu_format_cast(actual[index], torch_npu.Format.FRACTAL_NZ)
-        assert torch_npu.get_npu_format(actual[index]) == torch_npu.Format.FRACTAL_NZ
-        assert getattr(actual[index], "_base") is None
-        assert actual[index].storage_offset() == 0
-    return tuple(actual)
+def _golden_fp64(*args, **kwargs):
+    return _reference_run(*args, **kwargs, fp64=True)
 
 
-def _assert_precision_results(module, actual, expected, output, initial):
-    for value, truth in (
-        (output, expected.output),
-        (actual[9], expected.conv_state),
-        (actual[10], expected.recurrent_state), ):
-        torch.testing.assert_close(value.cpu().float(), truth.float(), atol=0.005, rtol=0.005)
-    assert output.is_contiguous() and output.dtype == torch.bfloat16
-    batch_size, seq_len = output.shape[:2]
-    num_heads = actual[15].shape[0]
-    launch = module._LAUNCHES[(num_heads, batch_size, actual[0].device)]
-    assert len(launch.workspace_views) == 7
-    assert launch.norm_exchange.shape == (128, 128)
-    rows = batch_size * seq_len
-    projection_size = num_heads * HEAD_DIM
-    golden_views = (
-        expected.gated_output.reshape(rows, projection_size),
-        expected.convolved_qkv[:, :, 1].reshape(rows, projection_size),
-        expected.convolved_qkv[:, :, 2].reshape(rows, projection_size),
-        expected.raw_decay.reshape(rows, projection_size),
-        expected.raw_output_gate.reshape(rows, projection_size), )
-    for workspace, truth in zip(launch.workspace_views, golden_views):
-        torch.testing.assert_close(workspace.cpu().float(), truth.float(), atol=0.005, rtol=0.005)
-    torch.testing.assert_close(actual[9][0].cpu(), initial[0][0], atol=0, rtol=0)
-    torch.testing.assert_close(actual[10][0].cpu(), initial[1][0], atol=0, rtol=0)
+def _baseline_fp32(*args, **kwargs):
+    return _reference_run(*args, **kwargs, fp64=False)
 
 
-def _available_core_counts(module):
-    device = torch.npu.current_device()
-    hardware = torch.npu.get_device_properties(device)
-    stream = torch.npu.current_stream(device)
-    info = module.cannbotdsl.get_platform_info(stream=stream)
-    cube = min(int(hardware.cube_core_num), int(info.cube_core_num))
-    vector = min(int(hardware.vector_core_num), int(info.vector_core_num))
-    return tuple(core for core in module.VALID_CORES if core <= cube and 2 * core <= vector)
+@torch.no_grad()
+def _commit_reference_impl(
+    checkpoint, u, k, decay, accepted, state_indices, *, fp64=True
+):
+    assert all(
+        t.device.type == "cpu"
+        for t in (checkpoint, u, k, decay, accepted, state_indices)
+    ), "CPU reference must never execute on NPU"
+    dtype = torch.float64 if fp64 else torch.float32
+    result = checkpoint.clone()
+    for batch, slot in enumerate(state_indices.tolist()):
+        current = checkpoint[slot].to(dtype)
+        for token in range(int(accepted[batch])):
+            current = current * decay[slot, :, token].to(dtype).unsqueeze(-2) + u[
+                slot, :, token
+            ].to(dtype).unsqueeze(-1) * k[slot, :, token].to(dtype).unsqueeze(-2)
+        result[slot] = current.to(torch.float32)
+    return result
 
 
-def _check_precision(batch_size, seq_len, block_num, num_heads, precision_case=None):
-    pytest.importorskip("torch_npu")
-    module = load_sample(SAMPLE)
-    available = _available_core_counts(module)
-    if not available:
-        pytest.skip("Mega KDA requires at least 8 AIC and 16 AIV cores")
-    quota = available[-1] if block_num is None else block_num
-    if quota not in available:
-        pytest.skip(f"AIC quota {quota} exceeds the device or current stream capacity")
-    scale, lower = 128**-0.5, -5.0
-    if precision_case is None:
-        arguments = _make_cpu_arguments(batch_size, seq_len, 731 + batch_size + seq_len, num_heads)
-        initial = (arguments[9].clone(), arguments[10].clone())
-        weights = MegaRecurrentKDAWeights(*arguments[1:9], arguments[15], arguments[16])
-        original_threads = torch.get_num_threads()
-        try:
-            torch.set_num_threads(min(original_threads, 8))
-            expected = run_mega_recurrent_kda_golden(
-                _GoldenCase(arguments[0], weights, initial[0].clone(), initial[1].clone(), *arguments[11:15], scale, lower,
-                    1e-5))
-        finally:
-            torch.set_num_threads(original_threads)
-    else:
-        arguments, initial, expected = precision_case
-    actual = _to_npu_arguments(arguments)
-    stream = torch.npu.Stream()
-    # Inputs and state seeds were produced on the caller stream.
-    torch.npu.synchronize()
-    torch.npu.set_stream_limit(stream, cube_num=quota, vector_num=2 * quota)
-    try:
-        with torch.npu.stream(stream):
-            for _ in range(2):
-                actual[9].copy_(initial[0])
-                actual[10].copy_(initial[1])
-                y = module.mega_recurrent_kda(*actual[:15], A_log=actual[15], dt_bias=actual[16],
-                    scale=scale, lower_bound=lower, rms_norm_eps=1e-5)
-                torch.npu.synchronize()
-                _assert_precision_results(module, actual, expected, y, initial)
-    finally:
-        torch.npu.synchronize()
-        torch.npu.reset_stream_limit(stream)
-    return arguments, initial, expected
+def _reference_run(*args, **kwargs):
+    with torch.device("cpu"):
+        return _reference_run_impl(*args, **kwargs)
 
 
-# Bound every device test by both physical cores and the current stream quota.
-_PRECISION_CASES = [
-    pytest.param(16, 8, 28, 6),
-    pytest.param(16, 8, "max", 6),
-    pytest.param(32, 8, "max", 6),
-    pytest.param(16, 8, "auto", 6),
-    pytest.param(32, 8, "auto", 6),
-    *[pytest.param(batch, 8, 16, 6) for batch in (16, 32, 512)],
-    *[pytest.param(batch, 8, "available", 6, marks=pytest.mark.slow) for batch in (16, 32, 48, 64, 256, 512)],
-    pytest.param(36, 8, "available", 24, id="TP4-NB-tail"),
-    pytest.param(72, 8, "available", 12, id="TP8-NB-tail"),
-    pytest.param(200, 8, "available", 12, id="TP8-Conv-state-regression"),
-    pytest.param(4, 8, "available", 24, id="TP4-NB-short"),
-    pytest.param(8, 8, "available", 12, id="TP8-NB-short"),
-    pytest.param(4, 8, 8, 24, id="TP4-short"),
-    pytest.param(12, 8, 24, 24, id="TP4-tail"),
-    pytest.param(8, 8, 16, 12, id="TP8-short"),
-    pytest.param(24, 8, "max", 12, id="TP8-tail"),
-    pytest.param(32, 8, "max", 24, id="TP4-aligned-main"),
-    pytest.param(64, 8, "max", 12, id="TP8-aligned-main"), ]
+def _commit_reference(*args, **kwargs):
+    with torch.device("cpu"):
+        return _commit_reference_impl(*args, **kwargs)
 
 
+# Both pytest and TTK execute only cases present in the canonical design CSV.
+import os
+
+_case_home = Path(__file__).resolve().parents[1] / "mega_recurrent_kda"
+sys.path.insert(0, str(_case_home))
+import kda_ttk_ops as adapter
+from assets import inputs as designed_cases
 
 
-@pytest.mark.npu
-@pytest.mark.parametrize("batch_size,seq_len,cores,num_heads", _PRECISION_CASES)
-def test_precision(batch_size, seq_len, cores, num_heads):
-    pytest.importorskip("torch_npu")
-    if not hasattr(torch, "npu") or not torch.npu.is_available():
-        pytest.skip("requires Ascend NPU")
-    module = load_sample(SAMPLE)
-    grids = _available_core_counts(module)
-    if not grids:
-        pytest.skip("Mega KDA requires at least 8 AIC and 16 AIV cores")
-    if cores == "available":
-        controls = grids
-    elif cores == "max":
-        controls = (grids[-1],)
-    else:
-        controls = (None,) if cores == "auto" else (cores,)
-    precision_case = None
-    for block_num in controls:
-        precision_case = _check_precision(batch_size, seq_len, block_num, num_heads, precision_case)
-    assert len(module._COMPILED_FNS) == 1
+@pytest.fixture(autouse=True)
+def external_evidence(tmp_path_factory, monkeypatch):
+    if not os.environ.get("MKDA_RUN_DIR"):
+        monkeypatch.setenv(
+            "MKDA_RUN_DIR", str(tmp_path_factory.getbasetemp() / "mega_kda_evidence")
+        )
+
+
+_selected = [c for c in designed_cases.select("pytest_smoke") if c["mode"] != "Commit"]
+if os.environ.get("MEGA_KDA_SUITE"):
+    wanted = {c["case_id"] for c in designed_cases.select(os.environ["MEGA_KDA_SUITE"])}
+    _selected = [c for c in _selected if c["case_id"] in wanted]
+_parameters = [
+    pytest.param(
+        c["case_id"],
+        id=c["case_id"],
+        marks=[
+            pytest.mark.npu,
+            pytest.mark.interception
+            if c["expected"] == "REJECT_ATOMIC"
+            else pytest.mark.functional,
+            *([pytest.mark.companion] if "companion" in c["coverage"] else []),
+        ],
+    )
+    for c in _selected
+]
+
+
+@pytest.mark.parametrize("case_id", _parameters)
+def test_designed_case(case_id):
+    torch.set_num_threads(4)
+    adapter.run_pytest_case(
+        case_id, reference_verify=_baseline_fp32, reference_commit=_commit_reference
+    )

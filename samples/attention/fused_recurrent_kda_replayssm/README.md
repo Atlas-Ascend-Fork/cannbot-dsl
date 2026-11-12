@@ -41,7 +41,7 @@ $$
 
 ### Verify 与 Commit
 
-Verify 不修改 `recurrent_state`，也不接收 accepted 参数。接受候选后，调用独立的 [`commit_recurrent_kda_replayssm`](../commit_recurrent_kda_replayssm/README.md)，从同一个 checkpoint 按顺序提交接受前缀。对每个 batch 的前 $a_b$ 个 token，Commit 使用保存的记录执行
+Verify 不修改 `recurrent_state`，也不接收 accepted 参数。接受候选后，将记录转置为 `[B,N,S,D]`，再按 `state_indices[b]` 放到形状为 `[block_num,N,S,D]` 的三个 PA 记录池中。U 转为 FP32，K 保留 FP16，decay 保留 FP32。随后调用独立的 [`commit_recurrent_kda`](../commit_recurrent_kda/README.md)，从同一个 checkpoint 按顺序提交接受前缀。对每个 batch 的前 $a_b$ 个 token，Commit 使用保存的记录执行
 
 $$
 S\leftarrow S\operatorname{diag}(\operatorname{replay\_decay}_t)
@@ -53,21 +53,21 @@ $a_b=0$ 时 checkpoint 保持不变。复用记录缓冲区前，须先完成上
 
 ## 快速开始
 
-在仓库根目录将 `samples/attention` 加入 `PYTHONPATH` 后运行以下示例。三个 replay record 张量必须由调用方预先分配，并通过关键字传入；`out` 由算子内部新建。
+在仓库根目录将 `samples` 加入 `PYTHONPATH` 后运行以下示例。三个 replay record 张量必须由调用方预先分配，并通过关键字传入；`out` 由算子内部新建。
 
 ```bash
-export PYTHONPATH="$PWD/samples/attention${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH="$PWD/samples${PYTHONPATH:+:$PYTHONPATH}"
 ```
 
 ```python
 import torch
 import torch_npu
 
-from fused_recurrent_kda_replayssm.fused_recurrent_kda_replayssm import (
+from attention.fused_recurrent_kda_replayssm.fused_recurrent_kda_replayssm import (
     fused_recurrent_kda_replayssm,
 )
-from commit_recurrent_kda_replayssm.commit_recurrent_kda_replayssm import (
-    commit_recurrent_kda_replayssm,
+from attention.commit_recurrent_kda.commit_recurrent_kda import (
+    commit_recurrent_kda,
 )
 
 B, S, N, D = 2, 8, 6, 128
@@ -91,8 +91,12 @@ out = fused_recurrent_kda_replayssm(
 )
 # Verify 后 checkpoint 不变；out 的 shape 为 [B, S, N, D]。
 accepted_tokens = torch.tensor([4, 0], device="npu", dtype=torch.int32)
-commit_recurrent_kda_replayssm(
-    checkpoint, replay_u, replay_k, replay_decay, accepted_tokens,
+# 本例 block_num=B，且逻辑 batch 和物理块一一对应。
+state_indices = torch.arange(B, device="npu", dtype=torch.int32)
+commit_recurrent_kda(
+    checkpoint, replay_u.transpose(1, 2).contiguous().float(),
+    replay_k.transpose(1, 2).contiguous(), replay_decay.transpose(1, 2).contiguous(),
+    accepted_tokens, state_indices,
 )
 # Commit 原地更新 checkpoint：第一个 batch 提交 4 个 token，第二个保持不变。
 ```

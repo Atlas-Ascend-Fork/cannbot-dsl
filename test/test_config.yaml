@@ -101,20 +101,13 @@ mega_recurrent_kda:
     - test/attention/mega_recurrent_kda
   options:
     - attention/mega_recurrent_kda
-mega_recurrent_kda_replayssm:
-  module: false
-  src:
-    - samples/attention/mega_recurrent_kda_replayssm
-    - test/attention/mega_recurrent_kda_replayssm
-  options:
-    - attention/mega_recurrent_kda_replayssm
-commit_recurrent_kda_replayssm:
+commit_recurrent_kda:
   module: true
   src:
-    - samples/attention/commit_recurrent_kda_replayssm
-    - test/attention/commit_recurrent_kda_replayssm
+    - samples/attention/commit_recurrent_kda
+    - test/attention/commit_recurrent_kda
   options:
-    - attention/commit_recurrent_kda_replayssm
+    - attention/commit_recurrent_kda
 quant_mla_prolog:
   module: true
   src:
@@ -398,8 +391,7 @@ k3_network:
     - attention/fused_recurrent_kda_snapshot
     - attention/fused_recurrent_kda_replayssm
     - attention/mega_recurrent_kda
-    - attention/mega_recurrent_kda_replayssm
-    - attention/commit_recurrent_kda_replayssm
+    - attention/commit_recurrent_kda
     - attention/quant_mla_prolog
 mega_mla:
   module: true
