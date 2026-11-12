@@ -108,11 +108,11 @@ CANNBot-DSL 的全部程序结构由六个装饰器声明。
 
 前四个在包顶层，后两个**不在**——它们分别属于 `cannbotdsl.aicpu` 和 `cannbotdsl.aot` 子模块，写 `cbd.aicpu_kernel` 会 `AttributeError`。
 
-完整说明见 [API 文档 · 装饰器](../api/language/decorators.md)。下面只讲它们之间的关系。
+接口说明见[@host](../api/language/host.md)、[@kernel](../api/language/kernel.md)、[@jit](../api/language/jit.md)、[datastruct](../api/data-structures/datastruct.md)、[@aicpu_kernel](../api/aicpu/programming/aicpu-kernel.md)和[@export](../api/compilation/aot/publication.md)。下面只讲它们之间的关系。
 
 ### `@host`：唯一的外部入口
 
-按[装饰器](../api/language/decorators.md)的约定，普通 Python 代码应当只直接调用 `@host` 函数。它负责：根据运行时参数做 Host 侧 tiling、挑选 Kernel 实现、启动 Kernel。
+按[@host](../api/language/host.md)的约定，普通 Python 代码应当只直接调用 `@host` 函数。它负责：根据运行时参数做 Host 侧 tiling、挑选 Kernel 实现、启动 Kernel。
 
 部分 API 示例页仍用 `@jit` 包一层 `run()` 再启动 Kernel。那是示例写法，不是推荐入口：`@jit` 不能从普通 Python 调用，也不能作为 `cbd.compile(...)` 的编译入口；Kernel 也不能由 `@jit` 间接启动。
 

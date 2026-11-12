@@ -6,7 +6,7 @@
 
 ## 功能说明
 
-描述 L0C 结果搬出时的类型转换、缩放和可选激活，交给 `mem_copy(dst, src.convert(...))` 执行。`convert` 本身不搬运、不分配结果存储；同一 L0C 可分别构造不同表达式写到多个输出，但不是一次调用同时写两个目标。
+在L0C结果搬出时执行类型转换、缩放和可选激活，用法为`mem_copy(dst, src.convert(...))`。需要多个输出时，分别配置转换参数并调用`mem_copy`。
 
 支持 `offset`、`negative_scale`、`relu_limit`。`negative_scale` 按原累加值是否为负选择独立系数，并非先乘 scale 再乘一个负半轴斜率；`relu_limit` 则先对原累加值做 ReLU，转换后再上限截断。与 `src.relu()` 不同，它还包含输出阈值。
 
@@ -23,13 +23,13 @@ $$y=\operatorname{sat}_{\mathrm{dtype}}\!\left(\operatorname{clip}_{[-256,255]}(
 ## 函数原型
 
 ```python
-Tensor.convert(
-    dtype: DType, *,
+convert(
+    self, dtype: DType, *,
     scale: float | Tensor | None = None,
     offset: int = 0,
     negative_scale: float | Tensor | None = None,
     relu_limit: float | StorageBits | None = None,
-    round_mode: str | None = None,
+    rounding_mode: str | None = None,
 ) -> Tensor
 ```
 
@@ -39,14 +39,13 @@ Tensor.convert(
 
 | 参数 | 输入/输出 | 说明 |
 | --- | --- | --- |
-| self | 输入 | L0C 累加结果 Tensor，常用 float32 或 int32。表达式在后续 mem_copy 执行时读取源值及参数表，而非构造表达式时保存数据快照。 |
-| dtype | 输入 | 目的元素类型，必须与 mem_copy 目标一致。offset 限定为 int8/uint8；relu_limit 支持 float16、bfloat16、int8、uint8、float8_e4m3fn、hifloat8，不支持 float32。具体类型组合还须满足累加类型和搬运目标的转换能力。 |
+| self | 输入 | L0C累加结果Tensor，常用float32或int32。源数据及参数表在对应的`mem_copy`执行时读取。 |
+| dtype | 输入 | 目的元素类型，必须与 mem_copy 目标一致。offset支持int4x2、int8和uint8；relu_limit支持float16、bfloat16、int4x2、int8、uint8、float8_e4m3fn、hifloat8，不支持 float32。具体类型组合还须满足累加类型和搬运目标的转换能力。 |
 | scale | 输入 | 标量缩放系数，或逐输出通道的编码量化表；表格式见[量化参数表格式](#量化参数表格式)。不启用量化控制时省略表示普通类型转换；使用激活或偏移控制而省略 scale 时默认系数为 1.0。 |
-| offset | 输入 | 标量 INT8/UINT8 输出偏移，范围 -256～255，默认 0。与量化表一起使用时不得另传非零或动态偏移，表内已含偏移。 |
+| offset | 输入 | 标量量化输出偏移，默认0。int4x2输出取值范围为[-16, 15]，int8/uint8输出取值范围为[-256, 255]。与量化表一起使用时不得另传非零或动态偏移，表内已含偏移。 |
 | negative_scale | 输入 | 对原始值小于 0 的 L0C 结果使用的独立缩放系数；可传入标量，对所有负值使用同一系数，也可传入逐输出通道参数表，分别缩放各通道的负值。该能力不限定卷积场景。<br>默认 `None`，不单独处理负值。支持数值或位于 L1/FBUF_ACT 的 `Tensor`；参数表须为连续 `float32[N]`，每项对应一个输出通道，N 须覆盖输出列数且为 1～512。L1 表自动暂存时长度须为 64B 的整数倍、源起点按 32B 对齐；FBUF_ACT 表起点须按 64B 对齐。表可从 GM 经 L1 准备，或用 `mem_copy` 显式搬入 FBUF_ACT 后复用；其分配及手动访问方式见 [FBUF_ACT.view](../storage/fbuf-act-view.md)。 |
-| relu_limit | 输入 | 输出上限，必须在目的类型中为正且有限；整数输出阈值必须为整数且不超过类型最大值。FP8/HIF8 必须用 [storage_bits](storage-bits.md) 提供有效单元素编码；FP16/BF16/INT8/UINT8 也可使用编码。 |
-
-| round_mode | 输入 | 默认 None，保持默认舍入；`"hybrid"` 用于带 scale 的 float32→hifloat8 GM 输出。 |
+| relu_limit | 输入 | 输出上限，必须在目的类型中为正且有限；整数输出阈值必须为整数且不超过类型最大值。FP8/HIF8 必须用 [storage_bits](storage-bits.md) 提供有效单元素编码；FP16/BF16/INT4/INT8/UINT8也可使用编码。 |
+| rounding_mode | 输入 | 默认`None`，使用转换的默认舍入方式。支持`"half_away"`和`"hybrid"`，用于L0C的float32转换为hifloat8。 |
 
 ### 量化参数表格式
 
@@ -64,12 +63,12 @@ Tensor.convert(
 
 ## 返回值说明
 
-返回转换结果的 Tensor 表达式；由 `mem_copy` 消费后才产生目标数据。未被搬运消费的表达式不执行转换。
+返回供`mem_copy`用作搬运源的Tensor，转换在对应的搬运过程中执行。
 
 ## 约束说明
 
-- `negative_scale` 与 `relu_limit` 互斥，不能在同一表达式中同时启用。
-- 保持 L0C、量化表、负分支表有效，直到消费表达式的搬运完成；重复输出可以共享 L0C，但各输出必须绑定各自参数。
+- `negative_scale`与`relu_limit`不能在同一次`convert`调用中同时启用。
+- L0C源数据、量化表及负值缩放系数表须保持有效，直到对应的`mem_copy`完成。多个输出可以使用同一L0C源，但须分别传入各自的转换参数。
 - 不把本接口用于任意 GM/UB 上的逐元素转换；本页描述的是 L0C 结果搬出路径。
 
 ## 调用示例

@@ -180,9 +180,9 @@ Kernel 的形参名；读写参数也可以通过 `inouts` 元组列出多个名
 ## 约束说明
 
 - `profile` 必须是 `ProfileSpec` 对象或 `None`；传入字典、字符串等其他类型会报错。
-- `name` 和 `op_type` 的合法回退值是 `None`；空字符串、含 NUL 的字符串及非字符串值
+- `name` 和 `op_type` 的默认值是 `None`；空字符串、含 NUL 的字符串及非字符串值
   会抛出 `ValueError`。
-- Tensor 角色配置必须使用参数名元组，各名称必须存在于 Kernel 签名中，并对应可上报的
+- Tensor 角色配置必须使用参数名元组，各名称必须与Kernel函数定义中的参数名一致，并对应可上报的
   Tensor 参数。同一名称不能在角色组内或跨角色组重复；读写同一 Tensor 时使用 `inouts`。
   需要上报矩阵或张量的 shape 等属性时，对应输入和输出应使用 `cb.Tensor`，详见
   [矩阵和张量参数的类型要求](#矩阵和张量参数的类型要求)。
@@ -191,45 +191,24 @@ Kernel 的形参名；读写参数也可以通过 `inouts` 元组列出多个名
 - 名称在编译时写入产物。修改配置后需要重新编译算子；保存、加载已有产物会沿用其中的
   名称，不会根据后续修改的 Python 声明自动改名。
 
-### Profiling 名称与执行符号
+### 性能分析中显示的名称
 
-Profiling 名称用于任务展示和逻辑分类，实际执行仍由编译产物中的 Kernel 符号确定。
+`name`指定性能分析工具中显示的任务名称，`op_type`指定任务的逻辑类型。
 
-| 项目 | 生成规则 | 示例 |
+| 项目 | 取值规则 | 示例 |
 | --- | --- | --- |
-| profiling 名称 | 自定义 `name`，或入口函数名 | `copy`、`CopyKernel___call__` |
-| profiling 类型 | 自定义 `op_type`，或入口函数名 | `Copy`、`CopyKernel___call__` |
-| Kernel 调用符号 | `"kernel_" + 入口函数名 + "_" + 编号` | `kernel_CopyKernel___call___0` |
+| 任务名称 | 自定义`name`，或入口函数名 | `copy`、`CopyKernel___call__` |
+| 逻辑类型 | 自定义`op_type`，或入口函数名 | `Copy`、`CopyKernel___call__` |
 
-`ProfileSpec(name="copy")` 设置的是性能采集时显示的名称，不会修改生成的 AscendC 函数名。
-
-例如，框架为 `CopyKernel.__call__` 生成的设备入口函数名为
-`kernel_CopyKernel___call___0`，那么生成的 Host 代码仍通过这个函数名启动 Kernel：
-
-```cpp
-// 示意：启动参数和函数参数按实际生成代码填写
-kernel_CopyKernel___call___0<<<block_dim, ..., stream>>>(...);
-```
-
-性能采集时，这次执行可以显示为 `copy`；执行时，Host 代码调用的仍是上述设备入口函数。
-修改 `ProfileSpec.name` 不会改变执行哪个 Kernel。
-
-函数名末尾的 `_0` 是框架在生成代码时分配的编号，用于区分当前 Host 编译中登记的
-不同 Kernel 实现。编号从 `0` 开始，新增实现时分配下一个编号，复用已有实现时保留
-原编号。不同入口即使代码相似，也可能因函数身份不同生成不同实现。
-编号在编译阶段确定，运行时反复调用同一个 Kernel，编号不会变化。
-
-每次独立的 Host 编译都从 `0` 开始编号；如果直接使用缓存产物，就沿用产物中已经生成的
-函数名。编号与设备卡数、调用次数无关。
+例如，`ProfileSpec(name="copy")`使任务在性能分析工具中显示为`copy`。这项配置不改变核函数的计算内容或启动方式。
 
 ### 在性能工具中查看
 
-使用当前框架上报路径重新编译、采集后，msprof summary 的 `Op Name` 和 `OP Type`
+编译算子并采集性能数据后，msprof summary中的`Op Name`和`OP Type`
 分别展示解析后的 `name` 和 `op_type`。MindStudio 中应查看对应的算子名称和类型字段；
 Kernel 符号字段用于查看实际执行入口，可以继续保留带参数类型编码的 C++ 符号。
 
-这套配置不会自动启动 msprof。旧框架或旧预编译算子可能仍以设备符号展示，需要使用
-当前框架重新编译并重新采集；已经生成的历史性能数据不会因此改变。
+配置`ProfileSpec`后仍需运行msprof进行性能采集。修改配置时，需要重新编译算子并采集数据；已有的性能记录不会自动更新。
 
 ## 调用示例
 
@@ -318,4 +297,4 @@ msprof --application="python profiling_names.py" \
 | `CopyKernel.run` | `CopyKernel_run` | `CopyKernel_run` |
 | `NamedCopyKernel.__call__` | `copy` | `Copy` |
 
-相关接口：[装饰器](./decorators.md#kernel)、[Kernel 启动配置](./launch.md)。
+相关接口：[@kernel](../language/kernel.md)、[Kernel 启动配置](../language/launch.md)。

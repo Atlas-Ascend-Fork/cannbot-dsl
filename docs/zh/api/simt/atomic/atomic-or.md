@@ -17,7 +17,7 @@ simt.atomic_or(
 ) -> ScalarValue
 ```
 
-其中，`ScalarValue`从`cannbotdsl.types`导入。支持的数据类型及匹配要求见参数说明。
+`ScalarValue`表示[标量值](../../data-structures/data-types.md#标量值)，即单个数值。支持的数据类型及匹配要求见参数说明。
 
 ## 参数说明
 

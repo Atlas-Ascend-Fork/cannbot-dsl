@@ -21,24 +21,16 @@ else:
 
 ## 条件说明
 
-| 条件形式 | 判断方式 |
-| --- | --- |
-| 编译期Python值 | 按Python真值规则判断，在生成设备代码时确定条件。 |
-| `const_expr(...)`、`target_version(...)` | 作为显式编译期条件处理。 |
-| 运行时布尔值 | 直接作为运行时条件。 |
-| 运行时整数 | 非`0`为真，`0`为假。 |
-| 运行时浮点数 | `+0.0`和`-0.0`为假，其他值（包括`NaN`）为真。 |
+条件支持单个布尔值、整数、浮点数或比较结果。例如，`x`为一维Tensor时，可以用`if x[0] > 0:`根据第一个元素的值选择分支。
 
 ## 约束说明
 
-- 运行时分支内不支持`return`、`raise`；`break`、`continue`仅可用于其中嵌套的编译期循环。
-- 运行时分支内不支持嵌套函数、嵌套类、`lambda`、推导式、`try`/`except`/`finally`、`yield`、`yield from`、`await`、`async for`、`async with`、`del`和`match`；可以使用`assert`和`pass`。
-- 运行时分支内可以声明`global`或`nonlocal`，但不能给相应变量赋值。
-- 普通`if`即使在编译时恰好得到Python布尔值，仍按运行时分支规则检查。需要明确
-  使用编译期分支时，完整条件必须是`const_expr(...)`或`target_version(...)`。
-- 运行时条件的各分支都会参与追踪和编译，不能依赖未命中分支跳过编译检查。
-  如果条件是Python静态值，前端按Python语义只追踪命中的分支；需要显式表达
-  编译期条件时可使用`const_expr(...)`或`target_version(...)`。
+变量初始化、类型、作用域及提前退出的错误示例见[控制流约束](./control-flow.md#约束)。
+
+- 普通`if`、`elif`、`else`分支中不支持`return`、`raise`；`break`、`continue`仅可用于其中嵌套的编译期循环。
+- 普通分支中不支持嵌套函数、嵌套类、`lambda`、推导式、`try`/`except`/`finally`、`yield`、`yield from`、`await`、`async for`、`async with`、`del`和`match`；可以使用`assert`和`pass`。
+
+`True`虽然是编译时已知的常量，`if True:`仍受上述语法限制，不能在分支中使用`return`。需要在编译期分支中提前返回时，使用`if cbd.const_expr(True):`，其中`cbd`为`cannbotdsl`的导入别名。用法见[const_expr](./compile-time-control/const-expr.md)。
 
 ## 调用示例
 

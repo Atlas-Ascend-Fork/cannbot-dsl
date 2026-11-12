@@ -2,11 +2,7 @@
 
 ## 产品支持情况
 
-| 执行位置 | 支持情况 |
-| --- | --- |
-| Kernel、SIMD VF、SIMT | 适用于Ascend 950PR&950DT系列的dav-3510；其他产品未声明支持。 |
-| 编译后的Host | 使用CPU运行库；HostLongDouble要求16字节原生ABI。 |
-| 普通Python | 使用Python内置print，不依赖NPU执行。 |
+- Ascend 950PR&950DT系列产品：支持
 
 ## 功能说明
 
@@ -21,7 +17,7 @@
 | SIMT VF或纯SIMT内格式化打印 | 每个执行到该位置的线程独立打印，不保证线程间显示顺序。 |
 | Kernel内首参为Tensor或DSL标量 | 使用原有采集模式，保留结构化记录；不属于CANN printf输出。 |
 
-构图、编译及AOT加载本身不会执行Host/Kernel格式化打印。Host使用C标准输出并刷新；Kernel由CANN异步处理，二者没有全局显示顺序保证。格式化print不会自动同步设备；原有采集模式则会执行Host回读和同步。
+编译及加载AOT产物本身不会执行Host/Kernel格式化打印。Host使用C标准输出并刷新；Kernel由CANN异步处理，二者没有全局显示顺序保证。格式化print不会自动同步设备；原有采集模式则会执行Host回读和同步。
 
 ## 函数原型
 
@@ -83,7 +79,7 @@ print(value, *, label=None, mode="ring") -> None
 
 当前不支持 FP4 可读数值输出。
 
-Python整数或浮点字面量作为`%f/%F`参数时，Kernel按FP32构图，可能发生舍入；动态整数值不会因此自动转为浮点，需先显式转换。整数格式按格式要求归一化为32/64位；有符号小整数用于十六进制时会先扩展，例如int8的−1使用`%x`显示为`ffffffff`。
+Python整数或浮点字面量作为`%f/%F`参数时，Kernel按FP32处理，可能发生舍入；动态整数值不会因此自动转为浮点，需先显式转换。整数按格式要求转换为32位或64位；有符号小整数用于十六进制时会先扩展，例如int8的−1使用`%x`显示为`ffffffff`。
 
 Kernel不接受bool、FP64、FP8、Tensor本体、RawVReg或任意Python对象作为格式化标量。不支持宽度、精度、flags、`hh/h/j/z/t`整数长度、`%lf`、`%c/%o/%e/%E/%g/%G/%a/%A`。需要打印Tensor或寄存器时使用[dump_tensor](./dump_tensor.md)或[dump_reg](./dump_reg.md)，打印单个元素时先取得支持的标量值。
 
@@ -124,7 +120,7 @@ Host运行时参数类型从`cannbotdsl`导出：
 | 类型 | 数据和生命周期要求 |
 | --- | --- |
 | `HostString` | 接受str、bytes或ctypes字符指针/数组；str按UTF-8编码。自有或引用的存储须在调用期间有效，外部指针须非空且零结尾。运行时内嵌NUL按C字符串规则终止。 |
-| `HostPointer` | 接受ctypes指针/数组、HostString或空指针，保留引用对象生命周期；不接受普通整数替代指针。 |
+| `HostPointer` | 接受ctypes指针/数组、HostString或空指针，持有原始对象的引用，避免其在使用期间被回收；不接受普通整数替代指针。 |
 | `HostLongDouble` | 接受十进制文本、Decimal、数值或ctypes.c_longdouble，以16字节原生ABI传递。有效精度取决于CPU ABI；Python float不能恢复其原先已损失的精度。 |
 
 编译时传入对应参数类型，执行时传入实例，复用Host参数ABI；这些类型不增加设备dtype或设备算术能力。
@@ -143,27 +139,27 @@ Host和Kernel格式化输出不进入`get_debug_prints()`。只有旧采集模�
 
 ## 约束说明
 
-### 显式使用DSL print与构图期警告
+### 使用print时的编译警告
 
-经过前端转换的`@host`、`@kernel`及继承其执行域的`@jit`中，若实际调用的是Python内置print，构图时发出`UserWarning`，定位到原始Python源文件和行号，并提示改用DSL接口：
+在`@host`、`@kernel`及其调用的`@jit`函数中，误用Python自带的`print`时，编译会发出`UserWarning`，指出源文件和行号，并提示改用CANNBot-DSL提供的`print`：
 
 > Python built-in print() in DSL code only executes during tracing; it will not print when the compiled Host/Kernel runs. Use 'from cannbotdsl import print' or 'cannbotdsl.print' for runtime output.
 
-- 检查按被调用的函数对象识别，不是只检查是否写了import语句。未导入DSL print而调用内置print、通过别名调用内置print或显式调用`builtins.print`，都会触发提示；仅仅没有导入但未发生该调用，不触发提示。
-- 默认行为是警告，不是强制报错。发出警告后仍执行原来的Python调用：常量立即显示，动态DSL值通常显示为对象或IR表示，`%d`等占位符不会按C printf规则自动替换。
-- 该调用不生成Host或Kernel运行时打印指令，执行编译产物或AOT产物时不会重复输出这些内容。缓存命中且未重新构图时，也不会重新检查或发出此警告；已编译产物不会追溯产生构图期提示。
+- 直接调用Python自带的`print`、通过别名调用它，或显式调用`builtins.print`，都会触发提示。只有实际调用时才检查，未使用的导入不产生提示。
+- 默认行为是警告，不是强制报错。发出警告后仍执行原来的Python调用：常量立即显示，执行时才确定的值通常显示为对象信息，`%d`等占位符不会按C printf规则自动替换。
+- Python自带的`print`只在编译阶段执行，运行编译结果或AOT产物时不会再次输出。复用已有编译结果时，不会重复发出这一编译警告。
 - 遵循Python标准warnings过滤策略。默认策略下，同一模块内同一源码位置提示一次；配置为ignore时不显示，配置为always时可重复显示，配置为error时会在原Python打印调用前抛出`UserWarning`异常并中断该调用。
-- 普通Python代码中的print、正确使用DSL print，以及名称为print但并非内置print的自定义函数，不因本检查产生警告。普通Python辅助函数内部未经前端转换的调用不在该检查范围内。
+- 普通Python代码中的print、正确使用DSL print，以及名称为print但并非内置print的自定义函数，不因本检查产生警告。未使用DSL装饰器的Python辅助函数中的调用不在此检查范围内。
 
 ### 程序入口要求
 
-使用Host打印的程序，其运行时参数至少须包含一个符合约定的Tensor、TensorList或StructRef参数。仅有普通标量参数的入口在构造程序时会报`TypeError: staged provider calls require at least one canonical ... leaf`，尚未执行到print。只在Host中打印可以不发起Kernel，但不取消入口参数要求，详见[Host编译支持](../compilation/host/index.md)。
+使用Host打印的程序，入口参数中至少需要一个Tensor、TensorList或StructRef参数。入口仅有整数、浮点数等标量参数时，会在编译阶段报`TypeError: staged provider calls require at least one canonical ... leaf`，尚未执行到print。只在Host中打印可以不发起Kernel，但不取消入口参数要求，参数规格见[TensorSpec](../compilation/host/specs/tensor_spec.md)、[TensorListSpec](../compilation/host/specs/tensor_list_spec.md)和[StructSpec](../compilation/host/specs/struct_spec.md)。
 
 ### 格式、地址和不支持范围
 
 - Host/Kernel的格式必须为编译期字符串；不支持运行时格式指针、`%n`写回计数、按编号取参的位置格式或宽字符`%lc/%ls`。
-- f-string、`.format()`或Python字符串插值不会自动变为DSL运行时格式化；涉及动态DSL值时可能在构图时失败，或把对象/IR表示固化为输出文本。例如`print(f"value={x}")`可能一直显示Integer对象信息。需要打印每次运行的值时，应使用格式字符串和独立参数。该情况不会触发内置print警告，因为调用目标仍是DSL print。
-- 普通Kernel和SIMT的运行时字符串须在GM，SIMD VF须在UB；运行时字符串不会被隐式搬运。调用者保证指针地址、生命周期和零终止符有效。
+- 打印Tensor元素等运行时值时，使用固定格式字符串和独立参数。例如，`value=x[0]`为`int32`时，使用`print("value=%d", value)`；不要使用`print(f"value={value}")`或`.format()`，这些写法不用于格式化Tensor元素等运行时值。
+- 普通Kernel和SIMT的运行时字符串须在GM，SIMD VF须在UB；运行时字符串不会被隐式搬运。使用指针的任务执行结束前，指向的内存必须始终有效；字符串须以零字符（`\0`）结尾。
 - `%p`只显示指针，不能据此认为当前上下文可以读取该内存。`Tensor.ptr()`当前只支持GM/UB Tensor；对L1、L0C等直接调用该取址方法会在到达print之前报错。GM/UB Tensor的元素须先加载为标量，其他存储位置的数据须先通过合法路径取出。
 - 纯AIC/AIV在对应核执行；MIX中的公共标量语句可能由两侧执行，依赖UB的打印只在AIV执行。SIMT每个线程独立输出，可用线程条件控制数量。
 
@@ -171,7 +167,7 @@ Host和Kernel格式化输出不进入`get_debug_prints()`。只有旧采集模�
 
 - 不存在一个同时适用于Host、普通Kernel、SIMD VF和SIMT的统一“最多字符数”。Kernel的格式、参数及字符串内容都会占用CANN记录空间。
 - SIMD VF与dump及原生断言共享2 KiB UB调测区。printf每条另占32字节管理信息，整条按8字节对齐，必须能完整放入记录区；不能将2 KiB直接当作可打印字符数。
-- 新`readLen/finish`协议可在同一次VF中排空并复用空间，累计记录可以超过2 KiB；旧`pidx`协议保留批次限制。该能力不取消单条大小及GM日志容量限制。
+- 当所用CANN版本支持排空并复用调试缓冲区时，可在同一次VF中重复利用缓冲空间，累计记录可以超过2 KiB；不支持该能力时，仍受单批次容量限制。该能力不取消单条大小及GM日志容量限制。
 - 含SIMD VF格式化print时总计预留10 KiB UB，其中2 KiB是格式及常量字符串临时区；用户手工存储也须避开保留区域。容量按UTF-8字节数计算，包含零终止符和自动追加的end。格式与常量字符串合计超出2 KiB时，翻译阶段拒绝，stderr提示`SIMD printf constant strings exceed the 2 KiB scratch budget`；Python侧可能只显示通用的`Translation to AscendC failed`。
 - 常量区放得下不代表单条记录一定放得下。若运行时整条printf记录超过VF调测记录区容量，会置缓冲错误标志并跳过该记录；本次VF后续的print及dump也会被跳过，通常不抛Python异常。下一次重新初始化的VF调用可恢复输出。运行时`%s`内容同样计入记录大小，不能只检查格式字符串长度。
 - CANN公开文档的SIMD默认打印缓冲限制为30 KB，SIMT默认缓冲为2 MB；相应配置字段为`simd_printf_fifo_size_per_core`和`simt_printf_fifo_size`。可配置范围、启动方式及SDK限制以实际环境为准，PyTorch调用及算子入图场景不能假定可调整SIMD缓冲。

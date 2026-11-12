@@ -12,7 +12,7 @@
 | --- | --- |
 | Python 语法 | `if` / `elif` / `else`、条件表达式、`and` / `or` / `not`、链式比较、`for`、`while`、`for ... else`、`while ... else` |
 | Python 内建函数 | `min()`、`max()`、`any()`、`all()`、`builtins.range()` |
-| CANNBotDSL API | `cannbotdsl.range()`、`range_constexpr()`、`const_expr()`、`target_version()` |
+| CANNBotDSL API | `cannbotdsl.range()`、`range_constexpr()`、`const_expr()` |
 
 ## 核心对照表
 
@@ -21,10 +21,8 @@
 | 控制流写法 | 设备执行时处理 | 生成设备代码时处理 |
 | --- | :---: | :---: |
 | `if const_expr(...)` | ✗ | ✓ |
-| `if target_version(...)` | ✗ | ✓ |
 | `if` 使用运行时条件 | ✓ | ✗ |
 | `while const_expr(...)` | ✗ | ✓ |
-| `while target_version(...)` | ✗ | ✓ |
 | `while` 使用运行时条件 | ✓ | ✗ |
 | `for i in range_constexpr(...)` | ✗ | ✓ |
 | `for i in 固定 tuple/list` | ✗ | ✓ |
@@ -95,25 +93,6 @@ if dynamic_var == 10:
     ...
 ```
 :::
-
-### 编译期分支：`target_version()`
-
-`target_version()` 专门用于标记**调用方已经算好的目标版本判断结果**。它本身不读取或比较硬件版本：
-
-```python
-TARGET_ARCH = cbd.get_platform_info().npu_arch
-IS_DAV_3510 = TARGET_ARCH == "dav-3510"
-
-
-@cbd.kernel
-def k(out: cbd.Tensor):
-    if cbd.target_version(IS_DAV_3510):
-        ...
-    else:
-        ...
-```
-
-两个接口的 `value` 都必须在编译期确定，并且只能在 `@jit` / `@kernel` 修饰的上下文中作为控制流条件使用。
 
 ### 条件表达式与 `min` / `max`
 

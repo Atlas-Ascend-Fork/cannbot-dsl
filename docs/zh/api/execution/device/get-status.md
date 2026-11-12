@@ -28,8 +28,8 @@ get_status() -> Int64
 | 7 | 浮点数转换为无符号整数时，输入值为负数。 |
 | 8 | 从L0C搬运到UB时发生溢出，例如 `float32` 转 `float16`、`int32` 转 `float16`。 |
 | 9 | 从L0C搬运到UB时，转换结果的绝对值过小，发生下溢，例如 `float32` 转 `float16`。 |
-| 10 | 矩阵（Cube）累加运算溢出（可能是 `float32`、`float16`、`int32`）。 |
-| 11 | 矩阵（Cube）累加运算下溢（可能是 `float32`、`float16`）。 |
+| 10 | 矩阵（Cube）的`float32`、`float16`或`int32`累加运算溢出。 |
+| 11 | 矩阵（Cube）的`float32`或`float16`累加运算下溢。 |
 | 13 | 标量指令输入为NaN/INF。 |
 | 14 | 向量指令输入为NaN/INF。 |
 | 15 | 矩阵（Cube）指令输入为NaN/INF。 |

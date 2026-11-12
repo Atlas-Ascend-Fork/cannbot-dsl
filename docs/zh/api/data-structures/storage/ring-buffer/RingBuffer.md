@@ -26,9 +26,9 @@ RingBuffer(
 
 | 参数名 | 输入/输出 | 说明 |
 | --- | --- | --- |
-| `mem_loc` | 输入 | 槽位所在的存储层级。必填，可选值：`MemLoc.UB`、`MemLoc.L1`、`MemLoc.L0A`、`MemLoc.L0B`、`MemLoc.L0C`、`MemLoc.BIAS`。具体说明见[存储位置枚举类](../memory-spaces.md)。 |
-| `dtype` | 输入 | 槽位的元素类型。必填，可选值：`dtypes.float16`、`dtypes.float32`、`dtypes.float64`、`dtypes.bfloat16`、`dtypes.float8_e4m3fn`、`dtypes.float8_e5m2`、`dtypes.float8_e8m0`、`dtypes.hifloat8`、`dtypes.int8`、`dtypes.int16`、`dtypes.int32`、`dtypes.int64`、`dtypes.uint8`、`dtypes.uint16`、`dtypes.uint32`、`dtypes.uint64`、`dtypes.fp4x2_e1m2`、`dtypes.fp4x2_e2m1`、`dtypes.int4x2`。具体说明见[预定义数据类型](../../data-types.md)。 |
-| `layout` | 输入 | 逻辑形状和坐标跨度。必填，传入 [make_layout()](../../layout/make_layout.md) 返回的 `Layout`。 |
+| `mem_loc` | 输入 | 槽位所在的存储层级。必填，可选值：`MemLoc.UB`、`MemLoc.L1`、`MemLoc.L0A`、`MemLoc.L0B`、`MemLoc.L0C`、`MemLoc.BIAS`。具体说明见[存储位置](../../tensor/properties/memloc.md)。 |
+| `dtype` | 输入 | 元素类型，必填。可指定的类型见[数据类型](../../data-types.md)；元素类型须为具有完整字节存储宽度的标量类型，或为支持的低位打包类型。 |
+| `layout` | 输入 | 逻辑形状和坐标跨度。必填，传入 [make_layout()](../../tensor/make_layout.md) 返回的 `Layout`。 |
 | `depth` | 输入 | 槽位数量。必填，为 Python 正整数。 |
 | `physical_layout` | 输入 | 物理存储的形状和跨度。默认 `None`，根据逻辑布局、元素类型和格式推导；也可传入 `make_layout()` 返回的 `Layout`，指定预留空间或物理跨度。 |
 | `data_format` | 输入 | 存储格式。可选值为 `None`、`"nd"`、`"nz"`。默认 `None`：L1、L0A、L0B、L0C 使用 NZ，UB、BIAS使用 ND。 |
@@ -37,16 +37,11 @@ RingBuffer(
 
 返回 RingBuffer 对象。所有槽位采用指定的元素类型和布局，`depth` 等于参数值，读写游标均从第一个槽位开始。
 
-成功构造后，各公开属性的读取范围如下：
-
-| 属性 | 是否可读取 |
-| --- | --- |
-| `dtype`、`memloc`、`depth`、`shape`、`layout`、`physical_layout`、`physical_shape`、`physical_stride`、`layout_map_kind`、`logical_format`、`physical_format`、`data_format` | 可以直接读取。 |
-| `stride` | ND 布局下可以读取；NZ 布局下不支持读取逻辑跨度，读取时会报错，可通过 `physical_stride` 查看物理跨度。 |
+公开属性参见 [RingBuffer 简介](./overview.md)。
 
 ## 约束说明
 
-- 物理分配容量必须能静态确定；动态逻辑长度须在预留物理空间内。
+- 每个槽位的存储容量须在编译时确定。例如，逻辑形状为`(n,)`且`n`在执行时确定时，可用`physical_layout=make_layout((128,))`为每个槽位预留128个元素的空间；调用方须保证`n`不超过128。
 - BIAS 使用一维、32 位元素及 ND 格式。
 - 同一层级不能同时使用普通分配和片上存储空间。
 

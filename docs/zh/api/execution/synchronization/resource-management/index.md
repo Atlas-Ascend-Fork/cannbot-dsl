@@ -18,6 +18,7 @@ GM 等 workspace 上的同步可以使用本章节开放的同步接口。
 
 | 接口 | 所在核 | 角色 | 对应模式 |
 | --- | --- | --- | --- |
+| [GroupSync](./group-sync.md) | 标量执行上下文 | 通过GM工作区协调生产者和消费者 | 轮次同步 |
 | [`cube_sync_block_arrive`](./cube-sync-block-arrive.md) | AIC | 生产者，负责发送通知 | 模式 0、模式 2 |
 | [`cube_sync_block_wait`](./cube-sync-block-wait.md) | AIC | 消费者，负责阻塞等待通知到达 | 模式 0、模式 2 |
 | [`cube_sync_intra_arrive`](./cube-sync-intra-arrive.md) | AIC | 生产者，负责向单个 AIV 发送通知 | 模式 4 |

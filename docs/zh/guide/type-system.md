@@ -177,7 +177,7 @@ class K:
 | --- | --- | --- |
 | 矢量侧转换数值类型 | `vcast(x, dtype, mask=..., rounding=...)` | 可指定舍入模式 |
 | 标量侧转换数值类型 | `cast(x, dtype)` | 可配 `RoundingMode` |
-| 按另一种 dtype 重新解释同一段字节 | `t.view(dtype=...)` / `t.reinterpret(dtype=...)` | **不做数值转换** |
+| 按另一种 dtype 重新解释同一段字节 | `t.view(dtype=...)` / `cbd.from_tensor(t, dtype=...)` | **不做数值转换** |
 | 搬入时展开 16 位到 32 位 lane | `vload_unpack(..., unpack_mode=UnpackMode.B16_TO_B32)` | 见[矢量寄存器](./vector-registers.md) |
 | 搬出时压回 16 位 | `vstore_pack(..., pack_mode=PackMode.B32_TO_B16)` | — |
 

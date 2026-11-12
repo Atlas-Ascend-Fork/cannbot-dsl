@@ -1,10 +1,11 @@
 # 语言
 
-本目录介绍 CANNBot-DSL 的 Python 入口和设备代码中的语言构造。装饰器决定函数进入哪种 DSL 上下文；控制流和编译期表达式决定代码如何被追踪和生成。
+本目录介绍函数声明、核函数启动，以及条件分支、循环和编译期条件等语言功能。
 
 ## 目录
 
-- [装饰器](./decorators.md)
+- [@kernel](./kernel.md)
+- [@jit](./jit.md)
+- [@host](./host.md)
 - [控制流](./control-flow/index.md)
 - [启动 Kernel](./launch.md)
-- [Profiling 名称与类型](./profiling.md)

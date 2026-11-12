@@ -6,7 +6,7 @@
 
 ## 功能说明
 
-将输入形状转换为以切块为单位的形状，各维度的值表示该维需要的块数，不足一个完整块的部分按一个块计数。具体操作为，从 `input` 的最后一个叶维开始，与 `tiler` 中对应的块长逐项相除并向上取整，得到以切块为单位的形状，没有参与切块的前部维度保持不变，结果保留 `input` 的嵌套结构。
+将输入形状转换为以切块为单位的形状，各维度的值表示该维需要的块数，不足一个完整块的部分按一个块计数。具体操作为，从 `input` 的最后一个最内层维度开始，与 `tiler` 中对应的块长逐项相除并向上取整，得到以切块为单位的形状，没有参与切块的前部维度保持不变，结果保留 `input` 的嵌套结构。
 
 ## 函数原型
 
@@ -19,12 +19,11 @@ ceil_div(input: Shape, tiler: Tiler) -> Shape
 | 参数名 | <span style="white-space: nowrap">输入/输出</span> | 说明 |
 | --- | --- | --- |
 | `input` | 输入 | <p>必填。输入形状，描述各维度的长度。可以是以下类型：</p> <ul><li><code>int</code>：一维静态长度。</li><li><code>Kernel 运行时整数值</code>：一维运行时长度。</li><li><code>tuple 或 list</code>：组合多个维度，可嵌套；与 <code>tiler</code> 从右侧按最内层维度配对，未配对的前部维度保持不变。</li></ul> |
-| `tiler` | 输入 | <p>必填。切块大小，与 <code>input</code> 从最后一个叶维开始逐项对应。可以是以下类型：</p> <ul><li><code>int</code>：一维静态正整数块长。</li><li><code>Kernel 运行时整数值</code>：一维运行时正整数块长。</li><li><code>tuple 或 list</code>：组合各最内层维度的正整数块长。</li></ul><p>最内层维度的数量不得超过 <code>input</code>；每对维度按 <code>(a + b - 1) // b</code> 计算，结果保留 <code>input</code> 的嵌套结构。</p> |
+| `tiler` | 输入 | <p>必填。切块大小，与 <code>input</code> 从最后一个最内层维度开始逐项对应。可以是以下类型：</p> <ul><li><code>int</code>：一维静态正整数块长。</li><li><code>Kernel 运行时整数值</code>：一维运行时正整数块长。</li><li><code>tuple 或 list</code>：组合各最内层维度的正整数块长。</li></ul><p>最内层维度的数量不得超过 <code>input</code>；每对维度按 <code>(a + b - 1) // b</code> 计算，结果保留 <code>input</code> 的嵌套结构。</p> |
 
 ## 返回值说明
 
-返回保持 input 嵌套结构的 Shape；全静态输入在追踪期折叠为 Python 值，动态输入
-在 Kernel 执行时计算。
+返回保持`input`嵌套结构的形状。
 
 ## 约束说明
 

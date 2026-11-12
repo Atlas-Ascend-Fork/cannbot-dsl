@@ -68,7 +68,7 @@ python3 scripts/ci/sync_catalog.py --check
 ```bash
 export PYTHON=/path/to/python3.12
 export CANN_ENV=/path/to/Ascend/ascend-toolkit/set_env.sh
-export CANNBOTDSL_WHEEL=/path/to/cannbot_dsl-0.8.0-cp312-cp312-manylinux_2_28_x86_64.whl
+export CANNBOTDSL_WHEEL=/path/to/cannbot_dsl-0.8.2-cp312-cp312-manylinux_2_17_x86_64.whl
 
 bash packaging/native/run-build.sh --list
 bash packaging/native/run-build.sh --group ds41
@@ -77,8 +77,8 @@ python3 -m pip install packaging/native/output/groups/ds41/wheels/*.whl
 ```
 
 默认目标是 `dav-3510`，可通过 `--target dav-2201` 指定其他受支持目标。
-`--list` 和 `--help` 可直接运行。环境配置及产物目录见
-[源码构建](../install/source-build.md)。
+`--list`和`--help`可直接运行。完整构建参数和产物目录见
+[Native打包说明](https://gitcode.com/cann/cannbot-dsl/blob/master/packaging/native/README.md)。
 
 wheel 分发名为 `cannbot-arena-net`，Python 包名为 `ops`，依赖 `cannbot-dsl>=0.8.0`。
 导入 `ops` 时通过 `cannbotdsl.aot.register_directory` 注册 Native 资源。

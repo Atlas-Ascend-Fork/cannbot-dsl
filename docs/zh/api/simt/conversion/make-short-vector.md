@@ -30,7 +30,6 @@ simt.make_short_vector(*values) -> 短向量
 
 - 实际分量数必须有已定义dtype。
 - int8/16/32/64、uint8/16/32/64和float32有2/3/4分量；float16、bfloat16仅有2分量。不存在float16x3或bfloat16x4构造。
-- 构造出的短向量能否用于数学、原子或访存操作，仍取决于对应接口支持的数据类型。
 
 ## 调用示例
 

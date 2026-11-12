@@ -32,7 +32,7 @@
 | `GetBlockIdx()` | `get_block_idx()` | — |
 | `GetSubBlockIdx()` | `get_subblock_id()` | 只有 Mix 算子有 subblock |
 | `dcci` / `dci` | `dcci_*` / `dci` | DCache 维护 |
-| `__NPU_ARCH__ == 3510` | `get_platform_info().npu_arch == "dav-3510"` | 配 `target_version()` 用 |
+| `__NPU_ARCH__ == 3510` | `get_platform_info().npu_arch == "dav-3510"` | 可与 `const_expr()` 配合使用 |
 | AIC↔AIV 经 GM 传标量 | `MemLoc.SSBUF` | 3510 新增，不用再绕 GM |
 
 ### 跨代变更速查（NPU ARCH 2201 → 3510）

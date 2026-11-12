@@ -1,4 +1,4 @@
-# Tensor.reinterpret
+# from_tensor
 
 ## 产品支持情况
 
@@ -6,18 +6,18 @@
 
 ## 功能说明
 
-返回与当前 Tensor 共享存储的新视图，可指定目标元素类型、逻辑布局、物理布局和字节偏移。新视图起点为当前 Tensor 起点加上 `offset`。
+返回与源Tensor共享存储的新视图，可指定目标元素类型、逻辑布局、物理布局和字节偏移。新视图起点为源Tensor起点加上`offset`。
 
 ## 函数原型
 
 ```python
-reinterpret(
-    self,
+from_tensor(
+    input,
     dtype=None,
     layout=None,
     *,
     physical_layout=None,
-    offset=0,
+    offset: int = 0,
     data_format=None,
 ) -> Tensor
 ```
@@ -26,7 +26,8 @@ reinterpret(
 
 | 参数名 | 输入/输出 | 说明 |
 | --- | --- | --- |
-| `dtype` | 输入 | 目标元素类型。默认 `None`，保留原类型。可选值：`dtypes.float16`、`dtypes.float32`、`dtypes.float64`、`dtypes.bfloat16`、`dtypes.float8_e4m3fn`、`dtypes.float8_e5m2`、`dtypes.float8_e8m0`、`dtypes.hifloat8`、`dtypes.int8`、`dtypes.int16`、`dtypes.int32`、`dtypes.int64`、`dtypes.uint8`、`dtypes.uint16`、`dtypes.uint32`、`dtypes.uint64`、`dtypes.fp4x2_e1m2`、`dtypes.fp4x2_e2m1`、`dtypes.int4x2`。具体说明见[预定义数据类型](../data-types.md)。 |
+| `input` | 输入 | 源Tensor，新视图共享该Tensor的存储。 |
+| `dtype` | 输入 | 目标元素类型。默认 `None`，保留源类型；可指定的类型见[数据类型](../data-types.md)。元素类型须为具有完整字节存储宽度的标量类型，或为支持的低位打包类型。 |
 | `layout` | 输入 | 目标逻辑布局。默认 `None`，沿用原逻辑布局；可传入 `make_layout()` 返回的 Layout，指定静态或运行时的形状、跨度。 |
 | `physical_layout` | 输入 | 目标物理布局。默认 `None`；提供新逻辑布局时按目标格式推导，逻辑/物理布局与格式全部省略时保留原布局。可显式传入 Layout。 |
 | `offset` | 输入 | 相对当前 Tensor 起点的字节偏移。默认 `0`，可为 `0`～`2^63-1` 的 Python 整数，或运行时非负整数值。 |
@@ -38,12 +39,8 @@ reinterpret(
 
 ## 约束说明
 
-- 原 Tensor 为组合视图，且本次调用保留原布局时，返回结果仍为组合视图；返回 Tensor 的 `stride`、`physical_format` 和 `data_format` 不支持读取，读取会报错；`physical_layout`、`physical_shape` 和 `physical_stride` 仍可读取。
-
-- `layout` 和 `physical_layout` 必须为 `make_layout()` 创建的显式布局。
-- 显式指定布局、格式或运行时偏移时，仅支持片上存储；GM 仅支持不指定布局和格式、偏移为静态值的形式。
-- SSBUF 只使用 ND；NZ/ZN 的逻辑形状必须为二维或三维。
-- 新视图必须满足底层存储容量和地址对齐要求。静态可确定的越界会报错，动态访问范围由调用者保证。
+- 将`t.layout`作为`layout`或`physical_layout`参数时，`t`须支持读取[data_format](./properties/data-format.md)。通过[make_layout](./make_layout.md)创建的布局和`t.physical_layout`不受此限制。
+- 调用方必须保证通过新视图访问的范围位于底层存储内；接口不检查容量。
 
 ## 调用示例
 
@@ -56,7 +53,7 @@ import cannbotdsl as cbd
 @cbd.kernel
 def example_kernel(y: cbd.Tensor):
     t = cbd.Buffer(cbd.MemLoc.UB, cbd.dtypes.float32, cbd.make_layout((64,)))
-    u = t.reinterpret(layout=cbd.make_layout((2, 8), stride=(16, 1)), offset=32)
+    u = cbd.from_tensor(t, layout=cbd.make_layout((2, 8), stride=(16, 1)), offset=32)
     y[0] = u.shape[0]
     y[1] = u.shape[1]
     y[2] = u.stride[0]

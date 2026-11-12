@@ -171,18 +171,18 @@ AOT 构建的默认目标是 `dav-3510`，可用 `--target` 切换；运行时�
 ./run-build.sh --group ds41 --target dav-3510
 ```
 
-设备侧要按架构分支时，用 `target_version()` 把**调用方算好的**布尔值标记成编译期条件：
+设备侧要按架构分支时，用 `const_expr()` 把调用方算好的布尔值标记成编译期条件：
 
 ```python
 IS_DAV_3510 = cbd.get_platform_info().npu_arch == "dav-3510"
 
 @cbd.kernel
 def k(out):
-    if cbd.target_version(IS_DAV_3510):
+    if cbd.const_expr(IS_DAV_3510):
         ...
 ```
 
-注意 `target_version()` **自己不查硬件版本**，只负责把一个已算好的布尔值标成编译期条件。
+`const_expr()` 不查询硬件版本，调用方须先取得并比较架构信息。
 
 ## 编译缓存
 

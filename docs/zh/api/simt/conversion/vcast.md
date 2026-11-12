@@ -6,7 +6,7 @@
 
 ## 功能说明
 
-将短向量value数值转换为dtype。舍入与饱和效果取决于具体类型和参数组合。
+将双分量短向量`value`转换为`dtype`指定的数据类型。支持的类型组合、舍入模式和饱和选项见[约束说明](#约束说明)。
 
 ## 函数原型
 
@@ -19,9 +19,9 @@ simt.vcast(value, *, dtype, rounding=RoundingMode.RN, saturate=False) -> 短向�
 | 参数 | 输入/输出 | 说明 |
 | --- | --- | --- |
 | value | 输入 | 双分量短向量，类型为`float32x2`、`float16x2`、`bfloat16x2`、`fp8x2_e4m3fn`、`fp8x2_e5m2`、`hifloat8x2`；具体源、目标组合见约束说明。 |
-| dtype | 输入 | 目标双分量短向量类型描述符，可选`float32x2`、`float16x2`、`bfloat16x2`、`fp8x2_e4m3fn`、`fp8x2_e5m2`、`hifloat8x2`；必须与源类型不同。 |
-| rounding | 输入 | [RoundingMode](./roundingmode.md) 枚举或名称字符串，默认`RoundingMode.RN`；是否生效取决于源、目标类型。 |
-| saturate | 输入 | Python bool，默认False，是否请求对应转换的饱和形式。 |
+| dtype | 输入 | 目标双分量短向量数据类型，可选`float32x2`、`float16x2`、`bfloat16x2`、`fp8x2_e4m3fn`、`fp8x2_e5m2`、`hifloat8x2`；必须与源类型不同。 |
+| rounding | 输入 | [RoundingMode](./roundingmode.md)枚举或名称字符串，默认`RoundingMode.RN`。各类型组合的可选值见[约束说明](#约束说明)。 |
+| saturate | 输入 | 是否启用饱和转换，类型为`bool`，默认`False`。各类型组合的支持情况和`CTRL[60]`设置要求见[约束说明](#约束说明)。 |
 
 ## 返回值说明
 
@@ -29,20 +29,21 @@ simt.vcast(value, *, dtype, rounding=RoundingMode.RN, saturate=False) -> 短向�
 
 ## 约束说明
 
-仅使用下表中的双分量短向量组合；源和目标数据类型必须不同，不进行分量广播。
+源和目标须为下表中的双分量短向量，且类型不同。不支持整数短向量、三分量或四分量短向量，也不进行分量广播。
 
-| 源类型 | 目标类型 | 额外限制 |
-| --- | --- | --- |
-| `float32x2` | `float16x2`、`bfloat16x2` | 舍入和饱和选项取决于目标类型。 |
-| `float16x2`、`bfloat16x2` | `float32x2` | `rounding`、`saturate`不生效。 |
-| `float32x2` | `fp8x2_e4m3fn`、`fp8x2_e5m2` | 不能通过`rounding`改变舍入规则。 |
-| `fp8x2_e4m3fn`、`fp8x2_e5m2` | `float32x2` | `rounding`、`saturate`不生效。 |
-| `float32x2`、`float16x2` | `hifloat8x2` | `RH`使用对应舍入规则，其他模式按`RNA`处理。 |
-| `hifloat8x2` | `float32x2`、`float16x2` | `rounding`、`saturate`不生效。 |
+| 源类型 | 目标类型 | `rounding` | `saturate` |
+| --- | --- | --- | --- |
+| `float32x2` | `float16x2` | `RN`、`RNA`、`RD`、`RU`、`RZ`、`RO`。 | `False`或`True`；启用时须满足下文`CTRL[60]`设置要求。 |
+| `float32x2` | `bfloat16x2` | `RN`、`RNA`、`RD`、`RU`、`RZ`。 | `False`或`True`；启用时须满足下文`CTRL[60]`设置要求。 |
+| `float16x2`、`bfloat16x2` | `float32x2` | 不生效。 | 不生效。 |
+| `float32x2` | `fp8x2_e4m3fn`、`fp8x2_e5m2` | 固定为`RN`，`rounding`参数不生效。 | `False`或`True`；启用时须满足下文`CTRL[60]`设置要求。 |
+| `fp8x2_e4m3fn`、`fp8x2_e5m2` | `float32x2` | 不生效。 | 不生效。 |
+| `float32x2`、`float16x2` | `hifloat8x2` | `RH`使用混合舍入；`RN`、`RNA`、`RD`、`RU`、`RZ`、`RO`均按`RNA`处理。 | `False`或`True`；启用时须满足下文`CTRL[60]`设置要求。 |
+| `hifloat8x2` | `float32x2`、`float16x2` | 不生效。 | 不生效。 |
 
-- 不能把上表理解为所有列出类型都能两两互转；例如未列出`float16x2`与`bfloat16x2`的直接转换。
-- 不使用整数短向量或三、四分量短向量替代上述类型。
-- `saturate=True`不是通用的`[0, 1]`截断；半精度饱和转换还依赖设备配置。
+- 不支持表外类型组合，包括`float16x2`与`bfloat16x2`直接互转。
+- 涉及`fp8x2_e4m3fn`、`fp8x2_e5m2`或`hifloat8x2`的转换，仅用于SIMD与SIMT混合执行场景。
+- 表中标明支持`saturate=True`的转换受`CTRL[60]`控制：须在进入SIMT函数前，在SIMD侧将`CTRL[60]`置为`0`。纯SIMT Kernel中不能通过该参数启用这些转换的饱和模式。寄存器设置接口见[set_ctrl](../../execution/device/spr/set-ctrl.md)。
 
 ## 调用示例
 

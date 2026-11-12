@@ -22,7 +22,7 @@ CompiledAicpuKernel.launch(
 
 | 参数 | 输入/输出 | 说明 |
 | --- | --- | --- |
-| `stream_handle` | 输入 | 当前NPU stream的整数句柄，通常由[current_raw_stream](./current-raw-stream.md)获取。 |
+| `stream_handle` | 输入 | 当前NPU stream的整数句柄，可通过[current_raw_stream](./current-raw-stream.md)获取。 |
 | `kwargs` | 输入 | 按参数类字段名称传入参数。标量字段传入Python整数，GM字段传入设备缓冲区地址。字段名称、数量和类型必须与参数类声明一致。 |
 
 ## 返回值说明

@@ -21,13 +21,6 @@ const rewriteReadmes = (id: string) => {
   return id
 }
 
-const guideSidebar = [
-  { text: '源码构建', link: '/zh/install/source-build' },
-  { text: '编程模型', link: '/zh/guide/overview' },
-  { text: '仓库结构', link: '/zh/guide/repository' },
-  { text: '样例导航', link: 'https://gitcode.com/cann/cannbot-dsl/tree/master/samples' }
-]
-
 const programmingModelSidebar = [
   { text: '编程模型概览', link: '/zh/guide/overview' },
   {
@@ -75,6 +68,7 @@ const programmingModelSidebar = [
     text: '工程化与附录',
     collapsed: false,
     items: [
+      { text: '仓库结构', link: '/zh/guide/repository' },
       { text: 'JIT 参数与编译缓存', link: '/zh/guide/jit-arguments' },
       { text: 'torch 接口与 stream 语义', link: '/zh/guide/torch-interop' },
       { text: '编译选项与产物观察', link: '/zh/guide/compiler-options' },
@@ -92,6 +86,14 @@ const simtSidebar = {
   "text": "SIMT 接口",
   "collapsed": true,
   "items": [
+    {
+      "text": "Kernel启动配置",
+      "link": "/zh/api/simt/launch"
+    },
+    {
+      "text": "短向量数据类型",
+      "link": "/zh/api/simt/data-types"
+    },
     {
       "text": "线程信息",
       "collapsed": true,
@@ -1207,17 +1209,12 @@ const apiSidebar = [
                   {
                     "text": "const_expr",
                     "link": "/zh/api/language/control-flow/compile-time-control/const-expr"
-                  },
-                  {
-                    "text": "target_version",
-                    "link": "/zh/api/language/control-flow/compile-time-control/target-version"
                   }
                 ],
                 "collapsed": true
               },
               {
-                "text": "谓词表达式",
-                "link": "/zh/api/language/control-flow/predicate-expressions",
+                "text": "条件判断",
                 "items": [
                   {
                     "text": "all",
@@ -1282,10 +1279,6 @@ const apiSidebar = [
                 "link": "/zh/api/language/control-flow/if"
               },
               {
-                "text": "判断条件",
-                "link": "/zh/api/language/control-flow/predicate-expressions"
-              },
-              {
                 "text": "值选择",
                 "link": "/zh/api/language/control-flow/value-selection"
               },
@@ -1297,16 +1290,8 @@ const apiSidebar = [
             "collapsed": true
           },
           {
-            "text": "CANNBot-DSL 装饰器",
-            "link": "/zh/api/language/decorators"
-          },
-          {
             "text": "Kernel 启动配置",
             "link": "/zh/api/language/launch"
-          },
-          {
-            "text": "Profiling 名称与类型",
-            "link": "/zh/api/language/profiling"
           }
         ],
         "collapsed": true
@@ -1342,69 +1327,11 @@ const apiSidebar = [
             "collapsed": true
           },
           {
-            "text": "Layout 接口",
-            "link": "/zh/api/data-structures/layout",
+            "text": "Tiler 接口",
+            "link": "/zh/api/data-structures/tiler",
             "items": [
-              {
-                "text": "Coord",
-                "link": "/zh/api/data-structures/layout/coord",
-                "items": [
-                  {
-                    "text": "Coord",
-                    "link": "/zh/api/data-structures/layout/coord"
-                  }
-                ],
-                "collapsed": true
-              },
-              {
-                "text": "Shape",
-                "link": "/zh/api/data-structures/layout/shape",
-                "items": [
-                  {
-                    "text": "Shape",
-                    "link": "/zh/api/data-structures/layout/shape"
-                  }
-                ],
-                "collapsed": true
-              },
-              {
-                "text": "Stride",
-                "link": "/zh/api/data-structures/layout/stride",
-                "items": [
-                  {
-                    "text": "Stride",
-                    "link": "/zh/api/data-structures/layout/stride"
-                  }
-                ],
-                "collapsed": true
-              },
-              {
-                "text": "Tiler 接口",
-                "link": "/zh/api/data-structures/tiler",
-                "items": [
-                  {
-                    "text": "make_tiler",
-                    "link": "/zh/api/data-structures/tiler/make_tiler"
-                  },
-                  {
-                    "text": "Tile / Tiler 简介",
-                    "link": "/zh/api/data-structures/tiler/overview"
-                  }
-                ],
-                "collapsed": true
-              },
-              {
-                "text": "make_layout",
-                "link": "/zh/api/data-structures/layout/make_layout"
-              },
-              {
-                "text": "Layout.offset",
-                "link": "/zh/api/data-structures/layout/offset"
-              },
-              {
-                "text": "Layout 简介",
-                "link": "/zh/api/data-structures/layout/overview"
-              }
+              { "text": "make_tiler", "link": "/zh/api/data-structures/tiler/make_tiler" },
+              { "text": "Tile / Tiler 简介", "link": "/zh/api/data-structures/tiler/overview" }
             ],
             "collapsed": true
           },
@@ -1457,29 +1384,6 @@ const apiSidebar = [
                   }
                 ],
                 "collapsed": true
-              },
-              {
-                "text": "Storage 接口",
-                "link": "/zh/api/data-structures/storage/storage",
-                "items": [
-                  {
-                    "text": "Storage 简介",
-                    "link": "/zh/api/data-structures/storage/storage/overview"
-                  },
-                  {
-                    "text": "Storage.view",
-                    "link": "/zh/api/data-structures/storage/storage/view"
-                  }
-                ],
-                "collapsed": true
-              },
-              {
-                "text": "存储位置",
-                "link": "/zh/api/data-structures/storage/memory-spaces"
-              },
-              {
-                "text": "片上存储空间",
-                "link": "/zh/api/data-structures/storage/on-chip-memory"
               }
             ],
             "collapsed": true
@@ -1489,28 +1393,46 @@ const apiSidebar = [
             "link": "/zh/api/data-structures/tensor",
             "items": [
               {
-                "text": "Tensor.bare",
-                "link": "/zh/api/data-structures/tensor/bare"
+                "text": "Tensor 简介",
+                "collapsed": true,
+                "items": [
+                  { "text": "Overview", "link": "/zh/api/data-structures/tensor/overview" },
+                  { "text": "shape / rank", "link": "/zh/api/data-structures/tensor/properties/shape-and-rank" },
+                  { "text": "stride", "link": "/zh/api/data-structures/tensor/properties/stride" },
+                  { "text": "dtype", "link": "/zh/api/data-structures/tensor/properties/dtype" },
+                  { "text": "memloc", "link": "/zh/api/data-structures/tensor/properties/memloc" },
+                  { "text": "layout / physical_layout", "link": "/zh/api/data-structures/tensor/properties/layouts" },
+                  { "text": "data_format", "link": "/zh/api/data-structures/tensor/properties/data-format" },
+                  { "text": "Indexing", "link": "/zh/api/data-structures/tensor/indexing" }
+                ]
               },
               {
-                "text": "Tensor.broadcast_to",
-                "link": "/zh/api/data-structures/tensor/broadcast_to"
+                "text": "make_layout",
+                "link": "/zh/api/data-structures/tensor/make_layout"
               },
               {
-                "text": "Tensor.extent",
-                "link": "/zh/api/data-structures/tensor/extent"
+                "text": "Tensor.expand",
+                "link": "/zh/api/data-structures/tensor/expand"
               },
               {
                 "text": "Tensor.flatten",
                 "link": "/zh/api/data-structures/tensor/flatten"
               },
               {
-                "text": "Tensor 简介",
-                "link": "/zh/api/data-structures/tensor/overview"
+                "text": "Tensor.pad",
+                "link": "/zh/api/data-structures/tensor/pad"
               },
               {
-                "text": "Tensor.pad_to",
-                "link": "/zh/api/data-structures/tensor/pad_to"
+                "text": "Tensor.relu",
+                "link": "/zh/api/data-structures/tensor/relu"
+              },
+              {
+                "text": "Tensor.convert",
+                "link": "/zh/api/data-structures/tensor/convert"
+              },
+              {
+                "text": "Tensor.ptr",
+                "link": "/zh/api/data-structures/tensor/ptr"
               },
               {
                 "text": "Tensor.partition",
@@ -1521,16 +1443,12 @@ const apiSidebar = [
                 "link": "/zh/api/data-structures/tensor/permute"
               },
               {
-                "text": "Tensor.reinterpret",
-                "link": "/zh/api/data-structures/tensor/reinterpret"
+                "text": "from_tensor",
+                "link": "/zh/api/data-structures/tensor/from_tensor"
               },
               {
                 "text": "Tensor.reshape",
                 "link": "/zh/api/data-structures/tensor/reshape"
-              },
-              {
-                "text": "Tensor.strided_slice",
-                "link": "/zh/api/data-structures/tensor/strided_slice"
               },
               {
                 "text": "Tensor.unflatten",
@@ -1540,10 +1458,6 @@ const apiSidebar = [
                 "text": "Tensor.view",
                 "link": "/zh/api/data-structures/tensor/view"
               },
-              {
-                "text": "Tensor.with_tail_fill",
-                "link": "/zh/api/data-structures/tensor/with_tail_fill"
-              }
             ],
             "collapsed": true
           }
@@ -1833,6 +1747,14 @@ const apiSidebar = [
               {
                 "text": "tile_slice",
                 "link": "/zh/api/compute/tensor/tile-slice"
+              },
+              {
+                "text": "tile_slice_multi",
+                "link": "/zh/api/compute/tensor/tile-slice-multi"
+              },
+              {
+                "text": "cv_valid_extent",
+                "link": "/zh/api/compute/tensor/cv-valid-extent"
               }
             ],
             "collapsed": true
@@ -2566,6 +2488,17 @@ const apiSidebar = [
                 "link": "/zh/api/execution/synchronization/resource-management",
                 "items": [
                   {
+                    "text": "GroupSync",
+                    "collapsed": true,
+                    "items": [
+                      { "text": "GroupSync 简介", "link": "/zh/api/execution/synchronization/resource-management/group-sync" },
+                      { "text": "GroupSync.acquire", "link": "/zh/api/execution/synchronization/resource-management/group-sync/acquire" },
+                      { "text": "GroupSync.commit", "link": "/zh/api/execution/synchronization/resource-management/group-sync/commit" },
+                      { "text": "GroupSync.wait", "link": "/zh/api/execution/synchronization/resource-management/group-sync/wait" },
+                      { "text": "GroupSync.release", "link": "/zh/api/execution/synchronization/resource-management/group-sync/release" }
+                    ]
+                  },
+                  {
                     "text": "cube_sync_block_arrive",
                     "link": "/zh/api/execution/synchronization/resource-management/cube-sync-block-arrive"
                   },
@@ -2647,7 +2580,7 @@ const apiSidebar = [
                 "link": "/zh/api/compilation/aot/compile"
               },
               {
-                "text": "Native 导出与构建",
+                "text": "@export 与 Native 构建",
                 "link": "/zh/api/compilation/aot/publication"
               },
               {
@@ -2852,7 +2785,7 @@ const normalizeApiSidebar = (sidebar: any[]) => {
       ? item.text.replace(/ 接口$/, '').replace(/^操作$/, '计算').replace(/^张量操作$/, '张量计算').replace(/^原子操作$/, '原子计算')
       : item.text
     const isRegOverview = item.link?.startsWith('/zh/api/compute/vector/') && cleaned === '概述'
-    const overviewLabel = typeof item.link === 'string' && /\/overview\/?$/.test(item.link) && typeof cleaned === 'string' && !/简介|概览/.test(cleaned) && !isRegOverview
+    const overviewLabel = typeof item.link === 'string' && /\/overview\/?$/.test(item.link) && typeof cleaned === 'string' && !/简介|概览|^Overview$/i.test(cleaned) && !isRegOverview
       ? `${cleaned}（概览）`
       : cleaned
     const conceptLabel = item.link?.endsWith('/control-flow/control-flow') && overviewLabel === '控制流'
@@ -2898,25 +2831,15 @@ const normalizeApiSidebar = (sidebar: any[]) => {
     const dataItems = dataStructures.items ?? []
     const dataTypes = find(dataItems, '/data-types')
     const tensor = find(dataItems, '/tensor')
-    const layout = find(dataItems, '/layout')
     const tiler = find(dataItems, '/tiler')
     const storage = find(dataItems, '/storage')
     const array = find(dataItems, '/array')
-    if (layout) {
-      const layoutItems = layout.items ?? []
-      const coord = find(layoutItems, '/layout/coord')
-      const shape = find(layoutItems, '/layout/shape')
-      const stride = find(layoutItems, '/layout/stride')
-      layout.items = [
-        find(layoutItems, '/layout/overview'),
-        coord,
-        shape,
-        stride,
-        find(layoutItems, '/layout/make_layout'),
-        find(layoutItems, '/layout/offset'),
-      ].filter(Boolean)
-    }
-    dataStructures.items = [dataTypes, tensor, layout, tiler, storage, array].filter(Boolean)
+    const storageItems = storage?.items ?? []
+    const buffer = find(storageItems, '/storage/buffer')
+    const ringBuffer = find(storageItems, '/storage/ring-buffer')
+    const datastruct = { text: 'datastruct', link: '/zh/api/data-structures/datastruct' }
+    const tensorList = { text: 'TensorList', link: '/zh/api/data-structures/tensor-list' }
+    dataStructures.items = [dataTypes, tensor, tensorList, array, buffer, ringBuffer, datastruct, tiler].filter(Boolean)
   }
 
   const language = find(items, '/language')
@@ -2927,19 +2850,28 @@ const normalizeApiSidebar = (sidebar: any[]) => {
       const controlItems = controlFlow.items ?? []
       controlFlow.items = [
         find(controlItems, '/language/control-flow/compile-time-control'),
-        find(controlItems, '/language/control-flow/predicate-expressions'),
+        controlItems.find((item: any) => item.text === '条件判断'),
         find(controlItems, '/language/control-flow/value-selection'),
         find(controlItems, '/language/control-flow/control-flow'),
-        find(controlItems, '/language/control-flow/for'),
+        { text: 'for 循环', collapsed: true, items: [
+          find(controlItems, '/language/control-flow/for'),
+          { text: 'range', link: '/zh/api/language/control-flow/for/range' },
+          { text: 'cannbotdsl.range', link: '/zh/api/language/control-flow/for/dsl-range' },
+          { text: 'range_constexpr', link: '/zh/api/language/control-flow/for/range-constexpr' },
+          { text: '遍历元组和列表', link: '/zh/api/language/control-flow/for/sequences' },
+        ].filter(Boolean) },
         find(controlItems, '/language/control-flow/if'),
         find(controlItems, '/language/control-flow/while'),
       ].filter(Boolean)
     }
     language.items = [
-      find(languageItems, '/language/decorators'),
+      { text: '装饰器', collapsed: true, items: [
+        { text: '@kernel', link: '/zh/api/language/kernel' },
+        { text: '@jit', link: '/zh/api/language/jit' },
+        { text: '@host', link: '/zh/api/language/host' },
+      ] },
       controlFlow,
       find(languageItems, '/language/launch'),
-      find(languageItems, '/language/profiling'),
     ].filter(Boolean)
   }
 
@@ -2986,6 +2918,11 @@ const normalizeApiSidebar = (sidebar: any[]) => {
     ].filter(Boolean)
   }
 
+  if (debug) {
+    debug.text = '调试与性能分析'
+    debug.items = [...(debug.items ?? []), { text: 'Profiling 名称与类型', link: '/zh/api/debug/profiling' }]
+  }
+
   const compilation = find(items, '/compilation')
   if (compilation) {
     const compilationItems = compilation.items ?? []
@@ -3018,19 +2955,24 @@ const normalizeApiSidebar = (sidebar: any[]) => {
     const aicpuItems = aicpu.items ?? []
     aicpu.items = [
       find(aicpuItems, '/aicpu/programming'),
-      find(aicpuItems, '/aicpu/build'),
-      find(aicpuItems, '/aicpu/validation'),
+      find(aicpuItems, '/aicpu/build/compile'),
+      find(aicpuItems, '/aicpu/validation/run-host'),
       find(aicpuItems, '/aicpu/runtime'),
     ].filter(Boolean)
   }
 
   if (dataMovement) dataMovement.items = [...(dataMovement.items ?? []), {"text": "卷积数据搬运", "collapsed": true, "items": [{"text": "conv2d_load_filter", "link": "/zh/api/data-movement/convolution/conv2d-load-filter"}, {"text": "conv2d_load_fmap", "link": "/zh/api/data-movement/convolution/conv2d-load-fmap"}, {"text": "conv2d_load_im2col", "link": "/zh/api/data-movement/convolution/conv2d-load-im2col"}, {"text": "conv2d_store_output", "link": "/zh/api/data-movement/convolution/conv2d-store-output"}, {"text": "load3d", "link": "/zh/api/data-movement/convolution/load3d"}]}]
-  if (dataStructures) dataStructures.items = [...(dataStructures.items ?? []), {"text": "卷积数据结构", "collapsed": true, "items": [{"text": "Conv2dTile", "link": "/zh/api/data-structures/convolution/conv2d-tile"}, {"text": "Load3DDestination", "link": "/zh/api/data-structures/convolution/load3d-destination"}, {"text": "Load3DFeatureMap", "link": "/zh/api/data-structures/convolution/load3d-feature-map"}, {"text": "Load3DPadding", "link": "/zh/api/data-structures/convolution/load3d-padding"}, {"text": "Load3DRepeat", "link": "/zh/api/data-structures/convolution/load3d-repeat"}, {"text": "Load3DWindow", "link": "/zh/api/data-structures/convolution/load3d-window"}, {"text": "make_conv2d_spec", "link": "/zh/api/data-structures/convolution/make-conv2d-spec", "collapsed": true, "items": [{"text": "Conv2dSpec.tile_count", "link": "/zh/api/data-structures/convolution/make-conv2d-spec/tile-count"}, {"text": "Conv2dSpec.fmap_l1_shape", "link": "/zh/api/data-structures/convolution/make-conv2d-spec/fmap-l1-shape"}, {"text": "Conv2dSpec.tile", "link": "/zh/api/data-structures/convolution/make-conv2d-spec/tile"}]}]}]
+  if (dataStructures) dataStructures.items = [...(dataStructures.items ?? []), {"text": "卷积数据结构", "collapsed": true, "items": [{"text": "Conv2dTile", "link": "/zh/api/data-structures/convolution/conv2d-tile"}, {"text": "Load3DDestination", "link": "/zh/api/data-structures/convolution/load3d-destination"}, {"text": "Load3DFeatureMap", "link": "/zh/api/data-structures/convolution/load3d-feature-map"}, {"text": "Load3DPadding", "link": "/zh/api/data-structures/convolution/load3d-padding"}, {"text": "Load3DRepeat", "link": "/zh/api/data-structures/convolution/load3d-repeat"}, {"text": "Load3DWindow", "link": "/zh/api/data-structures/convolution/load3d-window"}, {"text": "Conv2dSpec", "collapsed": true, "items": [{"text": "make_conv2d_spec", "link": "/zh/api/data-structures/convolution/make-conv2d-spec"}, {"text": "Conv2dSpec.tile_count", "link": "/zh/api/data-structures/convolution/make-conv2d-spec/tile-count"}, {"text": "Conv2dSpec.fmap_l1_shape", "link": "/zh/api/data-structures/convolution/make-conv2d-spec/fmap-l1-shape"}, {"text": "Conv2dSpec.tile", "link": "/zh/api/data-structures/convolution/make-conv2d-spec/tile"}]}]}]
   if (dataStructures) {
     const tensorGroup = find(dataStructures.items ?? [], '/tensor')
-    const storageGroup = find(dataStructures.items ?? [], '/storage')
-    if (tensorGroup) tensorGroup.items = [...(tensorGroup.items ?? []), [{"text": "Tensor.convert", "link": "/zh/api/data-structures/tensor/convert"}, {"text": "storage_bits", "link": "/zh/api/data-structures/tensor/storage-bits"}]].flat()
-    if (storageGroup) storageGroup.items = [...(storageGroup.items ?? []), [{"text": "FBUF_ACT.view", "link": "/zh/api/data-structures/storage/fbuf-act-view"}, {"text": "make_conv2d_fmap_l1", "link": "/zh/api/data-structures/storage/buffer/make-conv2d-fmap-l1"}]].flat()
+    const bufferGroup = find(dataStructures.items ?? [], '/storage/buffer')
+    if (tensorGroup) {
+      tensorGroup.items = [...(tensorGroup.items ?? []), { text: 'storage_bits', link: '/zh/api/data-structures/tensor/storage-bits' }]
+    }
+    if (bufferGroup) {
+      bufferGroup.items = [{ text: '片上存储空间', link: '/zh/api/data-structures/storage/buffer/memory-spaces' }, ...(bufferGroup.items ?? []), { text: 'make_conv2d_fmap_l1', link: '/zh/api/data-structures/storage/buffer/make-conv2d-fmap-l1' }]
+    }
+    dataStructures.items.push({ text: 'FBUF_ACT.view', link: '/zh/api/data-structures/storage/fbuf-act-view' })
   }
   if (compute) {
     const tensorGroup = find(compute.items ?? [], '/compute/tensor')
@@ -3069,12 +3011,13 @@ export default defineConfig({
   rewrites: rewriteReadmes,
   cleanUrls: false,
   // Repository samples and contribution guides live outside the VitePress source tree.
-  ignoreDeadLinks: [/CONTRIBUTION_DOC_en/, /CHANGELOG/, /LICENSE/],
+  ignoreDeadLinks: [/CONTRIBUTION_DOC_en/],
   lastUpdated: true,
   markdown: {
     math: true
   },
   vite: {
+    publicDir: path.join(projectRoot, 'public'),
     resolve: {
       alias: [
         { find: 'vue/server-renderer', replacement: path.join(projectRoot, 'node_modules/@vue/server-renderer') },
@@ -3091,31 +3034,17 @@ export default defineConfig({
     siteTitle: 'CANNBot-DSL',
     nav: [
       { text: '首页', link: '/zh/' },
-      { text: '算子开发指南', items: [
-        { text: '源码构建', link: '/zh/install/source-build' },
-        { text: '编程模型', link: '/zh/guide/overview' },
-        { text: '快速入门', link: '/zh/guide/add-simd' },
-        { text: '样例导航', link: 'https://gitcode.com/cann/cannbot-dsl/tree/master/samples' }
-      ] },
-      { text: 'CANNBot-DSL API', items: [
-        { text: '语言', link: '/zh/api/language/' },
-        { text: '数据结构', link: '/zh/api/data-structures/' },
-        { text: '数据搬运', link: '/zh/api/data-movement/' },
-        { text: '计算', link: '/zh/api/compute/' },
-        { text: '设备执行', link: '/zh/api/execution/' },
-        { text: '调试', link: '/zh/api/debug/' },
-        { text: '编译与发布', link: '/zh/api/compilation/' },
-        { text: 'AI CPU', link: '/zh/api/aicpu/' },
-        { text: 'SIMT 接口', link: '/zh/api/simt/' }
-      ] },
+      { text: '源码构建', link: '/zh/install/source-build' },
+      { text: '编程模型', link: '/zh/guide/overview', activeMatch: '^/zh/guide/' },
+      { text: '样例导航', link: 'https://gitcode.com/cann/cannbot-dsl/tree/master/samples' },
+      { text: 'API', link: '/zh/api/', activeMatch: '^/zh/api/' },
       { text: '语言 / Language', items: [
         { text: '简体中文', link: '/zh/' },
         { text: 'English', link: '/en/' }
       ] }
     ],
     sidebar: {
-      '/zh/install/': [{ text: '源码构建', collapsed: true, items: guideSidebar }],
-      '/zh/guide/': [...guideSidebar, ...programmingModelSidebar],
+      '/zh/guide/': programmingModelSidebar,
       '/zh/api/': normalizedApiSidebar,
     },
     search: {

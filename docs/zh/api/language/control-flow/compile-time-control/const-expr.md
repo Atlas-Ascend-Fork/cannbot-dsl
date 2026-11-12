@@ -5,21 +5,21 @@
 
 ## 功能说明
 
-`const_expr()`用于标记一般编译期条件，例如功能开关或静态参数。在编译期决定执行哪个分支或是否继续`while`循环，无需在设备运行时判断该条件。
+`const_expr`由CANNBot-DSL提供。通过`import cannbotdsl as cbd`导入后，使用`cbd.const_expr(value)`调用。
+
+`const_expr()`用于标记编译时可确定的条件，例如功能开关或静态参数。在编译期决定执行哪个分支或是否继续`while`循环，无需在设备运行时判断该条件。
 
 ## 函数原型
 
 ```python
-const_expr(value: Any) -> bool
+const_expr(value) -> bool
 ```
-
-`Any`来自`typing`。
 
 ## 参数说明
 
 | 参数 | 输入/输出 | 说明 |
 | --- | --- | --- |
-| `value` | 输入 | 必选，无默认值。必须是编译期已知且可转换为`bool`的Python值，不能依赖Tensor读取值、Kernel标量形参或其他运行时结果。 |
+| `value` | 输入 | 必选，无默认值。必须是编译期已知且可转换为`bool`的Python值，不能依赖Tensor读取值（如通过`x[0]`从Tensor中读出的元素值）或其他运行时结果（如由Tensor读取值计算得到的`x[0] + 1`、`x[0] > 0`）。 |
 
 ## 返回值说明
 
@@ -27,7 +27,7 @@ const_expr(value: Any) -> bool
 
 ## 约束说明
 
-无
+将运行时数据用作编译期条件的错误示例见[控制流约束](../control-flow.md#编译期条件依赖运行时数据)。
 
 ## 调用示例
 

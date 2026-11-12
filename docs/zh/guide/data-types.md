@@ -226,7 +226,7 @@ K 方向切块累加的顺序决定了浮点舍入的累积方式。设备上按
 | 搬出时数值转换和 scale | `mem_copy(dst, convert(l0c, dtype=..., scale=...))` |
 | 矢量侧转换数值类型 | `vcast`（可配 `RoundingMode`） |
 | 标量侧转换数值类型 | `cast` |
-| 按另一种 dtype 重新解释字节 | `t.view(dtype=...)` / `t.reinterpret(...)`，**不做数值转换** |
+| 按另一种 dtype 重新解释字节 | `t.view(dtype=...)` / `cbd.from_tensor(t, ...)`，**不做数值转换** |
 
 ## 下一步
 

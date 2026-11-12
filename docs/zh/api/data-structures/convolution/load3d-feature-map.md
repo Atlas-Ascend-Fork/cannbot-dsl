@@ -6,7 +6,7 @@
 
 ## 功能说明
 
-描述 [load3d](../../data-movement/convolution/load3d.md) 的单批源特征图几何及四条边界的补值宽度。它只描述几何，不分配或填充 L1；补值的数值由 [Load3DPadding](load3d-padding.md) 决定。
+配置[load3d](../../data-movement/convolution/load3d.md)处理的单个样本特征图的高度、宽度、通道数及四周填充量。填充值由[Load3DPadding](load3d-padding.md)指定，填充在`load3d`搬运时执行。
 
 ## 函数原型
 
@@ -18,7 +18,7 @@ Load3DFeatureMap(
 ) -> Load3DFeatureMap
 ```
 
-整数参数也接受 DSL 整数标量表达式。
+整数参数也可传入核函数中计算得到的整数值，取值范围见参数说明。
 
 ## 参数说明
 
@@ -38,7 +38,7 @@ Load3DFeatureMap(
 
 ## 约束说明
 
-声明的几何必须与源数据的实际排布一致；构造配置对象不会搬运数据。与 filter、stride、dilation 的组合要求见 [load3d](../../data-movement/convolution/load3d.md#约束说明)。
+`height`、`width`和`channels`须与L1源特征图的实际尺寸一致。与`filter`、`stride`、`dilation`的组合要求见[load3d](../../data-movement/convolution/load3d.md#约束说明)。
 
 ## 调用示例
 

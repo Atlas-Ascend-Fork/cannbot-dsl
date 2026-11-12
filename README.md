@@ -15,7 +15,7 @@
 
 > **2026-10-30**
 >
-> - **📦 发布 CANNBot-DSL 0.8.0 wheel 包**：`master` 分支配套 `cannbot-dsl==0.8.0`，可直接通过 pip 安装。
+> - **📦 发布 CANNBot-DSL 0.8.0 wheel 包**：可直接通过 pip 安装 `cannbot-dsl==0.8.0`。
 >
 > **2026-09-30**
 >
@@ -37,12 +37,12 @@ CANNBot 是 [CANN](https://hiascend.com/software/cann) 社区的 Infra 智能体
 | 昇腾产品 | Ascend 950PR / Ascend 950DT（NPU ARCH 3510），见[硬件兼容性查询](https://www.hiascend.com/hardware/compatibility) |
 | CPU 架构 | x86_64 / aarch64 |
 | 操作系统 | CANN 支持的 Linux 发行版，见[硬件兼容性查询](https://www.hiascend.com/hardware/compatibility) |
-| Python | 3.10、3.11、3.12 |
+| Python | 3.10、3.11、3.12、3.13 |
 | CANN | 9.2.1，见 [CANN 安装部署](https://www.hiascend.com/zh/cann/download?versionId=813&ids=d806%2Ch0501%2Ch0601%2Ch0703&currentTab=0) |
-| CANNBot-DSL | 0.8.0 |
+| CANNBot-DSL | 0.8.2 |
 | torch | 2.7.1 / 2.9.0 / 2.10.0 / 2.11.0 / 2.12.0 |
 
-> 上表口径截至 2026-10-29。CANN 软件包请以 [CANN 安装部署](https://www.hiascend.com/zh/cann/download?versionId=813&ids=d806%2Ch0501%2Ch0601%2Ch0703&currentTab=0)页面提供的产品和架构匹配版本为准。
+> CANN 软件包请以 [CANN 安装部署](https://www.hiascend.com/zh/cann/download?versionId=813&ids=d806%2Ch0501%2Ch0601%2Ch0703&currentTab=0)页面提供的产品和架构匹配版本为准。
 
 
 ## ⚡️ 快速上手
@@ -62,10 +62,10 @@ source ${install_path}/ascend-toolkit/set_env.sh
 
 ### 2. 安装 CANNBot-DSL
 
-CANNBot-DSL 0.8.0 已发布到 pip 源。发行包名为 `cannbot-dsl`，导入名为 `cannbotdsl`：
+CANNBot-DSL 0.8.2 已发布到 pip 源。发行包名为 `cannbot-dsl`，导入名为 `cannbotdsl`：
 
 ```bash
-python -m pip install cannbot-dsl==0.8.0
+python -m pip install cannbot-dsl==0.8.2
 ```
 
 
@@ -75,62 +75,10 @@ python -m pip install cannbot-dsl==0.8.0
 python -c 'import cannbotdsl; print(cannbotdsl.__version__)'
 ```
 
-接下来编译并安装算子包：将 `samples/` 中已登记的算子编译打包为 Native wheel，再安装生成的 wheel。完整流程见 [Native 打包](packaging/native/README.md)，支持按 `k3`、`ds41` 网络分组或单个算子构建。
+### 3. 获取源码并运行算子
 
-### 3. 运行一个算子
-
-以 `flash_kda` 为例。该样例依赖 CANNBot-DSL 0.8.0，先生成 metadata，再执行 FlashKDA：
-
-```python
-import math
-
-import torch
-import torch_npu
-
-from flash_kda.flash_kda import flash_kda
-from flash_kda.flash_kda_metadata import flash_kda_metadata
-
-B, NQK, NV, S, D = 1, 3, 3, 8192, 128
-q = torch.randn(B, NQK, S, D, device="npu", dtype=torch.bfloat16)
-k = torch.randn_like(q)
-v = torch.randn(B, NV, S, D, device="npu", dtype=torch.bfloat16)
-g = torch.randn_like(v)
-beta = torch.randn(B, NV, S, device="npu", dtype=torch.bfloat16)
-initial_state = torch.zeros(B, NV, D, D, device="npu", dtype=torch.float32)
-A_log = torch.randn(NV, device="npu", dtype=torch.float32)
-dt_bias = torch.randn(NV, D, device="npu", dtype=torch.float32)
-
-metadata = flash_kda_metadata(q, v, initial_state, "BNSD")
-out, final_state = flash_kda(
-    q, k, v, g, beta, 1 / math.sqrt(D), initial_state,
-    A_log, dt_bias, -5.0, "BNSD", metadata,
-)
-
-print("out", tuple(out.shape))
-print("final_state", tuple(final_state.shape))
-```
-
-样例以目录为单位组织，运行前请在仓库根目录将 `samples/attention` 加入 `PYTHONPATH`：
-
-```bash
-export PYTHONPATH="$PWD/samples/attention:$PYTHONPATH"
-python3 your_script.py
-```
-
-运行成功时打印：
-
-```text
-out (1, 3, 8192, 128)
-final_state (1, 3, 128, 128)
-```
-
-各算子的接口参数、数据类型约束与返回值说明，见[算子列表](#算子列表)中对应样例的 README。
-
-### 4. 运行精度测试
-
-```bash
-python3 -m pytest test/attention/flash_kda/test_flash_kda.py -v
-```
+获取源码、运行Add样例和精度测试的方法见[源码构建](docs/zh/install/source-build.md)。
+需要提前编译并分发算子时，参见[AOT与Native算子包](docs/zh/guide/aot-packaging.md)。
 
 
 ## 📦 算子列表

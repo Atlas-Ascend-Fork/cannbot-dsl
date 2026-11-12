@@ -5,13 +5,17 @@
 ## 目录
 
 - [控制流概览](./control-flow.md)
-- [for](./for.md)
+- for 循环
+  - [for](./for.md)
+  - [range](./for/range.md)
+  - [cannbotdsl.range](./for/dsl-range.md)
+  - [range_constexpr](./for/range-constexpr.md)
+  - [遍历元组和列表](./for/sequences.md)
 - [if / elif / else](./if.md)
 - [while](./while.md)
 - [编译期控制](./compile-time-control.md)
   - [const_expr](./compile-time-control/const-expr.md)
-  - [target_version](./compile-time-control/target-version.md)
-- [判断条件](./predicate-expressions.md)
+- 条件判断
   - [all](./predicate-expressions/all.md)
   - [and](./predicate-expressions/and.md)
   - [any](./predicate-expressions/any.md)

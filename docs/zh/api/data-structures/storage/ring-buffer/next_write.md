@@ -6,23 +6,21 @@
 
 ## 功能说明
 
-返回当前写游标对应槽位的 Tensor 或 Storage，再将该写游标推进一个位置；经过 `self.depth` 个槽位后回到第一个槽位。
+返回当前写游标对应槽位的 Tensor，再将写游标推进一个位置；经过 `self.depth` 个槽位后回到第一个槽位。
 
 ## 函数原型
 
 ```python
-next_write(self, *, bare=False) -> Tensor | Storage
+next_write(self) -> Tensor
 ```
 
 ## 参数说明
 
-| 参数名 | 输入/输出 | 说明 |
-| --- | --- | --- |
-| `bare` | 输入 | 返回形式，类型为 Python `bool`，默认 `False`。`False` 返回采用声明布局的 Tensor；`True` 返回 [Storage](../storage/overview.md)，可通过其 `view()` 绑定布局。 |
+无。
 
 ## 返回值说明
 
-返回选中槽位的 Tensor 或 Storage。Tensor 的元素类型及布局取自 RingBuffer 的声明，Storage 保存该槽位的容量和默认视图。
+返回选中槽位的 Tensor，其元素类型和布局取自 RingBuffer 的声明。
 
 ## 约束说明
 

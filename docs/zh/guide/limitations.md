@@ -109,7 +109,7 @@ SIMD + SIMT 混合编程和纯 SIMT 编程都需要 CANN 9.2.0 及以上版本�
 | 现象 | 先看 |
 | --- | --- |
 | 普通 Python 调 Kernel / `@jit` 报错 | 入口是不是 `@host` |
-| `const_expr` / `target_version` 报错 | 是不是写在 `@jit` / `@kernel` 里；传入的是不是编译期值 |
+| `const_expr` 报错 | 传入的是不是编译期值 |
 | `cbd.range` 不能迭代 | 是不是当成 Python `range` 用在了 Host 普通循环里 |
 | 同步相关的数据错乱 | RingBuffer 选槽顺序和保存的 Tensor 是否正确；有没有在 VF 里选槽；VF 是否缺 `vmem_bar` |
 | 多核才错、`block_dim=1` 正常 | `*_sync_block_*` 是不是漏写了 `mode=0`（默认 2 只管核内）；`flag_id` 是否超过 15 或与 `global_sync_all` 的 0/1/2 撞号 |

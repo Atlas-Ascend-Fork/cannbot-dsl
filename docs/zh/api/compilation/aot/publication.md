@@ -23,7 +23,7 @@ cannbotdsl.aot.build(*, collectors, target, output, operators=None, pattern="*.p
 | `collectors` | 输入 | 包含 `@aot.export` 发布入口的模块或目录。 |
 | `target` | 输入 | 目标设备型号。 |
 | `output` | 输入 | Native 产物输出目录。 |
-| `operators` | 输入 | 可选的收集任务名称列表。 |
+| `operators` | 输入 | 可选，指定要构建的发布入口名称。例如，`["my_op"]`只构建由`@aot.export("my_op")`声明的入口。 |
 | `pattern` | 输入 | 扫描 Python 文件的匹配模式，默认为 `*.py`。 |
 
 ## 返回值说明

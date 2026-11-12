@@ -24,12 +24,11 @@ reshape(self, *shape) -> Tensor
 
 返回新 Tensor，逻辑形状改为目标形状，`rank` 随新形状确定；`dtype`、`memloc` 不变，并共享原存储。
 
-能用各轴固定跨度表示变换后的访问方式时，推导相应的逻辑布局和物理布局；否则返回组合视图，保留原物理布局，通过编译器维护的坐标映射访问原数据。
+返回视图的`stride`和`data_format`读取规则见[stride](./properties/stride.md#形状变换后的跨度)。
 
 ## 约束说明
 
-- 当目标形状无法通过原布局的逐轴跨度表示，或原 Tensor 为 NZ / ZN 布局、组合视图时，返回组合视图。普通 ND 布局能推导出目标逐轴跨度时，不受此限制。
-- 返回组合视图时，其 `stride`、`physical_format` 和 `data_format` 不支持读取，读取会报错；`physical_layout`、`physical_shape` 和 `physical_stride` 仍可读取。
+无
 
 ## 调用示例
 

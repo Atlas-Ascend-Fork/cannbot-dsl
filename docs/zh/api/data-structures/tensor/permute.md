@@ -6,7 +6,7 @@
 
 ## 功能说明
 
-按照参数 `dims` 指定的顺序重新排列当前 Tensor 的逻辑轴，返回按该顺序排列形状和跨度的新 Tensor 视图。本操作不立即搬运或重排实际数据。
+按照参数`dims`指定的顺序重新排列Tensor的逻辑轴，返回新的Tensor视图。本操作不搬运或重排实际数据。
 
 ## 函数原型
 
@@ -24,14 +24,12 @@ permute(self, *dims) -> Tensor
 
 返回按 `dims` 排列逻辑轴的新 Tensor，共享原存储，`dtype`、`rank` 和 `memloc` 不变。
 
-普通 ND 布局的逻辑形状、跨度和物理布局均按 `dims` 排列。交换二维 NZ/ZN Tensor 的两个轴时，格式在 NZ 和 ZN 之间切换。对于存储在 L1 中的 Tensor，返回视图保留原物理布局。原 Tensor 为组合视图时，返回结果仍为组合视图，其 `physical_layout` 保持不变，由编译器根据 `dims` 调整坐标映射。
+例如，普通ND Tensor的形状为`(2, 3)`、跨度为`(3, 1)`时，`permute(1, 0)`返回形状为`(3, 2)`、跨度为`(1, 3)`的视图。交换二维NZ、ZN Tensor的两个轴时，`data_format`在`"nz"`和`"zn"`之间切换。对于存储在L1中的Tensor，返回视图保留原`physical_layout`。
 
 ## 约束说明
 
-- 返回组合视图时，其 `stride`、`physical_format` 和 `data_format` 不支持读取，读取会报错；`physical_layout`、`physical_shape` 和 `physical_stride` 仍可读取。
-
+- 对已不支持读取`stride`和`data_format`的变换视图调用本接口后，仍不支持读取这两个属性；可以通过`physical_layout`查看原数据的存储布局。相关示例见[stride](./properties/stride.md#形状变换后的跨度)。
 - 逻辑形状不能包含嵌套 tuple。
-- 支持交换二维 NZ/ZN Tensor 的两个轴，布局格式在 NZ 与 ZN 之间切换，底层数据不重排。
 - 支持 GM 和片上存储中的 Tensor。
 
 ## 调用示例

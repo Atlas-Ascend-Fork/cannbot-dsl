@@ -8,6 +8,20 @@
 
 将 `src` 描述的数据，按照 `copy_options` 配置的控制项，搬运到 `dst` 指定的存储区域。
 
+### 随路功能
+
+随路功能在搬运过程中对数据进行处理，结果写入`dst`。通过下列Tensor方法指定处理方式，再将返回的Tensor作为`mem_copy`的源。
+
+| 功能 | 调用形式 | 说明 |
+| --- | --- | --- |
+| [ReLU](../data-structures/tensor/relu.md) | `mem_copy(dst, src.relu())` | 在L0C结果搬出时，对元素执行ReLU。 |
+| [类型转换、量化与激活](../data-structures/tensor/convert.md) | `mem_copy(dst, src.convert(dtype, scale=scale))` | 在L0C结果搬出时，按目标数据类型、缩放系数和可选激活参数处理数据。 |
+| [填充](../data-structures/tensor/pad.md) | `mem_copy(dst, src.pad((0, 6), value=0))` | 在最后一维的末尾填充6个零，将原数据和填充数据写入目标。 |
+
+各搬运方向支持的数据类型、格式和功能组合见[搬运方向](#搬运方向)，各方法的参数和调用示例见表中链接。
+
+搬运分区通过[Tensor.partition](../data-structures/tensor/partition.md)指定；原子写入和FP32通道拆分通过[copy_options](copy-options.md)指定。Tensor的[reshape](../data-structures/tensor/reshape.md)、[permute](../data-structures/tensor/permute.md)及[索引与切片](../data-structures/tensor/indexing.md)用于描述搬运数据的形状、轴顺序和选取范围。
+
 ## 函数原型
 
 ```python

@@ -11,10 +11,10 @@
 
 ```python
 TensorSpec(
-    shape: Iterable,
+    shape,
     dtype: DType,
     *,
-    stride: Iterable | None = None,
+    stride=None,
     storage_format: str = "nd",
 ) -> TensorSpec
 ```
@@ -23,16 +23,16 @@ TensorSpec(
 
 | 参数 | 输入/输出 | 说明 |
 | --- | --- | --- |
-| `shape` | 输入 | Tensor各维的长度，支持整数、[Dim](./dim.md) 或维度表达式。静态长度的取值范围为 `[0, 2**63 - 1]`。 |
+| `shape` | 输入 | Tensor各维的长度，使用元组或列表按顺序指定，例如`(16, 32)`。每一项支持整数、[Dim](./dim.md) 或维度表达式。静态长度的取值范围为 `[0, 2**63 - 1]`。 |
 | `dtype` | 输入 | Tensor的元素类型，支持的取值见 [dtype支持类型](#dtype支持类型)。 |
-| `stride` | 输入 | 沿各维移动一个位置时跨过的元素数，项数须与 `shape` 一致。支持整数、`Dim` 或维度表达式；静态值的取值范围为 `[0, 2**63 - 1]`。默认值为 `None`，根据 `shape` 自动推导紧凑行主序步长。 |
+| `stride` | 输入 | 沿各维移动一个位置时跨过的元素数，使用元组或列表指定，例如二维行主序Tensor的`(32, 1)`。项数须与 `shape` 一致。支持整数、`Dim` 或维度表达式；静态值的取值范围为 `[0, 2**63 - 1]`。默认值为 `None`，根据 `shape` 自动推导紧凑行主序步长。 |
 | `storage_format` | 输入 | Tensor的存储格式，可选 `"nd"`、`"nz"`，分别表示ND格式和NZ分形格式。默认值为 `"nd"`。 |
 
 ### dtype支持类型
 
 | 存储格式 | 支持的数据类型 |
 | --- | --- |
-| `"nd"` | 浮点类型：`dtypes.float16`、`dtypes.float32`、`dtypes.float64`、`dtypes.bfloat16`、`dtypes.float8_e4m3fn`、`dtypes.float8_e5m2`、`dtypes.float8_e8m0`、`dtypes.hifloat8`、`dtypes.fp4x2_e2m1`<br>有符号整数：`dtypes.int8`、`dtypes.int16`、`dtypes.int32`、`dtypes.int64`<br>无符号整数：`dtypes.uint8`、`dtypes.uint16`、`dtypes.uint32`、`dtypes.uint64`<br>布尔类型：`dtypes.bool`；`dtypes.bool` 是同一类型的别名 |
+| `"nd"` | 浮点类型：`dtypes.float16`、`dtypes.float32`、`dtypes.float64`、`dtypes.bfloat16`、`dtypes.float8_e4m3fn`、`dtypes.float8_e5m2`、`dtypes.float8_e8m0`、`dtypes.hifloat8`、`dtypes.fp4x2_e2m1`<br>有符号整数：`dtypes.int8`、`dtypes.int16`、`dtypes.int32`、`dtypes.int64`<br>无符号整数：`dtypes.uint8`、`dtypes.uint16`、`dtypes.uint32`、`dtypes.uint64`<br>布尔类型：`dtypes.bool` |
 | `"nz"` | 浮点类型：`dtypes.float16`、`dtypes.bfloat16`、`dtypes.float32`、`dtypes.float8_e4m3fn`、`dtypes.float8_e5m2`、`dtypes.fp4x2_e2m1`<br>有符号整数：`dtypes.int8`<br>无符号整数：`dtypes.uint8` |
 
 ## 返回值说明

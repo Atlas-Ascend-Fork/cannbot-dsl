@@ -28,7 +28,7 @@
 | `size` | 算 Shape / Layout 的元素总数 | 偶尔 |
 | `make_layout` / `make_tensor` | 手工构造 Layout / Tensor | 很少，特殊布局才用 |
 | `Tile` / `PartitionTiler` | 切块描述的两个辅助类型 | 很少 |
-| `view` / `reinterpret` / `permute` | 三种视图接口，见下文 | 视情况 |
+| `view` / `from_tensor` / `permute` | 三种视图接口，见下文 | 视情况 |
 
 CANNBot-DSL **不提供 Layout 代数**（没有 `composition`、`logical_divide`、`complement` 这类运算）。上面这些是纯粹的构造与换算工具，不能用来组合出更复杂的布局运算。切块一律通过 `tile_slice` 加 `Tiler` 表达，布局转换一律通过 `mem_copy` 的随路转换完成。
 :::
@@ -45,8 +45,8 @@ CANNBot-DSL **不提供 Layout 代数**（没有 `composition`、`logical_divide
 | `t.dtype` | 元素存储类型 |
 | `t.memloc` | 所在存储层级 |
 | `t.layout` | 逻辑 Layout |
-| `t.physical_layout` / `t.physical_shape` / `t.physical_stride` | 物理布局 |
-| `t.logical_format` / `t.physical_format`（别名 `t.data_format`） | 逻辑 / 物理格式 |
+| `t.physical_layout` | 物理布局 |
+| `t.data_format` | 数据存储格式 |
 | `t.rank` | 逻辑 Shape 的顶层维数 |
 
 ### 逻辑布局与物理布局
@@ -87,27 +87,27 @@ shape_view = x.view(-1, 8)                     # 最多一个 -1，自动推导
 dtype_view = bits.view(dtype=cbd.dtypes.float32)  # 保留字节，换 dtype 解释
 ```
 
-三种形式（位置 Shape / `size=` / `dtype=`）互斥，每次调用只能选一种。
+形状位置参数和`dtype=`互斥，每次调用只能选一种。
 
 约束：仅支持逻辑格式和物理格式**均为 ND** 的 Tensor；`dtype view` 要求源 Tensor 的末维 Stride 为 1，且不支持 `bool`。dtype view **不执行数值转换**，需要转换数值请用 `vcast` / `cast`。
 
-### `reinterpret()`：改类型、布局、物理步长、起点
+### `from_tensor()`：改类型、布局、物理步长、起点
 
 ```python
 tmp = cbd.Buffer(cbd.MemLoc.UB, dtypes.float32, cbd.make_layout((4,)))
-view = tmp.reinterpret(
-    dtype=dtypes.float16, layout=cbd.make_layout((8,))
+view = cbd.from_tensor(
+    tmp, dtype=dtypes.float16, layout=cbd.make_layout((8,))
 )  # 16 字节换一种解释
 ```
 
 ```python
-t.reinterpret(
-    dtype=None, layout=None, *,
+cbd.from_tensor(
+    t, dtype=None, layout=None,
     physical_layout=None, data_format=None, offset=0,
 )
 ```
 
-`offset` 的单位始终是**字节**，基线是调用 `reinterpret()` 的当前 Tensor。`layout` 描述逻辑形状和元素步长，`physical_layout` 描述包含 padding 的物理布局，两者都用 `make_layout` 创建。布局可以包含运行时尺寸或步长；重绑定不搬动数据，也不做通用容量检查，调用方保证访问范围有效。
+`offset` 的单位始终是**字节**，基线是传入的源Tensor。`layout` 描述逻辑形状和元素步长，`physical_layout` 描述包含 padding 的物理布局。布局可以包含运行时尺寸或步长；重绑定不搬动数据，也不做通用容量检查，调用方保证访问范围有效。
 
 ### `permute()`：重排轴顺序
 
@@ -277,8 +277,8 @@ Add().run(x, y, out)
 | --- | --- |
 | 从大 Tensor 取第 (i, j) 块 | `tile_slice(t, tiler, (i, j))` |
 | 改变逻辑形状，不动数据 | `t.view(...)` |
-| 按另一种 dtype 解释同一段字节 | `t.view(dtype=...)` 或 `t.reinterpret(dtype=..., layout=...)` |
-| 在片上存储的某个字节偏移处开一个新视图 | `t.reinterpret(..., offset=bytes)` |
+| 按另一种 dtype 解释同一段字节 | `t.view(dtype=...)` 或 `cbd.from_tensor(t, dtype=..., layout=...)` |
+| 在片上存储的某个字节偏移处开一个新视图 | `cbd.from_tensor(t, offset=bytes)` |
 | 交换 Tensor 的轴顺序 | `t.permute(...)` |
 | ND 数据变成 Cube 要的 NZ | 声明 NZ 目的 Tensor，再 `mem_copy(dst, src)` |
 | 矩阵转置加载进 L0A/L0B | `mem_copy(l0a, l1_slice.permute(...))` |

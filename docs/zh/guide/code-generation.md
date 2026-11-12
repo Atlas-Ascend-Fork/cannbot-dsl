@@ -200,13 +200,13 @@ IS_DAV_3510 = TARGET_ARCH == "dav-3510"
 
 @cbd.kernel
 def compile_time_kernel(out: cbd.Tensor):
-    if cbd.target_version(IS_DAV_3510):
+    if cbd.const_expr(IS_DAV_3510):
         out[1] = 950
     else:
         out[1] = 0
 ```
 
-`target_version()` 本身不查询硬件版本，版本信息和比较逻辑必须由调用方提供；它只是把一个已经算好的 Python 布尔值标记为编译期条件。
+`const_expr()` 不查询硬件版本，版本信息和比较逻辑由调用方提供。
 
 ## 每种代码能写在哪
 
@@ -221,10 +221,10 @@ def compile_time_kernel(out: cbd.Tensor):
 | 创建 `RingBuffer` | ✗ | ✗ | ✗ | ✓ | ✓ |
 | `next_write()` / `next_read()` | ✗ | ✗ | ✗ | ✓ | ✓ |
 | 创建 `Array` 并读写标量历史 | ✗ | ✗ | ✗ | ✓ | ✓ |
-| `const_expr()` / `target_version()` 作为控制流条件 | ✗ | 见下 | ✓ | ✓ | ✓ |
+| `const_expr()` 作为控制流条件 | ✗ | 见下 | ✓ | ✓ | ✓ |
 | 启动 Kernel（`k[n](...)`） | ✗ | ✓ | ✗ | ✗ | ✗ |
 
-官方接口页写明：`const_expr()` / `target_version()` 作为 `if`/`while` 的完整条件时，只能用在 `@jit` 或 `@kernel` 里。`@host` 上若条件已经是 Python 布尔值，直接写 `if` 即可。`rms_norm` 的 `@host` 里也会写 `if const_expr(...)` 来挑选 Kernel 类——这是构图期选择实现，不是设备分支。
+`const_expr()` 可用于显式声明编译期条件；传入值须在编译期确定。具体用法参见 [const_expr](../api/language/control-flow/compile-time-control/const-expr.md)。
 
 简化成一句话：**片上资源只能在设备上下文里创建，Kernel 只能在 `@host` 函数体里启动。**
 

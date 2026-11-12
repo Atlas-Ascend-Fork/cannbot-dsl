@@ -6,7 +6,7 @@
 
 ## 功能说明
 
-将标量`value`转换为`dtype`指定的数据类型。舍入与饱和效果取决于具体类型和参数组合。
+将标量`value`转换为`dtype`指定的数据类型。支持的类型组合、舍入模式和饱和选项见[约束说明](#约束说明)。
 
 ## 函数原型
 
@@ -19,9 +19,9 @@ simt.cast(value, *, dtype, rounding=RoundingMode.RN, saturate=False) -> 目标�
 | 参数 | 输入/输出 | 说明 |
 | --- | --- | --- |
 | value | 输入 | 带明确数据类型的标量；本页源类型范围为`int8`、`uint8`、`int16`、`uint16`、`int32`、`uint32`、`int64`、`uint64`、`float16`、`bfloat16`、`float32`或`bool`。 |
-| dtype | 输入 | 目标标量类型描述符；可选`int8`、`uint8`、`int16`、`uint16`、`int32`、`uint32`、`int64`、`uint64`、`float16`、`bfloat16`、`float32`、`bool`。必须与源类型不同，合法组合见约束说明。 |
-| rounding | 输入 | [RoundingMode](./roundingmode.md) 枚举或名称字符串，默认`RoundingMode.RN`；是否生效取决于源、目标类型。 |
-| saturate | 输入 | Python bool，默认False，是否请求对应转换的饱和形式。 |
+| dtype | 输入 | 目标标量数据类型；可选`int8`、`uint8`、`int16`、`uint16`、`int32`、`uint32`、`int64`、`uint64`、`float16`、`bfloat16`、`float32`、`bool`。必须与源类型不同，合法组合见约束说明。 |
+| rounding | 输入 | [RoundingMode](./roundingmode.md)枚举或名称字符串，默认`RoundingMode.RN`。各类型组合的可选值见[约束说明](#约束说明)。 |
+| saturate | 输入 | 是否启用饱和转换，类型为`bool`，默认`False`。各类型组合的支持情况和`CTRL[60]`设置要求见[约束说明](#约束说明)。 |
 
 ## 返回值说明
 
@@ -29,21 +29,27 @@ simt.cast(value, *, dtype, rounding=RoundingMode.RN, saturate=False) -> 目标�
 
 ## 约束说明
 
-源和目标必须都是标量，且数据类型不同。下表中的整数类型指`int8`、`uint8`、`int16`、`uint16`、`int32`、`uint32`、`int64`、`uint64`。
+源和目标均须为标量，且数据类型不同。下表列出支持的转换组合。表中的舍入模式均为[RoundingMode](./roundingmode.md)成员。
 
-| 源类型 | 目标类型 | 额外限制 |
-| --- | --- | --- |
-| `float32` | `float16`、`bfloat16` | 舍入与饱和选项取决于目标类型；不要将所有舍入枚举理解为每种组合均可用。 |
-| `float16`、`bfloat16` | `float32` | `rounding`、`saturate`不生效。 |
-| `float16` | `bfloat16` | 使用`saturate=False`。 |
-| `bfloat16` | `float16` | 舍入与饱和选项取决于目标半精度类型。 |
-| 上述整数类型 | `float16`、`bfloat16` | 可用舍入选项取决于整数位宽及目标浮点类型。 |
-| `float16`、`bfloat16` | 上述整数类型 | 转为8位整数时固定向零舍入；整数输出不应用`saturate`。 |
-| 上述整数类型、`float32`、`bool` | 上述整数类型、`float32`、`bool`，且与源类型不同 | 按普通标量数值转换处理，不能依赖`rounding`或`saturate`改变行为。浮点转整数时应保证输入有限且结果在目标范围内。 |
+| 源类型 | 目标类型 | `rounding` | `saturate` |
+| --- | --- | --- | --- |
+| `float32` | `float16` | `RN`、`RNA`、`RD`、`RU`、`RZ`、`RO`。 | `False`或`True`；启用时须满足下文`CTRL[60]`设置要求。 |
+| `float32` | `bfloat16` | `RN`、`RNA`、`RD`、`RU`、`RZ`。 | `False`或`True`；启用时须满足下文`CTRL[60]`设置要求。 |
+| `float16`、`bfloat16` | `float32` | 不生效。 | 不生效。 |
+| `float16` | `bfloat16` | `RN`、`RNA`、`RD`、`RU`、`RZ`。 | 仅`False`。 |
+| `bfloat16` | `float16` | `RN`、`RNA`、`RD`、`RU`、`RZ`。 | `False`或`True`；启用时须满足下文`CTRL[60]`设置要求。 |
+| `int16`、`uint16` | `float16`、`bfloat16` | `RN`、`RD`、`RU`、`RZ`。 | 仅`False`。 |
+| `int32`、`uint32` | `float16` | `RN`、`RNA`、`RD`、`RU`、`RZ`。 | `False`或`True`；启用时须满足下文`CTRL[60]`设置要求。 |
+| `int32`、`uint32` | `bfloat16` | `RN`、`RNA`、`RD`、`RU`、`RZ`。 | 仅`False`。 |
+| `int64`、`uint64` | `float16`、`bfloat16` | `RN`、`RNA`、`RD`、`RU`、`RZ`。 | 仅`False`。 |
+| `float16`、`bfloat16` | `int8`、`uint8` | 固定向零舍入，`rounding`参数不生效。 | 不生效。 |
+| `float16`、`bfloat16` | `int16`、`uint16` | `RN`、`RD`、`RU`、`RZ`。 | 不生效。 |
+| `float16`、`bfloat16` | `int32`、`uint32`、`int64`、`uint64` | `RN`、`RNA`、`RD`、`RU`、`RZ`。 | 不生效。 |
+| `int8`、`uint8`、`int16`、`uint16`、`int32`、`uint32`、`int64`、`uint64`、`float32`、`bool` | 同左，且与源类型不同 | 不生效，按普通标量数值转换处理；浮点转整数时，输入须为有限值且结果在目标范围内。 | 不生效。 |
 
-- 表外组合不属于本页明确列出的转换范围；不能因为源、目标都在类型列表中就任意组合。
-- 使用默认舍入模式`RN`；需要其他舍入模式时，必须满足对应类型组合的设备支持条件。
-- `saturate=True`不是通用的`[0, 1]`截断；半精度饱和转换还依赖设备配置，仅设置该参数不保证生效。
+- 不支持表外类型组合。`int8`、`uint8`转换为`float16`或`bfloat16`时，须先转换为`int32`。
+- 表中标明支持`saturate=True`的转换受`CTRL[60]`控制：SIMD与SIMT混合执行时，须在进入SIMT函数前，在SIMD侧将`CTRL[60]`置为`0`；纯SIMT Kernel中不能通过该参数启用这些转换的饱和模式。寄存器设置接口见[set_ctrl](../../execution/device/spr/set-ctrl.md)。
+- 此处的饱和转换将超范围结果限制为目标类型的有限值，不是将结果限制到`[0, 1]`。
 
 ## 调用示例
 

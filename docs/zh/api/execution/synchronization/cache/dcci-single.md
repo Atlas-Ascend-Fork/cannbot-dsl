@@ -5,15 +5,13 @@
 
 ## 功能说明
 
-将本核DCache中指定GM地址所在缓存行的脏数据写回GM，并使该缓存行失效。失效后的下一次标量读取会重新从GM加载数据。
+将本核DCache中指定GM地址所在缓存行中已修改的数据写回GM，并使该缓存行失效。失效后的下一次标量读取会重新从GM加载数据。
 
 ## 函数原型
 
 ```python
-dcci_single(point: Any) -> None
+dcci_single(point) -> None
 ```
-
-`Any`来自`typing`。
 
 ## 参数说明
 

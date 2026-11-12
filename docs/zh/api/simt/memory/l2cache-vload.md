@@ -29,7 +29,7 @@ simt.l2cache_vload(ptr, *, dtype) -> 短向量
 
 - UB和通用地址空间指针被拒绝。
 - ptr元素必须与短向量分量一致，所有分量须连续、在界内，起始地址按向量ABI对齐。调用者需保证元素类型与边界正确，`dtype`参数不执行数值转换。
-- L2/GM的一致性不等于各核Data Cache已失效。与普通缓存访问混用且数据被其他核或原子更新后，读取方需要适当DCCI维护；写入与标志传递还应配合同步及内存栅栏。
+- 同一地址的数据已存入读取核的Data Cache后，其他核或原子操作更新GM不会使该缓存行自动失效。读取核再次通过Data Cache访问前，须先使对应缓存行失效，参见[缓存控制](../../execution/synchronization/cache/overview.md)。线程间通过完成标志交接数据时，还须满足[内存可见性与顺序要求](../synchronization/threadfence.md)。
 
 ## 调用示例
 

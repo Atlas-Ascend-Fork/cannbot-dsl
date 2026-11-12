@@ -25,8 +25,9 @@ else:
 
 ## 条件说明
 
-`condition`可以是Python `bool`、`const_expr(...)`、`target_version(...)`，或由
-Tensor读取值、Kernel标量参数等运行时数据构成的标量条件。运行时整数条件按非0判断；运行时浮点数中，`+0.0`和`-0.0`为假，其他值（包括`NaN`）为真。普通Python值按Python的真值规则判断。
+`condition`支持单个布尔值、整数、浮点数或比较结果，例如`x[0] > 0`、`i < n`。
+
+需要在编译期展开循环时，使用`while cbd.const_expr(condition):`。[const_expr](./compile-time-control/const-expr.md)由CANNBot-DSL提供，调用前先通过`import cannbotdsl as cbd`导入。每次判断循环条件时，条件值都须能在编译期确定。
 
 ## `while ... else`
 
@@ -35,6 +36,8 @@ Tensor读取值、Kernel标量参数等运行时数据构成的标量条件。�
 并在发生`break`时跳过`else`。
 
 ## 约束说明
+
+变量初始化、类型、作用域及提前退出的错误示例见[控制流约束](./control-flow.md#约束)。
 
 - 不在编译期展开的循环体不能使用`break`、`continue`、`return`或`raise`提前结束或跳出循环。
 - 动态`while`循环体内新创建的Tensor等资源不能直接在循环外使用；需要在循环外继续使用时，应在循环前创建或取得该资源。

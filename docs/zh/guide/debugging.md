@@ -274,7 +274,7 @@ dt = (time.perf_counter() - t0) / 100
 
 通过 `@kernel(profile=cannbotdsl.ProfileSpec(...))` 配置上报名称、逻辑类型及 Tensor 参数角色；
 未提供配置时，框架自动补齐名称并推导默认 Tensor 角色。具体规则见
-[Profiling 名称与类型](../api/language/profiling.md)。
+[Profiling 名称与类型](../api/debug/profiling.md)。
 
 设备侧可以用 [`get_system_cycle()`](../api/execution/device/get-system-cycle.md) 读周期数，给关键代码段做粗粒度计时。注意这会引入标量指令，别放在最内层循环里。
 

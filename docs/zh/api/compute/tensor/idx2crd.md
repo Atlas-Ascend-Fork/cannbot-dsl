@@ -11,10 +11,10 @@
 ## 函数原型
 
 ```python
-idx2crd(idx, shape: Shape) -> Coord | _Coord
+idx2crd(idx, shape: Shape)
 ```
 
-备注：`idx` 和 `shape` 均为静态值时，返回 Python 整数或元组形式的坐标；包含运行时值时，返回内部坐标对象 `_Coord`。`_Coord` 未作为公开接口导出，由 `idx2crd()` 返回。
+返回坐标的结构与`shape`一致，可按维读取，例如`coord[0]`表示第一维坐标。
 
 ## 参数说明
 

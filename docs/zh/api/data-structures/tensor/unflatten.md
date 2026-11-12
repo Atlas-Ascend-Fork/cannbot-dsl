@@ -25,14 +25,11 @@ unflatten(self, dim, sizes) -> Tensor
 
 返回新 Tensor，逻辑形状将指定轴拆分为给定长度，`rank` 随新形状确定；`dtype`、`memloc` 不变，并共享原存储。
 
-能用各轴固定跨度表示变换后的访问方式时，推导相应的逻辑布局和物理布局；否则返回组合视图，保留原物理布局，通过编译器维护的坐标映射访问原数据。
+返回视图的`stride`和`data_format`读取规则见[stride](./properties/stride.md#形状变换后的跨度)。
 
 ## 约束说明
 
-- 当拆分后的形状无法通过原布局的逐轴跨度表示，或原 Tensor 为 NZ / ZN 布局、组合视图时，返回组合视图。普通 ND 布局能推导出目标逐轴跨度时，不受此限制。
-- 返回组合视图时，其 `stride`、`physical_format` 和 `data_format` 不支持读取，读取会报错；`physical_layout`、`physical_shape` 和 `physical_stride` 仍可读取。
-
-- 当前 Tensor 的逻辑形状必须非空，且不能包含嵌套 tuple。
+- Tensor须至少有一个轴，形状须直接列出各轴长度，如`(2, 3)`；不支持`((2, 3), 4)`这样的嵌套形状。
 - `dim` 必须为 Python 整数，范围为 `-self.rank ≤ dim < self.rank`。负数轴编号从末轴向前计数，`-1` 表示最后一轴。
 
 ## 调用示例

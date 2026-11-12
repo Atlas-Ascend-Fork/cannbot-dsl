@@ -4,5 +4,4 @@
 
 | 接口 | 功能 |
 | --- | --- |
-| [`const_expr`](./compile-time-control/const-expr.md) | 根据一般编译期条件选择分支或控制循环。 |
-| [`target_version`](./compile-time-control/target-version.md) | 根据调用方提供的目标版本判断结果选择分支或控制循环。 |
+| [`const_expr`](./compile-time-control/const-expr.md) | 根据编译时可确定的条件选择分支或控制循环。 |

@@ -1,6 +1,6 @@
-# 调试
+# 调试与性能分析
 
-本目录说明Tensor、矢量寄存器及格式化打印接口，覆盖Python、Host和Kernel的适用范围。
+本目录介绍调试输出和性能分析配置相关接口。
 
 ## 接口
 
@@ -10,6 +10,7 @@
 | [dump_reg](./dump_reg.md) | 打印SIMD VF中的一个矢量寄存器。 |
 | [print](./print.md) | 按上下文分派Python、Host、Kernel格式化打印，并兼容原有采集模式。 |
 | [print_time_stamp](./print_time_stamp.md) | 记录设备周期和PC，并识别执行打点的核。 |
+| [Profiling 名称与类型](./profiling.md) | 配置性能分析中的Kernel名称、类型和参数信息。 |
 
 ## 使用说明
 

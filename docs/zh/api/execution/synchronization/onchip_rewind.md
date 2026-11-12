@@ -30,7 +30,7 @@ onchip_rewind(reset_sync_id: bool=True) -> None
 
 ## 约束说明
 
-- 只要当前 Kernel 使用任一[片上存储空间](../../data-structures/storage/on-chip-memory.md)，就不能使用该接口。
+- 只要当前 Kernel 使用任一[片上存储空间](../../data-structures/storage/buffer/memory-spaces.md)，就不能使用该接口。
 
 ## 调用示例
 

@@ -6,23 +6,22 @@
 
 ## 功能说明
 
-将参数 `tiler` 指定的可嵌套的切块大小，与 `alignment` 指定的可选对齐条件组合为可复用的 切块对象。`alignment` 的对齐要求不作用于尾块。
+将参数 `tiler` 指定的可嵌套的切块大小，与 `alignment` 指定的可选对齐条件组合为可复用的切块对象。`alignment` 的对齐要求不作用于尾块。
 
 ## 函数原型
 
 ```python
-make_tiler(tiler: Tiler, *, alignment=None) -> _Tile
+make_tiler(tiler: Tiler, *, alignment=None)
 ```
-
-备注：`_Tile` 是框架内部的切块对象类型，记录块长和对齐条件，可传入 `tile_slice()`。该类型未作为公开接口导出，由 `make_tiler()` 返回。
 
 ## 参数说明
 
 | 参数名 | <span style="white-space: nowrap">输入/输出</span> | 说明 |
 | --- | --- | --- |
-| <span id="tiler-参数可选值"></span>`tiler` | 输入 | <p>必填。可嵌套的切块大小，可以是以下类型：</p> <ul> <li><code>int</code>：一维静态正整数块长。</li> <li><code>Kernel 运行时整数标量</code>：运行时块长，须能转换为 64 位正整数。</li> <li><code>tuple 或 list</code>：组合各维块长，可嵌套；按从左到右的深度优先顺序保留分组。</li>  </ul>   |
-| <span id="alignment-参数可选值"></span>`alignment` | 输入 | <p>名义块长的对齐粒度，可以是以下类型：</p> <ul> <li><code>None</code>：默认值，不额外声明对齐条件。</li> <li><code>int</code>：编译期正整数，广播到全部叶维。</li> <li><code>tuple[int, ...]</code>：各项为编译期正整数；单元素时广播，多元素时须与深度优先展开后的叶维一一对应。</li> <li><code>list[int]</code>：与 tuple 的广播及逐项对应规则相同。</li> </ul>  |
+| <span id="tiler-参数可选值"></span>`tiler` | 输入 | <p>必填。可嵌套的切块大小，可以是以下类型：</p> <ul> <li><code>int</code>：一维静态正整数块长。</li> <li><code>核函数中计算得到的整数值</code>：例如输入Tensor的某一维长度；作为块长时须为64位正整数。</li> <li><code>tuple 或 list</code>：组合各维块长，可嵌套；保留各维的嵌套分组，维度顺序见下例。</li>  </ul>   |
+| <span id="alignment-参数可选值"></span>`alignment` | 输入 | <p>指定块长的对齐要求，可以是以下类型：</p> <ul> <li><code>None</code>：默认值，不额外声明对齐条件。</li> <li><code>int</code>：编译期正整数，对所有最内层维度采用同一对齐要求。</li> <li><code>tuple[int, ...]</code>：各项为编译期正整数；单元素时对所有最内层维度采用同一要求，多元素时须按从左到右的顺序，与各最内层维度一一对应。</li> <li><code>list[int]</code>：与tuple的逐维对应规则相同。</li> </ul>  |
 
+例如，`tiler=((16, 32), 8)`包含三个最内层维度，按顺序为16、32、8；`alignment=(8, 16, 4)`分别指定这三个维度的对齐要求。
 
 ## 返回值说明
 
@@ -30,7 +29,8 @@ make_tiler(tiler: Tiler, *, alignment=None) -> _Tile
 
 ## 约束说明
 
-- `tiler` 的各叶维块长须为正整数；`alignment` 的各项须为 Python 正整数。
+- 各维块长须为正整数，`alignment`各项须为编译时确定的正整数。
+- 每个块长须能被对应对齐值整除。例如，`alignment=8`时，块长可为16或24，不能为18；块长由Tensor数据等运行时值决定时，接口不自动检查整除关系，调用方须保证取值满足要求。
 
 ## 调用示例
 

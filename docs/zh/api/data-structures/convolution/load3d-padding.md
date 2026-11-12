@@ -16,7 +16,7 @@ Load3DPadding.value(value: int | float) -> Load3DPadding
 Load3DPadding.bits(bits: int) -> Load3DPadding
 ```
 
-数值也可使用对应 DSL 标量表达式；优先使用 `value`、`bits` 两个工厂方法表达意图。
+使用`Load3DPadding.value(0.75)`按数值指定填充值，或使用`Load3DPadding.bits(0x3a00)`按位编码指定同一个`float16`填充值。参数也可使用核函数中计算得到的对应数值或整数编码。
 
 ## 参数说明
 

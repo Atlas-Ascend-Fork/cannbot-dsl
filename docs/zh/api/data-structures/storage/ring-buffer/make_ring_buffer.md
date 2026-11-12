@@ -11,28 +11,20 @@
 ## 函数原型
 
 ```python
-make_ring_buffer(views) -> RingBuffer
+make_ring_buffer(tensors) -> RingBuffer
 ```
 
 ## 参数说明
 
 | 参数名 | 输入/输出 | 说明 |
 | --- | --- | --- |
-| `views` | 输入 | 槽位 Tensor 序列。必填，为非空 `list[Tensor]` 或 `tuple[Tensor, ...]`。各 Tensor 必须来自[片上存储空间](../on-chip-memory.md)，具有相同存储层级、元素类型、形状和逻辑/物理布局；形状及物理跨度须为静态正整数。 |
+| `tensors` | 输入 | 槽位 Tensor 序列。必填，为非空 `list[Tensor]` 或 `tuple[Tensor, ...]`。各 Tensor 必须来自[片上存储空间](../buffer/memory-spaces.md)，具有相同存储层级、元素类型、形状和逻辑/物理布局；形状及物理跨度须为静态正整数。 |
 
 ## 返回值说明
 
 返回 RingBuffer，`depth` 为传入 Tensor 的数量；槽位保留各自的地址，并采用输入 Tensor 的元素类型和布局。
 
-成功创建后，各公开属性的读取范围如下：
-
-| 属性 | 是否可读取 |
-| --- | --- |
-| `dtype`、`memloc`、`depth`、`shape`、`layout`、`physical_layout`、`physical_shape`、`physical_stride`、`layout_map_kind`、`logical_format` | 可以直接读取。 |
-| `stride` | 逻辑布局为 `Identity` 映射时可以读取；NZ、ZN 或组合视图不支持读取逻辑跨度，读取时会报错，可通过 `physical_stride` 查看物理跨度。 |
-| `physical_format`、`data_format` | 普通 ND、NZ、ZN 布局可以读取；`layout_map_kind` 为 `Composed` 的组合视图不支持读取，读取时会报错。 |
-
-属性读取条件由传入 Tensor 的布局决定。
+公开属性参见 [RingBuffer 简介](./overview.md)。
 
 ## 约束说明
 

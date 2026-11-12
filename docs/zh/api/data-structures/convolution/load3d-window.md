@@ -17,7 +17,7 @@ Load3DWindow(
 ) -> Load3DWindow
 ```
 
-整数参数也接受 DSL 整数标量表达式。
+整数参数也可传入核函数中计算得到的整数值，取值范围见参数说明。
 
 ## 参数说明
 
@@ -34,7 +34,7 @@ Load3DWindow(
 
 ## 约束说明
 
-窗口与 filter、feature 的关系按 [load3d](../../data-movement/convolution/load3d.md) 的展开语义计算；转置后目标尺寸须容纳交换后的两个轴。不要把窗口参数解释为源 Tensor 的二维切片。
+窗口的起点和大小按[load3d](../../data-movement/convolution/load3d.md)展开后的矩阵计算。启用转置时，目标Tensor的M、K两维须分别容纳窗口的K、M两维。
 
 ## 调用示例
 

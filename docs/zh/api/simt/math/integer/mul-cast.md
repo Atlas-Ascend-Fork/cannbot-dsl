@@ -20,7 +20,7 @@ simt.mul_cast(lhs, rhs, *, dtype) -> ScalarValue
 | --- | --- | --- |
 | lhs | 输入 | `int32`整数标量。 |
 | rhs | 输入 | `int32`整数标量，与`lhs`的数据类型相同。 |
-| dtype | 输入 | 必填的目标标量类型描述符：`int8`、`uint8`、`int16`、`uint16`、`int32`、`uint32`、`int64`、`uint64`、`float16`、`bfloat16`、`float32`或`bool`；例如`dtypes.float32`。 |
+| dtype | 输入 | 必填的目标标量数据类型：`int8`、`uint8`、`int16`、`uint16`、`int32`、`uint32`、`int64`、`uint64`、`float16`、`bfloat16`、`float32`或`bool`；例如`dtypes.float32`。 |
 
 ## 返回值说明
 

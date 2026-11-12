@@ -1,142 +1,103 @@
 # 源码构建
 
-本文介绍在宿主机上准备环境、下载算子源码、编译安装 Native 算子包及运行测试的方法。
+本文介绍开发环境配置、算子源码获取、运行和精度测试的方法。调用算子时，CANNBot-DSL完成所需的编译并执行计算。
 
 ## 环境准备
 
-本项目支持源码构建。编译前请完成基础环境搭建、安装 CANN 开发套件并准备仓库源码。NPU 驱动和固件属于运行态依赖，仅编译源码时可以不安装；运行样例或执行 NPU 测试前必须完成安装。
+### 软件依赖
 
-### 前置依赖
+| 软件 | 版本或要求 |
+| --- | --- |
+| 操作系统 | Linux，CPU架构为`x86_64`或`aarch64`。 |
+| Python | 3.10、3.11、3.12或3.13。 |
+| CANNBot-DSL | 0.8.2。 |
+| CANN | 9.2.1，安装与目标NPU匹配的Toolkit和算子包。 |
+| PyTorch、`torch_npu` | 选择与Python、CANN及目标NPU配套的版本。 |
 
-本项目编译和测试用到以下软件，请注意版本要求：
+### 安装CANN
 
-- Linux，CPU 架构为 `x86_64` 或 `aarch64`；
-- Python 3.10、3.11 或 3.12；
-- CANNBot-DSL 0.8.0；
-- CANN Toolkit 开发套件包；
-- `pip` 及仓库 `requirements.txt` 中列出的 Python 依赖；
-- 与目标 NPU 匹配的 PyTorch、`torch_npu`（运行样例和 NPU 测试时需要）。
+从[CANN下载页面](https://www.hiascend.com/zh/cann/download?versionId=813&ids=d806%2Ch0501%2Ch0601%2Ch0703&currentTab=0)获取CANN 9.2.1软件包，并按[CANN软件安装指南](https://www.hiascend.com/document/redirect/CannCommunityInstWizard)安装驱动、固件、Toolkit和算子包。
 
-### 安装CANN软件包
+根据实际安装路径加载环境变量。例如，安装在`/usr/local/Ascend`时执行：
 
-#### 1. 安装驱动与固件（运行态依赖）
+```bash
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+```
 
-驱动与固件的下载和安装操作请参考《[CANN软件安装指南](https://www.hiascend.com/document/redirect/CannCommunityInstWizard)》中“准备软件包”和“安装NPU驱动和固件”章节。驱动与固件是运行态依赖，若仅编译本项目源码，可以不安装。
-
-#### 2. 安装CANN软件包（开发态依赖）
-
-编译本项目依赖 CANN Toolkit 开发套件包。请根据操作系统架构和目标 NPU 产品下载匹配的 Toolkit 安装包，并参考《CANN软件安装指南》完成安装。运行样例或执行 NPU 测试时，还需要安装匹配的 CANN 算子包。
-
-### 环境验证
-
-安装 CANN 软件包后，需验证环境是否正常：
+检查设备是否正常：
 
 ```bash
 npu-smi info
-cat /usr/local/Ascend/cann/*-linux/ascend_toolkit_install.info
 ```
 
-### 环境变量配置
+### 安装Python依赖
 
-根据实际安装路径加载 CANN 环境变量。root 用户默认安装路径示例：
+安装配套的PyTorch和`torch_npu`后，使用同一个Python环境安装DSL和样例测试依赖：
 
 ```bash
-source /usr/local/Ascend/cann/set_env.sh
+python -m pip install cannbot-dsl==0.8.2
+python -m pip install numpy ml_dtypes pytest pytest-xdist==3.8.0 PyYAML
 ```
 
-非 root 用户或自定义安装路径请替换为实际的 `${install_path}/cann/set_env.sh`。
+验证DSL版本及NPU是否可用：
 
-## 编译安装
+```bash
+python -c 'import cannbotdsl; print(cannbotdsl.__version__)'
+python -c 'import torch, torch_npu; print(torch.npu.is_available())'
+```
 
-### 下载源码
+预期分别输出`0.8.2`和`True`。
+
+## 获取源码
 
 ```bash
 git clone -b master https://gitcode.com/cann/cannbot-dsl.git
 cd cannbot-dsl
 ```
 
-### 编译
+## 运行算子
 
-本项目提供统一的 Native 算子包构建入口。进入仓库根目录后，可先查看可构建的算子和算子组：
-
-```bash
-bash packaging/native/run-build.sh --list
-```
-
-配置构建环境并构建全部登记算子：
+以[Add样例](https://gitcode.com/cann/cannbot-dsl/blob/master/samples/vector/add/README.md)为例，在仓库根目录将样例目录加入模块搜索路径：
 
 ```bash
-export PYTHON=/path/to/python3.12
-export CANN_ENV=/path/to/Ascend/ascend-toolkit/set_env.sh
-export CANNBOTDSL_WHEEL=/path/to/cannbot_dsl-0.8.0-cp312-cp312-manylinux_2_28_x86_64.whl
-bash packaging/native/run-build.sh
+export PYTHONPATH="$PWD/samples/vector/add:$PYTHONPATH"
 ```
 
-也可以指定算子组、算子和目标架构：
+以下示例计算两个Tensor的逐元素加法，并与PyTorch结果比较：
+
+```python
+import torch
+import torch_npu
+
+from add import add
+
+
+x = torch.arange(16, dtype=torch.float32, device="npu")
+y = torch.ones_like(x)
+out = add(x, y)
+
+torch.testing.assert_close(out.cpu(), (x + y).cpu())
+print("Add校验通过")
+```
+
+将上述代码保存为`run_add.py`，在同一终端运行：
 
 ```bash
-bash packaging/native/run-build.sh --group ds41
-bash packaging/native/run-build.sh --operator mqsmla
-bash packaging/native/run-build.sh --group ds41 --target dav-2201
+python run_add.py
 ```
 
-默认目标架构为 `dav-3510`。构建脚本会根据 `operator_groups.toml` 查找 `samples/` 中登记的源码并生成安装包。
-
-### 安装
-
-构建成功后，安装输出目录中的 wheel：
-
-```bash
-python3 -m pip install --force-reinstall packaging/native/output/groups/ds41/wheels/*.whl
-```
-
-实际路径以构建日志和 `packaging/native/output/` 中的产物为准。
-
-### 卸载
-
-卸载构建安装的 wheel 时，请使用实际安装包名称：
-
-```bash
-python3 -m pip uninstall <package-name>
-```
-
-## 测试
-
-### 样例精度测试
-
-```bash
-python3 -m pytest test/matmul/matmul/test_matmul.py -v
-```
-
-### NPU测试
-
-运行 NPU 测试前，请确认驱动、固件、CANN 软件包、PyTorch 和 `torch_npu` 已正确安装并完成环境变量配置：
-
-```bash
-bash build.sh --mode=npu
-```
-
-没有 NPU 环境时可运行 CPU 侧检查：
-
-```bash
-bash build.sh --mode=cpu
-```
-
-## 附录
-
-### 构建产物
-
-构建缓存和产物位于 `packaging/native/`：
+预期输出：
 
 ```text
-packaging/native/
-├── .build/   # 编译缓存和临时文件
-└── output/   # Native、AICPU 和 wheel 产物
+Add校验通过
 ```
 
-### 常用构建参数
+## 精度测试
 
-- `--list`：列出已登记的算子和算子组；
-- `--group <name>`：构建指定算子组；
-- `--operator <name>`：构建指定算子；
-- `--target <arch>`：指定目标 NPU 架构。
+在仓库根目录运行Add已有的精度测试：
+
+```bash
+python -m pytest test/vector/add/test_add.py -v
+```
+
+其他算子的源码、参数和测试方法见[样例导航](https://gitcode.com/cann/cannbot-dsl/tree/master/samples)。

@@ -6,7 +6,7 @@
 
 ## 功能说明
 
-根据参数 `dim` 指定的轴，为当前 Tensor 设置两路搬运分区规则，返回带分区标记的 Tensor 视图。分区规则记录在编译过程生成的内部表示中，不作为 Tensor 的公开属性。指定 `part_id` 时，返回视图表示选中的分区；省略时，返回视图保留完整形状，并携带两路分区的规则。
+根据参数 `dim` 指定的轴，为当前 Tensor 设置两路搬运分区规则，返回带分区标记的 Tensor 视图。指定 `part_id` 时，返回视图表示选中的分区；省略时，返回视图保留完整形状，并携带两路分区的规则。
 
 在以下搬运路径中使用分区搬运时，对相应的 Tensor 调用 `partition()`，并将返回视图作为该位置的搬运参数：
 
@@ -34,9 +34,7 @@ partition(self, *, dim, part_id=None, alignment=1) -> Tensor
 
 ## 约束说明
 
-- 原 Tensor 已是组合视图时，分区后的结果仍为组合视图。
-- 返回组合视图时，其 `stride`、`physical_format` 和 `data_format` 不支持读取，读取会报错；`physical_layout`、`physical_shape` 和 `physical_stride` 仍可读取。
-
+- 对已不支持读取`stride`和`data_format`的变换视图调用本接口后，仍不支持读取这两个属性；可以通过`physical_layout`查看原数据的存储布局。相关示例见[stride](./properties/stride.md#形状变换后的跨度)。
 - 仅支持逻辑形状为非嵌套二维形状的 Tensor。
 
 ## 调用示例

@@ -30,7 +30,7 @@ FBUF_ACT.view(*shape: int, dtype: DType | None = None) -> Tensor
 ## 约束说明
 
 - 在同一 kernel 的 FBUF_ACT 空间内，不能混用手动空间视图与自动 Buffer 分配；其他存储空间可以独立选择方式。
-- 手动表的字节范围不能越界，起点满足 64 字节对齐；先 `make_buffer` 绑定再参与搬运，初始化完成后才能作为 negative_scale 消费。
+- 手动放置的参数表须位于FBUF_ACT空间范围内，起点按64字节对齐。先通过`make_buffer`绑定，再搬入参数数据；初始化完成后，才能将其传给`convert`的`negative_scale`参数。
 - 此参数空间不支持 RingBuffer，也不能通过不同别名规避表的读写依赖。
 
 ## 调用示例

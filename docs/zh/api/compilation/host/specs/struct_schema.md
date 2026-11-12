@@ -25,13 +25,13 @@ StructSchema(name: str, fields: tuple[StructField, ...]) -> StructSchema
 每个 `StructField` 定义一个字段的名称和类型。
 
 ```python
-StructField(name: str, dtype: Any) -> StructField
+StructField(name: str, dtype) -> StructField
 ```
 
 | 参数 | 输入/输出 | 说明 |
 | --- | --- | --- |
 | `name` | 输入 | 字段名称，须以英文字母开头，只包含字母、数字和下划线，不能使用 `class`、`if`、`return` 等语言关键字。 |
-| `dtype` | 输入 | 字段保存的数据类型，可以是单个数值、固定长度数组（`CArray`）或结构体。支持的具体类型见 [支持的字段类型](#支持的字段类型)。 |
+| `dtype` | 输入 | 字段保存的数据类型，可以是标量类型（如`dtypes.int32`）、固定长度数组（`CArray`）或结构体。支持的具体类型见 [支持的字段类型](#支持的字段类型)。 |
 
 ### 支持的字段类型
 

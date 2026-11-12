@@ -19,7 +19,7 @@ tile_slice(input: Tensor, tiler: Tiler, coord: Coord) -> Tensor
 | --- | --- | --- |
 | `input` | 输入 | 输入[Tensor](../../data-structures/tensor/overview.md)。<br>动态tile仅支持Identity/ND布局的GM Tensor。 |
 | `tiler` | 输入 | tile大小，单位为元素个数，支持整数、整数序列或[Tiler](../../data-structures/tiler/overview.md)。<br>- 静态大小：使用正整数或正整数序列指定。<br>- 动态大小：使用[make_tiler](../../data-structures/tiler/make_tiler.md)创建的`Tiler`指定；通过`alignment`参数声明对齐要求。 |
-| `coord` | 输入 | 非负tile序号，支持整数、整数序列或[Coord](../../data-structures/layout/coord.md)。例如，`tiler=(64, 128)`、`coord=(2, 1)`对应起点`(128, 128)`。<br>尾块不足`tiler`指定的大小时，按输入剩余大小返回；某一维度的起点达到或超出输入范围时，该维度大小为0。 |
+| `coord` | 输入 | 非负tile序号，支持整数、整数序列或[Coord](../../data-structures/tensor/indexing.md#坐标)。例如，`tiler=(64, 128)`、`coord=(2, 1)`对应起点`(128, 128)`。<br>尾块不足`tiler`指定的大小时，按输入剩余大小返回；某一维度的起点达到或超出输入范围时，该维度大小为0。 |
 
 
 ## 返回值说明

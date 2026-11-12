@@ -68,7 +68,7 @@ matmul(dst: Tensor, lhs: Tensor, rhs: Tensor, *, bias: Tensor | None = None, ini
 | 运行时布尔标量 | 运行时为`True` | Bias Tensor视图 | 沿M方向广播后的Bias矩阵 | $C = P + \mathbf{1}_{M \times 1}\,\mathrm{Bias}_{1 \times N}$ |
 | 运行时布尔标量 | 运行时为`False` | Bias Tensor视图 | L0C Buffer中原有的C矩阵，不读取Bias | $C = P + C_0$ |
 
-例如，沿K轴分块计算时，可将运行时首块条件作为`init`并传入`bias`：首块使用Bias初始化，后续块在已有C上累加，不再次加入Bias。直接传入Python布尔值`init=False`并提供`bias`则会被编译器拒绝，因为该调用不会使用Bias；这是当前DSL的接口约束。
+例如，沿K轴分块计算时，可将运行时首块条件作为`init`并传入`bias`：首块使用Bias初始化，后续块在已有C上累加，不再次加入Bias。直接传入Python布尔值`init=False`时，不能同时提供`bias`。
 
 ### 支持的数据类型
 
