@@ -1456,14 +1456,19 @@ class CubeW:
                 matmul(l0c_slot, a_rows, self.l0b.next_read(), init=const_expr(first))
 
     @jit
-    def store(self, tile, rows_l1):
+    def store(self, tile):
         """Whole-reduction store, straight into ``w``. Not used under w_workspace."""
         # softmax_scale folded into the fixpipe DEQSCALE register: the W path
         # never touches the vector unit.
         p = self.p
-        c_rows = self.c_rows(self.l0c.next_read(), rows_l1)
+        dst = tile_view(self.w_gm, (p.base_m, p.base_n_w), (tile, 0))
+        # ``mem_copy`` copies the source extent, so the source has to be the
+        # live rows of this tile, not the padded ``rows_l1``: on a short tail
+        # ``rows_l1`` rounds up to the 16-row fractal and would store past the
+        # end of ``w`` (T=5620 writes 12 rows past a 5620-row output).
+        c_rows = self.c_rows(self.l0c.next_read(), dst.shape[0])
         mem_copy(
-            tile_view(self.w_gm, (p.base_m, p.base_n_w), (tile, 0)),
+            dst,
             c_rows.convert(c_rows.dtype, scale=self.softmax_scale),
             options=copy_options(l2_cache_ctl=L2_W),
         )
@@ -1852,7 +1857,7 @@ def _w_prefix(gm, work):
         if const_expr(p.w_workspace):
             cube_w.store_partial(tile, h_block, gm.n_tiles, rows_l1)
         else:
-            cube_w.store(tile, rows_l1)
+            cube_w.store(tile)
         w_slot = None
         if const_expr(
             p.w_workspace and p.reduce_at == "early" and PROBE != "no_reduce"
@@ -1907,7 +1912,7 @@ def _q_heads(gm, work, lut_ub, cos_ub, w_slot):
         )
     _prefetch_qr(cube_q, gm.qr, gm.descale_qr, work, gm.n_work)
     if const_expr(PROBE != "no_w" and not p.w_separate):
-        cube_w.store(tile, rows_l1)
+        cube_w.store(tile)
     elif const_expr(PROBE == "no_w" and not p.w_separate):
         cube_w.l0c.next_read()
 
