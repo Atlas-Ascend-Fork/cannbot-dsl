@@ -50,6 +50,9 @@ stages:
         container:
           image: swr.cn-north-4.myhuaweicloud.com/ci_cann/ubuntu20.04.05_x86:k8s_v1.1006
       JOB_pre:
+        permissions:
+          repository: read
+          id-token: write
         name: Test_PreBuild
         if: ${{ !atomgit.event.pull_request.number || (atomgit.event.pull_request.state == 'open' && atomgit.event.pull_request.merged != true && !atomgit.event.pull_request.merged_at) }}
         uses: cann/.gitcode/.gitcode/workflows/pre_action.yml@master
@@ -60,6 +63,9 @@ stages:
     name: CodeCheck
     jobs:
       JOB_codecheck:
+        permissions:
+          repository: read
+          id-token: write
         name: CodeCheck
         if: ${{ !atomgit.event.pull_request.number || (atomgit.event.pull_request.state == 'open' && atomgit.event.pull_request.merged != true && !atomgit.event.pull_request.merged_at) }}
         uses: cann/.gitcode/.gitcode/workflows/codecheck_action.yml@master
@@ -67,6 +73,9 @@ stages:
           precommit_image_version: ${{ jobs.JOB_image.outputs.precommit }}
           codecheck_image_version: ${{ jobs.JOB_image.outputs.codecheck }}
       JOB_staticcheck_md_check:
+        permissions:
+          repository: read
+          id-token: write
         name: CodeCheck_staticcheck_md_check
         if: ${{ !atomgit.event.pull_request.number || (atomgit.event.pull_request.state == 'open' && atomgit.event.pull_request.merged != true && !atomgit.event.pull_request.merged_at) }}
         uses: .gitcode/workflows/staticcheck_action.yml
@@ -80,6 +89,9 @@ stages:
     name: Test
     jobs:
       JOB_test:
+        permissions:
+          repository: read
+          id-token: write
         name: PreSmoke_CPU_NPU_PERF
         uses: .gitcode/workflows/test_action.yml
     pre:
