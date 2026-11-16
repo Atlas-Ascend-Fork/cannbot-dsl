@@ -1,0 +1,173 @@
+/*
+ * Copyright (c) 2026 Huawei Technologies Co., Ltd.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ */
+
+.release-index-page .vp-doc h1,
+.release-detail-page .vp-doc h1 {
+  font-size: clamp(30px, 4vw, 42px);
+  font-weight: 650;
+  line-height: 1.25;
+  letter-spacing: -0.035em;
+}
+
+.release-timeline {
+  margin-top: 44px;
+}
+
+.release-entry {
+  display: grid;
+  grid-template-columns: 144px minmax(0, 1fr);
+  position: relative;
+}
+
+.release-date {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  padding-top: 27px;
+  color: var(--vp-c-text-1);
+  font-size: 14px;
+  font-variant-numeric: tabular-nums;
+}
+
+.release-date span {
+  color: var(--vp-c-text-2);
+  font-size: 12px;
+}
+
+.release-summary {
+  position: relative;
+  padding: 24px 0 32px 34px;
+  border-left: 1px solid var(--vp-c-divider);
+}
+
+.release-summary::before {
+  position: absolute;
+  top: 31px;
+  left: -5px;
+  width: 9px;
+  height: 9px;
+  border: 2px solid var(--vp-c-bg);
+  border-radius: 50%;
+  background: var(--vp-c-text-3);
+  box-shadow: 0 0 0 1px var(--vp-c-divider);
+  content: '';
+}
+
+.release-entry:first-child .release-summary::before {
+  background: var(--vp-c-brand-1);
+  box-shadow: 0 0 0 1px var(--vp-c-brand-1);
+}
+
+.release-index-page .vp-doc .release-summary h2 {
+  margin: 0 0 14px;
+  padding: 0;
+  border: 0;
+  font-family: Consolas, 'SFMono-Regular', 'Liberation Mono', monospace;
+  font-size: 32px;
+  font-weight: 600;
+  line-height: 1.2;
+  letter-spacing: -0.05em;
+}
+
+.release-index-page .vp-doc .release-summary h2 a:not(.header-anchor) {
+  color: var(--vp-c-text-1);
+  text-decoration: none;
+}
+
+.release-index-page .vp-doc .release-summary h2 a:not(.header-anchor):hover {
+  color: var(--vp-c-brand-1);
+}
+
+.release-index-page .vp-doc .release-summary p {
+  margin: 0;
+  color: var(--vp-c-text-2);
+  font-size: 14px;
+}
+
+.release-index-page .vp-doc .release-summary p + p {
+  margin-top: 12px;
+}
+
+.release-entry:last-child .release-summary {
+  padding-bottom: 24px;
+}
+
+.release-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px 28px;
+  margin: 20px 0 36px;
+  padding-bottom: 24px;
+  border-bottom: 1px solid var(--vp-c-divider);
+  color: var(--vp-c-text-2);
+  font-size: 13px;
+}
+
+.release-detail-page .vp-doc .release-meta + h2 {
+  margin-top: 0;
+  padding-top: 0;
+  border-top: 0;
+}
+
+.release-detail-page .vp-doc h2 {
+  font-size: 21px;
+  letter-spacing: -0.02em;
+}
+
+.release-detail-page .vp-doc a[href^="https://pypi.org/project/cannbot-dsl/"] {
+  display: inline-flex;
+  align-items: center;
+  min-height: 40px;
+  padding: 8px 16px;
+  border: 1px solid var(--vp-c-brand-1);
+  border-radius: 6px;
+  color: var(--vp-c-brand-1);
+  font-size: 14px;
+  text-decoration: none;
+}
+
+.release-detail-page .vp-doc a[href^="https://pypi.org/project/cannbot-dsl/"]:hover {
+  background: var(--vp-c-brand-soft);
+}
+
+.release-index-page .vp-doc a:focus-visible,
+.release-detail-page .vp-doc a:focus-visible {
+  outline: 2px solid var(--vp-c-brand-1);
+  outline-offset: 5px;
+  border-radius: 2px;
+}
+
+@media (max-width: 560px) {
+  .release-timeline {
+    margin-top: 28px;
+  }
+
+  .release-entry {
+    grid-template-columns: 112px minmax(0, 1fr);
+  }
+
+  .release-summary {
+    padding-left: 22px;
+  }
+
+  .release-date {
+    font-size: 13px;
+  }
+
+  .release-index-page .vp-doc .release-summary h2 {
+    font-size: 28px;
+  }
+
+  .release-meta {
+    flex-direction: column;
+    gap: 8px;
+  }
+}

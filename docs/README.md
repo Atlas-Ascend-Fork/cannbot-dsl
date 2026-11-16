@@ -6,7 +6,7 @@
 ```text
 docs/
 ├── zh/                 # 中文 API、开发指南和源码构建文档
-│   ├── index.md        # 中文站点首页
+│   ├── README.md       # 中文文档入口
 │   ├── api/            # API 参考及 API 公共图片
 │   │   ├── README.md   # API 手册目录
 │   │   └── figures/
@@ -14,7 +14,7 @@ docs/
 │   │   └── README.md   # 开发指南目录
 │   └── install/        # 源码构建文档
 ├── en/                 # 英文文档
-├── project/            # 文档站构建工程
+├── project/            # 文档站构建工程、网站首页源文件
 └── README.md            # 本目录说明和文档构建方法
 ```
 
@@ -48,4 +48,4 @@ npm run preview
 git diff --check
 ```
 
-文档正文位于 `docs/zh/` 和 `docs/en/`，VitePress 配置、主题和构建脚本位于 `docs/project/`。API 和开发指南的 `README.md` 只用于在代码仓库中提供手册目录，不作为网站侧边栏页面展示。
+文档正文位于 `docs/zh/` 和 `docs/en/`，VitePress 配置、主题和构建脚本位于 `docs/project/`。网站首页源文件为 `docs/project/home.md` 和 `docs/project/home-en.md`，分别构建到 `/` 和 `/en/`；中文、英文目录中的 `README.md` 用于仓库内阅读，不作为站点页面构建。API 和开发指南的 `README.md` 只用于在代码仓库中提供手册目录，不作为网站侧边栏页面展示。

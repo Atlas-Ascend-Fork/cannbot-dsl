@@ -9,6 +9,7 @@
 import DefaultTheme from 'vitepress/theme'
 import { h } from 'vue'
 import './custom.css'
+import './release-notes.css'
 import SidebarTitleToggle from './SidebarTitleToggle.vue'
 
 export default {

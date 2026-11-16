@@ -8,6 +8,8 @@
   */
 import { defineConfig } from 'vitepress'
 import path from 'node:path'
+import { mkdir, writeFile } from 'node:fs/promises'
+import { readdirSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
@@ -16,6 +18,8 @@ const docsVersion = process.env.DOCS_VERSION || 'next'
 
 // Keep directory entry URLs while using README files as the source entry points.
 const rewriteReadmes = (id: string) => {
+  if (id === 'project/home.md') return 'index.md'
+  if (id === 'project/home-en.md') return 'en/index.md'
   if (id === 'README.md') return 'index.md'
   if (id.endsWith('/README.md')) return `${id.slice(0, -'README.md'.length)}index.md`
   return id
@@ -3020,21 +3024,67 @@ const normalizeApiSidebar = (sidebar: any[]) => {
 
 const normalizedApiSidebar = normalizeApiSidebar(cleanedApiSidebar)
 
+const releaseVersions = readdirSync(path.resolve(projectRoot, '../zh/release-notes'))
+  .filter(name => /^\d+\.\d+\.\d+\.md$/.test(name))
+  .map(name => name.slice(0, -3))
+  .sort((a, b) => b.localeCompare(a, 'en', { numeric: true }))
+
+
 export default defineConfig({
   srcDir: '..',
   // Repository and handbook README files document the tree; they are not site pages.
-  srcExclude: ['README.md', 'zh/api/README.md', 'zh/guide/README.md'],
+  srcExclude: ['README.md', 'zh/README.md', 'en/README.md', 'zh/api/README.md', 'zh/guide/README.md'],
   lang: 'zh-CN',
   title: 'CANNBot-DSL',
   description: '面向 Ascend NPU 的算子开发项目文档',
   base: process.env.DOCS_BASE || '/',
   rewrites: rewriteReadmes,
   cleanUrls: false,
+  transformPageData(pageData) {
+    if (pageData.filePath === 'zh/release-notes.md') {
+      Object.assign(pageData.frontmatter, { pageClass: 'release-index-page', outline: false })
+    }
+    const version = /^zh\/release-notes\/(\d+\.\d+\.\d+)\.md$/.exec(pageData.filePath)?.[1]
+    const index = version ? releaseVersions.indexOf(version) : -1
+    if (index >= 0) {
+      const versionLink = (value: string) => ({ text: `CANNBot-DSL ${value}`, link: `/zh/release-notes/${value}` })
+      Object.assign(pageData.frontmatter, {
+        pageClass: 'release-detail-page',
+        prev: index === 0 ? { text: '全部版本', link: '/zh/release-notes' } : versionLink(releaseVersions[index - 1]),
+        next: index === releaseVersions.length - 1 ? false : versionLink(releaseVersions[index + 1]),
+      })
+    }
+  },
+  async buildEnd(config) {
+    const homeUrl = config.site.base
+    const legacyDir = path.join(config.outDir, 'zh')
+    await mkdir(legacyDir, { recursive: true })
+    await writeFile(path.join(legacyDir, 'index.html'),
+      `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta http-equiv="refresh" content="0; url=${homeUrl}"><title>CANNBot-DSL</title></head><body><a href="${homeUrl}">打开中文首页</a></body></html>`,
+      'utf8')
+  },
   // Repository samples and contribution guides live outside the VitePress source tree.
   ignoreDeadLinks: [/CONTRIBUTION_DOC_en/],
   lastUpdated: true,
   markdown: {
-    math: true
+    math: true,
+    config(md) {
+      const renderLink = md.renderer.rules.link_open!
+      md.renderer.rules.link_open = (tokens, index, options, env, renderer) => {
+        const sourceFile = env.realPath || env.path
+        if (!sourceFile) return renderLink(tokens, index, options, env, renderer)
+        const source = path.relative(path.resolve(projectRoot, '..'), sourceFile).replace(/\\/g, '/')
+        const href = tokens[index].attrGet('href')
+        // Homepage templates move to different routes; resolve their links from the source file first.
+        if ((source === 'project/home.md' || source === 'project/home-en.md') && href?.startsWith('.')) {
+          const [, file, suffix = ''] = href.match(/^([^?#]+)([?#].*)?$/)!
+          const target = path.relative(path.resolve(projectRoot, '..'), path.resolve(path.dirname(sourceFile), file))
+            .replace(/\\/g, '/')
+          tokens[index].attrSet('href', `/${rewriteReadmes(target)}${suffix}`)
+        }
+        return renderLink(tokens, index, options, env, renderer)
+      }
+    }
   },
   vite: {
     publicDir: path.join(projectRoot, 'public'),
@@ -3053,13 +3103,13 @@ export default defineConfig({
     logo: '/logo.svg',
     siteTitle: 'CANNBot-DSL',
     nav: [
-      { text: '首页', link: '/zh/' },
+      { text: '首页', link: '/' },
       { text: '源码构建', link: '/zh/install/source-build' },
       { text: '编程模型', link: '/zh/guide/overview', activeMatch: '^/zh/guide/' },
       { text: '样例导航', link: 'https://gitcode.com/cann/cannbot-dsl/tree/master/samples' },
       { text: 'API', link: '/zh/api/', activeMatch: '^/zh/api/' },
       { text: '语言 / Language', items: [
-        { text: '简体中文', link: '/zh/' },
+        { text: '简体中文', link: '/' },
         { text: 'English', link: '/en/' }
       ] }
     ],
