@@ -47,8 +47,8 @@ vgather_datablock(tensor, index: RawVReg, *, mask: Mask | None = None) -> RawVRe
 | `dtypes.int32` | 支持 |
 | `dtypes.uint32` | 支持 |
 | `dtypes.float32` | 支持 |
-| `dtypes.int64` | 不支持 |
-| `dtypes.uint64` | 不支持 |
+| `dtypes.int64` | 支持 |
+| `dtypes.uint64` | 支持 |
 
 ## 返回值说明
 
@@ -58,7 +58,6 @@ vgather_datablock(tensor, index: RawVReg, *, mask: Mask | None = None) -> RawVRe
 
 - 本接口需在`vf(mode="simd")`作用域内调用。
 
-- 本接口不支持64位元素类型。
 - 源操作数在UB中的起始地址需要32B对齐。
 - 索引位置要大于等于0且32B对齐，即一个索引值对应一个DataBlock。
 - 索引可以存在相同的值，即可以多次读取源操作数中同一个DataBlock的数据。
