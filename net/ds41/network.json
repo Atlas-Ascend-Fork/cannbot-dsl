@@ -12,6 +12,7 @@
     "mega_mla",
     "mega_full_index",
     "mega_compressor",
+    "mega_reindex",
     "attn_prologue"
   ]
 }

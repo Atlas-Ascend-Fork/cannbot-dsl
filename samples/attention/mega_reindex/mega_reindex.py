@@ -14,6 +14,7 @@ import math
 import cannbotdsl as cb
 import torch
 from cannbotdsl import dtypes as dt
+from cannbotdsl.aot import export
 from cannbotdsl.ops.sync import global_sync_all, onchip_rewind
 
 from .reindex_front import FrontPhases, FrontWorkspace
@@ -46,17 +47,28 @@ from .reindex_runtime import (
     check_platform,
     signature,
 )
-from .reindex_tail import CandidatePhase, PaReadPhase, TailScorePhase, TailTopkPhase
+from .reindex_tail import (
+    CandidatePhase,
+    LongPaReadPhase,
+    PaReadPhase,
+    TailScorePhase,
+    TailTopkPhase,
+)
 
 
 class MegaReindexTailWorkspace:
-    """Compact single-kernel workspace; use separately from the two-kernel tail."""
+    """Workspace with logical kv_s and candidate-bounded storage_kv_s for long PA."""
 
     def __init__(self, rows, kv_s, device, *, topk=512):
         self.rows, self.kv_s, self.topk = rows, kv_s, topk
         self.device = torch.device(device)
+        # Long PA addresses logical KV through the candidate table; only the
+        # bounded candidate set needs score/mask storage. Keep kv_s unchanged.
+        self.storage_kv_s = min(kv_s, MAX_KV_LENGTH)
         self.padded = (
-            (kv_s + SCORE_TILE_TOKENS - 1) // SCORE_TILE_TOKENS * SCORE_TILE_TOKENS
+            (self.storage_kv_s + SCORE_TILE_TOKENS - 1)
+            // SCORE_TILE_TOKENS
+            * SCORE_TILE_TOKENS
         )
 
         def alloc(shape, dtype):
@@ -282,9 +294,22 @@ class MegaReindexPA(MegaReindex):
         softmax_scale,
         page_size,
         cube_cores=None,
+        pages=None,
     ):
         super().__init__(rows, batch, length, topk, norm_eps, softmax_scale, cube_cores)
-        self.pa_read = PaReadPhase(batch, length, page_size, self.cube_cores)
+        self.long_pa = pages is not None and pages * page_size > MAX_KV_LENGTH
+        if self.long_pa:
+            self.pa_read = LongPaReadPhase(
+                rows, batch, page_size, pages, self.cube_cores
+            )
+            self.t_score = TailScorePhase(
+                rows, rows, length, self.cube_cores, compact=True
+            )
+            self.t_topk = TailTopkPhase(
+                rows, self.padded, topk, self.cube_cores, remap=True
+            )
+        else:
+            self.pa_read = PaReadPhase(batch, length, page_size, self.cube_cores)
 
     @cb.kernel
     def mega_reindex_kernel(
@@ -330,6 +355,7 @@ class MegaReindexPA(MegaReindex):
         t_usedk: cb.Tensor,
         pa_k: cb.Tensor,
         pa_table: cb.Tensor,
+        pa_map: cb.Tensor,
     ):
         self.f_quant.phase(f_x, f_ww, f_w, f_xq, f_xs)
         global_sync_all()
@@ -340,10 +366,34 @@ class MegaReindexPA(MegaReindex):
             self.f_weight.phase(f_x, f_ww, f_w, f_xq, f_xs)
         # Independent Vector work overlaps front Cube projections.
         # All lanes join the following barrier before workspace reuse.
-        self.t_candidates.phase(
-            t_candidates, t_counts, t_cuq, t_cuk, t_usedq, t_usedk, t_mask, t_visible
-        )
-        self.pa_read.phase(pa_k, pa_table, t_usedk, t_k, t_ks)
+        if cb.const_expr(self.long_pa):
+            self.pa_read.phase(
+                t_candidates,
+                t_counts,
+                t_cuq,
+                t_usedq,
+                t_usedk,
+                pa_k,
+                pa_table,
+                t_k,
+                t_ks,
+                t_mask,
+                t_visible,
+                pa_map,
+                t_score,
+            )
+        if cb.const_expr(not self.long_pa):
+            self.t_candidates.phase(
+                t_candidates,
+                t_counts,
+                t_cuq,
+                t_cuk,
+                t_usedq,
+                t_usedk,
+                t_mask,
+                t_visible,
+            )
+            self.pa_read.phase(pa_k, pa_table, t_usedk, t_k, t_ks)
         global_sync_all()
         onchip_rewind()
         self.f_norm.phase(
@@ -351,6 +401,10 @@ class MegaReindexPA(MegaReindex):
         )
         global_sync_all()
         onchip_rewind()
+        if cb.const_expr(self.long_pa):
+            self.pa_read.gather(
+                pa_k, pa_table, t_k, t_ks, t_mask, pa_map, t_counts, 0, 64
+            )
         self.t_query.phase(t_q, t_a, t_b, t_sa, t_sb, t_bias, t_freq, t_qs)
         global_sync_all()
         onchip_rewind()
@@ -364,15 +418,19 @@ class MegaReindexPA(MegaReindex):
                 )
             ),
             t_k_address,
-            t_ks.view((self.batch * self.t_score.length, 2, 2)),
+            t_ks.view((self.t_score.batch * self.t_score.length, 2, 2)),
             t_w,
             t_mask,
             t_visible,
             t_score,
+            t_counts,
+            pa_map,
         )
         global_sync_all()
         onchip_rewind()
-        self.t_topk.phase(t_score.view((self.rows * self.padded,)), t_indices)
+        self.t_topk.phase(
+            t_score.view((self.rows * self.padded,)), t_indices, pa_map, t_counts
+        )
 
     @cb.host
     def run(
@@ -418,6 +476,7 @@ class MegaReindexPA(MegaReindex):
         t_usedk,
         pa_k,
         pa_table,
+        pa_map,
     ):
         self.mega_reindex_kernel[self.cube_cores](
             f_x,
@@ -461,6 +520,7 @@ class MegaReindexPA(MegaReindex):
             t_usedk,
             pa_k,
             pa_table,
+            pa_map,
         )
 
 
@@ -620,8 +680,18 @@ def prepare_tail(
         else MegaReindexTailWorkspace(t, length, dev, topk=topk)
     )
     check_nz(wqb, "wqb")
-    if (ws.rows, ws.kv_s, ws.topk, ws.device) != (t, length, topk, dev):
-        raise ValueError("workspace T/kv_s/topk/device mismatch")
+    storage_length = getattr(ws, "storage_kv_s", ws.kv_s)
+    if (ws.rows, storage_length, ws.topk, ws.device) != (t, length, topk, dev):
+        raise ValueError(
+            "workspace T/storage_kv_s/topk/device mismatch: "
+            f"got {(ws.rows, storage_length, ws.topk, ws.device)}, "
+            f"expected {(t, length, topk, dev)}"
+        )
+    padded = (length + SCORE_TILE_TOKENS - 1) // SCORE_TILE_TOKENS * SCORE_TILE_TOKENS
+    if ws.padded != padded:
+        raise ValueError("workspace padded capacity mismatch; recreate the workspace")
+    check(ws.score, "workspace.score", (t, padded), torch.bfloat16, dev)
+    check(ws.indices, "workspace.indices", (t, topk), torch.int32, dev)
     if not hasattr(ws, "block_mask"):
         ws.block_mask = torch.empty(
             (t, ws.padded // CANDIDATE_BLOCK_SIZE), dtype=torch.uint8, device=dev
@@ -698,7 +768,13 @@ def prepare_pa(x, key, scale, table, usedq, usedk, cuk, ws, topk):
         or key.stride(0) < key.shape[1] * PA_RECORD_BYTES
     ):
         raise ValueError("PA k inner axes must be contiguous; pages cannot overlap")
-    length = table.shape[1] * page_size
+    logical_capacity = table.shape[1] * page_size
+    long_pa = logical_capacity > MAX_KV_LENGTH
+    if long_pa and key.stride(0) % 8:
+        raise ValueError("long PA requires an 8-byte-aligned physical page stride")
+    if logical_capacity > 1_048_704:
+        raise ValueError("long PA capacity exceeds the prototype limit")
+    length = min(logical_capacity, MAX_KV_LENGTH)
     if (
         not isinstance(topk, int)
         or topk < TOPK_ALIGNMENT
@@ -713,19 +789,48 @@ def prepare_pa(x, key, scale, table, usedq, usedk, cuk, ws, topk):
         if ws is not None
         else MegaReindexTailWorkspace(x.shape[0], length, x.device, topk=topk)
     )
-    if (ws.rows, ws.kv_s, ws.topk, ws.device) != (x.shape[0], length, topk, x.device):
-        raise ValueError("PA workspace T/capacity/topk/device mismatch")
-    sig = (batch, length)
+    if (ws.rows, ws.topk, ws.device) != (x.shape[0], topk, x.device) or ws.kv_s not in (
+        length,
+        logical_capacity,
+    ):
+        raise ValueError(
+            "PA workspace T/capacity/topk/device mismatch: "
+            f"got {(ws.rows, ws.kv_s, ws.topk, ws.device)}, "
+            f"expected T={x.shape[0]}, kv_s={length} or {logical_capacity}, "
+            f"topk={topk}, device={x.device}"
+        )
+    if getattr(ws, "storage_kv_s", ws.kv_s) != length:
+        raise ValueError(
+            "PA workspace storage capacity mismatch; recreate the workspace"
+        )
+    backing_batch = x.shape[0] if long_pa else batch
+    sig = (batch, length, long_pa)
     if getattr(ws, "_pa_signature", None) != sig:
         ws.pa_key = torch.empty(
-            (batch * length, 1, PACKED_HEAD_DIM), dtype=torch.uint8, device=x.device
+            (backing_batch * length, 1, PACKED_HEAD_DIM),
+            dtype=torch.uint8,
+            device=x.device,
         )
         ws.pa_scale = torch.empty(
-            (batch * length, 1, 2, 2), dtype=torch.uint8, device=x.device
+            (backing_batch * length, 1, 2, 2), dtype=torch.uint8, device=x.device
         )
         ws.pa_cuk = torch.arange(batch + 1, dtype=torch.int32, device=x.device) * length
+        ws.pa_map = (
+            torch.empty(
+                (x.shape[0], CANDIDATE_CAPACITY + 1), dtype=torch.int32, device=x.device
+            )
+            if long_pa
+            else ws.visible_lengths
+        )
         ws._pa_signature = sig
-    return ws.pa_key, ws.pa_scale, ws.pa_cuk, ws, (key, table), page_size
+    return (
+        ws.pa_key[: batch * length],
+        ws.pa_scale[: batch * length],
+        ws.pa_cuk,
+        ws,
+        (key, table, ws.pa_map),
+        page_size,
+    )
 
 
 @functools.lru_cache(maxsize=32)
@@ -743,7 +848,15 @@ def compile_mega_reindex(
 ):
     op = (
         MegaReindexPA(
-            rows, batch, length, topk, norm_eps, softmax_scale, page_size, cube_cores
+            rows,
+            batch,
+            length,
+            topk,
+            norm_eps,
+            softmax_scale,
+            page_size,
+            cube_cores,
+            specs[-2][1][1],
         )
         if page_size
         else MegaReindex(rows, batch, length, topk, norm_eps, softmax_scale, cube_cores)
@@ -854,6 +967,8 @@ def prepare_mega_reindex(
         workspace=tail_workspace,
         topk=topk,
     )
+    if page_size and block_table.shape[1] * page_size > MAX_KV_LENGTH:
+        ta = ta[:8] + (tw.pa_key, tw.pa_scale.view(SCALE_DTYPE)) + ta[10:]
     args = fa + ta + pa_args
     batch = seqused_q.numel()
     # Resource limits are dynamic and must not be hidden by the compile cache.
@@ -944,3 +1059,161 @@ def mega_reindex(
     )
     program(*args)
     return tw.indices
+
+
+def _native_signature(rows, batch, length, topk, page_size=0):
+    """Describe the prepare_front/prepare_tail ABI without allocating tensors."""
+    bf16, f32 = torch.bfloat16, torch.float32
+    u8, i8, i32, scale = torch.uint8, torch.int8, torch.int32, SCALE_DTYPE
+    padded = (length + SCORE_TILE_TOKENS - 1) // SCORE_TILE_TOKENS * SCORE_TILE_TOKENS
+    fields = [
+        ((rows, HIDDEN_SIZE), bf16),
+        ((NUM_HEADS, HIDDEN_SIZE), bf16),
+        ((rows, NUM_HEADS), f32),
+        ((rows * HIDDEN_SIZE,), u8),
+        ((rows * INPUT_SCALE_PAIRS * 2,), u8),
+        ((rows, HIDDEN_SIZE), i8),
+        ((rows, INPUT_SCALE_PAIRS, 2), scale),
+        ((HIDDEN_SIZE, Q_LORA_RANK), i8),
+        ((INPUT_SCALE_PAIRS, Q_LORA_RANK, 2), scale),
+        ((rows, Q_LORA_RANK), bf16),
+        ((0,), f32),
+        ((Q_LORA_RANK,), bf16),
+        ((rows * Q_LORA_RANK,), bf16),
+        ((rows * Q_LORA_RANK,), u8),
+        ((rows * QUERY_SCALE_PAIRS * 2,), u8),
+        ((rows, NUM_HEADS), bf16),
+        ((rows, NUM_HEADS * PACKED_HEAD_DIM), u8),
+        ((rows, Q_LORA_RANK), i8),
+        ((QUERY_DIM, Q_LORA_RANK), i8),
+        ((rows, QUERY_SCALE_PAIRS, 2), scale),
+        ((QUERY_DIM, QUERY_SCALE_PAIRS, 2), scale),
+        ((0,), f32),
+        ((rows * HEAD_DIM // 2,), f32),
+        ((rows, NUM_HEADS * HEAD_SCALE_GROUPS), u8),
+        ((batch * length, 1, PACKED_HEAD_DIM), u8),
+        ((batch * length, 1, 2, 2), scale),
+        ((rows, NUM_HEADS), bf16),
+        ((rows, padded // CANDIDATE_BLOCK_SIZE), u8),
+        ((rows,), i32),
+        ((rows, padded), bf16),
+        ((rows * topk,), i32),
+        None,
+        None,
+        ((rows, 1, CANDIDATE_CAPACITY), i32),
+        ((rows, 1), i32),
+        ((batch + 1,), i32),
+        ((batch + 1,), i32),
+        ((batch,), i32),
+        ((batch,), i32),
+    ]
+    if page_size:
+        fields.extend(
+            [
+                ((batch * length // page_size, page_size // 8, PA_RECORD_BYTES), u8),
+                ((batch, length // page_size), i32),
+                ((rows,), i32),  # Short PA passes visible_lengths as pa_map.
+            ]
+        )
+    result = []
+    for field in fields:
+        if field is None:
+            result.append(("int64",))
+            continue
+        shape, dtype = field
+        stride, step = [], 1
+        for size in reversed(shape):
+            stride.append(step)
+            step *= max(size, 1)
+        result.append(("tensor", shape, dtype, tuple(reversed(stride))))
+    return tuple(result)
+
+
+@export("mega_reindex")
+def export_mega_reindex():
+    """Publish TND and PA128 S6/S8/S16 profiles using the runtime compile factory.
+
+    CANNBOTDSL_DS41_PROFILES may override the defaults with a mega_reindex list.
+    Publication creates TensorSpecs only; it never allocates or launches tensors.
+    """
+    import json
+    import os
+
+    device = 0
+    defaults = dict(
+        batch=1,
+        seq_len=8,
+        length=8192,
+        topk=512,
+        norm_eps=1e-20,
+        softmax_scale=1 / 64,
+        page_size=0,
+        cube_cores=32,
+    )
+    profiles = [
+        dict(seq_len=seq, page_size=page) for seq in (6, 8, 16) for page in (0, 128)
+    ]
+    path = os.environ.get("CANNBOTDSL_DS41_PROFILES")
+    if path:
+        with open(path, encoding="utf-8") as stream:
+            profiles = json.load(stream).get("mega_reindex", profiles)
+    compile_mega_reindex.cache_clear()
+    try:
+        for profile in profiles:
+            unknown = set(profile) - set(defaults)
+            if unknown:
+                raise ValueError(
+                    f"Unknown mega_reindex profile fields: {sorted(unknown)}"
+                )
+            config = dict(defaults, **profile)
+            batch, seq, length, topk, page, cores = (
+                config[name]
+                for name in (
+                    "batch",
+                    "seq_len",
+                    "length",
+                    "topk",
+                    "page_size",
+                    "cube_cores",
+                )
+            )
+            if (
+                any(type(v) is not int for v in (batch, seq, length, topk, page, cores))
+                or batch < 1
+                or seq < 2
+                or seq % 2
+                or cores < 2
+                or topk < TOPK_ALIGNMENT
+                or topk % TOPK_ALIGNMENT
+                or not topk <= length <= MAX_KV_LENGTH
+                or (
+                    page
+                    and (
+                        page < PA_PAGE_ALIGNMENT
+                        or page > MAX_PA_PAGE_SIZE
+                        or page % PA_PAGE_ALIGNMENT
+                        or length % page
+                    )
+                )
+                or not math.isfinite(config["norm_eps"])
+                or config["norm_eps"] <= 0
+                or not math.isfinite(config["softmax_scale"])
+            ):
+                raise ValueError(f"Invalid mega_reindex export profile: {config}")
+            specs = _native_signature(batch * seq, batch, length, topk, page)
+            program = compile_mega_reindex(
+                batch * seq,
+                batch,
+                length,
+                topk,
+                config["norm_eps"],
+                config["softmax_scale"],
+                device,
+                specs,
+                page,
+                cores,
+            )
+            program.close()
+            compile_mega_reindex.cache_clear()
+    finally:
+        compile_mega_reindex.cache_clear()

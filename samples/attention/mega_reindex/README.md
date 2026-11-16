@@ -121,7 +121,7 @@ assert indices.shape == (T, topk)
 assert indices.dtype == torch.int32
 ```
 
-完整可复用调用函数见仓库 `test/attention/mega_reindex/example.py`。
+完整可复用调用函数见仓库 `test/attention/mega_reindex/test_mega_reindex.py` 中的 `run_example()`。
 
 ## 性能优化策略
 
@@ -156,33 +156,34 @@ reindex_matmul.py 与 reindex_mx.py 保留独立的底层矩阵乘模板。
 在已安装 CANN、torch/torch_npu、CANNBotDSL 的环境中，从默认名称
 `cannbot-dsl` 的克隆目录上一级进入仓库，并将 `samples` 加入模块搜索路径：
 
-    cd cannbot-dsl
-    PYTHONPATH="$PWD/samples${PYTHONPATH:+:$PYTHONPATH}" python3.12 -c "from attention.mega_reindex.mega_reindex import mega_reindex"
+```bash
+cd cannbot-dsl
+PYTHONPATH="$PWD/samples${PYTHONPATH:+:$PYTHONPATH}" python3.12 -c "from attention.mega_reindex.mega_reindex import mega_reindex"
+```
 
 算子以源码方式使用，首次调用按 shape 编译，后续复用进程内编译缓存。
 算子入口与 `FrontWorkspace` 从主源码模块导入；`prepare_weight_nz` 位于
 `reindex_front.py`，`prepare_wqa_nz` 和 `prepare_wqb_nz` 位于 `reindex_front.py`。
 示例和测试使用仓库统一的 `_samples_path.load_sample` 加载对应源码文件。
 
-
-## PA 分页缓存（PA_BBND）
+## PA 分页缓存（`PA_BBND`）
 
 新增 layout_k="PA_BBND" 和 block_table，兼容仓内
 quant_sparse_lightning_indexer_dsl 的 PA 缓存字节布局。
 key/descale_key 的旧位置参数继续支持；也可使用仓内命名 k/descale_k
 作为关键字别名，两种名字不得同时提供同一输入。
 
-| 参数 | TND | PA_BBND |
+| 参数 | TND | `PA_BBND` |
 | --- | --- | --- |
 | k / key | UINT8 [B*kv_s,1,64] | UINT8 [P,page_size/8,544] |
 | descale_k / descale_key | UINT8/E8M0 [B*kv_s,1,2,2] | 必须 None，scale 内嵌在 k |
 | block_table | 必须 None | 必填 INT32 [B,max_pages] |
 | cu_seqlens_k | 必填 | 必须 None |
 | seqused_k | INT32 [B] | INT32 [B]，实际有效 token 数 |
-| workspace kv_s | TND 每 batch 容量 | max_pages*page_size |
+| workspace kv_s | TND 每 batch 容量 | 页表逻辑容量 `max_pages*page_size`，或兼容传 `min(max_pages*page_size,16384)` |
 
 page_size 为 16 的倍数，范围 [16,1024]。
-PA 的逻辑容量 max_pages*page_size 仍须满足 topk<=容量<=16384。
+短 PA 的逻辑容量要求 `topk<=容量<=16384`。更大的容量走长 PA 候选紧凑路径，上限为 1,048,704。
 每个 8-token 块的前 512 字节保存 K，后 32 字节保存 scale。
 K 的页内两轴须连续；物理页之间允许 padding。
 block_table 必须连续，活动页表项由调用方保证为 [0,P) 内有效物理页号；
@@ -195,10 +196,9 @@ seqused_k 的值须位于 [0,逻辑容量]。
 L20 packed PA cache -> 本 kernel Vector 按页表读取 -> UB 拆分 K/scale
 -> 临时 GM -> 现有 MXFP4 QK -> BF16 score -> TopK。
 PA 读取与 WQ_A/weights_proj Cube 投影并行，复用已有全核屏障，
-无需额外分页解包 kernel。首版按实际有效页读取，不按候选稀疏程度跳页，
-且暂存整个逻辑 K/scale，尚不是 PA 直接到 L1 的零暂存方案。
+无需额外分页解包 kernel。短 PA 按实际有效页读取并暂存 K/scale。长 PA 仅暂存候选块的 K/scale。
 
-临时 workspace 增量为 68*B*逻辑容量 字节及 4*(B+1) 字节内部前缀。
+短 PA 的临时 workspace 增量为 68*B*逻辑容量 字节及 4*(B+1) 字节内部前缀。
 B=1、容量8192时为544 KiB加8字节。首次 prepare 分配，重复调用复用；
 同一 workspace 不可同时用于并发 stream。
 原地更新 page table、缓存内容或 seqused_k 后，下一次调用读取新值，
@@ -206,29 +206,55 @@ B=1、容量8192时为544 KiB加8字节。首次 prepare 分配，重复调用�
 
 调用示意（其余参数沿用原接口）：
 
-    indices = mega_reindex(
-        x, wqa, descale_wqa, ww, norm_weight, wqb, descale_wqb, rope,
-        k=l20_packed_cache, descale_k=None,
-        layout_k="PA_BBND", block_table=block_table,
-        candidate_block_indices=candidate_block_indices,
-        candidate_block_length=candidate_block_length,
-        cu_seqlens_q=cu_seqlens_q, seqused_q=seqused_q, seqused_k=seqused_k,
-        front_workspace=front_ws, tail_workspace=tail_ws,
-    )
+```python
+indices = mega_reindex(
+    x, wqa, descale_wqa, ww, norm_weight, wqb, descale_wqb, rope,
+    k=l20_packed_cache, descale_k=None,
+    layout_k="PA_BBND", block_table=block_table,
+    candidate_block_indices=candidate_block_indices,
+    candidate_block_length=candidate_block_length,
+    cu_seqlens_q=cu_seqlens_q, seqused_q=seqused_q, seqused_k=seqused_k,
+    front_workspace=front_ws, tail_workspace=tail_ws,
+)
+```
 
 TND 默认路径继续使用原编译模板；PA 的 page size、capacity 和 stride
 属于编译签名。本扩展不增加 QSLI metadata 输入，不改变最终 [T,topk] 输出。
 
+### 百万级逻辑地址
+
+长 PA 每个 query 最多读取候选表中的 2048 个 8-token 块，物理页 stride 须按 8 字节对齐。
+TopK 输出仍是 batch 内逻辑 token 索引。相邻 query 的有效候选前缀相同时，可以共享 K/scale 暂存。
+候选计划与 WQ_A/weights_proj 并行，K/scale 搬运与 WQ_B 并行。
+
+显式创建 workspace 时，`ws.kv_s` 保留传入值，内部 score 和 mask 按
+`ws.storage_kv_s = min(ws.kv_s, 16384)` 分配。长 PA 的 `ws.kv_s` 可传页表逻辑容量或 16384，
+并须与 query 行数、topk、设备及实际缓冲区匹配。旧的全容量 workspace 对象需要重新创建。
+
+| `seqused_k`（有效 token 数） | 128-token 页数 | `block_table.shape` | `ws.kv_s` |
+| ---: | ---: | --- | --- |
+| 1,048,576 | 8192 | `[B,8192]` | 1,048,576 或 16,384 |
+| 1,048,578 | 8193 | `[B,8193]` | 1,048,704 或 16,384 |
+
+长 PA 的 score 以紧凑候选槽为序。`pa_map[T,2049]` 的前 2048 项保存逻辑块映射，
+末项是内部调度标记。K/scale 暂存、映射和内部前缀合计增加
+`68*T*16384 + 4*T*2049 + 4*(B+1)` 字节。
 
 测试入口位于仓库 `test/attention/mega_reindex`，不随算子包发布。
 回归命令（从仓库根目录运行）：
 
-    python3.12 -m pytest -m npu test/attention/mega_reindex
+```bash
+python3.12 -m pytest -m npu test/attention/mega_reindex
+```
 
-    python3.12 test/attention/mega_reindex/smoke.py
+```bash
+python3.12 test/attention/mega_reindex/test_mega_reindex.py smoke
+```
 
-    python3.12 test/attention/mega_reindex/verify_pa.py
-    python3.12 test/attention/mega_reindex/verify_pa_batch.py
+```bash
+python3.12 test/attention/mega_reindex/test_mega_reindex.py verify-pa
+python3.12 test/attention/mega_reindex/test_mega_reindex.py verify-pa-batch
+```
 
 测试自行生成输入并将 PA 寻址结果与同字节 TND 路径比较；不依赖其他仓库、
 真实模型文件或外部测试数据。第一条覆盖四种页大小、物理页 padding、
@@ -247,24 +273,47 @@ scale 参数使用 `torch.float8_e8m0fnu`，权重预处理函数直接返回 E8
 为兼容原始 patch，同时接受同字节编码的 UINT8 输入；内部仅使用 dtype view，
 不做数值转换，不改变量化编码、形状和计算公式。
 
-NPU CI 通过既有 `test_mega_reindex_deployment.py` 调用 smoke、PA 和多 batch 脚本，
+NPU CI 通过既有 `test_mega_reindex.py` 分别执行 smoke、PA 和多 batch 场景，
 并验证非恒等 RoPE、不同 stream 核配额和 Graph 重放的结果一致性。
-
 
 ### 性能复测的参考快照
 
-`benchmark_migration.py` 需要与待测脚本输入完全一致的参考快照；仓库
+`test_mega_reindex.py benchmark` 需要与待测脚本输入完全一致的参考快照；仓库
 不附带 `baseline.pt`。先在参考实现对应的 DSL 环境中运行
-`verify_migration.py capture`，再在待测环境中显式传入 `--reference`：
+`test_mega_reindex.py capture`，再在待测环境中显式传入 `--reference`：
 
-    python3.12 test/attention/mega_reindex/verify_migration.py capture \
-      /path/to/reference_setup.py /path/to/baseline.pt
-    python3.12 test/attention/mega_reindex/benchmark_migration.py \
-      /path/to/candidate_setup.py /path/to/profile_output \
-      --reference /path/to/baseline.pt --samples 30
+```bash
+python3.12 test/attention/mega_reindex/test_mega_reindex.py capture \
+  /path/to/reference_setup.py /path/to/baseline.pt
+python3.12 test/attention/mega_reindex/test_mega_reindex.py benchmark \
+  /path/to/candidate_setup.py /path/to/profile_output \
+  --reference /path/to/baseline.pt --samples 30
+```
 
 两个 setup 脚本应定义同一组确定性输入及 `program`、`args`、
 `candidate_block_length`、`num_blocks`、`front_workspace`、
 `tail_workspace`。参考快照由原实现独立进程生成，不能用待测结果充当
 参考。若未提供文件或快照缺少 `full/tail/indices`、
 `full/tail/score`，性能脚本会在启动 NPU 工作前报错。
+
+## Native 打包
+
+`mega_reindex` 已加入 `ds41` 分组。`export_mega_reindex()` 复用运行时的
+`compile_mega_reindex()`，仅构造 TensorSpec，不分配 Tensor、不执行 NPU Kernel。
+默认发布 B=1、S=6/8/16、KV 容量 8192、topk=512、32 Cube 核的 TND 和
+PA128 配置；权重使用现有 NZ ABI，norm_eps=1e-20、softmax_scale=1/64。
+PA 默认配置使用紧凑物理页池，形状和 stride 必须与发布的 TensorSpec 一致。
+Native 发布配置的容量上限为 16384，百万级 PA 使用源码 JIT。
+
+可通过 `CANNBOTDSL_DS41_PROFILES` 指定 JSON 文件覆盖默认配置，例如：
+
+```json
+{"mega_reindex":[{"batch":1,"seq_len":8,"length":8192,"page_size":0,"cube_cores":32},{"batch":1,"seq_len":8,"length":8192,"page_size":128,"cube_cores":32}]}
+```
+
+`page_size=0` 表示 TND；非零表示 PA 分页 KV 布局。其余可选字段为 `topk`、
+`norm_eps`、`softmax_scale`。序列长度必须为正偶数；运行时形状、页池布局、
+参数及 stream 核配额必须命中发布配置，其他配置需要另行发布。
+构建方法见 [Native 打包说明](../../../packaging/native/README.md)。
+
+外部 migration setup 按普通 Python 脚本完整执行，应仅准备输入、program/args 与工作区。内置 setup 可直接指定 `test/attention/mega_reindex/test_mega_reindex.py`，由共享的 `_make_case()` 函数准备。

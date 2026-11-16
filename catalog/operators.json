@@ -325,7 +325,19 @@
     },
     "mega_reindex": {
       "source": "samples/attention/mega_reindex",
-      "test": "test/attention/mega_reindex"
+      "test": "test/attention/mega_reindex",
+      "native": {
+        "export": "mega_reindex",
+        "sources": [
+          "@mega_reindex/source/mega_reindex.py",
+          "@mega_reindex/source/reindex_front.py",
+          "@mega_reindex/source/reindex_query.py",
+          "@mega_reindex/source/reindex_runtime.py",
+          "@mega_reindex/source/reindex_tail.py",
+          "@mega_reindex/source/reindex_matmul.py",
+          "@mega_reindex/source/reindex_mx.py"
+        ]
+      }
     },
     "matmul_streamk": {
       "source": "samples/matmul/matmul/matmul_streamk.py",
@@ -415,7 +427,8 @@
     "moonep",
     "mega_mla",
     "mega_full_index",
-    "mega_compressor"
+    "mega_compressor",
+    "mega_reindex"
   ],
   "ci": {
     "skip_all_tests": false,
@@ -1040,7 +1053,8 @@
           "@attn_epilogue/test",
           "@mega_mla/test",
           "@mega_full_index/test",
-          "@mega_compressor/test"
+          "@mega_compressor/test",
+          "@mega_reindex/test"
         ]
       },
       {

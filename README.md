@@ -114,6 +114,7 @@ python -c 'import cannbotdsl; print(cannbotdsl.__version__)'
 | [indexer_prologue_qw](samples/attention/indexer_prologue_qw) | `indexer_prologue_qw()` | MXFP8 Q GEMM、尾部 RoPE、MXFP4 量化，以及 BF16 W GEMM |
 | [indexer_prologue_k](samples/attention/indexer_prologue_k) | `indexer_prologue_k()` | Indexer K 路前处理：BF16 投影、RMSNorm、RoPE、MXFP4 量化与分页 cache 写入 |
 | [mega_full_index](samples/attention/mega_full_index) | `mega_full_index()` | DeepSeek V4.1 第 20 层融合：Indexer Prologue QW/K 前处理与 Quant Lightning Indexer 单 kernel 启动，输出 Top-512 token 索引与候选块 |
+| [mega_reindex](samples/attention/mega_reindex) | `mega_reindex()` | DeepSeek V4.1 L24/L28/L32/L36 候选消费层 Indexer：融合量化、投影、RMSNorm、RoPE、候选打分与 TopK，支持 TND 与 PA 分页 KV 两种 K 布局 |
 | [qsa_indexer](samples/attention/qsa_indexer) | `qsa_indexer()`、`qsa_indexer_metadata()` | 压缩 Key 稀疏索引，选高分压缩块并展开为 token 索引 |
 | [stem_indexer](samples/attention/stem_indexer) | `stem_indexer()`、`stem_indexer_metadata()` | 块级特征打分 + 动态 TopK 选择 Key Block |
 | [quant_lightning_indexer](samples/attention/quant_lightning_indexer) | `quant_lightning_indexer()` | MXFP4 Lightning Indexer（QLI），遍历上下文选 TopK token |
