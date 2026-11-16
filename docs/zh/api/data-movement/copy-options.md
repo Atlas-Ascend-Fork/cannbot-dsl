@@ -41,7 +41,7 @@ copy_options(
 | `mx_scale` | 输入 | MX矩阵计算过程中所需的左/右矩阵对应的量化系数`Tensor`。<br>默认值为 `None`，表示只搬运左/右矩阵，不传入对应的量化`Tensor`；传入时，将量化`Tensor`搬入对应的 L0A_MX/L0B_MX。被传入 `mem_copy(dst, src, options=copy_options(mx_scale=scale))`使用时，`src` 是左/右矩阵，数据类型须为 `float8_e4m3fn`、`float8_e5m2` 或 `fp4x2_e2m1`；`mx_scale` 是对应的量化矩阵，数据类型须为 `float8_e8m0`。类型、布局和形状要求见 [MX 量化矩阵](#mx-量化矩阵)。 |
 | `l2_cache_ctl` | 输入 | 读写 GM 时的 L2 Cache 管理策略。<br>默认值为 `0`，各方向的可用策略`id`及含义见 [L2 Cache 策略](#l2-cache-策略)。 |
 | `atomic` | 输入 | 原子写入模式，支持 `"none"`、`"add"`、`"min"`、`"max"`，默认为 `"none"`。用于 UB 或 L0C 向 GM 搬运时的写入操作；不能与 `atomic_add` 同时指定。 |
-| `atomic_add` | 输入 | 是否将源`Tensor`的数据，原子累加到目标`Tensor`的原值上。<br>默认值为 `False`，表示覆盖写入；可传入布尔值，仅 UB→GM、L0C→GM 支持启用：<br> 1. UB→GM 要求源、目标元素类型相同，可为 `int8`、`int16`、`int32`、`bfloat16`、`float16` 或 `float32`；<br> 2. L0C→GM 要求源为 `float32` 或 `int32`，目标与源同类型，或为 `float16`、`bfloat16`、`int8`。L0C→GM 的目标须为 ND 布局，NZ 直存不支持原子累加。 |
+| `atomic_add` | 输入 | 是否将源`Tensor`的数据，原子累加到目标`Tensor`的原值上。<br>默认值为 `False`，表示覆盖写入；可传入布尔值，仅 UB→GM、L0C→GM 支持启用：<br> 1. UB→GM 要求源、目标元素类型相同，可为 `int8`、`int16`、`int32`、`bfloat16`、`float16` 或 `float32`；<br> 2. L0C→GM 要求源为 `float32` 或 `int32`，目标与源同类型，或为 `float16`、`bfloat16`、`int8`。L0C→GM 支持 ND 和 NZ 布局的原子累加。 |
 | `pad_val` | 输入 | 普通GM→UB/L1搬运时，对齐补齐使用的值。默认 `"first"` 表示使用首元素，也可指定常量或运行时标量。与 `Tensor.pad` 同时使用时，两者的常量填充值和编码必须一致。 |
 | `channel_split` | 输入 | 控制 L0C→GM/UB/L1 搬出时，是否把 16×16 的 FP32 源分形拆成两个 16×8 的目标分形。默认值为 `None`；显式设置时源、目标元素类型须为 `float32`，L0C→GM/UB 要求目标采用NZ布局。各取值见 [FP32 通道拆分](#fp32-通道拆分)。 |
 
