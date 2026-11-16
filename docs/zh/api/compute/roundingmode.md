@@ -1,24 +1,28 @@
-# RoundingMode
+# 舍入模式与饱和模式
 ## 产品支持情况
 
 - Ascend 950PR&950DT系列产品：支持
 
 ## 简介
 
-`RoundingMode`是寄存器级类型转换接口的舍入模式枚举，用于`vcast`的`rounding`参数，决定精度变化时如何选择结果值。它与标量转换使用的`scalar.RoundingMode`相互独立；饱和模式由单独的`saturate`参数控制。
+类型转换接口通过舍入模式和饱和模式控制精度变化与溢出行为。`RoundingMode`是标量、Reg矢量和SIMT接口共用的舍入模式枚举；各接口支持的类型组合、舍入子集和默认值以对应接口说明为准。
 
 ## 定义
 
 ```python
-from cannbotdsl.ops.reg import RoundingMode
+from cannbotdsl import RoundingMode
 
-RoundingMode.NA   # 不显式指定舍入模式，由转换接口按类型组合选择
+# 也可以从公共类型模块导入同一个枚举：
+# from cannbotdsl.types import RoundingMode
+
+RoundingMode.NA   # 不显式指定舍入模式，由支持该成员的接口按类型组合选择
 RoundingMode.RN   # 舍入到最近的可表示值，中点取偶数
 RoundingMode.RNA  # 舍入到最近的可表示值，中点远离零
 RoundingMode.RD   # 向负无穷方向舍入
 RoundingMode.RU   # 向正无穷方向舍入
 RoundingMode.RZ   # 向零方向舍入
-RoundingMode.RO   # 奇数舍入，用于 float32 转 float16
+RoundingMode.RO   # 奇数舍入，不等价于取整到奇数整数
+RoundingMode.RH   # 混合舍入，用于支持该模式的 hifloat8 转换
 ```
 
 ## 模式概述
@@ -32,25 +36,27 @@ RoundingMode.RO   # 奇数舍入，用于 float32 转 float16
 
 `RoundingMode`枚举支持以下舍入模式：
 
+下表及详细说明中的取整示例以整数精度为例；浮点精度转换按目标浮点格式的可表示值进行舍入，不表示先取整。
+
 **表1** 舍入模式说明
 
 | 舍入模式 | 枚举成员 | 说明 | 示例 |
 | :------ | :------ | :--- | :--- |
-| RINT | `RoundingMode.RN` | 四舍六入五成双舍入（Banker's Rounding）。当小数部分为0.5时，舍入到最近的偶数。 | 1.5 → 2, 2.5 → 2, 3.5 → 4 |
+| RINT | `RoundingMode.RN` | 四舍六入五成双舍入（Banker's Rounding）。舍入到最近的可表示值；恰好位于中点时，选择保留结果最低有效位为偶数的值。 | 1.5 → 2, 2.5 → 2, 3.5 → 4 |
 | ROUND | `RoundingMode.RNA` | 舍入到最近的可表示值；恰好位于中点时选择远离零的一侧。 | 1.4 → 1, 1.5 → 2, -1.5 → -2 |
-| FLOOR | `RoundingMode.RD` | 向负无穷方向舍入。总是向下取整。 | 1.7 → 1, -1.3 → -2 |
-| CEIL | `RoundingMode.RU` | 向正无穷方向舍入。总是向上取整。 | 1.3 → 2, -1.7 → -1 |
-| TRUNC | `RoundingMode.RZ` | 向零方向舍入。直接截断小数部分。 | 1.7 → 1, -1.7 → -1 |
-| ODD | `RoundingMode.RO` | 奇数舍入，仅用于`float32`转`float16`，控制浮点表示的舍入，不表示取整到最近的奇数。 | 不适用整数取整示例 |
+| FLOOR | `RoundingMode.RD` | 向负无穷方向舍入，整数精度下表现为向下取整。 | 1.7 → 1, -1.3 → -2 |
+| CEIL | `RoundingMode.RU` | 向正无穷方向舍入，整数精度下表现为向上取整。 | 1.3 → 2, -1.7 → -1 |
+| TRUNC | `RoundingMode.RZ` | 向零方向舍入，整数精度下表现为截断小数部分。 | 1.7 → 1, -1.7 → -1 |
+| ODD | `RoundingMode.RO` | 奇数舍入；发生精度损失时使保留结果的最低有效位为1，不表示取整到最近的奇数整数。 | 不适用整数取整示例 |
+| 未指定 | `RoundingMode.NA` | 未显式指定舍入模式，由支持该成员的接口按类型组合选择。 | 见对应接口说明 |
+| HYBRID | `RoundingMode.RH` | 混合舍入，用于支持该模式的`hifloat8`转换。 | 见对应接口说明 |
 
-`RoundingMode.NA`为默认值，表示未显式指定舍入模式。
-
-`vcast`的`rounding`参数也接受对应的字符串`"na"`、`"rn"`、`"rna"`、`"rd"`、`"ru"`、`"rz"`、`"ro"`，不区分大小写。可用模式与源、目标类型有关，具体子集见 [`vcast`](./vcast.md#约束说明)。
+`reg.vcast`的`rounding`默认值为`RoundingMode.NA`，表示未显式指定舍入模式；也接受对应的模式名称字符串，不区分大小写。可用模式与源、目标类型有关，具体子集见[`vcast`](./vector/reg_convert/vcast.md#约束说明)。
 
 ### 舍入模式详细说明
 
 #### RINT（四舍六入五成双）
-也称为"银行家舍入法"，是一种统计学上最无偏的舍入方法。
+也称为"银行家舍入法"。以下以整数精度说明：
 - 当小数部分小于0.5时，向下舍入
 - 当小数部分大于0.5时，向上舍入
 - 当小数部分等于0.5时，舍入到最近的偶数
@@ -94,7 +100,7 @@ RoundingMode.RO   # 奇数舍入，用于 float32 转 float16
 ```
 
 #### TRUNC（向零截断）
-直接截断小数部分，向零方向舍入。
+向零方向舍入，整数精度下直接截断小数部分。
 
 **示例：**
 ```text
@@ -103,7 +109,7 @@ RoundingMode.RO   # 奇数舍入，用于 float32 转 float16
 ```
 
 #### ODD（奇数舍入）
-用于`float32`转`float16`的浮点精度转换，不等价于舍入到最近的奇数整数。不能使用整数取整示例解释本模式。
+用于浮点精度转换，不等价于舍入到最近的奇数整数。不能使用整数取整示例解释本模式。`reg.vcast`中仅用于`float32`转`float16`，其他接口的支持范围见各自说明。
 
 ## 饱和模式与非饱和模式说明
 
@@ -111,7 +117,9 @@ RoundingMode.RO   # 奇数舍入，用于 float32 转 float16
 
 ### 配置方法
 
-饱和模式与非饱和模式通过转换接口的`saturate`参数配置，详细说明请参见[`vcast`](./vcast.md)。
+饱和模式与舍入模式是独立设置。对于提供`saturate`参数的转换接口，通过该参数配置饱和或非饱和模式，详细说明请参见[`vcast`](./vector/reg_convert/vcast.md)。以下以Reg类型转换说明常见行为；实际支持范围及溢出、NaN、Inf行为仍取决于类型组合、舍入模式和相关控制配置。
+
+对于需要调整CTRL寄存器饱和配置的场景，可通过[`set_ctrl`](../execution/device/spr/set-ctrl.md)接口配置，具体配置要求请参见该接口说明。
 
 ### 非饱和模式（Non-Saturation Mode）
 
@@ -140,11 +148,11 @@ RoundingMode.RO   # 奇数舍入，用于 float32 转 float16
 ```
 
 #### 浮点数转换
-- **超出范围**：返回输出类型的对应符号inf值（正/负无穷）
+- **超出范围**：对于支持Inf的目标格式，结果可能为对应符号的Inf或有限边界值，取决于舍入模式
 - **±inf输入**：返回±inf
 - **NaN输入**：返回NaN
 
-**示例（float → half）：**
+**示例（float → half，RN非饱和模式）：**
 ```text
 输入值: 70000.0 (超出half范围)
 输出值: +inf
@@ -251,8 +259,8 @@ RoundingMode.RO   # 奇数舍入，用于 float32 转 float16
 
 | 场景 | 非饱和模式 | 饱和模式 |
 | :--- | :--- | :--- |
-| **整型转整型（溢出）** | 截断低位，高位丢弃 | 返回目标类型最值 |
-| **浮点转浮点（超出范围）** | 返回±inf | 返回目标类型最值 |
+| **整型转整型（溢出）** | 保留低位，丢弃高位 | 返回目标类型最值 |
+| **浮点转浮点（超出范围）** | 视目标格式与舍入模式，可返回±inf或有限边界值 | 返回目标类型最值 |
 | **浮点转整型（超出范围）** | 截断至目标宽度 | 返回目标类型最值 |
 | **浮点转整型（±inf）** | 返回目标类型最值 | 返回目标类型最值 |
 | **浮点转浮点（±inf）** | 返回±inf | 返回目标类型最值 |
@@ -261,6 +269,7 @@ RoundingMode.RO   # 奇数舍入，用于 float32 转 float16
 ## 约束说明
 
 - 本枚举无独立执行语义；约束见其使用接口。
+- 模式含义共用不表示接口支持范围相同。标量转换见[`scalar.cast`](./scalar/scalar_convert/cast.md)，Reg转换见[`reg.vcast`](./vector/reg_convert/vcast.md)，SIMT转换见[`simt.cast`](../simt/conversion/cast.md)和[`simt.vcast`](../simt/conversion/vcast.md)。各接口的默认值、支持子集和饱和配置方式分别规定。
 
 ## 调用示例
 
@@ -273,8 +282,9 @@ import torch_npu
 from cannbotdsl import Buffer, dtypes, host, make_layout, mem_copy
 from cannbotdsl.lang.kernel import kernel
 from cannbotdsl.lang.vf import vf
-from cannbotdsl.ops.reg import PackMode, RoundingMode, create_mask, vcast, vload, vstore_pack
+from cannbotdsl.ops.reg import PackMode, create_mask, vcast, vload, vstore_pack
 from cannbotdsl.tensor import MemLoc
+from cannbotdsl.types import RoundingMode
 
 @kernel
 def _rounding_mode_kernel(src, dst):
@@ -288,8 +298,8 @@ def _rounding_mode_kernel(src, dst):
     with vf(mode="simd"):
         mask = create_mask(pattern="all", elem_bits=32)
         h = vcast(vload(in0, 0), dtypes.float16, mask=mask,
-                         rounding=RoundingMode.RN)
-        vstore_pack(res, 0, h, mask, pack_mode=PackMode.B32_TO_B16)
+                  rounding=RoundingMode.RN)
+        vstore_pack(res, 0, h, mask, pack_mode=PackMode.PACK_HALF)
 
     mem_copy(dst, out)
 

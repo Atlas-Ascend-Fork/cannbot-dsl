@@ -20,7 +20,7 @@ simt.vcast(value, *, dtype, rounding=RoundingMode.RN, saturate=False) -> 短向�
 | --- | --- | --- |
 | value | 输入 | 双分量短向量，类型为`float32x2`、`float16x2`、`bfloat16x2`、`fp8x2_e4m3fn`、`fp8x2_e5m2`、`hifloat8x2`；具体源、目标组合见约束说明。 |
 | dtype | 输入 | 目标双分量短向量数据类型，可选`float32x2`、`float16x2`、`bfloat16x2`、`fp8x2_e4m3fn`、`fp8x2_e5m2`、`hifloat8x2`；必须与源类型不同。 |
-| rounding | 输入 | [RoundingMode](./roundingmode.md)枚举或名称字符串，默认`RoundingMode.RN`。各类型组合的可选值见[约束说明](#约束说明)。 |
+| rounding | 输入 | 公共[RoundingMode](../../compute/roundingmode.md)枚举或名称字符串，默认`RoundingMode.RN`。各类型组合的可选值见[约束说明](#约束说明)。 |
 | saturate | 输入 | 是否启用饱和转换，类型为`bool`，默认`False`。各类型组合的支持情况和`CTRL[60]`设置要求见[约束说明](#约束说明)。 |
 
 ## 返回值说明

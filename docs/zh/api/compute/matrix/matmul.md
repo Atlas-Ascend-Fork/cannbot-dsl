@@ -114,7 +114,7 @@ matmul(dst: Tensor, lhs: Tensor, rhs: Tensor, *, bias: Tensor | None = None, ini
 
 ### 特殊值/边界值约束
 
-- 注意，应避免nan输入，否则可能会产生执行报错；整数类型仅支持[饱和模式](../vector/reg_convert/roundingmode.md#饱和模式与非饱和模式说明)。
+- 注意，应避免nan输入，否则可能会产生执行报错；整数类型仅支持[饱和模式](../roundingmode.md#饱和模式与非饱和模式说明)。
 
 ## 调用示例
 

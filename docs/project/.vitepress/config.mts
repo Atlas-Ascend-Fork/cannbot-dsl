@@ -1123,10 +1123,6 @@ const simtSidebar = {
       "collapsed": true,
       "items": [
         {
-          "text": "RoundingMode",
-          "link": "/zh/api/simt/conversion/roundingmode"
-        },
-        {
           "text": "cast",
           "link": "/zh/api/simt/conversion/cast"
         },
@@ -1473,6 +1469,10 @@ const apiSidebar = [
         "link": "/zh/api/compute",
         "items": [
           {
+            "text": "舍入模式与饱和模式",
+            "link": "/zh/api/compute/roundingmode"
+          },
+          {
             "text": "原子计算",
             "section": "/compute/atomic",
             "items": [
@@ -1701,10 +1701,6 @@ const apiSidebar = [
                   {
                     "text": "cast",
                     "link": "/zh/api/compute/scalar/scalar_convert/cast"
-                  },
-                  {
-                    "text": "RoundingMode",
-                    "link": "/zh/api/compute/scalar/scalar_convert/roundingmode"
                   }
                 ],
                 "collapsed": true
@@ -1987,10 +1983,6 @@ const apiSidebar = [
                 "text": "类型转换",
                 "section": "/compute/vector/reg_convert",
                 "items": [
-                  {
-                    "text": "RoundingMode",
-                    "link": "/zh/api/compute/vector/reg_convert/roundingmode"
-                  },
                   {
                     "text": "vcast",
                     "link": "/zh/api/compute/vector/reg_convert/vcast"
@@ -2888,6 +2880,7 @@ const normalizeApiSidebar = (sidebar: any[]) => {
     if (dataMovement) compute.items = remove(compute.items, dataMovement)
     const computeItems = compute.items ?? []
     compute.items = [
+      find(computeItems, '/compute/roundingmode'),
       find(computeItems, '/compute/tensor'),
       find(computeItems, '/compute/scalar'),
       find(computeItems, '/compute/vector'),

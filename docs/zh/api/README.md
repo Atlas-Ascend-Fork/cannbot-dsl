@@ -101,6 +101,7 @@ API 页面按语言、数据结构、数据搬运、计算、设备执行、调�
     - [conv2d_store_output](data-movement/convolution/conv2d-store-output.md)
     - [load3d](data-movement/convolution/load3d.md)
 - [计算](compute/index.md)
+  - [舍入模式与饱和模式](compute/roundingmode.md)
   - 张量计算
     - [ceil_div](compute/tensor/ceil_div.md)
     - [idx2crd](compute/tensor/idx2crd.md)
@@ -119,7 +120,6 @@ API 页面按语言、数据结构、数据搬运、计算、设备执行、调�
       - [zero_bits_cnt](compute/scalar/scalar_bit/zero-bits-cnt.md)
     - 类型转换
       - [cast](compute/scalar/scalar_convert/cast.md)
-      - [RoundingMode](compute/scalar/scalar_convert/roundingmode.md)
     - 数据搬入
       - [load_bypass](compute/scalar/scalar_load/load-bypass.md)
     - 数据搬出
@@ -250,7 +250,6 @@ API 页面按语言、数据结构、数据搬运、计算、设备执行、调�
       - [mask_counter](compute/vector/reg_mask/mask-counter.md)
       - [update_mask](compute/vector/reg_mask/update-mask.md)
     - 类型转换
-      - [RoundingMode](compute/vector/reg_convert/roundingmode.md)
       - [vcast](compute/vector/reg_convert/vcast.md)
       - [vceil](compute/vector/reg_convert/vceil.md)
       - [vfloor](compute/vector/reg_convert/vfloor.md)
@@ -633,7 +632,6 @@ API 页面按语言、数据结构、数据搬运、计算、设备执行、调�
       - [byte_perm](simt/math/integer/byte-perm.md)
       - [sad](simt/math/integer/sad.md)
   - [类型转换](simt/conversion/index.md)
-    - [RoundingMode](simt/conversion/roundingmode.md)
     - [cast](simt/conversion/cast.md)
     - [vcast](simt/conversion/vcast.md)
     - [bitcast](simt/conversion/bitcast.md)

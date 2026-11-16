@@ -11,7 +11,7 @@
 ## 函数原型
 
 ```python
-simt.add(lhs, rhs, rounding=simt.RoundingMode.RN) -> ScalarValue
+simt.add(lhs, rhs, rounding=RoundingMode.RN) -> ScalarValue
 ```
 
 ## 参数说明
@@ -20,7 +20,7 @@ simt.add(lhs, rhs, rounding=simt.RoundingMode.RN) -> ScalarValue
 | --- | --- | --- |
 | lhs | 输入 | 左加数，类型为`float16`、`bfloat16`或`float32`。 |
 | rhs | 输入 | 右加数，数据类型必须与`lhs`相同。 |
-| rounding | 输入 | 舍入模式，类型为 [RoundingMode](../../conversion/roundingmode.md) 或名称字符串，默认`simt.RoundingMode.RN`。 |
+| rounding | 输入 | 舍入模式，类型为公共[RoundingMode](../../../compute/roundingmode.md)或名称字符串，默认`RoundingMode.RN`。 |
 
 ## 返回值说明
 

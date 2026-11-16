@@ -20,7 +20,7 @@ simt.cast(value, *, dtype, rounding=RoundingMode.RN, saturate=False) -> 目标�
 | --- | --- | --- |
 | value | 输入 | 带明确数据类型的标量；本页源类型范围为`int8`、`uint8`、`int16`、`uint16`、`int32`、`uint32`、`int64`、`uint64`、`float16`、`bfloat16`、`float32`或`bool`。 |
 | dtype | 输入 | 目标标量数据类型；可选`int8`、`uint8`、`int16`、`uint16`、`int32`、`uint32`、`int64`、`uint64`、`float16`、`bfloat16`、`float32`、`bool`。必须与源类型不同，合法组合见约束说明。 |
-| rounding | 输入 | [RoundingMode](./roundingmode.md)枚举或名称字符串，默认`RoundingMode.RN`。各类型组合的可选值见[约束说明](#约束说明)。 |
+| rounding | 输入 | 公共[RoundingMode](../../compute/roundingmode.md)枚举或名称字符串，默认`RoundingMode.RN`。各类型组合的可选值见[约束说明](#约束说明)。 |
 | saturate | 输入 | 是否启用饱和转换，类型为`bool`，默认`False`。各类型组合的支持情况和`CTRL[60]`设置要求见[约束说明](#约束说明)。 |
 
 ## 返回值说明
@@ -29,7 +29,7 @@ simt.cast(value, *, dtype, rounding=RoundingMode.RN, saturate=False) -> 目标�
 
 ## 约束说明
 
-源和目标均须为标量，且数据类型不同。下表列出支持的转换组合。表中的舍入模式均为[RoundingMode](./roundingmode.md)成员。
+源和目标均须为标量，且数据类型不同。下表列出支持的转换组合。表中的舍入模式均为[RoundingMode](../../compute/roundingmode.md)成员。
 
 | 源类型 | 目标类型 | `rounding` | `saturate` |
 | --- | --- | --- | --- |
