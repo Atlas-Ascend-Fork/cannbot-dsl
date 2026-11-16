@@ -11,6 +11,7 @@
     "attn_epilogue",
     "mega_mla",
     "mega_full_index",
-    "mega_compressor"
+    "mega_compressor",
+    "attn_prologue"
   ]
 }

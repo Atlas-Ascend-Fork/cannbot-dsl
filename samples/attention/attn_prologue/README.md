@@ -2,7 +2,7 @@
 
 基于 CANNBotDSL 的 MXFP8 attention prologue 融合算子，面向 Ascend 950。
 在一个 MIX kernel 中完成 QA/KV 投影、RMSNorm、QR 动态量化、QB 投影、尾部 RoPE 和 KV cache 写回。
-固定生产维度为 `(H,R,N,D,Dr)=(5120,1280,64,512,64)`，支持 decode / prefill 的 `T=batch*sequence` 泛化。
+固定生产维度为 `(H,R,D,Dr)=(5120,1280,512,64)`，Q head 数 `N` 支持 16 和 64，支持 decode / prefill 的 `T=batch*sequence` 泛化。
 
 ## 功能说明
 
@@ -14,18 +14,20 @@ X = Deq(x, descale_x)
 qa = X @ Deq(wqa, descale_wqa).T                         # [T,R]
 kv = X @ Deq(wkv, descale_wkv).T                         # [T,D]
 
-qr, descale_qr = Quant32(RMSNorm(qa, norm_weight_qr))
-q_proj = Deq(qr, descale_qr) @ Deq(wqb, descale_wqb).T    # [T,N*D]
+qr_bf16 = BF16(RMSNorm(qa, norm_weight_qr))              # [T,R] 公开输出
+qr_fp8, descale_qr = Quant32(qr_bf16)                    # 内部，供 QB
+q_proj = Deq(qr_fp8, descale_qr) @ Deq(wqb, descale_wqb).T    # [T,N*D]
 q = BF16(TailRoPE(reshape(q_proj, [T,N,D])))
 
 kv_rope = TailRoPE(RMSNorm(kv, norm_weight_kv))
-kv_bytes = ByteView_uint8(E4M3FN(clamp(kv_rope, -448, 448)))
-kv_cache[cache_index[t] // BS, cache_index[t] % BS, 0, :] = kv_bytes[t, :]
+kv_payload, kv_scale = QuantKV32(kv_rope)              # 每 32 元素一个 BF16 scale
+kv_cache[cache_index[t] // BS, cache_index[t] % BS, 0, :] =
+    concat(ByteView_uint8(kv_payload[t]), ByteView_uint8(kv_scale[t]))
 ```
 
 三个矩阵乘由 Cube 执行，归约、归一化、量化和 RoPE 由 Vector 执行。
 设备矩阵乘直接消费 FP8 payload 和 scale，使用 FP32 中间累加。
-QB 的输入是量化后的 QR；KV 使用固定 scale=1，结果以 FP8 原始字节写入 cache。
+QB 的输入是量化后的 QR；KV 使用每 32 元素一个 BF16 scale，payload 与 scale 一起写入 cache。
 算子返回 `(q, qr, descale_qr)`，后续 attention 计算由其他算子完成。
 
 ### RMSNorm 与动态量化
@@ -36,32 +38,59 @@ RMSNorm 对每个 token 的完整特征行独立计算，不减均值。QA 的�
 RMSNorm(v, gamma)[j] = v[j] * gamma[j] / sqrt(mean(v^2) + norm_eps)
 ```
 
-QR 每 32 个元素组成一组。对非零组，量化规则为：
+QR（以及网络侧的 BF16 x）每 32 个元素组成一组，采用与 HF `round_scale` 一致的规则：
 
 ```text
 amax = max(abs(group))
-e = max(floor(log2(amax)) - 8, -127)
-scale = 2^e
+a = max(amax, 1e-4)
+s0 = a * (1/448)
+scale = ceil_pow2(s0)                 # 不小于 s0 的最小 2 的幂
 payload = E4M3FN(clamp(group / scale, -448, 448))
-scale 的编码字节 = e + 127
+scale 的编码字节 = exponent(scale) + 127
 ```
 
-E4M3FN 转换采用最近偶数舍入。全零组的 payload 和 scale 编码字节均写 0。
+`ceil_pow2` 由 FP32 指数/尾数位实现（向上取整），不依赖 log2 边界。全零组因
+`a` 的下限而 scale 非零、payload 全 0。E4M3FN 转换采用最近偶数舍入。
 相邻两个 scale 成对存储，因此每行 R 个元素对应 `[R/64,2]` 的 scale。
+
+### KV cache 量化与行布局
+
+KV 的每个 token 向量沿 D 轴每 32 个元素一组（D=512 共 16 组），每组使用独立 BF16 scale：
+
+```text
+a = max(amax, 1e-4)                          # amax=max(abs(group))，FP32
+s0 = a * (1/448)                             # FP32
+s_bf16 = ceil_pow2(s0)                       # 不小于 s0 的最小 2 的幂，BF16 存储
+s_used = bf16_to_fp32(s_bf16)
+payload = E4M3FN(clamp(group / s_used, -448, 448))
+```
+
+`ceil_pow2` 由 FP32 指数/尾数位实现（向上取整），不依赖 log2 边界。全零组的
+`amax` 被下限抬到 `1e-4`，因此 scale 不为 0、payload 全 0；这是网络原有
+`round_scale=True` 口径。
+
+cache 每行固定 544 字节：
+
+```text
+字节 0..511    : E4M3FN payload，按 group=32 顺序
+字节 512..543  : 16 个 BF16 scale（小端 2 字节），按 group 顺序
+```
+
+RoPE 之前量化第 0..13 组；第 14、15 组（元素 448..511）在尾部 RoPE 之后量化。
 
 ### 尾部 RoPE
 
-Q 的每个 head 和 KV 向量均保留前 `D-Dr` 维，仅变换最后 Dr 维。
-令 z 为该尾部、`h=Dr/2`，对 `i=0..h-1`：
+Q 的每个 head 和 KV 向量均保留前 `D-Dr` 维，仅变换最后 Dr 维。位置表为全宽
+`[T,Dr]`（输入可为 `[T,1,1,Dr]`），按相邻对 `(2i, 2i+1)` 取 cos/sin，输出保持
+interleave 排列：
 
 ```text
-out_tail[i]     = z[2*i] * rope_cos[t,i]   + z[2*i+1] * rope_sin[t,i]
-out_tail[h + i] = z[2*i] * rope_sin[t,h+i] + z[2*i+1] * rope_cos[t,h+i]
+out[2*i]   = z[2*i] * cos[t,2*i]   - z[2*i+1] * sin[t,2*i]
+out[2*i+1] = z[2*i+1] * cos[t,2*i+1] + z[2*i] * sin[t,2*i+1]
 ```
 
-采用 `INTERLEAVE_HALF` 约定：读取相邻输入对，分别写入输出的前后两个半区。
-公式中的符号由 sin 表提供。通常的旋转角 θ 对应前半 `sin=-sin(θ)`、后半 `sin=sin(θ)`，
-两半 cos 均为 `cos(θ)`；同一 token 的位置表在全部 Q head 上广播。
+网络直接传入正常 sin 表，不需要调用方预先加负号；同一 token 的位置表在全部 Q head
+上广播。滑窗层使用 `cos_sin["win"]`，压缩注意力层使用 `cos_sin["comp"]`。
 
 ## 函数原型
 
@@ -85,7 +114,8 @@ q, qr, descale_qr = attn_prologue(
 
 ## 参数与约束
 
-`T=batch*sequence` 为展平后的 token 数，`H=5120`、`R=1280`、`N=64`、`D=512`、`Dr=64`。
+`T=batch*sequence` 为展平后的 token 数，`H=5120`、`R=1280`、`D=512`、`Dr=64`，
+Q head 数 `N` 仅支持 16 和 64，由 `wqb.shape[0] // D` 推导。
 `P` 是 cache 页数，`BS` 是每页的 token slot 数，两者由调用方指定。
 下表均为逻辑形状；NZ 只改变物理布局，不改变权重的逻辑矩阵方向。
 
@@ -103,7 +133,7 @@ q, qr, descale_qr = attn_prologue(
 | `norm_weight_kv` | `[D]` | FP32 / ND | KV 的 RMSNorm 权重 |
 | `rope_sin`、`rope_cos` | 各 `[T,Dr]` | FP32 / ND | 每个 token 的位置变换系数 |
 | `cache_index` | `[T]` | INT64 / ND | 要更新的扁平 cache slot |
-| `kv_cache` | `[P,BS,1,D]` | UINT8 / ND | 原地更新的缓存 |
+| `kv_cache` | `[P,BS,1,544]` | UINT8 / ND | 原地更新的缓存，行宽 544 |
 | `norm_eps` | 标量 | host 实数 | 有限正数，默认 `1e-6`，两条支路共用 |
 
 E4M3FN 和 E8M0 分别为 `torch.float8_e4m3fn`、`torch.float8_e8m0fnu`。
@@ -113,15 +143,18 @@ E4M3FN 和 E8M0 分别为 `torch.float8_e4m3fn`、`torch.float8_e8m0fnu`。
 | 输出 | 形状 | dtype | 含义 |
 |---|---|---|---|
 | `q` | `[T,N,D]` | `torch.bfloat16` | QB 投影并完成尾部 RoPE 的最终 Q |
-| `qr` | `[T,R]` | `torch.float8_e4m3fn` | RMSNorm 后动态量化的中间结果 |
-| `descale_qr` | `[T,R/64,2]` | `torch.int8` | QR 的 E8M0 编码字节 |
-| 原地更新 `kv_cache` | `[P,BS,1,D]` | `torch.uint8` | E4M3FN 编码字节，仅改写命中的 slot |
+| `qr` | `[T,R]` | `torch.bfloat16` | RMSNorm 后的 BF16 结果（量化前，供下游算子） |
+| `descale_qr` | `[T,R/64,2]` | `torch.int8` | 内部 MXFP8 量化的 E8M0 编码字节 |
+| 原地更新 `kv_cache` | `[P,BS,1,544]` | `torch.uint8` | payload 512B + 16×BF16 scale，仅改写命中的 slot |
 
-`descale_qr` 使用 int8 字节载体，与输入 scale 的 E8M0 dtype 不同。
+`descale_qr` 使用 int8 字节载体，与输入 scale 的 E8M0 dtype 不同。公开的 `qr` 是
+RMSNorm 后的 BF16 值；QB 仍消费内部 E4M3FN payload 与 `descale_qr`，但量化结果不再作为
+公开 QR 输出。
 KV 不额外返回 scale，也不返回独立的 K、V 张量。
 
 - 所有输入张量须逻辑连续且位于同一 NPU；调用前设置对应的当前设备。ND 对应 format 0 或 2，NZ 对应 format 29。
-- H、R、D 须为 64 的倍数；Dr 为正数且是 16 的倍数，满足 `Dr <= 64`、`Dr <= D/2`。完整验收范围为上述固定生产维度的 T 泛化。
+- H、R、D 须为 64 的倍数；N 必须为 16 或 64；Dr 为正数且是 16 的倍数，满足 `Dr <= 64`、`Dr <= D/2`。完整验收范围为上述固定生产维度的 T 泛化。
+- `kv_cache` 最后一维必须等于 `D + (D/32)*2`（D=512 时为 544）；未命中的 slot 必须逐字节保持不变。
 - `x[t]`、位置表和 `cache_index[t]` 须对应同一个 token；算子不从 T 推断位置或所属序列。
 - 调用方须保证 `0 <= cache_index[t] < P*BS`，且一次调用内没有重复 slot。host 侧只校验元数据，不读取设备索引值；未命中的 slot 保持原始字节不变。
 - 公共入口自动选择分块并查询平台核数，只接受 `norm_eps` 这一可选关键字参数。
@@ -192,6 +225,40 @@ workspace_bytes = 4 * work_rows * split_k * (R + D)
 | KV 归约、后处理与写回 | [`_service_kv`](attn_prologue.py#L2079)、[`_reduce_normalize_a`](attn_prologue.py#L2542)、[`_finish_kv_row`](attn_prologue.py#L2976) |
 | 尾部 RoPE 与跨阶段发布 | [`_rope_pair`](attn_prologue.py#L3069)、[`_publish_a1`](attn_prologue.py#L1770)、[`_publish_qr`](attn_prologue.py#L1780) |
 | 公共入口与编译缓存 | [`prepare_attn_prologue`](attn_prologue.py#L4125)、[`_Launcher.compile_cached`](attn_prologue.py#L4042) |
+
+## 网络侧封装（替换现有 prolog）
+
+`NetworkAttnPrologue` 对现有 `Attention.compute_win_cache(self, x, kv_cache, attn_metadata)`
+提供等价入口，网络侧只替换调用：
+
+```python
+net = NetworkAttnPrologue(
+    wqa, wkv, wqb, descale_wqa, descale_wkv, descale_wqb,
+    norm_weight_qr, norm_weight_kv,
+    attention_type="win", weight_nz=True, norm_eps=1e-6,
+)
+win_kv, qr, q = net.compute_win_cache(
+    x_bf16, kv_cache, attn_metadata,
+    attention_type="win", norm_eps=1e-20,
+)
+```
+
+- `kv_cache` 可以是 `KVCache` 对象，封装层取 `kv_cache.win_kv`。
+- `attention_type` 必须按当前层显式传入（`"win"` 取 `cos_sin["win"]`，否则取 `"comp"`）；
+  `norm_eps` 使用网络值（通常 `1e-20`），不要沿用默认。
+- `cos_sin[key]` 是 `(cos, sin)` 元组；封装层按 `rope_sin=sin, rope_cos=cos` 传给 kernel。
+
+- `x`：BF16 `[T,H]`；每步由封装量化为 MXFP8（group=32），不融合进主 kernel。
+- 权重：逻辑 `[K,N]` E4M3，weight_scale `[K/64,N,2]` uint8 E8M0；构造时识别 ND/NZ，
+  一次性转置为内部 `[N,K]` 并预打包；gamma 为 BF16，构造时转 FP32。
+- `attn_metadata["cos_sin"]`：`{"win": (cos, sin), "comp": (cos, sin)}`，均为
+  FP32 `[T,1,1,Dr]`；`attention_type=="win"` 取 `"win"`，否则取 `"comp"`。
+- `attn_metadata["cache_slot_mapping"]["win_kv"]`：INT64 展平索引，允许 `-1`/越界；
+  无效 slot 只跳过 cache 写回，Q/QR 仍计算。
+- 返回 `(win_kv, qr, q)`；`win_kv` 是原地更新的 `kv_cache`。
+
+prepared 对象可通过 `update_inputs(x, descale_x, rope_sin, rope_cos, cache_index, norm_eps)`
+每步刷新；它直接改写 kernel 读取的补齐缓冲，避免图回放沿用 capture 时的数据。
 
 ## 调用示例
 

@@ -12,6 +12,7 @@ mqsmla = ["attention/mixed_quant_sparse_flash_mla/mixed_quant_sparse_flash_mla.p
 qli = ["attention/quant_lightning_indexer/quant_lightning_indexer.py", "attention/quant_lightning_indexer_metadata/quant_lightning_indexer_metadata.py"]
 qsli = ["attention/quant_sparse_lightning_indexer/quant_sparse_lightning_indexer.py", "attention/quant_sparse_lightning_indexer_metadata/quant_sparse_lightning_indexer_metadata.py"]
 attn_epilogue = ["attention/attn_epilogue/attn_epilogue.py"]
+attn_prologue = ["attention/attn_prologue/attn_prologue.py", "attention/attn_prologue/attn_prologue_kernel.py", "attention/attn_prologue/attn_prologue_tiling.py"]
 indexer_prologue_qw = ["attention/indexer_prologue_qw/indexer_prologue_qw.py", "attention/indexer_prologue_qw/indexer_prologue_qw_format.py"]
 indexer_prologue_k = ["attention/indexer_prologue_k/indexer_prologue_k.py"]
 engram_gate = ["vector/engram_gate/engram_gate.py"]
@@ -32,5 +33,5 @@ mega_full_index = ["attention/mega_full_index/mega_full_index.py", "attention/me
 mega_compressor = ["attention/mega_compressor/mega_compressor.py"]
 
 [groups]
-ds41 = ["mqsmla", "qli", "qsli", "indexer_prologue_qw", "indexer_prologue_k", "engram_gate", "attn_epilogue", "mega_mla", "mega_full_index", "mega_compressor"]
+ds41 = ["mqsmla", "qli", "qsli", "indexer_prologue_qw", "indexer_prologue_k", "engram_gate", "attn_epilogue", "mega_mla", "mega_full_index", "mega_compressor", "attn_prologue"]
 k3 = ["block_attn_res_update_rms_norm", "flash_kda", "flash_kda_fwd", "flash_kda_cp_preprocess", "flash_kda_cp_main", "fused_recurrent_kda", "fused_recurrent_kda_replayssm", "mega_recurrent_kda", "commit_recurrent_kda", "quant_mla_prolog"]

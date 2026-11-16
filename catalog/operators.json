@@ -21,7 +21,15 @@
     },
     "attn_prologue": {
       "source": "samples/attention/attn_prologue",
-      "test": "test/attention/attn_prologue"
+      "test": "test/attention/attn_prologue",
+      "native": {
+        "export": "attn_prologue",
+        "sources": [
+          "@attn_prologue/source/attn_prologue.py",
+          "@attn_prologue/source/attn_prologue_kernel.py",
+          "@attn_prologue/source/attn_prologue_tiling.py"
+        ]
+      }
     },
     "flash_kda": {
       "source": "samples/attention/flash_kda",
@@ -389,6 +397,7 @@
     "quant_lightning_indexer",
     "quant_sparse_lightning_indexer",
     "attn_epilogue",
+    "attn_prologue",
     "indexer_prologue_qw",
     "indexer_prologue_k",
     "engram_gate",

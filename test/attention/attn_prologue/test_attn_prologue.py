@@ -44,6 +44,12 @@ TYPICAL_BLOCK_SIZE = 128
 SMALL_PROFILE = (64, 64, 2, 64, 16)
 PRODUCTION_COMPAT_PROFILE = (7168, 1536, 32, 512, 64)
 TARGET_PROFILE = (5120, 1280, 64, 512, 64)
+KV_SCALE_BYTES = 2
+
+
+def kv_row_bytes(head_size: int) -> int:
+    """KV cache 单行字节数：512 字节 payload + 16 个 BF16 scale。"""
+    return head_size + (head_size // MX_GROUP_SIZE) * KV_SCALE_BYTES
 
 
 def ceil_div(value: int, divisor: int) -> int:
@@ -148,8 +154,8 @@ def quantize_mxfp8(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """沿最后一维做动态 MXFP8 量化，每 32 值共享一个 E8M0 指数。
 
-    共享指数 ``e = clamp(floor(log2(amax)) - 8, -127, 127)``。
-    零块输出 payload 全 0、scale 字节 0。
+    与 HF 一致：``scale = ceil_pow2(max(amax, 1e-4) / 448)``，用 FP32
+    指数/尾数位向上取整；零块 payload 全 0，但 scale 因下限 1e-4 不为 0。
 
     返回 ``(payload, paired_scale, normalized)``。``normalized`` 是**实际
     被 cast 的值**（已除以组 scale、已饱和），只服务于 03 文档 §4.3 的
@@ -175,25 +181,81 @@ def quantize_mxfp8(
         end = min(start + MX_GROUP_SIZE, width)
         block = work[:, start:end]
         amax = block.abs().amax(dim=1)
-        zero = amax == 0
-        # log2(0) 无定义：零块借 1.0 参与运算，稍后整组清零。
-        safe_amax = torch.where(zero, torch.ones_like(amax), amax)
-        exponents = (_floor_log2(safe_amax) - QUANT_EXP_HEADROOM).clamp(-127, 127)
+        # HF round_scale：a=max(amax,1e-4)，scale 为不小于 a/448 的最小 2 的幂。
+        floored = torch.maximum(amax, torch.full_like(amax, 1e-4))
+        s0 = (floored * (1.0 / E4M3FN_MAX)).to(torch.float32)
+        bits = s0.view(torch.int32)
+        exponents = ((bits + 0x007FFFFF) >> 23) - 127
+        exponents = exponents.clamp(-127, 127)
         scales = _pow2(exponents, compute_dtype)
         normalized = (block / scales[:, None]).clamp(-E4M3FN_MAX, E4M3FN_MAX)
-        normalized = torch.where(
-            zero[:, None], torch.zeros_like(normalized), normalized
-        )
         normalized_all[:, start:end] = normalized
         payload[:, start:end] = normalized.to(torch.float8_e4m3fn)
         encoded = _encode_e8m0_exponents(exponents)
-        # 零块按公开约定输出 scale 字节 0，不保留借用值。
-        scale_flat[:, group_index] = torch.where(
-            zero, torch.zeros_like(encoded), encoded
-        )
+        scale_flat[:, group_index] = encoded
 
     paired = scale_flat.reshape(rows, pair_groups // MX_SCALE_PAIR, MX_SCALE_PAIR)
     return payload, paired.contiguous(), normalized_all
+
+
+def kv_round_scale(amax: torch.Tensor) -> torch.Tensor:
+    """a=max(amax,1e-4)；scale 为不小于 a/448 的最小 2 的幂（BF16）。"""
+    floored = torch.maximum(amax, torch.full_like(amax, 1e-4))
+    s0 = (floored * (1.0 / E4M3FN_MAX)).to(torch.float32)
+    bits = s0.view(torch.int32)
+    exponent = ((bits + 0x007FFFFF) >> 23).clamp(max=254)
+    scale = (exponent << 23).to(torch.int32).view(torch.float32)
+    return scale.to(torch.bfloat16)
+
+
+def quantize_kv_rows(
+    values: torch.Tensor,
+    compute_dtype: torch.dtype = torch.float32,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Per-32 BF16-scale quantization for the KV cache.
+
+    Each group stores ``amax/448`` rounded to BF16 (round-to-nearest-even).
+    The payload is ``E4M3FN(clamp(value / s_used))`` where ``s_used`` is the
+    stored BF16 value widened back to FP32/FP64, so payload and scale are
+    self-consistent. All-zero groups store scale 0 and payload 0; a nonzero
+    group whose scale rounds to zero also stores payload 0.
+    """
+    if values.ndim != 2 or not values.is_floating_point():
+        raise TypeError("KV values must be a rank-2 floating-point tensor")
+    rows, width = values.shape
+    if width % MX_GROUP_SIZE:
+        raise ValueError("KV width must be a multiple of the group size")
+    groups = width // MX_GROUP_SIZE
+    work = values.to(compute_dtype)
+    payload = torch.empty((rows, width), dtype=torch.float8_e4m3fn)
+    normalized_all = torch.empty((rows, width), dtype=compute_dtype)
+    scale_bytes = torch.empty((rows, groups, KV_SCALE_BYTES), dtype=torch.uint8)
+    for group_index in range(groups):
+        start = group_index * MX_GROUP_SIZE
+        block = work[:, start : start + MX_GROUP_SIZE]
+        amax = block.abs().amax(dim=1)
+        # 网络原有 round_scale=True：a=max(amax,1e-4)，scale 为不小于 a/448
+        # 的最小 2 的幂（FP32 指数/尾数位向上取整），以 BF16 存储。
+        scale_bf16 = kv_round_scale(amax)
+        scale_used = scale_bf16.to(compute_dtype)
+        normalized = (block / scale_used[:, None]).clamp(-E4M3FN_MAX, E4M3FN_MAX)
+        normalized_all[:, start : start + MX_GROUP_SIZE] = normalized
+        payload[:, start : start + MX_GROUP_SIZE] = normalized.to(torch.float8_e4m3fn)
+        scale_bytes[:, group_index, :] = scale_bf16.view(torch.uint8).reshape(rows, 2)
+    return payload, scale_bytes, normalized_all
+
+
+def expand_bf16_scale(scale_bytes: torch.Tensor, width: int) -> torch.Tensor:
+    """(rows, groups, 2) little-endian BF16 bytes -> per-element FP64 factors."""
+    if scale_bytes.shape[-1] != KV_SCALE_BYTES:
+        raise ValueError("BF16 scale bytes must have a trailing 2-byte axis")
+    rows, groups = scale_bytes.shape[0], scale_bytes.shape[1]
+    words = scale_bytes.contiguous().view(torch.uint16).reshape(rows, groups)
+    factors = words.view(torch.bfloat16).to(torch.float64)
+    expanded = factors.repeat_interleave(MX_GROUP_SIZE, dim=1)
+    if expanded.shape[1] < width:
+        raise ValueError("BF16 scale groups do not cover the requested width")
+    return expanded[:, :width]
 
 
 # --------------------------------------------------------------------------
@@ -223,7 +285,8 @@ class RopeConvention(str, enum.Enum):
     """`rotary` 的配对/落位约定。
 
     流程图与 issue #7 **都没有定义**这件事（01 文档 §5，决策 D2）。
-    默认值是前一版基线冻结的 INTERLEAVE_HALF，已由用户确认沿用。
+    默认值按网络现有 prolog 采用 GPTJ_INTERLEAVED（interleave 输入/输出）；
+    INTERLEAVE_HALF 仅作为历史基线保留。
 
     ⚠️ **INTERLEAVE_HALF 在标准 RoPE 表下不是旋转。** 它的逐对 2×2 矩阵是
     ``[[cos[i], sin[i]], [sin[half+i], cos[half+i]]]``——注意**没有负号**，
@@ -244,7 +307,7 @@ def apply_tail_rope(
     rope_sin: torch.Tensor,
     rope_cos: torch.Tensor,
     *,
-    convention: RopeConvention = RopeConvention.INTERLEAVE_HALF,
+    convention: RopeConvention = RopeConvention.GPTJ_INTERLEAVED,
     compute_dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
     """只改写末尾 Dr 维；前 D-Dr 维**逐位原样透传**。
@@ -280,9 +343,10 @@ def apply_tail_rope(
     elif convention is RopeConvention.GPTJ_INTERLEAVED:
         even = tail[..., 0::2].clone()
         odd = tail[..., 1::2].clone()
-        se, ce = sin[..., 0::2], cos[..., 0::2]
+        ce, se = cos[..., 0::2], sin[..., 0::2]
+        co, so = cos[..., 1::2], sin[..., 1::2]
         tail[..., 0::2] = even * ce - odd * se
-        tail[..., 1::2] = even * se + odd * ce
+        tail[..., 1::2] = odd * co + even * so
     elif convention is RopeConvention.NEOX_HALF_SPLIT:
         lo = tail[..., :half].clone()
         hi = tail[..., half:].clone()
@@ -331,7 +395,7 @@ class AttnPrologueTrace:
     q: torch.Tensor  # ★ [T,N,D] bf16
     qr: torch.Tensor  # ★ [T,R]   e4m3
     descale_qr: torch.Tensor  # ★ [T,G(R),2] e8m0(int8)
-    kv_cache: torch.Tensor  # ★ [P,BS,1,D] uint8（就地更新结果）
+    kv_cache: torch.Tensor  # ★ [P,BS,1,D+2G] uint8（payload+BF16 scale，就地更新）
     # 中间量
     x_deq: torch.Tensor | None = None  # [T,H]
     qa_fp32: torch.Tensor | None = None  # [T,R]
@@ -342,7 +406,8 @@ class AttnPrologueTrace:
     kv_fp32: torch.Tensor | None = None  # [T,D]
     kv_normed: torch.Tensor | None = None  # [T,D]
     kv_roped: torch.Tensor | None = None  # [T,D]  RoPE 后、量化前
-    kv_bytes: torch.Tensor | None = None  # [T,D]  bitcast 后、scatter 前
+    kv_bytes: torch.Tensor | None = None  # [T,D]  payload bitcast 后、scatter 前
+    kv_scale: torch.Tensor | None = None  # [T,G,2] 每组 BF16 scale 的小端字节
 
 
 def _validate_inputs(inputs: AttnPrologueInputs) -> tuple[int, int, int, int, int]:
@@ -390,8 +455,14 @@ def _validate_inputs(inputs: AttnPrologueInputs) -> tuple[int, int, int, int, in
         raise ValueError("cache_index must have shape [T]")
     if inputs.cache_index.dtype != torch.int64:
         raise TypeError("cache_index must use int64")
-    if inputs.kv_cache.ndim != 4 or tuple(inputs.kv_cache.shape[2:]) != (1, head_size):
-        raise ValueError("kv_cache must have shape [blocks, block_size, 1, D]")
+    row_bytes = kv_row_bytes(head_size)
+    if inputs.kv_cache.ndim != 4 or tuple(inputs.kv_cache.shape[2:]) != (
+        1,
+        row_bytes,
+    ):
+        raise ValueError(
+            f"kv_cache must have shape [blocks, block_size, 1, {row_bytes}]"
+        )
     if inputs.kv_cache.dtype != torch.uint8:
         raise TypeError("kv_cache must use uint8 storage")
     if tuple(inputs.norm_weight_qr.shape) != (rank_size,):
@@ -430,7 +501,7 @@ def attn_prologue_golden(
     inputs: AttnPrologueInputs,
     norm_eps: float,
     *,
-    convention: RopeConvention = RopeConvention.INTERLEAVE_HALF,
+    convention: RopeConvention = RopeConvention.GPTJ_INTERLEAVED,
     trace: bool = True,
     row_chunk: int = 512,
     compute_dtype: torch.dtype = torch.float32,
@@ -453,8 +524,8 @@ def attn_prologue_golden(
     gamma_kv = inputs.norm_weight_kv
 
     kv_cache = inputs.kv_cache.clone()
-    # [P,BS,1,D] → [P*BS,D] 的零拷贝视图，scatter 直接写它
-    cache_2d = kv_cache.view(-1, head_size)
+    # [P,BS,1,row] → [P*BS,row] 的零拷贝视图，scatter 直接写整行。
+    cache_2d = kv_cache.view(-1, kv_row_bytes(head_size))
 
     part_names = (
         "q",
@@ -470,6 +541,7 @@ def attn_prologue_golden(
         "kv_normed",
         "kv_roped",
         "kv_bytes",
+        "kv_scale",
     )
     parts: dict[str, list[torch.Tensor]] = {name: [] for name in part_names}
 
@@ -492,6 +564,7 @@ def attn_prologue_golden(
         # [RMSNorm] 沿 R
         qr_fp32 = rms_norm(qa, gamma_qr, norm_eps, compute_dtype)
         # [动态 MXFP8 量化] 同时产出 payload 与 descale
+        qr_bf16 = qr_fp32.to(torch.bfloat16)
         qr, descale_qr, qr_normalized = quantize_mxfp8(qr_fp32, compute_dtype)
         # [QB] ★顺序关键★ A 操作数是量化后的 qr，不是 qr_fp32（03 文档 §2.1）
         q_proj = dequantize_mxfp8(qr, descale_qr, compute_dtype) @ wqb.T
@@ -511,15 +584,17 @@ def attn_prologue_golden(
         kv_roped = apply_tail_rope(
             kv_normed, sin, cos, convention=convention, compute_dtype=compute_dtype
         )
-        # [量化] 隐含 scale = 1，饱和到 ±448；★bitcast 不是数值 cast★
-        kv_payload = kv_roped.clamp(-E4M3FN_MAX, E4M3FN_MAX).to(torch.float8_e4m3fn)
+        # [量化] 每 32 元素一个 BF16 scale；payload 由存储的 scale 反量化。
+        kv_payload, kv_scale, _ = quantize_kv_rows(kv_roped, compute_dtype)
         kv_bytes = kv_payload.contiguous().view(torch.uint8)
 
-        # [scatter] 只就地更新 cache_index 命中的行
-        cache_2d[inputs.cache_index[rows]] = kv_bytes
+        # [scatter] payload 后紧跟 scale 字节，整行就地更新命中 slot。
+        cache_2d[inputs.cache_index[rows]] = torch.cat(
+            [kv_bytes, kv_scale.reshape(stop - start, -1)], dim=1
+        )
 
         parts["q"].append(q)
-        parts["qr"].append(qr)
+        parts["qr"].append(qr_bf16)
         parts["descale_qr"].append(descale_qr)
         if trace:
             parts["x_deq"].append(x_deq)
@@ -532,6 +607,7 @@ def attn_prologue_golden(
             parts["kv_normed"].append(kv_normed)
             parts["kv_roped"].append(kv_roped)
             parts["kv_bytes"].append(kv_bytes)
+            parts["kv_scale"].append(kv_scale)
 
     def joined(name: str) -> torch.Tensor | None:
         chunks = parts[name]
@@ -552,6 +628,7 @@ def attn_prologue_golden(
         kv_normed=joined("kv_normed"),
         kv_roped=joined("kv_roped"),
         kv_bytes=joined("kv_bytes"),
+        kv_scale=joined("kv_scale"),
     )
 
 
@@ -600,6 +677,8 @@ def attribute_e4m3_mismatch(
     expected_bytes: torch.Tensor,
     expected_value: torch.Tensor,
     *,
+    got_scale: torch.Tensor | None = None,
+    expected_scale: torch.Tensor | None = None,
     boundary_rel: float = 1e-5,
 ) -> E4M3Attribution:
     """归因 E4M3 payload 的逐字节失配。
@@ -626,6 +705,10 @@ def attribute_e4m3_mismatch(
     got_bytes = got_bytes.cpu().contiguous()
     expected_bytes = expected_bytes.cpu().contiguous()
     reference = expected_value.detach().cpu().to(torch.float32)
+    if got_scale is not None:
+        got_scale = got_scale.detach().cpu().to(torch.float32)
+    if expected_scale is not None:
+        expected_scale = expected_scale.detach().cpu().to(torch.float32)
 
     total = int(got_bytes.numel())
     diff_mask = got_bytes != expected_bytes
@@ -636,6 +719,10 @@ def attribute_e4m3_mismatch(
     index = torch.nonzero(diff_mask, as_tuple=True)
     got_value = _decode_e4m3_bytes(got_bytes)[index]
     exp_value = _decode_e4m3_bytes(expected_bytes)[index]
+    if got_scale is not None:
+        got_value = got_value * got_scale[index]
+    if expected_scale is not None:
+        exp_value = exp_value * expected_scale[index]
     truth = reference[index]
 
     lower = torch.minimum(got_value, exp_value)
@@ -802,7 +889,7 @@ def make_golden_inputs(
         kv_cache=torch.randint(
             0,
             256,
-            (block_count, block_size, 1, head_size),
+            (block_count, block_size, 1, kv_row_bytes(head_size)),
             dtype=torch.uint8,
             generator=generator,
         ),
@@ -1103,7 +1190,7 @@ class Case:
     s: int
     H: int = 5120
     R: int = 1280
-    N: int = 64
+    heads: int = 64
     D: int = 512
     Dr: int = 64
 
@@ -1113,7 +1200,8 @@ class Case:
 
     @property
     def case_id(self):
-        return f"{self.phase}-b{self.batch}-s{self.s}-t{self.T}"
+        suffix = "" if self.heads == 64 else f"-n{self.heads}"
+        return f"{self.phase}-b{self.batch}-s{self.s}-t{self.T}{suffix}"
 
     def record(self):
         return dict(
@@ -1126,12 +1214,22 @@ class Case:
 
 
 def all_cases():
-    """Return the 12 decode and 20 prefill production-shape cases."""
-    return [Case("decode", b, s) for b in (1, 4, 8, 12, 16, 32) for s in (1, 6)] + [
+    """Return production-shape N=64 cases plus representative N=16 variants."""
+    cases = [Case("decode", b, s) for b in (1, 4, 8, 12, 16, 32) for s in (1, 6)]
+    cases += [
         Case("prefill", b, s)
         for b in (1, 4, 8, 16, 32)
         for s in (1024, 2048, 4096, 8192)
     ]
+    # N=16 代表 T：decode-b1-s6/T=6、b8-s1/T=8、b16-s1/T=16、b16-s6/T=96、b32-s6/T=192。
+    cases += [
+        Case("decode", 1, 6, heads=16),
+        Case("decode", 8, 1, heads=16),
+        Case("decode", 16, 1, heads=16),
+        Case("decode", 16, 6, heads=16),
+        Case("decode", 32, 6, heads=16),
+    ]
+    return cases
 
 
 class SharedWeights:
@@ -1200,7 +1298,11 @@ def make_case_inputs(case: Case, weights, *, seed=2026, generation_chunk=1024):
         positions += 8192 - case.s
     sin, cos = make_rope_tables_for_positions(positions, dr)
     cache = torch.randint(
-        0, 256, (slots // 128, 128, 1, d), dtype=torch.uint8, generator=generator
+        0,
+        256,
+        (slots // 128, 128, 1, kv_row_bytes(d)),
+        dtype=torch.uint8,
+        generator=generator,
     )
     return AttnPrologueInputs(
         x=x,
@@ -1230,6 +1332,7 @@ def golden_chunks(inputs, weights, *, row_chunk=256, norm_eps=1e-6):
         x = dequantize_mxfp8(inputs.x[rows], inputs.descale_x[rows])
         qa = x @ w["wqa"].T
         qr_norm = rms_norm(qa, inputs.norm_weight_qr, norm_eps)
+        qr_bf16 = qr_norm.to(torch.bfloat16)
         qr, scales, normalized = quantize_mxfp8(qr_norm)
         qb = dequantize_mxfp8(qr, scales) @ w["wqb"].T
         q = apply_tail_rope(
@@ -1237,16 +1340,17 @@ def golden_chunks(inputs, weights, *, row_chunk=256, norm_eps=1e-6):
         ).to(torch.bfloat16)
         kv = rms_norm(x @ w["wkv"].T, inputs.norm_weight_kv, norm_eps)
         kv_roped = apply_tail_rope(kv, inputs.rope_sin[rows], inputs.rope_cos[rows])
-        kv_cast = kv_roped.clamp(-448.0, 448.0)
+        kv_payload, kv_scale, _ = quantize_kv_rows(kv_roped, torch.float32)
         yield (
             rows,
             dict(
                 q=q,
-                qr=qr,
+                qr=qr_bf16,
                 descale_qr=scales,
                 qr_normalized=normalized,
-                kv_bytes=kv_cast.to(torch.float8_e4m3fn).view(torch.uint8),
-                kv_roped=kv_cast,
+                kv_bytes=kv_payload.view(torch.uint8),
+                kv_scale=kv_scale,
+                kv_roped=kv_roped,
             ),
         )
 
@@ -1257,11 +1361,11 @@ class FP64Shadow:
         self._dequantized = {}
 
     def recompute_rows(self, inputs, rows, output, *, norm_eps=1e-6):
-        """Return (FP8 bytes, actual cast values) for complete independent rows."""
-        payload, _, cast_values, _ = self.recompute_full(
+        """Return (FP8 bytes, pre-scale truth) for complete independent rows."""
+        payload, _, _, truth = self.recompute_full(
             inputs, rows, output, norm_eps=norm_eps
         )
-        return payload, cast_values
+        return payload, truth
 
     def recompute_full(self, inputs, rows, output, *, norm_eps=1e-6):
         """Return FP64 (payload, scale, cast values, pre-scale values)."""
@@ -1288,13 +1392,8 @@ class FP64Shadow:
                 inputs.rope_cos[rows],
                 compute_dtype=torch.float64,
             )
-            cast_values = roped.clamp(-448.0, 448.0)
-            return (
-                cast_values.to(torch.float8_e4m3fn).view(torch.uint8),
-                None,
-                cast_values,
-                cast_values,
-            )
+            payload, scale, _ = quantize_kv_rows(roped, torch.float64)
+            return payload.view(torch.uint8), scale, None, roped
         raise ValueError("output must be qr or kv")
 
     def review(self, inputs, candidates, *, boundary_rel=1e-5, norm_eps=1e-6):
@@ -1326,7 +1425,8 @@ class FP64Shadow:
                     .view(torch.float8_e4m3fn)
                     .double()
                 )
-                got, ref = float(decoded[0]), float(decoded[1])
+                got = float(decoded[0]) * float(item.get("got_scale", 1.0))
+                ref = float(decoded[1]) * float(item.get("ref_scale", 1.0))
                 exact = got_byte == ref_byte
                 midpoint = (got + ref) * 0.5
                 near = abs(truth - midpoint) <= boundary_rel * max(abs(truth), 1e-30)
@@ -1441,6 +1541,7 @@ class Comparison:
             and self.q_bad / self.q_elements <= 1e-3
             and self.q_nonfinite == 0
             and self.qr_hard == 0
+            and self.scale_bad == 0
             and self.kv_hard == 0
             and self.untouched_bad == 0
         )
@@ -1454,7 +1555,9 @@ class Comparison:
         )
 
 
-def compare_chunk(stats, got_q, got_qr, got_scales, got_kv, expected, *, start=0):
+def compare_chunk(
+    stats, got_q, got_qr, got_scales, got_kv, got_kv_scale, expected, *, start=0
+):
     candidates = []
     q, ref = got_q.cpu().float(), expected["q"].float()
     diff = (q - ref).abs()
@@ -1468,6 +1571,16 @@ def compare_chunk(stats, got_q, got_qr, got_scales, got_kv, expected, *, start=0
     stats.q_max_rel = max(
         stats.q_max_rel, float((diff / ref.abs().clamp_min(1e-6)).nan_to_num().max())
     )
+    # 公开 QR 是量化前的 BF16 值；按 BF16 相对精度比较（内部 FP8 量化由 Q 结果兜底）。
+    got_qr_f = got_qr.cpu().float()
+    ref_qr_f = expected["qr"].float()
+    qr_delta = (got_qr_f - ref_qr_f).abs()
+    # 两个 FP32 实现（设备与 CPU golden）舍入到 BF16 时允许 1 ulp 的边界差。
+    qr_tol = (1.0 / 128.0) * ref_qr_f.abs() + 1e-6
+    stats.qr_elements += got_qr_f.numel()
+    qr_bad = int(((qr_delta > qr_tol) | ~torch.isfinite(got_qr_f)).sum())
+    stats.qr_mismatched += qr_bad
+    stats.qr_hard += qr_bad
     scales = got_scales.cpu().contiguous().view(torch.uint8)
     stats.scale_elements += scales.numel()
     stats.scale_bad += int((scales != expected["descale_qr"].view(torch.uint8)).sum())
@@ -1478,12 +1591,33 @@ def compare_chunk(stats, got_q, got_qr, got_scales, got_kv, expected, *, start=0
     )
     stats.scale_groups_reviewed += int(scale_diff.shape[0])
     for name, got, exp, truth in (
-        ("qr", got_qr, expected["qr"], expected["qr_normalized"]),
         ("kv", got_kv, expected["kv_bytes"], expected["kv_roped"]),
     ):
         got = got.cpu().contiguous().view(torch.uint8)
         exp = exp.contiguous().view(torch.uint8)
-        attr = attribute_e4m3_mismatch(got, exp, truth, boundary_rel=1e-5)
+        if name == "qr":
+            groups = got.shape[1] // MX_GROUP
+            got_factor = expand_scale(
+                got_scales.cpu().contiguous(), groups, got.shape[1]
+            )
+            ref_factor = expand_scale(expected["descale_qr"], groups, got.shape[1])
+            scale_rows = set(scale_diff[:, 0].tolist())
+        else:
+            got_factor = expand_bf16_scale(got_kv_scale.cpu(), got.shape[1])
+            ref_factor = expand_bf16_scale(expected["kv_scale"], got.shape[1])
+            scale_rows = set(
+                torch.nonzero(
+                    got_kv_scale.cpu() != expected["kv_scale"], as_tuple=False
+                )[:, 0].tolist()
+            )
+        attr = attribute_e4m3_mismatch(
+            got,
+            exp,
+            truth,
+            got_scale=got_factor,
+            expected_scale=ref_factor,
+            boundary_rel=1e-5,
+        )
         stats.__dict__[f"{name}_elements"] += attr.total
         stats.__dict__[f"{name}_mismatched"] += attr.mismatched
         setattr(
@@ -1492,8 +1626,7 @@ def compare_chunk(stats, got_q, got_qr, got_scales, got_kv, expected, *, start=0
             max(getattr(stats, f"{name}_max_code_distance"), attr.max_code_distance),
         )
         rows_hit = set(torch.nonzero(got != exp, as_tuple=False)[:, 0].tolist())
-        if name == "qr":
-            rows_hit |= set(scale_diff[:, 0].tolist())
+        rows_hit |= scale_rows
         for row in sorted(rows_hit):
             candidates.append(dict(output=name, row=start + row, local_row=row))
     return candidates
@@ -1507,12 +1640,13 @@ def _adjudicate_rows(
     got_qr,
     got_scales,
     got_kv,
+    got_kv_scale,
     start,
     *,
     norm_eps=1e-6,
 ):
     """Adjudicate nominated rows against complete FP64 recomputations."""
-    for name in ("qr", "kv"):
+    for name in ("kv",):
         local = sorted({c["local_row"] for c in candidates if c["output"] == name})
         if not local:
             continue
@@ -1529,7 +1663,10 @@ def _adjudicate_rows(
             ref_factor = expand_scale(ref_scale, groups, device_payload.shape[1])
         else:
             device_payload = got_kv.contiguous().view(torch.uint8)[local]
-            got_factor = ref_factor = None
+            got_factor = expand_bf16_scale(
+                got_kv_scale.contiguous()[local], device_payload.shape[1]
+            )
+            ref_factor = expand_bf16_scale(ref_scale, device_payload.shape[1])
         verdict = adjudicate(
             device_payload,
             ref_payload,
@@ -1554,6 +1691,12 @@ def _adjudicate_rows(
                     got_byte=int(device_payload[row, col]),
                     reference_byte=int(ref_payload[row, col]),
                     fp64_truth=float(truth[row, col]),
+                    got_scale=float(got_factor[row, col])
+                    if got_factor is not None
+                    else 1.0,
+                    ref_scale=float(ref_factor[row, col])
+                    if ref_factor is not None
+                    else 1.0,
                     criterion="fp64_value_domain",
                 )
             )
@@ -1575,15 +1718,25 @@ def validate_outputs(
     stats = Comparison()
     q, qr, scales = outputs
     d = weights.profile[3]
+    row_bytes = kv_row_bytes(d)
     # Cache is at most ~128 MiB at requested max T; q remains on device, copied
     # by chunks (~16 MiB for 256 target rows), never as an entire CPU tensor.
-    cache = cache_device.cpu().view(-1, d)
+    cache = cache_device.cpu().view(-1, row_bytes)
     for rows, expected in golden_chunks(
         inputs, weights, row_chunk=row_chunk, norm_eps=norm_eps
     ):
-        got_kv = cache[inputs.cache_index[rows]]
+        got_rows = cache[inputs.cache_index[rows]]
+        got_kv = got_rows[:, :d]
+        got_kv_scale = got_rows[:, d:].reshape(-1, d // MX_GROUP, KV_SCALE_BYTES)
         candidates = compare_chunk(
-            stats, q[rows], qr[rows], scales[rows], got_kv, expected, start=rows.start
+            stats,
+            q[rows],
+            qr[rows],
+            scales[rows],
+            got_kv,
+            got_kv_scale,
+            expected,
+            start=rows.start,
         )
         if candidates:
             _adjudicate_rows(
@@ -1594,6 +1747,7 @@ def validate_outputs(
                 qr[rows],
                 scales[rows],
                 got_kv,
+                got_kv_scale,
                 rows.start,
                 norm_eps=norm_eps,
             )
@@ -1601,8 +1755,8 @@ def validate_outputs(
             progress(rows.stop, stats)
     untouched = torch.ones(cache.shape[0], dtype=torch.bool)
     untouched[inputs.cache_index] = False
-    initial = inputs.kv_cache.view(-1, d)
-    stats.untouched_elements = int(untouched.sum()) * d
+    initial = inputs.kv_cache.view(-1, row_bytes)
+    stats.untouched_elements = int(untouched.sum()) * row_bytes
     stats.untouched_bad = int((cache[untouched] != initial[untouched]).sum())
     return stats
 
@@ -1664,14 +1818,32 @@ def _make_progress_reporter(case):
     return progress
 
 
-@dataclasses.dataclass
 class AccuracyRuntime:
-    kernel: object
-    device: str
-    cube_core_num: int
-    kernel_sha256: str
-    weights: SharedWeights
-    shadow: FP64Shadow
+    def __init__(self, kernel, device, cube_core_num, kernel_sha256):
+        self.kernel = kernel
+        self.device = device
+        self.cube_core_num = cube_core_num
+        self.kernel_sha256 = kernel_sha256
+        self._weights = {}
+        self._shadows = {}
+
+    def weights_for(self, heads):
+        if heads not in self._weights:
+            self._weights[heads] = SharedWeights(
+                profile=(
+                    TARGET_PROFILE[0],
+                    TARGET_PROFILE[1],
+                    heads,
+                    TARGET_PROFILE[3],
+                    TARGET_PROFILE[4],
+                )
+            )
+        return self._weights[heads]
+
+    def shadow_for(self, heads):
+        if heads not in self._shadows:
+            self._shadows[heads] = FP64Shadow(self.weights_for(heads))
+        return self._shadows[heads]
 
 
 def _create_accuracy_runtime(device, cpu_threads):
@@ -1688,14 +1860,11 @@ def _create_accuracy_runtime(device, cpu_threads):
     kernel = load_sample("attention/attn_prologue/attn_prologue.py")
     torch.npu.set_device(device)
     torch.set_num_threads(cpu_threads)
-    weights = SharedWeights()
     return AccuracyRuntime(
-        kernel=kernel,
-        device=device,
-        cube_core_num=get_platform_info().cube_core_num,
-        kernel_sha256=hashlib.sha256(Path(kernel.__file__).read_bytes()).hexdigest(),
-        weights=weights,
-        shadow=FP64Shadow(weights),
+        kernel,
+        device,
+        get_platform_info().cube_core_num,
+        hashlib.sha256(Path(kernel.__file__).read_bytes()).hexdigest(),
     )
 
 
@@ -1716,11 +1885,11 @@ def _run_accuracy_case(
             )
         start_time = time.monotonic()
         LOGGER.info("START %s", case.case_id)
-        inputs = make_case_inputs(case, runtime.weights)
+        weights = runtime.weights_for(case.heads)
+        shadow = runtime.shadow_for(case.heads)
+        inputs = make_case_inputs(case, weights)
         cache = inputs.kv_cache.to(runtime.device)
-        values = dict(
-            runtime.weights.device_fields(runtime.device, runtime.kernel.to_nz)
-        )
+        values = dict(weights.device_fields(runtime.device, runtime.kernel.to_nz))
         for name in ("x", "descale_x", "rope_sin", "rope_cos", "cache_index"):
             value = getattr(inputs, name)
             values[name] = device_input(
@@ -1733,16 +1902,16 @@ def _run_accuracy_case(
         torch.npu.synchronize()
         stats = validate_outputs(
             inputs,
-            runtime.weights,
+            weights,
             prepared.outputs,
             cache,
             row_chunk=row_chunk,
             progress=_make_progress_reporter(case),
-            shadow=runtime.shadow,
+            shadow=shadow,
             norm_eps=norm_eps,
         )
         if fp64_shadow and stats.hard_examples:
-            stats.shadow_reviews = runtime.shadow.review(
+            stats.shadow_reviews = shadow.review(
                 inputs, stats.hard_examples, norm_eps=norm_eps
             )
             for review in stats.shadow_reviews:
@@ -1899,26 +2068,35 @@ def test_fp8_value_criterion(encodings, truth, scales, expected_hard):
     assert verdict.legitimate == 1 - expected_hard
 
 
-@pytest.mark.parametrize("corruption", [None, "q", "qr", "scale", "kv", "untouched"])
+@pytest.mark.parametrize(
+    "corruption", [None, "q", "qr", "scale", "kv", "kv_scale", "untouched"]
+)
 def test_full_output_validator(corruption):
     """Reject damaged Q, FP8 payloads/scales and written or untouched cache."""
     weights = SharedWeights(profile=SMALL_PROFILE)
     inputs = make_case_inputs(Case("decode", 1, 3), weights)
     expected = attn_prologue_golden(inputs, 1e-6, trace=False, row_chunk=2)
     q = expected.q.clone()
-    qr = expected.qr.contiguous().view(torch.uint8).clone()
+    qr = expected.qr.clone()
     scales = expected.descale_qr.contiguous().view(torch.uint8).clone()
     cache = expected.kv_cache.clone()
     if corruption == "q":
         q[0, 0, 0] = float("nan")
     elif corruption == "qr":
-        qr[0, 0] = 0x7F
+        qr[0, 0] = float("nan")
     elif corruption == "scale":
         scales[0].fill_(255)
     elif corruption == "kv":
-        cache.view(-1, weights.profile[3])[inputs.cache_index[0], 0] = 0x7F
+        cache.view(-1, kv_row_bytes(weights.profile[3]))[inputs.cache_index[0], 0] = (
+            0x7F
+        )
+    elif corruption == "kv_scale":
+        d = weights.profile[3]
+        cache.view(-1, kv_row_bytes(d))[inputs.cache_index[0], d : d + 2] = (
+            torch.tensor([0x00, 0x7E], dtype=torch.uint8)
+        )
     elif corruption == "untouched":
-        cache_rows = cache.view(-1, weights.profile[3])
+        cache_rows = cache.view(-1, kv_row_bytes(weights.profile[3]))
         unused = next(
             i
             for i in range(cache_rows.shape[0])
@@ -1936,9 +2114,75 @@ def test_full_output_validator(corruption):
     assert stats.passed == (corruption is None), stats.output()
 
 
+def test_quantize_kv_rows_bf16_scale_and_zero_groups():
+    """All-zero and scale-underflow groups store scale 0 and payload 0."""
+    values = torch.zeros((2, 2 * MX_GROUP_SIZE), dtype=torch.float32)
+    values[1, :MX_GROUP_SIZE] = 1e-42  # rounds to BF16 scale 0
+    values[1, MX_GROUP_SIZE:] = torch.linspace(-1.0, 1.0, MX_GROUP_SIZE)
+    payload, scale_bytes, _ = quantize_kv_rows(values)
+    payload_bytes = payload.contiguous().view(torch.uint8)
+    zero_scale = kv_round_scale(torch.tensor([0.0]))
+    zero_bytes = zero_scale.view(torch.uint8).reshape(2)
+    assert torch.equal(scale_bytes[0], zero_bytes.repeat(scale_bytes.shape[1], 1))
+    assert payload_bytes[0].eq(0).all()
+    assert torch.equal(
+        scale_bytes[1, 0].reshape(-1), zero_scale.view(torch.uint8).reshape(2)
+    )
+    assert payload_bytes[1, :MX_GROUP_SIZE].eq(0).all()
+    # Nonzero group: scale is the ceiling power-of-two of max(amax,1e-4)/448.
+    expected_scale = kv_round_scale(values[1, MX_GROUP_SIZE:].abs().amax().reshape(1))[
+        0
+    ]
+    assert torch.equal(
+        scale_bytes[1, 1],
+        expected_scale.reshape(1).view(torch.uint8).reshape(2),
+    )
+    factors = expand_bf16_scale(scale_bytes, values.shape[1])
+    dequantized = payload.to(torch.float64) * factors
+    error = (dequantized[1, MX_GROUP_SIZE:] - values[1, MX_GROUP_SIZE:].double()).abs()
+    assert float(error.max()) <= 0.07 * float(values[1, MX_GROUP_SIZE:].abs().max())
+
+
+def test_kv_cache_row_layout_matches_golden():
+    """Payload occupies bytes 0..D-1 and BF16 scales the trailing 2*G bytes."""
+    inputs = make_golden_inputs(
+        4, hidden_size=64, rank_size=64, head_count=2, head_size=64, rope_width=16
+    )
+    trace = attn_prologue_golden(inputs, 1e-6, row_chunk=2)
+    head_size = inputs.wkv.shape[0]
+    row_bytes = kv_row_bytes(head_size)
+    rows = trace.kv_cache.view(-1, row_bytes)
+    got = rows[inputs.cache_index]
+    assert torch.equal(got[:, :head_size], trace.kv_bytes.contiguous())
+    assert torch.equal(
+        got[:, head_size:], trace.kv_scale.reshape(-1, row_bytes - head_size)
+    )
+    factors = expand_bf16_scale(trace.kv_scale, head_size)
+    dequantized = trace.kv_bytes.contiguous().view(torch.float8_e4m3fn).double()
+    dequantized = dequantized * factors
+    assert torch.allclose(dequantized, trace.kv_roped.double(), rtol=0.07, atol=1e-3)
+
+
+@pytest.mark.parametrize("heads", [16, 64])
+def test_head_count_supported_shapes(heads):
+    """Golden geometry carries N=16 and N=64 without shape coupling."""
+    inputs = make_golden_inputs(
+        6, hidden_size=64, rank_size=64, head_count=heads, head_size=64, rope_width=16
+    )
+    assert tuple(inputs.wqb.shape) == (heads * 64, 64)
+    trace = attn_prologue_golden(inputs, 1e-6, trace=False, row_chunk=3)
+    assert tuple(trace.q.shape) == (6, heads, 64)
+    assert trace.kv_cache.shape[-1] == kv_row_bytes(64)
+
+
 _NPU_CASES = [
     pytest.param(Case("decode", 1, 1), id="decode-b1-s1-t1"),
     pytest.param(Case("decode", 12, 6), id="decode-b12-s6-t72"),
+    pytest.param(Case("decode", 1, 6, heads=16), id="decode-b1-s6-t6-n16"),
+    pytest.param(Case("decode", 8, 1, heads=16), id="decode-b8-s1-t8-n16"),
+    pytest.param(Case("decode", 16, 1, heads=16), id="decode-b16-s1-t16-n16"),
+    pytest.param(Case("decode", 16, 6, heads=16), id="decode-b16-s6-t96-n16"),
+    pytest.param(Case("decode", 32, 6, heads=16), id="decode-b32-s6-t192-n16"),
     pytest.param(Case("prefill", 1, 1024), id="prefill-b1-s1024-t1024"),
     pytest.param(Case("prefill", 1, 2048), id="prefill-b1-s2048-t2048"),
 ]
