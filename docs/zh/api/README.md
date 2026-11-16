@@ -344,6 +344,8 @@ API 页面按语言、数据结构、数据搬运、计算、设备执行、调�
 - [调试与性能分析](debug/index.md)
   - [dump_tensor](debug/dump_tensor.md)
   - [dump_reg](debug/dump_reg.md)
+  - [log](debug/log.md)
+  - [统一错误模板](debug/error_message.md)
   - [print](debug/print.md)
   - [print_time_stamp](debug/print_time_stamp.md)
   - [Profiling 名称与类型](debug/profiling.md)

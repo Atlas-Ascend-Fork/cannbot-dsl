@@ -2380,6 +2380,8 @@ const apiSidebar = [
                 "text": "dump_reg",
                 "link": "/zh/api/debug/dump_reg"
               },
+              { "text": "log", "link": "/zh/api/debug/log" },
+              { "text": "统一错误模板", "link": "/zh/api/debug/error_message" },
               {
                 "text": "print",
                 "link": "/zh/api/debug/print"

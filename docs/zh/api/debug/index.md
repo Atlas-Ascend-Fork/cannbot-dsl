@@ -8,6 +8,8 @@
 | --- | --- |
 | [dump_tensor](./dump_tensor.md) | 将GM或支持的片上存储区间写入CANN调试流。 |
 | [dump_reg](./dump_reg.md) | 打印SIMD VF中的一个矢量寄存器。 |
+| [log](./log.md) | 分级诊断日志、ACLNN错误上报和输出配置。 |
+| [统一错误模板](./error_message.md) | 38种统一格式错误日志。 |
 | [print](./print.md) | 按上下文分派Python、Host、Kernel格式化打印，并兼容原有采集模式。 |
 | [print_time_stamp](./print_time_stamp.md) | 记录设备周期和PC，并识别执行打点的核。 |
 | [Profiling 名称与类型](./profiling.md) | 配置性能分析中的Kernel名称、类型和参数信息。 |
