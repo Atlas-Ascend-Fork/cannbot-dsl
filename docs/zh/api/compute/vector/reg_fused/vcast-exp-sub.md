@@ -14,7 +14,7 @@ $$
 ## 函数原型
 
 ```python
-vcast_exp_sub(lhs: RawVReg, rhs: RawVReg, *, mask: Mask, dtype = None) -> RawVReg
+vcast_exp_sub(lhs: RawVReg, rhs: RawVReg, *, mask: Mask, dtype=None, part: str = "even") -> RawVReg
 ```
 
 ## 参数说明
@@ -25,6 +25,7 @@ vcast_exp_sub(lhs: RawVReg, rhs: RawVReg, *, mask: Mask, dtype = None) -> RawVRe
 | `rhs` | 输入 | 源操作数1（矢量数据寄存器）。 |
 | `mask` | 输入 | 掩码寄存器，用于控制各元素是否参与计算。`mask`中与输出元素对应的比特位为1时，该元素参与计算；为0时，该元素不参与计算。<br>`mask`掩码位为0时，结果对应元素置0。 |
 | `dtype` | 输入 | 返回值的数据类型，仅支持`dtypes.float32`，默认值为`None`。取值为`None`时，返回值的数据类型为`dtypes.float32`。 |
+| `part` | 输入 | 指示源操作数的读取位置。取值为`"even"`时读取偶数索引元素；取值为`"odd"`时读取奇数索引元素。默认值为`"even"`。 |
 
 **支持的元素数据类型：**
 
@@ -37,12 +38,12 @@ vcast_exp_sub(lhs: RawVReg, rhs: RawVReg, *, mask: Mask, dtype = None) -> RawVRe
 ## 约束说明
 
 - 本接口需在`vf(mode="simd")`作用域内调用。
-
+- `mask`掩码位为0时，结果对应元素置0。
 - 只有当输出数据类型位宽大于输入时，计算时才会有精度提升。
 
 ## 调用示例
 
-以下示例演示`vcast_exp_sub`的调用，并在Host侧校验结果。
+以下示例演示输入数据类型为`float32`时`vcast_exp_sub`接口的调用方式，并在Host侧校验计算结果。
 
 ```python
 import torch
@@ -98,4 +99,58 @@ if __name__ == "__main__":
 ```text
 vcast_exp_sub example passed
 first=1.0000, last=40.1012
+```
+
+以下示例演示输入数据类型为`float16`时`vcast_exp_sub`接口的调用方式，并在Host侧校验计算结果。
+
+```python
+import torch
+import torch_npu
+
+from cannbotdsl import Buffer, dtypes, host, make_layout, mem_copy
+from cannbotdsl.lang.kernel import kernel
+from cannbotdsl.lang.vf import vf
+from cannbotdsl.ops.reg import create_mask, vcast_exp_sub, vload, vstore
+from cannbotdsl.tensor import MemLoc
+
+@kernel
+def half_cast_exp_sub(src0, src1, dst):
+    left = Buffer(MemLoc.UB, dtypes.float16, make_layout((128,)))
+    right = Buffer(MemLoc.UB, dtypes.float16, make_layout((128,)))
+    out = Buffer(MemLoc.UB, dtypes.float32, make_layout((128,)))
+    mem_copy(left, src0)
+    mem_copy(right, src1)
+    with vf(mode="simd"):
+        a = vload(left, 0)
+        b = vload(right, 0)
+        output_mask = create_mask(elem_bits=32)
+        even = vcast_exp_sub(a, b, mask=output_mask, part="even")
+        odd = vcast_exp_sub(a, b, mask=output_mask, part="odd")
+        vstore(out, 0, even, output_mask)
+        vstore(out, 64, odd, output_mask)
+    mem_copy(dst, out)
+
+@host
+def run_half(src0, src1, dst):
+    half_cast_exp_sub[1](src0, src1, dst)
+
+def main():
+    a = torch.linspace(-0.75, 0.75, 128, dtype=torch.float16, device="npu:0")
+    b = torch.linspace(0.5, -0.25, 128, dtype=torch.float16, device="npu:0")
+    dst = torch.empty(128, dtype=torch.float32, device="npu:0")
+    run_half(a, b, dst)
+    torch.npu.synchronize()
+    restored = dst.cpu().reshape(2, 64).t().contiguous().reshape(128)
+    expected = torch.exp(a.cpu().float() - b.cpu().float())
+    torch.testing.assert_close(restored, expected, atol=2e-4, rtol=2e-3)
+    print("vcast_exp_sub fp16 even/odd example passed")
+
+if __name__ == "__main__":
+    main()
+```
+
+预期结果：
+
+```text
+vcast_exp_sub fp16 even/odd example passed
 ```

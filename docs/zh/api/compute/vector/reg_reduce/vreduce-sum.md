@@ -49,8 +49,8 @@ vreduce_sum(src: RawVReg, *, mask: Mask) -> RawVReg
 
 | `src_dtype` | `dst_dtype` |
 | ----------- | ----------- |
-| `dtypes.int16` | `dtypes.int16` |
-| `dtypes.uint16` | `dtypes.uint16` |
+| `dtypes.int16` | `dtypes.int32` |
+| `dtypes.uint16` | `dtypes.uint32` |
 | `dtypes.float16` | `dtypes.float16` |
 | `dtypes.int32` | `dtypes.int32` |
 | `dtypes.uint32` | `dtypes.uint32` |
@@ -58,7 +58,7 @@ vreduce_sum(src: RawVReg, *, mask: Mask) -> RawVReg
 
 ## 返回值说明
 
-返回保存归约求和结果的矢量数据寄存器值，类型为`RawVReg`，元素数据类型与`src`一致。其中，`src_dtype`表示源寄存器的元素类型，`dst_dtype`表示返回寄存器的元素类型，对应关系见[参数说明](#参数说明)中的类型表。
+返回保存归约求和结果的矢量数据寄存器值，类型为`RawVReg`。`int16`和`uint16`输入分别返回`int32`和`uint32`结果，其余支持的输入类型返回同类型结果。`src_dtype`表示源寄存器的元素类型，`dst_dtype`表示返回寄存器的元素类型，对应关系见[参数说明](#参数说明)中的类型表。
 
 ## 约束说明
 

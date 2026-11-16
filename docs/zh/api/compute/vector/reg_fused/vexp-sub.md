@@ -7,7 +7,7 @@
 
 根据`mask`将`lhs`与`rhs`按元素相减，并计算以差值为指数的自然指数函数，将结果作为返回值返回。
 
-需要处理混合精度输入时，请使用[`vcast_exp_sub`](./vcast-exp-sub.md)。
+需要处理混合精度输入或选择FP16的奇数源位置时，请使用[`vcast_exp_sub`](./vcast-exp-sub.md)。本接口不提供奇偶位置选择参数。
 
 - `vexp_sub`用于`dtypes.float32`类型输入。计算公式如下：
 
@@ -15,7 +15,7 @@
   result_i = e^{lhs_i - rhs_i}
   $$
 
-- 源操作数为`dtypes.float16`类型时，读取源操作数中偶数索引的元素，将其转换为`dtypes.float32`类型后计算；计算公式如下：
+- 源操作数为`dtypes.float16`类型时，固定读取源操作数中偶数索引的元素，将其转换为`dtypes.float32`类型后计算；计算公式如下：
 
   $$
   result_i = e^{float(lhs_{2i}) - float(rhs_{2i})}
@@ -48,12 +48,11 @@ vexp_sub(lhs: RawVReg, rhs: RawVReg, *, mask: Mask) -> RawVReg
 ## 约束说明
 
 - 本接口需在`vf(mode="simd")`作用域内调用。
-
 - 只有当输出数据类型位宽大于输入时，计算时才会有精度提升。
 
 ## 调用示例
 
-以下示例演示`vexp_sub`的调用，并在Host侧校验结果。
+以下示例演示输入数据类型为`float32`时`vexp_sub`接口的调用方式，并在Host侧校验计算结果。
 
 ```python
 import torch
@@ -109,4 +108,55 @@ if __name__ == "__main__":
 ```text
 vexp_sub example passed
 first=1.0000, last=7.1617
+```
+
+以下示例演示输入数据类型为`float16`时`vexp_sub`接口的调用方式，并在Host侧校验计算结果。
+
+```python
+import torch
+import torch_npu
+
+from cannbotdsl import Buffer, dtypes, host, make_layout, mem_copy
+from cannbotdsl.lang.kernel import kernel
+from cannbotdsl.lang.vf import vf
+from cannbotdsl.ops.reg import create_mask, vexp_sub, vload, vstore
+from cannbotdsl.tensor import MemLoc
+
+@kernel
+def half_exp_sub(src0, src1, dst):
+    left = Buffer(MemLoc.UB, dtypes.float16, make_layout((128,)))
+    right = Buffer(MemLoc.UB, dtypes.float16, make_layout((128,)))
+    out = Buffer(MemLoc.UB, dtypes.float32, make_layout((64,)))
+    mem_copy(left, src0)
+    mem_copy(right, src1)
+    with vf(mode="simd"):
+        a = vload(left, 0)
+        b = vload(right, 0)
+        output_mask = create_mask(elem_bits=32)
+        result = vexp_sub(a, b, mask=output_mask)
+        vstore(out, 0, result, output_mask)
+    mem_copy(dst, out)
+
+@host
+def run_half(src0, src1, dst):
+    half_exp_sub[1](src0, src1, dst)
+
+def main():
+    a = torch.linspace(-0.75, 0.75, 128, dtype=torch.float16, device="npu:0")
+    b = torch.linspace(0.5, -0.25, 128, dtype=torch.float16, device="npu:0")
+    dst = torch.empty(64, dtype=torch.float32, device="npu:0")
+    run_half(a, b, dst)
+    torch.npu.synchronize()
+    expected = torch.exp(a.cpu().float()[::2] - b.cpu().float()[::2])
+    torch.testing.assert_close(dst.cpu(), expected, atol=2e-4, rtol=2e-3)
+    print("vexp_sub fp16 fixed-even example passed")
+
+if __name__ == "__main__":
+    main()
+```
+
+预期结果：
+
+```text
+vexp_sub fp16 fixed-even example passed
 ```
