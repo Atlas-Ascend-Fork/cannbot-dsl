@@ -63,3 +63,18 @@ def test_decode_shapes(t: int) -> None:
 def test_prefill_shapes(t: int) -> None:
     """T 2048 is split-K. T 4096 is the smallest split-T deployment shape."""
     _check_shape(t)
+
+
+@pytest.mark.npu
+@pytest.mark.parametrize(
+    "t", (129, 200, 1032, 3000, 4152), ids=lambda t: f"T{t}_unaligned"
+)
+def test_unaligned_t(t: int) -> None:
+    """T that is not a whole number of 128-row tiles.
+
+    The kernel launches on ceil(T/128) tiles and overlaps the last one with its
+    predecessor, so every tile is full height.  A short last tile used to be
+    computed from the wrong L1 fractal (q, descale_q and w of every row in that
+    tile); these shapes pin the overlapping path.
+    """
+    _check_shape(t)

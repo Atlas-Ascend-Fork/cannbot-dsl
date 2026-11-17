@@ -87,7 +87,6 @@ from cannbotdsl.ops.reg import (
     vbitwise_or,
     vbitwise_xor,
     vdups,
-    veq,
     vgather,
     vgather_reg,
     vgts,
@@ -127,6 +126,25 @@ Float8E8M0 = dtypes.float8_e8m0
 
 def tile_view(tensor, tiler, coord):
     return tile_slice(tensor, tiler, coord)
+
+
+@jit
+def tile_origin(p, tile, t_live):
+    origin = tile * p.base_m
+    last = t_live - p.base_m
+    if last < 0:
+        last = 0
+    if origin > last:
+        origin = last
+    return origin
+
+
+@jit
+def tile_rows(p, tile, t_live):
+    rows = t_live - tile_origin(p, tile, t_live)
+    if rows > p.base_m:
+        rows = p.base_m
+    return rows
 
 
 def local_slice(tensor, shape, stride=None, offset=0):
@@ -182,7 +200,11 @@ FP32_HALF_MANTISSA = 0x400000  # significand exactly 1.5
 FP32_MAG_MASK = 0x7FFFFFFF
 # |y| <= 6 always, so (bits(|y|) >> LUT_SHIFT) <= 1036.
 LUT_SHIFT = 20
-LUT_LEN = 1088
+# Length of the shipped 3-bit-code table.  ``build_e2m1_lut`` keeps this shape.
+LUT_BASE_LEN = 1088
+# The kernel gathers a folded table instead: one entry per (bucket, exactness),
+# so index ``2 * idx + inexact`` selects the RNE code without a midpoint chain.
+LUT_LEN = 2 * LUT_BASE_LEN
 
 
 # Ring depths, overridable while tuning so a sweep is one env var per run.
@@ -273,26 +295,89 @@ GRID_FULL = int(os.environ.get("IPQW_GRID_FULL", 1))
 # needed their own build of both templates -- and within a part the split moved
 # with T, which is where the nine binaries came from.
 #
-# The tile count a T-only schedule needs before it fills a chip on its own is
-# roughly the core count, so this is that value for the parts in play, frozen. A
-# part with more cores switches to split-T slightly early and one with fewer runs
-# split-K slightly long; that costs a little occupancy at the boundary and no
-# correctness, because neither template assumes anything about the grid -- the
-# work loop strides by ``get_block_num()``, which is a runtime value.
-SPLIT_T_TILES = int(os.environ.get("IPQW_SPLIT_T_TILES", 25))
-# The split-K head split, pinned.  ``_plan_head_split`` used to score this per
-# (T, cores), and it is genuinely T-dependent -- 16 wins at T=1 and 2 wins at
-# T=2048 -- but every distinct value is another binary, because the block count
-# is a loop trip count, a ``k_block`` width and a band UB width.  16 is the
-# decode optimum, and decode is the phase where this operator's latency is on
-# the critical path; see the measured table in ``_plan_head_split`` for what the
-# large end of the split-K range gives up for it.
+# The boundary is the measured one, not a core count: at 24 tiles the split-T
+# grid score fills 24 of the parts in play with 24 items and the paired
+# measurement is faster than the split-K band table it replaces (T=3072,
+# x1.0853-x1.0895). Below that the T-only schedule leaves cores idle, so the
+# boundary sits at 24 tiles; it is still a tile count and no core count in the
+# binary -- the work loop strides by ``get_block_num()``, a runtime value.
+SPLIT_T_TILES = int(os.environ.get("IPQW_SPLIT_T_TILES", 24))
+# The split-K head split is a measured band table on the tile count; this is its
+# fallback.  ``_plan_head_split`` used to score the count per (T, cores), and it
+# is genuinely T-dependent -- 16 wins at T=1 and 2 wins at T=2048 -- but every
+# distinct value is another binary, because the block count is a loop trip
+# count, a ``k_block`` width and a band UB width.  16 is the decode optimum, and
+# decode is the phase where this operator's latency is on the critical path, so
+# ``splitk_head_blocks`` keeps it for the 1-11 tile range and pinning is only
+# overridden above that.  See that function for the band table and
+# ``_plan_head_split`` for the measured table behind the large end.
 HEAD_BLOCKS_K = int(os.environ.get("IPQW_HEAD_BLOCKS_K", 16))
-# The band height of the workspace W reduction, pinned for the same reason: it is
-# a UB height and a register unroll.  The narrowest legal band spreads best over
-# the AIVs and 2 is what every decode shape already chose, so pinning it here
-# costs the large end of split-K some DMA round trips and decode nothing.
-ROWS_RED_K = int(os.environ.get("IPQW_ROWS_RED_K", 2))
+# The band height of the workspace W reduction is derived from the shape.  It is
+# a UB height and a register unroll, so it has to be a legal power of two, and
+# what it buys is DMA count: the reduction issues ``total_rows/rows_red`` DMAs per
+# K slice, and the measured cost is the count, not the bytes (T=1536: 2 -> 16
+# rows took 60.9 -> 54.9 us on the AIV, within 0.3 us of removing the reduction
+# altogether).  So the band is the widest legal height up to ``BAND_ROWS_MAX``:
+# past 16 rows the reduction is already at that floor, and a taller band would
+# only grow ``band_ub`` and the unrolled register sum.  ``IPQW_ROWS_RED_K`` pins
+# it for A/B runs.
+BAND_ROWS_MAX = int(os.environ.get("IPQW_BAND_ROWS_MAX", 16))
+ROWS_RED_K = int(os.environ.get("IPQW_ROWS_RED_K", 0))
+
+
+def band_height(base_m: int, n_heads: int) -> int:
+    """Band height for the W reduction: widest legal band up to the flat point.
+
+    ``legal`` is the set of heights that divide the tile into whole
+    ``VL``-lane registers.  Among those the height is the largest power of two
+    not above ``base_m`` and ``BAND_ROWS_MAX``: the measured reduction is flat
+    from 16 rows up (T=1536: 54.92 us at 16 rows against 54.62 us with the
+    reduction removed), so a taller band would only grow ``band_ub`` and the
+    unrolled register sum, and the tile height is what a band has to divide.
+
+    It is deliberately a function of the tile height alone and not of the live
+    T.  ``rows_red`` is part of ``Plan.shape_key``, while a bucket's T range is
+    enumerated once over tile counts in ``plan_buckets``; a band that moved
+    with T inside one base_m would make T land in a bucket whose Dim did not
+    admit it.  ``n_bands``/``n_bands_workspace`` still follow the live T.
+    """
+    legal = [
+        rows
+        for rows in range(1, base_m + 1)
+        if base_m % rows == 0 and (rows * n_heads) % VL == 0
+    ]
+    if not legal:
+        raise NotImplementedError(
+            f"no band height divides base_m={base_m} into whole "
+            f"{VL}-lane registers at N={n_heads}"
+        )
+    target = min(base_m, BAND_ROWS_MAX)
+    fitting = [rows for rows in legal if rows <= target and rows & (rows - 1) == 0]
+    if fitting:
+        return max(fitting)
+    return min(legal)
+
+
+def splitk_head_blocks(n_tiles: int) -> int:
+    """Head blocks for the split-K template, by tile count.
+
+    The per-work-item cost is the T-tile's ``qr``+scale staging (``hb * 174 KB``
+    per tile) plus the Cube->AIV ramp, and a round is ``rounds * per_item``; so
+    the count that wins is the one where the items fit the chip in the fewest
+    rounds without making each item long.  Measured on the frozen set: 2 blocks
+    (16 heads per item, 24-28 items) is one round at 12-14 tiles and 8 blocks
+    (4 heads per item, 20-24 items per core) is 5 rounds at 15-24 tiles, worth
+    x1.107-1.241 and x1.043-1.152 per case.  Below 12 tiles 16 blocks is the
+    decode optimum and is kept; from ``SPLIT_T_TILES`` up the split-T branch
+    scores the count itself and does not read this.
+    """
+    if 12 <= n_tiles <= 14:
+        return 2
+    if 15 <= n_tiles <= 24:
+        return 8
+    return HEAD_BLOCKS_K
+
+
 # Upper bound on the launch grid, used only to bound the ``workspace`` extent.
 #
 # The grid cannot be a plain host integer without the core count becoming part of
@@ -376,20 +461,46 @@ def build_e2m1_lut() -> torch.Tensor:
     biased fp32 exponent times eight plus the top three mantissa bits; every
     E2M1 midpoint (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0) is exactly on such a
     bucket boundary.  The normal bucket lookup therefore selects the upper
-    neighbour at a midpoint.  ``_pack_e2m1`` fixes the four exact midpoints
-    whose upper neighbour is odd, completing round-to-nearest-even (RNE).
+    neighbour at a midpoint.  ``build_e2m1_lut_folded`` carries the four exact
+    midpoints whose upper neighbour is odd, completing round-to-nearest-even.
     """
-    codes = torch.zeros(LUT_LEN, dtype=torch.int32)
+    codes = torch.zeros(LUT_BASE_LEN, dtype=torch.int32)
     midpoints = (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)
     for exponent in range(120, 133):
         for mantissa in range(8):
             index = exponent * 8 + mantissa
-            if index >= LUT_LEN:
+            if index >= LUT_BASE_LEN:
                 continue
             value = 2.0 ** (exponent - E8M0_BIAS) * (1.0 + mantissa / 8.0)
             codes[index] = sum(1 for m in midpoints if value >= m)
     codes[133 * 8 :] = 7
     return codes
+
+
+# The seven E2M1 midpoints sit exactly on a bucket boundary, so the bucket
+# lookup takes the upper neighbour there.  Round-to-nearest-even instead keeps
+# the even code, which is the lower one at these four: their upper codes are
+# 1, 3, 5 and 7.  The other three midpoints (0.75, 1.75, 3.5) already round to
+# an even upper code.  Folding both outcomes into the table turns the exactness
+# test into the table index, so the pack pass no longer compares the bucket
+# against four constants.
+RNE_LOWER_BUCKETS = (1000, 1018, 1026, 1034)
+
+
+def build_e2m1_lut_folded() -> torch.Tensor:
+    """Two-entry-per-bucket table for ``_pack_e2m1``.
+
+    ``folded[2 * index]`` is the code for a value that sits exactly on bucket
+    ``index``'s lower bound, ``folded[2 * index + 1]`` the code for a value
+    inside the bucket.  They differ only at the four RNE midpoints, where the
+    exact value takes the even (lower) code.  ``build_e2m1_lut`` is unchanged
+    and still describes the plain bucket lookup.
+    """
+    lut = build_e2m1_lut()
+    folded = lut.repeat_interleave(2)
+    for index in RNE_LOWER_BUCKETS:
+        folded[2 * index] -= 1
+    return folded
 
 
 # ---------------------------------------------------------------------------
@@ -498,12 +609,17 @@ class Plan:
         )
         ub = (
             D_CV * self.rows_vec * self.d * FP32_BYTES  # cv_ub
-            + D_QUB * self.rows_vec * (self.d // NIBBLES_PER_BYTE)  # packed q_ub
-            + D_QUB * self.rows_vec * self.groups  # descale, one byte per group
+            # packed q_ub, one D/2-byte slot per head of a store group
+            + D_QUB * self.rows_vec * self.q_store_heads * (self.d // NIBBLES_PER_BYTE)
+            # descale, one byte per group per slot, plus the row-major
+            # transposed copy the grouped store reads
+            + D_QUB * self.enc_regs * VL * self.dsc_slots
+            + self.rows_vec * self.groups * self.dsc_store_heads
             + self.amax_len * (FP32_BYTES + INT32_BYTES)  # amax fp32 + off int32
             + LUT_LEN * INT32_BYTES
             + COS_SIN_COPIES * self.rows_vec * max(self.dr, 1) * FP32_BYTES
-            # one band's partials plus the summed band
+            # one band's partials plus the summed band; ``rows_red`` is the
+            # derived band height, so this follows it rather than a constant
             + (self.n_head_blocks + 1) * self.rows_red * self.n_heads * FP32_BYTES
         )
         for name, used, cap in (
@@ -537,14 +653,27 @@ class Plan:
         weight-load bound (``wqb`` is 5.24 MB whatever T is) and the target
         flips from MFU to MBU.
 
-        Above ``cube_cores`` T-tiles the T axis fills the chip on its own and the
-        head split is off: a core then owns a whole T-tile, keeps its ``qr`` in
-        L1 for all 32 heads, and owns the W reduction outright.  That is the
-        split-T template.  Measured at 28 cores and T=4096 the head split makes
-        no difference at all there (157.6 .. 159.7 us over every block count from
-        1 to 32, including the 4-cores-do-two-tiles imbalance), because the shape
-        is MTE2-throughput bound and no split changes the bytes; so the cheapest
-        schedule wins by default.
+        At ``SPLIT_T_TILES`` T-tiles the T axis is meant to fill the chip on its
+        own, so the head split is off and a core owns a whole T-tile, keeps its
+        ``qr`` in L1 for all 32 heads, and owns the W reduction outright.  That is
+        the split-T template.  It does not always fill the grid, though: the tile
+        count is rounded up to whole rounds, and at 28 cores T=4096 is 32 tiles,
+        i.e. 4 cores with two tiles at 164 us and 24 with one at 86 us.  So that
+        branch scores the head block count instead of pinning it.  A work item is
+        one ``(tile, head block)``, splitting the heads ``hb`` ways makes
+        ``n_tiles*hb`` of them, and an item costs: ``heads_per_block`` Q GEMMs
+        plus its ``1/hb`` share of the W GEMM (K is split too), and its own
+        ``qr``/scale fill plus its ``1/hb`` share of ``wqb``/``x``/``ww``.  With
+        one head GEMM at 1.55 us of cube on one core (41.9 MFLOP at the measured
+        96-97% of 757 TFLOPS) and the two staging constants fitted to the measured
+        anchors of that tile count (80.7 us per item at ``hb=1``, 23.8 us at
+        ``hb=4``), the score is ``rounds * (cube + stage)``.  A split is only
+        admitted when it also cuts the per-core staging path by more than 10%:
+        that is the measured MTE2 limiter test, because at 64 tiles ``hb=2`` cuts
+        the modelled staging path 8.7% and the wall 0.3% while AIC-MTE2 rises 14%
+        and the L2 read hit drops 79% -> 54%.  The score then picks 4 blocks at 32
+        tiles (118.9 us measured, 1.38x the pinned 1), 1 block from 48 tiles up,
+        and leaves 25-28 tiles alone because they already fit in one round.
 
         Below that, more blocks is *not* simply better, and this is the one place
         where chasing occupancy actively costs time.  Splitting heads ``b`` ways
@@ -588,11 +717,49 @@ class Plan:
 
         ``IPQW_HEAD_BLOCKS`` pins the count for A/B runs.
         """
-        forced = int(os.environ.get("IPQW_HEAD_BLOCKS", 0)) or HEAD_BLOCKS_K
-        if not HEAD_SPLIT or forced == 1 or self.n_tiles >= SPLIT_T_TILES:
+        pinned = int(os.environ.get("IPQW_HEAD_BLOCKS", 0))
+        forced = pinned or splitk_head_blocks(self.n_tiles)
+        if not HEAD_SPLIT or forced == 1:
             self.n_head_blocks = 1
             self.heads_per_block = self.n_heads
             self.used_cores = self._grid(self.n_tiles)
+            return
+
+        if self.n_tiles >= SPLIT_T_TILES:
+            cube_us_per_head = 1.55
+            stage_us_per_tile = 26.8  # wqb/x/ww streams of a 128-row tile at hb=1
+            stage_us_per_item = 4.3  # qr/scale fill plus per-item prologue
+            stage_saving_min = 0.10
+            best_hb, best_wall, base_stage = 1, None, None
+            for hb in (1, 2, 4, 8, 16, 32):
+                if self.n_heads % hb or self.dim % hb:
+                    continue
+                # The W GEMM of a tile is ``n_heads*dim`` MAC against the
+                # ``d*q_lora`` of one Q head of it, and splitting heads divides
+                # it just like it divides ``heads_per_block``.
+                w_heads = self.n_heads * self.dim / hb / (self.d * self.q_lora)
+                scale = self.base_m / BASE_M
+                rounds = ceil_div(self.n_tiles * hb, self._grid(self.n_tiles * hb))
+                cube = scale * (self.n_heads // hb + w_heads) * cube_us_per_head
+                stage = scale * (stage_us_per_item + stage_us_per_tile / hb)
+                wall = rounds * (cube + stage)
+                if base_stage is None:
+                    base_stage, best_wall, best_hb = rounds * stage, wall, 1
+                    continue
+                if rounds * stage > base_stage * (1.0 - stage_saving_min):
+                    continue
+                if wall < best_wall:
+                    best_wall, best_hb = wall, hb
+            if pinned:
+                if self.n_heads % pinned:
+                    raise ValueError(
+                        f"head block count {pinned} does not divide "
+                        f"n_heads={self.n_heads}"
+                    )
+                best_hb = pinned
+            self.n_head_blocks = best_hb
+            self.heads_per_block = self.n_heads // self.n_head_blocks
+            self.used_cores = self._grid(self.n_tiles * self.n_head_blocks)
             return
 
         if self.n_heads % forced:
@@ -690,8 +857,9 @@ class Plan:
         ``n_head_blocks`` partials of its band into UB, one DMA each, and sums
         them register-wise, so a band has to be a whole number of vector
         registers wide.  Bands are handed out round-robin over every AIV on
-        the chip, so the narrowest legal band spreads best; it is only grown
-        when that would leave more than two bands per AIV.
+        the chip, so the height is one AIV's share of the rows: wide enough
+        that the reduction's DMA count (one per partial per band) stops being
+        the cost, and no wider.  See ``band_height`` and ``BAND_ROWS_MAX``.
         """
         if not self.w_workspace:
             # No partials to hold, so ``workspace`` is nothing but the grid marker.
@@ -717,17 +885,17 @@ class Plan:
                 f"no band height divides base_m={self.base_m} into whole "
                 f"{VL}-lane registers at N={self.n_heads}"
             )
-        # Pinned rather than fitted to the AIV count: sizing it to
-        # ``used_cores * SUBBLOCKS`` is a second way for the core count to reach
-        # the binary, since this is a UB height and a register unroll.  See
-        # ``ROWS_RED_K``.  Still checked against the legal set, because a band
-        # that does not divide ``base_m`` into whole registers cannot be summed.
-        if ROWS_RED_K not in legal:
+        # Derived from the tile height and the live row count rather than pinned
+        # to one number, because the cost is the DMA count: 2 rows cost 6.3 us of
+        # AIV time at T=1536 and 16 rows 0.3 us above removing the reduction.
+        # ``band_height`` stays inside the legal set, and ``IPQW_ROWS_RED_K``
+        # still pins it for A/B runs.
+        if ROWS_RED_K and ROWS_RED_K not in legal:
             raise ValueError(
                 f"ROWS_RED_K={ROWS_RED_K} is not a legal band height for "
                 f"base_m={self.base_m} at N={self.n_heads}; legal: {legal}"
             )
-        self.rows_red = ROWS_RED_K
+        self.rows_red = ROWS_RED_K or band_height(self.base_m, self.n_heads)
         self.n_bands_workspace = total_rows // self.rows_red
         # ``workspace`` is indexed by tile, so it carries the padded tile height; only
         # the live rows of ``w`` are produced, so the band loop stops at T and
@@ -904,6 +1072,24 @@ class Plan:
         self.rope_regs = dr // VL
         self.enc_regs = ceil_div(self.rows_vec * self.groups, VL)
         self.amax_len = self.enc_regs * VL
+        # How many heads share one GM store.  ``heads_per_block`` is already a
+        # specialisation key, so these are derived values, not new dimensions:
+        # the descriptor of one store is a burst of G_q * D/2 bytes for q and
+        # G_d * groups bytes for the descale, and both must divide the head
+        # group for the loop above to flush whole groups only.
+        self.q_store_heads = min(4, self.heads_per_block)
+        # The descale group store reads its slots back through a 64-word
+        # register transpose, so it needs the group to be a whole number of
+        # registers (rows_vec * heads) and a power-of-two head count.  Short
+        # decode tiles (rows_vec < 64 with two heads) do not satisfy that and
+        # keep the per-head descale store; q groups in every bucket.
+        self.dsc_grouped = bool(
+            (self.rows_vec * self.heads_per_block) % VL == 0
+            and self.heads_per_block & (self.heads_per_block - 1) == 0
+            and VL % self.heads_per_block == 0
+        )
+        self.dsc_store_heads = self.heads_per_block if self.dsc_grouped else 1
+        self.dsc_slots = self.dsc_store_heads
 
 
 # The plan the public entry will use, sharing the cache with _plan_for.
@@ -1081,11 +1267,19 @@ class CubeQ:
         height -- see ``rows_view``.
         """
         p = self.p
-        qr_src = tile_view(qr_gm, (p.base_m, p.qr_k_l1), (tile, 0))
-        scale_src = tile_view(
+        origin = tile_origin(p, tile, self.t_live)
+        rows = tile_rows(p, tile, self.t_live)
+        qr_src = from_tensor(
+            qr_gm,
+            layout=make_layout((rows, p.qr_k_l1)),
+            offset=origin * p.qr_k_l1,
+            data_format="nd",
+        )
+        scale_src = from_tensor(
             descale_qr_gm,
-            (p.base_m, p.scale_k_len_q // MX_PAIR, MX_PAIR),
-            (tile, 0, 0),
+            layout=make_layout((rows, p.scale_k_len_q // MX_PAIR, MX_PAIR)),
+            offset=origin * p.scale_k_len_q,
+            data_format="nd",
         ).flatten(start_dim=1)
         mem_copy(
             self.qr_l1.next_write(),
@@ -1381,9 +1575,16 @@ class CubeW:
         under ``w_k_split``.
         """
         p = self.p
+        origin = tile_origin(p, tile, self.t_live)
+        rows = tile_rows(p, tile, self.t_live)
         mem_copy(
             self.x_l1.next_write(),
-            tile_view(x_gm, (p.base_m, p.k_l1_w), (tile, k_base + kw)),
+            from_tensor(
+                x_gm,
+                layout=make_layout((rows, p.k_l1_w), stride=(p.dim, 1)),
+                offset=(origin * p.dim + (k_base + kw) * p.k_l1_w) * 2,
+                data_format="nd",
+            ),
             options=copy_options(l2_cache_ctl=L2_W),
         )
         mem_copy(
@@ -1461,11 +1662,14 @@ class CubeW:
         # softmax_scale folded into the fixpipe DEQSCALE register: the W path
         # never touches the vector unit.
         p = self.p
-        dst = tile_view(self.w_gm, (p.base_m, p.base_n_w), (tile, 0))
-        # ``mem_copy`` copies the source extent, so the source has to be the
-        # live rows of this tile, not the padded ``rows_l1``: on a short tail
-        # ``rows_l1`` rounds up to the 16-row fractal and would store past the
-        # end of ``w`` (T=5620 writes 12 rows past a 5620-row output).
+        origin = tile_origin(p, tile, self.t_live)
+        rows = tile_rows(p, tile, self.t_live)
+        dst = from_tensor(
+            self.w_gm,
+            layout=make_layout((rows, p.base_n_w)),
+            offset=origin * p.n_heads * 4,
+            data_format="nd",
+        )
         c_rows = self.c_rows(self.l0c.next_read(), dst.shape[0])
         mem_copy(
             dst,
@@ -1492,10 +1696,14 @@ class CubeW:
         view is cut to the live rows of ``w``.
         """
         p = self.p
+        origin = tile_origin(p, tile, self.t_live)
         c_rows = self.c_rows(self.l0c.next_read(), rows_l1)
         mem_copy(
-            tile_view(
-                self.workspace_gm, (p.base_m, p.base_n_w), (h_block * n_tiles + tile, 0)
+            from_tensor(
+                self.workspace_gm,
+                layout=make_layout((p.base_m, p.base_n_w)),
+                offset=(h_block * (n_tiles * p.base_m) + origin) * p.n_heads * 4,
+                data_format="nd",
             ),
             c_rows.convert(c_rows.dtype, scale=self.softmax_scale),
             options=copy_options(l2_cache_ctl=L2_W),
@@ -1517,14 +1725,31 @@ class VectorQ:
         self.p = p
         rows = p.rows_vec
         # D is a multiple of 64, so q_ub's rows are already 32-byte aligned and
-        # its declared stride is its real stride.  dsc_ub's natural shape
-        # (rows, groups) is not: UB rounds the innermost axis up to 32 bytes, so
-        # a 4-byte row would really be 32 bytes apart and the linear offsets
-        # pass 2 writes at would land in the padding.  Declare it in the shape
-        # pass 2 actually writes (one 64-byte register per row) and let ``store``
-        # re-view it as (rows, groups) with an explicit packed stride.
-        self.q_ub = Buffer(MemLoc.UB, U8, make_layout((rows, p.d // 2)))
-        self.dsc_ub = Buffer(MemLoc.UB, U8, make_layout((p.enc_regs, VL)))
+        # its declared stride is its real stride.  One row now holds a whole
+        # store group: head slot ``s`` occupies bytes ``s*D/2`` of every row, so
+        # a group store is one contiguous D/2*G_q-byte burst per row.  The pack
+        # pass addresses its own slot with ``q_slot``, which is why the slot
+        # moves between heads without the pass itself changing.
+        self.q_ub = Buffer(
+            MemLoc.UB, U8, make_layout((rows, p.q_store_heads * (p.d // 2)))
+        )
+        # Descale slots are always one ``enc_regs * VL`` block per head: the
+        # E8M0 pass writes 64 packed bytes per register and a short tile rounds
+        # up to a whole register, so the block is the unit that cannot collide.
+        # ``dsc_t_ub`` is the row-major group copy (one row's descale bytes for
+        # the whole group contiguous) that the grouped store reads.
+        self.dsc_ub = Buffer(
+            MemLoc.UB, U8, make_layout((p.dsc_slots * p.enc_regs * VL,))
+        )
+        self.dsc_t_ub = Buffer(
+            MemLoc.UB, U8, make_layout((rows * p.dsc_store_heads * p.groups,))
+        )
+        # ``dsc_ub`` as 32-bit words: one word is one row's descale byte group,
+        # which is what the slot transpose gathers.
+        self.dsc_w_ub = self.dsc_ub.view(I32)
+        self.dsc_t_w_ub = self.dsc_t_ub.view(I32)
+        # Slot of the current head inside the q store group, set per head.
+        self.q_slot = 0
         # Auto-buffer-sync orders MTE2 DMA against VF reads on Buffers.
         self.amax_ub = Buffer(MemLoc.UB, F32, make_layout((p.amax_len,)))
         self.off_ub = Buffer(MemLoc.UB, I32, make_layout((p.amax_len,)))
@@ -1626,18 +1851,72 @@ class VectorQ:
     # Store packed q and the scale from UB to GM, limited to this
     # partition's live rows.
     @jit
-    def store(self, q_tile, dsc_tile, rows):
-        """Write back exactly ``rows`` rows, so a short T tail cannot overrun GM."""
+    def store_q(self, q_tile, heads, rows):
+        """Write ``heads`` packed-q head slots, exactly ``rows`` rows.
+
+        A group store writes one ``heads * (D/2)``-byte q burst per row instead
+        of one 64 B burst per row per head, so the MTE3 instruction count per
+        work item drops by a factor of ``heads``.
+        """
         p = self.p
         part = get_subblock_id()
+        width = heads * (p.d // 2)
         mem_copy(
             q_tile.partition(dim=0, part_id=part),
-            local_slice(self.q_ub, (rows, p.d // 2), stride=(p.d // 2, 1)),
+            local_slice(self.q_ub, (rows, width), stride=(width, 1)),
         )
+
+    @jit
+    def store_dsc(self, dsc_tile, heads, rows):
+        """Write the transposed descale group, exactly ``rows`` rows."""
+        p = self.p
+        part = get_subblock_id()
+        width = heads * p.groups
+        mem_copy(
+            dsc_tile.partition(dim=0, part_id=part),
+            local_slice(self.dsc_t_ub, (rows, width), stride=(width, 1)),
+        )
+
+    @jit
+    def store_dsc_head(self, dsc_tile, rows):
+        """Fallback store: one head's descale bytes, exactly ``rows`` rows."""
+        p = self.p
+        part = get_subblock_id()
         mem_copy(
             dsc_tile.partition(dim=0, part_id=part),
             local_slice(self.dsc_ub, (rows, p.groups), stride=(p.groups, 1)),
         )
+
+    @jit
+    def repack_dsc(self, heads):
+        """Transpose ``heads`` descale head slots into one row-major group.
+
+        Slot ``s`` is ``enc_regs * VL`` bytes holding head ``s``'s descale
+        bytes, one 4-byte word per row; the group store needs row ``r``'s
+        ``heads * groups`` bytes contiguous.  Both are the same words, so the
+        permutation is the closed form ``dst[r * heads + s] = src[s * slot + r]``
+        and it walks the full declared height, which is why a short tail cannot
+        drift: the store afterwards is the only thing that uses the live rows.
+        """
+        p = self.p
+        head_bits = heads.bit_length() - 1
+        slot_words = p.enc_regs * VL // p.groups
+        with vf(mode="simd"):
+            m32 = full_mask()
+            lane = varange(0, I32)
+            head_mask = vdups(heads - 1, I32, mask=m32)
+            slot_step = vdups(slot_words, I32, mask=m32)
+            for reg in range(heads):
+                words = vadds(lane, reg * VL, mask=m32)
+                slot = vbitwise_and(words, head_mask, mask=m32)
+                row = vshr(words, head_bits, mask=m32)
+                src = vadd(vmul(slot, slot_step, mask=m32), row, mask=m32)
+                vstore(
+                    self.dsc_t_w_ub,
+                    reg * VL,
+                    vgather(self.dsc_w_ub, vreinterpret(src, U32), mask=m32),
+                    m32,
+                )
 
     @jit
     def _rope_amax(self, cv_ub, rows, cos_ub, sin_ub):
@@ -1725,13 +2004,20 @@ class VectorQ:
                     m32,
                 )
                 vstore_pack(
-                    self.dsc_ub, e * VL, e8m0_exp, m32, pack_mode=PackMode.B32_TO_B8
+                    self.dsc_view, e * VL, e8m0_exp, m32, pack_mode=PackMode.B32_TO_B8
                 )
             vmem_bar("vst_vld")
 
     @jit
     def _pack_e2m1(self, cv_ub, rows, lut_ub):
-        """Gather the magnitude code, merge the sign, pack two nibbles per byte."""
+        """Gather the magnitude code, merge the sign, pack two nibbles per byte.
+
+        The tie correction lives in the table now: ``idx`` is the descaled fp32
+        bucket and the discarded low bits say whether the value sits exactly on
+        the bucket boundary, so ``2 * idx + inexact`` selects between the plain
+        bucket code and the even code the four RNE midpoints need.  That is one
+        compare-free index instead of the four-midpoint compare/select chain.
+        """
         p = self.p
         with vf(mode="simd"):
             m32 = full_mask()
@@ -1751,46 +2037,31 @@ class VectorQ:
                 base = r * p.d
                 gbase = vadds(gsel, r * p.groups, mask=m32)
                 for i in range_constexpr(p.n_reg):
-                    off = vgather(
-                        self.off_ub,
-                        vreinterpret(vadds(gbase, 2 * i, mask=m32), U32),
-                        mask=m32,
-                    )
+                    if const_expr(i == 0):
+                        off = vgather(self.off_ub, vreinterpret(gbase, U32), mask=m32)
+                    else:
+                        off = vgather(
+                            self.off_ub,
+                            vreinterpret(vadds(gbase, 2 * i, mask=m32), U32),
+                            mask=m32,
+                        )
                     xv = vload(cv_ub, base + i * VL)
                     mag = vbitwise_and(vreinterpret(xv, I32), mag_mask, mask=m32)
                     idx = vsub(vshr(mag, LUT_SHIFT, mask=m32), off, mask=m32)
                     idx = vmaxs(idx, 0, mask=m32)
-                    code = vgather(lut_ub, vreinterpret(idx, U32), mask=m32)
-                    # The LUT takes the upper value at every midpoint.  For
-                    # RNE, the exact midpoints 0.25, 1.25, 2.5 and 5.0 must
-                    # instead take the lower (even) E2M1 code.  ``idx`` is
-                    # the descaled fp32 bucket, while the discarded LUT bits
-                    # distinguish the exact midpoint from values just above it.
-                    tie_lower = vselect(
+                    # A value exactly on the bucket's lower bound discards no
+                    # bits, and only then may the exact-midpoint entry apply.
+                    inexact = vselect(
                         one_i,
                         zero_i,
-                        cond_mask=veq(idx, vdups(1000, I32, mask=m32), mask=m32),
-                    )
-                    for midpoint_idx in (1018, 1026, 1034):
-                        tie_lower = vselect(
-                            one_i,
-                            tie_lower,
-                            cond_mask=veq(
-                                idx, vdups(midpoint_idx, I32, mask=m32), mask=m32
-                            ),
-                        )
-                    tie_code = vselect(
-                        vsub(code, one_i, mask=m32),
-                        code,
-                        cond_mask=veq(
+                        cond_mask=vne(
                             vbitwise_and(mag, lut_remainder_mask, mask=m32),
                             zero_i,
                             mask=m32,
                         ),
                     )
-                    code = vselect(
-                        tie_code, code, cond_mask=vne(tie_lower, zero_i, mask=m32)
-                    )
+                    idx2 = vadd(vshl(idx, 1, mask=m32), inexact, mask=m32)
+                    code = vgather(lut_ub, vreinterpret(idx2, U32), mask=m32)
                     # Sign follows q < 0, so negative zero encodes as nibble 0.
                     neg = vlts(xv, 0.0, mask=m32)
                     sign = vselect(k8, zero_i, cond_mask=neg)
@@ -1803,7 +2074,11 @@ class VectorQ:
                     )
                     vstore_pack(
                         self.q_ub,
-                        base // 2 + i * (VL // 2),
+                        # A row of the group is G_q slots wide, and this head
+                        # owns slot ``q_slot`` of it.
+                        r * (p.q_store_heads * (p.d // 2))
+                        + self.q_slot * (p.d // 2)
+                        + i * (VL // 2),
                         packed,
                         m_lo,
                         pack_mode=PackMode.B32_TO_B8,
@@ -1842,7 +2117,7 @@ def _w_prefix(gm, work):
     cube_w = gm.cube_w
     tile = work // p.n_head_blocks
     h_block = work % p.n_head_blocks
-    rows_full = tile_view(gm.w, (p.base_m, p.n_heads), (tile, 0)).shape[0]
+    rows_full = tile_rows(p, tile, gm.t_live)
     rows_l1 = ceil_div(rows_full, NZ_M_FRAC) * NZ_M_FRAC
     if const_expr(not (PROBE == "no_w" and p.w_separate)):
         w_slot = cube_w.l0c.next_write()
@@ -1879,21 +2154,31 @@ def _q_heads(gm, work, lut_ub, cos_ub, w_slot):
     vec = gm.vec
     tile = work // p.n_head_blocks
     h_block = work % p.n_head_blocks
-    rows_full = tile_view(gm.w, (p.base_m, p.n_heads), (tile, 0)).shape[0]
+    rows_full = tile_rows(p, tile, gm.t_live)
     rows_l1 = ceil_div(rows_full, NZ_M_FRAC) * NZ_M_FRAC
     # The vector epilogue, the L0C drain and the GM store must all walk the
     # same AIV row partition.  Read that split off the store's own partition
     # view instead of re-deriving it from the live tile extent: the two agree
     # on a full tile, but a short tail is where splitting the declared height
     # and splitting the clipped height diverge.
-    q_tile = tile_view(gm.q, (p.base_m, p.d // 2), (tile, 0))
+    origin = tile_origin(p, tile, gm.t_live)
+    q_row = p.n_heads * (p.d // 2)
+    q_tile = from_tensor(
+        gm.q,
+        layout=make_layout((rows_full, p.d // 2), stride=(q_row, 1)),
+        offset=origin * q_row,
+        data_format="nd",
+    )
     rows = q_tile.partition(dim=0, part_id=gm.subblock).shape[0]
     drain_rows = q_tile.partition(dim=0, part_id=0).shape[0] * 2
     sin_ub = gm.sin_ub
     qr_ready, dqr_ready = cube_q.wait_qr()
     qr_rows, dqr_rows = cube_q.rows_view(qr_ready, dqr_ready, rows_l1)
+    q_group = p.q_store_heads
+    dsc_group = p.dsc_store_heads
+    head_base = h_block * p.heads_per_block
     for local_head in range(p.heads_per_block):
-        head = h_block * p.heads_per_block + local_head
+        head = head_base + local_head
         if const_expr(PROBE != "no_w" and W_SCHED == "wfirst" and not p.w_separate):
             cube_w.gemm_head_slice(tile, local_head, 0, w_slot, rows_l1)
         cube_q.gemm_head(gm.wqb, gm.descale_wqb, head, qr_rows, dqr_rows)
@@ -1904,12 +2189,62 @@ def _q_heads(gm, work, lut_ub, cos_ub, w_slot):
                 cube_w.fill(tile, local_head + 1, 0)
             cube_w.drain(local_head, w_slot, rows_l1)
         cv_ready = cube_q.drain_to_vec(gm.cv_ub, drain_rows, rows_l1)
-        vec.epilogue(cv_ready, rows, lut_ub, cos_ub, sin_ub)
-        vec.store(
-            tile_view(gm.q, (p.base_m, p.d // 2), (tile, head)),
-            tile_view(gm.descale_q, (p.base_m, p.groups), (tile, head)),
-            rows,
+        # The epilogue writes this head's packed q and descale bytes into its
+        # slot of the store group.  The slot is a runtime value like the head
+        # index itself, so each of the three vector passes keeps one body for
+        # the whole head loop.
+        vec.q_slot = local_head % q_group
+        vec.dsc_view = local_slice(
+            vec.dsc_ub,
+            (p.enc_regs, VL),
+            offset=(local_head % dsc_group) * p.enc_regs * VL,
         )
+        vec.epilogue(cv_ready, rows, lut_ub, cos_ub, sin_ub)
+        if const_expr(p.dsc_grouped):
+            if (local_head + 1) % dsc_group == 0 or local_head + 1 == p.heads_per_block:
+                vec.repack_dsc(dsc_group)
+                vec.store_dsc(
+                    from_tensor(
+                        gm.descale_q,
+                        layout=make_layout(
+                            (rows_full, dsc_group * p.groups),
+                            stride=(p.n_heads * p.groups, 1),
+                        ),
+                        offset=origin * (p.n_heads * p.groups)
+                        + h_block * (dsc_group * p.groups),
+                        data_format="nd",
+                    ),
+                    dsc_group,
+                    rows,
+                )
+        else:
+            vec.store_dsc_head(
+                from_tensor(
+                    gm.descale_q,
+                    layout=make_layout(
+                        (rows_full, p.groups), stride=(p.n_heads * p.groups, 1)
+                    ),
+                    offset=origin * (p.n_heads * p.groups) + head * p.groups,
+                    data_format="nd",
+                ),
+                rows,
+            )
+        if (local_head + 1) % q_group == 0 or local_head + 1 == p.heads_per_block:
+            vec.store_q(
+                from_tensor(
+                    gm.q,
+                    layout=make_layout(
+                        (rows_full, q_group * (p.d // 2)), stride=(q_row, 1)
+                    ),
+                    offset=origin * q_row
+                    + (head_base // q_group + (local_head + 1) // q_group - 1)
+                    * q_group
+                    * (p.d // 2),
+                    data_format="nd",
+                ),
+                q_group,
+                rows,
+            )
     _prefetch_qr(cube_q, gm.qr, gm.descale_qr, work, gm.n_work)
     if const_expr(PROBE != "no_w" and not p.w_separate):
         cube_w.store(tile)
@@ -1963,6 +2298,9 @@ def _arm(p, direct, views, t_live):
     gm.n_bands = n_bands
     gm.n_bands_workspace = n_bands_workspace
     gm.first_work = get_block_idx()
+    gm.t_live = t_live
+    gm.cube_q.t_live = t_live
+    gm.cube_w.t_live = t_live
     return gm
 
 
@@ -1972,8 +2310,19 @@ def _one_tile(gm, work):
     p = gm.p
     tile = work // p.n_head_blocks
     if const_expr(p.dr > 0):
-        cos_tile = tile_view(gm.rope_cos, (p.base_m, p.dr), (tile, 0))
-        sin_tile = tile_view(gm.rope_sin, (p.base_m, p.dr), (tile, 0))
+        rope_origin = tile_origin(p, tile, gm.t_live)
+        cos_tile = from_tensor(
+            gm.rope_cos,
+            layout=make_layout((tile_rows(p, tile, gm.t_live), p.dr)),
+            offset=rope_origin * p.dr * 4,
+            data_format="nd",
+        )
+        sin_tile = from_tensor(
+            gm.rope_sin,
+            layout=make_layout((tile_rows(p, tile, gm.t_live), p.dr)),
+            offset=rope_origin * p.dr * 4,
+            data_format="nd",
+        )
     else:
         cos_tile = None
         sin_tile = None
@@ -2421,10 +2770,10 @@ _LUT_CACHE: dict[torch.device, torch.Tensor] = {}
 
 
 def _lut_cache(device: torch.device) -> torch.Tensor:
-    """E2M1 rounding table, uploaded once per device."""
+    """Folded E2M1 rounding table, uploaded once per device."""
     cached = _LUT_CACHE.get(device)
     if cached is None:
-        cached = build_e2m1_lut().to(device)
+        cached = build_e2m1_lut_folded().to(device)
         _LUT_CACHE[device] = cached
     return cached
 
@@ -2646,8 +2995,11 @@ def indexer_prologue_qw(*tensors, **options):
     whose hidden-state buffer is allocated at its own tile height can hand it
     over as it stands -- and the extra rows are dropped by a view, not read.
 
-    No GM is allocated for any input, at any T.  A short last row tile is
-    handled where the row fractal is, in L1; see ``CubeQ.rows_view``.
+    No GM is allocated for any input, at any T, and no input is padded.  A T
+    that is not a whole number of row tiles overlaps its last tile with the
+    previous one (origin ``T - base_m``), so every tile is full height; the
+    shared rows are computed twice from the same inputs and write the same
+    bytes, and every store ends at T.
 
     Returns ``(q, descale_q, w)``. ``q`` is packed uint8 e2m1 with shape
     ``(T, N, D/2)``; ``descale_q`` is e8m0; ``w`` is fp32.
