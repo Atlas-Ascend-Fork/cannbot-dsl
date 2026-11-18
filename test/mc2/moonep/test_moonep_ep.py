@@ -6,18 +6,14 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 
-"""MoonEP × moe_ep 四件套 E2E 验收（定案路线：ep 算子零 kernel 改动、零 adapter）。
+"""MoonEP plan/prefetch/reduce E2E 验收（DSL 原生三算子形态）。
 
-链路：DSL moonep_plan → ElasticBuffer dispatch/epilogue（topk_idx=vtopk，
-num_experts=2E 扩展虚拟空间）→ identity 专家 + GMM 侧加权 → 纯 sum combine。
-原生 MoonEP 的 NvS 布局 = 按 2epn 虚拟专家分组 + cu_seqlens，与 moe_ep 的
-expert-order + num_recv_tokens_per_expert 天然对应，无需任何装配层。
-反向验收 combine⁻¹（dispatch 散梯度）、dispatch⁻¹（ep combine 裸和）、
-reduce_grad（副本梯度归并）。
+（本文件覆盖：DSL moonep_plan（2E 扩展
+虚拟空间路由 + cu_seqlens 分组）、prefetch_weight（跨 rank 副本预取）、
+reduce_grad（副本梯度 v4 pull 归并）及布局公式单元验收。）
 
 依赖：
 - 本仓 samples/moonep（plan/prefetch_weight/reduce_grad）
-- 已安装 cann_ops_transformer（ElasticBuffer/EPHandle 与 ep 算子）
 
 运行（8 卡，验收标准形态）：
     python -m torch.distributed.run --nproc_per_node=8 -m pytest test/moonep/test_moonep_ep.py -q
@@ -45,8 +41,6 @@ _EPN = 32  # ElasticBuffer sizing 的 epn 上界（上游 #306 漏定义；test_
 from moonep_golden import (  # noqa: E402
     RouteShape,
     make_router_inputs,
-    moonep_combine_golden,
-    moonep_dispatch_golden,
 )
 
 try:
@@ -59,17 +53,6 @@ except ImportError:
 
 _requires_dsl = pytest.mark.skipif(
     not _HAS_DSL_IMPL, reason="samples/moonep 实现尚未合入"
-)
-
-try:
-    from cann_ops_transformer.ops import ElasticBuffer  # noqa: E402,F401
-
-    _HAS_EP = True
-except ImportError:
-    _HAS_EP = False
-
-_requires_ep = pytest.mark.skipif(
-    not _HAS_EP, reason="需已安装 cann_ops_transformer（ElasticBuffer 与 ep 算子）"
 )
 
 # (S, K, epn, mode, seed)：R 取运行时 world size，E = epn*R
@@ -139,52 +122,35 @@ def _assert_cu_matches_vtopk(cu, vtopk, num_experts):
 
 
 _EP_POOL = {}
+_POOL_CAP = 3  # HCCL 注册限额驱动的池上限（LRU 驱逐）
 
 
-def _get_ep_buf(world_size, num_tokens, top_k):
-    """全部用例共享同一 EP buffer/子通信域（shape 相同）。
+def _get_ep_buf(world_size, num_tokens, top_k, num_experts):
+    """全部用例共享 DSL buffer 池（同 shape 键控；0.8.2 URMA 通路）。
 
-    本机 ElasticBuffer Destroy 的 HcclBarrier 建 AICPU_TS 通道必等 ~120s/个，
-    每用例新建 buffer 会把 120s 付 N 次；池化共享 + 进程退出硬退
-    （见 conftest.py）跳过串行销毁。
+    MoonepBuffer 构造为集体调用（含 URMA 连接建立）——池化共享免重复
+    建连；进程退出统一回收（destroy 断开连接，秒级）。
     """
-    key = (num_tokens, top_k)
+    key = (num_tokens, top_k, num_experts)
+    # LRU 上限：HCCL 每通信器内存注册有限额——池超限驱逐最旧 buffer
+    # （destroy 断连释放注册；构造/驱逐均为集体序，全 rank 同步安全）
+    while len(_EP_POOL) >= _POOL_CAP:
+        _old_key = next(iter(_EP_POOL))
+        _old_buf = _EP_POOL.pop(_old_key)
+        _old_buf.destroy()
     if key not in _EP_POOL:
-        from torch_npu._C._distributed_c10d import ProcessGroupHCCL
+        from moonep_buffer import MoonepBuffer
 
-        eb_mb = ElasticBuffer.get_moe_ep_ccl_buffer_size(
-            world_size, _ep_nmtr(num_tokens, top_k), _H, _EPN * world_size, top_k
+        _EP_POOL[key] = MoonepBuffer(
+            num_tokens,
+            _H,
+            _H,  # Hp=H（W 上界不参与实算——本文件走 plan/prefetch/reduce）
+            top_k,
+            num_experts,
+            moonep_group=dist.group.WORLD,
+            ep_group=dist.group.WORLD,
         )
-        eb_opts = ProcessGroupHCCL.Options()
-        eb_opts.hccl_config = {"hccl_buffer_size": eb_mb}
-        ep_group = dist.new_group(
-            backend="hccl",
-            ranks=list(range(world_size)),
-            pg_options=eb_opts,
-        )
-        # nmtr = S：EB 窗口 per-peer 槽位承载 token 行（扩展发生在接收侧
-        # recv 区），per-peer 到达 ≤ S 恒成立，无需路由余量
-        buf = ElasticBuffer(
-            ep_group,
-            num_max_tokens_per_rank=_ep_nmtr(num_tokens, top_k),
-            hidden=_H,
-            num_topk=top_k,
-        )
-        _EP_POOL[key] = (ep_group, buf)
-    return _EP_POOL[key][1]
-
-
-def _ep_nmtr(num_tokens, top_k):
-    """per-peer 容量 = S（与 torchtitan 生产口径一致）。
-
-    EB 窗口 per-peer 槽位承载 token 行而非 (token,expert) 扩展对，per-peer
-    到达 ≤ S 恒成立（与路由分布/plan 均衡无关）；plan 均衡不变量（每 rank
-    扩展行恰 S*K）由接收侧 recv 分配承载。历史公式 max(S, S*K/R*1.25+64)
-    诞生于 plan 尚在修均衡 bug 的窗口期（3ee880219），且 10-24 才补 max
-    （8P K6 形状 3904 < S=4094 触发 dispatch tiling 拒绝——发送侧约束
-    的推导有缺陷，已废弃。
-    """
-    return num_tokens
+    return _EP_POOL[key]
 
 
 def _make_case(shape, mode, seed):
@@ -194,21 +160,6 @@ def _make_case(shape, mode, seed):
         shape.world_size, shape.num_tokens, _H, generator=gen, dtype=torch.float32
     ).to(torch.bfloat16)
     return topk_all, rw_all, hidden_all
-
-
-def _ep_dispatch(buf, x, vtopk, shape, rw=None):
-    """dispatch：topk_idx=vtopk（[N] 虚拟专家 id 投影 reshape 为 [S,K]），
-    num_experts=2E 扩展空间。返回 (recv_x, recv_w, handle)。
-    """
-    recv_x, _, recv_w, handle = buf.dispatch(
-        x,
-        topk_idx=vtopk.view(shape.num_tokens, shape.top_k),
-        topk_weights=rw,
-        num_experts=2 * shape.num_experts,
-        num_max_tokens_per_rank=_ep_nmtr(shape.num_tokens, shape.top_k),
-        do_cpu_sync=False,
-    )
-    return recv_x, recv_w, handle
 
 
 class _PlanOut(NamedTuple):
@@ -222,6 +173,42 @@ class _PlanOut(NamedTuple):
     vtopk: torch.Tensor
 
 
+_CTX = {}
+
+
+def _test_workspace():
+    """覆盖本文件用例矩阵上界的精算 workspace（分配即所需——不再粗预留）。
+
+    上界布局族：3 组 × 114688 宽（H×16）× 2 槽 × epn=28、bf16 梯度/权重
+    ——用例矩阵（_E2E_CASES 至 114688 宽变体）全部落位其内；逐用例更
+    精确的形状精算收益 <1 次窄分配，取矩阵上界一次成型。
+    """
+    from moonep_layout import HEAP_BASE, LAYOUT_TAIL_BYTES, reduce_region_end
+
+    return (
+        HEAP_BASE
+        + reduce_region_end(28, 114688, 3, 2, grad_bytes_per_elem=2)
+        + LAYOUT_TAIL_BYTES
+    )
+
+
+def _shared_ctx():
+    """进程级共享裸 ctx（默认布局族：3 组 × 512 宽 × 1 槽）。"""
+    if "ctx" not in _CTX:
+        _CTX["ctx"] = create_moonep_context(workspace_bytes=_test_workspace())
+    return _CTX["ctx"]
+
+
+def _fresh_ctx():
+    """布局变体用例专用裸 ctx（用后 close）。
+
+    layout_groups/组宽/槽位在 ctx 上**首调冻结**——跨族共享会触发布局
+    守卫（d5/d6 实证：2 组/32768 宽/双槽用例连环被拦）。专用 ctx 用后
+    即关，防 HCCL 注册累积（HcclCommMemReg 限额，池上限 3 的同源约束）。
+    """
+    return create_moonep_context(workspace_bytes=_test_workspace())
+
+
 def _assert_one_source_etc(etc_cpu, epn):
     """plan 契约：每个 destination rank 的副本槽至多来自一个 home rank。"""
     for rank, row in enumerate(etc_cpu.tolist()):
@@ -231,8 +218,9 @@ def _assert_one_source_etc(etc_cpu, epn):
         )
 
 
-def _plan_case(rank, shape, mode="balanced", seed=42):
-    """plan 测试样板：路由输入 → ctx → moonep_plan → 同步。"""
+def _plan_case(rank, shape, mode="balanced", seed=42, ctx=None):
+    """plan 测试样板：路由输入 → ctx（缺省共享族；变体用例传专用 ctx）
+    → moonep_plan → 同步。"""
     topk_all, _, _ = _make_case(shape, mode, seed)
     topk_my = topk_all[rank].to(torch.int32).npu()
     tpe_my = (
@@ -240,71 +228,12 @@ def _plan_case(rank, shape, mode="balanced", seed=42):
         .to(torch.int32)
         .npu()
     )
-    ctx = create_moonep_context()
+    ctx = ctx if ctx is not None else _shared_ctx()
     dst_n, cu, etc, src_n, vtopk = moonep_plan(ctx, tpe_my, topk_my)
     torch.npu.synchronize()
     etc_cpu = etc.cpu()
     _assert_one_source_etc(etc_cpu, etc_cpu.shape[1])
     return _PlanOut(ctx=ctx, etc=etc, dst_n=dst_n, cu=cu, src_n=src_n, vtopk=vtopk)
-
-
-@pytest.mark.npu
-@_requires_dsl
-@_requires_ep
-@pytest.mark.parametrize("num_tokens,top_k,epn,mode,seed", _E2E_CASES)
-def test_moonep_ep_dispatch_combine_vs_golden(num_tokens, top_k, epn, mode, seed):
-    """前向：plan → ep dispatch/epilogue → GMM 侧加权 → 纯 sum combine ≈ golden。
-
-    路由权重按 rank 独立随机（随 dispatch 随车承重）；golden 所需的
-    rw_all 由种子在测试侧确定性重建（生产路径不依赖种子）。
-    """
-    rank, world_size = _init_ep_group()
-    shape = RouteShape(world_size, num_tokens, top_k, epn * world_size)
-    topk_all, _, hidden_all = _make_case(shape, mode, seed)
-    rw_all = torch.stack(
-        [
-            torch.rand(
-                num_tokens, top_k, generator=torch.Generator().manual_seed(777 + r)
-            )
-            + 0.1
-            for r in range(world_size)
-        ]
-    )
-    rw_my = rw_all[rank]
-
-    topk_my = topk_all[rank].to(torch.int32).npu()
-    tpe_my = (
-        torch.bincount(topk_all[rank].flatten(), minlength=shape.num_experts)
-        .to(torch.int32)
-        .npu()
-    )
-    ctx = create_moonep_context()
-    dst_n, cu, etc, src_n, vtopk = moonep_plan(ctx, tpe_my, topk_my)
-    torch.npu.synchronize()
-
-    buf = _get_ep_buf(world_size, num_tokens, top_k)
-
-    recv_x, recv_w, handle = _ep_dispatch(
-        buf, hidden_all[rank].npu(), vtopk, shape, rw_my.npu()
-    )
-    # 完美均衡不变量：每 rank 扩展行数恒为 S*K，与路由倾斜无关
-    assert int(handle.num_recv_tokens_per_expert.sum()) == num_tokens * top_k, (
-        f"扩展行数 != S*K（mode={mode}）"
-    )
-
-    g_res = moonep_dispatch_golden(hidden_all, rw_all, topk_all, shape.num_experts)
-
-    # GMM 契约：权重由专家计算侧施加（此处专家为 identity，加权即 GMM 职责的替身），
-    # combine 纯 sum 回收（moe_ep 契约：算子内不乘 router weight）
-    y_weighted = (recv_x.float() * recv_w.unsqueeze(1)).to(recv_x.dtype)
-    out, out_w = buf.combine(y_weighted, handle, topk_weights=recv_w)
-
-    g_out = moonep_combine_golden(g_res, num_tokens, _H)
-    assert torch.allclose(out.cpu().float(), g_out[rank], atol=_ATOL, rtol=_RTOL), (
-        f"combine 输出与 golden 不符（mode={mode}）"
-    )
-    # 权重回收：combined_topk_weights 应精确等于本 rank 路由权重
-    assert torch.equal(out_w.cpu(), rw_my), f"回收权重不符（mode={mode}）"
 
 
 class _ReduceCase(NamedTuple):
@@ -377,52 +306,6 @@ def _verify_reduce_views(grads, case, base, tag):
 
 @pytest.mark.npu
 @_requires_dsl
-@_requires_ep
-@pytest.mark.parametrize("num_tokens,top_k,epn,mode,seed", _E2E_CASES)
-def test_moonep_ep_backward_vs_golden(num_tokens, top_k, epn, mode, seed):
-    """反向：combine⁻¹（ep dispatch 散梯度，权重随车）+ dispatch⁻¹
-    （ep combine 裸和）+ reduce_grad（副本梯度归并）。
-    """
-    from reduce_grad import reduce_grad
-
-    rank, world_size = _init_ep_group()
-    shape = RouteShape(world_size, num_tokens, top_k, epn * world_size)
-    w_elems = _H * 16
-    topk_all, rw_all, hidden_all = _make_case(shape, mode, seed)
-
-    ctx, etc, dst_n, cu, src_n, vtopk = _plan_case(rank, shape, mode, seed)
-
-    buf = _get_ep_buf(world_size, num_tokens, top_k)
-    _ep_dispatch(buf, hidden_all[rank].npu(), vtopk, shape)  # ep 通道状态与前向同构
-
-    # ---- combine⁻¹：dispatch 逐副本散 d(out)，rw 随车 ----
-    gen = torch.Generator().manual_seed(999 + rank)
-    g_out = torch.randn(num_tokens, _H, generator=gen, dtype=torch.float32)
-    recv_g, recv_w, handle_g = _ep_dispatch(
-        buf, g_out.to(torch.bfloat16).npu(), vtopk, shape, rw_all[rank].npu()
-    )
-    torch.npu.synchronize()
-    y_bwd = (recv_g.float() * recv_w.unsqueeze(1)).to(torch.bfloat16)
-
-    # ---- dispatch⁻¹：ep combine 裸和 ----
-    dx, _ = buf.combine(y_bwd, handle_g)  # y_bwd 已由 GMM 反向侧加权，combine 纯 sum
-    torch.npu.synchronize()
-
-    exp_dx = torch.stack([rw_all[rank, s].sum() * g_out[s] for s in range(num_tokens)])
-    assert torch.allclose(dx.cpu().float(), exp_dx, atol=_ATOL, rtol=_RTOL), (
-        f"dispatch⁻¹ 输出与期望不符（mode={mode}）"
-    )
-
-    # ---- reduce_grad：合成梯度归并（full-dW 直入——组数/行宽从张量解析）----
-    grads = _full_dw_tensors(2, epn, w_elems, 0.0)
-    reduce_grad(ctx, etc, grads, epn)
-    torch.npu.synchronize()
-    case = _ReduceCase(rank, world_size, epn, w_elems, mode, etc.cpu())
-    _verify_reduce_views(grads, case, 0.0, "")
-
-
-@pytest.mark.npu
-@_requires_dsl
 @pytest.mark.parametrize(
     "mode", ["balanced", pytest.param("skewed", marks=pytest.mark.full)]
 )
@@ -440,7 +323,9 @@ def test_moonep_reduce_grad_multigroup_multichunk(mode):
     shape = RouteShape(world_size, num_tokens, top_k, epn * world_size)
     num_groups = 3
     w_elems = _H * 1024
-    ctx, etc, *_ = _plan_case(rank, shape, mode)
+    # 32768 宽变体：专用 ctx（组宽首调冻结——共享族会拦截；用后即关
+    # 防 HCCL 注册累积）
+    ctx, etc, *_ = _plan_case(rank, shape, mode, ctx=_fresh_ctx())
     case = _ReduceCase(rank, world_size, epn, w_elems, mode, etc.cpu())
 
     grads1 = _full_dw_tensors(num_groups, epn, w_elems, 0.0)
@@ -453,6 +338,7 @@ def test_moonep_reduce_grad_multigroup_multichunk(mode):
     reduce_grad(ctx, etc, grads2, epn)
     torch.npu.synchronize()
     _verify_reduce_views(grads2, case, 100.0, "第2次 ")
+    ctx.close()
 
 
 def _fill_weight_real(rank, epn, w_elems, g=0):
@@ -596,7 +482,7 @@ def test_moonep_prefetch_weight_multigroup():
         .to(torch.int32)
         .npu()
     )
-    ctx = create_moonep_context()
+    ctx = _shared_ctx()
     _, _, etc, _, _ = moonep_plan(ctx, tpe_my, topk_my)
     torch.npu.synchronize()
 
@@ -629,7 +515,8 @@ def test_moonep_prefetch_weight_multislot():
     num_tokens, top_k, epn = 32, 8, 4
     shape = RouteShape(world_size, num_tokens, top_k, epn * world_size)
     w_elems = _H * 16
-    ctx, etc, *_ = _plan_case(rank, shape)
+    # 双槽变体：专用 ctx（window_slots 首调冻结——共享族会拦截）
+    ctx, etc, *_ = _plan_case(rank, shape, ctx=_fresh_ctx())
 
     num_groups, num_slots = 3, 2
     slot_views = []  # prefetch 返回视图按槽缓存（首调创建）
@@ -667,6 +554,7 @@ def test_moonep_prefetch_weight_multislot():
         # 已写槽的数据在后续槽预取后须原样保留（双缓冲语义）
         if s > 0:
             _verify_slot([v.cpu() for v in slot_views[0]], 0, "复检 ")
+    ctx.close()
 
 
 @pytest.mark.full
@@ -694,7 +582,7 @@ def test_moonep_prefetch_weight_dualslot():
         .to(torch.int32)
         .npu()
     )
-    ctx = create_moonep_context()
+    ctx = _fresh_ctx()  # 双槽变体：专用 ctx（window_slots 首调冻结）
     _, _, etc, _, _ = moonep_plan(ctx, tpe_my, topk_my)
     torch.npu.synchronize()
 
@@ -713,6 +601,7 @@ def test_moonep_prefetch_weight_dualslot():
         _verify_prefetch_view(
             view.cpu(), etc_cpu, _PrefetchCase(rank, epn, w_elems), g, f"双槽 组 {g} "
         )
+    ctx.close()
 
 
 @pytest.mark.npu
@@ -732,7 +621,8 @@ def test_moonep_reduce_grad_bf16(mode):
     num_tokens, top_k, epn = 32, 8, 4
     shape = RouteShape(world_size, num_tokens, top_k, epn * world_size)
     w_elems = _H * 16
-    ctx, etc, *_ = _plan_case(rank, shape, mode)
+    # 2 组变体：专用 ctx（layout_groups 首调冻结——共享族会拦截）
+    ctx, etc, *_ = _plan_case(rank, shape, mode, ctx=_fresh_ctx())
 
     # 同一非零编码模式分别走 fp32 / bf16（bf16 输入自带舍入，容差 5% 覆盖）。
     # dtype 从张量解析：fp32 轮先固化结果再跑 bf16 轮（同槽基址顺序复用）
@@ -755,6 +645,45 @@ def test_moonep_reduce_grad_bf16(mode):
             torch.full((w_elems,), exp_tail),
             atol=1e-2,
         ), f"bf16 副本行 {j} 被改写（full-dW 只读契约）"
+    ctx.close()
+
+
+@pytest.mark.npu
+@_requires_dsl
+@pytest.mark.parametrize("mode", ["balanced"])
+def test_moonep_reduce_grad_fp16(mode):
+    """grad_view fp16 支持：fp16 视图被接受，归并结果与 fp32 路径对拍一致
+    （相对容差 5%——fp16 尾数 10 位与 bf16 同容差面）；副本槽不清零契约
+    不变。16 位路径与 bf16 同构（B16↔B32 unpack/pack，dtype 三选一）。
+    """
+    from reduce_grad import reduce_grad
+
+    rank, world_size = _init_ep_group()
+    num_tokens, top_k, epn = 32, 8, 4
+    shape = RouteShape(world_size, num_tokens, top_k, epn * world_size)
+    w_elems = _H * 16
+    ctx, etc, *_ = _plan_case(rank, shape, mode, ctx=_fresh_ctx())
+
+    grads32 = _full_dw_tensors(2, epn, w_elems, 0.0, grad_dtype=torch.float32)
+    reduce_grad(ctx, etc, grads32, epn)
+    torch.npu.synchronize()
+    fp32_vals = grads32[0][:epn].cpu().float()
+
+    grads_h = _full_dw_tensors(2, epn, w_elems, 0.0, grad_dtype=torch.float16)
+    reduce_grad(ctx, etc, grads_h, epn)
+    torch.npu.synchronize()
+    fp16_vals = grads_h[0][:epn].cpu().float()
+    diff = (fp32_vals - fp16_vals).abs().max()
+    rel = diff / (fp32_vals.abs().max() + 1e-6)
+    assert float(rel) <= 5e-2, f"fp16 与 fp32 路径不一致（rel={float(rel):.4f}）"
+    for j in range(epn):
+        exp_tail = float((epn + j + 1) + 0.0)
+        assert torch.allclose(
+            grads_h[0][epn + j].cpu().float(),
+            torch.full((w_elems,), exp_tail),
+            atol=2e-2,
+        ), f"fp16 副本行 {j} 被改写（full-dW 只读契约）"
+    ctx.close()
 
 
 @pytest.mark.npu
@@ -792,7 +721,7 @@ def test_moonep_precision_pipeline_fp32_then_bf16():
         .npu()
     )
 
-    ctx = create_moonep_context()
+    ctx = _fresh_ctx()  # 2 组变体：专用 ctx
     _, cu, etc, _, vtopk = moonep_plan(ctx, tpe_my, topk_my)
     torch.npu.synchronize()
 
@@ -937,6 +866,7 @@ def test_moonep_precision_pipeline_fp32_then_bf16():
         assert torch.equal(
             grad32_h[g][:epn].float().cpu(), grad16_h[g][:epn].float().cpu()
         ), f"组 {g} fp32 与 bf16 归并结果不一致（跨 dtype 复用脏数据）"
+    ctx.close()
 
 
 @pytest.mark.npu
@@ -1007,10 +937,14 @@ def test_moonep_plan_blocks_within_core_count(monkeypatch):
                 f"{cores} 核机型上 plan 启动 {launch} 块（bd={bd}, bdp={bdp}）："
                 "栅栏要求全部 block 常驻，超核会挂死"
             )
-    # 核数富余时不压低块数（64 核仍按 64 起块）
+    # 核数富余时不压低启动块数（64 核仍 64 块起跑）；nc 逻辑分块受
+    # _VF_SAFE_CHUNK=1024 上限约束可超核数（ebbccf6：chunk=2048 时 bisheng
+    # vf 栈 6720B > 6144B 上限编译必败，压 chunk 至 1024、块内 chunk 循环
+    # 动态迭代消化多出的逻辑分块）
     monkeypatch.setattr(mc, "_RESIDENT_BLOCKS", 64)
-    _, nc64, bd64 = mp._plan_chunking(131072)
-    assert (nc64, bd64) == (64, 64), (nc64, bd64)
+    chunk64, nc64, bd64 = mp._plan_chunking(131072)
+    assert chunk64 == 1024, chunk64  # vf 栈安全 cap 生效
+    assert (nc64, bd64) == (128, 64), (nc64, bd64)
 
 
 @pytest.mark.npu
@@ -1046,15 +980,15 @@ def test_moonep_general_spec_8192_h7168_k16_epn28():
         .npu()
     )
 
-    ctx = create_moonep_context()
-    from moonep_context import HEAP_BASE, hccl_buffer_size, reduce_stg_off
+    ctx = _fresh_ctx()  # 114688 宽变体：专用 ctx（组宽首调冻结）
+    from moonep_context import HEAP_BASE, reduce_stg_off
 
     need = HEAP_BASE + reduce_stg_off(epn, w_elems, num_groups=num_groups)
-    avail = hccl_buffer_size(ctx)
+    avail = ctx.workspace_bytes  # 0.8.2：workspace 取代 HCCL 对称堆
     if need > avail:
         pytest.skip(
-            f"对称堆不足：本用例需 {need / 2**20:.0f}MiB，可用 {avail / 2**20:.0f}MiB"
-            "（设 HCCL_BUFFSIZE>=1024 再跑）"
+            f"workspace 不足：本用例需 {need / 2**20:.0f}MiB，"
+            f"可用 {avail / 2**20:.0f}MiB（按形状精算传 workspace_bytes 再跑）"
         )
 
     _, cu, etc, _, vtopk = moonep_plan(ctx, tpe_my, topk_my)
@@ -1107,6 +1041,7 @@ def test_moonep_general_spec_8192_h7168_k16_epn28():
         0.0,
         "spec ",
     )
+    ctx.close()
 
 
 # ---------------------------------------------------------------------------

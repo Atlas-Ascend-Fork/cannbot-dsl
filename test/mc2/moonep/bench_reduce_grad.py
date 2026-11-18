@@ -37,9 +37,13 @@ sys.path.insert(
 from moonep_context import create_moonep_context, sym_barrier  # noqa: E402
 from reduce_grad import reduce_grad  # noqa: E402
 
-# 精确匹配 DSL 生成的 kernel 名（mangled 名里含 "MoonepReducePullAccKernel"、
+# 精确匹配 DSL 生成的 kernel 名（mangled 名里含 "MoonepReducePullKernel"、
 # "MoonepBarrierKernel"），避免把 dist.barrier() 的 HCCL kernel 或 Fill 算进来。
-_PULL_HINTS = ("reducepull",)
+_PULL_HINTS = (
+    "reducesw",
+    "reducepull",
+)  # v7 SWPUSH（ReduceSw）兼容 v4 pull（ReducePull）
+_MERGE_HINTS = ("reducemerge",)  # 两段式第二段（迭代 span 终点成分）
 _BARRIER_HINTS = ("moonepbarrierkernel",)
 
 
@@ -72,17 +76,41 @@ def _pulled_bytes(etc_cpu, rank, epn, w_elems, groups=3):
 
 
 def _iter_kernels(out_dir):
+    """逐 rank 只取**最新** trace 的 kernel_details.csv。
+
+    out_dir 跨 run 累积（同 --out 复用）时全量递归会把旧 run 的 kernel
+    时长掺入中位数——2026-11-15 实证：K=28 单发射真值 374.9µs 被旧
+    K=8 的 112µs 稀释成 med 112.7（假带宽 513 vs 真 332.8）。按 rank
+    目录分组取 mtime 最新一份即免疫。
+    """
+    latest = {}
     for path in glob.glob(
         os.path.join(out_dir, "**", "kernel_details.csv"), recursive=True
     ):
+        # 分组键 = r{rank} 目录（path 上溯三级：kernel_details.csv ←
+        # ASCEND_PROFILER_OUTPUT ← host 时间戳目录 ← r{rank}）
+        key = os.path.dirname(os.path.dirname(os.path.dirname(path)))
+        old = latest.get(key)
+        if old is None or os.path.getmtime(path) > os.path.getmtime(old):
+            latest[key] = path
+    for path in sorted(latest.values()):
         with open(path, newline="") as handle:
             for row in csv.DictReader(handle):
                 yield row
 
 
 def _summarize(out_dir):
-    """返回 (pull 时长列表, [(barrier 起始时间, 时长)], kernel 名集合)。"""
+    """返回 (pull 时长列表, [(barrier 起始时间, 时长)], kernel 名集合, 迭代 span 列表)。
+
+    迭代 span：对齐 barrier[i] 起始 → barrier[i+1] 起始（末拍到本拍最后
+    一个 pull/merge/barrier kernel 的结束）。**逐拍口径**——多批次两段式
+    下 per-launch 中位数口径会把单次发射时长当整拍（×批数虚高，2026-11-15
+    实证 313 GB/s vs 真值 20.7），带宽一律以 iter 口径为准。
+    launch-med 口径仅在**每拍恰 1 次 pull 发射**时与 iter 等价（单
+    kernel 设计：prefetch/K=epn 直累/UbMem）；多发射/拍一律看 iter。
+    """
     pull, barrier, names = [], [], set()
+    tl = []  # (start, end) 全部相关 kernel——迭代时间线
     for row in _iter_kernels(out_dir):
         name = row["Name"].lower()
         names.add(row["Name"])
@@ -91,11 +119,19 @@ def _summarize(out_dir):
             start = float(row["Start Time(us)"])
         except ValueError:
             continue
+        tl.append((start, start + dur))
         if any(hint in name for hint in _BARRIER_HINTS):
             barrier.append((start, dur))
         elif any(hint in name for hint in _PULL_HINTS):
             pull.append(dur)
-    return pull, barrier, names
+    iter_spans = []
+    bstarts = sorted(s for s, _ in barrier)
+    if bstarts and tl:
+        last_end = max(e for _, e in tl)
+        for a, b in zip(bstarts, bstarts[1:]):
+            iter_spans.append(b - a)
+        iter_spans.append(last_end - bstarts[-1])
+    return pull, barrier, names, iter_spans
 
 
 def _fmt(values, unit):
@@ -117,6 +153,11 @@ def main():
     )
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--iters", type=int, default=20)
+    parser.add_argument(
+        "--sustained",
+        action="store_true",
+        help="加测持续吞吐（async_finish 背靠背 + 事件总时——训练流水形态，host 与设备重叠）",
+    )
     parser.add_argument("--out", default="/tmp/moonep_reduce_grad_bench")
     args = parser.parse_args()
 
@@ -124,7 +165,14 @@ def main():
     rank, world = dist.get_rank(), dist.get_world_size()
     torch.npu.set_device(rank)
 
-    ctx = create_moonep_context()
+    # workspace 按形状精算（分配即所需——context 缺省仅 plan 交换区下界）
+    from moonep_buffer import _workspace_need
+
+    ctx = create_moonep_context(
+        workspace_bytes=_workspace_need(
+            world, args.epn, args.w_elems, 1, torch.bfloat16, torch.bfloat16
+        )
+    )
     ctx.last_plan_shape = (32, 8)  # 绕开 plan 的调用顺序守卫
 
     # full-dW 契约：[2*epn, W] 张量（前 epn 行 home 种子、后 epn 行副本 dW
@@ -145,9 +193,9 @@ def main():
         torch.npu.synchronize()
         dist.barrier()
 
-        # 每拍先全组对齐再测（对齐用 sym_barrier——不走 HCCL）：
-        # 每拍因此有 2 个 barrier kernel：对齐（调用前）+ 收尾（finish_op 内），
-        # 按起始时间配对后分别统计。
+        # 每拍先全组对齐再测（对齐用 sym_barrier——不走 HCCL）。
+        # 0.8.2 起 finish_op 不再追加独立 barrier（到达等待内联在 pull
+        # kernel 中）——每拍恰 1 个对齐 barrier kernel，直接全量统计。
         out_dir = os.path.join(args.out, pattern, f"r{rank}")
         config = torch_npu.profiler._ExperimentalConfig(
             profiler_level=torch_npu.profiler.ProfilerLevel.Level0
@@ -172,14 +220,33 @@ def main():
                 torch.npu.synchronize()
             prof.step()
 
-        pull, barrier_rows, names = _summarize(out_dir)
-        barrier_rows.sort()
+        # —— 持续吞吐（训练流水形态：async 背靠背、host 与设备重叠、
+        #     事件计总时/拍——与逐拍 sync 的串行口径互补；无 profiler）——
+        sus_us = None
+        if args.sustained:
+            dist.barrier()
+            torch.npu.synchronize()
+            ev0 = torch.npu.Event(enable_timing=True)
+            ev1 = torch.npu.Event(enable_timing=True)
+            ev0.record()
+            for _ in range(args.iters):
+                # 无逐拍 leading barrier（跨 rank 序由 reduce 内部尾部
+                # barrier + kernel 旗协议保——leading 会合点在流水形态
+                # 纯属串行化开销）
+                reduce_grad(ctx, etc, grads, args.epn, async_finish=True)
+            ev1.record()
+            torch.npu.synchronize()
+            sus_us = ev0.elapsed_time(ev1) * 1000.0 / args.iters
+
+        pull, barrier_rows, names, iter_spans = _summarize(out_dir)
         payload = {
             "rank": rank,
             "pulled_bytes": _pulled_bytes(etc_cpu, rank, args.epn, args.w_elems),
             "pull": pull,
-            "align_barrier": [dur for _, dur in barrier_rows[0::2]],
-            "barrier": [dur for _, dur in barrier_rows[1::2]],
+            "iter": iter_spans,
+            "align_barrier": [dur for _, dur in barrier_rows],
+            "sustained_us": sus_us,
+            "barrier": [],
             "names": sorted(names),
         }
         gathered = [None] * world
@@ -193,15 +260,22 @@ def main():
                 f"pattern={pattern} iters={args.iters}\n"
             )
             for item in gathered:
-                pull, barrier = item["pull"], item["barrier"]
-                gbs = "n/a"
+                pull, barrier, it = item["pull"], item["barrier"], item["iter"]
+                gbs, iter_gbs, iter_med = "n/a", "n/a", "n/a"
                 if pull and item["pulled_bytes"]:
                     gbs = f"{item['pulled_bytes'] / (statistics.median(pull) * 1e-6) / 1e9:.1f} GB/s"
+                if it and item["pulled_bytes"]:
+                    iter_med = f"{statistics.median(it):.1f}us"
+                    iter_gbs = f"{item['pulled_bytes'] / (statistics.median(it) * 1e-6) / 1e9:.1f} GB/s"
+                if item.get("sustained_us") and item["pulled_bytes"]:
+                    iter_med += f" | sus {item['sustained_us']:.1f}us"
+                    iter_gbs += f" | sus {item['pulled_bytes'] / (item['sustained_us'] * 1e-6) / 1e9:.1f} GB/s"
                 print(
                     f"rank{item['rank']}: pulled {item['pulled_bytes'] / 2**20:.3f} MiB | "
                     f"pull {_fmt(pull, 'us')} | "
+                    f"iter med {iter_med} | **{iter_gbs}** | "
                     f"barrier {_fmt(barrier, 'us')} | "
-                    f"align {_fmt(item['align_barrier'], 'us')} | {gbs}"
+                    f"align {_fmt(item['align_barrier'], 'us')} | launch-med {gbs}"
                 )
             print(f"rank0 kernels: {gathered[0]['names']}")
 

@@ -6,15 +6,9 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 
-"""MoonEP golden 参考实现（纯 torch，单进程模拟整个 EP 组）。
+"""MoonEP 路由输入 golden 构造器（纯 torch，单进程模拟整个 EP 组）。
 
-语义契约（与具体放置算法无关）：
-- dispatch：每个 rank 恰好接收 S*K 个真实 token（完美均衡），输出按专家分组；
-- combine ：out[r, s] = sum_k w[r, s, k] * expert_fn(hidden[r, s])，恢复 token 主序。
-
-golden 内置一个贪心冗余专家规划器，仅用于生成合法布局；与实现侧规划器允许不同
-（实现侧另有"每个目的 rank 至多引入一个远程 home group"等工程约束，golden 不建模）。
-NvS 的 padding 属于实现细节，golden 输出不 padded，NvS = S*K。
+（本模块提供 plan/prefetch/reduce 测试所需的路由形状与确定性输入构造。）
 """
 
 from typing import NamedTuple
@@ -29,11 +23,6 @@ class RouteShape(NamedTuple):
     num_tokens: int  # 单 rank token 数
     top_k: int  # 每 token 路由专家数
     num_experts: int  # EP 组专家总数
-
-    @property
-    def epn(self) -> int:
-        """每 rank 真实本地专家数。"""
-        return self.num_experts // self.world_size
 
 
 def _home(e, epn):

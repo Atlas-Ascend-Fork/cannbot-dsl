@@ -8,15 +8,15 @@
 
 """MEMSTAT 显存统计打印基础设施（显存对账口径）。
 
-对 plan / prefetch_weight / reduce_grad / ElasticBuffer.dispatch/combine 的
-全部显存分配点打统一格式标签行，供训练用例侧 grep 汇总：
+对 plan / prefetch_weight / reduce_grad 的全部显存分配点打统一格式标签行，
+供训练用例侧 grep 汇总：
 
   [MEMSTAT] op=<算子> kind=<类别> what=<对象> [shape=..] [dtype=..] bytes=N (MiB)
 
 类别：
   alloc     —— 单次 torch 张量分配（算子内部的每处分配点）
-  heap      —— 对称堆（HCCL buffer）布局区段/总量（逻辑占用，堆整体已预分配）
-  ccl       —— EB 侧 C++ EnsureMoeContext 的通信窗（dispatch 首调时注册）
+  heap      —— workspace（per-rank 注册内存）布局区段/总量（逻辑占用，
+               堆整体已在 ctx 创建时一次性预分配）
   delta     —— 一次算子调用的 mem_get_info 前后差（真实设备显存增量）
   note      —— 上下文补充信息
 

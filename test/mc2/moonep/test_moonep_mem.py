@@ -14,35 +14,32 @@
   E=224（4 卡 epn=56 / 8 卡 epn=28；理论公式 *224/4、*224/8 口径一致）
   如需 140 专家形态，传 --E 140（此时每卡理论权重 = 35×63MB = 2.15GB）。
 
-架构（标准 MoE FFN——H 既是 dispatch token 维也是专家输入维）：
-  x[S,H] → EB dispatch（token 维 H 展开）
+架构（标准 MoE FFN 反向链——H 既是 token 维也是专家输入维）：
+  x[S,H]（token 数据面不在本套件——token 行以本地桩注入：
+  recv[n,H] 按 cu 分组序确定性生成，形状/分组与 dispatch 产物同构）
   → recv[n,H] → 逐组专家 FFN（gate/up [Hp,H] + down [H,Hp]，SiTU 激活）
-  → y[n,H] → 加权 → EB combine → out[S,H]
+  → y[n,H] → 加权 → loss
   反向镜像：dW 落 bf16 视图 [2*epn, W] → reduce_grad 归并 → SGD。
 
 迁移说明（测试用例须基于已封装的接口调用）：
-- 五算子（plan/dispatch/prefetch_weight/combine/reduce_grad）全部经
-  MoonepBuffer 驱动：手工堆需求计算/hccl_buffer_size 注入/
-  HCCL 子组创建/ctx 定型/window_slots 接线/EB@WORLD 构造/权重与梯度槽
-  视图列表/ctx 注入全部内化进构造与方法；FFN 读写视图逻辑原样保留；
+- 三算子（plan/prefetch_weight/reduce_grad）全部经
+  MoonepBuffer 驱动：堆需求精算/ctx 定型/window_slots 接线/权重与梯度
+  槽视图全部内化进构造与方法（HCCL 子组创建与组显存注入仍由测试侧
+  ——通信域创建方——承担：数据面不占 HCCL 外部 buffer，注入引擎下限
+  控制进程显存）；FFN 读写视图逻辑原样保留；
 - --slots/--grad-dtype CLI 旋钮直接映射构造参数；堆需求
-  打印改经 heap_config_mb/heap_required_bytes 只读 property 回读；
-- nmtr = S（构造期定型；旧公式 max(S, S*K/R*1.25+64) 已废弃——EB 窗口
-  槽位承载 token 行而非扩展对）——EB 通信窗容量相应
-  变化（do_cpu_sync=True 精确分配下 recv 尺寸不变），MEMSTAT
-  实测行如实反映；
+  打印改经 heap_required_bytes 只读 property 回读；
 - MEMSTAT delta/log 打点全部保留（观测点，非接口调用）；
 - 旧 MOONEP_PUSH_BLOCKS 覆盖开关移除：PR #261 后实现读 _MAX_PUSH_BLOCKS
   经 resident_blocks() 按核数自适应，开关写入手已是无效死代码（8P aivec
   271 规避由核数自适应承担）。
 
 显存统计（MEMSTAT 标签行，grep 汇总）：
-  - MoonepBuffer 构造（HCCL 子组+对称堆预留+ElasticBuffer）delta 打点，
+  - MoonepBuffer 构造（HCCL 子组+workspace 预留+URMA 建连）delta 打点，
     堆配置经只读 property 回读；
-  - DSL 三算子（plan/prefetch_weight/reduce_grad）全分配点 + 对称堆布局
-  - EB dispatch/combine 的 Python/C++ 分配点 + moe_ep 通信窗
+  - DSL 三算子（plan/prefetch_weight/reduce_grad）全分配点 + workspace 布局
   - 训练侧激活张量逐个打点 + 每步末设备占用快照
-  - 开跑前打印终态理论值（发布区/容量链/梯度/共享+激活四口径）对照
+  - 开跑前打印终态理论值（发布区/数据面行缓冲/梯度+副本区四口径）对照
 
 运行（A5_8P，qrun-next 内）：
   torchrun --nproc_per_node=<4|8> test/moonep/test_moonep_mem.py [--steps 2]
@@ -52,10 +49,10 @@
 
 import argparse
 import os
-
-import pytest
 import sys
 import time
+
+import pytest
 
 # 位置自适应：脚本形态（samples/moonep 内直跑）与测试形态（test/moonep
 # 收集）双兼容——测试形态下 samples 模块在 ../../samples/moonep
@@ -178,26 +175,30 @@ def run(args):
     epn = E // R
     W = H * Hp  # 权重行宽（展平）——三个矩阵均为 H×Hp
 
-    # moonep 子组：静态方法算堆容量（调用方建组）
-    from moonep_buffer import MoonepBuffer
+    # moonep 子组：数据面走私有 workspace，不占通信域 HCCL 外部 buffer——
+    # 注入引擎下限（2 MB，覆盖 comm 控制面/建连握手）封顶测试进程显存
+    # （组显存配置由建组方即本测试自理；不注入即用 HCCL 缺省配置）
     from torch_npu._C._distributed_c10d import ProcessGroupHCCL
 
-    moon_mb = MoonepBuffer.get_moon_ep_ccl_buffer_size(
-        S, H, Hp, K, E, R=R, slots=args.slots
-    )
     g_opts = ProcessGroupHCCL.Options()
-    g_opts.hccl_config = {"hccl_buffer_size": moon_mb}
-    moonep_group = dist.new_group(
+    g_opts.hccl_config = {"hccl_buffer_size": 2}
+    dist.new_group(
         backend="hccl",
         ranks=list(range(R)),
         use_local_synchronization=True,
         pg_options=g_opts,
     )
-    # EB 组：静态方法算通信 buffer
-    eb_mb = MoonepBuffer.get_moe_ep_ccl_buffer_size(R, S, H, E, K)
+    # EB 组：EB 数据面自建注册内存——建组建议值直取 EB 包静态方法
+    # （当前为默认值）；纯 DSL 环境降级按下限注入
+    try:
+        from cann_ops_transformer.ops import ElasticBuffer
+
+        eb_mb = ElasticBuffer.get_moe_ep_ccl_buffer_size(R, S, H, E, K)
+    except (ImportError, ModuleNotFoundError):
+        eb_mb = 2
     ep_opts = ProcessGroupHCCL.Options()
     ep_opts.hccl_config = {"hccl_buffer_size": eb_mb}
-    ep_group = dist.new_group(
+    dist.new_group(
         backend="hccl",
         ranks=list(range(R)),
         use_local_synchronization=True,
@@ -207,15 +208,15 @@ def run(args):
 
     # ---- 理论值打印（终态实现口径——实测对照的锚点；纯算术不依赖 buffer）----
     grad_elem = 2 if args.grad_dtype == "bf16" else 4
-    cap = S * K  # do_cpu_sync=True 精确分配口径（plan 均衡保证实际到达 S×K）
-    cap_tag = "S×K（do_cpu_sync 精确）"
+    cap = S * K  # 数据面行容量（plan 均衡保证分组行恰 S×K）
+    cap_tag = "S×K（plan 均衡不变量）"
     # 权重发布区（堆上 home 行 + 副本行，slots 双缓冲翻倍）
     theory_weights = args.slots * 3 * 2 * epn * W * 2
-    # dispatch/combine 容量链：recv/反向 recv/combine_in/gx_in 四条并存
-    theory_dcb = 4 * cap * H * 2
-    # 梯度（g1/g2/g3，grad_dtype 口径）+ reduce scratch
+    # 数据面行缓冲（本地桩口径：recv/反向 g_recv 两条并存）
+    theory_dcb = 2 * cap * H * 2
+    # 梯度（g1/g2/g3，grad_dtype 口径）+ reduce 副本区
     theory_grad = 3 * epn * W * grad_elem
-    theory_scratch = R * W * grad_elem
+    theory_scratch = epn * W * grad_elem
     # 激活链（y/merged）
     theory_act = (S * K) * (H + 2 * Hp) * 2
     mem_stat.log(
@@ -224,23 +225,23 @@ def run(args):
         "理论值（终态口径）",
         bytes_=theory_weights,
         note=f"权重发布区 = slots({args.slots})×3×2×epn({epn})×{W}×2B = "
-        f"{theory_weights / 2**30:.3f} GiB（home+副本行；ctx 创建实耗≈2×堆配置）",
+        f"{theory_weights / 2**30:.3f} GiB（home+副本行；实耗=构造期精算 workspace）",
     )
     mem_stat.log(
         "theory",
         "note",
         "理论值（终态口径）",
         bytes_=theory_dcb,
-        note=f"dispatch/combine 容量链 = 4×cap({cap})×{H}×2B = "
-        f"{theory_dcb / 2**30:.3f} GiB（四条并存；cap={cap_tag}）",
+        note=f"数据面行缓冲 = 2×cap({cap})×{H}×2B = "
+        f"{theory_dcb / 2**30:.3f} GiB（recv/g_recv 两条并存；cap={cap_tag}）",
     )
     mem_stat.log(
         "theory",
         "note",
         "理论值（终态口径）",
         bytes_=theory_grad + theory_scratch,
-        note=f"梯度 g1/g2/g3 = 3×epn({epn})×{W}×{grad_elem}B + scratch = "
-        f"R×{W}×{grad_elem}B = {(theory_grad + theory_scratch) / 2**30:.3f} GiB",
+        note=f"梯度 g1/g2/g3 = 3×epn({epn})×{W}×{grad_elem}B + 副本区 = "
+        f"epn×{W}×{grad_elem}B = {(theory_grad + theory_scratch) / 2**30:.3f} GiB",
     )
     mem_stat.log(
         "theory",
@@ -251,11 +252,11 @@ def run(args):
     )
 
     t0 = time.perf_counter()
-    # ---- MoonepBuffer 构造（ctx 子组 + 对称堆预留 + EB@WORLD 一体化）----
+    # ---- MoonepBuffer 构造（ctx 子组 + workspace 预留 + URMA 建连一体化）----
     # 旧 run 的手工段（heap_need 计算 → hccl_buffer_size 注入 → new_group →
-    # ctx 创建 → window_slots 定型 → EB 构造）全部内化于构造
+    # ctx 创建 → window_slots 定型）全部内化于构造
     with mem_stat.delta(
-        "train", note="MoonepBuffer 构造（HCCL 子组+对称堆预留+ElasticBuffer）"
+        "train", note="MoonepBuffer 构造（workspace 精算 + URMA 建连）"
     ):
         buf = MoonepBuffer(
             S,
@@ -263,8 +264,8 @@ def run(args):
             Hp,
             K,
             E,
-            moonep_group=moonep_group,
-            ep_group=ep_group,
+            moonep_group=dist.group.WORLD,
+            ep_group=dist.group.WORLD,
             slots=args.slots,
             grad_dtype=args.grad_dtype,
         )
@@ -273,20 +274,20 @@ def run(args):
     mem_stat.log(
         "train",
         "heap",
-        "ctx_hccl_buffer_config",
-        bytes_=buf.heap_config_mb * 1024**2,
+        "ctx_workspace_alloc",
+        bytes_=buf.heap_bytes,
         note=f"布局需求 {buf.heap_required_bytes} "
         f"({buf.heap_required_bytes / 2**30:.3f} GiB)——"
-        f"prefetch 发布区+reduce staging 的总预留",
+        f"prefetch 发布区+梯度副本区的精确预留",
     )
-    # ★ do_cpu_sync=True：EB 官方精确分配路径——dispatch 首调时 CPU 同步
-    # 获取实际到达行数后精确分配 recv（无 worst-case 预留，替代 compact 补丁）
+    # 数据面行缓冲：本地桩口径（plan 均衡不变量 S*K 行——dispatch/combine
+    # 不在本套件，行以确定性种子本地生成，形状/分组与真实产物同构）
     mem_stat.log(
         "train",
         "note",
-        "dispatch_do_cpu_sync",
-        note=f"do_cpu_sync=True 精确分配（替代 compact monkey-patch；"
-        f"worst-case 上界 = R×S×min(K,2E/R) = {R * S * min(K, 2 * E // R)} 行）",
+        "data_plane_stub",
+        note=f"本地行桩 S*K={S * K} 行/组（dispatch/combine 不在本 PR；"
+        f"显存对账口径：行缓冲 [n,H]×2 条计理论值）",
     )
     mem_stat.log(
         "train",
@@ -311,16 +312,19 @@ def run(args):
         ts = time.perf_counter()
         x, topk, scores, tpe = step_data(step)
 
-        # ---- 前向：plan → dispatch → 分组 FFN → combine ----
+        # ---- 前向：plan → 行桩注入 → 分组 FFN ----
         # plan：五件套（vtopk-only 快路径；NamedTuple 解包兼容）
         plan = buf.plan(tpe, topk)
         _dst_n, cu_seqlens, etc, _src_n, _vtopk = plan
         n = S * K  # plan 保证每 rank 恰收 S×K 行（负载均衡副本）
-        # dispatch：EB 主线（内部接线 topk_idx=vtopk.view(S,K)、num_experts=2E
-        # 虚拟专家空间、nmtr 构造期推导、权重 fp32；do_cpu_sync=True 缺省精确分配）
-        with mem_stat.delta("dispatch", note="首调含 CCL 窗注册；稳态≈recv 重分配"):
-            recv, recv_w, handle = buf.dispatch(plan, x, scores)
-        cap = recv.shape[0]  # vanilla 容量（R×nmtr×min(K,2E/R)——对照理论 S×K）
+        # 数据面行桩：recv [n,H] 按 cu 分组序确定性
+        # 生成（形状/分组与 dispatch 产物同构）；recv_w 为对应路由权重
+        # （topk 展平序——与真实 dispatch 行序一致）
+        with mem_stat.delta("data_plane", note="行桩注入（recv/recv_w 本地生成）"):
+            gen = torch.Generator().manual_seed(7000 + 53 * step + rank)
+            recv = torch.randn(n, H, generator=gen).to(torch.bfloat16).to(dev)
+            recv_w = scores.reshape(-1).to(dev)
+        cap = n  # 行容量（本地桩——恰 S*K）
 
         # 权重视图 + 参数：首步以参数张量为 real（视图按各组行宽创建并返回，
         # 参数拷入 home 行）；次步起零拷贝——参数更新直接写视图 home 行，
@@ -356,41 +360,29 @@ def run(args):
                 merged[prev:end] = m
                 y[prev:end] = situ_fwd(m, beta, lb) @ w2g.t()
             prev = end
-        # 路由加权（combine 契约是裸和——权重在 combine 前乘）
+        # 路由加权（数据面桩口径：直接对 y 加权——combine 归并不在本 PR）
         # float 中转 3-kernel 路径（bf16 直乘性能回退，实测结论）
-        weighted = (y.float() * recv_w[:n].unsqueeze(-1)).to(torch.bfloat16)
-        # combine 输入必须填满容量（尾行零填充不影响裸和）
-        combine_in = torch.zeros(cap, H, dtype=torch.bfloat16, device=dev)
-        mem_stat.log_tensor(
-            "train_act",
-            "combine_in[cap,H]",
-            combine_in,
-            note=f"cap={cap}（vanilla 容量，对照理论 S×K={n}）",
-        )
-        # 有效行填入 + 尾行零填充（裸和语义不受影响）
-        combine_in[:n] = weighted
-        with mem_stat.delta("combine", note="前向 combine"):
-            out, _ = buf.combine(combine_in, handle)  # topk_weights=None 缺省裸和
+        out = (y.float() * recv_w[:n].unsqueeze(-1)).to(torch.bfloat16)
         # 前向完成同步（计时切分点 + 确保后续读 loss 已落地）
         torch.npu.synchronize()
         tf = time.perf_counter()
-        # 大临时即刻释放（combine 已同步——combine_in/weighted 不再需要；
+        # 大临时即刻释放（out 已同步——y 后续反向还要用，保留；
         # 显存对账口径：释放后 empty_cache 归还 driver，快照更干净）
-        del weighted, combine_in
         torch.npu.empty_cache()
 
         # 简单目标：把输出拉向 0（loss 仅报告——本用例主目的是显存对账）
         loss = out.float().pow(2).sum() / (S * H)
 
-        # ---- 反向（手写链式）----
-        g_out = (2.0 * out.float() / (S * H)).to(torch.bfloat16)
-        # combine 反向 = dispatch 复用 plan（不传权重——梯度无需再乘路由分）
-        with mem_stat.delta("dispatch_bwd", note="反向 dispatch"):
-            g_recv_h, _g_w, _handle_b = buf.dispatch(plan, g_out, topk_weights=None)
+        # ---- 反向（手写链式；数据面桩——g_recv 不由 g_out 派生）----
+        # 数据面行桩（反向）：g_recv [n,H] 确定性生成
+        # （形状/分组与前向 recv 同构）
+        with mem_stat.delta("data_plane_bwd", note="反向行桩注入（g_recv 本地生成）"):
+            gen_b = torch.Generator().manual_seed(8000 + 53 * step + rank)
+            g_recv_h = torch.randn(n, H, generator=gen_b).to(torch.bfloat16).to(dev)
         # dL/dy = dL/dy_out × w_k（前向加权的链式法则——乘前向的 recv_w）
         # float 中转保精度（bf16 广播乘法实测更慢）
         g_y = (g_recv_h[:n].float() * recv_w[:n].unsqueeze(-1)).to(torch.bfloat16)
-        # g_recv_h（cap×H 大头）加权完毕即释放——后续 FFN 反向腾空间
+        # g_recv_h（n×H 大头）加权完毕即释放——后续 FFN 反向腾空间
         del g_recv_h
         # y 用完即释
         del y
@@ -525,13 +517,10 @@ def run(args):
                 flush=True,
             )
             del ref_home
-        # dispatch 反向 = combine（K 份梯度裸和回 token 序）
-        # combine 输入填满容量（与 forward 同款零填充）
-        gx_in = torch.zeros(cap, H, dtype=torch.bfloat16, device=dev)
-        mem_stat.log_tensor("train_act", "gx_in[cap,H]", gx_in)
-        gx_in[:n] = g_h
-        with mem_stat.delta("combine_bwd", note="反向 combine"):
-            g_x, _ = buf.combine(gx_in, handle)
+        # （dispatch 反向/combine 均不在本 PR——g_h 的 token 序回收由数据面
+        #  承接，本用例显存对账不消费该输出）
+        del g_h
+        torch.npu.empty_cache()
 
         # ---- SGD（手写——无 optimizer 状态）----
         with torch.no_grad():

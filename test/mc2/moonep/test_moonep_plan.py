@@ -8,14 +8,11 @@
 
 """moonep_plan 前向 E2E 与约束测试。
 
-链路：DSL moonep_plan → ElasticBuffer dispatch/epilogue（topk_idx=vtopk，
-num_experts=2E 扩展虚拟空间）→ identity 专家 + GMM 侧加权 → 纯 sum combine ≈ golden。
-原生 MoonEP 的 NvS 布局 = 按 2epn 虚拟专家分组 + cu_seqlens，与 moe_ep 的
-expert-order + num_recv_tokens_per_expert 天然对应，无需任何装配层。
+（本文件覆盖 plan 计数审计与约束：counts
+逐 chunk 对拍 + host 侧约束用例。）
 
 依赖：
 - 本仓 samples/mc2/moonep（moonep_plan）
-- 已安装 cann_ops_transformer（ElasticBuffer/EPHandle 与 ep 算子）
 
 运行（8 卡为验收标准形态，任意 >=2 卡可跑）：
     python -m torch.distributed.run --nproc_per_node=8 -m pytest \
@@ -55,10 +52,6 @@ try:
 except ImportError:
     _HAS_DSL_IMPL = False
 
-_requires_dsl = pytest.mark.skipif(
-    not _HAS_DSL_IMPL, reason="samples/mc2/moonep/moonep_plan 不可用"
-)
-
 try:
     from cann_ops_transformer.ops import ElasticBuffer  # noqa: E402,F401
 
@@ -70,7 +63,21 @@ _requires_ep = pytest.mark.skipif(
     not _HAS_EP, reason="需已安装 cann_ops_transformer（ElasticBuffer 与 ep 算子）"
 )
 
+_requires_dsl = pytest.mark.skipif(
+    not _HAS_DSL_IMPL, reason="samples/mc2/moonep/moonep_plan 不可用"
+)
+
 from prefetch_utils import _H, _init_ep_group  # noqa: E402
+
+_CTX = {}
+
+
+def _shared_ctx():
+    """进程级共享裸 ctx（workspace+连接为重资源——池化防用例间累积）。"""
+    if "ctx" not in _CTX:
+        _CTX["ctx"] = create_moonep_context()
+    return _CTX["ctx"]
+
 
 _EPN = 32  # ElasticBuffer sizing 的 epn 上界（上游 #306 漏定义；test_e2e 同款常量）
 
@@ -130,8 +137,7 @@ def _ep_nmtr(num_tokens, top_k):
     EB 窗口 per-peer 槽位承载 token 行而非 (token,expert) 扩展对，per-peer
     到达 ≤ S 恒成立；plan 均衡不变量（每 rank 扩展行恰 S*K）由接收侧 recv
     分配承载。历史公式 max(S, S*K/R*1.25+64) 非第一性推导（发送侧约束
-    的推导有缺陷），废弃（详见
-    test_moonep_ep._ep_nmtr 同款注释）。
+    的推导有缺陷），废弃。
     """
     return num_tokens
 
@@ -284,7 +290,7 @@ def test_moonep_count_audit(num_tokens, top_k, epn, seed):
         .to(torch.int32)
         .npu()
     )
-    ctx = create_moonep_context()
+    ctx = _shared_ctx()
     moonep_plan.moonep_plan(ctx, tpe_my, topk_my)
     check_pending_overflow(ctx)
 
@@ -309,3 +315,54 @@ def test_moonep_count_audit(num_tokens, top_k, epn, seed):
         f"counts 与 CPU 期望不符：{int(diff.sum())} 个 bin 错，"
         f"首个错位 {[tuple(x) for x in torch.nonzero(diff)[:5].tolist()]}"
     )
+
+
+# ---------------------------------------------------------------------------
+# 单源清单自洽回归：per-rank token 数不等（N % R != 0）的越界占位输入
+# 下，零搬移轮（min_load == cap）不得改写 rhome——否则 etc 行会漏掉该
+# rank 实际服务到的副本专家（prefetch 漏拉权重、GMM 读到 -1 槽）。
+# 说明：不等 N 不满足均衡服务契约（cu 尾值 == 本地 N），本用例只校验
+# etc/vtopk 投影自洽，不调用 check_pending_overflow。
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.npu
+@_requires_dsl
+def test_moonep_plan_single_source_nondivisible():
+    rank, world_size = _init_ep_group()
+    if world_size == 4:
+        per_rank = [[0], [0], [2, 2], [2, 2]]
+    elif world_size == 8:
+        per_rank = [[0], [0], [2, 2], [2, 2], [2], [2], [2], [2]]
+    else:
+        pytest.skip("仅 4/8 卡构造触发形态")
+    epn = 2
+    num_experts = epn * world_size
+    mine = per_rank[rank]
+    topk = torch.tensor(mine, dtype=torch.int32, device="npu").view(-1, 1)
+    tpe = (
+        torch.bincount(torch.tensor(mine), minlength=num_experts).to(torch.int32).npu()
+    )
+    ctx = create_moonep_context()
+    _, cu, etc, _, vtopk = moonep_plan(ctx, tpe, topk)
+
+    slots = 2 * epn
+    etc_rows = etc.cpu().tolist()
+    vid = vtopk.cpu().tolist()
+    for e, v in zip(mine, vid):
+        r, s = v // slots, v % slots
+        if s < epn:
+            assert e == r * epn + s, f"home 槽错位：e={e} (r{r},s{s})"
+        else:
+            assert etc_rows[r][s - epn] == e, (
+                f"副本槽专家与清单不符：slot={s - epn} e={e} etc[{r}]={etc_rows[r]}"
+            )
+    mat = torch.zeros(world_size, slots, dtype=torch.long, device="npu")
+    for v in vid:
+        mat[v // slots, v % slots] += 1
+    dist.all_reduce(mat)
+    row = mat[rank].cpu().tolist()
+    cu_l = cu.cpu().tolist()
+    for s in range(slots):
+        prev = 0 if s == 0 else cu_l[s - 1]
+        assert cu_l[s] - prev == row[s], f"cu[{s}] 段长与全局投影不符"

@@ -6,34 +6,22 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 
-"""moonep_plan：MoonEP 规划算子。
+"""moonep_plan：MoonEP 均衡规划算子。
 
-输入路由计数与 topk，输出 PlanResult（五件套，NamedTuple，可按 5-tuple 解包）：
+输入本 rank 的 tokens_per_expert[E] 与 topk[S,K]，输出 MoonepPlan 五件套：
 
-    dst_n[N]                零占位；vtopk-only 快路径下不计算
-    cu_seqlens[2*epn]       本 rank 接收区各视图行累计结束偏移
-                            （本地专家升序 + 预取槽，空行重复前值）
-    experts_to_copy[R,epn]  各 rank 承载的远程专家副本清单（-1 填充）
-    src_n[N]                零占位；vtopk-only 快路径下不计算
-    vtopk[N]                每个 (s,k) 的虚拟专家 id（扩展空间 2E）
+    dst_n[N] / src_n[N]         零占位（vtopk-only 快路径不计算）
+    cu_seqlens[2*epn]           本 rank 接收区各槽位累计行数
+    experts_to_copy[R, epn]     各 rank 的副本清单（-1 填充，单源）
+    vtopk[N]                    虚拟专家 id（扩展空间 2E）
 
-形状约束：E <= 1024、R <= 64、E % R == 0；S*K 不限（仅受显存与时间约束），
-且任意 N 原生整除（topk 直接用调用方 [S,K] 扁平视图；分块粒度降档到 N 的
-因子，无尾补机制）。
+约束：E <= 1024、R <= MAX_R（128）、E % R == 0；N = S*K 任意规模。
 
-算法（与 test/mc2/moonep/moonep_golden.py 同语义；一次 launch、两次
-global_sync_all）：
+实现为单 kernel 三阶段，阶段间 global_sync_all 栅栏，块角色由 block_idx 决定：
 
-    阶段 0  Exchange（block 0）：跨卡交换 tokens_per_expert（put + flag + 轮询）
-            Count（token_blocks 并行，每 block 串多个 chunk）：per-expert 计数
-            GreedyAll（block 0）：demand 矩阵上做 cap 均衡贪心（warp 归约
-            argmax/argmin，一卡一源修正），同时生成冷专家 vid 表
-    阶段 1  Tables（block 内轮询 R 行）：按唯一远程 home 生成压缩 jrep 与
-            experts_to_copy
-            Pfx（按专家切）：热专家的 chunk 前缀表与段查找表
-    阶段 2  Assign（token_blocks 并行，每 block 串多个 chunk）：冷专家路径 vgather
-            查 vid；热专家路径下标压缩后按原顺序处理，段查找二分 O(log R)，
-            只在段边界重定位，与逐 token 串行扫描逐位等价
+    阶段 0  交换计数 → 计数 → cap 均衡贪心 + 冷/热专家 vid
+    阶段 1  副本清单（Tables）与段查找表（Pfx）
+    阶段 2  token 落位（冷专家 vgather；热专家按段二分定位）
 """
 
 import threading
@@ -51,12 +39,6 @@ from cannbotdsl.lang.kernel import kernel
 from cannbotdsl.lang.vf import vf
 from cannbotdsl.ops import simt
 from cannbotdsl.ops.arch import get_block_idx, get_block_num
-from cannbotdsl.ops.distributed import (
-    CommContext,
-    SymBuffer,
-    TransferRole,
-    create_transfer_context,
-)
 from cannbotdsl.ops.memcpy import mem_copy
 from cannbotdsl.ops.reg import (
     full_mask,
@@ -80,20 +62,29 @@ from cannbotdsl.ops.reg import (
     vstorealign_squeeze_status,
 )
 from cannbotdsl.ops.sync import global_sync_all, vec_sync_all
-from cannbotdsl.tensor import MemLoc, make_layout, tile_slice
+from cannbotdsl.tensor import MemLoc, make_layout, make_pointer, make_tensor, tile_slice
 from cannbotdsl.types.datastruct import StructRef
 
 from moonep_context import (
     DEM_ALL_OFF,
+    HEAP_BASE,
     MAX_E,
     MAX_R,
-    READY_OFF,
-    busy_wait_flag,
-    check_no_shared_elastic_buffer,
+    next_barrier_epoch,
     check_pending_overflow,
     record_transport_event,
     resident_blocks,
     sync_transport_stream,
+)
+from moonep_urma import (
+    NOTIFY_STRIDE,
+    MoonepUrmaCtx,
+    make_xfer_rb,
+    spin_u32_ge,
+    tensor_address,
+    ub_flag_write,
+    ub_write,
+    xfer_open,
 )
 
 # ---------------------------------------------------------------------------
@@ -101,6 +92,7 @@ from moonep_context import (
 # ---------------------------------------------------------------------------
 _MAX_PLAN_BLOCKS = 64  # 单次启动 block 上限，实际取 min(AIV 核数, cap)
 _CHUNK_MIN = 128  # chunk 下限（token/块），再小则每块 O(E) 重建占比过高
+_VF_SAFE_CHUNK = 1024  # chunk 上限（vf 栈安全——见 _plan_chunking docstring）
 
 # 向量粒度（2048-bit 向量）
 _I32_LANES = 64  # int32 lanes（Assign 冷专家路径步长）
@@ -110,7 +102,6 @@ _HISTOGRAM_MAX_CHUNK = 1 << 16
 _HISTOGRAM_SENTINEL = -(1 << 24)  # b3=0xFF 的 int32 表示
 _WARP_SIZE = 32
 _PLAN_INIT_THREADS = _WARP_SIZE
-_XFER_UB_BYTES = 512
 
 # 贪心的极值哨兵
 _GREEDY_NEG_INF = -(1 << 30)
@@ -148,9 +139,7 @@ def ceil_pow2(x):
 # ---------------------------------------------------------------------------
 # 运行期状态
 # ---------------------------------------------------------------------------
-_EVENT_ID = 7
-_EPOCH = 0  # 进程内单调调用序号（epoch flag）
-_R = 1  # 组内 rank_size（编译锁内写入，参与编译缓存键）
+_RANK_SIZE = 1  # 组内 rank_size（编译锁内写入，参与编译缓存键）
 
 
 # ---------------------------------------------------------------------------
@@ -174,9 +163,9 @@ class _PlanKernel:
         pfx_blocks,
     ):
         """绑定编译期形状参数。"""
-        self._r = int(rank_size)
-        self._e = int(num_experts)
-        self._epn = self._e // self._r
+        self._rank_size = int(rank_size)
+        self._num_experts = int(num_experts)
+        self._epn = self._num_experts // self._rank_size
         self._chunk = int(num_rows) // int(num_chunks)
         self._num_chunks = int(num_chunks)
         self._token_blocks = int(token_blocks)
@@ -189,22 +178,25 @@ class _PlanKernel:
         gm_ws,
         gm_topk,
         gm_io,
-        ctx: StructRef[CommContext],
+        ctx: StructRef[MoonepUrmaCtx],
     ):
         """按 block 角色分派三个阶段。"""
-        r, e = self._r, self._e
+        rank_size, num_experts = self._rank_size, self._num_experts
         epn = self._epn
-        views = _bind_plan_views(gm_ws, r, e, self._num_chunks)
-        # 输出三件套共享一个 io 张量：cu [2epn] | etc [R,epn] | vtopk [N]
+        views = _bind_plan_views(gm_ws, rank_size, num_experts, self._num_chunks)
+        # 三份输出共用一块 io：cu [2epn] | copy_list [R,epn] | vtopk [N]
         cu_elems = _SLOTS_PER_RANK * epn
-        io_base = cu_elems + r * epn
+        etc_end = cu_elems + rank_size * epn
         gm_cu = gm_io[0:cu_elems,]
-        gm_etc = gm_io[cu_elems:io_base,].view(r, epn)
-        gm_vtopk = gm_io[io_base : io_base + self._chunk * self._num_chunks,]
+        gm_copy_list = gm_io[cu_elems:etc_end,].view(rank_size, epn)
+        vtopk_end = etc_end + self._chunk * self._num_chunks
+        gm_vtopk = gm_io[etc_end:vtopk_end,]
         block_id = get_block_idx()
-        ub_demand = Buffer(MemLoc.UB, dtypes.int32, make_layout((r, e)))
+        ub_demand = Buffer(
+            MemLoc.UB, dtypes.int32, make_layout((rank_size, num_experts))
+        )
 
-        if block_id < dtypes.int64(r):
+        if block_id < dtypes.int64(rank_size):
             self._exchange_put_peer(ctx, gm_tpe, gm_flag, block_id)
         if block_id == dtypes.int64(0):
             self._exchange(ctx, gm_tpe, gm_flag, views.dem, ub_demand)
@@ -215,102 +207,93 @@ class _PlanKernel:
 
         global_sync_all()
 
-        # ---- 阶段 1：Tables / Pfx（仅依赖阶段 0 的 order/counts，可并行） ----
+        # ---- 阶段 1：Tables / Pfx（只依赖阶段 0 的 order/counts） ----
         num_blocks = get_block_num()
-        self._tables_loop(block_id, num_blocks, views, gm_etc)
+        self._tables_loop(block_id, num_blocks, views, gm_copy_list)
         if block_id < dtypes.int64(self._pfx_blocks):
             self._pfx(ctx, block_id, views)
 
         global_sync_all()
 
-        # ---- 阶段 2：token 落位（按 chunk） ----
+        # ---- 阶段 2：token 落位 ----
         if block_id < dtypes.int64(self._token_blocks):
             self._assign(block_id, gm_topk, gm_vtopk, views)
 
     # ---- 阶段 0：Exchange（单 block 通信） ----
     @jit
-    def _exchange(self, ctx, gm_tpe, gm_flag, gm_dem_by_rank, ub_demand):
-        """单 block 跨卡交换 tokens_per_expert，落到 dem 矩阵。"""
-        world_size, num_experts = self._r, self._e
-        my_rank = dtypes.int32(ctx.rankId)  # 运行时从 CommContext 取（rank 不进编译键）
-        dem_all = SymBuffer(
-            ctx,
-            shape=(MAX_R, MAX_E),
-            dtype=dtypes.int32,
-            rank_size=world_size,
-            base_offset=DEM_ALL_OFF,
+    def _exchange(self, ctx, gm_tpe, gm_flag, gm_dem, ub_demand):
+        """块 0：本地 tpe 行落位 + 自旋收齐全部 peer，汇总为 dem 矩阵。"""
+        world_size, num_experts = self._rank_size, self._num_experts
+        my_rank_u64 = dtypes.uint64(ctx.rankId)  # 运行时取，rank 不进编译键
+        my_rank = dtypes.int32(ctx.rankId)
+        epoch = dtypes.uint32(gm_flag[dtypes.int64(0)])
+
+        ws_base = dtypes.uint64(ctx.localWsAddr)
+        # 本端 dem_all 视图（[MAX_R, MAX_E] int32，本地读路径）
+        dem_all = make_tensor(
+            make_pointer(
+                dtypes.int32,
+                dtypes.int64(ws_base + dtypes.uint64(HEAP_BASE + DEM_ALL_OFF)),
+                MemLoc.GM,
+            ),
+            make_layout((MAX_R, MAX_E)),
         )
-        ready = SymBuffer(
-            ctx,
-            shape=(MAX_R,),
-            dtype=dtypes.int32,
-            rank_size=world_size,
-            base_offset=READY_OFF,
-        )
+
         ub_tpe = Buffer(MemLoc.UB, dtypes.int32, make_layout((1, num_experts)))
         mem_copy(ub_tpe, gm_tpe.view(1, num_experts))
         mem_copy(tile_slice(dem_all, (1, num_experts), (my_rank, 0)), ub_tpe)
-        for r in cannbotdsl.range(world_size):
-            if r != my_rank:
-                busy_wait_flag(tile_slice(ready, (1,), (r,)), gm_flag, _EVENT_ID)
+        # 收齐：全部对端到达槽 ≥ epoch（tpe 行落地证明）
+        for p in range_constexpr(world_size):
+            if dtypes.uint64(p) != my_rank_u64:
+                spin_u32_ge(
+                    ctx,
+                    dtypes.uint64(p) * dtypes.uint64(NOTIFY_STRIDE),
+                    epoch,
+                )
         mem_copy(ub_demand, tile_slice(dem_all, (world_size, num_experts), (0, 0)))
-        mem_copy(gm_dem_by_rank, ub_demand)
+        mem_copy(gm_dem, ub_demand)
 
     @jit
     def _exchange_put_peer(self, ctx, gm_tpe, gm_flag, block_id):
-        """helper block：按**实际启动块数**跨步，向本 block 负责的每个 peer
-        发射 dem 行 + ready flag。
-
-        原 block 0 串行 (R-1)×(put+put+flush) 是 Exchange 主要耗时；改
-        block-per-peer 并行发射（各 block 独立 transfer context，同 issue #77
-        规避纪律），block 0 只留本地行/轮询/收集。
-
-        注意：实际启动块数 B 可能小于 R（R=64、可常驻核 56 时 B<=56），
-        故必须按 B 跨步遍历 peer（peer = block_id, block_id+B, ...），保证
-        每个远程 peer 恰有一个发送者；只发 peer 0..B-1 会让其余 peer 等不到
-        ready flag 而挂死。"""
-        my_rank = dtypes.int32(ctx.rankId)
-        num_experts = self._e
+        """块并行发射 tpe 行 + 哨兵：按实际块数跨步覆盖全部 peer（B<R 安全）。"""
+        world_size, num_experts = self._rank_size, self._num_experts
+        my_rank_u64 = dtypes.uint64(ctx.rankId)
+        epoch = dtypes.uint32(gm_flag[dtypes.int64(0)])
+        xfer_rb = make_xfer_rb()
+        tpe_addr = tensor_address(gm_tpe)
         num_blocks = get_block_num()
-        if block_id < dtypes.int64(self._r):
-            dem_all = SymBuffer(
-                ctx,
-                shape=(MAX_R, MAX_E),
-                dtype=dtypes.int32,
-                rank_size=self._r,
-                base_offset=DEM_ALL_OFF,
-            )
-            ready = SymBuffer(
-                ctx,
-                shape=(MAX_R,),
-                dtype=dtypes.int32,
-                rank_size=self._r,
-                base_offset=READY_OFF,
-            )
-            ub_xfer = Buffer(MemLoc.UB, dtypes.uint8, make_layout((_XFER_UB_BYTES,)))
-            xfer = create_transfer_context(ctx, ub_xfer, role=TransferRole.VEC)
-            for peer in cannbotdsl.range(block_id, self._r, num_blocks):
-                if peer != my_rank:
-                    xfer.put(
-                        peer,
-                        tile_slice(dem_all, (1, num_experts), (my_rank, 0))
-                        .peer(peer)
-                        .view((1, num_experts)),
-                        gm_tpe,
-                    )
-                    xfer.put(
-                        peer,
-                        tile_slice(ready, (1,), (my_rank,)).peer(peer).view((1,)),
-                        gm_flag,
-                    )
-                    xfer.flush(peer)
+        for peer in cannbotdsl.range(
+            dtypes.int64(block_id), dtypes.int64(world_size), num_blocks
+        ):
+            if dtypes.uint64(peer) != my_rank_u64:
+                peer_idx = dtypes.uint32(dtypes.uint64(peer))
+                if dtypes.uint64(peer) > my_rank_u64:
+                    peer_idx = peer_idx - dtypes.uint32(1)
+                peerh = xfer_open(ctx, peer_idx)
+                # ① tpe 行 → 对端 dem_all[me]
+                ub_write(
+                    peerh,
+                    dtypes.uint64(HEAP_BASE + DEM_ALL_OFF)
+                    + my_rank_u64 * dtypes.uint64(MAX_E * 4),
+                    tpe_addr,
+                    num_experts * 4,
+                    xfer_rb,
+                )
+                # ② epoch 哨兵 → 对端到达槽[me]（ub_flag_write 首尾 fence
+                #    ——MTE3 同通道保序：哨兵到达即此前数据全部落地）
+                ub_flag_write(
+                    peerh,
+                    my_rank_u64 * dtypes.uint64(NOTIFY_STRIDE),
+                    epoch,
+                    tensor_address(gm_flag),
+                )
 
     # ---- 阶段 0：Count ----
     @jit
     def _count(self, block_id, gm_topk, gm_counts):
         """按 chunk 并行统计 per-expert token 数。"""
         num_experts, chunk, num_chunks, token_blocks = (
-            self._e,
+            self._num_experts,
             self._chunk,
             self._num_chunks,
             self._token_blocks,
@@ -328,7 +311,7 @@ class _PlanKernel:
     @jit
     def _count_vec(self, chunk_id, num_hist_groups, gm_topk, gm_counts):
         """向量直方图路径（uint8 打包 + 双 bin）。"""
-        num_experts, chunk = self._e, self._chunk
+        num_experts, chunk = self._num_experts, self._chunk
         ub_topk = Buffer(MemLoc.UB, dtypes.int32, make_layout((chunk,)))
         ub_hist = Buffer(
             MemLoc.UB,
@@ -414,7 +397,7 @@ class _PlanKernel:
     @jit
     def _count_scalar(self, chunk_id, gm_topk, gm_counts):
         """标量回退路径（chunk 非 256 倍数或过大时）。"""
-        num_experts, chunk = self._e, self._chunk
+        num_experts, chunk = self._num_experts, self._chunk
         ub_topk = Buffer(MemLoc.UB, dtypes.int32, make_layout((chunk,)))
         ub_cnt = Buffer(MemLoc.UB, dtypes.int32, make_layout((num_experts,)))
         with vf(mode="simt", thread=1):
@@ -433,8 +416,9 @@ class _PlanKernel:
     @jit
     def _greedy_all(self, ctx, ub_demand, views, gm_cu):
         """demand 矩阵 → rem/order 分配 + cu + 冷专家 vid。"""
-        world_size, num_experts = self._r, self._e
+        world_size, num_experts = self._rank_size, self._num_experts
         epn = self._epn
+        # ub_demand 读出后复用为 rem（控制 UB 峰值）
         ub_rem = ub_demand.view(num_experts, world_size)
         ub_order = Buffer(
             MemLoc.UB, dtypes.int32, make_layout((num_experts, world_size))
@@ -442,36 +426,37 @@ class _PlanKernel:
         ub_served = Buffer(MemLoc.UB, dtypes.int32, make_layout((num_experts,)))
         ub_loads = Buffer(MemLoc.UB, dtypes.int32, make_layout((world_size,)))
         ub_rhome = Buffer(MemLoc.UB, dtypes.int32, make_layout((world_size,)))
-        ub_expert_total = Buffer(MemLoc.UB, dtypes.int32, make_layout((num_experts,)))
+        ub_aux = Buffer(MemLoc.UB, dtypes.int32, make_layout((num_experts,)))
         # cu 与 vid 生命周期重叠，不能别名复用（否则 vid 写进 cu）
         ub_cu = Buffer(MemLoc.UB, dtypes.int32, make_layout((_SLOTS_PER_RANK * epn,)))
-        # ctx.rankId 须在 vf scope 外读取（datastruct_ref_load 不允许在 vf 内）
+        # ctx.rankId 须在 vf scope 外读取（datastruct_ref_load 不支持 vf 内）
         my_rank = dtypes.int32(ctx.rankId)
 
         with vf(mode="simt", thread=_PLAN_INIT_THREADS):
             thread_id = simt.thread_idx()[0]
             num_threads = simt.thread_dim()[0]
             for e in cannbotdsl.range(thread_id, num_experts, num_threads):
-                total = dtypes.int32(0)
+                expert_total = dtypes.int32(0)
                 for r in cannbotdsl.range(world_size):
-                    total = total + ub_demand[dtypes.int64(r), dtypes.int64(e)]
-                ub_expert_total[dtypes.int64(e)] = total
+                    expert_total = (
+                        expert_total + ub_demand[dtypes.int64(r), dtypes.int64(e)]
+                    )
+                ub_aux[dtypes.int64(e)] = expert_total
             simt.syncthreads()
-            # demand 已全部读出，ub_demand 转置复用为 rem，控制 UB 峰值
             for e in cannbotdsl.range(thread_id, num_experts, num_threads):
                 home_rank = e // epn
                 for r in cannbotdsl.range(world_size):
                     ub_rem[dtypes.int64(e), dtypes.int64(r)] = dtypes.int32(0)
                     ub_order[dtypes.int64(e), dtypes.int64(r)] = _ORDER_UNSERVED
-                ub_rem[dtypes.int64(e), home_rank] = ub_expert_total[dtypes.int64(e)]
+                ub_rem[dtypes.int64(e), home_rank] = ub_aux[dtypes.int64(e)]
                 ub_order[dtypes.int64(e), home_rank] = _ORDER_HOME
                 ub_served[dtypes.int64(e)] = dtypes.int32(1)
             simt.syncthreads()
             for r in cannbotdsl.range(thread_id, world_size, num_threads):
-                acc = dtypes.int32(0)
+                load = dtypes.int32(0)
                 for e in cannbotdsl.range(r * epn, (r + 1) * epn):
-                    acc = acc + ub_expert_total[dtypes.int64(e)]
-                ub_loads[dtypes.int64(r)] = acc
+                    load = load + ub_aux[dtypes.int64(e)]
+                ub_loads[dtypes.int64(r)] = load
                 ub_rhome[dtypes.int64(r)] = dtypes.int32(-1)
             simt.syncthreads()
             if thread_id < _WARP_SIZE:
@@ -512,30 +497,31 @@ class _PlanKernel:
                 if lane == 0:
                     self._fill_cu_seqlens(my_rank, ub_rem, ub_order, ub_rhome, ub_cu)
             simt.syncthreads()
+            # ub_aux 复用为 vid 表：热专家 -1，冷专家直接给出虚拟 id
             for e in cannbotdsl.range(thread_id, num_experts, num_threads):
                 home_rank = e // epn
                 if ub_served[dtypes.int64(e)] > dtypes.int32(1):
-                    ub_expert_total[dtypes.int64(e)] = _VID_HOT
+                    ub_aux[dtypes.int64(e)] = _VID_HOT
                 else:
-                    ub_expert_total[dtypes.int64(e)] = dtypes.int32(
+                    ub_aux[dtypes.int64(e)] = dtypes.int32(
                         home_rank * (_SLOTS_PER_RANK * epn) + (e % epn)
                     )
             simt.syncthreads()
         mem_copy(views.rem, ub_rem)
         mem_copy(views.order, ub_order)
         mem_copy(views.rhome, ub_rhome)
-        mem_copy(views.vid, ub_expert_total)
+        mem_copy(views.vid, ub_aux)
         mem_copy(gm_cu, tile_slice(ub_cu, (_SLOTS_PER_RANK * epn,), (0,)))
 
     @jit
     def _warp_extreme_idx(self, ub_values, num_values, lane, maximize):
-        """warp 归约极值，并列取最小下标（maximize=True/False 对应 max/min）。"""
+        """warp 归约极值，并列取最小下标（maximize 选 True/False 对应 max/min）。"""
         best = dtypes.int32(_GREEDY_NEG_INF if maximize else _GREEDY_POS_INF)
         idx = dtypes.int32(0)
-        invalid = dtypes.int32(_GREEDY_NEG_INF if maximize else _GREEDY_POS_INF)
+        pad = dtypes.int32(_GREEDY_NEG_INF if maximize else _GREEDY_POS_INF)
         for j in range_constexpr((num_values + _WARP_SIZE - 1) // _WARP_SIZE):
             k = lane + j * _WARP_SIZE
-            v = invalid
+            v = pad
             if k < num_values:
                 v = ub_values[dtypes.int64(k)]
             if const_expr(maximize):
@@ -559,17 +545,11 @@ class _PlanKernel:
     def _greedy_round_warp(
         self, ub_rem, ub_order, ub_served, ub_rhome, src_r, dst_r, min_load, cap, lane
     ):
-        """一轮组间搬移：warp 扫描 + 属主 lane 写回。
-
-        属主纪律：专家 e 的 rem/order/served 固定由 e%32 号 lane 读写；
-        扫描只读本 lane 属主的槽位，跨 lane 数据只经 shuffle 归约——
-        内层迭代不再需要 syncthreads（原版每次搬移一次栅栏 + lane0
-        串行 order 计数，倾斜路由下是贪心段的主要耗时）。"""
+        """一轮 src→dst 搬移；专家 e 的 rem/order/served 由 e%32 号 lane 独占，
+        跨 lane 只经 warp 归约，内层无需栅栏。"""
         epn = self._epn
         move = cap - min_load
         moved = dtypes.int32(0)
-        if lane == dtypes.int32(0):
-            ub_rhome[dtypes.int64(dst_r)] = src_r
         # 属主对齐起点：本 lane 持有的本地专家 i 满足 i ≡ lane - src*epn (mod 32)
         i0 = (lane + dtypes.int32(32) - (src_r * epn) % dtypes.int32(32)) % (
             dtypes.int32(32)
@@ -611,31 +591,34 @@ class _PlanKernel:
                         )
                     move = move - take
                     moved = moved + take
+        # 仅在确有搬移时登记源 rank：零搬移轮写 rhome 会让清单漏掉实际副本。
+        if lane == dtypes.int32(0) and moved > dtypes.int32(0):
+            ub_rhome[dtypes.int64(dst_r)] = src_r
         return moved
 
     @jit
     def _fill_cu_seqlens(self, my_rank, ub_rem, ub_order, ub_rhome, ub_cu):
-        """[2*epn] 槽位行数前缀和 → cu_seqlens。副本槽按源 rank 专家升序压缩填充。"""
+        """[2*epn] 槽位行数前缀和 → cu_seqlens；副本槽按源专家升序压缩。"""
         epn = self._epn
-        home = ub_rhome[dtypes.int64(my_rank)]
+        src_rank = ub_rhome[dtypes.int64(my_rank)]
         for i in range_constexpr(epn):
             ub_cu[dtypes.int64(i)] = ub_rem[
                 dtypes.int64(my_rank * epn + i), dtypes.int64(my_rank)
             ]
         for i in range_constexpr(epn):
             ub_cu[dtypes.int64(epn + i)] = dtypes.int32(0)
-        if home >= dtypes.int32(0):
-            rep_cnt = dtypes.int32(0)
+        if src_rank >= dtypes.int32(0):
+            copy_cnt = dtypes.int32(0)
             for i in cannbotdsl.range(epn):
-                e = home * epn + i
+                e = src_rank * epn + i
                 if (
                     ub_order[dtypes.int64(e), dtypes.int64(my_rank)]
                     >= _ORDER_FIRST_REPLICA
                 ):
-                    ub_cu[dtypes.int64(epn) + rep_cnt] = ub_rem[
+                    ub_cu[dtypes.int64(epn) + copy_cnt] = ub_rem[
                         dtypes.int64(e), dtypes.int64(my_rank)
                     ]
-                    rep_cnt = rep_cnt + dtypes.int32(1)
+                    copy_cnt = copy_cnt + dtypes.int32(1)
         acc = dtypes.int32(0)
         for i in range_constexpr(_SLOTS_PER_RANK * epn):
             acc = acc + ub_cu[dtypes.int64(i)]
@@ -643,48 +626,48 @@ class _PlanKernel:
 
     # ---- 阶段 1：Tables ----
     @jit
-    def _tables_loop(self, block_id, num_blocks, views, gm_etc):
-        """当前 block 轮询处理 rank block_id, block_id+num_blocks, ...；R 可大于 block 数。"""
-        for r in cannbotdsl.range(block_id, self._r, num_blocks):
-            self._tables(r, views, gm_etc)
+    def _tables_loop(self, block_id, num_blocks, views, gm_copy_list):
+        """按块步进轮询处理 rank 行（R 可大于块数）。"""
+        for r in cannbotdsl.range(block_id, self._rank_size, num_blocks):
+            self._tables(r, views, gm_copy_list)
 
-    def _tables(self, r, views, gm_etc):
-        """生成 rank r 的 jrep 与 experts_to_copy 行。"""
+    def _tables(self, r, views, gm_copy_list):
+        """生成 rank r 的副本槽映射与副本清单行。"""
         epn = self._epn
-        ub_jrep_row = Buffer(MemLoc.UB, dtypes.int32, make_layout((1, epn)))
-        ub_etc_row = Buffer(MemLoc.UB, dtypes.int32, make_layout((1, epn)))
+        ub_rep_row = Buffer(MemLoc.UB, dtypes.int32, make_layout((1, epn)))
+        ub_copy_row = Buffer(MemLoc.UB, dtypes.int32, make_layout((1, epn)))
 
         with vf(mode="simt", thread=1):
-            self._fill_jrep_etc(
-                views.order, views.rhome, ub_jrep_row, ub_etc_row, r, epn
+            self._fill_rep_copy(
+                views.order, views.rhome, ub_rep_row, ub_copy_row, r, epn
             )
-        mem_copy(tile_slice(views.jrep, (1, epn), (r, 0)), ub_jrep_row)
-        mem_copy(tile_slice(gm_etc, (1, epn), (r, 0)), ub_etc_row)
+        mem_copy(tile_slice(views.rep_slot, (1, epn), (r, 0)), ub_rep_row)
+        mem_copy(tile_slice(gm_copy_list, (1, epn), (r, 0)), ub_copy_row)
 
     @jit
-    def _fill_jrep_etc(self, gm_order, gm_rhome, ub_jrep_row, ub_etc_row, r, epn):
-        """压缩副本映射：jrep 行与 etc 行。"""
+    def _fill_rep_copy(self, gm_order, gm_rhome, ub_rep_row, ub_copy_row, r, epn):
+        """压缩副本映射：rep_slot 行与 copy_list 行。"""
         for j in range_constexpr(epn):
-            ub_jrep_row[dtypes.int64(0), dtypes.int64(j)] = dtypes.int32(0)
-            ub_etc_row[dtypes.int64(0), dtypes.int64(j)] = dtypes.int32(-1)
+            ub_rep_row[dtypes.int64(0), dtypes.int64(j)] = dtypes.int32(0)
+            ub_copy_row[dtypes.int64(0), dtypes.int64(j)] = dtypes.int32(-1)
         home = simt.l2cache_load(gm_rhome.ptr((dtypes.int64(r),)))
         if home >= dtypes.int32(0):
             copy_idx = dtypes.int32(0)
             for i in cannbotdsl.range(epn):
                 e = home * epn + i
-                seg = simt.l2cache_load(
+                order_seg = simt.l2cache_load(
                     gm_order.ptr((dtypes.int64(e), dtypes.int64(r)))
                 )
-                if seg >= _ORDER_FIRST_REPLICA:
-                    ub_jrep_row[dtypes.int64(0), dtypes.int64(i)] = copy_idx
-                    ub_etc_row[dtypes.int64(0), copy_idx] = dtypes.int32(e)
+                if order_seg >= _ORDER_FIRST_REPLICA:
+                    ub_rep_row[dtypes.int64(0), dtypes.int64(i)] = copy_idx
+                    ub_copy_row[dtypes.int64(0), copy_idx] = dtypes.int32(e)
                     copy_idx = copy_idx + dtypes.int32(1)
 
     # ---- 阶段 1：Pfx ----
     @jit
     def _pfx(self, ctx, block_id, views):
         """热专家的 chunk 前缀位置表与段查找表。"""
-        world_size, num_experts = self._r, self._e
+        world_size, num_experts = self._rank_size, self._num_experts
         num_chunks = self._num_chunks
         experts_per_block = num_experts // self._pfx_blocks
         expert_start = block_id * experts_per_block
@@ -703,51 +686,51 @@ class _PlanKernel:
     @jit
     def _build_pfx_row(self, ctx, e, views, pcnt_row, ord_rank_row, ord_end_row):
         """单个专家的 pcnt/ord_rank/ord_end 行。"""
-        world_size = self._r
+        world_size = self._rank_size
         my_rank = dtypes.int32(ctx.rankId)  # 运行时取（self-serve 偏好序）
         num_chunks = self._num_chunks
-        gm_dem_by_rank, gm_counts = views.dem, views.counts
+        gm_dem, gm_counts = views.dem, views.counts
         gm_rem, gm_order, gm_vid = views.rem, views.order, views.vid
         with vf(mode="simt", thread=1):
             # 冷专家早退：Assign 冷专家路径直读 vid，不消费本行 pcnt/ord
             vid = simt.l2cache_load(gm_vid.ptr((dtypes.int64(e),)))
             if vid < dtypes.int32(0):
-                # 段序表先行：偏好序依赖 home/副本的段排列
-                for seg in cannbotdsl.range(world_size):
-                    ord_rank_row[dtypes.int64(0), dtypes.int64(seg)] = dtypes.int32(-1)
+                # 先建段序表（偏好序依赖 home/副本段排列）
+                for seg_idx in cannbotdsl.range(world_size):
+                    ord_rank_row[dtypes.int64(0), dtypes.int64(seg_idx)] = dtypes.int32(
+                        -1
+                    )
                 for r in cannbotdsl.range(world_size):
-                    seg = simt.l2cache_load(
+                    order_seg = simt.l2cache_load(
                         gm_order.ptr((dtypes.int64(e), dtypes.int64(r)))
                     )
-                    if seg >= _ORDER_HOME:
-                        ord_rank_row[dtypes.int64(0), dtypes.int64(seg - 1)] = (
+                    if order_seg >= _ORDER_HOME:
+                        ord_rank_row[dtypes.int64(0), dtypes.int64(order_seg - 1)] = (
                             dtypes.int32(r)
                         )
                 # 偏好序 [home, 副本按段序, 非服务 rank]，pcnt 取其前序需求之和
                 prefix_base = dtypes.int32(0)
                 seen_self = dtypes.int32(0)
-                for seg in cannbotdsl.range(world_size):
-                    r = ord_rank_row[dtypes.int64(0), dtypes.int64(seg)]
+                for seg_idx in cannbotdsl.range(world_size):
+                    r = ord_rank_row[dtypes.int64(0), dtypes.int64(seg_idx)]
                     if r >= dtypes.int32(0) and seen_self == dtypes.int32(0):
                         if r == my_rank:
                             seen_self = dtypes.int32(1)
                         else:
                             prefix_base = prefix_base + simt.l2cache_load(
-                                gm_dem_by_rank.ptr((dtypes.int64(r), dtypes.int64(e)))
+                                gm_dem.ptr((dtypes.int64(r), dtypes.int64(e)))
                             )
                 for r in cannbotdsl.range(world_size):
                     if seen_self == dtypes.int32(0):
                         if r == my_rank:
                             seen_self = dtypes.int32(1)
                         else:
-                            seg = simt.l2cache_load(
+                            order_seg = simt.l2cache_load(
                                 gm_order.ptr((dtypes.int64(e), dtypes.int64(r)))
                             )
-                            if seg == _ORDER_UNSERVED:
+                            if order_seg == _ORDER_UNSERVED:
                                 prefix_base = prefix_base + simt.l2cache_load(
-                                    gm_dem_by_rank.ptr(
-                                        (dtypes.int64(r), dtypes.int64(e))
-                                    )
+                                    gm_dem.ptr((dtypes.int64(r), dtypes.int64(e)))
                                 )
                 chunk_prefix = dtypes.int32(0)
                 for c in range_constexpr(num_chunks):
@@ -757,46 +740,40 @@ class _PlanKernel:
                     chunk_prefix = chunk_prefix + simt.l2cache_load(
                         gm_counts.ptr((dtypes.int64(c), dtypes.int64(e)))
                     )
-                seg_end_acc = dtypes.int32(0)
-                for seg in cannbotdsl.range(world_size):
-                    rnk = ord_rank_row[dtypes.int64(0), dtypes.int64(seg)]
-                    if rnk >= dtypes.int32(0):
-                        seg_end_acc = seg_end_acc + simt.l2cache_load(
-                            gm_rem.ptr((dtypes.int64(e), dtypes.int64(rnk)))
+                seg_acc = dtypes.int32(0)
+                for seg_idx in cannbotdsl.range(world_size):
+                    seg_rank = ord_rank_row[dtypes.int64(0), dtypes.int64(seg_idx)]
+                    if seg_rank >= dtypes.int32(0):
+                        seg_acc = seg_acc + simt.l2cache_load(
+                            gm_rem.ptr((dtypes.int64(e), dtypes.int64(seg_rank)))
                         )
-                    ord_end_row[dtypes.int64(0), dtypes.int64(seg)] = seg_end_acc
+                    ord_end_row[dtypes.int64(0), dtypes.int64(seg_idx)] = seg_acc
 
     # ---- 阶段 2：Assign ----
     @jit
     def _assign(self, block_id, gm_topk, gm_vtopk, views):
         """token 落位：按 chunk 并行处理冷/热专家路径。"""
-        world_size, num_experts = self._r, self._e
+        world_size, num_experts = self._rank_size, self._num_experts
         num_chunks, token_blocks = self._num_chunks, self._token_blocks
 
-        # buf_id 预算：ord_end 是二分热表留 UB；ord_rank/jrep 每轮只读一次，
-        # 走 L2 直读省 2 个 buf_id。
-        self._ord_end = Buffer(
+        # ord_end 参与二分，驻 UB；ord_rank / rep_slot 每轮直读 L2，省 buf_id。
+        self._ub_ord_end = Buffer(
             MemLoc.UB, dtypes.int32, make_layout((num_experts, world_size))
         )
-        mem_copy(self._ord_end, views.ord_end)
-        self._vid = Buffer(MemLoc.UB, dtypes.int32, make_layout((num_experts,)))
-        mem_copy(self._vid, views.vid)
+        mem_copy(self._ub_ord_end, views.ord_end)
+        self._ub_vid = Buffer(MemLoc.UB, dtypes.int32, make_layout((num_experts,)))
+        mem_copy(self._ub_vid, views.vid)
 
         for k in cannbotdsl.range(num_chunks // token_blocks):
             self._assign_chunk(block_id + k * token_blocks, gm_topk, gm_vtopk, views)
 
     @jit
     def _assign_chunk(self, chunk_id, gm_topk, gm_vtopk, views):
-        """单 chunk 落位：per-chunk vid 表 + vgather，段跨界的少量 token 走标量兜底。
-
-        per-chunk vid 表：冷专家直读 vid；热专家按 pcnt[e][chunk]（本 chunk 起点）
-        只做**一次**段查找——若该专家在本 chunk 的整段 token 不跨段边界，整 chunk
-        复用该 vid，否则置 -1 交给逐 token 标量路径。把原"每热 token 一次定位"
-        降为"每 (热专家, chunk) 一次"，skewed/extreme 路由下热 token 占比高时收益
-        显著；balanced 下热 token 本就稀少，行为等价、无回归。"""
-        num_experts = self._e
+        """单 chunk 落位：冷专家直读 vid，热专家每 (专家, chunk) 定位一次，
+        跨段 token 走逐 token 标量兜底。"""
+        num_experts = self._num_experts
         chunk = self._chunk
-        gm_pcnt, gm_ord_rank, gm_jrep = views.pcnt, views.ord_rank, views.jrep
+        gm_pcnt, gm_ord_rank, gm_rep_slot = views.pcnt, views.ord_rank, views.rep_slot
         gm_counts = views.counts
         ub_topk = Buffer(MemLoc.UB, dtypes.int32, make_layout((chunk,)))
         ub_vtopk = Buffer(MemLoc.UB, dtypes.int32, make_layout((chunk,)))
@@ -809,7 +786,7 @@ class _PlanKernel:
 
         with vf(mode="simt", thread=1):
             for e in cannbotdsl.range(num_experts):
-                vid_e = self._vid[dtypes.int64(e)]
+                vid_e = self._ub_vid[dtypes.int64(e)]
                 if vid_e < dtypes.int32(0):
                     pos0 = simt.l2cache_load(
                         gm_pcnt.ptr((dtypes.int64(e), dtypes.int64(chunk_id)))
@@ -819,8 +796,12 @@ class _PlanKernel:
                     )
                     if cnt > dtypes.int32(0):
                         pos1 = pos0 + cnt
-                        vid0, seg_idx = self._relocate(e, pos0, gm_ord_rank, gm_jrep)
-                        seg_end = self._ord_end[dtypes.int64(e), dtypes.int64(seg_idx)]
+                        vid0, seg_idx = self._relocate(
+                            e, pos0, gm_ord_rank, gm_rep_slot
+                        )
+                        seg_end = self._ub_ord_end[
+                            dtypes.int64(e), dtypes.int64(seg_idx)
+                        ]
                         if pos1 <= seg_end:
                             ub_vid_chunk[dtypes.int64(e)] = vid0
                         else:
@@ -868,8 +849,8 @@ class _PlanKernel:
                 e = ub_topk[dtypes.int64(i)]
                 pos = ub_pos[dtypes.int64(e)]
                 if pos >= ub_seg_end[dtypes.int64(e)]:
-                    vid, seg_idx = self._relocate(e, pos, gm_ord_rank, gm_jrep)
-                    ub_seg_end[dtypes.int64(e)] = self._ord_end[
+                    vid, seg_idx = self._relocate(e, pos, gm_ord_rank, gm_rep_slot)
+                    ub_seg_end[dtypes.int64(e)] = self._ub_ord_end[
                         dtypes.int64(e), seg_idx
                     ]
                     ub_cur_vid[dtypes.int64(e)] = vid
@@ -878,32 +859,32 @@ class _PlanKernel:
         mem_copy(tile_slice(gm_vtopk, (chunk,), (chunk_id,)), ub_vtopk)
 
     @jit
-    def _relocate(self, e, pos, gm_ord_rank, gm_jrep):
+    def _relocate(self, e, pos, gm_ord_rank, gm_rep_slot):
         """二分定位 pos 所在段，返回 (vid, seg_idx)。"""
-        world_size, epn = self._r, self._epn
+        world_size, epn = self._rank_size, self._epn
         # ord_end[e,:] 非降累计——二分找首个 pos < end 的段
         lo = dtypes.int32(0)
         span = dtypes.int32(world_size)
         for _ in range_constexpr(world_size.bit_length()):
             half = span // dtypes.int32(2)
             mid = lo + half
-            end_mid = self._ord_end[dtypes.int64(e), dtypes.int64(mid)]
+            end_mid = self._ub_ord_end[dtypes.int64(e), dtypes.int64(mid)]
             if pos < end_mid:
                 span = half
             else:
                 lo = mid + dtypes.int32(1)
                 span = span - half - dtypes.int32(1)
         seg_idx = lo
-        dst_rank = simt.l2cache_load(
+        seg_rank = simt.l2cache_load(
             gm_ord_rank.ptr((dtypes.int64(e), dtypes.int64(seg_idx)))
         )
-        vid = dst_rank * dtypes.int32(_SLOTS_PER_RANK * epn) + (e % dtypes.int32(epn))
+        vid = seg_rank * dtypes.int32(_SLOTS_PER_RANK * epn) + (e % dtypes.int32(epn))
         if seg_idx >= dtypes.int32(1):
             vid = (
-                dst_rank * dtypes.int32(_SLOTS_PER_RANK * epn)
+                seg_rank * dtypes.int32(_SLOTS_PER_RANK * epn)
                 + dtypes.int32(epn)
                 + simt.l2cache_load(
-                    gm_jrep.ptr((dtypes.int64(dst_rank), dtypes.int64(e % epn)))
+                    gm_rep_slot.ptr((dtypes.int64(seg_rank), dtypes.int64(e % epn)))
                 )
             )
         return vid, seg_idx
@@ -915,10 +896,16 @@ class _PlanKernel:
 
 
 def _plan_chunking(num_rows):
-    """分块：chunk 取 2 的幂且整除 N，下限 _CHUNK_MIN。"""
+    """chunk 取整除 N 的 2 的幂，范围 [_CHUNK_MIN, _VF_SAFE_CHUNK]。
+
+    上限来自 vf 栈：constexpr 展开次数随 chunk 增长，chunk=2048 时栈
+    6720B 超 6144B 上限、编译失败（A5 S=8192 实证）。
+    """
     cap = resident_blocks(_MAX_PLAN_BLOCKS)
     target_chunk = max(_CHUNK_MIN, ceil_div(num_rows, cap))
     chunk = ceil_pow2(target_chunk)
+    if chunk > _VF_SAFE_CHUNK:
+        chunk = _VF_SAFE_CHUNK
     while chunk > 1 and num_rows % chunk != 0:
         chunk //= 2
     num_chunks = num_rows // chunk
@@ -957,11 +944,11 @@ def _moonep_plan_host(
     gm_ws,
     gm_topk,
     gm_io,
-    ctx: StructRef[CommContext],
+    ctx: StructRef[MoonepUrmaCtx],
 ):
     """单 launch 发射：三个阶段一次提交。"""
     num_experts = gm_tpe.shape[0]
-    world_size = _R  # trace 期烘焙；rank 运行时由 ctx.rankId 取
+    world_size = _RANK_SIZE  # trace 期烘焙；rank 运行时由 ctx.rankId 取
     num_rows = gm_topk.shape[0]  # 本 rank topk 扁平视图，直接作 Cnt/Asg 输入
     blocks = _plan_blocks(num_rows, num_experts)
     _PlanKernel(
@@ -992,22 +979,6 @@ _PLAN_LOCK = threading.Lock()
 # dst_n/src_n 零占位：只读、kernel 不写，进程级缓存省 alloc+H2D。
 _PLACEHOLDER_CACHE = {}
 
-# 预生成 1..cap 的 epoch 值池，取独立标量视图，省每轮 torch.full。
-_EPOCH_POOLS = []
-_EPOCH_POOL_CAP = 0
-_EPOCH_POOL_MIN_CAP = 1 << 16
-
-
-def _epoch_flag(epoch):
-    """取 epoch 对应的独立标量视图（预生成值池）。"""
-    global _EPOCH_POOL_CAP
-    if not _EPOCH_POOLS or epoch > _EPOCH_POOL_CAP:
-        _EPOCH_POOL_CAP = max(_EPOCH_POOL_MIN_CAP, 1 << (epoch - 1).bit_length())
-        _EPOCH_POOLS.append(
-            torch.arange(1, _EPOCH_POOL_CAP + 1, dtype=torch.int32, device="npu")
-        )
-    return _EPOCH_POOLS[-1][epoch - 1 : epoch]
-
 
 class _PlanDims(NamedTuple):
     """plan 形状键：单 rank token 数 / top-k / 专家总数 / EP rank 数。"""
@@ -1020,24 +991,24 @@ class _PlanDims(NamedTuple):
 
 # workspace 布局：(表名, 维度名)；元素数为各维之积。
 _WS_SPECS = (
-    ("dem", ("r", "e")),
-    ("rem", ("e", "r")),
-    ("order", ("e", "r")),
-    ("counts", ("num_chunks", "e")),
-    ("pcnt", ("e", "num_chunks")),
-    ("vid", ("e",)),
-    ("ord_rank", ("e", "r")),
-    ("ord_end", ("e", "r")),
-    ("jrep", ("r", "epn")),
-    ("rhome", ("r",)),
+    ("dem", ("rank_size", "num_experts")),
+    ("rem", ("num_experts", "rank_size")),
+    ("order", ("num_experts", "rank_size")),
+    ("counts", ("num_chunks", "num_experts")),
+    ("pcnt", ("num_experts", "num_chunks")),
+    ("vid", ("num_experts",)),
+    ("ord_rank", ("num_experts", "rank_size")),
+    ("ord_end", ("num_experts", "rank_size")),
+    ("rep_slot", ("rank_size", "epn")),
+    ("rhome", ("rank_size",)),
 )
 
 
 def _ws_tables(rank_size, num_experts, num_chunks):
     """(name, offset, count, shape) 序列 + 总元素数（布局的唯一来源）。"""
     dims = {
-        "r": rank_size,
-        "e": num_experts,
+        "rank_size": rank_size,
+        "num_experts": num_experts,
         "num_chunks": num_chunks,
         "epn": num_experts // rank_size,
     }
@@ -1073,7 +1044,7 @@ class _PlanViews(NamedTuple):
     vid: object
     ord_rank: object
     ord_end: object
-    jrep: object
+    rep_slot: object
     rhome: object
 
 
@@ -1082,7 +1053,8 @@ def _bind_plan_views(gm_ws, rank_size, num_experts, num_chunks):
     tables, _ = _ws_tables(rank_size, num_experts, num_chunks)
     bound = {}
     for name, off, count, shape in tables:
-        seg = gm_ws[off : off + count,]
+        seg_end = off + count
+        seg = gm_ws[off:seg_end,]
         bound[name] = seg.view(*shape) if len(shape) > 1 else seg
     return _PlanViews(
         dem=bound["dem"],
@@ -1093,7 +1065,7 @@ def _bind_plan_views(gm_ws, rank_size, num_experts, num_chunks):
         vid=bound["vid"],
         ord_rank=bound["ord_rank"],
         ord_end=bound["ord_end"],
-        jrep=bound["jrep"],
+        rep_slot=bound["rep_slot"],
         rhome=bound["rhome"],
     )
 
@@ -1118,17 +1090,17 @@ def _get_plan_program(num_tokens, top_k, num_experts, world_size):
         resident_blocks(_MAX_PLAN_BLOCKS),
     )
     with _PLAN_LOCK:
-        prog = _PLAN_PROGRAMS.get(key)
-        if prog is not None:
-            return prog
+        program = _PLAN_PROGRAMS.get(key)
+        if program is not None:
+            return program
         num_rows = num_tokens * top_k
         blocks = _plan_blocks(num_rows, num_experts)
         ws_total = _ws_layout(world_size, num_experts, blocks.num_chunks)["total"]
-        global _R
-        _R = world_size
+        global _RANK_SIZE
+        _RANK_SIZE = world_size
         epn = num_experts // world_size
         i32 = dtypes.int32
-        prog = cannbotdsl.compile(
+        program = cannbotdsl.compile(
             _moonep_plan_host,
             TensorSpec((num_experts,), i32),  # tokens_per_expert
             TensorSpec((1,), i32),  # epoch flag
@@ -1137,14 +1109,28 @@ def _get_plan_program(num_tokens, top_k, num_experts, world_size):
             TensorSpec(
                 (_SLOTS_PER_RANK * epn + world_size * epn + num_rows,), i32
             ),  # 合并输出
-            StructRef[CommContext],
+            StructRef[MoonepUrmaCtx],
         )
-        _PLAN_PROGRAMS[key] = prog
-        return prog
+        _PLAN_PROGRAMS[key] = program
+        return program
 
 
-class PlanResult(NamedTuple):
-    """plan 五件套（NamedTuple，可按 5-tuple 解包）。"""
+class MoonepPlan(NamedTuple):
+    """plan 五件套句柄（moonep_plan 输出的纯数据包装，零同步契约保持）。
+
+    NamedTuple 选型：元组解包兼容（``dst_n, cu_seqlens, experts_to_copy,
+    src_n, vtopk = plan`` 仍成立，迁移面最小）+ 属性访问 + 零运行时开销；
+    不添加任何同步类方法（plan 返回路径零同步，溢出检查延迟到
+    prefetch/reduce 尾部——既有模块行为透传）。语义对标 GPU MoonEPCommPlan。
+
+    Fields:
+        dst_n: [N] int32 零占位（vtopk-only 快路径不计算）。
+        cu_seqlens: [2*epn] int32 分组偏移（GMM 分段边界）。
+        experts_to_copy: [R, epn] int32 副本清单（-1 填充；每行至多一个
+            远程 home rank），prefetch/reduce 共用。
+        src_n: [N] int32 零占位（vtopk-only 快路径不计算）。
+        vtopk: [N] int32 虚拟专家 id（扩展空间 2E，供 moe_ep dispatch 路由）。
+    """
 
     dst_n: torch.Tensor
     cu_seqlens: torch.Tensor
@@ -1162,13 +1148,13 @@ def moonep_plan(context, tokens_per_expert, topk_experts_sk):
         topk_experts_sk: [S, K] int32，本 rank 的 top-k 专家索引。
 
     Returns:
-        PlanResult（NamedTuple，可按 5-tuple 解包）：
+        MoonepPlan（NamedTuple，可按 5-tuple 解包）：
         dst_n[N] / src_n[N] 为零占位；cu_seqlens[2*epn]、experts_to_copy[R,epn]
         与 vtopk[N] 由 kernel 全量产出。
 
     Notes:
         - 返回路径零同步：溢出与布局不变量延迟到下一个 moonep 算子尾部校验。
-        - 形状约束：E <= 1024、R <= 64、E % R == 0；S*K 任意 N 原生整除。
+        - 形状约束：E <= 1024、R <= MAX_R（128）、E % R == 0；S*K 任意 N 原生整除。
         - 规划结果可跨调用、跨前反向复用。
     """
 
@@ -1177,16 +1163,12 @@ def moonep_plan(context, tokens_per_expert, topk_experts_sk):
             f"tpe/topk 须为 int32（bincount/topk 默认 int64，需 .to(torch.int32)）："
             f"got {tokens_per_expert.dtype} / {topk_experts_sk.dtype}"
         )
-    if not context.eb_scan_done:  # 通信域分离契约复查：覆盖 ctx 先建、EB 后建
-        check_no_shared_elastic_buffer(context.group_name)
-        context.eb_scan_done = True
     cur_stream = sync_transport_stream(context)  # 跨流护栏（握手状态机要求调用按序）
     world_size = context.rank_size
-    # 硬约束：R ≤ MAX_R=64（dem/rhome 表维度）
+    # 硬约束：R ≤ MAX_R（dem/rhome 表维度；MAX_R=128 时 dem_all 区 512KB）
     if world_size > MAX_R:
         raise RuntimeError(
-            f"EP 组规模 {world_size} 超过 MAX_R={MAX_R}（dem/rhome 表维度上限）；"
-            "128P 需扩 MAX_R 并做表 GM 分块/CSR"
+            f"EP 组规模 {world_size} 超过 MAX_R={MAX_R}（dem/rhome 表维度上限）"
         )
     num_tokens, top_k = topk_experts_sk.shape
     num_experts = tokens_per_expert.shape[0]
@@ -1199,18 +1181,19 @@ def moonep_plan(context, tokens_per_expert, topk_experts_sk):
     dims = _PlanDims(num_tokens, top_k, num_experts, world_size)
 
     dst_n = _zero_placeholder(num_rows)
-    # 三个输出共享一次分配；kernel 对 cu/etc/vtopk 均全量覆写，empty 即可
+    # 三份输出共享一次分配；kernel 全量覆写，empty 即可
     cu_elems = _SLOTS_PER_RANK * epn
     etc_elems = world_size * epn
-    io = torch.empty(cu_elems + etc_elems + num_rows, dtype=torch.int32, device="npu")
-    cu_seqlens = io[:cu_elems]
-    experts_to_copy = io[cu_elems : cu_elems + etc_elems].view(world_size, epn)
+    gm_io = torch.empty(
+        cu_elems + etc_elems + num_rows, dtype=torch.int32, device="npu"
+    )
+    cu_seqlens = gm_io[:cu_elems]
+    etc_end = cu_elems + etc_elems
+    experts_to_copy = gm_io[cu_elems:etc_end].view(world_size, epn)
     src_n = _zero_placeholder(num_rows)
-    vtopk = io[cu_elems + etc_elems :]
-    global _EPOCH
-    _EPOCH += 1
-    # _R 的烘焙在 _get_plan_program 锁内（与编译原子）；wrapper 只管 epoch
-    gm_flag = _epoch_flag(_EPOCH)
+    vtopk = gm_io[etc_end:]
+    # epoch 全算子共用一个单调计数器（跨算子单调，哨兵不串轮）
+    gm_flag = next_barrier_epoch(context)
     # workspace 单槽缓存：同 shape 复用，shape 变化时按新布局重分配。
     ws_entry = context.plan_workspace
     if ws_entry is None or ws_entry[0] != dims:
@@ -1218,30 +1201,27 @@ def moonep_plan(context, tokens_per_expert, topk_experts_sk):
         ws_total = _ws_layout(dims.world_size, dims.num_experts, blocks.num_chunks)[
             "total"
         ]
-        tables = torch.zeros(ws_total, dtype=torch.int32, device="npu")
-        ws_entry = (dims, tables)
+        gm_ws = torch.zeros(ws_total, dtype=torch.int32, device="npu")
+        ws_entry = (dims, gm_ws)
         context.plan_workspace = ws_entry
-    tables = ws_entry[1]
-    # Cnt/Asg 只消费本 rank 的行，直接用 [S,K] 展平视图省一次整行 copy_。
+    gm_ws = ws_entry[1]
+    # Cnt/Asg 只消费本 rank 的行，直接传 [S,K] 展平视图
     _get_plan_program(dims.num_tokens, dims.top_k, dims.num_experts, dims.world_size)(
         tokens_per_expert,
         gm_flag,
-        tables,
+        gm_ws,
         topk_experts_sk.reshape(-1),
-        io,
+        gm_io,
         context.ctx_tensor,
     )
     # 跨流护栏 fork 点：只等我方算子，不等主流尾部
     record_transport_event(context, stream=cur_stream)
-    # 溢出检查延迟执行（返回路径零同步，不阻塞 dispatch 发射）；
-    # 冲洗上一轮延迟检查——async_finish 链的 finish_op 跳过检查且本行
-    # 无条件覆写，纯异步链的 plan 溢出信号曾在此被静默丢弃（
-    # moonep-architecture-challenge-review §3 发现：check 在旧值上执行，
-    # 旧 plan kernel 早已在本流前序完成，.item() 有界等待无死锁面）
+    # 先冲洗上一轮延迟检查（异步链曾在此静默丢弃溢出信号）；
+    # 本轮结果延迟到下一个算子校验，返回路径零同步。
     check_pending_overflow(context)
     context.pending_overflow = (cu_seqlens, num_rows)
     context.last_plan_shape = (num_tokens, top_k)  # 供 prefetch/reduce 的调用顺序守卫
-    return PlanResult(dst_n, cu_seqlens, experts_to_copy, src_n, vtopk)
+    return MoonepPlan(dst_n, cu_seqlens, experts_to_copy, src_n, vtopk)
 
 
 # ---------------------------------------------------------------------------

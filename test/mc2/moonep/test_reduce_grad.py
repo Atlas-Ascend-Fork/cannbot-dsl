@@ -44,21 +44,12 @@ try:
 except Exception:  # CI 无 NPU / 无 DSL 时收集不报错（skip 而非 error）
     _HAS_DSL_IMPL = False
 
-try:
-    from cann_ops_transformer.ops import ElasticBuffer  # noqa: F401,E402
-
-    _HAS_EP = True
-except ImportError:
-    _HAS_EP = False
-
 _requires_train_env = pytest.mark.skipif(
     not _HAS_DSL_IMPL
-    or not _HAS_EP
     or "RANK" not in os.environ
     or "WORLD_SIZE" not in os.environ
     or os.environ["WORLD_SIZE"] == "1",
-    reason="需 torch.distributed.run 多卡拉起且已装 cann_ops_transformer"
-    "（单进程 pytest 收集形态跳过）",
+    reason="需 torch.distributed.run 多卡拉起（单进程 pytest 收集形态跳过）",
 )
 
 _S, _K, _EPN = 32, 8, 4
@@ -83,12 +74,12 @@ def _init_group():
     return rank, world
 
 
-def _routing(seed):
-    """均衡路由 → (topk, tpe)（与 test_moonep_buffer 同法）。"""
+def _routing(seed, epn=None):
+    """均衡路由 → (topk, tpe)（与 test_moonep_buffer 同法；epn 缺省模块值）。"""
     from moonep_golden import RouteShape, make_router_inputs
 
     world = dist.get_world_size()
-    shape = RouteShape(world, _S, _K, _EPN * world)
+    shape = RouteShape(world, _S, _K, (epn if epn is not None else _EPN) * world)
     topk_all, _ = make_router_inputs(shape, mode="balanced", seed=seed)
     topk = topk_all[dist.get_rank()].to(torch.int32).npu()
     tpe = (
@@ -202,6 +193,36 @@ def test_r2_reduce_2group_intertwined_bf16(moonep_groups):
 
 @pytest.mark.npu
 @_requires_train_env
+def test_r9_reduce_rotated_peer_blocks(moonep_groups, monkeypatch):
+    """R9：块数封顶常驻核数后的 peer 轮转路径（issue #14 B1/B2）。
+
+    R>64 时读/屏障块不再等于 R-1，而是封顶后在块内轮转多个 peer；本机只
+    有 4 卡，把 resident_blocks 压到 2 即可在 R=4 复现同一路径（UBMEM 直累
+    n_read=2/per=2），归并语义须与 block-per-peer 逐位一致。
+    """
+    rank, world = _init_group()
+    import reduce_grad as rg_mod
+
+    monkeypatch.setattr(rg_mod, "resident_blocks", lambda cap=64: 2)
+    buf = _get_buffer(moonep_groups, "bf16")
+    topk, tpe = _routing(19)
+    plan = buf.plan(tpe, topk)
+    etc_cpu = plan.experts_to_copy.cpu()
+    assert int((etc_cpu >= 0).sum()) > 0
+    base = 2.0
+    grads = [_full_dw(buf.epn, _W, g, base, torch.bfloat16) for g in range(_NUM_GROUPS)]
+    home_views = buf.reduce_grad(plan, local_grads=grads)
+    assert len(home_views) == _NUM_GROUPS
+    # 确实按 clamp 后的块数编译（否则本用例退化为 block-per-peer，白跑）
+    specs = list(rg_mod._UBMEM_PROGRAMS)  # URMA pull 缓存已随传输退役删除
+    assert any(spec.blocks == 2 for spec in specs), "未走到块数 clamp 的轮转路径"
+    torch.npu.synchronize()
+    for g, t in enumerate(grads):
+        _verify_merged(t, rank, world, buf.epn, etc_cpu, g, base, _W, f"R9 组{g} ")
+
+
+@pytest.mark.npu
+@_requires_train_env
 def test_r3_e5_grad_dtype_mismatch(moonep_groups):
     """R3（E5 负例）：local_grads dtype ≠ 构造 grad_dtype 定型值 → TypeError。
 
@@ -221,48 +242,38 @@ def test_r3_e5_grad_dtype_mismatch(moonep_groups):
 @pytest.mark.npu
 @_requires_train_env
 def test_r4_capacity_failfast():
-    """R4（容量 fail-fast）：注入小堆组 → 发布区越界 RuntimeError。
+    """R4（容量 fail-fast，0.8.2 形态）：小 workspace 裸 ctx → 接收区越界 RuntimeError。
 
-    构造注入 moonep_group（hccl_buffer_size=4 MB，实际 ≈8 MB——远小于
-    权重发布区需求 ≈ 25 MB）：check_heap_capacity 在视图创建路径秒级
-    报错（明确"需要/可用"，防运行中 507899 静默越界）。注入组的容量
-    由调用方负责是构造契约（heap_config_mb/heap_required_bytes 只读
-    property 回读对账）。
+    0.8.2 退役 EB/对称堆——MoonepBuffer 构造按形状精算 workspace（
+    heap_required_bytes == heap_bytes 恒成立），旧"注入小 hccl_buffer_size
+    组"的注入面不复存在。等价 fail-fast：显式 workspace_bytes 仅过 plan
+    区（构造检查）的裸 ctx 上调 reduce_grad——check_heap_capacity 在程序
+    发射前秒级报错（需要/可用，防运行中静默越界）。
     """
     _init_group()
-    world = dist.get_world_size()
-    from torch_npu._C._distributed_c10d import ProcessGroupHCCL
+    dist.get_world_size()
+    from moonep_context import create_moonep_context
+    from moonep_layout import HEAP_BASE, PLAN_REGION_END
+    from moonep_plan import moonep_plan
+    from reduce_grad import reduce_grad
 
-    options = ProcessGroupHCCL.Options()
-    # 注入 16 MB（实际 ≈32 MB）：plan 区 ≈0.3 MB 通过、权重发布区
-    # ≈50 MB 越界——fail-fast 裕度 18 MB，不依赖边界巧合
-    options.hccl_config = {"hccl_buffer_size": 16}
-    tiny_group = dist.new_group(
-        backend="hccl",
-        ranks=list(range(world)),
-        use_local_synchronization=True,
-        pg_options=options,
+    # 仅过 plan 区（+64B 裕度）、不过权重发布区+梯度接收区（reduce 拦截）
+    ctx = create_moonep_context(
+        group=dist.group.WORLD,
+        workspace_bytes=HEAP_BASE + PLAN_REGION_END + 64,
     )
-    # EB 通信域须与 moonep 组分属两个通信器（本用例不跑 dispatch 数据流，
-    # 仅需独立小容量组过构造校验）
-    tiny_ep_group = dist.new_group(
-        backend="hccl",
-        ranks=list(range(world)),
-        use_local_synchronization=True,
-        pg_options=options,
-    )
-    # 大形状：W = 512×2048 = 1048576（H=512, Hp=2048；发布区 3×W×2B×2×epn ≈ 50 MB > 32 MB）
-    # 前置校验已移入构造器——构造期即报错（fail-fast 更早）
-    with pytest.raises(RuntimeError, match="超出.*对称缓冲区"):
-        MoonepBuffer(
-            _S,
-            512,
-            2048,
-            _K,
-            _EPN * world,
-            moonep_group=tiny_group,
-            ep_group=tiny_ep_group,
-        )
+    # 首调 plan 定型 last_plan_shape（reduce 的调用序守卫；plan 交换区在
+    # 容量内——首版直接调 reduce 被该守卫拦截，A5 d5 实证）
+    topk, tpe = _routing(15)
+    _, _, etc, _, _ = moonep_plan(ctx, tpe, topk)
+    grads = [
+        torch.zeros(2 * _EPN, _W, dtype=torch.bfloat16, device="npu")
+        for _ in range(_NUM_GROUPS)
+    ]
+
+    with pytest.raises(RuntimeError, match="超出 workspace"):
+        reduce_grad(ctx, etc, grads, _EPN)
+    ctx.close()
 
 
 @pytest.mark.full
@@ -321,7 +332,7 @@ def _expect_randn_merged(world, epn, w, g, dtype, etc_cpu, rank):
     epn+j；owner home 行 = e % epn）。两版历史误构造：首版误加全组种子
     （999ab6d 修）；第二版假设"槽 j 恒承载本地索引 j 的专家"（``e % epn
     == j`` 门 + ``exp[j] += dw[epn + j]``）——plan 的槽位是**紧凑排布**
-    （_fill_jrep_etc 按专家号升序从 0 压缩填槽，非 e%epn 对位；一专家可
+    （_fill_rep_copy 按专家号升序从 0 压缩填槽，非 e%epn 对位；一专家可
     多 rank 副本），v24 8P routing-21 下 etc[1][0]=15 / etc[3,6,7][0]=17 /
     etc[2][0]=31 全部落 j=0，rank 3/4/7 的行 3/1/3 期望漏加（got 实为
     正确——8P 探针 kernel 语义逐 rank 对拍全过）。"""
@@ -466,3 +477,77 @@ def test_r7_reduce_empty_and_asymmetric(moonep_groups):
     buf.reduce_grad(plan3, local_grads=g3)
     torch.npu.synchronize()
     _verify_merged(g3[0], rank, world, buf.epn, etc_active, 0, 7.0, _W, "R7 轮3 ")
+
+
+@pytest.mark.npu
+@_requires_train_env
+def test_r8_reduce_multichunk_column_position(moonep_groups):
+    """R8：多 chunk 列位置回归（W=32768 > chunk 16384，n_c=2）。
+
+    行内列位置编码（半区异值）：远读须带列块偏移 c——若漏加（历史缺陷：
+    每个列块都并入远端行首 chunk），后半区会归并到错误值。行恒值填法
+    检测不了本缺陷，故本用例列值随半区分。
+    """
+    rank, world = _init_group()
+    epn = _EPN
+    w = 32768  # bf16 chunk=16384 → n_c=2
+    half = w // 2
+
+    buf = MoonepBuffer(
+        _S,
+        _H,
+        w // _H,  # Hp=1024 → W=32768（专用 buffer——形状键独立）
+        _K,
+        _EPN * world,
+        moonep_group=moonep_groups[0],
+        ep_group=moonep_groups[1],
+        grad_dtype="bf16",
+    )
+    try:
+        topk, tpe = _routing(23)
+        plan = buf.plan(tpe, topk)
+        etc_cpu = plan.experts_to_copy.cpu()
+        assert int((etc_cpu >= 0).sum()) > 0
+
+        def _row_val(i, g):
+            return float((i + 1) * (g + 1))
+
+        # full-dW：行 i 的前半区 = row_val(i)，后半区 = row_val(i)+8（值域
+        # ≤ ~130——bf16 整数精确域内；+8 使列半区可判而总和不失精确）
+        grads = []
+        for g in range(_NUM_GROUPS):
+            t = torch.empty(2 * epn, w, dtype=torch.bfloat16, device="npu")
+            for i in range(2 * epn):
+                t[i, :half] = _row_val(i, g)
+                t[i, half:] = _row_val(i, g) + 8.0
+            grads.append(t)
+
+        buf.reduce_grad(plan, local_grads=grads)  # sync：单值——归并原位
+        torch.npu.synchronize()
+
+        for g, t in enumerate(grads):
+            m = t[:epn].cpu().float()
+            for i in range(epn):
+                # 期望 = home 种子 + Σ 各 rank 副本贡献（同 _expect_merged_row
+                # 的 etc 语义），按半区独立计算
+                e = rank * epn + i
+                exp_lo = _row_val(i, g)
+                exp_hi = _row_val(i, g) + 8.0
+                for r in range(world):
+                    if r == rank:
+                        continue
+                    for j in range(epn):
+                        if int(etc_cpu[r][j]) == e:
+                            exp_lo += _row_val(epn + j, g)
+                            exp_hi += _row_val(epn + j, g) + 8.0
+                got_lo = m[i, 0].item()
+                got_hi = m[i, half].item()
+                assert abs(got_lo - exp_lo) < 1e-2, (
+                    f"R8 g={g} 行{i} 前半区：期望 {exp_lo}，实得 {got_lo}"
+                )
+                assert abs(got_hi - exp_hi) < 1e-2, (
+                    f"R8 g={g} 行{i} 后半区：期望 {exp_hi}，实得 {got_hi}"
+                    "——远读缺列块偏移（首 chunk 并入每个列块）的典型症状"
+                )
+    finally:
+        buf.destroy()

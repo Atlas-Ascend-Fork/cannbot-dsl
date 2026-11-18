@@ -6,10 +6,10 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 
-"""从设备地址构造 NPU 张量视图（非拥有型，供对称堆权重视图使用）。
+"""从设备地址构造 NPU 张量视图（非拥有型，供 workspace 权重视图使用）。
 
-仅 MoonEP 对称堆直推（direct push）路径使用：调用方需保证地址来自
-HCCL 对称缓冲区且生命周期覆盖视图使用期。
+仅 prefetch_weight 的 workspace 权重/scale 视图路径使用：调用方需保证
+地址来自 workspace（对称布局约定）且生命周期覆盖视图使用期。
 
 实现要点：必须走 at_npu::native::from_blob（见内嵌 _CPP_SOURCE），普通
 at::from_blob 造出的张量底层不是 NPUStorageImpl，torch 侧进 NPU 算子会报
@@ -49,6 +49,8 @@ torch::Tensor npu_from_blob(int64_t addr, std::vector<int64_t> sizes, std::strin
     at::TensorOptions options;
     if (dtype == "bf16") {
         options = at::TensorOptions().dtype(at::kBFloat16);
+    } else if (dtype == "fp16") {
+        options = at::TensorOptions().dtype(at::kHalf);
     } else if (dtype == "fp32") {
         options = at::TensorOptions().dtype(at::kFloat);
     } else if (dtype == "uint8") {
@@ -107,7 +109,7 @@ def _get_ext():
 
 
 def npu_from_blob(addr, sizes, dtype):
-    """addr(int) + sizes(list[int]) + dtype("bf16"/"fp32"/"uint8"/"e4m3fn"/
-    "e5m2"/"e8m0fnu"/"int32") -> NPU Tensor（mxfp8 数据面：e4m3fn/e5m2
-    权重 + e8m0fnu scale——OCP MX 标准编码）。"""
+    """addr(int) + sizes(list[int]) + dtype("bf16"/"fp16"/"fp32"/"uint8"/
+    "e4m3fn"/"e5m2"/"e8m0fnu"/"int32") -> NPU Tensor（mxfp8 数据面：
+    e4m3fn/e5m2 权重 + e8m0fnu scale——OCP MX 标准编码）。"""
     return _get_ext().npu_from_blob(int(addr), list(sizes), str(dtype))

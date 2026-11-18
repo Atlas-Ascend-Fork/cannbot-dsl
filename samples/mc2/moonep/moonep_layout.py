@@ -1,12 +1,12 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd.
-# This program is free software: you can redistribute it and/or modify it under the terms and conditions of
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
 # CANN Open Software License Agreement Version 2.0 (the "License").
 # Please refer to the License for details. You may not use this file except in compliance with the License.
 # THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 
-"""MoonEP 对称堆布局：常量与区域公式（纯计算，无设备依赖）。
+"""MoonEP workspace（堆）布局：常量与区域公式（纯计算，无设备依赖）。
 
 布局常量 + 分区基址/步长公式 +
 LCM 对齐。kernel 编译期（prefetch_weight 的 _MoonepPrefetchPushKernel
@@ -20,17 +20,20 @@ import math
 
 from cannbotdsl import dtypes
 
-
-# 对称堆内布局（字节偏移，均以 heap_base=4096 为基址，32B 对齐）：
-#   [0, PLAN_REGION_END)         元数据与同步标志区
+# 堆（workspace）内布局（字节偏移，均以 heap_base 为基址，32B 对齐）：
+#   [0, HEAP_BASE)               到达槽区（per-sender epoch 哨兵，见 notify_slot_off）
+#   [HEAP_BASE, PLAN_REGION_END) 元数据与同步标志区
 #   [prefetch_weight_off(), ...) 权重视图（每组包含本地专家行与预取槽）
 #   [reduce_stg_off(...), ...)   发布区之后的工作缓冲区
 # 同步标志与工作缓冲区使用各自的固定基址。
 # 各区域基址由下列函数按运行时形状计算，所有 rank 公式一致 → 结果一致。
-HEAP_BASE = 4096  # 对称堆基址（与 cannbotdsl SymBuffer 的默认 heap_base 一致）
+NOTIFY_STRIDE = 64  # per-sender 到达槽步长（64B=1 cache line，950PR 定值）
 MAX_E = 1024  # v1 支持的专家总数上限
-MAX_R = 64  # COMM_MAX_RANK_NUM
-DEM_ALL_OFF = 0  # (MAX_R, MAX_E) int32：各 rank 本地计数交换区（256KB）
+MAX_R = 128  # 组内 rank 上限（128 卡适配；下列定宽区域随本常量放大）
+HEAP_BASE = max(
+    4096, MAX_R * NOTIFY_STRIDE
+)  # 到达槽区上界：MAX_R 个 sender 槽不得侵入堆区
+DEM_ALL_OFF = 0  # (MAX_R, MAX_E) int32：各 rank 本地计数交换区（512KB@R=128）
 READY_OFF = MAX_R * MAX_E * 4  # (MAX_R,) int32：元数据就绪标志
 BAR_FLAGS_OFF = READY_OFF + MAX_R * 4  # (MAX_R,) int32：rank 自旋同步屏障的 epoch flag
 LAYOUT_TAIL_BYTES = 4096  # 区域尾部对齐余量（32B 对齐要求下取整页）
@@ -84,6 +87,28 @@ def slot_stride_bytes(epn: int, widths, scale_widths, weight_bytes: int) -> int:
     return lcm_slot_stride(epn, row_bytes)
 
 
+def group_slot_rows(epn: int, row_bytes):
+    """校验组前缀和可整除，返回每组起始行号与 slot 行步长。
+
+    kernel 按“组起始行 + slot × 行步长 + 槽内行号”寻址，要求每组前缀和
+    和 slot 步长都能被该组行字节数整除；不满足时在这里提前报错。
+    """
+    row_bytes = tuple(int(rb) for rb in row_bytes)
+    slot_bytes = lcm_slot_stride(epn, row_bytes)
+    group_rows, slot_rows = [], []
+    base_bytes = 0
+    for g, rb in enumerate(row_bytes):
+        if base_bytes % rb or slot_bytes % rb:
+            raise ValueError(
+                f"第 {g} 组行宽 {rb}B 无法与前缀 {base_bytes}B / "
+                f"slot 步长 {slot_bytes}B 对齐；请调整该组行宽或 epn"
+            )
+        group_rows.append(base_bytes // rb)
+        slot_rows.append(slot_bytes // rb)
+        base_bytes += rb * ROWS_PER_EXPERT * int(epn)
+    return tuple(group_rows), tuple(slot_rows)
+
+
 def reduce_stg_off(
     epn: int,
     w_elems: int = 0,
@@ -126,7 +151,12 @@ def grad_slot_off(
     scale_widths=None,
     weight_bytes: int = WEIGHT_BYTES,
 ) -> int:
-    """pull 协议梯度槽区基址（紧随权重发布区，变宽组/scale 组同 reduce_stg_off）。"""
+    """pull 协议梯度副本区基址（紧随权重发布区，变宽组/scale 组同 reduce_stg_off）。
+
+    梯度区为 **[epn, Wg] × 组副本发布区**——每 rank 只发布自己的
+    副本行，owner 经远读拉取归并（无 R 维度、无并发写）；区域大小见
+    reduce_region_end。
+    """
     return reduce_stg_off(
         epn,
         w_elems,
@@ -139,7 +169,6 @@ def grad_slot_off(
 
 
 def reduce_region_end(
-    world_size: int,
     epn: int,
     w_elems: int,
     num_groups: int = 1,
@@ -150,10 +179,13 @@ def reduce_region_end(
     scale_widths=None,
     weight_bytes: int = WEIGHT_BYTES,
 ) -> int:
-    """pull 协议的堆上界（含梯度槽区；变宽组传 widths，槽区 = Σ宽×epn×grad 字节）。
+    """堆上界（含梯度副本区；变宽组传 widths）。
 
-    梯度槽区恒按 epn 行（仅副本行、单窗口不随 slots 倍增——PR #261 同构）；
-    ``scale_widths`` 只扩大权重发布区（scale 随 slot 轮转），不影响槽区。
+    - 副本发布区 [epn, Wg] × 组——每 rank 只发布自己的副本行供
+      owner 远读；无 R 维度，显存恒定（19.3MB 级）
+    - 历史参照：push 形态接收区 [R, epn, Wg] 随 R 线性（32 卡
+      617MB），为 pull 选型的动因
+    ``scale_widths`` 只扩大权重发布区（scale 随 slot 轮转），不影响梯度区。
     """
     total_w = (
         sum(int(w) for w in widths)

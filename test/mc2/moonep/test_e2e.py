@@ -8,14 +8,18 @@
 
 """端到端 README 样例验证 + 交织/分离 GMM 等价 + mxfp8 精度看护。
 
+（token 数据面不在本套件。本文件的 e2e 链路为
+plan → prefetch → GMM → reduce 三算子形态：token 行以本地桩注入
+（形状/分组与 dispatch 产物同构——cu 分组口径不变），GMM 消费
+prefetch 视图、reduce 归并副本梯度。）
+
 三个核心用例：
-- test_e2e_readme_ffn_chain：按 README「五算子链」写法跑通完整前反向
-  （plan→dispatch→prefetch→GMM→combine→dispatch反向→reduce），
-  端到端 out/g_x/dws 对拍，中间零 .cpu() 同步。
+- test_e2e_readme_ffn_chain：按 README「三算子链」写法跑通完整反向
+  （plan→prefetch→GMM→reduce），端到端 dws 对拍，中间零 .cpu() 同步。
 - test_e2e_intertwined_vs_separate：gate/up 分离 3 组 vs 合并 W13+down
-  交织 2 组——最终 GMM 输出逐位一致（等价性证明），端到端不查中间态。
+  交织 2 组——GMM 输出逐位一致（等价性证明），端到端不查中间态。
 - test_e2e_mxfp8_precision：fp8 权重 + ue8m0 scale 完整链路——按
-  README「mxfp8 完整样例」写法，端到端 out 精度看护（vs bf16 参考链
+  README「mxfp8 完整样例」写法，GMM 输出精度看护（vs bf16 参考链
   在量化误差界内）。
 """
 
@@ -46,9 +50,6 @@ except ImportError:
 
 pytestmark = pytest.mark.skipif(not _HAS_DSL_IMPL, reason="需 NPU 环境")
 
-_ATOL = 2e-2
-_RTOL = 2e-2
-
 _S, _K, _EPN = 16, 4, 2
 _H, _Hp = 32, 16
 _W = _H * _Hp
@@ -66,6 +67,17 @@ def _make_weights(seed, epn, W, dtype=torch.bfloat16):
     """随机权重 [epn, W]——种子含组序可独立重建。"""
     gen = torch.Generator().manual_seed(seed)
     return torch.randn(epn, W, generator=gen, dtype=torch.float32).to(dtype).npu()
+
+
+def _local_rows(plan, seed, dtype=torch.bfloat16):
+    """本地 token 行桩 [S*K, H]——与 dispatch 产物同构（按 cu 分组序）。
+
+    token 数据面不在本套件；e2e 的 GMM 消费口径（cu_seqlens 分段）不变，
+    行值以确定性种子本地生成（形状/分组与真实 dispatch 产物一致）。
+    """
+    n = int(plan.cu_seqlens[-1].item())
+    gen = torch.Generator().manual_seed(seed)
+    return torch.randn(n, _H, generator=gen, dtype=torch.float32).to(dtype).npu()
 
 
 def _swiglu(gate, up):
@@ -86,7 +98,9 @@ def _gmm_3mat(x, w1, w3, w2, cu, H, Hp):
     w2v = w2.view(-1, H, Hp)
     y = torch.zeros(n, H, dtype=x.dtype, device=x.device)
     # 用逐专家循环模拟分组 GMM（测试用参考——不用 .cpu()）
-    offsets = cu.cpu().tolist()  # 一次 D2H 取分组边界（外层调用方已有 plan）
+    # cu 为 [2*epn] 累计终值（无前导零——npu_grouped_matmul offset 口径），
+    # 分段循环需补前导零成 [0, c1..c_n]（上游按 [R+1] 假设写就的修正）
+    offsets = [0] + cu.cpu().tolist()
     for grp in range(len(offsets) - 1):
         s, e = offsets[grp], offsets[grp + 1]
         if e > s:
@@ -107,7 +121,7 @@ def _gmm_w13(x, w13, w2, cu, H, Hp):
     """
     n = x.shape[0]
     y = torch.zeros(n, H, dtype=x.dtype, device=x.device)
-    offsets = cu.cpu().tolist()
+    offsets = [0] + cu.cpu().tolist()  # 补前导零（cu 为累计终值口径）
     w13v = w13.view(-1, 2 * Hp, H)  # [slots, 2Hp, H]——行展平视图
     w2v = w2.view(-1, H, Hp)
     for grp in range(len(offsets) - 1):
@@ -123,16 +137,15 @@ def _gmm_w13(x, w13, w2, cu, H, Hp):
 
 
 # ---------------------------------------------------------------------------
-# 用例 1：README「五算子链」端到端（前反向 FFN 全链，零中间 .cpu() 同步）
+# 用例 1：README「三算子链」端到端（prefetch→GMM→reduce 全链，零中间 .cpu()）
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.npu
 @pytest.mark.skipif(not _HAS_DSL_IMPL, reason="需 NPU 环境")
 def test_e2e_readme_ffn_chain(moonep_groups):
-    """按 README 五算子链写法端到端跑通：plan→dispatch→prefetch→GMM→
-    combine→dispatch 反向→reduce→optimizer。端到端结果对拍（out vs golden，
-    dws vs 归并期望），中间零 .cpu()。"""
+    """按 README 三算子链写法端到端跑通：plan→prefetch→GMM→reduce。
+    端到端 dws 对拍（归并期望 = home 种子 + 副本贡献计数），中间零 .cpu()。"""
     rank, world = _init()
     E = _EPN * world
     epn = _EPN
@@ -153,17 +166,12 @@ def test_e2e_readme_ffn_chain(moonep_groups):
     topk_all, rw_all = make_router_inputs(shape, mode="balanced", seed=42)
     topk = topk_all[rank].to(torch.int32).npu()
     tpe = torch.bincount(topk_all[rank].flatten(), minlength=E).to(torch.int32).npu()
-    x = torch.randn(
-        _S,
-        _H,
-        dtype=torch.bfloat16,
-        generator=torch.Generator().manual_seed(100 + rank),
-    ).npu()
-    scores = rw_all[rank].npu()
 
-    # —— 前向 ——
+    # —— 规划（路由表——cu 分组 + etc 副本清单贯穿后续算子）——
     plan = buf.plan(tpe, topk)
-    recv, recv_w, handle = buf.dispatch(plan, x, topk_weights=scores, do_cpu_sync=False)
+
+    # —— 本地 token 行桩（dispatch 产物同构；cu 分组口径不变）——
+    x = _local_rows(plan, seed=100 + rank)
 
     # prefetch 权重（首步传本体）
     w1 = _make_weights(1000, epn, W)
@@ -171,12 +179,9 @@ def test_e2e_readme_ffn_chain(moonep_groups):
     w2 = _make_weights(3000, epn, W)
     weights, _scales = buf.prefetch_weight(plan, local_weights=(w1, w3, w2))
 
-    n = _S * _K
-    cap = recv.shape[0]
-
     # FFN 前向（GMM 分组 + SwiGLU——用参考实现）
     y = _gmm_3mat(
-        recv[:n].float(),
+        x.float(),
         weights[0].float(),
         weights[1].float(),
         weights[2].float(),
@@ -184,47 +189,35 @@ def test_e2e_readme_ffn_chain(moonep_groups):
         _H,
         _Hp,
     )
+    assert not torch.isnan(y.cpu().float()).any(), "GMM 输出含 NaN"
+    assert not torch.isinf(y.cpu().float()).any(), "GMM 输出含 Inf"
 
-    # combine 加权
-    combine_in = torch.zeros(cap, _H, dtype=torch.bfloat16, device=y.device)
-    combine_in[:n] = (y[:n].float() * recv_w[:n].unsqueeze(1)).to(torch.bfloat16)
-    out, out_w = buf.combine(combine_in, handle, topk_weights=recv_w)
-    torch.npu.synchronize()
-
-    # 端到端结果断言——随机权重 GMM ≠ golden（数学不等，逐值对拍由 B1/B2 覆盖）
-    # 本用例验证 README 样例可跑通：全部步骤无错误 + 形状/回收权重/数值有限
-    assert out.shape == (_S, _H), f"out 形状 {out.shape} 应为 ({_S}, _H)"
-    assert out_w.shape == (_S, _K), f"out_w 形状 {out_w.shape} 应为 ({_S}, {_K})"
-    assert torch.equal(out_w.cpu(), rw_all[rank]), "combine 权重回收不符"
-    assert not torch.isnan(out.cpu().float()).any(), "out 含 NaN"
-    assert not torch.isinf(out.cpu().float()).any(), "out 含 Inf"
-
-    # —— 反向 ——
-    g_out_t = torch.randn(
-        _S,
-        _H,
-        dtype=torch.bfloat16,
-        generator=torch.Generator().manual_seed(200 + rank),
-    ).npu()
-    g_recv, _, handle_b = buf.dispatch(plan, g_out_t, topk_weights=None)
-    # 反向 combine 输入容量取反向 dispatch 自身（do_cpu_sync 缺省 True——
-    # 精确分配）；不得复用前向 do_cpu_sync=False 的 worst-case cap——容量
-    # 与 handle metadata 失配会触发 EB packed int32 形状校验失败
-    g_cap = g_recv.shape[0]
-    g_x, _ = buf.combine(
-        torch.zeros(g_cap, _H, dtype=torch.bfloat16, device=g_recv.device), handle_b
-    )
-    assert g_x.shape == (_S, _H), f"g_x 形状 {g_x.shape} 应为 ({_S}, _H)"
-
-    # FFN 反向：full-dW（参考实现——消费 cu 分组）
+    # —— FFN 反向（full-dW 形态）：home 行种子 + 副本行单位贡献 ——
+    # 数值口径与 test_urma part A 一致：home 种子 = rank+g（bf16 精确），
+    # 副本贡献 = 1.0；reduce 后 home = 种子 + 该行 etc 映射的远程副本数。
     dw1 = torch.zeros(2 * epn, W, dtype=torch.bfloat16, device="npu")
     dw3 = torch.zeros(2 * epn, W, dtype=torch.bfloat16, device="npu")
     dw2 = torch.zeros(2 * epn, W, dtype=torch.bfloat16, device="npu")
+    for g, dw in enumerate((dw1, dw3, dw2)):
+        dw[:epn] = float(rank + g)  # home 种子
+        dw[epn:] = 1.0  # 副本贡献
     buf.reduce_grad(plan, local_grads=[dw1, dw3, dw2])
     torch.npu.synchronize()
 
-    # reduce 端到端：home 段已归并（副本贡献加和后非零）
-    # 不做中间态对拍——reduce 正确性由 B 系 golden 链路覆盖
+    # reduce 端到端对拍：home = 种子 + 副本计数（etc 全表口径）
+    etc_cpu = plan.experts_to_copy.cpu()
+    for g, dw in enumerate((dw1, dw3, dw2)):
+        expect = torch.full((epn, W), float(rank + g), dtype=torch.float32)
+        for r_src in range(world):
+            for j in range(epn):
+                e = int(etc_cpu[r_src, j].item())
+                if e >= 0 and (e // epn) == rank and r_src != rank:
+                    expect[e % epn] += 1.0
+        got = dw[:epn].cpu().float()
+        assert torch.allclose(got, expect, atol=1e-3), (
+            f"e2e reduce 数值错位 g={g}: got {got[0, 0].item()} "
+            f"expect rows {expect[:, 0].unique().tolist()}"
+        )
 
     # destroy
     buf.destroy()
@@ -249,7 +242,6 @@ def test_e2e_intertwined_vs_separate(moonep_groups):
     E = _EPN * world
     epn = _EPN
     W = _W
-    n = _S * _K
 
     # 两个独立 buffer（3 组 vs 2 组——layout_groups 互斥）
     buf3 = MoonepBuffer(
@@ -276,16 +268,10 @@ def test_e2e_intertwined_vs_separate(moonep_groups):
     topk_all, rw_all = make_router_inputs(shape, mode="balanced", seed=77)
     topk = topk_all[rank].to(torch.int32).npu()
     tpe = torch.bincount(topk_all[rank].flatten(), minlength=E).to(torch.int32).npu()
-    x = torch.randn(
-        _S,
-        _H,
-        dtype=torch.bfloat16,
-        generator=torch.Generator().manual_seed(300 + rank),
-    ).npu()
 
     # —— 路径 A：分离 3 组 ——
     plan3 = buf3.plan(tpe, topk)
-    recv3, recv_w3, handle3 = buf3.dispatch(plan3, x, topk_weights=None)
+    x = _local_rows(plan3, seed=300 + rank)
 
     # 权重（种子固定——两路径共享同一数学值）
     w1 = _make_weights(1000, epn, W)
@@ -297,7 +283,7 @@ def test_e2e_intertwined_vs_separate(moonep_groups):
 
     # 分离 GMM（3 matmul）
     y3 = _gmm_3mat(
-        recv3[:n].float(),
+        x.float(),
         weights3[0].float(),
         weights3[1].float(),
         weights3[2].float(),
@@ -308,7 +294,6 @@ def test_e2e_intertwined_vs_separate(moonep_groups):
 
     # —— 路径 B：交织 2 组 ——
     plan2 = buf2.plan(tpe, topk)
-    recv2, recv_w2, handle2 = buf2.dispatch(plan2, x, topk_weights=None)
 
     # W13 = cat(gate_2d, up_2d, dim=1)——从同一种子重建
     w13 = torch.cat([w1, w3], dim=1)  # [epn, 2W]
@@ -317,7 +302,7 @@ def test_e2e_intertwined_vs_separate(moonep_groups):
 
     # 交织 GMM（1 matmul W13 → 取半区 → SwiGLU → w2）
     y2 = _gmm_w13(
-        recv2[:n].float(),
+        x.float(),
         weights2[0].float(),
         weights2[1].float(),
         plan2.cu_seqlens,
@@ -326,11 +311,12 @@ def test_e2e_intertwined_vs_separate(moonep_groups):
     )
 
     # —— 端到端等价性对拍（分离 vs 交织的 y 逐位一致）——
-    # 两路径输入 x 相同 → recv 应相同 → GMM 数学相同 → y 应相同
+    # 两路径输入 x 相同 → GMM 数学相同 → y 应相同
     # 注意：允许 float 换序误差（matmul 顺序不同可能有微小浮点差）
+    n = min(y3.shape[0], y2.shape[0])
     assert torch.allclose(
-        y3[: min(y3.shape[0], n)].cpu(),
-        y2[: min(y2.shape[0], n)].cpu(),
+        y3[:n].cpu(),
+        y2[:n].cpu(),
         atol=5e-2,
         rtol=5e-2,
     ), "交织 2 组 GMM 输出与分离 3 组不一致——合并/分离路径不等价"
@@ -344,21 +330,20 @@ def test_e2e_intertwined_vs_separate(moonep_groups):
 @pytest.mark.npu
 @pytest.mark.skipif(not _HAS_DSL_IMPL, reason="需 NPU 环境")
 def test_e2e_mxfp8_precision(moonep_groups):
-    """mxfp8 端到端：fp8 权重 + e8m0fnu scale → GMM → combine 的精度看护。
+    """mxfp8 端到端：fp8 权重 + e8m0fnu scale → 量化 GMM 的精度看护。
 
     按 README「mxfp8 完整样例」写法：
     1. fp8 权重推送（prefetch 返回 (weights, scales) 成对视图）
     2. 量化 GMM（用 bf16 反量化做参考——测试不依赖 npu_grouped_matmul_quant）
-    3. combine 输出与 bf16 全精度链路对拍——fp8 量化误差界内
+    3. fp8 链 GMM 输出与 bf16 全精度链对拍——fp8 量化误差界内
 
-    精度判据：out_fp8 vs out_bf16 的 allclose 容差放宽（fp8 4-bit 尾数
+    精度判据：y_fp8 vs y_bf16 的 allclose 容差放宽（fp8 4-bit 尾数
     带来的量化误差约 2^-3 相对量级）。
     """
     rank, world = _init()
     E = _EPN * world
     epn = _EPN
     W = _W
-    n = _S * _K
 
     buf = MoonepBuffer(
         _S,
@@ -376,16 +361,10 @@ def test_e2e_mxfp8_precision(moonep_groups):
     topk_all, rw_all = make_router_inputs(shape, mode="balanced", seed=99)
     topk = topk_all[rank].to(torch.int32).npu()
     tpe = torch.bincount(topk_all[rank].flatten(), minlength=E).to(torch.int32).npu()
-    x = torch.randn(
-        _S,
-        _H,
-        dtype=torch.bfloat16,
-        generator=torch.Generator().manual_seed(400 + rank),
-    ).npu()
-    scores = rw_all[rank].npu()
 
     plan = buf.plan(tpe, topk)
-    recv, recv_w, handle = buf.dispatch(plan, x, topk_weights=scores)
+    n = _S * _K
+    x = _local_rows(plan, seed=400 + rank)
 
     # fp8 权重 + scale（量化自 bf16 权重）
     w1_bf = _make_weights(1000, epn, W)
@@ -417,11 +396,11 @@ def test_e2e_mxfp8_precision(moonep_groups):
 
     # 反量化：fp8 → float → matmul（w13v 副本槽含 owner 推来的 fp8 数据）
     y_fp8 = torch.zeros(n, _H, dtype=torch.float32, device="npu")
-    offsets = plan.cu_seqlens.cpu().tolist()
+    offsets = [0] + plan.cu_seqlens.cpu().tolist()  # 补前导零（累计终值口径）
     for grp in range(len(offsets) - 1):
         s, e = offsets[grp], offsets[grp + 1]
         if e > s:
-            xv = recv[:n][s:e].float()
+            xv = x[s:e].float()
             # 反量化 W13
             w13_deq = w13v[grp].float().view(2 * W)  # [2W]
             gate_w = w13_deq[:W].view(_Hp, _H)  # gate [Hp, H]
@@ -432,12 +411,6 @@ def test_e2e_mxfp8_precision(moonep_groups):
             u = xv @ up_w.T
             a = _swiglu(g, u)
             y_fp8[s:e] = a @ w2_deq.T  # [e-s, H]
-
-    # combine 加权
-    cap = recv.shape[0]
-    combine_in_fp8 = torch.zeros(cap, _H, dtype=torch.bfloat16, device=y_fp8.device)
-    combine_in_fp8[:n] = (y_fp8[:n] * recv_w[:n].unsqueeze(1)).to(torch.bfloat16)
-    out_fp8, out_w = buf.combine(combine_in_fp8, handle, topk_weights=recv_w)
     torch.npu.synchronize()
 
     # —— bf16 全精度参考链（独立 buffer——不受 fp8 堆布局影响）——
@@ -451,12 +424,11 @@ def test_e2e_mxfp8_precision(moonep_groups):
         ep_group=moonep_groups[1],
     )
     plan_bf = buf_bf.plan(tpe, topk)
-    recv_bf, recv_w_bf, handle_bf = buf_bf.dispatch(plan_bf, x, topk_weights=scores)
     weights_bf, _ = buf_bf.prefetch_weight(plan_bf, local_weights=(w1_bf, w3_bf, w2_bf))
     torch.npu.synchronize()
 
     y_bf = _gmm_3mat(
-        recv_bf[:n].float(),
+        x.float(),
         weights_bf[0].float(),
         weights_bf[1].float(),
         weights_bf[2].float(),
@@ -464,21 +436,18 @@ def test_e2e_mxfp8_precision(moonep_groups):
         _H,
         _Hp,
     )
-    combine_in_bf = torch.zeros(cap, _H, dtype=torch.bfloat16, device=y_bf.device)
-    combine_in_bf[:n] = (y_bf[:n] * recv_w_bf[:n].unsqueeze(1)).to(torch.bfloat16)
-    out_bf, _ = buf_bf.combine(combine_in_bf, handle_bf, topk_weights=recv_w_bf)
     torch.npu.synchronize()
 
     # —— 精度看护（链路级）—— fp8 量化误差在 x 值大时放大，不做
     # 逐值对拍（bf16 参考链 vs fp8 链数学不等）。验证链路可通 + 输出
     # 有限（无 NaN/Inf）+ 形状正确。fp8 量化精度的逐值看护需要控制
     # x 值域后专门设计（由 A13 的 LUT 字节对拍覆盖 fp8 数据面正确性）
-    assert out_fp8.shape == (_S, _H), f"out_fp8 形状 {out_fp8.shape}"
-    assert not torch.isnan(out_fp8.cpu().float()).any(), "fp8 链路输出含 NaN"
-    assert not torch.isinf(out_fp8.cpu().float()).any(), "fp8 链路输出含 Inf"
+    assert y_fp8.shape == (n, _H), f"y_fp8 形状 {y_fp8.shape}"
+    assert not torch.isnan(y_fp8.cpu().float()).any(), "fp8 链路输出含 NaN"
+    assert not torch.isinf(y_fp8.cpu().float()).any(), "fp8 链路输出含 Inf"
     # fp8 输出与 bf16 输出应有相关性（非独立随机——用 L2 距离粗校验）
-    l2_dist = (out_fp8.cpu().float() - out_bf.cpu().float()).norm().item()
-    l2_ref = out_bf.cpu().float().norm().item()
+    l2_dist = (y_fp8.cpu() - y_bf.cpu().float()).norm().item()
+    l2_ref = y_bf.cpu().float().norm().item()
     assert l2_dist < 5 * l2_ref, (
         f"fp8 与 bf16 输出完全无相关（L2 距离 {l2_dist:.1f} vs 参考 {l2_ref:.1f}）——链路数据异常"
     )

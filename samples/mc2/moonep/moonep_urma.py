@@ -1,0 +1,551 @@
+# Copyright (c) 2026 Huawei Technologies Co., Ltd.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+
+"""moonep_urma：新通信 API 的设备数据面原语（**仅 UBMEM**）。
+
+本模块承接 moonep 全部跨 rank 数据面（早期 ``ops.distributed`` 旧 API
+已移除，演进史见 git 历史）。
+
+**URMA 后端已退役（2026-11-16 用户指令——仅保留 UBMEM）**：SQE/CQE
+原语、逐 peer Urma 单连接、``MOONEP_TRANSPORT`` 模式分发与 ``const_expr``
+双传输裁剪全部删除；kernel 侧不再有传输分支（单一 UBMEM 直译）。模块与
+入口名保留历史称谓（``moonep_urma`` / ``connect_moonep_urma``——跨文件
+import 与 r128 分支兼容），勿再以其推断存在 URMA 通路。
+
+- **Host 控制面**（``connect_moonep_urma``）：本 rank 独立分配 workspace 张量
+  并注册（``MemoryDesc``），全组以相同布局公式各自分配（对称布局约定——
+  本 rank 私有注册内存，不受 HCCL_BUFFSIZE 约束、与 EB 通信域天然隔离）。
+  逐 peer 解析首个 UbMem 可达层建连（同层全互联聚单连接；部分
+  可达/多层分组当前直接拒绝——不回退）。
+- **UbMem 设备写**（``ub_write``）：两跳搬运（GM→UB staging 环→对端
+  mapped GM；``mem_copy`` 不支持 GM→GM——含远端 dst，A5 实证），
+  字节粒度分块编译期展开。
+- **到达信号（sentinel write）**：每 (peer, 轮) 的末笔额外一笔 4B epoch 写
+  对端的 per-sender **到达槽**（fence + 经 MTE3 数据通道写）——"哨兵到达
+  ⇒ 同通道此前数据全部落地"。接收侧 ``spin_u32_ge``（scalar load_bypass
+  轮询）等本端到达槽 ≥ epoch。
+- **rendezvous 屏障**（``urma_barrier_all``，名留史）：旧 per-peer flag
+  握手的 put flag + 自旋收齐——头部屏障语义沿用。
+
+布局约定（workspace 相对偏移；公式唯一真源 moonep_layout）：
+    到达槽（per sender rank）：notify_slot_off(r) = r * NOTIFY_STRIDE
+    值 = 本轮 epoch（u32）；epoch 跨算子单调（moonep_context 维护）。
+"""
+
+from __future__ import annotations
+
+import atexit
+import ctypes
+import threading
+
+import cannbotdsl as cbd
+import torch
+from cannbotdsl import Constexpr, comm, datastruct, dtypes
+from cannbotdsl.buffer import Buffer
+from cannbotdsl.core.ir_transport import unwrap_operand
+from cannbotdsl.types.datastruct import _marshal_datastruct
+from cannbotdsl.lang.constexpr import const_expr, range_constexpr
+from cannbotdsl.lang.jit import jit
+from cannbotdsl.ring_buffer import RingBuffer
+from cannbotdsl.tensor import MemLoc, make_layout, make_pointer, make_tensor, tile_slice
+from cannbotdsl.types._numeric import UInt64
+from moonep_layout import NOTIFY_STRIDE
+
+from cannbotdsl._mlir.dialects import cannbotir
+
+# ---------------------------------------------------------------------------
+# 到达槽布局（workspace 相对偏移；区域 [0, MAX_R*NOTIFY_STRIDE) ⊂ [0, HEAP_BASE)）
+# ---------------------------------------------------------------------------
+
+
+def notify_slot_off(rank: int) -> int:
+    """sender rank r 的到达槽偏移（接收侧 workspace 相对偏移，u32 值域）。"""
+    return int(rank) * NOTIFY_STRIDE
+
+
+# ---------------------------------------------------------------------------
+# 设备上下文 datastruct（host 构造字节、kernel 侧 StructRef 读取）
+# ---------------------------------------------------------------------------
+@datastruct(c_name="MoonepUrmaCommCtx")
+class MoonepUrmaCtx:
+    """设备侧通信上下文（rank/连接地址/本端 workspace 基址）。
+
+    Host 持有 connection 与 workspace 的生命周期；kernel 侧仅持借用视图
+    （官方样例 DeviceCommContext 同款契约）。
+    """
+
+    rankId: dtypes.uint64
+    rankSize: dtypes.uint64
+    connection: dtypes.uint64  # UbMem 单连接地址
+    localWsAddr: dtypes.uint64  # 本端 workspace 基址（到达槽/flags 轮询寻址）
+
+
+def marshal_ctx(rank_id, rank_size, connection, ws_addr):
+    """构造设备上下文字节 → uint8 NPU 张量（kernel 的 StructRef 实参）。"""
+    value = MoonepUrmaCtx(
+        rankId=rank_id,
+        rankSize=rank_size,
+        connection=connection.get_address(),
+        localWsAddr=ws_addr,
+    )
+    # __cannbotdsl_datastruct_schema__ 由 @datastruct 装饰器自动生成
+    # （cannbotdsl.types.datastruct._DatastructMeta），框架虽未暴露
+    # 公共序列化接口，但该属性是框架定义的稳定契约（样例代码同用法）
+    packed = _marshal_datastruct(value, MoonepUrmaCtx.__cannbotdsl_datastruct_schema__)
+    payload = ctypes.string_at(ctypes.addressof(packed), ctypes.sizeof(packed))
+    return torch.tensor(list(payload), dtype=torch.uint8).npu()
+
+
+# ---------------------------------------------------------------------------
+# UbMem 字节 staging 环（两跳搬运的 UB 中转；depth 流水 MTE2→MTE3）
+# ---------------------------------------------------------------------------
+UB_XFER_CHUNK = 32768  # 分块（字节）——行 224KB→7 块；小行单块
+# depth=3：in-flight 3×32KB=96KB（A5 实证 UB 预算约束：dispatch 表扫描
+# 占 128KB，ring 可用 ≤ 96KB（248-128-杂项）；depth=8 会 MLIR UB 超限
+# 编译失败——深度 2→3 是预算内最大加深）
+UB_XFER_DEPTH = 3
+
+
+def make_xfer_rb(depth=UB_XFER_DEPTH):
+    """UbMem 字节 staging 环（kernel __call__ 期分配，逐笔 next_write）。
+
+    depth 由调用方按其 UB 预算选（如 prefetch 用深环提高 MTE 在飞量；
+    reduce 的 UB 被 ub_row/ub_acc 大头占据，维持缺省浅环）。
+    """
+    return RingBuffer(
+        MemLoc.UB, dtypes.uint8, make_layout((UB_XFER_CHUNK,)), depth=depth
+    )
+
+
+def _gm_view(address, count, dtype):
+    """绝对地址（u64 运行期值）→ GM Tensor（官方样例同款，无分配无拷贝）。"""
+    return make_tensor(
+        make_pointer(dtype, dtypes.int64(address), MemLoc.GM), make_layout((count,))
+    )
+
+
+def tensor_address(tensor):
+    """Tensor → u64 GM 地址（提取 signless IR 后显式补 unsigned 语义）。"""
+    return UInt64(
+        cannbotir.extract_address(cannbotir.extract_pointer(unwrap_operand(tensor)))
+    )
+
+
+# ---------------------------------------------------------------------------
+# 设备原语（@jit；循环携带状态由调用方以变量传递——铁律 12）
+# ---------------------------------------------------------------------------
+@jit
+def spin_u32_ge(ctx, offset, epoch):
+    """自旋等待本端 workspace[offset] 追平 epoch（scalar bypass 轮询）。
+
+    offset 为 workspace 相对偏移（到达槽/flags 槽，运行期值）；epoch 为
+    运行期 uint32 标量。load_bypass（DCache 旁路）读 + while 轮询；
+    vec_busy_wait 是官方样例记载的自旋降频指令（避免纯死循环 100% 占核），
+    不是功能重复——删去则编译器可能消除轮询副作用（官方 wait_cqe 同款形态）。
+    用有符号差值判断是否到达，epoch 跨 2^32 回绕时仍然成立。
+    """
+    view = _gm_view(
+        dtypes.uint64(ctx.localWsAddr) + dtypes.uint64(offset), 1, dtypes.uint32
+    )
+    v = dtypes.uint32(cbd.scalar.load_bypass(view.ptr(0)))
+    while dtypes.int32(v - epoch) < 0:
+        cbd.vec_busy_wait(view[0], v, cmp=cbd.CmpOp.EQ)
+        v = dtypes.uint32(cbd.scalar.load_bypass(view.ptr(0)))
+    return v
+
+
+@jit
+def ub_write(peer, remote_off, src_addr, nbytes, xfer_rb):
+    """UbMem 两跳写：GM(src)→UB(staging 环)→对端 mapped GM（字节粒度）。
+
+    nbytes 为编译期常量——整块/尾块编译期展开（tile 计数静态）。当前
+    mem_copy 不支持 GM→GM（含远端 dst——A5 实证），故以 UB 环中转；
+    depth=2 使 MTE2（GM→UB）与 MTE3（UB→远端）流水。数据落地的完成由
+    调用方 fence（``_ub_fence``）或末笔 flag 写（``ub_flag_write``）收敛。
+    """
+    mapped = dtypes.uint64(peer.get_mapped_addr(0))
+    if const_expr(nbytes <= UB_XFER_CHUNK):
+        stage = xfer_rb.next_write()
+        cbd.mem_copy(
+            tile_slice(stage, (nbytes,), (0,)), _gm_view(src_addr, nbytes, dtypes.uint8)
+        )
+        cbd.mem_copy(
+            _gm_view(mapped + dtypes.uint64(remote_off), nbytes, dtypes.uint8),
+            tile_slice(stage, (nbytes,), (0,)),
+        )
+    else:
+        full = int(nbytes) // UB_XFER_CHUNK
+        tail = int(nbytes) % UB_XFER_CHUNK
+        for c in range_constexpr(full):
+            stage = xfer_rb.next_write()
+            off = c * UB_XFER_CHUNK
+            cbd.mem_copy(
+                tile_slice(stage, (UB_XFER_CHUNK,), (0,)),
+                _gm_view(src_addr + dtypes.uint64(off), UB_XFER_CHUNK, dtypes.uint8),
+            )
+            cbd.mem_copy(
+                _gm_view(
+                    mapped + dtypes.uint64(remote_off) + dtypes.uint64(off),
+                    UB_XFER_CHUNK,
+                    dtypes.uint8,
+                ),
+                tile_slice(stage, (UB_XFER_CHUNK,), (0,)),
+            )
+        if const_expr(tail > 0):
+            stage = xfer_rb.next_write()
+            off = full * UB_XFER_CHUNK
+            cbd.mem_copy(
+                tile_slice(stage, (tail,), (0,)),
+                _gm_view(src_addr + dtypes.uint64(off), tail, dtypes.uint8),
+            )
+            cbd.mem_copy(
+                _gm_view(
+                    mapped + dtypes.uint64(remote_off) + dtypes.uint64(off),
+                    tail,
+                    dtypes.uint8,
+                ),
+                tile_slice(stage, (tail,), (0,)),
+            )
+
+
+@jit
+def ub_write_local(dst_addr, src_addr, nbytes, xfer_rb):
+    """本端 GM→GM 两跳写（UB 跳板——自段行；与 ub_write 同构、目的为本端）。"""
+    if const_expr(nbytes <= UB_XFER_CHUNK):
+        stage = xfer_rb.next_write()
+        cbd.mem_copy(
+            tile_slice(stage, (nbytes,), (0,)), _gm_view(src_addr, nbytes, dtypes.uint8)
+        )
+        cbd.mem_copy(
+            _gm_view(dst_addr, nbytes, dtypes.uint8), tile_slice(stage, (nbytes,), (0,))
+        )
+    else:
+        full = int(nbytes) // UB_XFER_CHUNK
+        tail = int(nbytes) % UB_XFER_CHUNK
+        for c in range_constexpr(full):
+            stage = xfer_rb.next_write()
+            off = c * UB_XFER_CHUNK
+            cbd.mem_copy(
+                tile_slice(stage, (UB_XFER_CHUNK,), (0,)),
+                _gm_view(src_addr + dtypes.uint64(off), UB_XFER_CHUNK, dtypes.uint8),
+            )
+            cbd.mem_copy(
+                _gm_view(dst_addr + dtypes.uint64(off), UB_XFER_CHUNK, dtypes.uint8),
+                tile_slice(stage, (UB_XFER_CHUNK,), (0,)),
+            )
+        if const_expr(tail > 0):
+            stage = xfer_rb.next_write()
+            off = full * UB_XFER_CHUNK
+            cbd.mem_copy(
+                tile_slice(stage, (tail,), (0,)),
+                _gm_view(src_addr + dtypes.uint64(off), tail, dtypes.uint8),
+            )
+            cbd.mem_copy(
+                _gm_view(dst_addr + dtypes.uint64(off), tail, dtypes.uint8),
+                tile_slice(stage, (tail,), (0,)),
+            )
+
+
+@jit
+def _ub_fence():
+    """管同步 + 数据栅栏（MTE 写落地收敛——flag 写前/flush 用）。"""
+    cbd.vec_sync_pipe(cbd.PIPE.ALL)
+    cbd.scalar.data_barrier()
+
+
+@jit
+def ub_flag_write(peer, slot_off, value, src_addr):
+    """4B epoch 写对端槽——**经 MTE3 数据通道**（与数据写同 pipe 保序）。
+
+    A5 实证（combine 数值错位根因）：scalar bypass 写与 MTE3 批量写走
+    不同通道——64 行批量下 flag 先落地、数据在途，接收侧 kernel 返回后
+    torch/MTE 读窗仍见部分陈旧行。改经 UB 暂存 + mem_copy（MTE3）写
+    flag——同 pipe 内 MTE3 写按序完成，flag 到达即此前数据全部落地
+    （probe_ubmem_full 单笔形态原已验证同通道序，本修把批量形态对齐
+    到同一结论）。首尾 fence：数据写落地 + flag 全通道可见。
+    """
+    mapped = dtypes.uint64(peer.get_mapped_addr(0))
+    _ub_fence()
+    # 值经 GM 源（epoch 张量视图）→ UB → MTE3 写对端——全程数据通道，
+    # 免 UB 标量运行期赋值（@jit 不支持动态标量写 UB 元素）
+    ub_flag = Buffer(MemLoc.UB, dtypes.uint32, make_layout((1,)))
+    cbd.mem_copy(ub_flag, _gm_view(src_addr, 1, dtypes.uint32))
+    cbd.mem_copy(_gm_view(mapped + dtypes.uint64(slot_off), 1, dtypes.uint32), ub_flag)
+    _ub_fence()
+
+
+@jit
+def connection_from_address(addr):
+    """构造 UbMem 连接借用视图（kernel 侧从 ctx.connection 取地址后解析）。"""
+    return comm.UbMemConnection.from_address(addr)
+
+
+@jit
+def xfer_open(ctx, peer_idx):
+    """解析 peer 传输句柄（ctx.connection 上 get_peer(peer_idx)）。
+
+    返回 peer handle（``peer.get_mapped_addr`` 直接寻址对端 workspace）。
+    """
+    conn = comm.UbMemConnection.from_address(dtypes.uint64(ctx.connection))
+    return conn.get_peer(peer_idx)
+
+
+# ---------------------------------------------------------------------------
+# rendezvous 屏障（put flag + 自旋收齐；函数名 urma_* 留史）
+# ---------------------------------------------------------------------------
+@jit
+def urma_barrier_all(
+    ctx,
+    rank_size: Constexpr[int],
+    flags_off,
+    gm_epoch,
+    epoch,
+):
+    """向全部 peer 直推本轮 epoch flag 并自旋收齐（单 block 调用）。
+
+    flags 区：workspace 相对偏移 flags_off 起的 (MAX_R,) int32 槽（旧
+    BAR_FLAGS_OFF 布局同款，flag 槽按 sender rank 索引）；flag 数据取
+    gm_epoch（[1] int32 张量，host 侧按 epoch 填好）。
+
+    rank_size 为编译期常量，逐 peer range_constexpr 展开：每笔 flag 走
+    ub_flag_write（经 MTE3 数据通道，首尾 fence）。返回即：本轮全部
+    flag 已落地对端且全部对端 flag 已收齐——头部屏障语义（对端 kernel
+    启动即其流序在前的 host 写入已完成）。
+    """
+    me64 = dtypes.uint64(ctx.rankId)
+    src_addr = tensor_address(gm_epoch)
+    for p in range_constexpr(rank_size):
+        if dtypes.uint64(p) != me64:
+            peer_idx = dtypes.uint32(dtypes.uint64(p))
+            if dtypes.uint64(p) > me64:
+                peer_idx = peer_idx - dtypes.uint32(1)
+            peer = xfer_open(ctx, peer_idx)
+            ub_flag_write(
+                peer,
+                dtypes.uint64(flags_off) + me64 * dtypes.uint64(4),
+                epoch,
+                src_addr,
+            )
+    for p in range_constexpr(rank_size):
+        if dtypes.uint64(p) != me64:
+            spin_u32_ge(
+                ctx,
+                dtypes.uint64(flags_off) + dtypes.uint64(p) * dtypes.uint64(4),
+                epoch,
+            )
+
+
+# ---------------------------------------------------------------------------
+# Host 控制面：建连（layer 选择 + 校验 + 上下文字节）
+# ---------------------------------------------------------------------------
+_CONNECT_LOCK = threading.Lock()
+_TAG_SEQ = 0  # 同通信域内连接 tag 唯一化（对称进程序列 ⇒ 全 rank 同步推进）
+
+# 活连接注册表：解释器退出前干净断连（逆序）——防通信原生对象在
+# 任意 GC 次序下被回收引发的退出期 SIGSEGV。实证链（2026-11-14）：
+# 显式 close 的 smoke 干净退出；泄漏连接的测试进程 rank0 退出 segv；
+# 且脏退出使同卡下一个进程建连挂起（HCCL/URMA 域残留）——atexit
+# 断连同时消两个问题。close() 已断连的重复调用幂等（try 吞）。
+_LIVE_CONNECTIONS = []
+
+
+def _register_connection(conn):
+    _LIVE_CONNECTIONS.append(conn)
+    return conn
+
+
+@atexit.register
+def _disconnect_all():
+    for conn in reversed(_LIVE_CONNECTIONS):
+        try:
+            conn.disconnect()
+        except Exception:  # noqa: BLE001
+            pass
+    _LIVE_CONNECTIONS.clear()
+
+
+class _TopoNative:
+    """0.8.3 x86 面 adapter：native handle 上的 layer 级协议表 + 逐对
+    check_reachable（x86 whl 的 Python 层移除旧方法且 get_peer_protocols
+    委托的 native 符号缺失——native handle 持完整旧方法面，混装实证可用）。
+
+    ``handle`` 为 native handle（``domain._native``）；``domain`` 提供
+    ``get_rank_id``。
+    """
+
+    def __init__(self, domain, handle):
+        self._domain = domain
+        self._handle = handle
+
+    def protocols(self, layer, peer):
+        return [_proto_value(x) for x in self._handle.get_protocols(layer)]
+
+    def reachable(self, layer, peer, proto):
+        me = self._domain.get_rank_id()
+        return bool(self._handle.check_reachable(me, peer, layer, comm.Protocol(proto)))
+
+
+class _TopoPeerProto:
+    """0.8.3 aarch64 面 adapter：``get_peer_protocols(layer, dst)`` 逐对协议表。
+
+    A5_8P（aarch64 0.8.3）实证唯一可用查询面——可达性 = 目标协议出现在
+    该 (layer, peer) 的链路协议列表中（无独立 check_reachable 查询）。
+    """
+
+    def __init__(self, handle):
+        self._handle = handle
+
+    def protocols(self, layer, peer):
+        return [_proto_value(x) for x in self._handle.get_peer_protocols(layer, peer)]
+
+    def reachable(self, layer, peer, proto):
+        return proto in self.protocols(layer, peer)
+
+
+def _topo_surface(domain):
+    """拓扑查询 API 面解析（0.8.3 两形态，按实证优先级）。
+
+    0.8.3（x86 whl）：native handle 持完整旧方法面（get_protocols /
+    check_reachable）——Python 层的 get_peer_protocols 委托符号缺失。
+    0.8.3（aarch64 whl）：两面旧方法均缺（native 亦无 get_protocols），
+    py-new ``get_peer_protocols(layer, dst)`` 直接给出 (me, dst) 逐对
+    协议表——A5_8P 建连/查询实证可用。
+
+    返回统一 adapter（``protocols(layer, peer)`` / ``reachable(layer,
+    peer, proto)``，proto 为数值）。
+    """
+    native = getattr(domain, "_native", None)
+    if native is not None and hasattr(native, "get_protocols"):
+        return _TopoNative(domain, native)
+    if hasattr(domain, "get_peer_protocols"):
+        return _TopoPeerProto(domain)
+    raise comm.CommError(
+        "通信域无可用拓扑查询面（get_protocols/get_peer_protocols）："
+        "native 与 Python handle 均缺失",
+    )
+
+
+def _proto_value(x):
+    """协议对象 → 数值（native 面可返回裸 int）。"""
+    return x.value if hasattr(x, "value") else x
+
+
+def _group_peers_by_layer(domain, peers, proto_enum):
+    """逐 peer 分组：{layer: [peers]}——任意拓扑建链的数据源。
+
+    对每个 peer，在层序中找首个含目标协议且 (me, p) 可达的层。
+    同层全互联（4/8 卡）自然聚成单组；跨层级/supernode/异构组网按
+    peer 落入不同层组——每组建一条连接（connect 的 peers 序保持升序，
+    peer 索引 = 组内位置）。不可达 peer 记 None（调用方决定处理）。
+    """
+    surface = _topo_surface(domain)
+    layers = domain.get_layers()
+    if not layers:
+        raise ValueError("通信域无可用网络层级")
+    proto = _proto_value(proto_enum)
+    groups = {}
+    for p in sorted(peers):
+        for layer in layers:
+            if proto not in surface.protocols(layer, p):
+                continue
+            if surface.reachable(layer, p, proto):
+                groups.setdefault(layer, []).append(p)
+                break
+        else:
+            groups.setdefault(None, []).append(p)
+    return groups
+
+
+def connect_moonep_urma(group_name, rank, rank_size, workspace, tag="moonep"):
+    """注册 workspace 并建连（**仅 UbMem**），返回 (connection, ctx_tensor)。
+
+    - workspace：torch uint8 NPU 张量（调用方持有；对称布局约定——全组
+      以相同公式各自分配，区域偏移一致）。
+    - UbMem（映射内存——层内 FullMesh）：全部 peer 同层可映射时单连接
+      承载；**部分可达或跨层多组当前直接拒绝**（URMA 回退已随传输退役
+      删除——2026-11-16 用户指令；多层混合形态留二期）。
+    - 通信域分离不变量自然消解：workspace 为本 rank 私有注册内存。
+    """
+
+    ws_addr = int(workspace.data_ptr())
+    ws_bytes = int(workspace.numel())
+    if ws_addr <= 0 or ws_bytes <= 0:
+        raise ValueError("workspace 须为有效 NPU 张量")
+    if not isinstance(workspace, torch.Tensor) or workspace.dtype != torch.uint8:
+        raise TypeError("workspace 须为 uint8 NPU 张量（布局公式以字节计）")
+    if rank_size < 2:
+        raise ValueError("rank_size >= 2 才需要建连（单 rank 无通信）")
+    domain = comm.get_comm_by_name(group_name)
+    if domain.get_rank_size() != rank_size:
+        raise ValueError(f"通信域 rank size {domain.get_rank_size()} != {rank_size}")
+    peers = [r for r in range(rank_size) if r != rank]
+    memories = [comm.MemoryDesc(ws_addr, ws_bytes)]
+    global _TAG_SEQ
+    connection = None  # 建连真源（None = 尚未连通）
+    with _CONNECT_LOCK:
+        # tag 追加进程级序号：同通信域多 context（测试池化等）防重名——
+        # 全 rank 以同序构造（集体纪律）⇒ 序号一致
+        unique_tag = f"{tag}-{_TAG_SEQ}"
+        # —— 直连建链（任意拓扑）：逐 peer 分 (layer) 组，每组一条 UbMem
+        #     连接——同层全互联聚单组；跨层级/supernode 异构按组多连接
+        #     当前不支持（单连接 ctx 结构 + kernel 侧 blk↔紧凑序换算假设
+        #     连接承载全部 peers），直接拒绝。
+        ub_groups = _group_peers_by_layer(domain, peers, comm.UbMemProtocol.UB_MEM)
+        fallback = ub_groups.pop(None, [])
+        if fallback:
+            missing = sorted(fallback)
+            raise comm.CommError(
+                f"UbMem 不可达 {len(fallback)}/{len(peers)} peers"
+                f"（不可达：{missing}）——部分可达/多层分组形态当前不支持"
+                "（URMA 回退已退役；多层混合留二期）",
+            )
+        if len(ub_groups) == 1:
+            layer, plist = next(iter(ub_groups.items()))
+            if len(plist) < len(peers):
+                # 部分可达：kernel 紧凑序换算假设全 peers——直接拒绝
+                raise comm.CommError(
+                    f"UbMem 组仅覆盖 {len(plist)}/{len(peers)} peers"
+                    "——部分可达形态当前不支持",
+                )
+            connection = domain.connect(
+                peers=plist,
+                layer=layer,
+                transport=comm.UbMem(),
+                memories=memories,
+                tag=unique_tag,
+            )
+            _register_connection(connection)
+        elif len(ub_groups) > 1:
+            # 多层 UbMem：单连接 ctx 结构不支持多组——直接拒绝（二期）
+            raise comm.CommError(
+                f"UbMem 分层多组（{len(ub_groups)} 组）——多组形态当前不支持"
+                "（需 ctx 扩展与查表；URMA 回退已退役）",
+            )
+        else:
+            # 拓扑查询全空（协议查询可能返回空列表）——直接 UbMem 试连
+            # layer 0：单层全互联形态下连接本身可行（探针实证：查询面空
+            # ≠ 传输不可用）；失败即报错（无回退）
+            try:
+                connection = domain.connect(
+                    peers=peers,
+                    layer=0,
+                    transport=comm.UbMem(),
+                    memories=memories,
+                    tag=unique_tag,
+                )
+                _register_connection(connection)
+            except comm.CommError:
+                pass  # 试连失败——落到下方统一报错
+        _TAG_SEQ += 1
+        if connection is None:
+            raise comm.CommError(
+                "无法建立 UbMem 通信连接——检查 CANN 环境与拓扑"
+                "（native 查询面全空且 layer-0 试连失败）",
+            )
+    ctx_tensor = marshal_ctx(rank, rank_size, connection, ws_addr)
+    return connection, ctx_tensor

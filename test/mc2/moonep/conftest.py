@@ -48,20 +48,13 @@ def moonep_groups(request):
     _init_ep_group()  # torchrun bootstrap（幂等；skip 语义与用例内一致）
     world = dist.get_world_size()
 
-    from moonep_buffer import MoonepBuffer
     from torch_npu._C._distributed_c10d import ProcessGroupHCCL
 
-    # moonep 组：静态方法算堆容量
-    moon_mb = MoonepBuffer.get_moon_ep_ccl_buffer_size(
-        32,
-        32,
-        16,
-        8,
-        4 * world,
-        slots=2,
-    )
+    # moonep 组：数据面走私有 workspace，不占通信域 HCCL 外部 buffer——
+    # 注入引擎下限（2 MB，覆盖 comm 控制面/建连握手）封顶测试进程显存
+    # （组显存配置由建组方即本测试自理；不注入即用 HCCL 缺省配置）
     opts = ProcessGroupHCCL.Options()
-    opts.hccl_config = {"hccl_buffer_size": moon_mb}
+    opts.hccl_config = {"hccl_buffer_size": 2}
     group = dist.new_group(
         backend="hccl",
         ranks=list(range(world)),
@@ -69,14 +62,22 @@ def moonep_groups(request):
         pg_options=opts,
     )
 
-    # EB 组：静态方法算通信 buffer
-    eb_mb = MoonepBuffer.get_moe_ep_ccl_buffer_size(
-        world,
-        32,
-        32,
-        4 * world,
-        8,
-    )
+    # EB 组：EB 数据面自建注册内存（不占 HCCL 外部 buffer）；建组建议值
+    # 直取 EB 包自身的静态方法（当前为默认值）。纯 DSL 验证环境（venv 未装
+    # cann_ops_transformer——cp312 无配套 wheel）降级按下限注入（EB 后端
+    # 用例不在该环境运行——DSL 侧用例零影响）
+    try:
+        from cann_ops_transformer.ops import ElasticBuffer
+
+        eb_mb = ElasticBuffer.get_moe_ep_ccl_buffer_size(
+            world,
+            32,
+            32,
+            4 * world,
+            8,
+        )
+    except (ImportError, ModuleNotFoundError):
+        eb_mb = 2
     ep_opts = ProcessGroupHCCL.Options()
     ep_opts.hccl_config = {"hccl_buffer_size": eb_mb}
     ep_group = dist.new_group(

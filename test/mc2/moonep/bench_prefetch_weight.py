@@ -44,8 +44,11 @@ _BARRIER_HINTS = ("moonepbarrierkernel",)
 def _build_etc(pattern, rank_size, epn):
     """构造与 plan 输出同格式的 experts_to_copy [R, epn]，每行单一 home rank。
 
-    fanout: 除 rank0 外的每个 dst 都从 home0 取 epn 个专家（最坏 fan-out）。
-    ring  : dst d 从 home (d+1)%R 取，每个 rank 恰好服务一个 peer。
+    fanout   : 除 rank0 外的每个 dst 都从 home0 取 epn 个专家（最坏 fan-out）。
+    ring     : dst d 从 home (d+1)%R 取，每个 rank 恰好服务一个 peer。
+    revfanout: 仅 dst0 从全部 home 1..R-1 取（rank0 收满 3 链——写侧
+               ingress 对照口径：测的是 3 对端同时推入 rank0 的聚合，
+               与 reduce fanout 的读侧 ingress 同构）。
     """
     etc = torch.full((rank_size, epn), -1, dtype=torch.int32)
     for dst in range(rank_size):
@@ -56,6 +59,13 @@ def _build_etc(pattern, rank_size, epn):
         elif pattern == "ring":
             home = (dst + 1) % rank_size
             etc[dst] = torch.arange(home * epn, (home + 1) * epn, dtype=torch.int32)
+        elif pattern == "revfanout":
+            if dst != 0:
+                continue
+            n_home = rank_size - 1
+            for j in range(epn):
+                home = 1 + (j % n_home)
+                etc[dst][j] = home * epn + (j // n_home)
         else:
             raise ValueError(f"unknown pattern {pattern}")
     return etc
@@ -122,7 +132,14 @@ def main():
     rank, world = dist.get_rank(), dist.get_world_size()
     torch.npu.set_device(rank)
 
-    ctx = create_moonep_context()
+    # workspace 按形状精算（分配即所需——context 缺省仅 plan 交换区下界）
+    from moonep_buffer import _workspace_need
+
+    ctx = create_moonep_context(
+        workspace_bytes=_workspace_need(
+            world, args.epn, args.w_elems, 1, torch.bfloat16, torch.bfloat16
+        )
+    )
     ctx.last_plan_shape = (32, 8)  # 绕开 plan 的调用顺序守卫
 
     reals = [
@@ -141,11 +158,11 @@ def main():
         torch.npu.synchronize()
         dist.barrier()
 
-        # 每拍先全组对齐再测：对齐用样例自带的 sym_barrier（对称堆自旋，
-        # 不走 HCCL）——本机把 dist.barrier() 放进 profiler 窗口会触发
-        # HCCL AICPU 的 RunAicpuIndOpThreadInit 异常。
-        # 每拍因此有 2 个 barrier kernel：对齐（调用前）+ 收尾（finish_op 内），
-        # 按起始时间配对后分别统计。
+        # 每拍先全组对齐再测：对齐用 sym_barrier（不走 HCCL）——把
+        # dist.barrier() 放进 profiler 窗口会触发 HCCL AICPU 的
+        # RunAicpuIndOpThreadInit 异常。
+        # 0.8.2 起 finish_op 不再追加独立 barrier（到达等待内联在 push
+        # kernel 中）——每拍恰 1 个对齐 barrier kernel，直接全量统计。
         out_dir = os.path.join(args.out, pattern, f"r{rank}")
         config = torch_npu.profiler._ExperimentalConfig(
             profiler_level=torch_npu.profiler.ProfilerLevel.Level0
@@ -168,13 +185,12 @@ def main():
             prof.step()
 
         push, barrier_rows, names = _summarize(out_dir)
-        barrier_rows.sort()
         payload = {
             "rank": rank,
             "pushed_bytes": _pushed_bytes(etc_cpu, rank, args.epn, args.w_elems),
             "push": push,
-            "align_barrier": [dur for _, dur in barrier_rows[0::2]],
-            "barrier": [dur for _, dur in barrier_rows[1::2]],
+            "align_barrier": [dur for _, dur in barrier_rows],
+            "barrier": [],
             "names": sorted(names),
         }
         gathered = [None] * world
@@ -200,6 +216,18 @@ def main():
                     f"barrier {_fmt(barrier, 'us')} | "
                     f"align {_fmt(item['align_barrier'], 'us')} | {gbs}"
                 )
+            if pattern == "revfanout":
+                # rank0 写侧 ingress：3 对端推入 rank0 的总量 / 接收方 kernel 时长
+                # （rank0 无推送行——其 kernel 时长 = 等收齐三链数据的完成证明）
+                recv_bytes = sum(item["pushed_bytes"] for item in gathered[1:])
+                r0_push = gathered[0]["push"]
+                if r0_push and recv_bytes:
+                    ingress = recv_bytes / (statistics.median(r0_push) * 1e-6) / 1e9
+                    print(
+                        f"[revfanout] rank0 WRITE-INGRESS: {recv_bytes / 2**20:.3f} MiB "
+                        f"in {statistics.median(r0_push):.1f}us = {ingress:.1f} GB/s"
+                        "（写侧入站聚合——与 reduce fanout 读侧 73 GB/s 同构对照）"
+                    )
             print(f"rank0 kernels: {gathered[0]['names']}")
 
 

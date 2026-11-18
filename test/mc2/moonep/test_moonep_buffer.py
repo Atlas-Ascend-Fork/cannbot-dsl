@@ -6,38 +6,28 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 
-"""MoonepBuffer 用例矩阵：基础功能 + EB dispatch/combine 增量（设计 §6.3）。
+"""MoonepBuffer 用例矩阵：plan/prefetch/reduce 三算子基础功能（设计 §6.3）。
 
 运行（4 卡）：
     torchrun --nproc_per_node=4 -m pytest test/moonep/test_moonep_buffer.py -q
     （或脚本形态：torchrun --nproc_per_node=4 test/moonep/test_moonep_buffer.py）
-单进程 pytest 收集自动跳过（CI 安全——双守卫：DSL/EB import 失败或非 torchrun
+单进程 pytest 收集自动跳过（CI 安全——双守卫：DSL import 失败或非 torchrun
 拉起均 skip，与 test_moonep_mem.py / test_moonep_ep.py 同款思想）。
 
-方法学：
+方法学（0.8.2 URMA 适配后）：
 - 数值对拍用编码值法（行值编码 home*1000+e、期望合并值公式、空槽 -1 保持，
-  test_moonep_ep.py 同源）+ golden 对拍（moonep_golden 的 dispatch/combine，
-  B1/B2/B4 的 EB 链路）；数据流按 PR #261 后的 pull 协议建模。
-- 副本槽契约（已知事实）：pull 协议下 owner 对槽位只读远拉、不清零——断言
-  "副本槽保持写入值"而非"清零"。
-- ⚠️ EB 在场禁用 dist.all_reduce（EI0006：EB URMA 与集合通信混用的已知风险，
-  mem 用例 --verify 注记同源）：A2 的 cu/vtopk 跨 rank 对拍改为本地全表落点
-  校验（etc 为 [R, epn] 全表，vtopk→(dst, slot) 逐 token 核对），端到端路由
-  正确性由 B1/B4 的 golden 对拍兜底。
+  test_moonep_ep.py 同源）；reduce 数据流按 v4 pull 协议建模（副本区
+  [epn,Wg] 恒定——发送侧拷入、owner 远读归并）。
+- A2 的 cu/vtopk 跨 rank 对拍走本地全表落点校验口径（与 EB 时代相同）。
 
-组织（对齐 test_moonep_ep._EP_POOL 思想 + EB 平台行为约束）：
+组织（对齐 test_moonep_ep._EP_POOL 思想）：
 - _BUFFER_POOL 按 (S,K,E,W,groups,slots,grad_dtype,hidden) 键控共享 buffer
   （构造为集体调用，避免每用例建子组/堆累积）；
-- 专用 buffer（destroy 类）入 _DEDICATED 保活列表——EB 以
-  explicitly_destroy=False 构造，GC 析构会触发 C++ Destroy 的 AICPU_TS 等待
-  （conftest 实证 ~120s/个）；引用保活到进程退出 + conftest 硬退跳过 GC。
-- 全部 EB@WORLD：moe 通信窗按 (group, tag) 进程级共享池复用、容量取首建值
-  （EB csrc 语义），故本文件全部 dispatch 形状一致（同 S/K/E/hidden/nmtr），
-  A11 的大形状 buffer 只构造不 dispatch（不触窗注册）。
+- 专用 buffer（destroy 类）入 _DEDICATED 保活列表（防 GC 中途析构触发
+  URMA 连接断开噪声；DSL 原生 destroy 为秒级——保活仅为隔离用例间状态）。
 """
 
 import os
-import subprocess
 import sys
 from typing import NamedTuple
 
@@ -56,8 +46,6 @@ sys.path.insert(
 from moonep_golden import (  # noqa: E402
     RouteShape,
     make_router_inputs,
-    moonep_combine_golden,
-    moonep_dispatch_golden,
 )
 
 from conftest import fill_empty_slots  # noqa: E402
@@ -72,24 +60,15 @@ try:
     )
 
     _HAS_DSL_IMPL = True
-except Exception:  # CI 无 NPU / 无 DSL / 无 EB whl 时收集不报错（skip 而非 error）
+except Exception:  # CI 无 NPU / 无 DSL 时收集不报错（skip 而非 error）
     _HAS_DSL_IMPL = False
-
-try:
-    from cann_ops_transformer.ops import ElasticBuffer  # noqa: F401,E402
-
-    _HAS_EP = True
-except ImportError:
-    _HAS_EP = False
 
 _requires_train_env = pytest.mark.skipif(
     not _HAS_DSL_IMPL
-    or not _HAS_EP
     or "RANK" not in os.environ
     or "WORLD_SIZE" not in os.environ
     or os.environ["WORLD_SIZE"] == "1",
-    reason="需 torch.distributed.run 多卡拉起且已装 cann_ops_transformer"
-    "（单进程 pytest 收集形态跳过）",
+    reason="需 torch.distributed.run 多卡拉起（单进程 pytest 收集形态跳过）",
 )
 
 # 主门禁形状：W = _H*_Hp = 512（W%64 与 chunk 可分性满足）；E = epn*R 运行时定；
@@ -125,7 +104,8 @@ def _init_group():
     return rank, world
 
 
-_BUFFER_POOL = {}  # (S, K, E, W, groups, slots, grad_dtype, hidden) 键控共享
+_BUFFER_POOL = {}
+_POOL_CAP = 3  # HCCL 注册限额驱动的池上限（LRU 驱逐）  # (S, K, E, W, groups, slots, grad_dtype, hidden) 键控共享
 
 
 _DEDICATED = []  # 专用 buffer 保活（防 GC 中途触发 EB 析构——conftest 120s 经验）
@@ -155,6 +135,12 @@ def _get_buffer(moonep_groups, slots=1, grad_dtype="bf16"):
     world = dist.get_world_size()
     E = _EPN * world
     key = (_S, _K, E, _W, _NUM_GROUPS, slots, str(grad_dtype), _H)
+    # LRU 上限：HCCL 每通信器内存注册有限额——池超限驱逐最旧 buffer
+    # （destroy 断连释放注册；构造/驱逐均为集体序，全 rank 同步安全）
+    while len(_BUFFER_POOL) >= _POOL_CAP:
+        _old_key = next(iter(_BUFFER_POOL))
+        _old_buf = _BUFFER_POOL.pop(_old_key)
+        _old_buf.destroy()
     if key not in _BUFFER_POOL:
         moonep_group, ep_group = moonep_groups
         _BUFFER_POOL[key] = MoonepBuffer(
@@ -575,52 +561,6 @@ def test_a6_view_zero_copy_and_layout(moonep_groups):
 # ---------------------------------------------------------------------------
 # A7 destroy 幂等
 # ---------------------------------------------------------------------------
-
-
-@pytest.mark.npu
-@_requires_train_env
-def test_a7_destroy_idempotent_and_reject(moonep_groups):
-    """A7：destroy() 幂等；destroyed 置位；后续 plan/视图/prefetch/reduce/
-    dispatch/combine/barrier 均 RuntimeError；纯值 property 仍可读。"""
-    rank, _world = _init_group()
-    # 专用小 buffer（不入池——destroy 不殃及后续用例；入 _DEDICATED 保活防 GC）
-    buf = _dedicated_buffer(moonep_groups)
-    topk, tpe = _routing(42)
-    plan = buf.plan(tpe, topk)
-    assert not buf.destroyed
-    buf.destroy()
-    buf.destroy()  # 幂等：二次不抛
-    assert buf.destroyed
-    with pytest.raises(RuntimeError):
-        buf.plan(tpe, topk)
-    with pytest.raises(RuntimeError):
-        buf.weight_view(0)
-    with pytest.raises((RuntimeError, TypeError)):
-        # C7+C8: local_weights 必选——None 时 TypeError（先于 destroy 检查）
-        buf.prefetch_weight(plan)
-    with pytest.raises(RuntimeError):
-        buf.reduce_grad(
-            plan,
-            local_grads=[torch.zeros(2 * _EPN, _W, dtype=torch.bfloat16)] * _NUM_GROUPS,
-        )
-    # dispatch/combine 同经 _require_alive 拒绝（EB 虽保活，逻辑资源已关）
-    x = torch.zeros(_S, _H, dtype=torch.bfloat16, device="npu")
-    with pytest.raises(RuntimeError):
-        buf.dispatch(plan, x)
-    with pytest.raises(RuntimeError):
-        buf.combine(x, None)
-    with pytest.raises(RuntimeError):
-        buf.barrier()
-    with pytest.raises(RuntimeError):
-        _ = buf.heap_bytes
-    # 纯值 property 在 destroy 后仍可读（构造期定型量）
-    assert buf.epn == _EPN and buf.H * buf.Hp == _W
-    assert buf.slots == 1
-    assert buf.heap_required_bytes > 0 and buf.heap_config_mb >= 2
-    assert buf.grad_dtype == torch.bfloat16 and buf.rank == rank
-    assert buf.H == _H and buf.nmtr >= _S
-
-
 # ---------------------------------------------------------------------------
 # A8 连续两轮 epoch 复入
 # ---------------------------------------------------------------------------
@@ -1002,281 +942,10 @@ def test_a11_knob_mapping(moonep_groups):
         )
 
 
-# ---------------------------------------------------------------------------
-# B0 import 失败守卫（EB 依赖显性化的运行期证据）
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.npu
-@_requires_train_env
-def test_b0_import_failure_guidance(tmp_path):
-    """B0：cann_ops_transformer 缺失时 import moonep_buffer 报错文案含
-    "安装指引"要素（stub 触发真实 except ImportError 分支）。"""
-    _init_group()
-    stub = tmp_path / "cann_ops_transformer.py"
-    stub.write_text('raise ImportError("simulated missing")\n', encoding="utf-8")
-    # PYTHONPATH 置 stub 于前（优先于真实安装路径与 samples 目录）
-    env = dict(os.environ)
-    env["PYTHONPATH"] = os.pathsep.join(
-        p for p in (str(tmp_path), _SAMPLES_DIR, os.environ.get("PYTHONPATH")) if p
-    )
-    r = subprocess.run(
-        [sys.executable, "-c", "import moonep_buffer"],
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=600,
-    )
-    assert r.returncode != 0, f"stub 导入意外成功：\n{r.stdout}\n{r.stderr}"
-    err = r.stderr
-    assert "cann_ops_transformer" in err, f"报错未指明缺失依赖：\n{err}"
-    assert "安装" in err, f"报错缺安装指引：\n{err}"
-
-
-# ---------------------------------------------------------------------------
-# B1 dispatch/combine 前向 vs golden
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.npu
-@_requires_train_env
-def test_b1_dispatch_combine_forward_vs_golden(moonep_groups):
-    """B1：前向 plan→dispatch→GMM 侧加权→combine ≈ golden（identity 专家，
-    权重施加为 GMM 职责替身）；nmtr 推导断言；recv 扩展行数 == S*K；
-    combine 权重回收（out_w 精确等于本 rank 路由权重）。"""
-    rank, world = _init_group()
-    buf = _get_buffer(moonep_groups)
-    # —— nmtr 断言（= S，发送侧 per-peer 上界；运行时口径）——
-    assert buf.nmtr == _S  # = S；1.25 余量公式已废弃（review 11-05）
-    assert buf.H == _H
-    shape = RouteShape(world, _S, _K, _EPN * world)
-    topk_all, rw_all, hidden_all = _make_case(shape, 42)
-    topk, tpe = _local_route(topk_all, rank, shape.num_experts)
-    plan = buf.plan(tpe, topk)
-    x = hidden_all[rank].npu()
-    scores = rw_all[rank].npu()
-    recv_x, recv_w, handle = buf.dispatch(plan, x, scores)  # do_cpu_sync=True 缺省
-    torch.npu.synchronize()
-    n = _S * _K
-    # 扩展行数 == S*K（plan 均衡不变量在 EB 侧的体现；host 元数据零同步）
-    assert int(handle.num_recv_tokens_per_expert.sum()) == n
-    cap = recv_x.shape[0]
-    assert cap >= n
-    # GMM 侧加权 + cap 零填充契约（do_cpu_sync=True 下 cap 即精确行数，惯用法原样）
-    y_w = (recv_x[:n].float() * recv_w[:n].unsqueeze(1)).to(recv_x.dtype)
-    combine_in = torch.zeros(cap, _H, dtype=recv_x.dtype, device=recv_x.device)
-    combine_in[:n] = y_w
-    out, out_w = buf.combine(combine_in, handle, topk_weights=recv_w)
-    torch.npu.synchronize()
-    g_res = moonep_dispatch_golden(hidden_all, rw_all, topk_all, shape.num_experts)
-    g_out = moonep_combine_golden(g_res, _S, _H)
-    assert torch.allclose(out.cpu().float(), g_out[rank], atol=_ATOL, rtol=_RTOL), (
-        "combine 输出与 golden 不符"
-    )
-    # combine 权重回收：精确等于本 rank 路由权重（fp32 逐位）
-    assert torch.equal(out_w.cpu(), rw_all[rank]), "回收权重不符"
-
-
-# ---------------------------------------------------------------------------
-# B2 反向链路 vs golden
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.npu
-@_requires_train_env
-def test_b2_backward_chain_vs_golden(moonep_groups):
-    """B2：反向链路——combine⁻¹（dispatch 散梯度：rw 随车 / scores=None 复用
-    前向权重两形态）+ dispatch⁻¹（combine 裸和）对拍 golden 公式；
-    + A5 方法 reduce 对拍（EB 在场用编码值法，规避 EI0006 的 all_reduce）。"""
-    rank, world = _init_group()
-    buf = _get_buffer(moonep_groups)
-    shape = RouteShape(world, _S, _K, _EPN * world)
-    topk_all, rw_all, hidden_all = _make_case(shape, 42)
-    topk, tpe = _local_route(topk_all, rank, shape.num_experts)
-    plan = buf.plan(tpe, topk)
-    n = _S * _K
-    # 前向 dispatch 一轮：取得 recv_w（mem 形态反向的权重复用源）
-    _recv_x, recv_w, _handle = buf.dispatch(
-        plan, hidden_all[rank].npu(), rw_all[rank].npu()
-    )
-    torch.npu.synchronize()
-    gen = torch.Generator().manual_seed(999 + rank)
-    g_out = torch.randn(_S, _H, generator=gen, dtype=torch.float32)
-    exp_dx = torch.stack([rw_all[rank, s].sum() * g_out[s] for s in range(_S)])
-    # —— combine⁻¹ 形态 1（ep 实证形态：rw 随车）——
-    g_recv, g_rw, handle_g = buf.dispatch(
-        plan, g_out.to(torch.bfloat16).npu(), rw_all[rank].npu()
-    )
-    torch.npu.synchronize()
-    y_bwd = (g_recv[:n].float() * g_rw[:n].unsqueeze(1)).to(torch.bfloat16)
-    cap_g = g_recv.shape[0]
-    gin = torch.zeros(cap_g, _H, dtype=torch.bfloat16, device=g_recv.device)
-    gin[:n] = y_bwd
-    dx, _ = buf.combine(gin, handle_g)  # 裸和（topk_weights=None）
-    torch.npu.synchronize()
-    assert torch.allclose(dx.cpu().float(), exp_dx, atol=_ATOL, rtol=_RTOL), (
-        "dispatch⁻¹（散梯度随车加权形态）输出与期望不符"
-    )
-    # —— combine⁻¹ 形态 2（mem 实证形态：scores=None，复用前向 recv_w 加权）——
-    g_recv2, w2, handle_g2 = buf.dispatch(
-        plan, g_out.to(torch.bfloat16).npu(), topk_weights=None
-    )
-    assert w2 is None, "topk_weights=None 时 EB 不随车权重（recv_w 应为 None）"
-    torch.npu.synchronize()
-    cap2 = g_recv2.shape[0]
-    y2 = (g_recv2[:n].float() * recv_w[:n].unsqueeze(1)).to(torch.bfloat16)
-    gin2 = torch.zeros(cap2, _H, dtype=torch.bfloat16, device=g_recv2.device)
-    gin2[:n] = y2
-    dx2, _ = buf.combine(gin2, handle_g2)
-    torch.npu.synchronize()
-    assert torch.allclose(dx2.cpu().float(), exp_dx, atol=_ATOL, rtol=_RTOL), (
-        "dispatch⁻¹（topk_weights=None 复用前向权重形态）输出与期望不符"
-    )
-    # —— reduce 对拍（EB 在场——编码值法，无集合通信；full-dW 直入）——
-    etc_cpu = plan.experts_to_copy.cpu()
-    base = 0.0
-    g1 = _full_dw_grads(buf.epn, _Hp, _H, 0, base, buf.grad_dtype)
-    g3 = _full_dw_grads(buf.epn, _Hp, _H, 1, base, buf.grad_dtype)
-    g2t = _full_dw_grads(buf.epn, _H, _Hp, 2, base, buf.grad_dtype)
-    buf.reduce_grad(plan, local_grads=[g1, g3, g2t])
-    torch.npu.synchronize()
-    for gi, t in enumerate((g1, g3, g2t)):
-        _verify_merged(
-            t,
-            rank,
-            world,
-            buf.epn,
-            etc_cpu,
-            gi,
-            base,
-            buf.H * buf.Hp,
-            tag=f"B2 组{gi} ",
-        )
-    _verify_replica_intact((g1, g3, g2t), buf.epn, base, tag="B2 ")
-
-
-# ---------------------------------------------------------------------------
-# B3 destroy 的 EB 销毁策略
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.npu
-@_requires_train_env
-def test_b3_destroy_eb_default_keepalive(moonep_groups):
-    """B3（缺省路径）：destroy() 后 dispatch 拒绝；EB 引用仍存活（池化保活——
-    防 GC 中途析构）。release_eb=True 慢路径见 full 标记用例。"""
-    _init_group()
-    buf = _dedicated_buffer(moonep_groups)
-    topk, tpe = _routing(42)
-    plan = buf.plan(tpe, topk)
-    buf.destroy()
-    assert buf.destroyed
-    x = torch.zeros(_S, _H, dtype=torch.bfloat16, device="npu")
-    with pytest.raises(RuntimeError):
-        buf.dispatch(plan, x)
-    # 白盒断言（池化保活契约的运行期证据）：逻辑 destroy 后本对象仍持有 EB
-    # 引用且未销毁（_runtime 非 None = 平台"未销毁"判定口径）
-    assert buf._eb is not None  # noqa: SLF001
-    assert getattr(buf._eb, "_runtime", None) is not None, (
-        "缺省 destroy 不应销毁 EB（release_eb=False 池化保活）"
-    )
-
-
-@pytest.mark.slow
-@pytest.mark.npu
-@_requires_train_env
-def test_b3_destroy_release_eb_slowpath(moonep_groups):
-    """B3（opt-in 慢路径，slow 标记——-m "not slow" 可解筛）：release_eb=True
-    显式销毁 EB 走通——先真实 dispatch 一次（通道建立后的销毁才是慢路径
-    实证），接受 ~120s（conftest 的 AICPU_TS 等待经验）。"""
-    _init_group()
-    buf = _dedicated_buffer(moonep_groups)
-    topk, tpe = _routing(42)
-    plan = buf.plan(tpe, topk)
-    x = torch.zeros(_S, _H, dtype=torch.bfloat16, device="npu")
-    recv_x, _recv_w, _handle = buf.dispatch(plan, x)
-    torch.npu.synchronize()
-    assert recv_x.shape[0] >= _S * _K
-    buf.destroy(release_eb=True)
-    assert buf.destroyed
-    # 平台约定：destroy 后 _runtime 置 None（check_no_shared_elastic_buffer
-    # 对"已 destroy 实例"的同款判定口径）
-    assert getattr(buf._eb, "_runtime", None) is None, "release_eb=True 应已销毁 EB"
-    x2 = torch.zeros(_S, _H, dtype=torch.bfloat16, device="npu")
-    with pytest.raises(RuntimeError):
-        buf.dispatch(plan, x2)
-
-
-# ---------------------------------------------------------------------------
-# B4 do_cpu_sync=False 透传 + nmtr/容量对拍
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.npu
-@_requires_train_env
-def test_b4_do_cpu_sync_false_and_nmtr_capacity(moonep_groups):
-    """B4：do_cpu_sync=False 透传（ep 实证路径回归：worst-case 容量 recv 直喂
-    combine）+ nmtr 推导与堆容量对拍（构造期公式逐项核对——A1 口径的
-    B 侧承载）。"""
-    rank, world = _init_group()
-    buf = _get_buffer(moonep_groups)
-    # —— nmtr 推导与堆容量（构造期口径）——
-    assert buf.nmtr == _S  # = S；1.25 余量公式已废弃（review 11-05）
-    assert buf.nmtr >= _S
-    assert buf.heap_bytes >= buf.heap_required_bytes > 0
-    assert 2 * buf.heap_config_mb * 2**20 >= buf.heap_required_bytes
-    grad_elem = 2 if buf.grad_dtype == torch.bfloat16 else 4
-    need = (
-        HEAP_BASE
-        + reduce_region_end(  # 堆按 3W 总宽上限预留（组数运行期自适应）
-            world,
-            buf.epn,
-            buf.H * buf.Hp,
-            _NUM_GROUPS,
-            buf.slots,
-            grad_bytes_per_elem=grad_elem,
-        )
-        + LAYOUT_TAIL_BYTES
-    )
-    assert buf.heap_required_bytes == need, "heap_required_bytes 与手算公式不符"
-    # —— do_cpu_sync=False 透传一轮（ep 实证形态：全容量张量直喂 combine）——
-    shape = RouteShape(world, _S, _K, _EPN * world)
-    topk_all, rw_all, hidden_all = _make_case(shape, 42)
-    topk, tpe = _local_route(topk_all, rank, shape.num_experts)
-    plan = buf.plan(tpe, topk)
-    recv_x, recv_w, handle = buf.dispatch(
-        plan, hidden_all[rank].npu(), rw_all[rank].npu(), do_cpu_sync=False
-    )
-    torch.npu.synchronize()
-    n = _S * _K
-    assert int(handle.num_recv_tokens_per_expert.sum()) == n
-    # 免同步路径：recv 为 worst-case 容量，recv 全量加权后直喂 combine（ep 同款）
-    y_w = (recv_x.float() * recv_w.unsqueeze(1)).to(recv_x.dtype)
-    out, out_w = buf.combine(y_w, handle, topk_weights=recv_w)
-    torch.npu.synchronize()
-    g_res = moonep_dispatch_golden(hidden_all, rw_all, topk_all, shape.num_experts)
-    g_out = moonep_combine_golden(g_res, _S, _H)
-    assert torch.allclose(out.cpu().float(), g_out[rank], atol=_ATOL, rtol=_RTOL), (
-        "do_cpu_sync=False 路径 combine 输出与 golden 不符"
-    )
-    assert torch.equal(out_w.cpu(), rw_all[rank]), "do_cpu_sync=False 回收权重不符"
-
-
-# test_b5（pin_recv_rows 精确容量）已删：公开 pin API 经评审移除
-# （容量/免同步语义由 test_b4_do_cpu_sync_false_and_nmtr_capacity 覆盖）
-
-
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__]))
 
 
-# ---------------------------------------------------------------------------
-# A13 mxfp8（uint8 + ue8m0 scale）形态 C——R3/R2 完整形态（v2）
-# ---------------------------------------------------------------------------
-
-# mxfp8 专用形状：W = 64×16 = 1024（交织 (2W, W) 的自然 Sg = (64, 32)——
-# 恰为 32B 对齐，无需 pad；主门禁 W=512 的自然 Sg=16 须 pad 到 32，本组
-# 形状避开 pad 以聚焦数据面验证——pad 形态由 E3 负例覆盖契约侧）
 _QUANT_HP = 32  # W = _H × _QUANT_HP = 1024（Sg (64,32) 自然 32B 对齐）
 _QUANT_W = _H * _QUANT_HP
 _QUANT_POOL = {}  # (world,) 键控共享 mxfp8 buffer

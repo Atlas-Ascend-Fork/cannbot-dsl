@@ -8,42 +8,37 @@
 
 """Communication contexts and symmetric-memory layout for MoonEP weight prefetch.
 
-Resolves torch.distributed process groups into device-side CommContext tensors.
-Provides capacity checks, stream ordering, workspace storage and rank synchronization barriers."""
+新通信 API 适配（仅 UbMem——URMA 已退役删除，2026-11-16）：
+  - MoonepContext 持有本 rank 独立 workspace（uint8 NPU 张量，本 rank
+    私有注册内存）+ UbMem 连接 + 设备上下文字节
+    （StructRef[MoonepUrmaCtx]，含 connection 地址；类名留史）。
+  - 旧 ``cannbotdsl.ops.distributed``（SymBuffer / create_transfer_context /
+    hccl.get_comm_handle）已随其移除；数据面原语见 moonep_urma。
+  - 对称布局约定：全组以相同公式各自分配 workspace（区域偏移一致，
+    moonep_layout 为唯一真源）；旧 HCCL_BUFFSIZE 容量约束与 EB 通信域
+    分离契约（check_no_shared_elastic_buffer）随之消解——workspace 为
+    本 rank 私有注册内存。
+
+Resolves torch.distributed process groups into device-side MoonepUrmaCtx tensors.
+Provides capacity checks, stream ordering, workspace storage and rank
+synchronization barriers."""
 
 from __future__ import annotations
 
 import threading
 import warnings
 
-import torch
-import torch_npu
-
 import cannbotdsl
-from cannbotdsl import dtypes, make_layout
-from cannbotdsl import TensorSpec
-from cannbotdsl.buffer import Buffer
-from cannbotdsl.types.datastruct import StructRef
-from cannbotdsl.tensor import MemLoc, tile_slice
-from cannbotdsl.lang.constexpr import const_expr, range_constexpr
+import torch
+import torch.distributed as dist
+import torch_npu
+from cannbotdsl import TensorSpec, dtypes
 from cannbotdsl.lang.host import host
 from cannbotdsl.lang.kernel import kernel
-from cannbotdsl.ops.memcpy import mem_copy
-from cannbotdsl.ops.sync import PIPE, vec_busy_wait, vec_sync_notify, vec_sync_wait
-from cannbotdsl.ops.distributed import (
-    CommContext,
-    create_transfer_context,
-    SymBuffer,
-    TransferRole,
-    get_comm_context,
-)
-from cannbotdsl.ops.distributed.context import hccl
+from cannbotdsl.types.datastruct import StructRef
 
 # ---------------------------------------------------------------------------
-# moonep_layout 为布局契约唯一真源
-# （常量 + 区域公式 + LCM），moonep_topology 为 rank graph 层选择补丁
-# （host 侧建链驱动——见其模块 docstring）。此处重导出全部符号，
-# 既有 import 面（from moonep_context import HEAP_BASE, ...）零变更。
+# 布局契约唯一真源（moonep_layout）+ 旧 import 面重导出（零变更）
 # ---------------------------------------------------------------------------
 from moonep_layout import (  # noqa: F401
     BAR_FLAGS_OFF,
@@ -52,6 +47,7 @@ from moonep_layout import (  # noqa: F401
     LAYOUT_TAIL_BYTES,
     MAX_E,
     MAX_R,
+    NOTIFY_STRIDE,
     PLAN_REGION_END,
     READY_OFF,
     ROWS_PER_EXPERT,
@@ -60,17 +56,19 @@ from moonep_layout import (  # noqa: F401
     WEIGHT_DTYPE,
     XFER_WORKSPACE_BYTES,
     grad_slot_off,
+    group_slot_rows,
     lcm_slot_stride,
     prefetch_weight_off,
     reduce_region_end,
     reduce_stg_off,
     slot_stride_bytes,
 )
-from moonep_topology import (  # noqa: F401
-    _patch_rank_graph_layer_selection,
-    _select_rank_graph_links_by_protocol,
+from moonep_urma import (
+    MoonepUrmaCtx,
+    connect_moonep_urma,
+    marshal_ctx,
+    urma_barrier_all,
 )
-
 
 _RESIDENT_BLOCKS = None  # 本机有效 AIV 核数（首次查询后缓存）
 _FALLBACK_BLOCKS = 16  # 平台信息不可用时的保守值（小核数机型也不会卡死在同步屏障）
@@ -137,12 +135,13 @@ def resident_blocks(cap: int = 64) -> int:
 
 
 def finish_op(context, async_finish=False):
-    """完成权重预取的同步收尾。
+    """完成算子的同步收尾。
 
-    同步模式等待全组完成，记录发起流事件并检查布局容量状态，返回 None。
-    异步模式记录并返回发起流事件；调用方通过 wait_event 汇合后复用缓冲区。"""
+    数据到达证明由 kernel 内到达槽自旋收齐承担（尾部等待内联在
+    各算子 kernel 中），本函数不追加独立 sym_barrier——旧实现里
+    "kernel 内 barrier + finish_op 再 barrier" 的双屏障开销已消除。
+    同步模式记录发起流事件并检查布局容量状态；异步模式仅返回事件。"""
     if not async_finish:
-        sym_barrier(context)
         record_transport_event(context)  # 跨流护栏 fork 点（只等我方算子）
         check_pending_overflow(context)
         return None
@@ -155,9 +154,8 @@ def finish_op(context, async_finish=False):
 def normalize_group_list(context, tensors, op_name, *, min_groups=2, max_groups=3):
     """将 Tensor、list 或 tuple 归一化为列表，并检查组数、形状和布局元数据。
 
-    返回 ``(tensors, widths)``：``widths`` 为各组行宽元组（元素数）——
-    支持变宽组（交织型 W13 宽 2W、down 宽 W）。同一上下文内的组数由
-    首次调用确定（layout_groups 守卫防发布区/槽区错位）。
+    返回 ``(tensors, widths)``（组数/组宽定型守卫，
+    布局错位的防线上移到首调）。
     """
     if isinstance(tensors, torch.Tensor):
         tensors = [tensors]
@@ -173,7 +171,7 @@ def normalize_group_list(context, tensors, op_name, *, min_groups=2, max_groups=
     elif context.layout_groups != len(tensors):
         raise RuntimeError(
             f"权重组数不一致（已有 {context.layout_groups}，本次 {len(tensors)}），"
-            "会导致发布/staging 区重叠"
+            "会导致发布区/槽区重叠"
         )
     widths = []
     for g, t in enumerate(tensors):
@@ -181,8 +179,6 @@ def normalize_group_list(context, tensors, op_name, *, min_groups=2, max_groups=
             raise ValueError(
                 f"{op_name} 第 {g} 组须为 (行, ...) >= 2 维，实得 {tuple(t.shape)}"
             )
-        # 行宽 = 尾维展平宽（N-D 形态如 [行, F, D]——调用方免 reshape）；
-        # 行宽 0（如 [行, 0] 张量）须入口拦截——下游 LCM 公式会除零
         w = int(t.numel() // t.shape[0])
         if w <= 0:
             raise ValueError(
@@ -190,8 +186,6 @@ def normalize_group_list(context, tensors, op_name, *, min_groups=2, max_groups=
                 f"（张量形状 {tuple(t.shape)}）"
             )
         widths.append(w)
-    # 组宽守卫（E4）：与首调定型值一致——梯度槽区基址按实际 widths 计算，
-    # 宽度漂移会使槽区起点落进权重发布区（发布/槽区重叠互踩）
     widths = tuple(widths)
     if context.layout_widths is None:
         context.layout_widths = widths
@@ -227,29 +221,75 @@ def pick_weight_chunk(w_elems: int, ub_limit_elems: int) -> int:
 
 
 class MoonepContext:
-    """EP 组级通信上下文句柄：封装设备侧 CommContext 张量与组信息。
+    """EP 组级通信上下文句柄：workspace + UbMem 连接 + 设备侧上下文字节。
 
     Attributes:
-        ctx_tensor: torch.uint8 NPU 张量，CommContext 的设备侧字节（传给算子的
-            StructRef[CommContext] 入参）。
+        ctx_tensor: torch.uint8 NPU 张量，MoonepUrmaCtx 的设备侧字节（传给
+            算子的 ``StructRef[MoonepUrmaCtx]`` 入参）。
         rank: 本 rank 在 EP 组内的 id。
         rank_size: EP 组 rank 数。
+        workspace: 本 rank 私有 workspace（uint8 NPU 张量；对称布局约定）。
+        connection: cannbotdsl.comm.UrmaConnection（每 peer 独占 Jetty）。
     """
 
     def __init__(
-        self, group_name: str, *, op_name: str = "moonep", rank=None, rank_size=None
+        self,
+        group_name: str,
+        *,
+        op_name: str = "moonep",
+        rank=None,
+        rank_size=None,
+        workspace_bytes=None,
     ):
         self.group_name = group_name
-        self.ctx_tensor = get_comm_context(CommContext, group_name, op_name=op_name)
-        import torch.distributed as dist
 
         # rank/rank_size 缺省回退 WORLD；EP 为子通信域时由 create_moonep_context(group=...) 显式传入
         self.rank = dist.get_rank() if rank is None else rank
         self.rank_size = dist.get_world_size() if rank_size is None else rank_size
-        if self.rank_size > 64:
+        if self.rank_size > MAX_R:
+            # MAX_R 为布局定宽区域上限；引擎侧 COMM_MAX_RANK_NUM 的同级
+            # 上限尚未实机核对（>64 卡环境未验证）
             raise ValueError(
-                f"moonep 暂支持 EP 组 rank 数 <= 64（COMM_MAX_RANK_NUM），当前 {self.rank_size}"
+                f"moonep 支持 EP 组 rank 数 <= MAX_R={MAX_R}，当前 {self.rank_size}"
             )
+        # workspace：本 rank 私有注册内存（全组对称布局约定）。
+        # 容量：本张量即通信 buffer（本 rank 私有注册内存——分配字节即
+        # 实际容量）。数据面不占通信域 HCCL 外部 buffer——hccl_buffer_size
+        # 由通信域创建方自理（默认/显式值均可），库不感知。
+        # 缺省 = 本 context 自知的唯一硬需求（plan 交换区下界）——不做
+        # 环境变量级粗预留（2048MiB 缺省的额外预留已实证）；reduce/prefetch
+        # 的形状相关区域（权重/scale 发布区 + 梯度副本区）由调用方显式
+        # 传入（MoonepBuffer 按形状精算；裸 API 用 _workspace_need() 同式）。
+        if workspace_bytes is None:
+            workspace_bytes = HEAP_BASE + PLAN_REGION_END
+        workspace_bytes = int(workspace_bytes)
+        if workspace_bytes < HEAP_BASE + PLAN_REGION_END:
+            raise ValueError(
+                f"workspace {workspace_bytes} B 不足以容纳 plan 交换区 "
+                f"（需 >= {HEAP_BASE + PLAN_REGION_END} B）"
+            )
+        # 清零必做：到达槽/flags 区被轮询（≥ epoch 判定）——未清零的回收页
+        # 垃圾值会造成假到达（2GiB 新页恰好全零曾掩盖该缺陷；A5 实证小
+        # workspace 必现）。NPU memset ~1TB/s，2GiB ≈ 2ms。
+        self.workspace = torch.zeros(workspace_bytes, dtype=torch.uint8, device="npu")
+        self.workspace_bytes = workspace_bytes
+        # 单 rank 无副本可交换：不建连（算子侧 R==1 早退）
+        if self.rank_size >= 2:
+            # 建连前全组 barrier：对端协商要求全 rank 就绪，时序差会触发
+            # HcclChannelAcquire 竞态（A5 实证 code 19/11——skill 记载修法）；
+            # 全 rank 同序构造 ⇒ barrier 集体安全
+            if dist.is_available() and dist.is_initialized():
+                dist.barrier()
+            self.connection, self.ctx_tensor = connect_moonep_urma(
+                group_name,
+                self.rank,
+                self.rank_size,
+                self.workspace,
+                tag=op_name,
+            )
+        else:
+            self.connection = None
+            self.ctx_tensor = marshal_single_rank_ctx(self.rank, self.rank_size)
         # 单槽清单缓存：(etc 张量强引用, 清单 NPU 张量组)。同一 plan 的 etc 不变时，
         # reduce 重复调用免清单重建（清单由设备侧 kernel 从 etc 生成）；新 etc
         # （新 plan）自动重建。（内部状态，外部只读，勿改）
@@ -260,89 +300,56 @@ class MoonepContext:
         self.pull_scratch = None
         # 槽视图已用的 slots 值（一致性守卫——create_grad_slot_view 写入）。
         self.pull_slots_used = None
-        # plan 中间 workspace 缓存：((S,K,E,R), (dem/topk_all/rem/order))。
-        # A/B kernel 对四表全量覆写，同 shape 重复调用免分配。（内部状态，勿改）
         self.plan_workspace = None
-        # 跨流安全护栏状态：首个算子调用的发起流；跨流调用时
-        # 由 sync_transport_stream 做事件 fork/join 串行化（跨流时等
-        # transport_event=上一个我方算子的完成点，而非旧流尾部）
         self.transport_stream = None
         self.transport_event = None
-        # 调用者设置为 (S, K)，用于描述输入形状和窗口布局
         self.last_plan_shape = None
-        # rank 同步屏障作用域：EP 子组时由 create_moonep_context(group=...) 设置，缺省 WORLD
         self.group = None
-        # 多权重组布局守卫：同一上下文的组数须一致，避免发布区与工作区重叠
-        # （内部状态，勿改）
         self.layout_groups = None
-        # 组结构守卫：各组行宽/scale 行宽首调定型、此后不可变
-        # ——梯度槽区基址按实际 widths 计算，宽度漂移会使槽区起点落进发布区
-        # （内部状态，勿改）
         self.layout_widths = None
         self.layout_scale_widths = None
-        # 权重 dtype 定型值：MoonepBuffer 构造传入（weight_dtype）；
-        # 裸 API 首次 prefetch 冻结。dtype 进编译键与视图 dtype，不可漂移
-        # （内部状态，勿改）
         self.weight_dtype = None
-        # grad dtype 定型值：MoonepBuffer 构造传入（grad_dtype，
-        # 缺省 bf16）；裸 API 首次 reduce 冻结。local_grads 的 dtype 校验基
-        # （内部状态，勿改）
         self.grad_dtype = None
-        # 多槽窗口池层数：首个 create_weight_view 定型（缺省 1 = 单槽），
-        # 后续调用须一致；reduce 容量校验按它推导（内部状态，勿改）
         self.window_slots = None
-        # 通信域分离契约：ctx 创建时已校验一次；首个算子调用再复查一次，
-        # 覆盖"ctx 先建、ElasticBuffer 后建"的顺序（内部状态，勿改）
-        self.eb_scan_done = False
-        # plan 的延迟溢出检查载荷 (cu_seqlens, num_rows)：plan 返回路径零同步，
-        # 布局状态在预取完成后检查（sym_barrier 后流已排空，
-        # .item() 微秒级）执行（内部状态，勿改）
         self.pending_overflow = None
-        # HCCL 对称缓冲区（base, size）：每次 hccl.get_comm_handle +
-        # get_hccl_buffer 都是 C API 调用，而值在 comm 生命周期内不变——
-        # 缓存后 create_weight_view / prefetch / reduce 的每步 host 路径省掉它们
-        # （内部状态，勿改）
-        self.hccl_buf = None
-        # 权重视图缓存：{(epn, W, group, groups, slot, slots): tensor}。视图只是
-        # 同一块对称堆上的非拥有句柄，重复 create_weight_view 直接复用（免 HCCL
-        # API、免容量校验、免 npu_from_blob 扩展调用）（内部状态，勿改）
         self.weight_views = {}
-        # rank 同步屏障 epoch 张量（复用，避免每步 torch.full 分配）（内部状态，勿改）
         self.bar_epoch_t = None
 
-
-def _hccl_buf(context):
-    """(base, size) 单次查询后缓存在 context 上（comm 生命周期内不变）。"""
-    cached = context.hccl_buf
-    if cached is None:
-        comm = hccl.get_comm_handle(context.group_name)
-        cached = hccl.get_hccl_buffer(comm)
-        context.hccl_buf = cached
-    return cached
+    def close(self):
+        """断开连接（幂等；workspace/视图随张量引用回收）。"""
+        if getattr(self, "connection", None) is not None:
+            self.connection.disconnect()
+            self.connection = None
 
 
-def hccl_buffer_base(context):
-    """本 rank HCCL 对称缓冲区基址（SymBuffer 的 commBufferAddrs[me]）。"""
-    return _hccl_buf(context)[0]
+def marshal_single_rank_ctx(rank, rank_size):
+    """单 rank（R==1）的占位上下文（无连接；算子侧早退不触通信面）。"""
+
+    # connection 地址填 0：kernel 侧 R==1 路径在建连分支之前早退
+    return marshal_ctx(rank, rank_size, _NullConnection(), 0)
 
 
-def hccl_buffer_size(context):
-    """本 rank HCCL 对称缓冲区字节数。"""
-    return _hccl_buf(context)[1]
+class _NullConnection:
+    """R==1 占位（get_address 返回 0；不进入设备侧使用路径）。"""
+
+    def get_address(self):
+        return 0
+
+
+def workspace_base(context):
+    """本 rank workspace 基址（取代旧 hccl_buffer_base；视图/寻址唯一基点）。"""
+    return int(context.workspace.data_ptr())
 
 
 def check_heap_capacity(context, need_bytes, what):
-    """对称堆容量前置校验：不足即报所需/现有，防运行中 507899
-    静默越界（"driver internal error" 不指向根因，排查代价极高）。
-
-    need_bytes 为相对 HCCL 缓冲区起点的总占用（含 HEAP_BASE）。
-    """
-    heap_bytes = hccl_buffer_size(context)
+    """workspace 容量前置校验：不足即报所需/现有（沿用旧函数名与语义）。"""
+    heap_bytes = context.workspace_bytes
     if need_bytes > heap_bytes:
         raise RuntimeError(
-            f"{what}超出 HCCL 对称缓冲区：需要 {need_bytes} B "
+            f"{what}超出 workspace：需要 {need_bytes} B "
             f"({need_bytes / 2**20:.1f} MiB)，可用 {heap_bytes} B "
-            f"({heap_bytes / 2**20:.1f} MiB)。请调大 HCCL_BUFFSIZE。"
+            f"({heap_bytes / 2**20:.1f} MiB)。请按形状精算显式传入 "
+            "workspace_bytes（MoonepBuffer._workspace_need() 同式）。"
         )
 
 
@@ -362,80 +369,15 @@ def check_pending_overflow(context):
         )
 
 
-def check_no_shared_elastic_buffer(group_name):
-    """通信域分离契约校验：同 HCCL 通信器上存在存活 ElasticBuffer 即报错。
-
-    ElasticBuffer（moe_ep dispatch/combine）与 moonep 算子上下文共用通信器
-    即共用同一块 HCCL 对称堆：双方各自圈地导致 flag/staging 互相踩踏，表现
-    为 dispatch AIV 自旋死锁（~600s 后 507899 vector core timeout）。本校验
-    把挂死变为创建期/首次算子调用时的秒级明确错误。EB 须与
-    create_moonep_context 各用独立通信器（dist.new_group）。
-    """
-    import gc
-
-    try:
-        from cann_ops_transformer.ops import ElasticBuffer
-    except ImportError:
-        return
-    for obj in gc.get_objects():
-        if not isinstance(obj, ElasticBuffer):
-            continue
-        if getattr(obj, "_runtime", None) is None:  # 已 destroy 的实例不拦截
-            continue
-        if getattr(obj, "_group_name", None) == group_name:
-            raise RuntimeError(
-                "ElasticBuffer 与 moonep 算子上下文共用同一 HCCL 通信器"
-                f"（{group_name}）：双方在同一块对称堆上各自圈地会互相踩踏，"
-                "dispatch 将自旋死锁（507899）。请为 ElasticBuffer 与 "
-                "create_moonep_context 各建独立通信器（dist.new_group）。"
-            )
-
-
-def busy_wait_flag(view, gm_epoch, event_id, ub_flag=None, ub_epoch=None, exact=False):
-    """轮询 view 处 flag 就位（缺省 >= gm_epoch；exact=True 时 == gm_epoch）。
-
-    该握手原语用于同步标志。
-    ub_flag/ub_epoch 缺省现配；recv 侧按组轮询时由调用方共享传入，
-    避免每实例一对 UB 缓冲耗尽 VEC buf_id。
-
-    两种匹配语义的分工：
-    - **>=（缺省，rank 同步屏障 / plan ready 必须用）**：容忍"peer 已进入下一轮、
-      用 n+1 覆盖了自己槽位"——这两类收齐协议没有"对方已读走本轮 flag"的
-      回执，等待方可能读到超前值，改 == 会死锁。
-    - **==（exact=True，仅 reduce staging flag）**：WORLD 组对称堆在同进程
-      多用例间复用，flag 槽位的**残留数据**（前置 prefetch/多槽用例写入的
-      权重编码，bf16 位型当 int32 读数 ~1e9 大正数）在 >= 下被当作"已就位"，
-      recv 首轮即放行、读到在途的旧 staging。reduce 有组间 rank 同步屏障充当"读
-      完成回执"，== 无被下一轮覆盖的死锁风险；残留恰等于当轮 epoch 需 32 位
-      巧合，概率可忽略。
-    """
-    if ub_flag is None:
-        ub_flag = Buffer(MemLoc.UB, dtypes.int32, make_layout((1,)))
-        ub_epoch = Buffer(MemLoc.UB, dtypes.int32, make_layout((1,)))
-
-    def _check():
-        vec_sync_notify(PIPE.S, PIPE.MTE2, event_id)
-        vec_sync_wait(PIPE.S, PIPE.MTE2, event_id)
-        mem_copy(ub_flag, view)
-        mem_copy(ub_epoch, gm_epoch)
-        vec_sync_notify(PIPE.MTE2, PIPE.S, event_id)
-        vec_sync_wait(PIPE.MTE2, PIPE.S, event_id)
-        if exact:
-            return ub_flag[dtypes.int64(0)] == ub_epoch[dtypes.int64(0)]
-        return ub_flag[dtypes.int64(0)] >= ub_epoch[dtypes.int64(0)]
-
-    vec_busy_wait(_check)
-
-
 # ---------------------------------------------------------------------------
-# 对称堆上的 rank 自旋同步屏障
+# rank 自旋同步屏障（UbMem 直推 flag + 自旋收齐）
 # ---------------------------------------------------------------------------
-# sym_barrier 独立实现的依据：①流级设备序保证强于
-# host 侧集合通信（kernel 返回即全组本轮此前流上工作完成）；②无 host 往返；
-# ③epoch 单调防陈旧 flag 提前放行。用与数据面相同的 put/flag 通道做 rank
-# 对齐：flag 与数据同通道保序，不经过 HCCL 集合通信路径。
-_BAR_EVENT_ID = 5  # plan=7、reduce=6、barrier=5
+# 依据链：①流级设备序保证强于 host 侧集合
+# 通信（kernel 返回即全组本轮此前流上工作完成）；②无 host 往返；③epoch
+# 单调防陈旧 flag 提前放行；flag 与数据同通道（MTE3 数据通道，
+# ub_flag_write 首/尾 fence）保序。
 _BAR_EPOCH = 0  # 跨算子共享的单调 rank 同步屏障 epoch（各次调用共用一套 flag）
+_BAR_EPOCH_MAX = (1 << 31) - 1
 _BAR_PROGRAMS = {}
 _BAR_LOCK = threading.Lock()
 
@@ -444,91 +386,56 @@ _BAR_LOCK = threading.Lock()
 class _MoonepBarrierKernel:
     """各 rank 把本轮 epoch 直推全部 peer 的 flag 槽，再自旋收齐（单 block）。"""
 
-    def __init__(self, rank, rank_size):
-        self._me = int(rank)
+    def __init__(self, rank_size):
         self._r = int(rank_size)
 
-    def __call__(self, gm_epoch, ctx: StructRef[CommContext]):
-        world_size, me = self._r, self._me
-        flags = SymBuffer(
+    def __call__(self, gm_epoch, ctx: StructRef[MoonepUrmaCtx]):
+        epoch = dtypes.uint32(gm_epoch[dtypes.int64(0)])
+        urma_barrier_all(
             ctx,
-            shape=(MAX_R,),
-            dtype=dtypes.int32,
-            rank_size=world_size,
-            base_offset=BAR_FLAGS_OFF,
+            self._r,
+            BAR_FLAGS_OFF,
+            gm_epoch,
+            epoch,
         )
-        ub_xfer = Buffer(MemLoc.UB, dtypes.uint8, make_layout((512,)))
-        xfer = create_transfer_context(ctx, ub_xfer, role=TransferRole.VEC)
-        for r in range_constexpr(world_size):
-            if const_expr(r != me):
-                xfer.put(r, tile_slice(flags, (1,), (me,)).peer(r), gm_epoch)
-        for r in range_constexpr(world_size):
-            if const_expr(r != me):
-                xfer.flush(r)
-        # 共享一对轮询缓冲：range_constexpr 逐 peer 展开时缺省现配会让每个
-        # busy_wait_flag 实例各占一对 UB 缓冲——R=8 时 7 对耗尽 VEC buf_id
-        # （aivec 271 "scalar access internal buffer out of bounds"；R=4 的
-        # 3 对未触界）。与 reduce _poll_row 的共享形态同源。
-        ub_flag = Buffer(MemLoc.UB, dtypes.int32, make_layout((1,)))
-        ub_epoch = Buffer(MemLoc.UB, dtypes.int32, make_layout((1,)))
-        for r in range_constexpr(world_size):
-            if const_expr(r != me):
-                busy_wait_flag(
-                    tile_slice(flags, (1,), (r,)),
-                    gm_epoch,
-                    _BAR_EVENT_ID,
-                    ub_flag,
-                    ub_epoch,
-                )
 
 
-def _make_barrier_host(me, world_size):
-    """闭包工厂：rank/rank_size 进闭包参数（无 global 烘焙）。"""
-
+def _make_barrier_host(rank_size):
     @host
-    def _barrier_host(gm_epoch, ctx: StructRef[CommContext]):
-        _MoonepBarrierKernel(me, world_size)[1](gm_epoch, ctx)
+    def _barrier_host(gm_epoch, ctx: StructRef[MoonepUrmaCtx]):
+        _MoonepBarrierKernel(rank_size)[1](gm_epoch, ctx)
 
     return _barrier_host
 
 
 def record_transport_event(context, stream=None):
-    """各算子 wrapper 发射后记录完成事件（跨流护栏的 fork 点）。
-
-    后续跨流调用只等待本事件（上一个我方算子的完成点），而非发起流尾部
-    （主流尾部可能排着 dispatch 等非我方工作，等尾部会把双流重叠串行掉）。
-    事件对象复用（每步新建 torch.npu.Event() 有 host 分配开销；单线程
-    按序"先等后录"，重录语义安全）。stream 缺省取当前流；跨流调用方
-    传入 sync_transport_stream 返回的发起流，保证事件录在算子实际发射的流上。
-    """
+    """各算子 wrapper 发射后记录完成事件（跨流护栏的 fork 点）。"""
     ev = context.transport_event
     if ev is None:
         ev = context.transport_event = torch.npu.Event()
     ev.record(stream if stream is not None else torch.npu.current_stream())
 
 
-def _get_barrier_program(world_size, me):
-    """(world_size, me) 键控的 rank 同步屏障 program（闭包参数化，无 global）。"""
-    key = (world_size, me)
+def _get_barrier_program(world_size):
+    """world_size 键控的 rank 同步屏障 program（rank 运行期取自 ctx）。"""
+    key = world_size
     with _BAR_LOCK:
         prog = _BAR_PROGRAMS.get(key)
         if prog is None:
             prog = cannbotdsl.compile(
-                _make_barrier_host(me, world_size),
+                _make_barrier_host(key),
                 TensorSpec((1,), dtypes.int32),
-                StructRef[CommContext],
+                StructRef[MoonepUrmaCtx],
             )
             _BAR_PROGRAMS[key] = prog
-    return prog
+        return prog
 
 
 def next_barrier_epoch(context):
-    """推进本轮 barrier epoch 并写回设备张量（1 元素 int32），返回该张量。
-
-    独立 barrier kernel 与内联在算子里的收尾 barrier 共用同一个 epoch 计数，
-    保证两种形态交错调用时 flag 不会串轮。
-    """
+    """推进本轮 epoch 并写回设备张量（1 元素 int32），返回该张量（复用）。"""
     global _BAR_EPOCH
+    if _BAR_EPOCH >= _BAR_EPOCH_MAX:
+        raise RuntimeError("barrier epoch 已达 int32 上限，请重建 MoonEP 上下文")
     _BAR_EPOCH += 1
     gm_epoch = context.bar_epoch_t
     if gm_epoch is None:
@@ -539,47 +446,34 @@ def next_barrier_epoch(context):
 
 
 def sym_barrier(context, *, sync=True):
-    """对称堆自旋 barrier：dist.barrier 的流级强化替代（非因后者不可用）。
+    """workspace flag 自旋 barrier：dist.barrier 的流级强化替代。
 
-    语义与同流 dist.barrier 等价且更强：返回时全组 rank 本轮此前流上工作全部
-    完成（kernel 内自旋收齐各 peer 的 epoch flag，flag 与数据同通道保序）。
-    epoch 跨算子单调递增，陈旧 flag 不会提前放行。
+    单 block kernel 经 UbMem 把 epoch flag 直推全部 peer 的
+    flag 槽（urma_barrier_all），自旋收齐后返回——返回即全组本轮此前流
+    上工作全部完成（flag 与数据同通道保序）。
 
-    sync=False 为"只发射"形态：仅入队 rank 同步屏障 kernel、不做 host 同步——
-    跨 rank 保序由 kernel 自身的自旋协议保证（后继同流 kernel 在设备序上
-    排在它之后），host 立即返回。供 async_finish 路径的组间 staging 复用
-    同步屏障使用：staging 覆写的跨 rank 安全是设备序问题，不需要 host 等待。
+    sync=False 为"只发射"形态（跨 rank 保序由 kernel 自身
+    的自旋协议保证，host 立即返回）。
     """
+    if context.rank_size < 2:
+        if sync:
+            torch.npu.current_stream().synchronize()
+        return
     gm_epoch = next_barrier_epoch(context)
-    _get_barrier_program(context.rank_size, context.rank)(gm_epoch, context.ctx_tensor)
+    _get_barrier_program(context.rank_size)(gm_epoch, context.ctx_tensor)
     if not sync:
         return
-    # 等待范围为发起流而非整卡：rank 同步屏障 kernel 在发起流上，等本流完成即意味着
-    # 全组本轮握手收齐。全设备 synchronize 会把无关流上的在飞工作也等进来，
-    # 封死跨层/跨流流水（多层训练里每层 reduce/组间串行都走本 rank 同步屏障）。
+    # 等待范围为发起流而非整卡（避免封死跨层/跨流流水）
     torch.npu.current_stream().synchronize()
 
 
 def sync_transport_stream(context):
-    """跨流安全护栏：算子握手状态机（epoch flag 轮询 + staging
-    槽位复用）要求调用严格按发起序执行。
-
-    - 首次调用：记录发起流；
-    - 同流调用：快路径，仅一次比较，零开销；
-    - 跨流调用（激活重算等 autograd 场景）：在旧流上记录事件、新流等待——
-      事件 fork/join 把调用序列串行化，握手语义保持成立（替代框架侧钉流）。
-
-    覆盖 moonep 各算子（plan / prefetch_weight）；dispatch/combine 为 moe_ep
-    原生算子，不在本护栏内——框架侧仍需同流发起或重算回放。返回发起流，
-    供 wrapper 在算子实际发射的流上记录完成事件。
-    """
+    """跨流安全护栏（算子握手状态机要求调用严格按发起序执行）。"""
     cur = torch.npu.current_stream()
     ts = context.transport_stream
     if ts is None or ts == cur:
         context.transport_stream = cur
         return cur
-    # 跨流：等上一个我方算子的完成事件（而非旧流尾部——主流尾部可能排着
-    # dispatch 等非我方工作，等尾部会把双流重叠串行掉）
     if context.transport_event is not None:
         cur.wait_event(context.transport_event)
     context.transport_stream = cur
@@ -587,40 +481,41 @@ def sync_transport_stream(context):
 
 
 def _hccl_comm_name(group, rank):
-    """由 ProcessGroup 解析 HCCL comm name。
-
-    torch 未公开 backend 访问接口（get_hccl_comm_name 只在 backend 对象上），
-    全仓仅此一处触达保护成员。
-    """
-    # torch 未公开 backend 对象访问接口（get_backend 只返回名字枚举，拿不到
-    # ProcessGroupHCCL 实例）；经属性名动态获取，语义与直接点取完全一致
-    backend = getattr(group, "_get_backend")(torch.device("npu"))
+    """由 ProcessGroup 解析 HCCL comm name（新 API get_comm_by_name 的名字源）。"""
+    backend = group._get_backend(torch.device("npu"))
     return backend.get_hccl_comm_name(rank)
 
 
 def create_moonep_context(
-    group_name: str | None = None, *, group=None
+    group_name: str | None = None,
+    *,
+    group=None,
+    workspace_bytes: int | None = None,
 ) -> MoonepContext:
-    """创建 moonep 通信上下文。
+    """创建 moonep 通信上下文（workspace + UbMem 连接）。
 
     group_name 缺省时用 torch.distributed 默认组；EP 为子通信域时传 ``group``
     （ProcessGroup），rank/rank_size 与 HCCL comm name 均按组内取值。
+    workspace_bytes 缺省 = plan 交换区下界（HEAP_BASE + PLAN_REGION_END，
+    分配即所需——不做粗预留）；跑 reduce/prefetch 的裸 API 调用方须按形状
+    精算显式传入（``MoonepBuffer._workspace_need()``；MoonepBuffer 路径
+    构造期已自动注入）。
+    裸 API 的形状在首调算子时才确定，按上界预留；MoonepBuffer 构造路径
+    按形状精算注入。
     """
-    import torch.distributed as dist
-
     if group is not None:
         rank = dist.get_rank(group)
         rank_size = dist.get_world_size(group)
         if group_name is None:
             group_name = _hccl_comm_name(group, rank)
-        ctx = MoonepContext(group_name, rank=rank, rank_size=rank_size)
+        ctx = MoonepContext(
+            group_name, rank=rank, rank_size=rank_size, workspace_bytes=workspace_bytes
+        )
         ctx.group = group
-        check_no_shared_elastic_buffer(group_name)
         check_heap_capacity(ctx, HEAP_BASE + PLAN_REGION_END, "plan 交换区")
         return ctx
     if group_name is None:
         group_name = _hccl_comm_name(dist.group.WORLD, dist.get_rank())
-    ctx = MoonepContext(group_name)
-    check_no_shared_elastic_buffer(group_name)
+    ctx = MoonepContext(group_name, workspace_bytes=workspace_bytes)
     check_heap_capacity(ctx, HEAP_BASE + PLAN_REGION_END, "plan 交换区")
     return ctx

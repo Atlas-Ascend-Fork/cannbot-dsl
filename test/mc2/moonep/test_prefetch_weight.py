@@ -62,9 +62,16 @@ def test_moonep_prefetch_weight_dsl_api(moonep_groups, monkeypatch):
     num_tokens, top_k, epn = 32, 8, 4
     w_elems = _H * 17  # 非默认行宽，确保重新 trace，不复用已编译 program
 
-    # 独立子组建 ctx：裸 WORLD 会与本 session 其它文件已建的 EB 通信器
-    # 撞车（对称堆互踩守卫拒绝）
-    ctx = create_moonep_context(group=moonep_groups[0])
+    # 独立子组建 ctx（workspace+连接按测试隔离；连接 tag 进程序列唯一化）
+    # workspace 按形状精算（分配即所需——context 缺省仅 plan 交换区下界）
+    from moonep_buffer import _workspace_need
+
+    ctx = create_moonep_context(
+        group=moonep_groups[0],
+        workspace_bytes=_workspace_need(
+            world_size, epn, w_elems, 1, torch.bfloat16, torch.bfloat16
+        ),
+    )
     ctx.last_plan_shape = (num_tokens, top_k)  # 设置窗口布局元数据
 
     # 每行至多一个 home rank，空槽填 -1
@@ -107,3 +114,72 @@ def test_moonep_prefetch_weight_dsl_api(moonep_groups, monkeypatch):
             assert torch.equal(
                 w_cpu[i], torch.full((w_elems,), exp, dtype=torch.bfloat16)
             ), f"第 {g} 组 home 行 {i} 未被同步写入"
+
+
+@pytest.mark.npu
+def test_moonep_prefetch_weight_fp16_ring(moonep_groups):
+    """2 组 fp16 + 环形清单：视图 dtype 跟随输入，命中槽与 home 行逐元素相等。"""
+    rank, world_size = _init_ep_group()
+    epn, w_elems = 1, 17
+    ctx = create_moonep_context(group=moonep_groups[0], workspace_bytes=64 << 20)
+    ctx.last_plan_shape = (32, 8)
+
+    etc_cpu = torch.full((world_size, epn), -1, dtype=torch.int32)
+    for dst in range(world_size):
+        home = (dst + 1) % world_size
+        etc_cpu[dst] = torch.arange(home * epn, (home + 1) * epn, dtype=torch.int32)
+    etc = etc_cpu.npu()
+
+    reals = []
+    for g in range(2):
+        w = torch.empty(epn, w_elems, dtype=torch.float16)
+        for i in range(epn):
+            w[i] = float((rank * 100 + rank * epn + i) * (g + 1))
+        reals.append(w.npu())
+
+    views_w, views_s = prefetch_weight(ctx, etc, reals, epn)
+    assert views_s == ()
+    from conftest import fill_and_repush
+
+    fill_and_repush(ctx, etc, (views_w, views_s), epn)
+
+    for g, view in enumerate(views_w):
+        assert view.dtype == torch.float16
+        view_cpu = view.cpu()
+        assert torch.equal(view_cpu[:epn], reals[g].cpu())
+        for j in range(epn):
+            e = int(etc_cpu[rank][j])
+            if e < 0:
+                assert bool((view_cpu[epn + j] == -1.0).all())
+                continue
+            home = e // epn
+            exp = torch.full(
+                (w_elems,),
+                float((home * 100 + e) * (g + 1)),
+                dtype=torch.float16,
+            )
+            assert torch.equal(view_cpu[epn + j], exp)
+
+
+def test_prefetch_weight_fp16_contract():
+    """fp16 白名单、组前缀整除校验。"""
+    epn = 3
+    w = torch.zeros(epn, 7, dtype=torch.float16)
+    flat, sizes, dtype = pw._normalize_groups((w, w), epn)
+    assert sizes == (7, 7) and dtype is torch.float16
+    assert tuple(flat[0].shape) == (epn, 7)
+
+    from moonep_layout import group_slot_rows
+
+    assert group_slot_rows(4, (200, 100)) == ((0, 16), (12, 24))
+    with pytest.raises(ValueError, match="无法与前缀"):
+        group_slot_rows(4, (200, 128))
+
+    with pytest.raises(ValueError, match="epn 必须为正"):
+        pw._normalize_groups((w, w), 0)
+    with pytest.raises(TypeError, match="torch.Tensor"):
+        pw._normalize_groups((w, None), epn)
+
+    s = torch.zeros(epn, 32, dtype=torch.float8_e8m0fnu)
+    with pytest.raises(ValueError, match="仅支持 fp8 权重"):
+        pw._normalize_scales((s, s), epn, 2, torch.float16)
