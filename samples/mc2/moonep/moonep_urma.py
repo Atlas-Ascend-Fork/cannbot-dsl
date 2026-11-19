@@ -20,8 +20,9 @@ import 与 r128 分支兼容），勿再以其推断存在 URMA 通路。
 - **Host 控制面**（``connect_moonep_urma``）：本 rank 独立分配 workspace 张量
   并注册（``MemoryDesc``），全组以相同布局公式各自分配（对称布局约定——
   本 rank 私有注册内存，不受 HCCL_BUFFSIZE 约束、与 EB 通信域天然隔离）。
-  逐 peer 解析首个 UbMem 可达层建连（同层全互联聚单连接；部分
-  可达/多层分组当前直接拒绝——不回退）。
+  优先选择「全部 peer 均 UbMem 可达」的最低层建单连接（如 16 卡
+  UB 拓扑中 layer 0 仅同 8 卡组可达、layer 1 全覆盖 → 选 layer 1）；
+  无全覆盖层时按逐 peer 分组诊断，部分可达/多层分组直接拒绝——不回退。
 - **UbMem 设备写**（``ub_write``）：两跳搬运（GM→UB staging 环→对端
   mapped GM；``mem_copy`` 不支持 GM→GM——含远端 dst，A5 实证），
   字节粒度分块编译期展开。
@@ -181,9 +182,11 @@ def ub_write(peer, remote_off, src_addr, nbytes, xfer_rb):
     else:
         full = int(nbytes) // UB_XFER_CHUNK
         tail = int(nbytes) % UB_XFER_CHUNK
-        for c in range_constexpr(full):
+        # 运行时循环：IR 恒为一个 loop body（RingBuffer 游标与地址均为
+        # 运行期值；小行/大行统一走此路径，避免按块展开导致 IR 随行宽爆炸）。
+        for c in cbd.range(full):
             stage = xfer_rb.next_write()
-            off = c * UB_XFER_CHUNK
+            off = c * dtypes.int64(UB_XFER_CHUNK)
             cbd.mem_copy(
                 tile_slice(stage, (UB_XFER_CHUNK,), (0,)),
                 _gm_view(src_addr + dtypes.uint64(off), UB_XFER_CHUNK, dtypes.uint8),
@@ -227,9 +230,10 @@ def ub_write_local(dst_addr, src_addr, nbytes, xfer_rb):
     else:
         full = int(nbytes) // UB_XFER_CHUNK
         tail = int(nbytes) % UB_XFER_CHUNK
-        for c in range_constexpr(full):
+        # 运行时循环（见 ub_write 同款说明）。
+        for c in cbd.range(full):
             stage = xfer_rb.next_write()
-            off = c * UB_XFER_CHUNK
+            off = c * dtypes.int64(UB_XFER_CHUNK)
             cbd.mem_copy(
                 tile_slice(stage, (UB_XFER_CHUNK,), (0,)),
                 _gm_view(src_addr + dtypes.uint64(off), UB_XFER_CHUNK, dtypes.uint8),
@@ -435,6 +439,31 @@ def _proto_value(x):
     return x.value if hasattr(x, "value") else x
 
 
+def _full_coverage_layer(domain, peers, proto_enum):
+    """全部 peer 均可达目标协议的最低 layer（不存在则 None）。
+
+    kernel 侧紧凑序换算假设**单条连接承载全部 peers**（peer 索引 = 全组
+    升序去掉本 rank 后的位置），因此建连应优先选「单层全覆盖」。16 卡
+    UB 拓扑中 layer 0 仅覆盖同 8 卡组、layer 1 覆盖全部 peers——旧
+    「逐 peer 取首个含协议层」贪心会拆成 layer 0/1 两组并被误判为
+    「分层多组」；本函数直接选出 layer 1 单连接。≤8 卡仍返回 layer 0，
+    原有行为不变。
+    """
+    surface = _topo_surface(domain)
+    layers = domain.get_layers()
+    if not layers:
+        raise ValueError("通信域无可用网络层级")
+    proto = _proto_value(proto_enum)
+    ordered = sorted(peers)
+    for layer in layers:
+        if all(
+            proto in surface.protocols(layer, p) and surface.reachable(layer, p, proto)
+            for p in ordered
+        ):
+            return layer
+    return None
+
+
 def _group_peers_by_layer(domain, peers, proto_enum):
     """逐 peer 分组：{layer: [peers]}——任意拓扑建链的数据源。
 
@@ -466,9 +495,10 @@ def connect_moonep_urma(group_name, rank, rank_size, workspace, tag="moonep"):
 
     - workspace：torch uint8 NPU 张量（调用方持有；对称布局约定——全组
       以相同公式各自分配，区域偏移一致）。
-    - UbMem（映射内存——层内 FullMesh）：全部 peer 同层可映射时单连接
-      承载；**部分可达或跨层多组当前直接拒绝**（URMA 回退已随传输退役
-      删除——2026-11-16 用户指令；多层混合形态留二期）。
+    - UbMem（映射内存）：优先选全部 peer 均可达的最低层，以单连接承载
+      全部 peers（kernel 紧凑序契约）；**不存在全覆盖层时，部分可达或
+      跨层多组直接拒绝**（URMA 回退已随传输退役删除——2026-11-16 用户
+      指令；多层混合形态留二期）。
     - 通信域分离不变量自然消解：workspace 为本 rank 私有注册内存。
     """
 
@@ -491,56 +521,70 @@ def connect_moonep_urma(group_name, rank, rank_size, workspace, tag="moonep"):
         # tag 追加进程级序号：同通信域多 context（测试池化等）防重名——
         # 全 rank 以同序构造（集体纪律）⇒ 序号一致
         unique_tag = f"{tag}-{_TAG_SEQ}"
-        # —— 直连建链（任意拓扑）：逐 peer 分 (layer) 组，每组一条 UbMem
-        #     连接——同层全互联聚单组；跨层级/supernode 异构按组多连接
-        #     当前不支持（单连接 ctx 结构 + kernel 侧 blk↔紧凑序换算假设
-        #     连接承载全部 peers），直接拒绝。
-        ub_groups = _group_peers_by_layer(domain, peers, comm.UbMemProtocol.UB_MEM)
-        fallback = ub_groups.pop(None, [])
-        if fallback:
-            missing = sorted(fallback)
-            raise comm.CommError(
-                f"UbMem 不可达 {len(fallback)}/{len(peers)} peers"
-                f"（不可达：{missing}）——部分可达/多层分组形态当前不支持"
-                "（URMA 回退已退役；多层混合留二期）",
-            )
-        if len(ub_groups) == 1:
-            layer, plist = next(iter(ub_groups.items()))
-            if len(plist) < len(peers):
-                # 部分可达：kernel 紧凑序换算假设全 peers——直接拒绝
-                raise comm.CommError(
-                    f"UbMem 组仅覆盖 {len(plist)}/{len(peers)} peers"
-                    "——部分可达形态当前不支持",
-                )
+        # —— 直连建链：优先「单层全覆盖」——kernel 紧凑序换算假设单条
+        #     连接承载全部 peers。16 卡 UB 拓扑（layer 0 仅同 8 卡组可达、
+        #     layer 1 全覆盖）由此选 layer 1 单连接，而非被逐 peer 贪心
+        #     拆成两组误拒。≤8 卡仍选 layer 0（见 _full_coverage_layer）。
+        coverage_layer = _full_coverage_layer(domain, peers, comm.UbMemProtocol.UB_MEM)
+        if coverage_layer is not None:
             connection = domain.connect(
-                peers=plist,
-                layer=layer,
+                peers=peers,
+                layer=coverage_layer,
                 transport=comm.UbMem(),
                 memories=memories,
                 tag=unique_tag,
             )
             _register_connection(connection)
-        elif len(ub_groups) > 1:
-            # 多层 UbMem：单连接 ctx 结构不支持多组——直接拒绝（二期）
-            raise comm.CommError(
-                f"UbMem 分层多组（{len(ub_groups)} 组）——多组形态当前不支持"
-                "（需 ctx 扩展与查表；URMA 回退已退役）",
-            )
         else:
-            # 拓扑查询全空（协议查询可能返回空列表）——直接 UbMem 试连
-            # layer 0：单层全互联形态下连接本身可行（探针实证：查询面空
-            # ≠ 传输不可用）；失败即报错（无回退）
-            try:
+            # —— 无全覆盖层：逐 peer 分组诊断（同层全互联聚单组；跨层级/
+            #     supernode 异构多组当前不支持——单连接 ctx 结构 + kernel
+            #     侧 blk↔紧凑序换算假设连接承载全部 peers），直接拒绝。
+            ub_groups = _group_peers_by_layer(domain, peers, comm.UbMemProtocol.UB_MEM)
+            fallback = ub_groups.pop(None, [])
+            if fallback:
+                missing = sorted(fallback)
+                raise comm.CommError(
+                    f"UbMem 不可达 {len(fallback)}/{len(peers)} peers"
+                    f"（不可达：{missing}）——部分可达/多层分组形态当前不支持"
+                    "（URMA 回退已退役；多层混合留二期）",
+                )
+            if len(ub_groups) == 1:
+                layer, plist = next(iter(ub_groups.items()))
+                if len(plist) < len(peers):
+                    # 部分可达：kernel 紧凑序换算假设全 peers——直接拒绝
+                    raise comm.CommError(
+                        f"UbMem 组仅覆盖 {len(plist)}/{len(peers)} peers"
+                        "——部分可达形态当前不支持",
+                    )
                 connection = domain.connect(
-                    peers=peers,
-                    layer=0,
+                    peers=plist,
+                    layer=layer,
                     transport=comm.UbMem(),
                     memories=memories,
                     tag=unique_tag,
                 )
                 _register_connection(connection)
-            except comm.CommError:
-                pass  # 试连失败——落到下方统一报错
+            elif len(ub_groups) > 1:
+                # 多层 UbMem 且无全覆盖层：单连接 ctx 结构不支持多组
+                raise comm.CommError(
+                    f"UbMem 分层多组（{len(ub_groups)} 组，且无单层全覆盖）"
+                    "——多组形态当前不支持（需 ctx 扩展与查表；URMA 回退已退役）",
+                )
+            else:
+                # 拓扑查询全空（协议查询可能返回空列表）——直接 UbMem 试连
+                # layer 0：单层全互联形态下连接本身可行（探针实证：查询面空
+                # ≠ 传输不可用）；失败即报错（无回退）
+                try:
+                    connection = domain.connect(
+                        peers=peers,
+                        layer=0,
+                        transport=comm.UbMem(),
+                        memories=memories,
+                        tag=unique_tag,
+                    )
+                    _register_connection(connection)
+                except comm.CommError:
+                    pass  # 试连失败——落到下方统一报错
         _TAG_SEQ += 1
         if connection is None:
             raise comm.CommError(

@@ -83,9 +83,16 @@ def test_peer_block_split_covers_all_peers():
 def test_prefetch_push_layout_covers_all_peers():
     """prefetch 的 clamp+轮转在 MAX_R 下同样覆盖全部 peer。"""
     for rank_size in (2, 8, 65, MAX_R):
-        nblk, per_blk = _push_layout(rank_size)
+        nblk, per_blk, n_slices = _push_layout(rank_size)
+        n_rem = rank_size - 1
         assert nblk <= 64
-        assert _covered(rank_size - 1, nblk, per_blk) == list(range(rank_size - 1))
+        if n_slices > 1:
+            # 行分片模式：peer = blk % n_rem、slice = blk // n_rem
+            assert nblk == n_rem * n_slices
+            assert n_slices <= 8
+            assert {blk % n_rem for blk in range(nblk)} == set(range(n_rem))
+        else:
+            assert _covered(n_rem, nblk, per_blk) == list(range(n_rem))
 
 
 def test_kernel_read_split_at_max_rank():

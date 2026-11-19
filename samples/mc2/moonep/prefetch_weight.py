@@ -21,7 +21,7 @@ import cannbotdsl
 import torch
 from cannbotdsl import TensorSpec, dtypes
 from cannbotdsl.buffer import Buffer
-from cannbotdsl.lang.constexpr import range_constexpr
+from cannbotdsl.lang.constexpr import const_expr, range_constexpr
 from cannbotdsl.lang.host import host
 from cannbotdsl.lang.jit import jit
 from cannbotdsl.lang.kernel import kernel
@@ -58,9 +58,11 @@ from moonep_context import (
     sync_transport_stream,
     workspace_base,
 )
+from moonep_layout import PREFETCH_SLICE_FLAGS_OFF
 from moonep_urma import (
     NOTIFY_STRIDE,
     MoonepUrmaCtx,
+    _gm_view,
     make_xfer_rb,
     spin_u32_ge,
     tensor_address,
@@ -78,6 +80,9 @@ _PrefetchResult = (
 )
 
 _MAX_PUSH_BLOCKS = 64
+# 行分片上限：与 reduce 的 MOONEP_ACC_SPLIT 同构——每 peer 最多 8 个 block
+# 并发驱动其链路（跨 supernode 链路单核仅 ~26 GB/s，需多核聚合）。
+_PUSH_SPLIT = 8
 # UbMem 深环承载在飞量，prefetch 侧 UB 占用小。
 _PREFETCH_XFER_DEPTH = 6
 _MAX_PUSH_PROGRAMS = 64
@@ -103,10 +108,28 @@ def _is_fp8_weight(dtype):
 
 
 def _push_layout(rank_size):
+    """块布局：(nblk, per_block, n_slices)。
+
+    优先「每 peer n_slices 个 block 行分片」（n_slices ≤ _PUSH_SPLIT）；
+    常驻核数不足时退回 block-per-peer（n_slices=1, per_block>1）。分片模式
+    下 nblk 裁齐到 n_rem 整数倍，保证每个 peer 的分片数一致。
+    """
     n_rem = max(rank_size - 1, 0)
-    nblk = min(max(n_rem, 1), resident_blocks(_MAX_PUSH_BLOCKS))
-    per_blk = (n_rem + nblk - 1) // nblk if n_rem > 0 else 1
-    return nblk, per_blk
+    if n_rem <= 0:
+        return 1, 1, 1
+    resident = resident_blocks(_MAX_PUSH_BLOCKS)
+    want = min(n_rem * _PUSH_SPLIT, resident)
+    if want >= n_rem:
+        nblk = (want // n_rem) * n_rem
+        return nblk, 1, nblk // n_rem
+    nblk = max(want, 1)
+    return nblk, (n_rem + nblk - 1) // nblk, 1
+
+
+def _slice_flag_off(p_comp, k, n_slices):
+    """本 rank 本地 (peer 紧凑号, slice) 完成标志的 workspace 偏移。"""
+    idx = dtypes.uint64(p_comp) * dtypes.uint64(int(n_slices)) + dtypes.uint64(k)
+    return dtypes.uint64(PREFETCH_SLICE_FLAGS_OFF) + idx * dtypes.uint64(4)
 
 
 @kernel
@@ -136,6 +159,7 @@ class _MoonepPrefetchPushKernel:
         ngroups,
         nblk,
         per_block,
+        n_slices=1,
     ):
         self._r = int(rank_size)
         self._epn = int(epn)
@@ -149,6 +173,7 @@ class _MoonepPrefetchPushKernel:
         self._group_rows, self._slot_rows = group_slot_rows(self._epn, actual)
         self._nblk = int(nblk)
         self._per_block = int(per_block)
+        self._n_slices = int(n_slices)
 
     def __call__(
         self,
@@ -163,8 +188,7 @@ class _MoonepPrefetchPushKernel:
         gm_epoch,
         ctx: StructRef[MoonepUrmaCtx],
     ):
-        world_size, epn, ngroups = self._r, self._epn, self._ngroups
-        row_bytes = self._row_bytes
+        world_size, epn, _ngroups = self._r, self._epn, self._ngroups
         # 真实组在前、pad 槽在后
         reals = (k0, k1, k2, k3, k4, k5)
         # rank 从 ctx 读，不进编译键
@@ -178,60 +202,155 @@ class _MoonepPrefetchPushKernel:
 
         blk = dtypes.int64(get_block_idx())
         n_rem = dtypes.int64(world_size - 1)
-        epn64 = dtypes.int64(epn)
+        dtypes.int64(epn)
         ub_etc = Buffer(MemLoc.UB, dtypes.int32, make_layout((1, self._epn)))
         ub_row = Buffer(MemLoc.UB, dtypes.int32, make_layout((1, self._epn)))
-        for peer_slot in range_constexpr(self._per_block):
-            peer_id = blk + dtypes.int64(peer_slot * self._nblk)
-            if peer_id < n_rem:
-                peer = peer_id if peer_id < me else peer_id + dtypes.int64(1)
-                # peer 索引按排序非自身 rank 紧凑编号
-                peer_idx = dtypes.uint32(dtypes.uint64(peer))
-                if dtypes.uint64(peer) > me64:
-                    peer_idx = peer_idx - dtypes.uint32(1)
-                peerh = xfer_open(ctx, peer_idx)
-                self._scan_peer(gm_etc, peer, ub_etc, ub_row, me32)
+        if const_expr(self._n_slices > 1):
+            # 行分片模式：每 peer n_slices 个 block 并发驱动同一条链路。
+            self._push_one(
+                ctx,
+                gm_etc,
+                ub_etc,
+                ub_row,
+                me,
+                me32,
+                me64,
+                epoch,
+                epoch_addr,
+                push_base,
+                reals,
+                slot,
+                xfer_rb,
+                blk % n_rem,
+                blk // n_rem,
+            )
+        else:
+            for peer_slot in range_constexpr(self._per_block):
+                peer_id = blk + dtypes.int64(peer_slot * self._nblk)
+                if peer_id < n_rem:
+                    self._push_one(
+                        ctx,
+                        gm_etc,
+                        ub_etc,
+                        ub_row,
+                        me,
+                        me32,
+                        me64,
+                        epoch,
+                        epoch_addr,
+                        push_base,
+                        reals,
+                        slot,
+                        xfer_rb,
+                        peer_id,
+                        dtypes.int64(0),
+                    )
 
-                # 逐行直推，每行 ngroups 笔
-                for i in cannbotdsl.range(epn64):
-                    row = dtypes.int64(ub_row[dtypes.int64(0), i])
-                    if row >= dtypes.int64(0):
-                        # 目的槽行号 = epn + i
-                        slot_row = epn64 + i
-                        for g in range_constexpr(_MAX_GROUPS):
-                            if g < ngroups:  # 编译期裁剪：缺组槽不发射
-                                dst = (
-                                    dtypes.int64(self._group_rows[g])
-                                    + slot * dtypes.int64(self._slot_rows[g])
-                                    + slot_row
-                                )
-                                remote_off = push_base + dtypes.uint64(
-                                    dst
-                                ) * dtypes.uint64(row_bytes[g])
-                                src_addr = tensor_address(reals[g]) + dtypes.uint64(
-                                    row
-                                ) * dtypes.uint64(row_bytes[g])
-                                ub_write(
-                                    peerh,
-                                    remote_off,
-                                    src_addr,
-                                    self._row_bytes[g],
-                                    xfer_rb,
-                                )
-                # 尾部 flag 与数据同通道保序（ub_flag_write 首尾 fence——
-                # MTE3 同 pipe：flag 落地即此前全部行已到对端）
+    @jit
+    def _push_one(
+        self,
+        ctx,
+        gm_etc,
+        ub_etc,
+        ub_row,
+        me,
+        me32,
+        me64,
+        epoch,
+        epoch_addr,
+        push_base,
+        reals,
+        slot,
+        xfer_rb,
+        peer_id,
+        slice_id,
+    ):
+        """向单个 peer 推送本 block 分管的行（peer_id 为紧凑序号）。
+
+        分片模式下 ``slice_id`` 为行分片号；slice-0 block 等本 peer 全部分片
+        的本地完成标志后，才向对端写原有的 per-sender flag。
+        """
+        epn, ngroups = self._epn, self._ngroups
+        row_bytes = self._row_bytes
+        epn64 = dtypes.int64(epn)
+        peer = peer_id if peer_id < me else peer_id + dtypes.int64(1)
+        # peer 索引按排序非自身 rank 紧凑编号（peer_id 本身即紧凑序号）
+        peerh = xfer_open(ctx, dtypes.uint32(dtypes.uint64(peer_id)))
+        self._scan_peer(gm_etc, peer, ub_etc, ub_row, me32)
+
+        # 逐行直推，每行 ngroups 笔（分片模式以 slice_id 起步、n_slices 步进）
+        for i in cannbotdsl.range(slice_id, epn64, dtypes.int64(self._n_slices)):
+            row = dtypes.int64(ub_row[dtypes.int64(0), i])
+            if row >= dtypes.int64(0):
+                # 目的槽行号 = epn + i
+                slot_row = epn64 + i
+                for g in range_constexpr(_MAX_GROUPS):
+                    if g < ngroups:  # 编译期裁剪：缺组槽不发射
+                        dst = (
+                            dtypes.int64(self._group_rows[g])
+                            + slot * dtypes.int64(self._slot_rows[g])
+                            + slot_row
+                        )
+                        remote_off = push_base + dtypes.uint64(dst) * dtypes.uint64(
+                            row_bytes[g]
+                        )
+                        src_addr = tensor_address(reals[g]) + dtypes.uint64(
+                            row
+                        ) * dtypes.uint64(row_bytes[g])
+                        ub_write(
+                            peerh,
+                            remote_off,
+                            src_addr,
+                            self._row_bytes[g],
+                            xfer_rb,
+                        )
+        if const_expr(self._n_slices > 1):
+            # 每个分片完成后写本地 (peer, slice) 标志（MTE3 同 pipe，数据
+            # 先于标志）；slice-0 汇总本 peer 全部分片后再发远端 flag。
+            self._put_slice_flag(ctx, peer_id, slice_id, epoch_addr)
+            if slice_id == dtypes.int64(0):
+                for k in range_constexpr(self._n_slices):
+                    spin_u32_ge(
+                        ctx,
+                        _slice_flag_off(peer_id, k, self._n_slices),
+                        epoch,
+                    )
                 ub_flag_write(
                     peerh,
                     me64 * dtypes.uint64(NOTIFY_STRIDE),
                     epoch,
                     epoch_addr,
                 )
-                # 等对端收到本轮 flag
                 spin_u32_ge(
                     ctx,
                     dtypes.uint64(peer) * dtypes.uint64(NOTIFY_STRIDE),
                     epoch,
                 )
+        else:
+            # 尾部 flag 与数据同通道保序（ub_flag_write 首尾 fence——
+            # MTE3 同 pipe：flag 落地即此前全部行已到对端）
+            ub_flag_write(
+                peerh,
+                me64 * dtypes.uint64(NOTIFY_STRIDE),
+                epoch,
+                epoch_addr,
+            )
+            # 等对端收到本轮 flag
+            spin_u32_ge(
+                ctx,
+                dtypes.uint64(peer) * dtypes.uint64(NOTIFY_STRIDE),
+                epoch,
+            )
+
+    @jit
+    def _put_slice_flag(self, ctx, p_comp, slice_id, epoch_addr):
+        """本 rank 本地写 (peer, slice) 完成标志（值=本轮 epoch）。"""
+        ub_epoch = Buffer(MemLoc.UB, dtypes.uint32, make_layout((1,)))
+        mem_copy(ub_epoch, _gm_view(epoch_addr, 1, dtypes.uint32))
+        addr = dtypes.uint64(ctx.localWsAddr) + _slice_flag_off(
+            p_comp, slice_id, self._n_slices
+        )
+        mem_copy(_gm_view(addr, 1, dtypes.uint32), ub_epoch)
 
     @jit
     def _scan_peer(self, gm_etc, peer, ub_etc, ub_row, me32):
@@ -284,6 +403,7 @@ class _PushConfig(NamedTuple):
     window_bytes: int
     nblk: int
     per_block: int
+    n_slices: int = 1  # 每 peer 行分片数（1 = block-per-peer）
     transport: str = ""  # 历史字段（URMA 退役后恒空，保留键兼容）
 
 
@@ -309,6 +429,7 @@ def _make_push_host(cfg):
             cfg.ngroups,
             cfg.nblk,
             cfg.per_block,
+            cfg.n_slices,
         )[cfg.nblk](k0, k1, k2, k3, k4, k5, gm_etc, slot, gm_epoch, ctx)
 
     return _push_host
@@ -344,7 +465,7 @@ def _get_push_program(
         pad_elem = (weight_bytes,) * (_MAX_GROUPS - n_w)
     sizes = real_sizes + pad_sizes
     elem6 = real_elem + pad_elem
-    nblk, per_blk = _push_layout(rank_size)
+    nblk, per_blk, n_slices = _push_layout(rank_size)
     cfg = _PushConfig(
         rank_size,
         epn,
@@ -354,6 +475,7 @@ def _get_push_program(
         int(window_bytes),
         nblk,
         per_blk,
+        n_slices,
     )
     with _PUSH_LOCK:
         prog = _PUSH_PROGRAMS.get(cfg)

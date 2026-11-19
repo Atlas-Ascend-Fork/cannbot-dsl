@@ -37,7 +37,11 @@ DEM_ALL_OFF = 0  # (MAX_R, MAX_E) int32：各 rank 本地计数交换区（512KB
 READY_OFF = MAX_R * MAX_E * 4  # (MAX_R,) int32：元数据就绪标志
 BAR_FLAGS_OFF = READY_OFF + MAX_R * 4  # (MAX_R,) int32：rank 自旋同步屏障的 epoch flag
 LAYOUT_TAIL_BYTES = 4096  # 区域尾部对齐余量（32B 对齐要求下取整页）
-PLAN_REGION_END = BAR_FLAGS_OFF + MAX_R * 4 + LAYOUT_TAIL_BYTES
+# prefetch 行分片完成标志（**本 rank 本地**，按 (peer 紧凑号, slice) 索引）：
+# 每 peer 至多 resident 个分片 → 槽数 ≤ 64，占用尾部余量前 256B。slice-0
+# block 等到本 peer 全部分片置位后，才向对端写原有的 per-sender flag。
+PREFETCH_SLICE_FLAGS_OFF = BAR_FLAGS_OFF + MAX_R * 4
+PLAN_REGION_END = PREFETCH_SLICE_FLAGS_OFF + LAYOUT_TAIL_BYTES
 WEIGHT_DTYPE = dtypes.bfloat16  # 权重发布区缺省 bf16（按构造 weight_dtype 参数化）
 WEIGHT_BYTES = WEIGHT_DTYPE.bytes_for(1)  # 权重要素字节数缺省（bf16 = 2；uint8 = 1）
 ROWS_PER_EXPERT = 2  # 每专家两行：前 epn 行真实权重，后 epn 行预取槽

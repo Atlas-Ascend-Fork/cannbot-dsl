@@ -453,10 +453,17 @@ class _PlanKernel:
                 ub_served[dtypes.int64(e)] = dtypes.int32(1)
             simt.syncthreads()
             for r in cannbotdsl.range(thread_id, world_size, num_threads):
-                load = dtypes.int32(0)
-                for e in cannbotdsl.range(r * epn, (r + 1) * epn):
-                    load = load + ub_aux[dtypes.int64(e)]
-                ub_loads[dtypes.int64(r)] = load
+                if epn == 1:
+                    # epn=1 时内层 range 恰为单次迭代，会被 canonicalize
+                    # 折叠成直写；事件从内层循环移到外层后
+                    # verify-target-buffer-sync 会误报控制路径变更
+                    # （R=E 形态编译实证）。trace 期直接发射直写形态。
+                    ub_loads[dtypes.int64(r)] = ub_aux[dtypes.int64(r)]
+                else:
+                    load = dtypes.int32(0)
+                    for e in cannbotdsl.range(r * epn, (r + 1) * epn):
+                        load = load + ub_aux[dtypes.int64(e)]
+                    ub_loads[dtypes.int64(r)] = load
                 ub_rhome[dtypes.int64(r)] = dtypes.int32(-1)
             simt.syncthreads()
             if thread_id < _WARP_SIZE:
