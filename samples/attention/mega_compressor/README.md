@@ -15,7 +15,7 @@ output = RMSNorm(pooled, norm_weight, norm_eps)
 
 | 特性与约束 | 说明 |
 | :--- | :--- |
-| 优化 shape | H=5120、D=512、B=1/4、cmp_ratio=1/2 |
+| 优化 shape | H=5120、D=512、B=1/4，以及 B=2/3、S=6/8 和 BSH S=8192；cmp_ratio=1/2 |
 | Decode / MTP | S=1/6/8，验收 start_pos=8192 |
 | Prefill | S=8192，验收 start_pos=0 |
 | 数据类型 | 快路径使用 BF16；投影和 state_cache 使用 FP32 |
@@ -82,6 +82,10 @@ Host 构造时查询当前 stream 的核资源，Kernel 从实际 launch 读取 
 
 图模式的 TH 调用使用 `THDecodeHost`，在设备端读取实时元数据；模型快路径条件包含 `total in (batch, batch * 6, batch * 8)`。工作区通过 `DecodePlan().workspace_shape(total)` 分配。编译与权重打包在图捕获前完成，升级后重新预热、捕获图。普通 `mega_compressor` 入口包含 host 校验，不用于 decode 图内调用。
 
+B=2/3 支持 S=6/8：BSH 可使用普通入口及 prepared 专用路径；TH 的总行数须为 B×6 或 B×8，请求内长度可通过 `cu_seqlens`、`seqused` 调整。支持 cmp_ratio=1/2，以及 100000/100001 等运行时起点。
+
+B=2/3 也支持 BSH S=8192 Prefill，可使用普通入口及 prepared 专用路径，cmp_ratio=1/2；专用路径仍需 32 个 Mix block 和按 ratio 对齐的起点。
+
 确定性以相同硬件、软件、shape、输入及初始 cache 为前提，不承诺跨编译器版本逐位一致。不同请求须使用独立 cache block，同一工作区/cache 不可重叠写入。
 
 ## 精度测试
@@ -91,6 +95,9 @@ pytest test/attention/mega_compressor/test_mega_compressor.py -v
 ```
 
 覆盖 B1/B4、S1/S6/S8/8192、ratio=1/2，对比 CPU golden，检查输出、完整 cache、未写位置、TH ragged/奇数起点及图重放确定性。性能对照工具与原始记录单独维护，不随算子提交。
+
+B2/B3 的 S6/S8 用例覆盖 BSH 普通入口、prepared、TH 普通入口及图模式，并检查长上下文起点、ragged 长度、空请求与 cache 环绕。
+B2/B3 的 BSH S8192 用例覆盖普通入口、prepared、ratio=1/2，以及输出、完整 cache 和图重放确定性。
 
 2026-10-28 在 Ascend 950DT 单卡、CANN `9.2.0-beta.2`、Python 3.12.15、
 `torch_npu 2.9.0.post8` 下，使用 `dsl-whl.tar` 中的
@@ -117,6 +124,7 @@ python packaging/native/build.py --operator mega_compressor
 
 缺省导出 BF16、B1/B4、R2、slots=8、cache_blocks=B、norm_eps=1e-6：
 BSH/TH Decode 的 S1/S6/S8 分别生成 28/32 Mix block 变体；BSH S8192 Prefill 生成 32 Mix block 变体。
+另默认导出 B2/B3、S6/S8、R2 的 BSH/TH、28/32 Mix block 变体，以及 B2/B3、S8192、R2 的 BSH、32 Mix block 变体；R1 可通过下述 profiles 配置导出。
 NPU 元数据须连续且已显式提供；TH 总行数为 B*S，cu/used/start/table 内容可在图中动态变化。
 
 其他配置可将 `CANNBOTDSL_DS41_PROFILES` 指向 JSON 文件，在 `mega_compressor` 数组中设置 `layout`、`batch`、`seq_len`、`ratio`、`slots`、`cache_blocks`、`norm_eps`、`cube_cores`。未导出的配置在 Native `prefer` 模式下回退 JIT，在 `require` 模式下报错。FP16 通用路径、非连续输入整理、缺省/CPU 元数据初始化目前不属于该 Native 导出目录。

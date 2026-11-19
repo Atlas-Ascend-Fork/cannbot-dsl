@@ -116,8 +116,11 @@ def _replay(call, state, initial, output):
 
 
 @pytest.mark.npu
-@pytest.mark.parametrize("batch", [1, 4])
-@pytest.mark.parametrize("seq", [1, 6, 8, 8192])
+@pytest.mark.parametrize(
+    "batch,seq",
+    [(b, s) for b in (1, 4) for s in (1, 6, 8, 8192)]
+    + [(b, s) for b in (2, 3) for s in (6, 8, 8192)],
+)
 @pytest.mark.parametrize("ratio", [1, 2])
 def test_mega_compressor_bsh(batch, seq, ratio):
     pytest.importorskip("torch_npu")
@@ -134,7 +137,14 @@ def test_mega_compressor_bsh(batch, seq, ratio):
         prepared.output.zero_()  # S1/R2/even start has no valid output.
         output = prepared()
         _check(output, state, cpu, ratio)
-        _replay(prepared, state, cpu[3], output)
+        graph, captured = _replay(prepared, state, cpu[3], output)
+        if seq in (6, 8):
+            for base in (100000, 100001):
+                cpu[5].fill_(base)
+                starts.copy_(cpu[5])
+                state.copy_(cpu[3])
+                graph.replay()
+                _check(captured, state, cpu, ratio)
 
 
 @pytest.mark.npu
@@ -180,7 +190,9 @@ def test_mega_compressor_int32_start_boundary(ratio):
 
 @pytest.mark.npu
 @pytest.mark.parametrize(
-    "batch,seq,ratio", [(b, s, r) for b in (1, 4) for s in (1, 6, 8) for r in (1, 2)]
+    "batch,seq,ratio",
+    [(b, s, r) for b in (1, 4) for s in (1, 6, 8) for r in (1, 2)]
+    + [(b, s, r) for b in (2, 3) for s in (6, 8) for r in (1, 2)],
 )
 def test_mega_compressor_th(batch, seq, ratio):
     pytest.importorskip("torch_npu")
@@ -220,6 +232,13 @@ def test_mega_compressor_th(batch, seq, ratio):
         if batch == 4 and seq == 8:
             cpu[7] = torch.tensor([0, 2, 15, 15, 32], dtype=torch.int32)
             cpu[6] = torch.tensor([2, 13, 0, 5], dtype=torch.int32)
+        elif batch in (2, 3):
+            cpu[5].fill_(100001)
+            cpu[7] = torch.tensor(
+                [0] + [1] * (batch - 1) + [batch * seq], dtype=torch.int32
+            )
+            cpu[6] = cpu[7][1:] - cpu[7][:-1]
+            cpu[6][-1] -= 1
         for i in (3, 5, 6, 7, 8):
             tensors[i].copy_(cpu[i])
         graph.replay()
@@ -234,6 +253,32 @@ def test_mega_compressor_th(batch, seq, ratio):
         )
     finally:
         program.close()
+
+
+@pytest.mark.npu
+@pytest.mark.parametrize("batch", [2, 3])
+@pytest.mark.parametrize("seq", [6, 8])
+@pytest.mark.parametrize("ratio", [1, 2])
+def test_mega_compressor_small_batch_th_public(batch, seq, ratio):
+    pytest.importorskip("torch_npu")
+    cpu = _inputs(batch, seq)
+    cpu[5].fill_(100001)
+    x, wk, wg, state, gamma, starts, used, cu, table = [t.npu() for t in cpu]
+    output = op.mega_compressor(
+        x,
+        wk,
+        wg,
+        state,
+        cmp_ratio=ratio,
+        norm_weight=gamma,
+        norm_eps=1e-6,
+        state_block_table=table,
+        start_pos=starts,
+        cu_seqlens=cu,
+        seqused=used,
+    )
+    count = int(((cpu[5] + cpu[6]) // ratio - cpu[5] // ratio).sum())
+    _check(output[:count], state, cpu, ratio)
 
 
 @pytest.mark.npu

@@ -8,8 +8,9 @@
 
 """Deterministic mega_compressor: projection, pooling, RMSNorm and ring cache.
 
-Single-file BSH/TH implementation for H5120/D512, B1/B4, ratio 1/2,
-S1/S6/S8 decode and S8192 prefill. Static preparation stays outside execution.
+Single-file BSH/TH implementation for H5120/D512, ratio 1/2,
+S1/S6/S8 decode and S8192 prefill; B2/B3 support S6/S8 and BSH S8192.
+Static preparation stays outside execution.
 """
 
 from __future__ import annotations
@@ -2898,6 +2899,16 @@ class PreparedMegaCompressor:
         self.close()
 
 
+def _supports_batch_rows(batch, total_rows, *, is_th=False):
+    return batch in (1, 4, 8, 16, 32) or (
+        batch in (2, 3)
+        and (
+            total_rows in (batch * 6, batch * 8)
+            or (not is_th and total_rows == batch * 8192)
+        )
+    )
+
+
 def prepare_mega_compressor(
     x,
     wkv,
@@ -2921,8 +2932,10 @@ def prepare_mega_compressor(
     if x.ndim != 3 or x.shape[-1] != 5120 or x.shape[1] not in (1, 6, 8, 8192):
         raise ValueError("prepared mega_compressor requires BSH, H5120, S1/S6/S8/S8192")
     batch, seq, _ = x.shape
-    if batch not in (1, 4, 8, 16, 32) or cmp_ratio not in (1, 2):
-        raise ValueError("prepared mega_compressor requires B1/4/8/16/32, R1/2")
+    if not _supports_batch_rows(batch, batch * seq) or cmp_ratio not in (1, 2):
+        raise ValueError(
+            "prepared mega_compressor requires B1/4/8/16/32 or B2/3 with S6/S8/S8192, R1/2"
+        )
     if x.device.type not in ("npu", "privateuseone"):
         raise ValueError("prepared mega_compressor requires NPU tensors")
     for name, tensor, shape in [
@@ -3121,8 +3134,11 @@ def _validate_inputs(
     if state_block_table is None:
         raise ValueError("AscendC mega_compressor requires state_block_table")
     batch = int(cu_seqlens.numel() - 1) if x_is_th else int(x.shape[0])
-    if batch not in (1, 4, 8, 16, 32):
-        raise ValueError("mega_compressor requires batch 1/4/8/16/32")
+    if not _supports_batch_rows(batch, x.numel() // hidden_size, is_th=x_is_th):
+        raise ValueError(
+            "mega_compressor requires B1/4/8/16/32 or B2/3 with "
+            "S6/S8/S8192 (BSH) or T=B*6/B*8 (TH)"
+        )
     if not x_is_th and int(x.shape[1]) not in (1, 6, 8, 8192):
         raise ValueError("mega_compressor requires S=1, 6, 8, or 8192")
     if state_cache.ndim != 3 or state_cache.dtype != torch.float32:
@@ -3198,7 +3214,7 @@ def _specialized_input(
         and not metadata.is_th
         and x.dtype == torch.bfloat16
         and norm_weight.dtype == torch.bfloat16
-        and (metadata.batch in (1, 4) or backend == "pr221")
+        and (metadata.batch in (1, 2, 3, 4) or backend == "pr221")
         and metadata.used == metadata.lengths
         and len(set(metadata.blocks)) == metadata.batch
         and all(tensor.is_contiguous() for tensor in (x, wkv, wgate, state_cache))
@@ -3431,8 +3447,13 @@ class _NativeProfile:
         dimensions = (self.batch, self.seq_len, self.ratio, self.slots, self.cube_cores)
         if any(type(value) is not int for value in dimensions):
             raise ValueError("native profile dimensions must be integers")
-        if self.layout not in ("BSH", "TH") or self.batch not in (1, 4, 8, 16, 32):
-            raise ValueError("native profiles require BSH/TH and B1/4/8/16/32")
+        if self.layout not in ("BSH", "TH") or not _supports_batch_rows(
+            self.batch, self.batch * self.seq_len, is_th=self.layout == "TH"
+        ):
+            raise ValueError(
+                "native profiles require BSH/TH and B1/4/8/16/32 or "
+                "B2/3 with S6/S8 or BSH S8192"
+            )
         lengths = (1, 6, 8, 8192) if self.layout == "BSH" else (1, 6, 8)
         if self.seq_len not in lengths or self.ratio not in (1, 2):
             raise ValueError("native profile sequence length or ratio is unsupported")
@@ -3461,7 +3482,14 @@ def _native_profiles():
         for seq in (1, 6, 8)
         for layout in ("BSH", "TH")
         for cores in (28, 32)
-    ] + [_NativeProfile(batch, 8192) for batch in (1, 4)]
+    ] + [_NativeProfile(batch, 8192) for batch in (1, 2, 3, 4)]
+    profiles += [
+        _NativeProfile(batch, seq, layout=layout, cube_cores=cores)
+        for batch in (2, 3)
+        for seq in (6, 8)
+        for layout in ("BSH", "TH")
+        for cores in (28, 32)
+    ]
     path = os.environ.get("CANNBOTDSL_DS41_PROFILES")
     if path:
         with open(path, encoding="utf-8") as stream:
