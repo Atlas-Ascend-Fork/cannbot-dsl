@@ -6,23 +6,23 @@
 
 ## 功能说明
 
-返回x的低32位中置位的总数。
+统计输入的全部位中值为 1 的位数。
 
 ## 函数原型
 
 ```python
-simt.popc(x) -> ScalarValue
+simt.popc(x) -> int32
 ```
 
 ## 参数说明
 
 | 参数 | 输入/输出 | 说明 |
 | --- | --- | --- |
-| x | 输入 | `int32`或`uint32`整数标量。 |
+| `x` | 输入 | 待处理的输入值，`uint32` 或 `uint64` 标量。 |
 
 ## 返回值说明
 
-返回计算结果，数据类型与输入相同。
+返回 `int32` 标量。`uint32` 输入的结果范围为 0～32，`uint64` 输入的结果范围为 0～64。
 
 ## 约束说明
 
@@ -54,11 +54,11 @@ def run(src: Tensor, dst: Tensor):
 
 
 def main():
-    src = torch.tensor([11], dtype=torch.int32, device='npu')
+    src = torch.tensor([0x100000001], dtype=torch.uint64, device='npu')
     dst = torch.empty((1,), dtype=torch.int32, device='npu')
     run(src, dst)
     torch.npu.synchronize()
-    expected = torch.tensor([3], dtype=torch.int32)
+    expected = torch.tensor([2], dtype=torch.int32)
     torch.testing.assert_close(dst.cpu(), expected, rtol=0, atol=0)
     print(dst.cpu().tolist())
 
@@ -70,5 +70,5 @@ if __name__ == "__main__":
 预期结果：
 
 ```text
-[3]
+[2]
 ```

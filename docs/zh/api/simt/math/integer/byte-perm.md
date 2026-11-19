@@ -11,20 +11,20 @@
 ## 函数原型
 
 ```python
-simt.byte_perm(x, y, selector) -> ScalarValue
+simt.byte_perm(x, y, selector) -> uint32
 ```
 
 ## 参数说明
 
 | 参数 | 输入/输出 | 说明 |
 | --- | --- | --- |
-| x | 输入 | `int32`或`uint32`整数标量。 |
-| y | 输入 | `int32`或`uint32`整数标量，与`x`的数据类型相同。 |
-| selector | 输入 | `int32`或`uint32`标量，与`x`、`y`同类型；低四个半字节分别指定四个结果字节的来源。 |
+| `x` | 输入 | 提供编号 0～3 的字节，`uint32` 标量。 |
+| `y` | 输入 | 提供编号 4～7 的字节，`uint32` 标量。 |
+| `selector` | 输入 | 低四个半字节分别指定四个结果字节的来源，`uint32` 标量。 |
 
 ## 返回值说明
 
-返回计算结果，数据类型与输入相同。
+返回所选字节组成的 `uint32` 标量。
 
 ## 约束说明
 
@@ -56,12 +56,11 @@ def run(src: Tensor, dst: Tensor):
 
 
 def main():
-    src = torch.tensor([67305985, 134678021, 12816], dtype=torch.int32, device='npu')
-    dst = torch.empty((1,), dtype=torch.int32, device='npu')
+    src = torch.tensor([0x89ABCDEF, 0xFEDCBA98, 0x7654], dtype=torch.uint32, device='npu')
+    dst = torch.empty((1,), dtype=torch.uint32, device='npu')
     run(src, dst)
     torch.npu.synchronize()
-    expected = torch.tensor([67305985], dtype=torch.int32)
-    torch.testing.assert_close(dst.cpu(), expected, rtol=0, atol=0)
+    assert dst.cpu().tolist() == [0xFEDCBA98]
     print(dst.cpu().tolist())
 
 
@@ -72,5 +71,5 @@ if __name__ == "__main__":
 预期结果：
 
 ```text
-[67305985]
+[4275878552]
 ```

@@ -195,40 +195,20 @@ const simtSidebar = {
           "link": "/zh/api/simt/atomic/atomic-and"
         },
         {
-          "text": "vatomic_and",
-          "link": "/zh/api/simt/atomic/vatomic-and"
-        },
-        {
           "text": "atomic_or",
           "link": "/zh/api/simt/atomic/atomic-or"
-        },
-        {
-          "text": "vatomic_or",
-          "link": "/zh/api/simt/atomic/vatomic-or"
         },
         {
           "text": "atomic_xor",
           "link": "/zh/api/simt/atomic/atomic-xor"
         },
         {
-          "text": "vatomic_xor",
-          "link": "/zh/api/simt/atomic/vatomic-xor"
-        },
-        {
           "text": "atomic_inc",
           "link": "/zh/api/simt/atomic/atomic-inc"
         },
         {
-          "text": "vatomic_inc",
-          "link": "/zh/api/simt/atomic/vatomic-inc"
-        },
-        {
           "text": "atomic_dec",
           "link": "/zh/api/simt/atomic/atomic-dec"
-        },
-        {
-          "text": "vatomic_dec",
-          "link": "/zh/api/simt/atomic/vatomic-dec"
         }
       ]
     },
@@ -763,10 +743,6 @@ const simtSidebar = {
             {
               "text": "tan",
               "link": "/zh/api/simt/math/trigonometric/tan"
-            },
-            {
-              "text": "vtan",
-              "link": "/zh/api/simt/math/trigonometric/vtan"
             },
             {
               "text": "asin",

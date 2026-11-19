@@ -18,16 +18,15 @@ simt.llrint(x) -> int64
 
 | 参数 | 输入/输出 | 说明 |
 | --- | --- | --- |
-| x | 输入 | 待舍入的`float32`标量。 |
+| x | 输入 | 待舍入的 `float16`、`bfloat16` 或 `float32` 标量。 |
 
 ## 返回值说明
 
-返回`int64`类型的整数。
+返回 `int64` 类型的整数。`NaN` 转换为 `0`；正、负无穷以及越界值分别饱和到 `int64` 的最大值、最小值。
 
 ## 约束说明
 
-- 只对有限输入且舍入结果落在int64可表示范围内使用；不依赖NaN、无穷或越界输入的整数结果。
-- float32输入本身的精度已决定可区分的数值；int64返回类型不能恢复输入丢失的低位。
+无
 
 ## 调用示例
 
@@ -60,7 +59,7 @@ def run(src, dst):
 
 
 def main():
-    src = torch.tensor([2.5, 3.5, -2.5, -3.5, 1.25, -1.25], dtype=torch.float32, device='npu')
+    src = torch.tensor([2.5, 3.5, -2.5, -3.5, 1.25, -1.25], dtype=torch.float16, device='npu')
     dst = torch.empty((6,), dtype=torch.int64, device='npu')
     run(src, dst)
     torch.npu.synchronize()

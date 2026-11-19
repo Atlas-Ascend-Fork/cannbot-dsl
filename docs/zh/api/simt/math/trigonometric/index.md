@@ -5,7 +5,6 @@
 - [cos](./cos.md)
 - [vcos](./vcos.md)
 - [tan](./tan.md)
-- [vtan](./vtan.md)
 - [asin](./asin.md)
 - [acos](./acos.md)
 - [atan](./atan.md)

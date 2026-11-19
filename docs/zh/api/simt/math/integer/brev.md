@@ -6,28 +6,27 @@
 
 ## 功能说明
 
-将x的低32位逐位反转，第i位变为第31-i位。
+将输入的全部位逐位反转。`uint32` 的第 i 位变为第 31−i 位，`uint64` 的第 i 位变为第 63−i 位。
 
 ## 函数原型
 
 ```python
-simt.brev(x) -> ScalarValue
+simt.brev(x) -> uint32 | uint64
 ```
 
 ## 参数说明
 
 | 参数 | 输入/输出 | 说明 |
 | --- | --- | --- |
-| x | 输入 | `int32`或`uint32`整数标量。 |
+| `x` | 输入 | 待处理的输入值，`uint32` 或 `uint64` 标量。 |
 
 ## 返回值说明
 
-返回计算结果，数据类型与输入相同。
+返回反转后的值，数据类型与输入相同。
 
 ## 约束说明
 
-- 按32位位模式处理输入，不提供64位反转语义。
-- 位模式`0x80000000`在`int32`中表示`-2147483648`。
+无
 
 ## 调用示例
 
@@ -55,12 +54,11 @@ def run(src: Tensor, dst: Tensor):
 
 
 def main():
-    src = torch.tensor([1], dtype=torch.int32, device='npu')
-    dst = torch.empty((1,), dtype=torch.int32, device='npu')
+    src = torch.tensor([1], dtype=torch.uint64, device='npu')
+    dst = torch.empty((1,), dtype=torch.uint64, device='npu')
     run(src, dst)
     torch.npu.synchronize()
-    expected = torch.tensor([-2147483648], dtype=torch.int32)
-    torch.testing.assert_close(dst.cpu(), expected, rtol=0, atol=0)
+    assert dst.cpu().tolist() == [0x8000000000000000]
     print(dst.cpu().tolist())
 
 
@@ -71,5 +69,5 @@ if __name__ == "__main__":
 预期结果：
 
 ```text
-[-2147483648]
+[9223372036854775808]
 ```
