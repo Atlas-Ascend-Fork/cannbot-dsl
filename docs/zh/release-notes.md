@@ -1,6 +1,18 @@
 # Release Notes
 
 <div class="release-timeline">
+<section class="release-entry" aria-labelledby="release-084">
+<div class="release-date"><time datetime="2026-11-18">2026-11-18</time><span>源码版本更新日期</span></div>
+<div class="release-summary">
+
+## [0.8.4](./release-notes/0.8.4.md) {#release-084}
+
+支持运行时队列长度归并，默认打包原生通信模块，扩展数据搬运和矢量地址自更新能力。
+
+[查看版本说明](./release-notes/0.8.4.md)
+
+</div>
+</section>
 <section class="release-entry" aria-labelledby="release-083">
 <div class="release-date"><time datetime="2026-11-12">2026-11-12</time><span>PyPI上架日期</span></div>
 <div class="release-summary">
