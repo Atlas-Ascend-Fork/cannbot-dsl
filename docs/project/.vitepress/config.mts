@@ -3024,7 +3024,8 @@ export default defineConfig({
   srcExclude: ['README.md', 'zh/README.md', 'en/README.md', 'zh/api/README.md', 'zh/guide/README.md'],
   lang: 'zh-CN',
   title: 'CANNBot-DSL',
-  description: '面向 Ascend NPU 的算子开发项目文档',
+  description: 'Agent 友好的 Ascend NPU 算子开发 DSL',
+  appearance: 'dark',
   base: process.env.DOCS_BASE || '/',
   rewrites: rewriteReadmes,
   cleanUrls: false,
@@ -3092,10 +3093,10 @@ export default defineConfig({
     siteTitle: 'CANNBot-DSL',
     nav: [
       { text: '首页', link: '/' },
-      { text: '源码构建', link: '/zh/install/source-build' },
-      { text: '编程模型', link: '/zh/guide/overview', activeMatch: '^/zh/guide/' },
-      { text: '样例导航', link: 'https://gitcode.com/cann/cannbot-dsl/tree/master/samples' },
-      { text: 'API', link: '/zh/api/', activeMatch: '^/zh/api/' },
+      { text: '开始使用', link: '/zh/install/source-build' },
+      { text: '入门教程', link: '/zh/guide/overview', activeMatch: '^/zh/guide/' },
+      { text: '样例', link: 'https://gitcode.com/cann/cannbot-dsl/tree/master/samples' },
+      { text: 'API 文档', link: '/zh/api/', activeMatch: '^/zh/api/' },
       { text: '语言 / Language', items: [
         { text: '简体中文', link: '/' },
         { text: 'English', link: '/en/' }
