@@ -13,16 +13,19 @@
   FFN 反向产出 full-dW ``t[2*epn, Wg]``（前 epn 行 home 种子、后 epn 行
   副本 dW）→ 发送侧 host 把副本行拷入**本 rank** workspace 副本区
   ``[epn, Wg]``（一次 GM 拷贝，恒定不随 R 增长）→ 单 kernel
-  （2/3 组一次 launch，block-per-peer）：
+  （2/3 组一次 launch）：
   ① 头部屏障（per-peer flag 握手：对端 kernel 启动即其流序在前的
      host 副本区写入已完成——保护对端上轮远读与本轮覆写不重叠）
-  ② owner 逐 peer **映射远读**副本区（etc_inv 逆映射行命中）→ UB
-     流水环（depth=2：读 k+1 ∥ 累加 k）→ ``mem_copy(
-     atomic_add=True)`` 拷贝引擎原子直累 home 行
+  ② owner **映射远读**副本区（etc_inv 逆映射行命中）→ 确定性归并
+     （行单写者分区 + 固定 peer 升序远读（滞后窗流水）+ UB fp32 累加 +
+     单次写回）
   ③ 尾部 sym_barrier（下一轮 host 覆写安全）
 
-  精度注记：bf16 逐加舍入（测试整值精确；生产梯度累积可接受——
-  fp32 梯度路径为精确档）。
+  精度（确定性归并）：逐元素加法序列恒定（seed → peer 升序 →
+  终轮一次舍入），**跨 run 逐位可重复**；bf16/fp16 舍入从 R-1 次降为
+  1 次（精度提升 ~(R-1)×）。代价：块内 peer 串行读（链路级并发读数
+  不变——吞吐对块内调度形态不敏感），UB 额外 acc/seed/out 缓冲（16 位
+  chunk 16K 时环深 ≤3）。
 
 本模块要求：E%R==0；grad_view 为 [2*epn, W]（home 段 + 副本段，行序与
 prefetch 视图一致）。
@@ -35,15 +38,28 @@ from typing import NamedTuple
 import cannbotdsl
 import cannbotdsl as cbd
 import torch
-from cannbotdsl import copy_options
 from cannbotdsl import TensorSpec, dtypes
+from cannbotdsl.buffer import Buffer
 from cannbotdsl.ring_buffer import RingBuffer
 from cannbotdsl.lang.constexpr import const_expr, range_constexpr
 from cannbotdsl.lang.host import host
 from cannbotdsl.lang.jit import jit
 from cannbotdsl.lang.kernel import kernel
+from cannbotdsl.lang.vf import vf
 from cannbotdsl.ops.arch import get_block_idx
 from cannbotdsl.ops.memcpy import mem_copy
+from cannbotdsl.ops.reg import (
+    PackMode,
+    RoundingMode,
+    UnpackMode,
+    full_mask,
+    vadd,
+    vcast,
+    vload,
+    vload_unpack,
+    vstore,
+    vstore_pack,
+)
 from cannbotdsl.tensor import MemLoc, make_layout, make_pointer, make_tensor, tile_slice
 from cannbotdsl.types.datastruct import StructRef
 
@@ -70,15 +86,13 @@ from moonep_comm import (
     xfer_open,
 )
 
-# 归并步进：vf 寄存器 256B，fp32 即 64（950PR）。
-# get_vf_len() 需 IR location（host 侧不可用），range_constexpr 需编译期
-# 常量，故用常量。
+# _VL：fp32 归并步进（vf 寄存器 256B//4 = 64）。
 _VL = 64
 _MERGE_FENCE_ID = 6  # etc 扫描 MTE2→S 栅栏事件（kernel 内独立无冲突）
 
 _MAX_GRAD_GROUPS = 3  # 梯度组槽上限（kernel 入口固定 3 张量槽，ngroups 裁剪）
 
-_R = 1  # 组内 R（编译锁内写入，进 program 键）
+_R = 1  # 组内 rank_size（编译锁内写入，进 program 键）
 _BLOCKS = 28  # 实际启动块数（编译锁内写入，进 program 键）
 _REDUCE_LOCK = threading.Lock()
 
@@ -88,21 +102,23 @@ _CHUNK_UB_LIMIT_FP32 = 8192
 _HEADER_BARRIER_CAP = 64  # 头部屏障/读块上限（950PR vector_core_num 满额）
 
 
-def peer_block_layout(rank_size, blocks, row_split=1):
-    """写者/读块布局：peer 轮转覆盖全 peer，返回块数与分片数。
+def peer_block_split(rank_size, blocks, reserve_merge=False):
+    """头部屏障写者块与读块的划分（R 与 AIV 核数解耦）。
 
-    写者块 = 前 n_writer 个块；读块 = min(n_rem*row_split, blocks)，超过
-    n_rem 时裁齐到 n_rem 整数倍（保证每 peer 恰好若干分片块）。
+    ``blocks`` 由 host clamp 到常驻核数（resident_blocks）——所有块都在首波，
+    屏障写者不会再被分波调度推到第二波。写者块按 ``rank_size-1`` 轮转分摊
+    peer（``reserve_merge=True`` 供归并同拍形态让出读块——当前直累路径
+    不用，保留给组合形态）。
+    返回 ``(n_writer, per_writer, n_read, per_read)``。
     """
     n_rem = max(int(rank_size) - 1, 0)
     n_writer = min(n_rem, int(blocks))
     per_writer = (n_rem + n_writer - 1) // n_writer if n_writer else 0
-    n_read = min(n_rem * int(row_split), int(blocks))
-    if n_read > n_rem:
-        n_read = (n_read // n_rem) * n_rem
+    n_read = n_writer
+    if reserve_merge and n_writer >= int(blocks):
+        n_read = max(1, int(blocks) // 2)
     per_read = (n_rem + n_read - 1) // n_read if n_read else 0
-    n_slices = (n_read + n_rem - 1) // n_rem if n_rem else 1
-    return n_writer, per_writer, n_read, per_read, n_slices
+    return n_writer, per_writer, n_read, per_read
 
 
 @jit
@@ -191,24 +207,23 @@ class _ReduceSpec(NamedTuple):
     grad_bf16: bool
     grad_fp16: bool  # fp16 梯度（16 位路径与 bf16 同构，dtype 三选一）
     blocks: int
-    split: int = 8  # 行分片读块数/链（=1 退化 block-per-peer；进键）
     depth: int = 3  # 流水环槽深（≥2；进键——UB 占用 = depth×chunk）
 
 
 # ---------------------------------------------------------------------------
-# reduce 直累 kernel（UbMem 映射读）
+# reduce 直累 kernel（仅 UbMem）
 # ---------------------------------------------------------------------------
 @kernel
 class _UbmemReduceAccKernel:
-    """直累 kernel（UbMem 映射直读 + 拷贝引擎原子加）。
+    """确定性归并 kernel（行单写者 + 固定 peer 升序流水远读 + UB fp32
+    累加 + 单次写回）。
 
-    读块按 peer 轮转：块 b 分管 peer b, b+n_writer, ...（host 侧按块轮转分配
-    ——R>64 时块数封顶常驻核数，与链路结构解耦）；逐行 etc_inv 直读标量
-    （j≥0 = 该 peer 承载行 i 副本）；逐 chunk：映射远读 tile → UB 暂存 →
-    ``mem_copy(atomic_add=True)`` 直累 home 行（**归并零 vf——拷贝引擎
-    原子加，硬件串行化任意 sender 数正确**）。home 种子由调用侧 local_grads
-    前段即位（原子加叠加上去——无种子搬运）。精度注记：bf16 逐加舍入
-    （测试整值精确；生产梯度累积可接受——fp32 梯度为精确档）。
+    行单写者分区：块 b 归并行 {b, b+blocks, ...}（同行恰一块——单写者，
+    无原子）；逐行 etc_inv 直读标量（j≥0 = 该 peer 承载行 i 副本）；固定
+    peer 升序流水远读（滞后窗）→ UB fp32 累加 → 单次写回 home 行（一次
+    dtype 舍入）。home 种子由调用侧 local_grads 前段即位（seed 入 UB 后
+    逐 peer 累加）。逐元素加法序列恒定——跨 run 逐位可重复，bf16/fp16
+    舍入从 R-1 次降为 1 次。
     """
 
     def __init__(
@@ -223,7 +238,6 @@ class _UbmemReduceAccKernel:
         blocks,
         grad_bf16,
         grad_fp16=False,
-        row_split=1,
         depth=2,
     ):
         self._rank_size = int(rank_size)
@@ -232,36 +246,29 @@ class _UbmemReduceAccKernel:
         self._elem_bytes = tuple(int(b) for b in elem_bytes)
         self._ngroups = int(ngroups)
         self._copy_off = int(copy_off)
-        self._rank_sizeow_bytes = tuple(
-            s * b for s, b in zip(self._sizes, self._elem_bytes)
-        )
+        self._row_bytes = tuple(s * b for s, b in zip(self._sizes, self._elem_bytes))
         self._chunks = tuple(int(c) for c in chunks)
         self._n_tiles = tuple(
             self._epn * (self._sizes[g] // self._chunks[g]) for g in range(3)
         )
         self._blocks = int(blocks)
-        self._rank_sizeow_split = int(row_split)
         self._depth = int(depth)
-        # 读块布局（R 与块数解耦 + 行分片提在飞读数/链）：
-        #   块 b ∈ [0, n_read)：peer 槽 = b % n_rem（轮转覆盖全 peer），
-        #   行分片 = b // n_rem（行 i 以 n_slices 步进归属本块——同行
-        #   仅一个 (peer, 行) 写者，跨块同行并发由 atomic_add 硬件串行化）。
-        #   split=1 或块数不足时 n_slices=1/per_read>1——退化为原
-        #   block-per-peer 全行形态（含 R>64 封顶轮转）。
-        #   flag 写者块独立取前 n_writer 个（peer 轮转分管）。
-        (
-            self._n_writer,
-            self._per_writer,
-            self._n_read,
-            self._per_read,
-            self._n_slices,
-        ) = peer_block_layout(self._rank_size, self._blocks, self._rank_sizeow_split)
+        # 读块布局（确定性归并——行单写者分区）：块 b 归并行
+        #   {b, b+blocks, ...}（同行恰一块，逐 peer 升序远读）；全部启动
+        #   块都是读块（块数多于行数时高位块空转退出）。flag 写者块独立
+        #   取前 n_writer 个（peer 轮转分管）。
+        n_rem = max(self._rank_size - 1, 0)
+        self._n_writer = min(n_rem, self._blocks)
+        self._per_writer = (
+            (n_rem + self._n_writer - 1) // self._n_writer if self._n_writer else 0
+        )
+        self._n_read = self._blocks
         self._grad_bf16 = bool(grad_bf16)
         self._grad_fp16 = bool(grad_fp16)
         group_off, gbase = [], int(copy_off)
         for g in range(3):
             group_off.append(gbase)
-            gbase += self._epn * self._rank_sizeow_bytes[g]
+            gbase += self._epn * self._row_bytes[g]
         self._group_off = tuple(group_off)
 
     def __call__(
@@ -273,9 +280,8 @@ class _UbmemReduceAccKernel:
         gm_epoch,
         ctx: StructRef[MoonepCommCtx],
     ):
-        rank_size, _epn, ngroups = self._rank_size, self._epn, self._ngroups
+        rank_size = self._rank_size
         reals = (k0, k1, k2)
-        epn_rt = dtypes.int64(self._epn)
         my_rank = dtypes.int64(ctx.rankId)
         my_rank_u64 = dtypes.uint64(ctx.rankId)
         epoch = dtypes.uint32(gm_epoch[dtypes.int64(0)])
@@ -284,19 +290,27 @@ class _UbmemReduceAccKernel:
             if self._grad_fp16
             else (dtypes.bfloat16 if self._grad_bf16 else dtypes.float32)
         )
-        elem = 2 if const_expr(_ACC_BF16 or _ACC_FP16) else 4
         max_chunk = max(self._chunks)
-        # grad dtype 流水环：读 k+1（MTE2 入环槽）∥ 累加 k
-        # 出上一槽（MTE3 atomic）——换单槽 ub_tmp 的 WAW 串行；槽深
+        # grad dtype 流水环：读 k+1（MTE2 入环槽）∥ 消费 k
+        # 出上一槽——换单槽 ub_tmp 的 WAW 串行；槽深
         # depth（≥2）越高在读腿上的在飞 chunk 越多（WAR 间隔 = depth-1）
         ub_pipe = RingBuffer(
             MemLoc.UB, grad_dt, make_layout((max_chunk,)), depth=self._depth
         )
+        # UB 预算（16 位 @chunk=16K/depth=3）：环 96K + acc fp32 64K +
+        # seed 32K + out 32K ≈ 224K < 248K；fp32：环 96K + acc 32K。
+        ub_acc = Buffer(MemLoc.UB, dtypes.float32, make_layout((max_chunk,)))
+        if const_expr(self._grad_bf16 or self._grad_fp16):
+            ub_seed = Buffer(MemLoc.UB, grad_dt, make_layout((max_chunk,)))
+            ub_out = Buffer(MemLoc.UB, grad_dt, make_layout((max_chunk,)))
+        else:
+            # fp32：seed 入/结果出都直通 acc（MTE2/MTE3），无 16 位转换
+            ub_seed = ub_acc
+            ub_out = ub_acc
         blk = dtypes.int64(get_block_idx())
         if blk < dtypes.int64(self._n_read):
             # —— ① 头部屏障写者：my flag 写到本块分管的全部 peer
-            #     （写者块 ≤ 常驻核数，先写完再等，不会分波互等；行分片
-            #     模式下写者块 ⊂ 读块，其余读块只等不写）——
+            #     （写者块 ≤ 常驻核数，先写完再等，不会分波互等）
             if blk < dtypes.int64(self._n_writer):
                 _barrier_flags_put(
                     ctx,
@@ -310,123 +324,275 @@ class _UbmemReduceAccKernel:
                 )
             connection = connection_from_address(dtypes.uint64(ctx.connection))
             inv_base = tensor_address(gm_etc_inv)
-            # 行分片：本块分管行 i = slice_id, slice_id+n_slices, ...
-            # （split=1 时 n_slices=1、slice_id=0——与全行形态逐位一致）
-            n_rem_rt = dtypes.int64(rank_size - 1)
-            slice_id = blk // n_rem_rt
-            i_start = slice_id
-            i_step = dtypes.int64(self._n_slices)
-            for read_slot in range_constexpr(int(self._per_read)):
-                p_compact = blk + dtypes.int64(read_slot * int(self._n_read))
-                if self._rank_sizeow_split > 1 and self._per_read == 1:
-                    # 纯分片模式（n_read ≥ n_rem）：块号取模落 peer 槽——
-                    # 每 (peer, 行) 恰一个块。per_read>1 的封顶轮转形态
-                    # 不取模（模回绕会在 stride 形态重复覆盖 peer——
-                    # R=128 封顶形态 double write），沿用原 stride+守卫。
-                    p_compact = p_compact - (p_compact // n_rem_rt) * n_rem_rt
-                if p_compact < dtypes.int64(rank_size - 1):
-                    peer_idx = dtypes.uint32(dtypes.uint64(p_compact))
-                    p_actual = p_compact
-                    if p_compact >= my_rank:
-                        p_actual = p_compact + dtypes.int64(1)
-                    # —— ② 等 peer p 的 flag（副本入槽可见）——
-                    spin_u32_ge(
-                        ctx,
-                        dtypes.uint64(HEAP_BASE + BAR_FLAGS_OFF)
-                        + dtypes.uint64(p_actual) * dtypes.uint64(4),
-                        epoch,
-                    )
-                    # —— 映射远读句柄（peer p 的副本区视图）——
-                    peer = connection.get_peer(peer_idx)
-                    mapped = dtypes.uint64(peer.get_mapped_addr(0))
-                    # —— ③ 逐行（本块分片）：etc_inv 直读 j → 逐组逐 chunk
-                    #     远读+原子直累 ——
-                    for i in cannbotdsl.range(i_start, epn_rt, i_step):
-                        j_t = make_tensor(
-                            make_pointer(
-                                dtypes.int32,
-                                inv_base
-                                + dtypes.uint64(i * rank_size + p_actual)
-                                * dtypes.uint64(4),
-                                MemLoc.GM,
+            # —— 确定性归并：行单写者 + 固定 peer 升序 + UB fp32 累加 +
+            #     单次写（逐位可重复）——
+            self._det_merge(
+                connection,
+                reals,
+                ctx,
+                my_rank,
+                epoch,
+                inv_base,
+                ub_pipe,
+                ub_acc,
+                ub_seed,
+                ub_out,
+            )
+
+    @jit
+    def _det_read_j(self, inv_base, i, p_actual, rank_size):
+        """etc_inv[i, p_actual] 的 GM 标量读（load_bypass）。
+
+        返回 int64 的 j（<0 = 无映射）。逐 tile 消费/发射侧各查一次——
+        GM 标量读 ~百 ns 级，DCache 行内命中后随查随取。
+        """
+        j_t = make_tensor(
+            make_pointer(
+                dtypes.int32,
+                inv_base + dtypes.uint64(i * rank_size + p_actual) * dtypes.uint64(4),
+                MemLoc.GM,
+            ),
+            make_layout((1,)),
+        )
+        return dtypes.int64(cbd.scalar.load_bypass(j_t.ptr(0)))
+
+    @jit
+    def _det_wait_peer_flags(self, ctx, my_rank, epoch):
+        """等全部 peer 的入槽 flag（本块逐 peer 远读：对端 kernel 启动即
+        其流序在前的 host 副本区写入已完成——保护上轮远读与本轮覆写
+        不重叠）。"""
+        rank_size = int(self._rank_size)
+        for p in cannbotdsl.range(
+            dtypes.int64(0), dtypes.int64(rank_size), dtypes.int64(1)
+        ):
+            if p != my_rank:
+                spin_u32_ge(
+                    ctx,
+                    dtypes.uint64(HEAP_BASE + BAR_FLAGS_OFF)
+                    + dtypes.uint64(p) * dtypes.uint64(4),
+                    epoch,
+                )
+
+    @jit
+    def _det_seed_acc(self, reals, g, tile_idx, ub_acc, ub_seed):
+        """seed 入 fp32 累加器（fp32 直通 acc；16 位经 seed 缓冲 + vf
+        展开成 fp32）。"""
+        chunk = int(self._chunks[g])
+        home_tile = tile_slice(reals[g], (chunk,), (tile_idx,))
+        if const_expr(not (self._grad_bf16 or self._grad_fp16)):
+            mem_copy(tile_slice(ub_acc, (chunk,), (0,)), home_tile)
+        else:
+            mem_copy(tile_slice(ub_seed, (chunk,), (0,)), home_tile)
+            with vf(mode="simd"):
+                full = full_mask()
+                for off in range_constexpr(0, chunk, _VL):
+                    vstore(
+                        ub_acc,
+                        off,
+                        vcast(
+                            vload_unpack(
+                                ub_seed,
+                                off,
+                                unpack_mode=UnpackMode.B16_TO_B32,
                             ),
-                            make_layout((1,)),
+                            dtypes.float32,
+                            mask=full,
+                        ),
+                        full,
+                    )
+
+    @jit
+    def _det_consume(self, t, i, g, my_rank, rank_size, inv_base, ub_pipe, ub_acc):
+        """滞后窗消费侧：peer tc = t-depth 的贡献入 fp32 累加器
+        （先消费后发射——环在飞数恒 ≤ depth）。"""
+        depth = int(self._depth)
+        chunk = int(self._chunks[g])
+        tc = t - dtypes.int64(depth)
+        if tc >= dtypes.int64(0):
+            pa_c = tc
+            if pa_c >= my_rank:
+                pa_c = pa_c + dtypes.int64(1)
+            j_c = self._det_read_j(inv_base, i, pa_c, rank_size)
+            if j_c >= dtypes.int64(0):
+                slot = ub_pipe.next_read()
+                # vf: acc += slot（fp32 直加；16 位 unpack+cast 后加）
+                with vf(mode="simd"):
+                    full = full_mask()
+                    if const_expr(not (self._grad_bf16 or self._grad_fp16)):
+                        for off in range_constexpr(0, chunk, _VL):
+                            acc_v = vadd(
+                                vload(ub_acc, off), vload(slot, off), mask=full
+                            )
+                            vstore(ub_acc, off, acc_v, full)
+                    else:
+                        for off in range_constexpr(0, chunk, _VL):
+                            contrib = vcast(
+                                vload_unpack(
+                                    slot, off, unpack_mode=UnpackMode.B16_TO_B32
+                                ),
+                                dtypes.float32,
+                                mask=full,
+                            )
+                            vstore(
+                                ub_acc,
+                                off,
+                                vadd(vload(ub_acc, off), contrib, mask=full),
+                                full,
+                            )
+
+    @jit
+    def _det_issue(self, connection, inv_base, i, t, c, g, my_rank, rank_size, ub_pipe):
+        """滞后窗发射侧：peer t 的副本 chunk 映射远读入环下一槽。
+
+        get_peer 取 compact 序号（连接表 0..R-2）；etc_inv 列取 actual
+        rank（pa_i）——两者域不同，混用则 get_peer 越界 → mapped 野值 →
+        远读地址无效（MTE 507035）。
+        """
+        if t < dtypes.int64(rank_size - 1):
+            pa_i = t
+            if pa_i >= my_rank:
+                pa_i = pa_i + dtypes.int64(1)
+            j_i = self._det_read_j(inv_base, i, pa_i, rank_size)
+            if j_i >= dtypes.int64(0):
+                chunk = int(self._chunks[g])
+                elem = 2 if (self._grad_bf16 or self._grad_fp16) else 4
+                grad_dt = (
+                    dtypes.float16
+                    if self._grad_fp16
+                    else (dtypes.bfloat16 if self._grad_bf16 else dtypes.float32)
+                )
+                slot_w = ub_pipe.next_write()
+                peer = connection.get_peer(dtypes.uint32(dtypes.uint64(t)))
+                mapped = dtypes.uint64(peer.get_mapped_addr(0))
+                j64 = dtypes.int64(j_i)
+                row_base = dtypes.uint64(
+                    HEAP_BASE + int(self._group_off[g]) + j64 * int(self._row_bytes[g])
+                )
+                remote_src = make_tensor(
+                    make_pointer(
+                        grad_dt,
+                        dtypes.int64(
+                            mapped + row_base + dtypes.uint64(c * chunk * elem)
+                        ),
+                        MemLoc.GM,
+                    ),
+                    make_layout((chunk,)),
+                )
+                mem_copy(tile_slice(slot_w, (chunk,), (0,)), remote_src)
+
+    @jit
+    def _det_writeback(self, reals, g, tile_idx, ub_acc, ub_out):
+        """单次写回 home chunk（终轮一次 dtype 舍入——逐位可重复的
+        关键）。"""
+        chunk = int(self._chunks[g])
+        home_tile = tile_slice(reals[g], (chunk,), (tile_idx,))
+        if const_expr(not (self._grad_bf16 or self._grad_fp16)):
+            mem_copy(home_tile, tile_slice(ub_acc, (chunk,), (0,)))
+        else:
+            grad_dt = (
+                dtypes.float16
+                if self._grad_fp16
+                else (dtypes.bfloat16 if self._grad_bf16 else dtypes.float32)
+            )
+            with vf(mode="simd"):
+                full = full_mask()
+                for off in range_constexpr(0, chunk, _VL):
+                    vstore_pack(
+                        ub_out,
+                        off,
+                        vcast(
+                            vload(ub_acc, off),
+                            grad_dt,
+                            mask=full,
+                            rounding=RoundingMode.RN,
+                        ),
+                        full,
+                        pack_mode=PackMode.B32_TO_B16,
+                    )
+            mem_copy(home_tile, tile_slice(ub_out, (chunk,), (0,)))
+
+    @jit
+    def _det_merge(
+        self,
+        connection,
+        reals,
+        ctx,
+        my_rank,
+        epoch,
+        inv_base,
+        ub_pipe,
+        ub_acc,
+        ub_seed,
+        ub_out,
+    ):
+        """确定性归并主循环：行单写者 + 固定 peer 升序 + 单次写。
+
+        块 b 归并行 {b, b+blocks, ...}（同行恰一块——单写者，无原子）。
+        每 (行, 组, chunk) tile：seed（home chunk，本地快读）入 fp32
+        累加器 → peer 升序流水累加（读块内环深滞后窗，MTE2 读 ∥ vf 加）→
+        单次写回 home chunk（一次 dtype 舍入）。
+
+        逐元素加法序列恒为 seed、peer 升序贡献、终轮一次舍入——与 host
+        参照（fp32 串行累加后一次 cast）逐位一致，跨 run 逐位可重复。
+
+        peer 发射/消费用统一滞后窗（consume(t-depth) ∥ issue(t)）：t 遍历
+        [0, n_rem+depth)，消费侧 peer = t-depth、发射侧 peer = t，各自独立
+        查 etc_inv 有效性——无需"下一个有效 peer"前瞻扫描；窗内在飞读数
+        恒 ≤ depth（环槽不覆写未消费数据）。
+
+        j 值直接 GM 标量 load_bypass 读（UB 标量读路径 j 野值致
+        MTE 507035）。逐 tile 2×(n_rem+depth) 次 GM 读，测试形状可
+        忽略；bench 形状的行内缓存命中由 DCache 承担。
+        """
+        rank_size = int(self._rank_size)
+        epn_rt = dtypes.int64(self._epn)
+        blocks_rt = dtypes.int64(self._blocks)
+        # ① 等全部 peer 的入槽 flag
+        self._det_wait_peer_flags(ctx, my_rank, epoch)
+        # ② 行单写者分区：i = blk, blk+blocks, ...
+        blk = dtypes.int64(get_block_idx())
+        for i in cannbotdsl.range(blk, epn_rt, blocks_rt):
+            for g in range_constexpr(_MAX_GRAD_GROUPS):
+                if g < int(self._ngroups):
+                    chunk = int(self._chunks[g])
+                    n_c = int(self._sizes[g]) // chunk
+                    for c in cannbotdsl.range(
+                        dtypes.int64(0), dtypes.int64(n_c), dtypes.int64(1)
+                    ):
+                        # —— tile (i, g, c)：seed → peer 升序流水 → 单次写 ——
+                        tile_idx = i * dtypes.int64(n_c) + c
+                        self._det_seed_acc(reals, g, tile_idx, ub_acc, ub_seed)
+                        # —— peer 升序 issue/consume（滞后窗 depth；先消费
+                        #    后发射——环在飞数恒 ≤ depth）——
+                        n_iter = dtypes.int64(rank_size - 1) + dtypes.int64(
+                            int(self._depth)
                         )
-                        j = dtypes.int64(cbd.scalar.load_bypass(j_t.ptr(0)))
-                        if j >= dtypes.int64(0):
-                            for g in range_constexpr(_MAX_GRAD_GROUPS):
-                                if g < ngroups:
-                                    chunk = self._chunks[g]
-                                    n_c = self._sizes[g] // chunk
-                                    row_base = dtypes.uint64(
-                                        HEAP_BASE
-                                        + self._group_off[g]
-                                        + j * self._rank_sizeow_bytes[g]
-                                    )
-                                    # 流水：chunk k 读入环当前槽
-                                    # （MTE2）∥ 从上一槽原子累加 k 出去（MTE3）
-                                    # ——两腿不同 UB 槽 = 无 WAW = MTE 通道重叠。
-                                    # prologue：chunk 0 入首槽（累加在主循环消费）
-                                    slot = ub_pipe.next_write()
-                                    remote_src = make_tensor(
-                                        make_pointer(
-                                            grad_dt,
-                                            dtypes.int64(
-                                                mapped
-                                                + row_base
-                                                + dtypes.uint64(0 * chunk * elem)
-                                            ),
-                                            MemLoc.GM,
-                                        ),
-                                        make_layout((chunk,)),
-                                    )
-                                    mem_copy(
-                                        tile_slice(slot, (chunk,), (0,)), remote_src
-                                    )
-                                    for c in cannbotdsl.range(
-                                        dtypes.int64(0),
-                                        dtypes.int64(n_c),
-                                        dtypes.int64(1),
-                                    ):
-                                        slot_next = ub_pipe.next_write()
-                                        # 预读 chunk k+1 入下一槽（末块无 k+1）
-                                        c_next = c + dtypes.int64(1)
-                                        if c_next < dtypes.int64(n_c):
-                                            remote_src = make_tensor(
-                                                make_pointer(
-                                                    grad_dt,
-                                                    dtypes.int64(
-                                                        mapped
-                                                        + row_base
-                                                        + dtypes.uint64(
-                                                            c_next * chunk * elem
-                                                        )
-                                                    ),
-                                                    MemLoc.GM,
-                                                ),
-                                                make_layout((chunk,)),
-                                            )
-                                            mem_copy(
-                                                tile_slice(slot_next, (chunk,), (0,)),
-                                                remote_src,
-                                            )
-                                        # 累加 chunk k 出当前槽（MTE3 atomic）
-                                        mem_copy(
-                                            tile_slice(
-                                                reals[g], (chunk,), (i * n_c + c,)
-                                            ),
-                                            tile_slice(slot, (chunk,), (0,)),
-                                            copy_options(atomic_add=True),
-                                        )
-                                        slot = slot_next
+                        for t in cannbotdsl.range(
+                            dtypes.int64(0), n_iter, dtypes.int64(1)
+                        ):
+                            self._det_consume(
+                                t, i, g, my_rank, rank_size, inv_base, ub_pipe, ub_acc
+                            )
+                            self._det_issue(
+                                connection,
+                                inv_base,
+                                i,
+                                t,
+                                c,
+                                g,
+                                my_rank,
+                                rank_size,
+                                ub_pipe,
+                            )
+                        # —— 单次写回（终轮一次舍入）——
+                        self._det_writeback(reals, g, tile_idx, ub_acc, ub_out)
 
 
 # ---------------------------------------------------------------------------
 # reduce host entry + program cache
 # ---------------------------------------------------------------------------
 _UBMEM_PROGRAMS = {}
-# 直累程序缓存锁（编译锁内写入）
-_ACC_LOCK = threading.Lock()
+_ACC_LOCK = threading.Lock()  # program 缓存写入互斥锁
 # ★ 编译烘焙走模块级全局（_get_acc_program 锁内赋值）——§5.7 烘焙铁律：
 #   声明行 + 赋值行成对改，漏 global 声明则局部遮蔽、按缺省值 trace
 _ACC_R = 4
@@ -439,7 +605,6 @@ _ACC_CHUNKS = (1,)
 _ACC_BF16 = True
 _ACC_FP16 = False  # fp16 梯度（16 位路径同 bf16——dtype 三选一）
 _ACC_BLOCKS = 8
-_ACC_SPLIT = 8  # 行分片读块数/链（>1 提每链在飞读数；1=block-per-peer）
 _ACC_DEPTH = 3  # 流水环槽深（UB = depth×max_chunk；2=issue#16 基线）
 
 
@@ -452,8 +617,8 @@ def _reduce_ubmem_host(
     gm_epoch,
     ctx: StructRef[MoonepCommCtx],
 ):
-    """reduce host entry（仅 UbMem）：单 kernel——block-per-peer 逐行
-    映射远读 + 拷贝引擎原子直累。"""
+    """reduce host entry（仅 UbMem）：单 kernel——行单写者确定性归并
+    （固定 peer 升序远读 + UB fp32 累加 + 单次写回）。"""
     _UbmemReduceAccKernel(
         _ACC_R,
         _ACC_EPN,
@@ -465,7 +630,6 @@ def _reduce_ubmem_host(
         _ACC_BLOCKS,
         _ACC_BF16,
         _ACC_FP16,
-        row_split=_ACC_SPLIT,
         depth=_ACC_DEPTH,
     )[_ACC_BLOCKS](k0, k1, k2, gm_etc_inv, gm_epoch, ctx)
 
@@ -479,7 +643,7 @@ def _get_acc_program(spec):
         global _ACC_R, _ACC_EPN, _ACC_SIZES, _ACC_ELEM
         global _ACC_NGROUPS, _ACC_COPY_OFF, _ACC_CHUNKS
         global _ACC_BF16, _ACC_BLOCKS, _ACC_FP16
-        global _ACC_SPLIT, _ACC_DEPTH
+        global _ACC_DEPTH
         _ACC_R = spec.rank_size
         _ACC_EPN = spec.epn
         _ACC_SIZES = spec.sizes
@@ -490,15 +654,14 @@ def _get_acc_program(spec):
         _ACC_BF16 = spec.grad_bf16
         _ACC_FP16 = spec.grad_fp16
         _ACC_BLOCKS = spec.blocks
-        _ACC_SPLIT = spec.split
         _ACC_DEPTH = spec.depth
         i32 = dtypes.int32
-        grad_dtype = (
+        dt = (
             dtypes.float16
             if spec.grad_fp16
             else (dtypes.bfloat16 if spec.grad_bf16 else dtypes.float32)
         )
-        specs = [TensorSpec((2 * spec.epn * s,), grad_dtype) for s in spec.sizes]
+        specs = [TensorSpec((2 * spec.epn * s,), dt) for s in spec.sizes]
         specs.append(TensorSpec((spec.epn, spec.rank_size), i32))
         specs.append(TensorSpec((1,), i32))  # epoch
         specs.append(StructRef[MoonepCommCtx])
@@ -520,11 +683,11 @@ def _copy_grads_to_ws(
     narrow/view/view × 组的 aten 派发是 host 段 ~70 ops/拍的
     削减项之一；源侧 local_grads 每拍新张量不可缓存）。
     """
-    grad_dtype = (
+    dt = (
         torch.float16 if grad_fp16 else (torch.bfloat16 if grad_bf16 else torch.float32)
     )
     elem = 2 if (grad_bf16 or grad_fp16) else 4
-    workspace = context.workspace
+    ws = context.workspace
     key = (
         tuple(int(w) for w in widths),
         bool(grad_bf16),
@@ -538,9 +701,7 @@ def _copy_grads_to_ws(
         base = HEAP_BASE + int(copy_off)
         for w in widths:
             region = epn * w * elem
-            views.append(
-                workspace.narrow(0, base, region).view(grad_dtype).view(epn, w)
-            )
+            views.append(ws.narrow(0, base, region).view(dt).view(epn, w))
             base += region
         cached = (key, views)
         context._pull_ws_copy_views = cached
@@ -649,7 +810,7 @@ def reduce_grad(
     # 归并 kernel：owner 远读 peer 副本 + vf 流式归并
     gm_epoch = next_barrier_epoch(context)
     # 块数封顶常驻核数（950PR 64 块）——R>64 时不随 R 增长：屏障写者与读块
-    # 都按 peer 轮转，避免写者被分波调度推到第二波互等
+    # 都按 peer 轮转（peer_block_split），避免写者被分波调度推到第二波互等
     # 。归并 tile 条带同样取此块数。
     blocks = resident_blocks(_HEADER_BARRIER_CAP)
     chunk_limit = (
@@ -660,13 +821,15 @@ def reduce_grad(
     # MoonepBuffer 构造期已查，裸 API 路径在此 fail-fast）
     for w in widths:
         if w % _VL:
-            raise ValueError(f"Wg={w} 须为 {_VL} 的倍数（归并步进尾块越界防护）")
+            raise ValueError(f"Wg={w} 须为 {_VL} 的倍数（归并 _VL 尾块越界防护）")
     ngroups = len(local_grads)
     # 3 槽：真实组前缀 + pad 尾置（缺省槽复用末组——kernel 不读取）
     sizes = tuple(widths) + (widths[-1],) * (_MAX_GRAD_GROUPS - ngroups)
-    # 行分片/环深旋钮（缺省生产值；MOONEP_ACC_SPLIT/MOONEP_ACC_DEPTH
-    # 供 bench 矩阵实验——spec 进编译键，环境变量不直接进 kernel）
-    acc_split = int(os.environ.get("MOONEP_ACC_SPLIT", "8"))
+    # 环深旋钮（缺省生产值；MOONEP_ACC_DEPTH 供 bench 矩阵实验——spec
+    # 进编译键，环境变量不直接进 kernel）。确定性归并（唯一累加
+    # 路径）：固定 peer 升序 + UB fp32 累加 + 单次写回——逐位可重复，
+    # bf16/fp16 舍入从 R-1 次降为 1 次；UB 预算含 acc/seed/out（16 位
+    # chunk 16K 时 depth≤3）。
     acc_depth = int(os.environ.get("MOONEP_ACC_DEPTH", "3"))
     spec = _ReduceSpec(
         epn=epn,
@@ -679,7 +842,6 @@ def reduce_grad(
         grad_bf16=grad_bf16,
         grad_fp16=grad_fp16,
         blocks=blocks,
-        split=acc_split,
         depth=acc_depth,
     )
     # 3 槽实参（缺省槽复用末组张量——kernel 不读取）
@@ -689,7 +851,7 @@ def reduce_grad(
     # 每 tile 一次 R×4B 行拷贝即得全部源，消逐 peer 的 etc 拷贝 + fence
     # + epn 次标量扫描
     # 1 槽 etc_inv 记忆化（同 etc 张量同版本 → 同内容，纯 host 派生
-    # 可复用——多 micro-batch/梯度累积循环同 etc 复用形态；槽持
+    # 可复用——多 micro-batch/梯度累积循环同 etc 复用；槽持
     # etc 引用防 ptr/id 复用误撞）
     inv_cache = getattr(context, "_pull_etc_inv_cache", None)
     inv_key = (id(experts_to_copy), experts_to_copy._version, epn)
@@ -698,11 +860,11 @@ def reduce_grad(
     else:
         dev = experts_to_copy.device
         targets = context.rank * epn + torch.arange(epn, device=dev, dtype=torch.int32)
-        hit_mask = experts_to_copy.unsqueeze(-1) == targets  # [R, epn(j), epn(i)]
-        has = hit_mask.any(dim=1)  # [R, epn(i)]
+        eq = experts_to_copy.unsqueeze(-1) == targets  # [R, epn(j), epn(i)]
+        has = eq.any(dim=1)  # [R, epn(i)]
         # argmax 恒返 int64——须显式转回 int32（TensorSpec 声明 int32，
         # int64 张量按 4B 步长解读 = 静默错值 + 野偏移远读）
-        j_idx = hit_mask.to(torch.int32).argmax(dim=1).to(torch.int32)  # [R, epn(i)]
+        j_idx = eq.to(torch.int32).argmax(dim=1).to(torch.int32)  # [R, epn(i)]
         etc_inv = (
             torch.where(has, j_idx, torch.tensor(-1, dtype=torch.int32, device=dev))
             .t()
@@ -713,7 +875,7 @@ def reduce_grad(
             etc_inv,
             experts_to_copy,
         )
-    # 直累路径（UbMem 映射读 + 拷贝引擎原子加）
+    # 确定性归并路径（UbMem 映射读）
     _get_acc_program(spec)(
         *(t.reshape(-1) for t in reals3),
         etc_inv,
