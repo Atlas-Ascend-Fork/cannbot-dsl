@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 
-"""R>64 布局与块划分静态回归（issue #14；不占卡）。
+"""R>64 布局与块划分静态回归（不占卡）。
 
 本机 8 卡无法实跑 R>64，这里守住两条可静态验证的不变量：
 - 布局定宽区域不越界：到达槽区 [0, MAX_R*NOTIFY_STRIDE) ⊂ [0, HEAP_BASE)，
@@ -69,15 +69,15 @@ def test_peer_block_split_covers_all_peers():
     """屏障写者/读块轮转覆盖全部 peer，且块数不超过常驻核数。"""
     for rank_size in (2, 8, 33, 64, 65, 66, MAX_R):
         n_rem = rank_size - 1
-        for reserve_merge in (False, True):
-            n_writer, per_writer, n_read, per_read = rg.peer_block_split(
-                rank_size, 64, reserve_merge
+        for row_split in (1, 8):
+            n_writer, per_writer, n_read, per_read, n_slices = rg.peer_block_layout(
+                rank_size, 64, row_split
             )
             assert n_writer == min(n_rem, 64)
             assert _covered(n_rem, n_writer, per_writer) == list(range(n_rem))
+            assert 0 < n_read <= 64
             assert _covered(n_rem, n_read, per_read) == list(range(n_rem))
-            if reserve_merge:
-                assert n_read < 64  # 两段式必须留出归并块
+            assert n_slices == -(-n_read // n_rem)
 
 
 def test_prefetch_push_layout_covers_all_peers():
@@ -96,7 +96,7 @@ def test_prefetch_push_layout_covers_all_peers():
 
 
 def test_kernel_read_split_at_max_rank():
-    """R=MAX_R：直累 kernel 每块分管多个 peer（URMA 两段式已退役删除）。"""
+    """R=MAX_R：直累 kernel 每块分管多个 peer。"""
 
     class _Probe:
         pass

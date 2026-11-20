@@ -193,7 +193,7 @@ def test_e2e_readme_ffn_chain(moonep_groups):
     assert not torch.isinf(y.cpu().float()).any(), "GMM 输出含 Inf"
 
     # —— FFN 反向（full-dW 形态）：home 行种子 + 副本行单位贡献 ——
-    # 数值口径与 test_urma part A 一致：home 种子 = rank+g（bf16 精确），
+    # 数值口径与参考用例 part A 一致：home 种子 = rank+g（bf16 精确），
     # 副本贡献 = 1.0；reduce 后 home = 种子 + 该行 etc 映射的远程副本数。
     dw1 = torch.zeros(2 * epn, W, dtype=torch.bfloat16, device="npu")
     dw3 = torch.zeros(2 * epn, W, dtype=torch.bfloat16, device="npu")

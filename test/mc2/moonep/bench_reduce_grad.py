@@ -79,8 +79,7 @@ def _iter_kernels(out_dir):
     """逐 rank 只取**最新** trace 的 kernel_details.csv。
 
     out_dir 跨 run 累积（同 --out 复用）时全量递归会把旧 run 的 kernel
-    时长掺入中位数——2026-11-15 实证：K=28 单发射真值 374.9µs 被旧
-    K=8 的 112µs 稀释成 med 112.7（假带宽 513 vs 真 332.8）。按 rank
+    时长掺入中位数（旧 run 会稀释当前指标）。按 rank
     目录分组取 mtime 最新一份即免疫。
     """
     latest = {}
@@ -104,8 +103,7 @@ def _summarize(out_dir):
 
     迭代 span：对齐 barrier[i] 起始 → barrier[i+1] 起始（末拍到本拍最后
     一个 pull/merge/barrier kernel 的结束）。**逐拍口径**——多批次两段式
-    下 per-launch 中位数口径会把单次发射时长当整拍（×批数虚高，2026-11-15
-    实证 313 GB/s vs 真值 20.7），带宽一律以 iter 口径为准。
+    下 per-launch 中位数口径会把单次发射时长当整拍（×批数虚高 → 带宽虚高），带宽一律以 iter 口径为准。
     launch-med 口径仅在**每拍恰 1 次 pull 发射**时与 iter 等价（单
     kernel 设计：prefetch/K=epn 直累/UbMem）；多发射/拍一律看 iter。
     """
@@ -194,7 +192,7 @@ def main():
         dist.barrier()
 
         # 每拍先全组对齐再测（对齐用 sym_barrier——不走 HCCL）。
-        # 0.8.2 起 finish_op 不再追加独立 barrier（到达等待内联在 pull
+        # finish_op 不追加独立 barrier（到达等待内联在 pull
         # kernel 中）——每拍恰 1 个对齐 barrier kernel，直接全量统计。
         out_dir = os.path.join(args.out, pattern, f"r{rank}")
         config = torch_npu.profiler._ExperimentalConfig(

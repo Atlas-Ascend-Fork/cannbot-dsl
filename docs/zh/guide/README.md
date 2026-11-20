@@ -28,3 +28,4 @@
   - [当前限制、迁移与常见问题](limitations.md)
   - [概念对照、命名速查与术语表](appendix.md)
 - [仓库结构](repository.md)
+- [pre-commit 配置指导书](pre-commit.md)

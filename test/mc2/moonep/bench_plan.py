@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 
-"""moonep_plan 基线：双传输（stage.sh=UBMEM / stage_urma.sh=URMA）对拍。
+"""moonep_plan 基线（UbMem 通路）。
 
 口径同 bench_reduce_grad（§11 教训）：
 - **kernel 时长**：profiler kernel_details.csv Duration 中位数（每拍恰

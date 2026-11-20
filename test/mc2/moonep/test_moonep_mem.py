@@ -30,12 +30,12 @@
 - --slots/--grad-dtype CLI 旋钮直接映射构造参数；堆需求
   打印改经 heap_required_bytes 只读 property 回读；
 - MEMSTAT delta/log 打点全部保留（观测点，非接口调用）；
-- 旧 MOONEP_PUSH_BLOCKS 覆盖开关移除：PR #261 后实现读 _MAX_PUSH_BLOCKS
+- MOONEP_PUSH_BLOCKS 覆盖开关已移除：实现读 _MAX_PUSH_BLOCKS
   经 resident_blocks() 按核数自适应，开关写入手已是无效死代码（8P aivec
   271 规避由核数自适应承担）。
 
 显存统计（MEMSTAT 标签行，grep 汇总）：
-  - MoonepBuffer 构造（HCCL 子组+workspace 预留+URMA 建连）delta 打点，
+  - MoonepBuffer 构造（HCCL 子组+workspace 预留+通信建连）delta 打点，
     堆配置经只读 property 回读；
   - DSL 三算子（plan/prefetch_weight/reduce_grad）全分配点 + workspace 布局
   - 训练侧激活张量逐个打点 + 每步末设备占用快照
@@ -252,12 +252,10 @@ def run(args):
     )
 
     t0 = time.perf_counter()
-    # ---- MoonepBuffer 构造（ctx 子组 + workspace 预留 + URMA 建连一体化）----
+    # ---- MoonepBuffer 构造（ctx 子组 + workspace 预留 + 通信建连一体化）----
     # 旧 run 的手工段（heap_need 计算 → hccl_buffer_size 注入 → new_group →
     # ctx 创建 → window_slots 定型）全部内化于构造
-    with mem_stat.delta(
-        "train", note="MoonepBuffer 构造（workspace 精算 + URMA 建连）"
-    ):
+    with mem_stat.delta("train", note="MoonepBuffer 构造（workspace 精算 + 通信建连）"):
         buf = MoonepBuffer(
             S,
             H,
@@ -551,7 +549,7 @@ def run(args):
 
     # ★ 跨运行对拍导出（功能验证）：种子确定性下，pull 与 torch 两模式的
     # 终态梯度/权重应一致（差异仅在 reduce 协议的舍入路径）。
-    # 背景：in-process --verify 的 all_reduce 在 EB URMA 混用下触发 A5 已知
+    # 背景：in-process --verify 的 all_reduce 在 EB 与 MoonEP 通信混用下触发 A5 已知
     # EI0006（设计文档 P8 记载）——跨运行对拍为零集合通信的替代验证路径。
     if args.dump:
         os.makedirs(args.dump, exist_ok=True)
@@ -643,7 +641,7 @@ def main(argv=None):
         action="store_true",
         help="pull 功能验证：reduce 前建 all_reduce 参考，"
         "reduce 后对比（会增加 ~[E,W] 瞬态——勿与显存测量同用；"
-        "qrun 下 EB URMA+all_reduce 混用有 EI0006 已知风险，"
+        "qrun 下 EB 通信+all_reduce 混用有 EI0006 已知风险，"
         "建议直跑或用 --dump 跨运行对拍替代）",
     )
     # 跨运行对拍导出：pull/torch 两模式分别 --dump，离线比较终态

@@ -59,9 +59,9 @@ from moonep_context import (
     workspace_base,
 )
 from moonep_layout import PREFETCH_SLICE_FLAGS_OFF
-from moonep_urma import (
+from moonep_comm import (
     NOTIFY_STRIDE,
-    MoonepUrmaCtx,
+    MoonepCommCtx,
     _gm_view,
     make_xfer_rb,
     spin_u32_ge,
@@ -99,7 +99,7 @@ _WEIGHT_DTYPES = (
     torch.float16,
     torch.float8_e4m3fn,
     torch.float8_e5m2,
-)  # E1：权重 dtype 白名单终态（bf16 / fp16 / e4m3fn / e5m2，uint8 退役）
+)  # E1：权重 dtype 白名单终态（bf16 / fp16 / e4m3fn / e5m2，uint8 不支持）
 
 
 def _is_fp8_weight(dtype):
@@ -136,7 +136,7 @@ def _slice_flag_off(p_comp, k, n_slices):
 class _MoonepPrefetchPushKernel:
     """按组推送：窗口是一维 uint8 workspace 视图，每组以“本组一行”为瓦片。
 
-    控制面在算子内：rank 取自 ``MoonepUrmaCtx``，组
+    控制面在算子内：rank 取自 ``MoonepCommCtx``，组
     起始行号与槽步长由编译期 ``sizes`` 计算，收尾 barrier 内联在推送 kernel
     里（flag 与数据同通道保序）。单一入口固定 6 个张量槽（3 权重 + 3
     scale），``ngroups``（权重组数 + scale 组数，2..6）在 trace 阶段裁剪实际
@@ -186,15 +186,15 @@ class _MoonepPrefetchPushKernel:
         gm_etc,
         slot,
         gm_epoch,
-        ctx: StructRef[MoonepUrmaCtx],
+        ctx: StructRef[MoonepCommCtx],
     ):
         world_size, epn, _ngroups = self._r, self._epn, self._ngroups
         # 真实组在前、pad 槽在后
         reals = (k0, k1, k2, k3, k4, k5)
         # rank 从 ctx 读，不进编译键
-        me = dtypes.int64(ctx.rankId)
-        me32 = dtypes.int32(ctx.rankId)
-        me64 = dtypes.uint64(ctx.rankId)
+        my_rank = dtypes.int64(ctx.rankId)
+        my_rank_i32 = dtypes.int32(ctx.rankId)
+        my_rank_u64 = dtypes.uint64(ctx.rankId)
         epoch = dtypes.uint32(gm_epoch[dtypes.int64(0)])
         xfer_rb = make_xfer_rb(_PREFETCH_XFER_DEPTH)
         epoch_addr = tensor_address(gm_epoch)
@@ -212,9 +212,9 @@ class _MoonepPrefetchPushKernel:
                 gm_etc,
                 ub_etc,
                 ub_row,
-                me,
-                me32,
-                me64,
+                my_rank,
+                my_rank_i32,
+                my_rank_u64,
                 epoch,
                 epoch_addr,
                 push_base,
@@ -233,9 +233,9 @@ class _MoonepPrefetchPushKernel:
                         gm_etc,
                         ub_etc,
                         ub_row,
-                        me,
-                        me32,
-                        me64,
+                        my_rank,
+                        my_rank_i32,
+                        my_rank_u64,
                         epoch,
                         epoch_addr,
                         push_base,
@@ -253,9 +253,9 @@ class _MoonepPrefetchPushKernel:
         gm_etc,
         ub_etc,
         ub_row,
-        me,
-        me32,
-        me64,
+        my_rank,
+        my_rank_i32,
+        my_rank_u64,
         epoch,
         epoch_addr,
         push_base,
@@ -273,10 +273,10 @@ class _MoonepPrefetchPushKernel:
         epn, ngroups = self._epn, self._ngroups
         row_bytes = self._row_bytes
         epn64 = dtypes.int64(epn)
-        peer = peer_id if peer_id < me else peer_id + dtypes.int64(1)
+        peer = peer_id if peer_id < my_rank else peer_id + dtypes.int64(1)
         # peer 索引按排序非自身 rank 紧凑编号（peer_id 本身即紧凑序号）
         peerh = xfer_open(ctx, dtypes.uint32(dtypes.uint64(peer_id)))
-        self._scan_peer(gm_etc, peer, ub_etc, ub_row, me32)
+        self._scan_peer(gm_etc, peer, ub_etc, ub_row, my_rank_i32)
 
         # 逐行直推，每行 ngroups 笔（分片模式以 slice_id 起步、n_slices 步进）
         for i in cannbotdsl.range(slice_id, epn64, dtypes.int64(self._n_slices)):
@@ -317,7 +317,7 @@ class _MoonepPrefetchPushKernel:
                     )
                 ub_flag_write(
                     peerh,
-                    me64 * dtypes.uint64(NOTIFY_STRIDE),
+                    my_rank_u64 * dtypes.uint64(NOTIFY_STRIDE),
                     epoch,
                     epoch_addr,
                 )
@@ -331,7 +331,7 @@ class _MoonepPrefetchPushKernel:
             # MTE3 同 pipe：flag 落地即此前全部行已到对端）
             ub_flag_write(
                 peerh,
-                me64 * dtypes.uint64(NOTIFY_STRIDE),
+                my_rank_u64 * dtypes.uint64(NOTIFY_STRIDE),
                 epoch,
                 epoch_addr,
             )
@@ -353,7 +353,7 @@ class _MoonepPrefetchPushKernel:
         mem_copy(_gm_view(addr, 1, dtypes.uint32), ub_epoch)
 
     @jit
-    def _scan_peer(self, gm_etc, peer, ub_etc, ub_row, me32):
+    def _scan_peer(self, gm_etc, peer, ub_etc, ub_row, my_rank_i32):
         epn = self._epn
         # VL 按 int32 lane 数换算
         vl = (
@@ -363,7 +363,7 @@ class _MoonepPrefetchPushKernel:
         )
         # 按 VL 分块，保持硬件循环
         n_chunks = (dtypes.int64(epn) + vl - 1) // vl
-        lo_e = me32 * dtypes.int32(epn)  # 本 rank 负责的专家区间 [lo, hi)
+        lo_e = my_rank_i32 * dtypes.int32(epn)  # 本 rank 负责的专家区间 [lo, hi)
         hi_e = lo_e + dtypes.int32(epn)
         mem_copy(
             tile_slice(ub_etc, (1, epn), (0, 0)),
@@ -404,7 +404,6 @@ class _PushConfig(NamedTuple):
     nblk: int
     per_block: int
     n_slices: int = 1  # 每 peer 行分片数（1 = block-per-peer）
-    transport: str = ""  # 历史字段（URMA 退役后恒空，保留键兼容）
 
 
 def _make_push_host(cfg):
@@ -419,7 +418,7 @@ def _make_push_host(cfg):
         gm_etc,
         slot: int,
         gm_epoch,
-        ctx: StructRef[MoonepUrmaCtx],
+        ctx: StructRef[MoonepCommCtx],
     ):
         _MoonepPrefetchPushKernel(
             cfg.rank_size,
@@ -488,7 +487,7 @@ def _get_push_program(
             specs.append(TensorSpec((rank_size, epn), dtypes.int32))
             specs.append(dtypes.int64)  # slot
             specs.append(TensorSpec((1,), dtypes.int32))  # barrier epoch
-            specs.append(StructRef[MoonepUrmaCtx])
+            specs.append(StructRef[MoonepCommCtx])
             prog = cannbotdsl.compile(_make_push_host(cfg), *specs)
             if len(_PUSH_PROGRAMS) >= _MAX_PUSH_PROGRAMS:
                 _PUSH_PROGRAMS.pop(next(iter(_PUSH_PROGRAMS)))
@@ -686,30 +685,30 @@ def _normalize_groups(local_weights, epn, context=None):
         )
     flats, sizes = [], []
     dtype = None
-    for g, rw in enumerate(local_weights):
-        if not isinstance(rw, torch.Tensor):
+    for g, weight in enumerate(local_weights):
+        if not isinstance(weight, torch.Tensor):
             raise TypeError(
-                f"第 {g} 组权重必须是 torch.Tensor，实得 {type(rw).__name__}"
+                f"第 {g} 组权重必须是 torch.Tensor，实得 {type(weight).__name__}"
             )
-        if rw.dim() < 2 or int(rw.shape[0]) != int(epn):
+        if weight.dim() < 2 or int(weight.shape[0]) != int(epn):
             raise ValueError(
-                f"第 {g} 组权重形状应为 (epn, ...) >= 2 维，实得 {tuple(rw.shape)}"
+                f"第 {g} 组权重形状应为 (epn, ...) >= 2 维，实得 {tuple(weight.shape)}"
             )
-        if not rw.is_contiguous():
+        if not weight.is_contiguous():
             raise ValueError(f"第 {g} 组须连续（展平前置）")
         if dtype is None:
-            dtype = rw.dtype
-        elif rw.dtype != dtype:
+            dtype = weight.dtype
+        elif weight.dtype != dtype:
             raise TypeError(
-                f"多权重组的 dtype 必须一致（第 {g} 组 {rw.dtype} != {dtype}）"
+                f"多权重组的 dtype 必须一致（第 {g} 组 {weight.dtype} != {dtype}）"
             )
-        w = int(rw.numel() // int(epn))
-        flats.append(rw.reshape(int(epn), w))
+        w = int(weight.numel() // int(epn))
+        flats.append(weight.reshape(int(epn), w))
         sizes.append(w)
     if dtype not in _WEIGHT_DTYPES:
         raise TypeError(
             "权重 dtype 仅支持 bf16 / fp16 / float8_e4m3fn / float8_e5m2"
-            f"（dtype 终态，uint8 已退役），got {dtype}"
+            f"（dtype 终态，uint8 不支持），got {dtype}"
         )
     if context is not None:
         frozen = getattr(context, "weight_dtype", None)

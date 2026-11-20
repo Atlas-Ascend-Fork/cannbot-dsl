@@ -92,6 +92,8 @@ _E2E_CASES = [
     pytest.param(4096, 8, 7, "balanced", 43, id="s4096k8_epn7"),
     # 大 E 形态（epn=28）：覆盖 E>128 的分箱、段查找与副本布局
     pytest.param(4096, 8, 28, "balanced", 43, id="s4096k8_epn28"),
+    # epn=1（E==R）：plan 单次迭代折叠路径回归
+    pytest.param(512, 8, 1, "balanced", 43, id="s512k8_epn1"),
 ]
 
 _ATOL = _RTOL = 2e-2
@@ -232,7 +234,7 @@ def test_moonep_ep_dispatch_combine_vs_golden(num_tokens, top_k, epn, mode, seed
 # ---------------------------------------------------------------------------
 # B < R 回归：实际启动块数小于 EP 组规模（R=64、可常驻核 56 的真机场景）
 # 时，Exchange 的 per-peer 发送必须按实际块数跨步覆盖全部远程 peer，
-# 否则其余 peer 等不到 ready flag，plan 挂死（检视意见 2026-11-10）。
+# 否则其余 peer 等不到 ready flag，plan 挂死。
 # 用 resident_blocks 打桩到 2 构造 B=2 < R 的本机可复现形态。
 # ---------------------------------------------------------------------------
 

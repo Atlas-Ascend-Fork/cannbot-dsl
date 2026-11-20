@@ -126,9 +126,9 @@ _POOL_CAP = 3  # HCCL 注册限额驱动的池上限（LRU 驱逐）
 
 
 def _get_ep_buf(world_size, num_tokens, top_k, num_experts):
-    """全部用例共享 DSL buffer 池（同 shape 键控；0.8.2 URMA 通路）。
+    """全部用例共享 DSL buffer 池（同 shape 键控；UbMem 通路）。
 
-    MoonepBuffer 构造为集体调用（含 URMA 连接建立）——池化共享免重复
+    MoonepBuffer 构造为集体调用（含通信连接建立）——池化共享免重复
     建连；进程退出统一回收（destroy 断开连接，秒级）。
     """
     key = (num_tokens, top_k, num_experts)
@@ -203,7 +203,7 @@ def _fresh_ctx():
     """布局变体用例专用裸 ctx（用后 close）。
 
     layout_groups/组宽/槽位在 ctx 上**首调冻结**——跨族共享会触发布局
-    守卫（d5/d6 实证：2 组/32768 宽/双槽用例连环被拦）。专用 ctx 用后
+    守卫（d5/d6：2 组/32768 宽/双槽用例连环被拦）。专用 ctx 用后
     即关，防 HCCL 注册累积（HcclCommMemReg 限额，池上限 3 的同源约束）。
     """
     return create_moonep_context(workspace_bytes=_test_workspace())
@@ -984,7 +984,7 @@ def test_moonep_general_spec_8192_h7168_k16_epn28():
     from moonep_context import HEAP_BASE, reduce_stg_off
 
     need = HEAP_BASE + reduce_stg_off(epn, w_elems, num_groups=num_groups)
-    avail = ctx.workspace_bytes  # 0.8.2：workspace 取代 HCCL 对称堆
+    avail = ctx.workspace_bytes  # workspace 取代 HCCL 对称堆
     if need > avail:
         pytest.skip(
             f"workspace 不足：本用例需 {need / 2**20:.0f}MiB，"

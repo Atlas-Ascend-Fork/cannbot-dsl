@@ -6,31 +6,24 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 
-"""moonep_urma：新通信 API 的设备数据面原语（**仅 UBMEM**）。
+"""moonep_comm：MoonEP 跨 rank 数据面原语（UbMem 映射内存）。
 
 本模块承接 moonep 全部跨 rank 数据面（早期 ``ops.distributed`` 旧 API
-已移除，演进史见 git 历史）。
+已移除）：设备侧原语、host 侧建连与重排屏障。
 
-**URMA 后端已退役（2026-11-16 用户指令——仅保留 UBMEM）**：SQE/CQE
-原语、逐 peer Urma 单连接、``MOONEP_TRANSPORT`` 模式分发与 ``const_expr``
-双传输裁剪全部删除；kernel 侧不再有传输分支（单一 UBMEM 直译）。模块与
-入口名保留历史称谓（``moonep_urma`` / ``connect_moonep_urma``——跨文件
-import 与 r128 分支兼容），勿再以其推断存在 URMA 通路。
-
-- **Host 控制面**（``connect_moonep_urma``）：本 rank 独立分配 workspace 张量
+- **Host 控制面**（``connect_moonep_comm``）：本 rank 独立分配 workspace 张量
   并注册（``MemoryDesc``），全组以相同布局公式各自分配（对称布局约定——
   本 rank 私有注册内存，不受 HCCL_BUFFSIZE 约束、与 EB 通信域天然隔离）。
   优先选择「全部 peer 均 UbMem 可达」的最低层建单连接（如 16 卡
   UB 拓扑中 layer 0 仅同 8 卡组可达、layer 1 全覆盖 → 选 layer 1）；
   无全覆盖层时按逐 peer 分组诊断，部分可达/多层分组直接拒绝——不回退。
 - **UbMem 设备写**（``ub_write``）：两跳搬运（GM→UB staging 环→对端
-  mapped GM；``mem_copy`` 不支持 GM→GM——含远端 dst，A5 实证），
+  mapped GM；``mem_copy`` 不支持 GM→GM——含远端 dst），
   字节粒度分块编译期展开。
 - **到达信号（sentinel write）**：每 (peer, 轮) 的末笔额外一笔 4B epoch 写
   对端的 per-sender **到达槽**（fence + 经 MTE3 数据通道写）——"哨兵到达
   ⇒ 同通道此前数据全部落地"。接收侧 ``spin_u32_ge``（scalar load_bypass
   轮询）等本端到达槽 ≥ epoch。
-- **rendezvous 屏障**（``urma_barrier_all``，名留史）：旧 per-peer flag
   握手的 put flag + 自旋收齐——头部屏障语义沿用。
 
 布局约定（workspace 相对偏移；公式唯一真源 moonep_layout）：
@@ -72,8 +65,8 @@ def notify_slot_off(rank: int) -> int:
 # ---------------------------------------------------------------------------
 # 设备上下文 datastruct（host 构造字节、kernel 侧 StructRef 读取）
 # ---------------------------------------------------------------------------
-@datastruct(c_name="MoonepUrmaCommCtx")
-class MoonepUrmaCtx:
+@datastruct(c_name="MoonepCommCtx")
+class MoonepCommCtx:
     """设备侧通信上下文（rank/连接地址/本端 workspace 基址）。
 
     Host 持有 connection 与 workspace 的生命周期；kernel 侧仅持借用视图
@@ -88,7 +81,7 @@ class MoonepUrmaCtx:
 
 def marshal_ctx(rank_id, rank_size, connection, ws_addr):
     """构造设备上下文字节 → uint8 NPU 张量（kernel 的 StructRef 实参）。"""
-    value = MoonepUrmaCtx(
+    value = MoonepCommCtx(
         rankId=rank_id,
         rankSize=rank_size,
         connection=connection.get_address(),
@@ -97,7 +90,7 @@ def marshal_ctx(rank_id, rank_size, connection, ws_addr):
     # __cannbotdsl_datastruct_schema__ 由 @datastruct 装饰器自动生成
     # （cannbotdsl.types.datastruct._DatastructMeta），框架虽未暴露
     # 公共序列化接口，但该属性是框架定义的稳定契约（样例代码同用法）
-    packed = _marshal_datastruct(value, MoonepUrmaCtx.__cannbotdsl_datastruct_schema__)
+    packed = _marshal_datastruct(value, MoonepCommCtx.__cannbotdsl_datastruct_schema__)
     payload = ctypes.string_at(ctypes.addressof(packed), ctypes.sizeof(packed))
     return torch.tensor(list(payload), dtype=torch.uint8).npu()
 
@@ -106,7 +99,7 @@ def marshal_ctx(rank_id, rank_size, connection, ws_addr):
 # UbMem 字节 staging 环（两跳搬运的 UB 中转；depth 流水 MTE2→MTE3）
 # ---------------------------------------------------------------------------
 UB_XFER_CHUNK = 32768  # 分块（字节）——行 224KB→7 块；小行单块
-# depth=3：in-flight 3×32KB=96KB（A5 实证 UB 预算约束：dispatch 表扫描
+# depth=3：in-flight 3×32KB=96KB（A5 UB 预算约束：dispatch 表扫描
 # 占 128KB，ring 可用 ≤ 96KB（248-128-杂项）；depth=8 会 MLIR UB 超限
 # 编译失败——深度 2→3 是预算内最大加深）
 UB_XFER_DEPTH = 3
@@ -165,7 +158,7 @@ def ub_write(peer, remote_off, src_addr, nbytes, xfer_rb):
     """UbMem 两跳写：GM(src)→UB(staging 环)→对端 mapped GM（字节粒度）。
 
     nbytes 为编译期常量——整块/尾块编译期展开（tile 计数静态）。当前
-    mem_copy 不支持 GM→GM（含远端 dst——A5 实证），故以 UB 环中转；
+    mem_copy 不支持 GM→GM（含远端 dst），故以 UB 环中转；
     depth=2 使 MTE2（GM→UB）与 MTE3（UB→远端）流水。数据落地的完成由
     调用方 fence（``_ub_fence``）或末笔 flag 写（``ub_flag_write``）收敛。
     """
@@ -266,7 +259,7 @@ def _ub_fence():
 def ub_flag_write(peer, slot_off, value, src_addr):
     """4B epoch 写对端槽——**经 MTE3 数据通道**（与数据写同 pipe 保序）。
 
-    A5 实证（combine 数值错位根因）：scalar bypass 写与 MTE3 批量写走
+    （combine 数值错位根因）：scalar bypass 写与 MTE3 批量写走
     不同通道——64 行批量下 flag 先落地、数据在途，接收侧 kernel 返回后
     torch/MTE 读窗仍见部分陈旧行。改经 UB 暂存 + mem_copy（MTE3）写
     flag——同 pipe 内 MTE3 写按序完成，flag 到达即此前数据全部落地
@@ -300,10 +293,9 @@ def xfer_open(ctx, peer_idx):
 
 
 # ---------------------------------------------------------------------------
-# rendezvous 屏障（put flag + 自旋收齐；函数名 urma_* 留史）
 # ---------------------------------------------------------------------------
 @jit
-def urma_barrier_all(
+def comm_barrier_all(
     ctx,
     rank_size: Constexpr[int],
     flags_off,
@@ -321,22 +313,22 @@ def urma_barrier_all(
     flag 已落地对端且全部对端 flag 已收齐——头部屏障语义（对端 kernel
     启动即其流序在前的 host 写入已完成）。
     """
-    me64 = dtypes.uint64(ctx.rankId)
+    my_rank_u64 = dtypes.uint64(ctx.rankId)
     src_addr = tensor_address(gm_epoch)
     for p in range_constexpr(rank_size):
-        if dtypes.uint64(p) != me64:
+        if dtypes.uint64(p) != my_rank_u64:
             peer_idx = dtypes.uint32(dtypes.uint64(p))
-            if dtypes.uint64(p) > me64:
+            if dtypes.uint64(p) > my_rank_u64:
                 peer_idx = peer_idx - dtypes.uint32(1)
             peer = xfer_open(ctx, peer_idx)
             ub_flag_write(
                 peer,
-                dtypes.uint64(flags_off) + me64 * dtypes.uint64(4),
+                dtypes.uint64(flags_off) + my_rank_u64 * dtypes.uint64(4),
                 epoch,
                 src_addr,
             )
     for p in range_constexpr(rank_size):
-        if dtypes.uint64(p) != me64:
+        if dtypes.uint64(p) != my_rank_u64:
             spin_u32_ge(
                 ctx,
                 dtypes.uint64(flags_off) + dtypes.uint64(p) * dtypes.uint64(4),
@@ -351,10 +343,9 @@ _CONNECT_LOCK = threading.Lock()
 _TAG_SEQ = 0  # 同通信域内连接 tag 唯一化（对称进程序列 ⇒ 全 rank 同步推进）
 
 # 活连接注册表：解释器退出前干净断连（逆序）——防通信原生对象在
-# 任意 GC 次序下被回收引发的退出期 SIGSEGV。实证链（2026-11-14）：
-# 显式 close 的 smoke 干净退出；泄漏连接的测试进程 rank0 退出 segv；
-# 且脏退出使同卡下一个进程建连挂起（HCCL/URMA 域残留）——atexit
-# 断连同时消两个问题。close() 已断连的重复调用幂等（try 吞）。
+# 任意 GC 次序下被回收引发的退出期 SIGSEGV；脏退出还会使同卡下一个
+# 进程建连挂起（域残留）。atexit 断连同时消两个问题；close() 已断连
+# 的重复调用幂等（try 吞）。
 _LIVE_CONNECTIONS = []
 
 
@@ -374,9 +365,9 @@ def _disconnect_all():
 
 
 class _TopoNative:
-    """0.8.3 x86 面 adapter：native handle 上的 layer 级协议表 + 逐对
+    """x86 面 adapter：native handle 上的 layer 级协议表 + 逐对
     check_reachable（x86 whl 的 Python 层移除旧方法且 get_peer_protocols
-    委托的 native 符号缺失——native handle 持完整旧方法面，混装实证可用）。
+    委托的 native 符号缺失——native handle 持完整旧方法面，混装可用）。
 
     ``handle`` 为 native handle（``domain._native``）；``domain`` 提供
     ``get_rank_id``。
@@ -390,14 +381,16 @@ class _TopoNative:
         return [_proto_value(x) for x in self._handle.get_protocols(layer)]
 
     def reachable(self, layer, peer, proto):
-        me = self._domain.get_rank_id()
-        return bool(self._handle.check_reachable(me, peer, layer, comm.Protocol(proto)))
+        my_rank = self._domain.get_rank_id()
+        return bool(
+            self._handle.check_reachable(my_rank, peer, layer, comm.Protocol(proto))
+        )
 
 
 class _TopoPeerProto:
-    """0.8.3 aarch64 面 adapter：``get_peer_protocols(layer, dst)`` 逐对协议表。
+    """aarch64 面 adapter：``get_peer_protocols(layer, dst)`` 逐对协议表。
 
-    A5_8P（aarch64 0.8.3）实证唯一可用查询面——可达性 = 目标协议出现在
+    A5_8P 唯一可用查询面——可达性 = 目标协议出现在
     该 (layer, peer) 的链路协议列表中（无独立 check_reachable 查询）。
     """
 
@@ -412,13 +405,13 @@ class _TopoPeerProto:
 
 
 def _topo_surface(domain):
-    """拓扑查询 API 面解析（0.8.3 两形态，按实证优先级）。
+    """拓扑查询 API 面解析（两种形态）。
 
-    0.8.3（x86 whl）：native handle 持完整旧方法面（get_protocols /
+    x86 形态：native handle 持完整旧方法面（get_protocols /
     check_reachable）——Python 层的 get_peer_protocols 委托符号缺失。
-    0.8.3（aarch64 whl）：两面旧方法均缺（native 亦无 get_protocols），
-    py-new ``get_peer_protocols(layer, dst)`` 直接给出 (me, dst) 逐对
-    协议表——A5_8P 建连/查询实证可用。
+    aarch64 形态：两面旧方法均缺（native 亦无 get_protocols），
+    py-new ``get_peer_protocols(layer, dst)`` 直接给出 (my_rank, dst) 逐对
+    协议表——A5_8P 建连/查询可用。
 
     返回统一 adapter（``protocols(layer, peer)`` / ``reachable(layer,
     peer, proto)``，proto 为数值）。
@@ -467,7 +460,7 @@ def _full_coverage_layer(domain, peers, proto_enum):
 def _group_peers_by_layer(domain, peers, proto_enum):
     """逐 peer 分组：{layer: [peers]}——任意拓扑建链的数据源。
 
-    对每个 peer，在层序中找首个含目标协议且 (me, p) 可达的层。
+    对每个 peer，在层序中找首个含目标协议且 (my_rank, p) 可达的层。
     同层全互联（4/8 卡）自然聚成单组；跨层级/supernode/异构组网按
     peer 落入不同层组——每组建一条连接（connect 的 peers 序保持升序，
     peer 索引 = 组内位置）。不可达 peer 记 None（调用方决定处理）。
@@ -490,14 +483,13 @@ def _group_peers_by_layer(domain, peers, proto_enum):
     return groups
 
 
-def connect_moonep_urma(group_name, rank, rank_size, workspace, tag="moonep"):
+def connect_moonep_comm(group_name, rank, rank_size, workspace, tag="moonep"):
     """注册 workspace 并建连（**仅 UbMem**），返回 (connection, ctx_tensor)。
 
     - workspace：torch uint8 NPU 张量（调用方持有；对称布局约定——全组
       以相同公式各自分配，区域偏移一致）。
     - UbMem（映射内存）：优先选全部 peer 均可达的最低层，以单连接承载
       全部 peers（kernel 紧凑序契约）；**不存在全覆盖层时，部分可达或
-      跨层多组直接拒绝**（URMA 回退已随传输退役删除——2026-11-16 用户
       指令；多层混合形态留二期）。
     - 通信域分离不变量自然消解：workspace 为本 rank 私有注册内存。
     """
@@ -546,7 +538,6 @@ def connect_moonep_urma(group_name, rank, rank_size, workspace, tag="moonep"):
                 raise comm.CommError(
                     f"UbMem 不可达 {len(fallback)}/{len(peers)} peers"
                     f"（不可达：{missing}）——部分可达/多层分组形态当前不支持"
-                    "（URMA 回退已退役；多层混合留二期）",
                 )
             if len(ub_groups) == 1:
                 layer, plist = next(iter(ub_groups.items()))
@@ -568,11 +559,10 @@ def connect_moonep_urma(group_name, rank, rank_size, workspace, tag="moonep"):
                 # 多层 UbMem 且无全覆盖层：单连接 ctx 结构不支持多组
                 raise comm.CommError(
                     f"UbMem 分层多组（{len(ub_groups)} 组，且无单层全覆盖）"
-                    "——多组形态当前不支持（需 ctx 扩展与查表；URMA 回退已退役）",
                 )
             else:
                 # 拓扑查询全空（协议查询可能返回空列表）——直接 UbMem 试连
-                # layer 0：单层全互联形态下连接本身可行（探针实证：查询面空
+                # layer 0：单层全互联形态下连接本身可行（探针观察：查询面空
                 # ≠ 传输不可用）；失败即报错（无回退）
                 try:
                     connection = domain.connect(

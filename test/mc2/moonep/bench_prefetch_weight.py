@@ -161,7 +161,7 @@ def main():
         # 每拍先全组对齐再测：对齐用 sym_barrier（不走 HCCL）——把
         # dist.barrier() 放进 profiler 窗口会触发 HCCL AICPU 的
         # RunAicpuIndOpThreadInit 异常。
-        # 0.8.2 起 finish_op 不再追加独立 barrier（到达等待内联在 push
+        # finish_op 不追加独立 barrier（到达等待内联在 push
         # kernel 中）——每拍恰 1 个对齐 barrier kernel，直接全量统计。
         out_dir = os.path.join(args.out, pattern, f"r{rank}")
         config = torch_npu.profiler._ExperimentalConfig(

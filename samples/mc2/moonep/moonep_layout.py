@@ -63,15 +63,15 @@ def lcm_slot_stride(epn: int, row_bytes) -> int:
     公式（widths/scale_widths 折行字节）都收敛到这里——两侧行字节列表
     相同则步长逐字节一致。
     """
-    row_bytes = [int(rb) for rb in row_bytes]
-    if not row_bytes or any(rb <= 0 for rb in row_bytes):
+    row_bytes = [int(row_bytes_i) for row_bytes_i in row_bytes]
+    if not row_bytes or any(row_bytes_i <= 0 for row_bytes_i in row_bytes):
         # 防御深度：0 行宽会使 LCM 归零后除零（上游 E3/normalize_group_list
         # 已友好拦截，这里兜底把 ZeroDivisionError 变为指向根因的报错）
         raise ValueError(f"行宽列表须非空且为正，实得 {row_bytes}")
     raw = sum(row_bytes) * ROWS_PER_EXPERT * int(epn)
     lcm = row_bytes[0]
-    for rb in row_bytes[1:]:
-        lcm = lcm * rb // math.gcd(lcm, rb)
+    for row_bytes_i in row_bytes[1:]:
+        lcm = lcm * row_bytes_i // math.gcd(lcm, row_bytes_i)
     return (raw + lcm - 1) // lcm * lcm
 
 
@@ -97,19 +97,19 @@ def group_slot_rows(epn: int, row_bytes):
     kernel 按“组起始行 + slot × 行步长 + 槽内行号”寻址，要求每组前缀和
     和 slot 步长都能被该组行字节数整除；不满足时在这里提前报错。
     """
-    row_bytes = tuple(int(rb) for rb in row_bytes)
+    row_bytes = tuple(int(row_bytes_i) for row_bytes_i in row_bytes)
     slot_bytes = lcm_slot_stride(epn, row_bytes)
     group_rows, slot_rows = [], []
     base_bytes = 0
-    for g, rb in enumerate(row_bytes):
-        if base_bytes % rb or slot_bytes % rb:
+    for g, row_bytes_i in enumerate(row_bytes):
+        if base_bytes % row_bytes_i or slot_bytes % row_bytes_i:
             raise ValueError(
-                f"第 {g} 组行宽 {rb}B 无法与前缀 {base_bytes}B / "
+                f"第 {g} 组行宽 {row_bytes_i}B 无法与前缀 {base_bytes}B / "
                 f"slot 步长 {slot_bytes}B 对齐；请调整该组行宽或 epn"
             )
-        group_rows.append(base_bytes // rb)
-        slot_rows.append(slot_bytes // rb)
-        base_bytes += rb * ROWS_PER_EXPERT * int(epn)
+        group_rows.append(base_bytes // row_bytes_i)
+        slot_rows.append(slot_bytes // row_bytes_i)
+        base_bytes += row_bytes_i * ROWS_PER_EXPERT * int(epn)
     return tuple(group_rows), tuple(slot_rows)
 
 
@@ -187,7 +187,7 @@ def reduce_region_end(
 
     - 副本发布区 [epn, Wg] × 组——每 rank 只发布自己的副本行供
       owner 远读；无 R 维度，显存恒定（19.3MB 级）
-    - 历史参照：push 形态接收区 [R, epn, Wg] 随 R 线性（32 卡
+    - push 形态接收区 [R, epn, Wg] 随 R 线性（32 卡
       617MB），为 pull 选型的动因
     ``scale_widths`` 只扩大权重发布区（scale 随 slot 轮转），不影响梯度区。
     """

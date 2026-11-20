@@ -8,8 +8,7 @@
 
 """reduce_grad：副本专家权重梯度跨 rank 归并回 home rank（训练反向）。
 
-**owner 直累协议（0.8.3 新通信 API，仅 UbMem 映射读——URMA 两段式
-已随传输退役删除，2026-11-16 用户指令）**，数据流：
+**owner 直累协议（UbMem 映射读）**，数据流：
 
   FFN 反向产出 full-dW ``t[2*epn, Wg]``（前 epn 行 home 种子、后 epn 行
   副本 dW）→ 发送侧 host 把副本行拷入**本 rank** workspace 副本区
@@ -18,7 +17,7 @@
   ① 头部屏障（per-peer flag 握手：对端 kernel 启动即其流序在前的
      host 副本区写入已完成——保护对端上轮远读与本轮覆写不重叠）
   ② owner 逐 peer **映射远读**副本区（etc_inv 逆映射行命中）→ UB
-     流水环（issue #16 depth=2：读 k+1 ∥ 累加 k）→ ``mem_copy(
+     流水环（depth=2：读 k+1 ∥ 累加 k）→ ``mem_copy(
      atomic_add=True)`` 拷贝引擎原子直累 home 行
   ③ 尾部 sym_barrier（下一轮 host 覆写安全）
 
@@ -62,8 +61,8 @@ from moonep_context import (
     sync_transport_stream,
 )
 from moonep_context import sym_barrier
-from moonep_urma import (
-    MoonepUrmaCtx,
+from moonep_comm import (
+    MoonepCommCtx,
     connection_from_address,
     spin_u32_ge,
     tensor_address,
@@ -71,17 +70,15 @@ from moonep_urma import (
     xfer_open,
 )
 
-# VL：fp32 归并步进（vf 寄存器 256B//4 = 64 @950PR——A5 实证）。
-# 检视意见建议 get_vf_len() 动态获取——实测不可行：该 API 需 IR
-# location（登录节点 ValueError "No current Location"——模块导入期/
-# host 侧均不可调用；range_constexpr 亦要求编译期常量）。保留常量 +
-# 本注释作为 won't-fix 依据。
-VL = 64
+# 归并步进：vf 寄存器 256B，fp32 即 64（950PR）。
+# get_vf_len() 需 IR location（host 侧不可用），range_constexpr 需编译期
+# 常量，故用常量。
+_VL = 64
 _MERGE_FENCE_ID = 6  # etc 扫描 MTE2→S 栅栏事件（kernel 内独立无冲突）
 
 _MAX_GRAD_GROUPS = 3  # 梯度组槽上限（kernel 入口固定 3 张量槽，ngroups 裁剪）
 
-_R = 1  # 组内 rank_size（编译锁内写入，进 program 键）
+_R = 1  # 组内 R（编译锁内写入，进 program 键）
 _BLOCKS = 28  # 实际启动块数（编译锁内写入，进 program 键）
 _REDUCE_LOCK = threading.Lock()
 
@@ -91,27 +88,27 @@ _CHUNK_UB_LIMIT_FP32 = 8192
 _HEADER_BARRIER_CAP = 64  # 头部屏障/读块上限（950PR vector_core_num 满额）
 
 
-def peer_block_split(rank_size, blocks, reserve_merge=False):
-    """头部屏障写者块与读块的划分（R 与 AIV 核数解耦，issue #14 B1/B2）。
+def peer_block_layout(rank_size, blocks, row_split=1):
+    """写者/读块布局：peer 轮转覆盖全 peer，返回块数与分片数。
 
-    ``blocks`` 由 host clamp 到常驻核数（resident_blocks）——所有块都在首波，
-    屏障写者不会再被分波调度推到第二波。写者块按 ``rank_size-1`` 轮转分摊
-    peer（``reserve_merge=True`` 供归并同拍形态让出读块——当前直累路径
-    不用，保留给组合形态）。
-    返回 ``(n_writer, per_writer, n_read, per_read)``。
+    写者块 = 前 n_writer 个块；读块 = min(n_rem*row_split, blocks)，超过
+    n_rem 时裁齐到 n_rem 整数倍（保证每 peer 恰好若干分片块）。
     """
     n_rem = max(int(rank_size) - 1, 0)
     n_writer = min(n_rem, int(blocks))
     per_writer = (n_rem + n_writer - 1) // n_writer if n_writer else 0
-    n_read = n_writer
-    if reserve_merge and n_writer >= int(blocks):
-        n_read = max(1, int(blocks) // 2)
+    n_read = min(n_rem * int(row_split), int(blocks))
+    if n_read > n_rem:
+        n_read = (n_read // n_rem) * n_rem
     per_read = (n_rem + n_read - 1) // n_read if n_read else 0
-    return n_writer, per_writer, n_read, per_read
+    n_slices = (n_read + n_rem - 1) // n_rem if n_rem else 1
+    return n_writer, per_writer, n_read, per_read, n_slices
 
 
 @jit
-def _barrier_flags_put(ctx, blk, me64, n_peer, n_writer, per_writer, gm_epoch, epoch):
+def _barrier_flags_put(
+    ctx, blk, my_rank_u64, n_peer, n_writer, per_writer, gm_epoch, epoch
+):
     """头部屏障写者块：把 my flag 写到本块分管的全部 peer（轮转分配）。
 
     先写完分管 peer 再进自旋（调用方在循环外等全部 peer）——写者块全在
@@ -125,7 +122,8 @@ def _barrier_flags_put(ctx, blk, me64, n_peer, n_writer, per_writer, gm_epoch, e
             peerh = xfer_open(ctx, peer_idx)
             ub_flag_write(
                 peerh,
-                dtypes.uint64(HEAP_BASE + BAR_FLAGS_OFF) + me64 * dtypes.uint64(4),
+                dtypes.uint64(HEAP_BASE + BAR_FLAGS_OFF)
+                + my_rank_u64 * dtypes.uint64(4),
                 epoch,
                 tensor_address(gm_epoch),
             )
@@ -198,14 +196,13 @@ class _ReduceSpec(NamedTuple):
 
 
 # ---------------------------------------------------------------------------
-# reduce 直累 kernel（仅 UbMem——URMA 两段式已随传输退役删除）
+# reduce 直累 kernel（UbMem 映射读）
 # ---------------------------------------------------------------------------
 @kernel
 class _UbmemReduceAccKernel:
-    """直累 kernel（master 0.8 设计回归，0.8.3 API 适配——用户指令
-    2026-11-15：UbMem 映射直读底层即 URMA 同链，master 实证 359.4）。
+    """直累 kernel（UbMem 映射直读 + 拷贝引擎原子加）。
 
-    读块按 peer 轮转：块 b 分管 peer b, b+n_writer, ...（``peer_block_split``
+    读块按 peer 轮转：块 b 分管 peer b, b+n_writer, ...（host 侧按块轮转分配
     ——R>64 时块数封顶常驻核数，与链路结构解耦）；逐行 etc_inv 直读标量
     （j≥0 = 该 peer 承载行 i 副本）；逐 chunk：映射远读 tile → UB 暂存 →
     ``mem_copy(atomic_add=True)`` 直累 home 行（**归并零 vf——拷贝引擎
@@ -229,19 +226,21 @@ class _UbmemReduceAccKernel:
         row_split=1,
         depth=2,
     ):
-        self._r = int(rank_size)
+        self._rank_size = int(rank_size)
         self._epn = int(epn)
         self._sizes = tuple(int(s) for s in sizes)
         self._elem_bytes = tuple(int(b) for b in elem_bytes)
         self._ngroups = int(ngroups)
         self._copy_off = int(copy_off)
-        self._row_bytes = tuple(s * b for s, b in zip(self._sizes, self._elem_bytes))
+        self._rank_sizeow_bytes = tuple(
+            s * b for s, b in zip(self._sizes, self._elem_bytes)
+        )
         self._chunks = tuple(int(c) for c in chunks)
         self._n_tiles = tuple(
             self._epn * (self._sizes[g] // self._chunks[g]) for g in range(3)
         )
         self._blocks = int(blocks)
-        self._row_split = int(row_split)
+        self._rank_sizeow_split = int(row_split)
         self._depth = int(depth)
         # 读块布局（R 与块数解耦 + 行分片提在飞读数/链）：
         #   块 b ∈ [0, n_read)：peer 槽 = b % n_rem（轮转覆盖全 peer），
@@ -250,27 +249,19 @@ class _UbmemReduceAccKernel:
         #   split=1 或块数不足时 n_slices=1/per_read>1——退化为原
         #   block-per-peer 全行形态（含 R>64 封顶轮转）。
         #   flag 写者块独立取前 n_writer 个（peer 轮转分管）。
-        n_rem = max(self._r - 1, 0)
-        self._n_writer = min(n_rem, self._blocks)
-        self._per_writer = (
-            (n_rem + self._n_writer - 1) // self._n_writer if self._n_writer else 0
-        )
-        n_read = min(n_rem * self._row_split, self._blocks)
-        if n_read > n_rem:
-            # 纯分片域：裁齐到 n_rem 整数倍——保证每 peer 恰 k 个分片块
-            # （非整倍时尾 cohort 部分覆盖 → 该 peer 缺行——R=16/b=64 仿真实证）
-            n_read = (n_read // n_rem) * n_rem
-        self._n_read = n_read
-        self._per_read = (
-            (n_rem + self._n_read - 1) // self._n_read if self._n_read else 0
-        )
-        self._n_slices = (self._n_read + n_rem - 1) // n_rem if n_rem else 1
+        (
+            self._n_writer,
+            self._per_writer,
+            self._n_read,
+            self._per_read,
+            self._n_slices,
+        ) = peer_block_layout(self._rank_size, self._blocks, self._rank_sizeow_split)
         self._grad_bf16 = bool(grad_bf16)
         self._grad_fp16 = bool(grad_fp16)
         group_off, gbase = [], int(copy_off)
         for g in range(3):
             group_off.append(gbase)
-            gbase += self._epn * self._row_bytes[g]
+            gbase += self._epn * self._rank_sizeow_bytes[g]
         self._group_off = tuple(group_off)
 
     def __call__(
@@ -280,13 +271,13 @@ class _UbmemReduceAccKernel:
         k2,
         gm_etc_inv,
         gm_epoch,
-        ctx: StructRef[MoonepUrmaCtx],
+        ctx: StructRef[MoonepCommCtx],
     ):
-        rank_size, _epn, ngroups = self._r, self._epn, self._ngroups
+        rank_size, _epn, ngroups = self._rank_size, self._epn, self._ngroups
         reals = (k0, k1, k2)
         epn_rt = dtypes.int64(self._epn)
-        me = dtypes.int64(ctx.rankId)
-        me64 = dtypes.uint64(ctx.rankId)
+        my_rank = dtypes.int64(ctx.rankId)
+        my_rank_u64 = dtypes.uint64(ctx.rankId)
         epoch = dtypes.uint32(gm_epoch[dtypes.int64(0)])
         grad_dt = (
             dtypes.float16
@@ -295,7 +286,7 @@ class _UbmemReduceAccKernel:
         )
         elem = 2 if const_expr(_ACC_BF16 or _ACC_FP16) else 4
         max_chunk = max(self._chunks)
-        # grad dtype 流水环（issue #16）：读 k+1（MTE2 入环槽）∥ 累加 k
+        # grad dtype 流水环：读 k+1（MTE2 入环槽）∥ 累加 k
         # 出上一槽（MTE3 atomic）——换单槽 ub_tmp 的 WAW 串行；槽深
         # depth（≥2）越高在读腿上的在飞 chunk 越多（WAR 间隔 = depth-1）
         ub_pipe = RingBuffer(
@@ -310,7 +301,7 @@ class _UbmemReduceAccKernel:
                 _barrier_flags_put(
                     ctx,
                     blk,
-                    me64,
+                    my_rank_u64,
                     rank_size - 1,
                     self._n_writer,
                     self._per_writer,
@@ -327,16 +318,16 @@ class _UbmemReduceAccKernel:
             i_step = dtypes.int64(self._n_slices)
             for read_slot in range_constexpr(int(self._per_read)):
                 p_compact = blk + dtypes.int64(read_slot * int(self._n_read))
-                if self._row_split > 1 and self._per_read == 1:
+                if self._rank_sizeow_split > 1 and self._per_read == 1:
                     # 纯分片模式（n_read ≥ n_rem）：块号取模落 peer 槽——
                     # 每 (peer, 行) 恰一个块。per_read>1 的封顶轮转形态
                     # 不取模（模回绕会在 stride 形态重复覆盖 peer——
-                    # R=128 封顶仿真实证 double write），沿用原 stride+守卫。
+                    # R=128 封顶形态 double write），沿用原 stride+守卫。
                     p_compact = p_compact - (p_compact // n_rem_rt) * n_rem_rt
                 if p_compact < dtypes.int64(rank_size - 1):
                     peer_idx = dtypes.uint32(dtypes.uint64(p_compact))
                     p_actual = p_compact
-                    if p_compact >= me:
+                    if p_compact >= my_rank:
                         p_actual = p_compact + dtypes.int64(1)
                     # —— ② 等 peer p 的 flag（副本入槽可见）——
                     spin_u32_ge(
@@ -370,9 +361,9 @@ class _UbmemReduceAccKernel:
                                     row_base = dtypes.uint64(
                                         HEAP_BASE
                                         + self._group_off[g]
-                                        + j * self._row_bytes[g]
+                                        + j * self._rank_sizeow_bytes[g]
                                     )
-                                    # 流水（issue #16）：chunk k 读入环当前槽
+                                    # 流水：chunk k 读入环当前槽
                                     # （MTE2）∥ 从上一槽原子累加 k 出去（MTE3）
                                     # ——两腿不同 UB 槽 = 无 WAW = MTE 通道重叠。
                                     # prologue：chunk 0 入首槽（累加在主循环消费）
@@ -399,8 +390,8 @@ class _UbmemReduceAccKernel:
                                     ):
                                         slot_next = ub_pipe.next_write()
                                         # 预读 chunk k+1 入下一槽（末块无 k+1）
-                                        c1 = c + dtypes.int64(1)
-                                        if c1 < dtypes.int64(n_c):
+                                        c_next = c + dtypes.int64(1)
+                                        if c_next < dtypes.int64(n_c):
                                             remote_src = make_tensor(
                                                 make_pointer(
                                                     grad_dt,
@@ -408,7 +399,7 @@ class _UbmemReduceAccKernel:
                                                         mapped
                                                         + row_base
                                                         + dtypes.uint64(
-                                                            c1 * chunk * elem
+                                                            c_next * chunk * elem
                                                         )
                                                     ),
                                                     MemLoc.GM,
@@ -434,7 +425,8 @@ class _UbmemReduceAccKernel:
 # reduce host entry + program cache
 # ---------------------------------------------------------------------------
 _UBMEM_PROGRAMS = {}
-_ACC_LOCK = threading.Lock()  # 名留史（原 pull/acc 共锁）
+# 直累程序缓存锁（编译锁内写入）
+_ACC_LOCK = threading.Lock()
 # ★ 编译烘焙走模块级全局（_get_acc_program 锁内赋值）——§5.7 烘焙铁律：
 #   声明行 + 赋值行成对改，漏 global 声明则局部遮蔽、按缺省值 trace
 _ACC_R = 4
@@ -458,7 +450,7 @@ def _reduce_ubmem_host(
     k2,
     gm_etc_inv,
     gm_epoch,
-    ctx: StructRef[MoonepUrmaCtx],
+    ctx: StructRef[MoonepCommCtx],
 ):
     """reduce host entry（仅 UbMem）：单 kernel——block-per-peer 逐行
     映射远读 + 拷贝引擎原子直累。"""
@@ -501,15 +493,15 @@ def _get_acc_program(spec):
         _ACC_SPLIT = spec.split
         _ACC_DEPTH = spec.depth
         i32 = dtypes.int32
-        dt = (
+        grad_dtype = (
             dtypes.float16
             if spec.grad_fp16
             else (dtypes.bfloat16 if spec.grad_bf16 else dtypes.float32)
         )
-        specs = [TensorSpec((2 * spec.epn * s,), dt) for s in spec.sizes]
+        specs = [TensorSpec((2 * spec.epn * s,), grad_dtype) for s in spec.sizes]
         specs.append(TensorSpec((spec.epn, spec.rank_size), i32))
         specs.append(TensorSpec((1,), i32))  # epoch
-        specs.append(StructRef[MoonepUrmaCtx])
+        specs.append(StructRef[MoonepCommCtx])
         prog = cannbotdsl.compile(_reduce_ubmem_host, *specs)
         _UBMEM_PROGRAMS[spec] = prog
         return prog
@@ -525,14 +517,14 @@ def _copy_grads_to_ws(
     基址公式但无 R 维度——内存恒定 [epn, Wg]×组。
 
     dst 视图 1 槽缓存（同 shape/dtype/copy_off 复用——每拍
-    narrow/view/view × 组的 aten 派发是 host 段 ~70 ops/拍的实证
+    narrow/view/view × 组的 aten 派发是 host 段 ~70 ops/拍的
     削减项之一；源侧 local_grads 每拍新张量不可缓存）。
     """
-    dt = (
+    grad_dtype = (
         torch.float16 if grad_fp16 else (torch.bfloat16 if grad_bf16 else torch.float32)
     )
     elem = 2 if (grad_bf16 or grad_fp16) else 4
-    ws = context.workspace
+    workspace = context.workspace
     key = (
         tuple(int(w) for w in widths),
         bool(grad_bf16),
@@ -546,7 +538,9 @@ def _copy_grads_to_ws(
         base = HEAP_BASE + int(copy_off)
         for w in widths:
             region = epn * w * elem
-            views.append(ws.narrow(0, base, region).view(dt).view(epn, w))
+            views.append(
+                workspace.narrow(0, base, region).view(grad_dtype).view(epn, w)
+            )
             base += region
         cached = (key, views)
         context._pull_ws_copy_views = cached
@@ -655,18 +649,18 @@ def reduce_grad(
     # 归并 kernel：owner 远读 peer 副本 + vf 流式归并
     gm_epoch = next_barrier_epoch(context)
     # 块数封顶常驻核数（950PR 64 块）——R>64 时不随 R 增长：屏障写者与读块
-    # 都按 peer 轮转（peer_block_split），避免写者被分波调度推到第二波互等
-    # （issue #14 B1/B2）。归并 tile 条带同样取此块数。
+    # 都按 peer 轮转，避免写者被分波调度推到第二波互等
+    # 。归并 tile 条带同样取此块数。
     blocks = resident_blocks(_HEADER_BARRIER_CAP)
     chunk_limit = (
         _CHUNK_UB_LIMIT_BF16 if (grad_bf16 or grad_fp16) else _CHUNK_UB_LIMIT_FP32
     )
     chunks = tuple(pick_weight_chunk(w, chunk_limit) for w in widths)
-    # 行宽须为 VL=64 倍数（归并 tile 步进=VL——非倍数时尾 tile 越界 UB；
+    # 行宽须为 _VL=64 倍数（归并 tile 步进=_VL——非倍数时尾 tile 越界 UB；
     # MoonepBuffer 构造期已查，裸 API 路径在此 fail-fast）
     for w in widths:
-        if w % VL:
-            raise ValueError(f"Wg={w} 须为 {VL} 的倍数（归并 VL 尾块越界防护）")
+        if w % _VL:
+            raise ValueError(f"Wg={w} 须为 {_VL} 的倍数（归并步进尾块越界防护）")
     ngroups = len(local_grads)
     # 3 槽：真实组前缀 + pad 尾置（缺省槽复用末组——kernel 不读取）
     sizes = tuple(widths) + (widths[-1],) * (_MAX_GRAD_GROUPS - ngroups)
@@ -695,7 +689,7 @@ def reduce_grad(
     # 每 tile 一次 R×4B 行拷贝即得全部源，消逐 peer 的 etc 拷贝 + fence
     # + epn 次标量扫描
     # 1 槽 etc_inv 记忆化（同 etc 张量同版本 → 同内容，纯 host 派生
-    # 可复用——多 micro-batch/梯度累积循环同 etc 复用实证形态；槽持
+    # 可复用——多 micro-batch/梯度累积循环同 etc 复用形态；槽持
     # etc 引用防 ptr/id 复用误撞）
     inv_cache = getattr(context, "_pull_etc_inv_cache", None)
     inv_key = (id(experts_to_copy), experts_to_copy._version, epn)
@@ -704,11 +698,11 @@ def reduce_grad(
     else:
         dev = experts_to_copy.device
         targets = context.rank * epn + torch.arange(epn, device=dev, dtype=torch.int32)
-        eq = experts_to_copy.unsqueeze(-1) == targets  # [R, epn(j), epn(i)]
-        has = eq.any(dim=1)  # [R, epn(i)]
+        hit_mask = experts_to_copy.unsqueeze(-1) == targets  # [R, epn(j), epn(i)]
+        has = hit_mask.any(dim=1)  # [R, epn(i)]
         # argmax 恒返 int64——须显式转回 int32（TensorSpec 声明 int32，
         # int64 张量按 4B 步长解读 = 静默错值 + 野偏移远读）
-        j_idx = eq.to(torch.int32).argmax(dim=1).to(torch.int32)  # [R, epn(i)]
+        j_idx = hit_mask.to(torch.int32).argmax(dim=1).to(torch.int32)  # [R, epn(i)]
         etc_inv = (
             torch.where(has, j_idx, torch.tensor(-1, dtype=torch.int32, device=dev))
             .t()
@@ -719,8 +713,7 @@ def reduce_grad(
             etc_inv,
             experts_to_copy,
         )
-    # 直累路径（UbMem 映射读 + 拷贝引擎原子加——master 0.8 设计回归；
-    # URMA 两段式 SQE 路径已随传输退役删除）
+    # 直累路径（UbMem 映射读 + 拷贝引擎原子加）
     _get_acc_program(spec)(
         *(t.reshape(-1) for t in reals3),
         etc_inv,

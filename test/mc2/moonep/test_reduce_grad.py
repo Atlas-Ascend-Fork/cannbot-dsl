@@ -214,7 +214,7 @@ def test_r9_reduce_rotated_peer_blocks(moonep_groups, monkeypatch):
     home_views = buf.reduce_grad(plan, local_grads=grads)
     assert len(home_views) == _NUM_GROUPS
     # 确实按 clamp 后的块数编译（否则本用例退化为 block-per-peer，白跑）
-    specs = list(rg_mod._UBMEM_PROGRAMS)  # URMA pull 缓存已随传输退役删除
+    specs = list(rg_mod._UBMEM_PROGRAMS)  # 直累程序缓存
     assert any(spec.blocks == 2 for spec in specs), "未走到块数 clamp 的轮转路径"
     torch.npu.synchronize()
     for g, t in enumerate(grads):
@@ -242,9 +242,9 @@ def test_r3_e5_grad_dtype_mismatch(moonep_groups):
 @pytest.mark.npu
 @_requires_train_env
 def test_r4_capacity_failfast():
-    """R4（容量 fail-fast，0.8.2 形态）：小 workspace 裸 ctx → 接收区越界 RuntimeError。
+    """R4（容量 fail-fast）：小 workspace 裸 ctx → 接收区越界 RuntimeError。
 
-    0.8.2 退役 EB/对称堆——MoonepBuffer 构造按形状精算 workspace（
+    MoonepBuffer 构造按形状精算 workspace，不使用 EB/对称堆（
     heap_required_bytes == heap_bytes 恒成立），旧"注入小 hccl_buffer_size
     组"的注入面不复存在。等价 fail-fast：显式 workspace_bytes 仅过 plan
     区（构造检查）的裸 ctx 上调 reduce_grad——check_heap_capacity 在程序
@@ -263,7 +263,7 @@ def test_r4_capacity_failfast():
         workspace_bytes=HEAP_BASE + PLAN_REGION_END + 64,
     )
     # 首调 plan 定型 last_plan_shape（reduce 的调用序守卫；plan 交换区在
-    # 容量内——首版直接调 reduce 被该守卫拦截，A5 d5 实证）
+    # 容量内——首版直接调 reduce 被该守卫拦截，A5 d5）
     topk, tpe = _routing(15)
     _, _, etc, _, _ = moonep_plan(ctx, tpe, topk)
     grads = [

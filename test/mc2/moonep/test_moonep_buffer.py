@@ -14,7 +14,7 @@
 单进程 pytest 收集自动跳过（CI 安全——双守卫：DSL import 失败或非 torchrun
 拉起均 skip，与 test_moonep_mem.py / test_moonep_ep.py 同款思想）。
 
-方法学（0.8.2 URMA 适配后）：
+方法学（UbMem 适配后）：
 - 数值对拍用编码值法（行值编码 home*1000+e、期望合并值公式、空槽 -1 保持，
   test_moonep_ep.py 同源）；reduce 数据流按 v4 pull 协议建模（副本区
   [epn,Wg] 恒定——发送侧拷入、owner 远读归并）。
@@ -24,7 +24,7 @@
 - _BUFFER_POOL 按 (S,K,E,W,groups,slots,grad_dtype,hidden) 键控共享 buffer
   （构造为集体调用，避免每用例建子组/堆累积）；
 - 专用 buffer（destroy 类）入 _DEDICATED 保活列表（防 GC 中途析构触发
-  URMA 连接断开噪声；DSL 原生 destroy 为秒级——保活仅为隔离用例间状态）。
+  通信连接断开噪声；DSL 原生 destroy 为秒级——保活仅为隔离用例间状态）。
 """
 
 import os
@@ -328,7 +328,7 @@ def _verify_merged(t, rank, world_size, epn, etc_cpu, g, base, w_elems, tag=""):
 def _verify_replica_intact(grads, epn, base, tag=""):
     """full-dW 尾段保持校验：reduce 只读副本行（入槽后归并远端贡献进 home 段）。
 
-    已知事实（当前实现实证）：pull 协议对输入副本行不清零（对称堆槽是
+    已知事实：pull 协议对输入副本行不清零（对称堆槽是
     独立落点，非输入张量本体），断言实际契约而非历史语义。
     """
     for g, t in enumerate(grads):
@@ -1118,7 +1118,7 @@ def test_a13_mxfp8_intertwined_scale(moonep_groups):
         ), f"fp8 组 {g} home 行未被同步写入"
 
     # —— bf16 full-dW reduce（梯度槽区基址含 scale 区域——离线对拍已验证
-    #     grad_slot_off == 权重+scale 窗口步长；此为上板实证）——
+    #     grad_slot_off == 权重+scale 窗口步长；上板行为）——
     base = 0.0
     g13 = _full_dw_2d(epn, 2 * W, 0, base, torch.bfloat16)
     g2 = _full_dw_2d(epn, W, 1, base, torch.bfloat16)
@@ -1240,8 +1240,8 @@ def test_e1_weight_dtype_mismatch(moonep_groups):
 
 @pytest.mark.npu
 @_requires_train_env
-def test_e1_uint8_retired(moonep_groups):
-    """E1 负例：weight_dtype=uint8 已退役（dtype 终态）→ TypeError。"""
+def test_e1_uint8_unsupported(moonep_groups):
+    """E1 负例：weight_dtype=uint8 不支持（dtype 终态）→ TypeError。"""
     _init_group()
     world = dist.get_world_size()
     with pytest.raises(TypeError, match="uint8"):

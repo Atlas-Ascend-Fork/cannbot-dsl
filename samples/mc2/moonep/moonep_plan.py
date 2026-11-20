@@ -76,9 +76,9 @@ from moonep_context import (
     resident_blocks,
     sync_transport_stream,
 )
-from moonep_urma import (
+from moonep_comm import (
     NOTIFY_STRIDE,
-    MoonepUrmaCtx,
+    MoonepCommCtx,
     make_xfer_rb,
     spin_u32_ge,
     tensor_address,
@@ -113,7 +113,7 @@ _ORDER_HOME = 1
 _ORDER_FIRST_REPLICA = 2
 _VID_HOT = -1  # 热专家标记（需走 pcnt/ord 段查找）
 
-_INT32_BYTES = 4  # squeeze 状态字节数 → int32 计数
+_INT32_BYTES = 4  # int32 字节宽（计数换算与字节偏移共用）
 _SLOTS_PER_RANK = 2  # 每 rank 两组槽位：本地专家 + 预取副本
 _WS_ALIGN = 16  # workspace 每段按 16 元素（64B）对齐
 
@@ -139,7 +139,7 @@ def ceil_pow2(x):
 # ---------------------------------------------------------------------------
 # 运行期状态
 # ---------------------------------------------------------------------------
-_RANK_SIZE = 1  # 组内 rank_size（编译锁内写入，参与编译缓存键）
+_RANK_SIZE = 1  # 组内 R（编译锁内写入，参与编译缓存键）
 
 
 # ---------------------------------------------------------------------------
@@ -178,7 +178,7 @@ class _PlanKernel:
         gm_ws,
         gm_topk,
         gm_io,
-        ctx: StructRef[MoonepUrmaCtx],
+        ctx: StructRef[MoonepCommCtx],
     ):
         """按 block 角色分派三个阶段。"""
         rank_size, num_experts = self._rank_size, self._num_experts
@@ -270,16 +270,16 @@ class _PlanKernel:
                 if dtypes.uint64(peer) > my_rank_u64:
                     peer_idx = peer_idx - dtypes.uint32(1)
                 peerh = xfer_open(ctx, peer_idx)
-                # ① tpe 行 → 对端 dem_all[me]
+                # ① tpe 行 → 对端 dem_all[my_rank]
                 ub_write(
                     peerh,
                     dtypes.uint64(HEAP_BASE + DEM_ALL_OFF)
-                    + my_rank_u64 * dtypes.uint64(MAX_E * 4),
+                    + my_rank_u64 * dtypes.uint64(MAX_E * _INT32_BYTES),
                     tpe_addr,
-                    num_experts * 4,
+                    num_experts * _INT32_BYTES,
                     xfer_rb,
                 )
-                # ② epoch 哨兵 → 对端到达槽[me]（ub_flag_write 首尾 fence
+                # ② epoch 哨兵 → 对端到达槽[my_rank]（ub_flag_write 首尾 fence
                 #    ——MTE3 同通道保序：哨兵到达即此前数据全部落地）
                 ub_flag_write(
                     peerh,
@@ -325,11 +325,11 @@ class _PlanKernel:
                 dtypes.int32(_HISTOGRAM_SENTINEL), dtypes.int32, mask=bmask
             )
             for boff in range_constexpr(0, chunk, _I32_LANES):
-                bv = vload(ub_topk, boff)
+                topk_vec = vload(ub_topk, boff)
                 vstore(
                     ub_topk,
                     boff,
-                    vbitwise_or(bv, sentinel, mask=bmask),
+                    vbitwise_or(topk_vec, sentinel, mask=bmask),
                     mask=bmask,
                 )
         with vf(mode="simd"):
@@ -368,25 +368,25 @@ class _PlanKernel:
                         mask=mask16,
                     )
                 base = group * _HISTOGRAM_U8_LANES
-                lo = vreinterpret(
+                low_part = vreinterpret(
                     vunpack(acc0, dtypes.uint32, part="lower"), dtypes.int32
                 )
-                vstore(ub_hist, base, lo, mask32)
-                hi = vreinterpret(
+                vstore(ub_hist, base, low_part, mask32)
+                high_part = vreinterpret(
                     vunpack(acc0, dtypes.uint32, part="upper"), dtypes.int32
                 )
-                vstore(ub_hist, base + _I32_LANES, hi, mask32)
-                lo1 = vreinterpret(
+                vstore(ub_hist, base + _I32_LANES, high_part, mask32)
+                low_part1 = vreinterpret(
                     vunpack(acc1, dtypes.uint32, part="lower"), dtypes.int32
                 )
-                vstore(ub_hist, base + _HISTOGRAM_BINS_PER_VL, lo1, mask32)
-                hi1 = vreinterpret(
+                vstore(ub_hist, base + _HISTOGRAM_BINS_PER_VL, low_part1, mask32)
+                high_part1 = vreinterpret(
                     vunpack(acc1, dtypes.uint32, part="upper"), dtypes.int32
                 )
                 vstore(
                     ub_hist,
                     base + _HISTOGRAM_BINS_PER_VL + _I32_LANES,
-                    hi1,
+                    high_part1,
                     mask32,
                 )
         mem_copy(
@@ -457,7 +457,7 @@ class _PlanKernel:
                     # epn=1 时内层 range 恰为单次迭代，会被 canonicalize
                     # 折叠成直写；事件从内层循环移到外层后
                     # verify-target-buffer-sync 会误报控制路径变更
-                    # （R=E 形态编译实证）。trace 期直接发射直写形态。
+                    # （R=E 形态）。trace 期直接发射直写形态。
                     ub_loads[dtypes.int64(r)] = ub_aux[dtypes.int64(r)]
                 else:
                     load = dtypes.int32(0)
@@ -558,14 +558,14 @@ class _PlanKernel:
         move = cap - min_load
         moved = dtypes.int32(0)
         # 属主对齐起点：本 lane 持有的本地专家 i 满足 i ≡ lane - src*epn (mod 32)
-        i0 = (lane + dtypes.int32(32) - (src_r * epn) % dtypes.int32(32)) % (
+        i_start = (lane + dtypes.int32(32) - (src_r * epn) % dtypes.int32(32)) % (
             dtypes.int32(32)
         )
         for _ in cannbotdsl.range(epn):
             if move > dtypes.int32(0):
                 best = dtypes.int32(0)
                 idx = dtypes.int32(-1)
-                for i in cannbotdsl.range(i0, epn, dtypes.int32(32)):
+                for i in cannbotdsl.range(i_start, epn, dtypes.int32(32)):
                     v = ub_rem[dtypes.int64(src_r * epn + i), dtypes.int64(src_r)]
                     if v > best:
                         best = v
@@ -703,9 +703,9 @@ class _PlanKernel:
             vid = simt.l2cache_load(gm_vid.ptr((dtypes.int64(e),)))
             if vid < dtypes.int32(0):
                 # 先建段序表（偏好序依赖 home/副本段排列）
-                for seg_idx in cannbotdsl.range(world_size):
-                    ord_rank_row[dtypes.int64(0), dtypes.int64(seg_idx)] = dtypes.int32(
-                        -1
+                for segment_index in cannbotdsl.range(world_size):
+                    ord_rank_row[dtypes.int64(0), dtypes.int64(segment_index)] = (
+                        dtypes.int32(-1)
                     )
                 for r in cannbotdsl.range(world_size):
                     order_seg = simt.l2cache_load(
@@ -718,8 +718,8 @@ class _PlanKernel:
                 # 偏好序 [home, 副本按段序, 非服务 rank]，pcnt 取其前序需求之和
                 prefix_base = dtypes.int32(0)
                 seen_self = dtypes.int32(0)
-                for seg_idx in cannbotdsl.range(world_size):
-                    r = ord_rank_row[dtypes.int64(0), dtypes.int64(seg_idx)]
+                for segment_index in cannbotdsl.range(world_size):
+                    r = ord_rank_row[dtypes.int64(0), dtypes.int64(segment_index)]
                     if r >= dtypes.int32(0) and seen_self == dtypes.int32(0):
                         if r == my_rank:
                             seen_self = dtypes.int32(1)
@@ -748,13 +748,15 @@ class _PlanKernel:
                         gm_counts.ptr((dtypes.int64(c), dtypes.int64(e)))
                     )
                 seg_acc = dtypes.int32(0)
-                for seg_idx in cannbotdsl.range(world_size):
-                    seg_rank = ord_rank_row[dtypes.int64(0), dtypes.int64(seg_idx)]
+                for segment_index in cannbotdsl.range(world_size):
+                    seg_rank = ord_rank_row[
+                        dtypes.int64(0), dtypes.int64(segment_index)
+                    ]
                     if seg_rank >= dtypes.int32(0):
                         seg_acc = seg_acc + simt.l2cache_load(
                             gm_rem.ptr((dtypes.int64(e), dtypes.int64(seg_rank)))
                         )
-                    ord_end_row[dtypes.int64(0), dtypes.int64(seg_idx)] = seg_acc
+                    ord_end_row[dtypes.int64(0), dtypes.int64(segment_index)] = seg_acc
 
     # ---- 阶段 2：Assign ----
     @jit
@@ -803,11 +805,11 @@ class _PlanKernel:
                     )
                     if cnt > dtypes.int32(0):
                         pos1 = pos0 + cnt
-                        vid0, seg_idx = self._relocate(
+                        vid0, segment_index = self._relocate(
                             e, pos0, gm_ord_rank, gm_rep_slot
                         )
                         seg_end = self._ub_ord_end[
-                            dtypes.int64(e), dtypes.int64(seg_idx)
+                            dtypes.int64(e), dtypes.int64(segment_index)
                         ]
                         if pos1 <= seg_end:
                             ub_vid_chunk[dtypes.int64(e)] = vid0
@@ -856,9 +858,11 @@ class _PlanKernel:
                 e = ub_topk[dtypes.int64(i)]
                 pos = ub_pos[dtypes.int64(e)]
                 if pos >= ub_seg_end[dtypes.int64(e)]:
-                    vid, seg_idx = self._relocate(e, pos, gm_ord_rank, gm_rep_slot)
+                    vid, segment_index = self._relocate(
+                        e, pos, gm_ord_rank, gm_rep_slot
+                    )
                     ub_seg_end[dtypes.int64(e)] = self._ub_ord_end[
-                        dtypes.int64(e), seg_idx
+                        dtypes.int64(e), segment_index
                     ]
                     ub_cur_vid[dtypes.int64(e)] = vid
                 ub_vtopk[dtypes.int64(i)] = ub_cur_vid[dtypes.int64(e)]
@@ -867,26 +871,26 @@ class _PlanKernel:
 
     @jit
     def _relocate(self, e, pos, gm_ord_rank, gm_rep_slot):
-        """二分定位 pos 所在段，返回 (vid, seg_idx)。"""
+        """二分定位 pos 所在段，返回 (vid, segment_index)。"""
         world_size, epn = self._rank_size, self._epn
         # ord_end[e,:] 非降累计——二分找首个 pos < end 的段
-        lo = dtypes.int32(0)
+        low_index = dtypes.int32(0)
         span = dtypes.int32(world_size)
         for _ in range_constexpr(world_size.bit_length()):
             half = span // dtypes.int32(2)
-            mid = lo + half
-            end_mid = self._ub_ord_end[dtypes.int64(e), dtypes.int64(mid)]
-            if pos < end_mid:
+            mid_index = low_index + half
+            end_mid_value = self._ub_ord_end[dtypes.int64(e), dtypes.int64(mid_index)]
+            if pos < end_mid_value:
                 span = half
             else:
-                lo = mid + dtypes.int32(1)
+                low_index = mid_index + dtypes.int32(1)
                 span = span - half - dtypes.int32(1)
-        seg_idx = lo
+        segment_index = low_index
         seg_rank = simt.l2cache_load(
-            gm_ord_rank.ptr((dtypes.int64(e), dtypes.int64(seg_idx)))
+            gm_ord_rank.ptr((dtypes.int64(e), dtypes.int64(segment_index)))
         )
         vid = seg_rank * dtypes.int32(_SLOTS_PER_RANK * epn) + (e % dtypes.int32(epn))
-        if seg_idx >= dtypes.int32(1):
+        if segment_index >= dtypes.int32(1):
             vid = (
                 seg_rank * dtypes.int32(_SLOTS_PER_RANK * epn)
                 + dtypes.int32(epn)
@@ -894,7 +898,7 @@ class _PlanKernel:
                     gm_rep_slot.ptr((dtypes.int64(seg_rank), dtypes.int64(e % epn)))
                 )
             )
-        return vid, seg_idx
+        return vid, segment_index
 
 
 # ---------------------------------------------------------------------------
@@ -906,7 +910,7 @@ def _plan_chunking(num_rows):
     """chunk 取整除 N 的 2 的幂，范围 [_CHUNK_MIN, _VF_SAFE_CHUNK]。
 
     上限来自 vf 栈：constexpr 展开次数随 chunk 增长，chunk=2048 时栈
-    6720B 超 6144B 上限、编译失败（A5 S=8192 实证）。
+    6720B 超 6144B 上限、编译失败（A5 S=8192）。
     """
     cap = resident_blocks(_MAX_PLAN_BLOCKS)
     target_chunk = max(_CHUNK_MIN, ceil_div(num_rows, cap))
@@ -951,7 +955,7 @@ def _moonep_plan_host(
     gm_ws,
     gm_topk,
     gm_io,
-    ctx: StructRef[MoonepUrmaCtx],
+    ctx: StructRef[MoonepCommCtx],
 ):
     """单 launch 发射：三个阶段一次提交。"""
     num_experts = gm_tpe.shape[0]
@@ -1116,7 +1120,7 @@ def _get_plan_program(num_tokens, top_k, num_experts, world_size):
             TensorSpec(
                 (_SLOTS_PER_RANK * epn + world_size * epn + num_rows,), i32
             ),  # 合并输出
-            StructRef[MoonepUrmaCtx],
+            StructRef[MoonepCommCtx],
         )
         _PLAN_PROGRAMS[key] = program
         return program

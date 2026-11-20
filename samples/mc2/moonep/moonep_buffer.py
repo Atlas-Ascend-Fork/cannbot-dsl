@@ -8,7 +8,7 @@
 
 """MoonepBuffer：moonep 五算子统一封装（构造即拥有全部通信资源 + ElasticBuffer 收编）。
 
-基于 0.8.3 新通信 API（仅 UbMem——URMA 已退役删除，2026-11-16）：plan / prefetch /
+基于 UbMem 映射内存通信：plan / prefetch /
 reduce 三算子（workspace 布局精算、ctx 定型、权重/梯度视图样板）+ dispatch/combine
 （ElasticBuffer 委托通路——``ep_group`` 上构造 EB；nmtr 推导与参数接线
 vtopk.view(S,K)、num_experts=2E、scores.float()）。接口形态对标 GPU MoonEP
@@ -91,7 +91,7 @@ Usage（五算子链端到端，FFN 侧全 NPU 算子、零 host 同步——形
     - 容量对拍：heap_required_bytes <= heap_bytes（workspace 构造期精算，
       分配即所需）。数据面不占通信域 HCCL 外部 buffer——hccl_buffer_size
       由通信域创建方自理（默认/显式值均可），库不感知、不校验。
-    - 依赖 cannbotdsl >= 0.8.3（cannbotdsl.comm 新通信 API）；dispatch/combine
+    - 依赖 cannbotdsl.comm 通信 API；dispatch/combine
       另依赖 cann_ops_transformer whl（ElasticBuffer）——缺失时构造期秒级
       报错并给安装指引（纯 DSL 环境下 plan/prefetch/reduce 不受影响）。
 """
@@ -99,6 +99,7 @@ Usage（五算子链端到端，FFN 侧全 NPU 算子、零 host 同步——形
 from __future__ import annotations
 
 import warnings
+import threading
 
 import torch
 import torch.distributed as dist
@@ -192,8 +193,7 @@ def _normalize_weight_dtype(weight_dtype):
     2 字节、不配 scale；fp8（e4m3fn/e5m2）= mxfp8 数据面 ⟹ 一并推断
     scale 区预留与"首调必传 local_scales"硬契约（双向：scales ⟺ fp8
     ——quant 参数已并入 dtype 语义，无半状态、无浪费预留；无 block
-    scale 的 int8 形态不在范围）。dtype 终态：uint8 退役（mxfp8 请显式
-    e4m3fn/e5m2）。
+    scale 的 int8 形态不在范围（mxfp8 请显式 e4m3fn/e5m2）。
     """
     if isinstance(weight_dtype, str):
         if weight_dtype == "bf16":
@@ -206,7 +206,7 @@ def _normalize_weight_dtype(weight_dtype):
             return torch.float8_e5m2
         raise TypeError(
             "weight_dtype 仅支持 'bf16'/'fp16'/'e4m3fn'/'e5m2'（或 torch 对应"
-            " dtype；uint8 已退役——mxfp8 用 e4m3fn/e5m2），"
+            " dtype；uint8 不支持——mxfp8 用 e4m3fn/e5m2），"
             f"got {weight_dtype!r}"
         )
     if weight_dtype in (
@@ -218,7 +218,7 @@ def _normalize_weight_dtype(weight_dtype):
         return weight_dtype
     raise TypeError(
         "weight_dtype 仅支持 'bf16'/'fp16'/'e4m3fn'/'e5m2'（或 torch 对应"
-        f" dtype；uint8 已退役——mxfp8 用 e4m3fn/e5m2），got {weight_dtype!r}"
+        f" dtype；uint8 不支持——mxfp8 用 e4m3fn/e5m2），got {weight_dtype!r}"
     )
 
 
@@ -312,14 +312,14 @@ class MoonepBuffer:
             weight_dtype: 权重容量口径 "bf16"/"fp16"/"e4m3fn"/"e5m2"
                 （或 torch.dtype），缺省 bf16。fp16 与 bf16 同为 2 字节、
                 不配 scale；fp8 = mxfp8 数据面 ⟹ 首调必传 local_scales
-                （双向硬契约）并预留 scale 区（dtype 终态：uint8 已退役）。
+                （双向硬契约）并预留 scale 区。
             grad_dtype: 梯度槽 dtype 定型值 "bf16"/"fp16"/"fp32"，**缺省字面
                 bf16**（显存优先 + 当前唯一可信口径；fp16 与 bf16 同 2 字节；
                 fp32 显式声明为 master-weight 精度口径）。定型值 = 槽区容量预留
                 口径 + local_grads 校验基。
             slots: 多槽窗口池层数（层间流水双槽传 2），>= 1；构造期定型
                 ctx.window_slots——缺此定型 slots>1 时槽区基址按 slots=1
-                计算，落在发布区 slot-1 段内被 prefetch 踩（实证偏差 15-48%）。
+                计算，落在发布区 slot-1 段内被 prefetch 覆盖。
 
         组数契约（运行期自适应）：权重/梯度组数不构造期固定——调用方按
         3 组等宽 ``(W, W, W)`` 或交织 2 组 ``(2W, W)``（gate/up 融合为 W13）
@@ -327,15 +327,15 @@ class MoonepBuffer:
         2 等宽组更小），首次算子调用定型 layout_groups 并由容量校验兜底。
         """
         # —— 守卫（全部先于 dist.new_group：违例构造为纯本地失败，不产生集合调用）——
-        # R 取注入通信域的组内 rank 数（子组 != WORLD 时 epn 须按组内分片
-        # 计算——如 WORLD=16、EP 子组=8 时 epn = E/8 而非 E/16）
-        R = dist.get_world_size(moonep_group)
+        # R 取注入通信域的组内 rank 数（子组 != WORLD 时 epn 须按组内
+        # 分片计算——如 WORLD=16、EP 子组=8 时 epn = E/8 而非 E/16）
+        rank_size = dist.get_world_size(moonep_group)
         # ---- C4: num_ep_ranks 显式参数（与 MoonEP 同形；与组 world size 校验）----
         if num_ep_ranks is None:
-            num_ep_ranks = R
-        elif int(num_ep_ranks) != R:
+            num_ep_ranks = rank_size
+        elif int(num_ep_ranks) != rank_size:
             raise ValueError(
-                f"num_ep_ranks={num_ep_ranks} 与组 world size={R} 不符"
+                f"num_ep_ranks={num_ep_ranks} 与组 world size={rank_size} 不符"
                 "（参照 MoonEP 显式声明，防跨组误用）"
             )
         # ---- 通信域校验（仅接受 ProcessGroup——建组方式/组显存由调用方自理）----
@@ -357,8 +357,10 @@ class MoonepBuffer:
             # E=0 时 E%R==0 成立会静默通过（0 模任意正数余 0），epn=0
             # 在下游 numel//epn 除零；负数经 E%R==0 同样漏网
             raise ValueError(f"E 须 >= 1，got {E}")
-        if E % R != 0:
-            raise ValueError(f"E={E} 必须能被 R={R} 整除（epn = E // R）")
+        if E % rank_size != 0:
+            raise ValueError(
+                f"E={E} 必须能被 rank_size={rank_size} 整除（epn = E // rank_size）"
+            )
         if slots < 1:
             raise ValueError(f"slots 须 >= 1，got {slots}")
         if H < 1:
@@ -379,10 +381,10 @@ class MoonepBuffer:
         pick_weight_chunk(w, _CHUNK_TRIAL_UB)  # 不可整除即 ValueError（fail-fast）
         # —— workspace 布局（权重+scale 发布区 + 梯度副本区 [epn,Wg] × 组
         #     + 尾部对齐；副本区无 R 维度——显存恒定）——
-        epn = E // R
+        epn = E // rank_size
         grad_elem = 2 if gdtype in (torch.bfloat16, torch.float16) else 4
         # 实际容量唯一真源（构造分配与裸 API 指引共用）
-        heap_need = _workspace_need(R, epn, w, slots, gdtype, wdtype)
+        heap_need = _workspace_need(rank_size, epn, w, slots, gdtype, wdtype)
 
         # —— 集体段（全 EP rank 同序执行）——
         # 不自建子组——调用方注入（数据面走私有 workspace，组仅提供 HCCL
@@ -400,10 +402,10 @@ class MoonepBuffer:
         check_heap_capacity(self._ctx, heap_need, "MoonepBuffer 构造")
         # —— EB（dispatch/combine）构造：ElasticBuffer 委托通路 ——
         #     DSL ctx 与 EB 分属两个 HCCL 通信器（通信域分离不变量——
-        #     ep_group 由调用方保证独立）。URMA 退役后 EB 为 token
-        #     数据面唯一通路（原 DSL 直写通路随 URMA 删除——2026-11-16）。
+        #     ep_group 由调用方保证独立）；EB 为 token 数据面唯一通路。
         self._ep_group = ep_group
         self._eb = None  # 懒构造：首调 dispatch/combine 时建（见 _ensure_eb）
+        self._eb_lock = threading.Lock()  # 首调并发守卫（EB 构造不可重入）
         self._nmtr = int(S)  # EB 容量（首调 dispatch/combine 时用；= S）
         # —— 定型状态（构造期只读）——
         self._S, self._K, self._E = int(S), int(K), int(E)
@@ -412,7 +414,7 @@ class MoonepBuffer:
         self._Hp = int(Hp)
         self._w_elems = w  # 仅内部布局口径（properties 不再对外暴露 w_elems）
         self._slots = int(slots)
-        # pull 流水旋钮已退役（pull 协议无 scratch/分段流水）；参数保留
+        # pull 流水旋钮对当前协议无效；参数保留
         # 仅为 API 兼容（构造即忽略）
         self._views_cache = {}  # slot -> prefetch 返回的 (weights, scales) 二元组
         self._weight_dtype = wdtype
@@ -654,31 +656,36 @@ class MoonepBuffer:
     # ------------------------------------------------------------------
 
     def _ensure_eb(self):
-        """EB 懒构造：首调 dispatch/combine 时建（nmtr=S，master 同式）。
+        """EB 懒构造：首调 dispatch/combine 时建（nmtr=S）。
 
         懒构造理由：MoonepBuffer 构造为纯 DSL ctx（workspace+连接），EB
         涉及 HCCL 集体通信（ElasticBuffer 构造为集体调用）——构造期即建
         会让纯 plan/prefetch/reduce 用户也付出 EB 建连代价 + cann_ops
         硬依赖（无 whl 环境直接 ImportError）。
+
+        首调即集体构造点：ElasticBuffer 构造含 HCCL 集合通信，全 rank 须同序
+        首调 dispatch/combine；本锁只防同进程多线程重复构造。
         """
         if self._eb is not None:
             return
-        try:
-            from cann_ops_transformer.ops import ElasticBuffer
-        except ImportError as exc:
-            raise ImportError(
-                "dispatch/combine 需要 cann_ops_transformer（ElasticBuffer）。"
-                "安装：pip install <cann_ops_transformer whl>"
-            ) from exc
-        # EB 建在 ep_group：与 DSL ctx 的 moonep_group 分属两个 HCCL 通信器
-        # ——通信域分离由构造保证（EB@ep_group 与 DSL ctx@moonep_group
-        #    分属两个 HCCL 通信器——ep_group 由调用方保证独立）
-        self._eb = ElasticBuffer(
-            self._ep_group,
-            num_max_tokens_per_rank=self._nmtr,
-            hidden=self._H,
-            num_topk=self._K,
-        )
+        with self._eb_lock:
+            if self._eb is not None:
+                return
+            try:
+                from cann_ops_transformer.ops import ElasticBuffer
+            except ImportError as exc:
+                raise ImportError(
+                    "dispatch/combine 需要 cann_ops_transformer（ElasticBuffer）。"
+                    "安装：pip install <cann_ops_transformer whl>"
+                ) from exc
+            # EB 建在 ep_group：与 DSL ctx 的 moonep_group 分属两个 HCCL 通信器
+            # ——ep_group 由调用方保证独立
+            self._eb = ElasticBuffer(
+                self._ep_group,
+                num_max_tokens_per_rank=self._nmtr,
+                hidden=self._H,
+                num_topk=self._K,
+            )
 
     def dispatch(
         self,
@@ -700,11 +707,11 @@ class MoonepBuffer:
             x: [S, hidden] 张量——前向为 token 载荷（bf16），反向为输出梯度
                 （combine⁻¹ 散梯度形态）。
             topk_weights: [S, K] 路由权重（fp32 或可 ``.float()``）。None = 反向
-                形态：rw 不随车，返回的 recv_w 为 None——加权由调用方复用
-                前向 recv_w 或由 GMM 反向侧施加（mem 实证路径）。
+                形态：路由权重不随车，返回的 recv_w 为 None——加权由调用方复用
+                前向 recv_w 或由 GMM 反向侧施加（显存优化路径）。
             do_cpu_sync: True（缺省）为 EB 官方精确分配路径——dispatch 首调
                 CPU 同步获取实际到达行数后精确分配 recv（无 worst-case 预留，
-                显存最优，代价一次 CPU 同步）；False 免同步（ep 测试实证路径，
+                显存最优，代价一次 CPU 同步）；False 免同步（ep 测试路径，
                 recv 按 worst-case 容量分配）。透传可调，缺省取显存最优。
 
         Returns:
@@ -842,11 +849,7 @@ class MoonepBuffer:
 
     @property
     def heap_bytes(self) -> int:
-        """workspace 实际字节数（构造期精算分配；名称沿旧 heap 口径）。
-
-        纯值 property：构造期定型缓存（destroy 后仍可读——A7 契约；旧
-        实现走 live ctx 在 destroy 后裸 AttributeError，A5 d6 实证）。
-        """
+        """workspace 实际字节数（构造期精算分配）。"""
         return self._heap_bytes
 
     @property
@@ -868,7 +871,7 @@ class MoonepBuffer:
                 True 为 opt-in：显式提前释放。
             release_eb: 缺省 False **不调用** ``self._eb.destroy()``，EB 引用
                 在逻辑 destroy 后仍由本对象持有到进程退出（"池化保活 + 进程
-                退出硬退回收"，conftest 实证路径）。依据一（平台代价）：EB
+                退出硬退回收"，conftest 路径）。依据一（平台代价）：EB
                 Destroy 的 HcclBarrier 建 AICPU_TS 通道必等 ~120s/个——缺省
                 路径若立即弃引用，GC 可能在会话中段触发 EB 析构造成分钟级
                 停顿；依据二（释放不完备性）：C++ 共享池按 tag 绑定的物理
@@ -888,7 +891,7 @@ class MoonepBuffer:
         if self._ctx is not None:
             self._ctx.close()  # 连接断开（workspace 随引用回收）
         self._ctx = None  # 后续调用经 _require_alive 以 RuntimeError 拒绝
-        if release_eb:
+        if release_eb and self._eb is not None:
             self._eb.destroy()
         if release_group:
             dist.destroy_process_group(self._group)
