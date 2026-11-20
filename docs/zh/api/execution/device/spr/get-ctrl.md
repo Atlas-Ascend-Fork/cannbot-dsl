@@ -19,7 +19,7 @@ get_ctrl() -> int
 
 ## 返回值说明
 
-返回CTRL寄存器的值，设备侧类型为`Int64`。各比特位含义参见[`set_ctrl`参数说明](set-ctrl.md#参数说明)。
+返回CTRL寄存器的值，设备侧类型为`Int64`。仅需查询饱和开关或策略时，可使用[get_saturation_flag](get-saturation-flag.md)或[get_saturation_strategy](get-saturation-strategy.md)。各比特位含义参见[`set_ctrl`参数说明](set-ctrl.md#参数说明)。
 
 ## 约束说明
 

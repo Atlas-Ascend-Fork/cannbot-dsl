@@ -302,6 +302,10 @@ API 页面按语言、数据结构、数据搬运、计算、设备执行、调�
     - 特殊寄存器
       - [get_ctrl](execution/device/spr/get-ctrl.md)
       - [set_ctrl](execution/device/spr/set-ctrl.md)
+      - [get_saturation_flag](execution/device/spr/get-saturation-flag.md)
+      - [get_saturation_strategy](execution/device/spr/get-saturation-strategy.md)
+      - [set_saturation_flag](execution/device/spr/set-saturation-flag.md)
+      - [set_saturation_strategy](execution/device/spr/set-saturation-strategy.md)
     - [get_block_idx](execution/device/get-block-idx.md)
     - [get_block_num](execution/device/get-block-num.md)
     - [get_core_id](execution/device/get-core-id.md)

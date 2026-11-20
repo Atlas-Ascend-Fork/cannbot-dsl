@@ -20,3 +20,7 @@
 | [is_aiv](./is-aiv.md) | 判断当前编译通道是否为Vector（AIV）。 |
 | [get_ctrl](./spr/get-ctrl.md) | 读取CTRL控制寄存器。 |
 | [set_ctrl](./spr/set-ctrl.md) | 设置CTRL控制寄存器。 |
+| [get_saturation_flag](./spr/get-saturation-flag.md) | 按模式读取饱和开关。 |
+| [get_saturation_strategy](./spr/get-saturation-strategy.md) | 读取饱和控制策略。 |
+| [set_saturation_flag](./spr/set-saturation-flag.md) | 按模式设置饱和开关。 |
+| [set_saturation_strategy](./spr/set-saturation-strategy.md) | 选择单指令或全局饱和策略。 |

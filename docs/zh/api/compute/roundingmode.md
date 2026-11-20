@@ -119,7 +119,7 @@ RoundingMode.RH   # 混合舍入，用于支持该模式的 hifloat8 转换
 
 饱和模式与舍入模式是独立设置。对于提供`saturate`参数的转换接口，通过该参数配置饱和或非饱和模式，详细说明请参见[`vcast`](./vector/reg_convert/vcast.md)。以下以Reg类型转换说明常见行为；实际支持范围及溢出、NaN、Inf行为仍取决于类型组合、舍入模式和相关控制配置。
 
-对于需要调整CTRL寄存器饱和配置的场景，可通过[`set_ctrl`](../execution/device/spr/set-ctrl.md)接口配置，具体配置要求请参见该接口说明。
+对于需要调整全局饱和配置的场景，可通过[set_saturation_flag](../execution/device/spr/set-saturation-flag.md)设置对应模式开关，通过[set_saturation_strategy](../execution/device/spr/set-saturation-strategy.md)选择全局或单指令策略；修改前可用[get_saturation_flag](../execution/device/spr/get-saturation-flag.md)及[get_saturation_strategy](../execution/device/spr/get-saturation-strategy.md)保存并在计算完成后恢复。仅对支持相应单指令配置的转换，`USE_API`按调用参数生效；`USE_GLOBAL`使用对应全局配置，可能覆盖`saturate`参数。完整CTRL访问仍可使用[`set_ctrl`](../execution/device/spr/set-ctrl.md)。
 
 ### 非饱和模式（Non-Saturation Mode）
 

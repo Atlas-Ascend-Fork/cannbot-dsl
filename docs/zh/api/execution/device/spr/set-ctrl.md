@@ -39,6 +39,7 @@ set_ctrl(value: int) -> None
 
 - 本接口运行在标量流水`[PIPE](../../pipeline.md).S`上，只能在`@kernel`函数体或由其展开的设备侧辅助函数中调用，不能在Host或`vf(...)`作用域内直接调用。
 - 使用前需要先用[`get_ctrl()`](get-ctrl.md)获取当前值，仅对需要变更的bit位进行修改。
+- 仅调整饱和配置时，可使用[set_saturation_flag](set-saturation-flag.md)和[set_saturation_strategy](set-saturation-strategy.md)，无需自行处理控制位极性。
 
 ## 调用示例
 

@@ -2375,6 +2375,22 @@ const apiSidebar = [
                   {
                     "text": "set_ctrl",
                     "link": "/zh/api/execution/device/spr/set-ctrl"
+                  },
+                  {
+                    "text": "get_saturation_flag",
+                    "link": "/zh/api/execution/device/spr/get-saturation-flag"
+                  },
+                  {
+                    "text": "get_saturation_strategy",
+                    "link": "/zh/api/execution/device/spr/get-saturation-strategy"
+                  },
+                  {
+                    "text": "set_saturation_flag",
+                    "link": "/zh/api/execution/device/spr/set-saturation-flag"
+                  },
+                  {
+                    "text": "set_saturation_strategy",
+                    "link": "/zh/api/execution/device/spr/set-saturation-strategy"
                   }
                 ],
                 "collapsed": true
