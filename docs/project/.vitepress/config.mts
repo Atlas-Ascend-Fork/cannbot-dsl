@@ -2348,6 +2348,7 @@ const apiSidebar = [
                 "text": "dump_reg",
                 "link": "/zh/api/debug/dump_reg"
               },
+              { "text": "异常 Tensor 落盘", "link": "/zh/api/debug/exception_dump" },
               { "text": "log", "link": "/zh/api/debug/log" },
               { "text": "统一错误模板", "link": "/zh/api/debug/error_message" },
               {

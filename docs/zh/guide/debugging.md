@@ -129,6 +129,14 @@ with vf(mode="simd"):
 两个接口在包顶层导出（`cbd.dump_reg` / `cbd.dump_tensor`），实现在 `cannbotdsl/core/diag/native_dump.py`，官方 API 文档站只列了名字。
 :::
 
+## AIC/AIV 异常时的 Tensor 落盘
+
+在包含异常 Tensor 导出适配的 CANNBot-DSL 版本中，运行时可以在 AIC/AIV 异常后将当次任务的 Tensor 信息交给 CANN，生成供 AI Core Error 工具解析的标准 `.custom.<timestamp>` 文件。普通 Python 异常和编译失败不触发该回调。
+
+在启动 Python、初始化 ACL/NPU 之前设置 `ASCEND_DUMP_SCENE=aic_err_brief_dump` 和 CANN 工作目录 `ASCEND_WORK_PATH`。`CANNBOTDSL_AIC_ERROR_DEBUG=1` 用于编译行号，不能替代 CANN 异常 Dump 开关；`CANNBOTDSL_AIC_ERROR_DEBUG_DIR` 指定的 DSL 报告目录与 CANN 目录独立。
+
+详细配置、可导出的 Tensor 范围、文件关联和解析步骤见[异常 Tensor 落盘](../api/debug/exception_dump.md)。DSL 的 JSON/LOG、原有输入 `.bin/.pt` 与 CANN 标准文件用途不同；异常时观察到的数据也不保证等于执行前输入或完整输出，不能直接作为复现依据。
+
 ## 精度验证
 
 ### 测试组织
