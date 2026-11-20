@@ -10,8 +10,7 @@
 
 布局常量 + 分区基址/步长公式 +
 LCM 对齐。kernel 编译期（prefetch_weight 的 _MoonepPrefetchPushKernel
-__init__）与 host 视图/容量公式三方同源引用——**本模块是布局契约的
-唯一真源**；moonep_context 重导出全部符号（既有 import 面零变更）。
+__init__）与 host 视图/容量公式三方同源引用——本模块是布局契约的唯一真源；moonep_context 重导出全部符号（既有 import 面零变更）。
 """
 
 from __future__ import annotations
@@ -37,7 +36,7 @@ DEM_ALL_OFF = 0  # (MAX_R, MAX_E) int32：各 rank 本地计数交换区（512KB
 READY_OFF = MAX_R * MAX_E * 4  # (MAX_R,) int32：元数据就绪标志
 BAR_FLAGS_OFF = READY_OFF + MAX_R * 4  # (MAX_R,) int32：rank 自旋同步屏障的 epoch flag
 LAYOUT_TAIL_BYTES = 4096  # 区域尾部对齐余量（32B 对齐要求下取整页）
-# prefetch 行分片完成标志（**本 rank 本地**，按 (peer 紧凑号, slice) 索引）：
+# prefetch 行分片完成标志（本 rank 本地，按 (peer 紧凑号, slice) 索引）：
 # 每 peer 至多 resident 个分片 → 槽数 ≤ 64，占用尾部余量前 256B。slice-0
 # block 等到本 peer 全部分片置位后，才向对端写原有的 per-sender flag。
 PREFETCH_SLICE_FLAGS_OFF = BAR_FLAGS_OFF + MAX_R * 4
@@ -76,11 +75,11 @@ def lcm_slot_stride(epn: int, row_bytes) -> int:
 
 
 def slot_stride_bytes(epn: int, widths, scale_widths, weight_bytes: int) -> int:
-    """单 slot 窗口步长（字节）——**LCM 对齐**（kernel/host 共用唯一公式）。
+    """单 slot 窗口步长（字节）——LCM 对齐（kernel/host 共用唯一公式）。
 
     原始步长 = (ΣWg×weight_bytes + ΣSg) × 2×epn；但 push kernel 的槽寻址
     ``dst = group_rows[g] + slot × slot_rows[g] + slot_row`` 以"本组一行字节宽"
-    为单位（tile_slice 坐标 = 瓦片序号），要求步长被**每个**组的行字节数
+    为单位（tile_slice 坐标 = 瓦片序号），要求步长被每个组的行字节数
     整除。scale 组加入后原始步长一般不再满足（如交织 (1024,512)+scale
     (32,16)：原始 12672B 不被 1024 整除）——向上取整到全部行宽的最小公
     倍数。代价 ≤ lcm-1 字节/slot；kernel（编译期 __init__）与本侧
@@ -135,7 +134,7 @@ def reduce_stg_off(
     down 宽 W）传 ``widths=(2W, W)``，总宽按各组件宽求和——交织两组与
     等宽三组字节数相同（2W + W = 3W）。``weight_bytes`` 为每组
     权重要素字节宽（bf16 2B / fp8 1B，进编译键）；``scale_widths`` 为
-    各 scale 组行宽（**字节**——ue8m0 定宽 1B，mxfp8 形态传入；scale 组
+    各 scale 组行宽（字节——ue8m0 定宽 1B，mxfp8 形态传入；scale 组
     跟随同 slot 窗口的权重组之后前缀和排布，None = 无 scale 组）。
     """
     if widths is None:
@@ -157,7 +156,7 @@ def grad_slot_off(
 ) -> int:
     """pull 协议梯度副本区基址（紧随权重发布区，变宽组/scale 组同 reduce_stg_off）。
 
-    梯度区为 **[epn, Wg] × 组副本发布区**——每 rank 只发布自己的
+    梯度区为 [epn, Wg] × 组副本发布区——每 rank 只发布自己的
     副本行，owner 经远读拉取归并（无 R 维度、无并发写）；区域大小见
     reduce_region_end。
     """

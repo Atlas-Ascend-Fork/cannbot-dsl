@@ -128,7 +128,7 @@ _POOL_CAP = 3  # HCCL 注册限额驱动的池上限（LRU 驱逐）
 def _get_ep_buf(world_size, num_tokens, top_k, num_experts):
     """全部用例共享 DSL buffer 池（同 shape 键控；UbMem 通路）。
 
-    MoonepBuffer 构造为集体调用（含通信连接建立）——池化共享免重复
+    Buffer 构造为集体调用（含通信连接建立）——池化共享免重复
     建连；进程退出统一回收（destroy 断开连接，秒级）。
     """
     key = (num_tokens, top_k, num_experts)
@@ -139,16 +139,16 @@ def _get_ep_buf(world_size, num_tokens, top_k, num_experts):
         _old_buf = _EP_POOL.pop(_old_key)
         _old_buf.destroy()
     if key not in _EP_POOL:
-        from moonep_buffer import MoonepBuffer
+        from moonep_buffer import Buffer
 
-        _EP_POOL[key] = MoonepBuffer(
+        _EP_POOL[key] = Buffer(
             num_tokens,
             _H,
             _H,  # Hp=H（W 上界不参与实算——本文件走 plan/prefetch/reduce）
             top_k,
             num_experts,
-            moonep_group=dist.group.WORLD,
-            ep_group=dist.group.WORLD,
+            num_ep_ranks=dist.get_world_size(),
+            group=dist.group.WORLD,
         )
     return _EP_POOL[key]
 
@@ -202,7 +202,7 @@ def _shared_ctx():
 def _fresh_ctx():
     """布局变体用例专用裸 ctx（用后 close）。
 
-    layout_groups/组宽/槽位在 ctx 上**首调冻结**——跨族共享会触发布局
+    layout_groups/组宽/槽位在 ctx 上首调冻结——跨族共享会触发布局
     守卫（d5/d6：2 组/32768 宽/双槽用例连环被拦）。专用 ctx 用后
     即关，防 HCCL 注册累积（HcclCommMemReg 限额，池上限 3 的同源约束）。
     """
@@ -691,7 +691,7 @@ def test_moonep_reduce_grad_fp16(mode):
 def test_moonep_precision_pipeline_fp32_then_bf16():
     """三算子数值漏斗：plan 落点 → prefetch 副本槽 → reduce 归并（fp32 紧接 bf16）。
 
-    精度口径：每个被测张量都与**独立计算的期望值**比较（路由表 + 编码公式），
+    精度口径：每个被测张量都与独立计算的期望值比较（路由表 + 编码公式），
     不拿算子输入当参照，也不放宽容差。
       - prefetch 副本槽逐元素 == bf16(编码值)，空槽仍为 -1；
       - reduce home 行逐元素 == 副本和（整数编码，bf16 可精确表示，故用逐位

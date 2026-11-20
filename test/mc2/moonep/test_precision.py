@@ -148,7 +148,7 @@ def test_reduce_grad_precision_formula(grad_dtype, moonep_groups):
     torch.manual_seed(100 + rank)
     topk = torch.randint(0, epn * world, (32, 8), dtype=torch.int32)
     tpe = torch.bincount(topk.flatten(), minlength=epn * world).to(torch.int32)
-    plan = buf.plan(tpe.npu(), topk.npu())
+    plan = buf._plan(tpe.npu(), topk.npu())
 
     base = 2.0
     grads = []
@@ -234,7 +234,7 @@ def test_dispatch_combine_precision(moonep_groups):
     torch.manual_seed(200 + rank)
     topk = torch.randint(0, epn * world, (tokens, top_k), dtype=torch.int32)
     tpe = torch.bincount(topk.flatten(), minlength=epn * world).to(torch.int32)
-    plan = buf.plan(tpe.npu(), topk.npu())
+    plan = buf._plan(tpe.npu(), topk.npu())
 
     # dispatch 精度：x → recv_x（bf16 逐位一致）
     x = torch.randn(tokens, hidden, dtype=torch.bfloat16).npu()

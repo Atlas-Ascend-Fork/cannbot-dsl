@@ -27,6 +27,8 @@ import os
 import sys
 
 import pytest
+
+from conftest import _prefetch_api, _reduce_api  # noqa: E402
 import torch
 import torch.distributed as dist
 
@@ -41,7 +43,7 @@ sys.path.insert(
 
 try:
     import torch_npu  # noqa: F401
-    from moonep_buffer import MoonepBuffer  # noqa: F401
+    from moonep_buffer import Buffer  # noqa: F401
     from moonep_golden import RouteShape, make_router_inputs  # noqa: F401
 
     _HAS_DSL_IMPL = True
@@ -49,6 +51,7 @@ except ImportError:
     _HAS_DSL_IMPL = False
 
 pytestmark = pytest.mark.skipif(not _HAS_DSL_IMPL, reason="需 NPU 环境")
+
 
 _S, _K, _EPN = 16, 4, 2
 _H, _Hp = 32, 16
@@ -151,14 +154,14 @@ def test_e2e_readme_ffn_chain(moonep_groups):
     epn = _EPN
     W = _W
 
-    buf = MoonepBuffer(
+    buf = Buffer(
         _S,
         _H,
         _Hp,
         _K,
         E,
-        moonep_group=moonep_groups[0],
-        ep_group=moonep_groups[1],
+        num_ep_ranks=dist.get_world_size(),
+        group=moonep_groups,
     )
 
     # 路由 + 输入
@@ -168,7 +171,7 @@ def test_e2e_readme_ffn_chain(moonep_groups):
     tpe = torch.bincount(topk_all[rank].flatten(), minlength=E).to(torch.int32).npu()
 
     # —— 规划（路由表——cu 分组 + etc 副本清单贯穿后续算子）——
-    plan = buf.plan(tpe, topk)
+    plan = buf._plan(tpe, topk)
 
     # —— 本地 token 行桩（dispatch 产物同构；cu 分组口径不变）——
     x = _local_rows(plan, seed=100 + rank)
@@ -177,7 +180,7 @@ def test_e2e_readme_ffn_chain(moonep_groups):
     w1 = _make_weights(1000, epn, W)
     w3 = _make_weights(2000, epn, W)
     w2 = _make_weights(3000, epn, W)
-    weights, _scales = buf.prefetch_weight(plan, local_weights=(w1, w3, w2))
+    weights, _scales = _prefetch_api(buf, plan, local_weights=(w1, w3, w2))
 
     # FFN 前向（GMM 分组 + SwiGLU——用参考实现）
     y = _gmm_3mat(
@@ -201,7 +204,7 @@ def test_e2e_readme_ffn_chain(moonep_groups):
     for g, dw in enumerate((dw1, dw3, dw2)):
         dw[:epn] = float(rank + g)  # home 种子
         dw[epn:] = 1.0  # 副本贡献
-    buf.reduce_grad(plan, local_grads=[dw1, dw3, dw2])
+    _reduce_api(buf, plan, local_grads=[dw1, dw3, dw2])
     torch.npu.synchronize()
 
     # reduce 端到端对拍：home = 种子 + 副本计数（etc 全表口径）
@@ -234,7 +237,7 @@ def test_e2e_intertwined_vs_separate(moonep_groups):
     """gate/up 分离 3 组 vs 合并 W13+down 交织 2 组——最终 GMM 输出逐位一致。
 
     用户侧将 gate [epn, Hp, H] + up [epn, Hp, H] 合并为
-    W13 = cat(gate_2d, up_2d, dim=1) [epn, 2W]，经 MoonepBuffer 推送后
+    W13 = cat(gate_2d, up_2d, dim=1) [epn, 2W]，经 Buffer 推送后
     在消费端展开——分离/交织两条链路的最终 y 必须逐位一致（等价性证明）。
     端到端校验 y，不查中间副本槽内容。
     """
@@ -244,23 +247,23 @@ def test_e2e_intertwined_vs_separate(moonep_groups):
     W = _W
 
     # 两个独立 buffer（3 组 vs 2 组——layout_groups 互斥）
-    buf3 = MoonepBuffer(
+    buf3 = Buffer(
         _S,
         _H,
         _Hp,
         _K,
         E,
-        moonep_group=moonep_groups[0],
-        ep_group=moonep_groups[1],
+        num_ep_ranks=dist.get_world_size(),
+        group=moonep_groups,
     )
-    buf2 = MoonepBuffer(
+    buf2 = Buffer(
         _S,
         _H,
         _Hp,
         _K,
         E,
-        moonep_group=moonep_groups[0],
-        ep_group=moonep_groups[1],
+        num_ep_ranks=dist.get_world_size(),
+        group=moonep_groups,
         slots=1,
     )
 
@@ -270,7 +273,7 @@ def test_e2e_intertwined_vs_separate(moonep_groups):
     tpe = torch.bincount(topk_all[rank].flatten(), minlength=E).to(torch.int32).npu()
 
     # —— 路径 A：分离 3 组 ——
-    plan3 = buf3.plan(tpe, topk)
+    plan3 = buf3._plan(tpe, topk)
     x = _local_rows(plan3, seed=300 + rank)
 
     # 权重（种子固定——两路径共享同一数学值）
@@ -278,7 +281,7 @@ def test_e2e_intertwined_vs_separate(moonep_groups):
     w3 = _make_weights(2000, epn, W)
     w2 = _make_weights(3000, epn, W)
 
-    weights3, _ = buf3.prefetch_weight(plan3, local_weights=(w1, w3, w2))
+    weights3, _ = _prefetch_api(buf3, plan3, local_weights=(w1, w3, w2))
     torch.npu.synchronize()
 
     # 分离 GMM（3 matmul）
@@ -293,11 +296,11 @@ def test_e2e_intertwined_vs_separate(moonep_groups):
     )
 
     # —— 路径 B：交织 2 组 ——
-    plan2 = buf2.plan(tpe, topk)
+    plan2 = buf2._plan(tpe, topk)
 
     # W13 = cat(gate_2d, up_2d, dim=1)——从同一种子重建
     w13 = torch.cat([w1, w3], dim=1)  # [epn, 2W]
-    weights2, _ = buf2.prefetch_weight(plan2, local_weights=(w13, w2))
+    weights2, _ = _prefetch_api(buf2, plan2, local_weights=(w13, w2))
     torch.npu.synchronize()
 
     # 交织 GMM（1 matmul W13 → 取半区 → SwiGLU → w2）
@@ -345,14 +348,14 @@ def test_e2e_mxfp8_precision(moonep_groups):
     epn = _EPN
     W = _W
 
-    buf = MoonepBuffer(
+    buf = Buffer(
         _S,
         _H,
         _Hp,
         _K,
         E,
-        moonep_group=moonep_groups[0],
-        ep_group=moonep_groups[1],
+        num_ep_ranks=dist.get_world_size(),
+        group=moonep_groups,
         weight_dtype="e4m3fn",
         grad_dtype="bf16",
     )
@@ -362,7 +365,7 @@ def test_e2e_mxfp8_precision(moonep_groups):
     topk = topk_all[rank].to(torch.int32).npu()
     tpe = torch.bincount(topk_all[rank].flatten(), minlength=E).to(torch.int32).npu()
 
-    plan = buf.plan(tpe, topk)
+    plan = buf._plan(tpe, topk)
     n = _S * _K
     x = _local_rows(plan, seed=400 + rank)
 
@@ -384,8 +387,8 @@ def test_e2e_mxfp8_precision(moonep_groups):
     # W13 = cat(gate, up, dim=1)
     w13_fp8 = torch.cat([w1_fp8, w3_fp8], dim=1)  # [epn, 2W] fp8
 
-    weights, scales = buf.prefetch_weight(
-        plan, local_weights=(w13_fp8, w2_fp8), local_scales=(s13, s2)
+    weights, scales = _prefetch_api(
+        buf, plan, local_weights=(w13_fp8, w2_fp8), local_scales=(s13, s2)
     )
     torch.npu.synchronize()
 
@@ -414,17 +417,17 @@ def test_e2e_mxfp8_precision(moonep_groups):
     torch.npu.synchronize()
 
     # —— bf16 全精度参考链（独立 buffer——不受 fp8 堆布局影响）——
-    buf_bf = MoonepBuffer(
+    buf_bf = Buffer(
         _S,
         _H,
         _Hp,
         _K,
         E,
-        moonep_group=moonep_groups[0],
-        ep_group=moonep_groups[1],
+        num_ep_ranks=dist.get_world_size(),
+        group=moonep_groups,
     )
-    plan_bf = buf_bf.plan(tpe, topk)
-    weights_bf, _ = buf_bf.prefetch_weight(plan_bf, local_weights=(w1_bf, w3_bf, w2_bf))
+    plan_bf = buf_bf._plan(tpe, topk)
+    weights_bf, _ = _prefetch_api(buf_bf, plan_bf, local_weights=(w1_bf, w3_bf, w2_bf))
     torch.npu.synchronize()
 
     y_bf = _gmm_3mat(

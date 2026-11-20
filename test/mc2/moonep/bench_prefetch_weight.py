@@ -200,7 +200,7 @@ def main():
         if rank == 0:
             view_bytes = 2 * args.epn * args.w_elems * 2 * 3
             print(
-                f"\n== prefetch_weight kernel 基线 ==\n"
+                f"\n== prefetch_weight 基线 ==\n"
                 f"规格: R={world} epn={args.epn} W={args.w_elems} groups=3 "
                 f"pattern={pattern} iters={args.iters}\n"
                 f"权重视图: {view_bytes / 2**20:.2f} MiB/rank\n"
@@ -228,7 +228,7 @@ def main():
                         f"in {statistics.median(r0_push):.1f}us = {ingress:.1f} GB/s"
                         "（写侧入站聚合——与 reduce fanout 读侧 73 GB/s 同构对照）"
                     )
-            print(f"rank0 kernels: {gathered[0]['names']}")
+            print(f"[kernels] rank0: {gathered[0]['names']}")
 
 
 if __name__ == "__main__":

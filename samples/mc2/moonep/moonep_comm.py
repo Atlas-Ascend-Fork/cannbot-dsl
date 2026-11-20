@@ -11,17 +11,17 @@
 本模块承接 moonep 全部跨 rank 数据面（早期 ``ops.distributed`` 旧 API
 已移除）：设备侧原语、host 侧建连与重排屏障。
 
-- **Host 控制面**（``connect_moonep_comm``）：本 rank 独立分配 workspace 张量
+- Host 控制面（``connect_moonep_comm``）：本 rank 独立分配 workspace 张量
   并注册（``MemoryDesc``），全组以相同布局公式各自分配（对称布局约定——
   本 rank 私有注册内存，不受 HCCL_BUFFSIZE 约束、与 EB 通信域天然隔离）。
   优先选择「全部 peer 均 UbMem 可达」的最低层建单连接（如 16 卡
   UB 拓扑中 layer 0 仅同 8 卡组可达、layer 1 全覆盖 → 选 layer 1）；
   无全覆盖层时按逐 peer 分组诊断，部分可达/多层分组直接拒绝——不回退。
-- **UbMem 设备写**（``ub_write``）：两跳搬运（GM→UB staging 环→对端
+- UbMem 设备写（``ub_write``）：两跳搬运（GM→UB staging 环→对端
   mapped GM；``mem_copy`` 不支持 GM→GM——含远端 dst），
   字节粒度分块编译期展开。
-- **到达信号（sentinel write）**：每 (peer, 轮) 的末笔额外一笔 4B epoch 写
-  对端的 per-sender **到达槽**（fence + 经 MTE3 数据通道写）——"哨兵到达
+- 到达信号（sentinel write）：每 (peer, 轮) 的末笔额外一笔 4B epoch 写
+  对端的 per-sender 到达槽（fence + 经 MTE3 数据通道写）——"哨兵到达
   ⇒ 同通道此前数据全部落地"。接收侧 ``spin_u32_ge``（scalar load_bypass
   轮询）等本端到达槽 ≥ epoch。
   握手的 put flag + 自旋收齐——头部屏障语义沿用。
@@ -70,7 +70,7 @@ class MoonepCommCtx:
     """设备侧通信上下文（rank/连接地址/本端 workspace 基址）。
 
     Host 持有 connection 与 workspace 的生命周期；kernel 侧仅持借用视图
-    （官方样例 DeviceCommContext 同款契约）。
+    （DeviceCommContext 契约）。
     """
 
     rankId: dtypes.uint64
@@ -117,7 +117,7 @@ def make_xfer_rb(depth=UB_XFER_DEPTH):
 
 
 def _gm_view(address, count, dtype):
-    """绝对地址（u64 运行期值）→ GM Tensor（官方样例同款，无分配无拷贝）。"""
+    """绝对地址（u64 运行期值）→ GM Tensor（无分配无拷贝）。"""
     return make_tensor(
         make_pointer(dtype, dtypes.int64(address), MemLoc.GM), make_layout((count,))
     )
@@ -139,8 +139,8 @@ def spin_u32_ge(ctx, offset, epoch):
 
     offset 为 workspace 相对偏移（到达槽/flags 槽，运行期值）；epoch 为
     运行期 uint32 标量。load_bypass（DCache 旁路）读 + while 轮询；
-    vec_busy_wait 是官方样例记载的自旋降频指令（避免纯死循环 100% 占核），
-    不是功能重复——删去则编译器可能消除轮询副作用（官方 wait_cqe 同款形态）。
+    vec_busy_wait 是自旋降频指令（避免纯死循环 100% 占核），不是功能重复
+    ——删去则编译器可能消除轮询副作用。
     用有符号差值判断是否到达，epoch 跨 2^32 回绕时仍然成立。
     """
     view = _gm_view(
@@ -257,7 +257,7 @@ def _ub_fence():
 
 @jit
 def ub_flag_write(peer, slot_off, value, src_addr):
-    """4B epoch 写对端槽——**经 MTE3 数据通道**（与数据写同 pipe 保序）。
+    """4B epoch 写对端槽——经 MTE3 数据通道（与数据写同 pipe 保序）。
 
     （combine 数值错位根因）：scalar bypass 写与 MTE3 批量写走
     不同通道——64 行批量下 flag 先落地、数据在途，接收侧 kernel 返回后
@@ -435,7 +435,7 @@ def _proto_value(x):
 def _full_coverage_layer(domain, peers, proto_enum):
     """全部 peer 均可达目标协议的最低 layer（不存在则 None）。
 
-    kernel 侧紧凑序换算假设**单条连接承载全部 peers**（peer 索引 = 全组
+    kernel 侧紧凑序换算假设单条连接承载全部 peers（peer 索引 = 全组
     升序去掉本 rank 后的位置），因此建连应优先选「单层全覆盖」。16 卡
     UB 拓扑中 layer 0 仅覆盖同 8 卡组、layer 1 覆盖全部 peers——旧
     「逐 peer 取首个含协议层」贪心会拆成 layer 0/1 两组并被误判为
@@ -484,13 +484,13 @@ def _group_peers_by_layer(domain, peers, proto_enum):
 
 
 def connect_moonep_comm(group_name, rank, rank_size, workspace, tag="moonep"):
-    """注册 workspace 并建连（**仅 UbMem**），返回 (connection, ctx_tensor)。
+    """注册 workspace 并建连（仅 UbMem），返回 (connection, ctx_tensor)。
 
     - workspace：torch uint8 NPU 张量（调用方持有；对称布局约定——全组
       以相同公式各自分配，区域偏移一致）。
     - UbMem（映射内存）：优先选全部 peer 均可达的最低层，以单连接承载
-      全部 peers（kernel 紧凑序契约）；**不存在全覆盖层时，部分可达或
-      指令；多层混合形态留二期）。
+      全部 peers（kernel 紧凑序契约）；不存在全覆盖层时，部分可达或
+      跨层多组直接拒绝（多层混合形态留二期）。
     - 通信域分离不变量自然消解：workspace 为本 rank 私有注册内存。
     """
 

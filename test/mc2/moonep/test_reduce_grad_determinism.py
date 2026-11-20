@@ -172,7 +172,7 @@ def test_d1_bitwise_pinned(dtype_name, torch_dtype, moonep_groups):
     buf = _get_buffer(moonep_groups, dtype_name)
     epn = buf.epn
     topk, tpe = _routing(41)
-    plan = buf.plan(tpe, topk)
+    plan = buf._plan(tpe, topk)
     etc_cpu = plan.experts_to_copy.cpu()
     assert int((etc_cpu >= 0).any()) > 0
 
@@ -231,7 +231,7 @@ def test_d1b_multichunk(moonep_groups):
     )
     epn = buf.epn
     topk, tpe = _routing(43)
-    plan = buf.plan(tpe, topk)
+    plan = buf._plan(tpe, topk)
     etc_cpu = plan.experts_to_copy.cpu()
     all_grads = [
         _randn_grads(r, world, buf.epn, (weight_rows,) * 2, torch.bfloat16, seed=43)
@@ -262,7 +262,7 @@ def test_d2_encoded_exact(dtype_name, moonep_groups):
     buf = _get_buffer(moonep_groups, dtype_name)
     epn = buf.epn
     topk, tpe = _routing(45)
-    plan = buf.plan(tpe, topk)
+    plan = buf._plan(tpe, topk)
     etc_cpu = plan.experts_to_copy.cpu()
 
     # 行编码：行 r 的 home 行 i = 2 + (i+1)（小整数，7 次加仍精确）
@@ -304,7 +304,7 @@ def test_d3_workspace_readonly(moonep_groups):
     rank, world = _init_group()
     buf = _get_buffer(moonep_groups, "bf16")
     topk, tpe = _routing(47)
-    plan = buf.plan(tpe, topk)
+    plan = buf._plan(tpe, topk)
     all_grads = [
         _randn_grads(r, world, buf.epn, (_W,) * 3, torch.bfloat16, seed=47)
         for r in range(world)
@@ -335,7 +335,7 @@ def test_d5_lifecycle_rounds(moonep_groups):
     epn = buf.epn
     # 轮 1：active
     topk, tpe = _routing(51)
-    plan = buf.plan(tpe, topk)
+    plan = buf._plan(tpe, topk)
     etc_1 = plan.experts_to_copy.cpu()
     grads1 = _local_grads_of(_randn_grads_set(51, world, buf.epn), rank)
     buf.reduce_grad(plan, local_grads=grads1)
@@ -352,7 +352,7 @@ def test_d5_lifecycle_rounds(moonep_groups):
     )
     # 轮 2：empty（本地路由）——home = 纯种子（逐位）
     topk_e, tpe_e = _local_only_routing()
-    plan_e = buf.plan(tpe_e, topk_e)
+    plan_e = buf._plan(tpe_e, topk_e)
     etc_e = plan_e.experts_to_copy.cpu()
     assert not bool((etc_e >= 0).any()), "本地路由不应产生副本清单"
     grads2 = _local_grads_of(_randn_grads_set(52, world, buf.epn), rank)
@@ -366,7 +366,7 @@ def test_d5_lifecycle_rounds(moonep_groups):
         )
     # 轮 3：active 复位
     topk3, tpe3 = _routing(53)
-    plan3 = buf.plan(tpe3, topk3)
+    plan3 = buf._plan(tpe3, topk3)
     etc_3 = plan3.experts_to_copy.cpu()
     grads3 = _local_grads_of(_randn_grads_set(53, world, buf.epn), rank)
     buf.reduce_grad(plan3, local_grads=grads3)

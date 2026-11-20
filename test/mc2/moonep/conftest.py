@@ -39,7 +39,7 @@ def moonep_groups(request):
     """创建/复用测试用 HCCL 子组 + EB 组（C5+C6 适配，session 级）。
 
     首次请求建组（进程级缓存——同 session 的多个测试共享同一组，
-    免重复建组开销）；返回 ``(moonep_group, ep_group)`` 二元组。
+    免重复建组开销）；返回单 ``group``。
     """
     import torch.distributed as dist
 
@@ -50,22 +50,9 @@ def moonep_groups(request):
 
     from torch_npu._C._distributed_c10d import ProcessGroupHCCL
 
-    # moonep 组：数据面走私有 workspace，不占通信域 HCCL 外部 buffer——
-    # 注入引擎下限（2 MB，覆盖 comm 控制面/建连握手）封顶测试进程显存
-    # （组显存配置由建组方即本测试自理；不注入即用 HCCL 缺省配置）
-    opts = ProcessGroupHCCL.Options()
-    opts.hccl_config = {"hccl_buffer_size": 2}
-    group = dist.new_group(
-        backend="hccl",
-        ranks=list(range(world)),
-        use_local_synchronization=True,
-        pg_options=opts,
-    )
-
-    # EB 组：EB 数据面自建注册内存（不占 HCCL 外部 buffer）；建组建议值
-    # 直取 EB 包自身的静态方法（当前为默认值）。纯 DSL 验证环境（venv 未装
-    # cann_ops_transformer——cp312 无配套 wheel）降级按下限注入（EB 后端
-    # 用例不在该环境运行——DSL 侧用例零影响）
+    # 单 group：Buffer 的 MoonEP ctx 与 ElasticBuffer 复用同一通信组。
+    # 组 buffer 取 EB 建组建议值；纯 DSL 环境（未装 cann_ops_transformer）
+    # 降级按下限注入。
     try:
         from cann_ops_transformer.ops import ElasticBuffer
 
@@ -78,15 +65,59 @@ def moonep_groups(request):
         )
     except (ImportError, ModuleNotFoundError):
         eb_mb = 2
-    ep_opts = ProcessGroupHCCL.Options()
-    ep_opts.hccl_config = {"hccl_buffer_size": eb_mb}
-    ep_group = dist.new_group(
+    opts = ProcessGroupHCCL.Options()
+    opts.hccl_config = {"hccl_buffer_size": eb_mb}
+    group = dist.new_group(
         backend="hccl",
         ranks=list(range(world)),
         use_local_synchronization=True,
-        pg_options=ep_opts,
+        pg_options=opts,
     )
-    return (group, ep_group)
+    return group
+
+
+# ---------------------------------------------------------------------------
+# Buffer 命名参数适配器（4 个测试文件共享）
+# ---------------------------------------------------------------------------
+def _prefetch_api(
+    buf, plan, local_weights, local_scales=None, slot=0, async_finish=False
+):
+    """测试适配器：tuple 形态 → Buffer.prefetch_weight 命名参数。"""
+    weights = tuple(local_weights)
+    scales = None if local_scales is None else tuple(local_scales)
+    if len(weights) == 3:
+        kw = dict(
+            local_gate_weight=weights[0],
+            local_up_weight=weights[1],
+            local_down_weight=weights[2],
+        )
+        if scales is not None:
+            kw.update(
+                local_gate_scales=scales[0],
+                local_up_scales=scales[1],
+                local_down_scales=scales[2],
+            )
+    else:
+        kw = dict(local_gate_up_weight=weights[0], local_down_weight=weights[1])
+        if scales is not None:
+            kw.update(local_gate_up_scales=scales[0], local_down_scales=scales[1])
+    out = buf.prefetch_weight(plan=plan, slot=slot, async_finish=async_finish, **kw)
+    if async_finish:
+        views, event = out
+        return (views, buf.scale_views(slot)), event
+    return out, buf.scale_views(slot)
+
+
+def _reduce_api(buf, plan, local_grads, async_finish=False):
+    """测试适配器：tuple 形态 → Buffer.reduce_grad 命名参数。"""
+    grads = tuple(local_grads)
+    if len(grads) == 3:
+        kw = dict(
+            local_gate_grad=grads[0], local_up_grad=grads[1], local_down_grad=grads[2]
+        )
+    else:
+        kw = dict(local_gate_up_grad=grads[0], local_down_grad=grads[1])
+    return buf.reduce_grad(plan=plan, async_finish=async_finish, **kw)
 
 
 # ---------------------------------------------------------------------------

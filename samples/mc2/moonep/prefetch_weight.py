@@ -8,10 +8,12 @@
 
 """prefetch_weight：把本地专家权重（可选 MX scale）直推到各消费 rank 的预取槽。
 
-``local_weights`` 为 2/3 组，形状 ``[epn, ...]``，行宽由尾维展平推断；
-fp8 权重必须同序传 ``local_scales``（``float8_e8m0fnu``，``Sg`` 32B 对齐），
-bf16/fp16 不传 scale。返回 ``(weights, scales)``，前 ``epn`` 行是本地专家、
-后 ``epn`` 行是预取槽；``async_finish=True`` 时追加完成事件。
+- 权重按命名参数传入（gate/up/down 或 gate_up/down），形状 ``[epn, ...]``，
+  行宽由尾维展平推断；
+- fp8 权重必须同序传 ``local_scales``（``float8_e8m0fnu``，``Sg`` 32B 对齐）；
+  bf16/fp16 不传 scale；
+- 返回 ``(weights, scales)``：前 ``epn`` 行为本地专家，后 ``epn`` 行为预取槽；
+  ``async_finish=True`` 时追加完成事件。
 """
 
 import threading
@@ -52,6 +54,7 @@ from moonep_context import (
     group_slot_rows,
     next_barrier_epoch,
     prefetch_weight_off,
+    capped_blocks,
     reduce_stg_off,
     resident_blocks,
     slot_stride_bytes,
@@ -99,15 +102,18 @@ _WEIGHT_DTYPES = (
     torch.float16,
     torch.float8_e4m3fn,
     torch.float8_e5m2,
-)  # E1：权重 dtype 白名单终态（bf16 / fp16 / e4m3fn / e5m2，uint8 不支持）
+)  # 权重 dtype 白名单（bf16 / fp16 / e4m3fn / e5m2）
 
 
+# ---------------------------------------------------------------------------
+# 参数与布局
+# ---------------------------------------------------------------------------
 def _is_fp8_weight(dtype):
     """是否 fp8 权重。"""
     return dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
 
 
-def _push_layout(rank_size):
+def _push_layout(rank_size, block_limit=None):
     """块布局：(nblk, per_block, n_slices)。
 
     优先「每 peer n_slices 个 block 行分片」（n_slices ≤ _PUSH_SPLIT）；
@@ -117,7 +123,9 @@ def _push_layout(rank_size):
     n_rem = max(rank_size - 1, 0)
     if n_rem <= 0:
         return 1, 1, 1
-    resident = resident_blocks(_MAX_PUSH_BLOCKS)
+    resident = (
+        resident_blocks(_MAX_PUSH_BLOCKS) if block_limit is None else int(block_limit)
+    )
     want = min(n_rem * _PUSH_SPLIT, resident)
     if want >= n_rem:
         nblk = (want // n_rem) * n_rem
@@ -132,6 +140,9 @@ def _slice_flag_off(p_comp, k, n_slices):
     return dtypes.uint64(PREFETCH_SLICE_FLAGS_OFF) + idx * dtypes.uint64(4)
 
 
+# ---------------------------------------------------------------------------
+# 设备侧 kernel
+# ---------------------------------------------------------------------------
 @kernel
 class _MoonepPrefetchPushKernel:
     """按组推送：窗口是一维 uint8 workspace 视图，每组以“本组一行”为瓦片。
@@ -394,6 +405,9 @@ class _MoonepPrefetchPushKernel:
         vec_sync_wait(PIPE.V, PIPE.S, _PUSH_EVENT_ID)
 
 
+# ---------------------------------------------------------------------------
+# Host 配置与编译缓存
+# ---------------------------------------------------------------------------
 class _PushConfig(NamedTuple):
     rank_size: int
     epn: int
@@ -445,6 +459,7 @@ def _get_push_program(
     weight_bytes,
     window_bytes,
     rank_size,
+    block_limit=None,
 ):
     """按配置编译/复用推送程序；sizes/elem_bytes 进键，rank 不进键。"""
     n_w = len(weight_sizes)
@@ -464,7 +479,7 @@ def _get_push_program(
         pad_elem = (weight_bytes,) * (_MAX_GROUPS - n_w)
     sizes = real_sizes + pad_sizes
     elem6 = real_elem + pad_elem
-    nblk, per_blk, n_slices = _push_layout(rank_size)
+    nblk, per_blk, n_slices = _push_layout(rank_size, block_limit)
     cfg = _PushConfig(
         rank_size,
         epn,
@@ -495,6 +510,9 @@ def _get_push_program(
     return prog
 
 
+# ---------------------------------------------------------------------------
+# Host 参数与视图辅助
+# ---------------------------------------------------------------------------
 def _dsl_dtype(elem_bytes):
     """元素字节宽 → DSL dtype（2B=bf16，1B=uint8）。"""
     if elem_bytes == 2:
@@ -800,6 +818,9 @@ def _validate_etc(context, experts_to_copy, epn):
         raise ValueError("experts_to_copy 必须连续")
 
 
+# ---------------------------------------------------------------------------
+# 公开入口
+# ---------------------------------------------------------------------------
 def prefetch_weight(
     context,
     experts_to_copy,
@@ -876,6 +897,7 @@ def prefetch_weight(
         weight_bytes,
         _window_bytes(context, epn, sizes, scale_sizes, weight_bytes),
         context.rank_size,
+        capped_blocks(context, _MAX_PUSH_BLOCKS),
     )(
         *reals6,
         experts_to_copy,

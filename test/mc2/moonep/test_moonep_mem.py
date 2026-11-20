@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 
-"""moonep_train_memstat.py——显存对账训练用例（MoonepBuffer 驱动迁移版）。
+"""moonep_train_memstat.py——显存对账训练用例（Buffer 驱动迁移版）。
 
 目标形状：
   S=8192, K=16, H=3584（token/专家 FFN 输入维——同参）、Hp=3072（中间维）
@@ -23,7 +23,7 @@
 
 迁移说明（测试用例须基于已封装的接口调用）：
 - 三算子（plan/prefetch_weight/reduce_grad）全部经
-  MoonepBuffer 驱动：堆需求精算/ctx 定型/window_slots 接线/权重与梯度
+  Buffer 驱动：堆需求精算/ctx 定型/window_slots 接线/权重与梯度
   槽视图全部内化进构造与方法（HCCL 子组创建与组显存注入仍由测试侧
   ——通信域创建方——承担：数据面不占 HCCL 外部 buffer，注入引擎下限
   控制进程显存）；FFN 读写视图逻辑原样保留；
@@ -35,7 +35,7 @@
   271 规避由核数自适应承担）。
 
 显存统计（MEMSTAT 标签行，grep 汇总）：
-  - MoonepBuffer 构造（HCCL 子组+workspace 预留+通信建连）delta 打点，
+  - Buffer 构造（HCCL 子组+workspace 预留+通信建连）delta 打点，
     堆配置经只读 property 回读；
   - DSL 三算子（plan/prefetch_weight/reduce_grad）全分配点 + workspace 布局
   - 训练侧激活张量逐个打点 + 每步末设备占用快照
@@ -53,6 +53,8 @@ import sys
 import time
 
 import pytest
+
+from conftest import _prefetch_api, _reduce_api  # noqa: E402
 
 # 位置自适应：脚本形态（samples/moonep 内直跑）与测试形态（test/moonep
 # 收集）双兼容——测试形态下 samples 模块在 ../../samples/moonep
@@ -72,10 +74,10 @@ try:
     import torch.distributed as dist
 
     # 平级导入：显存打点 mem_stat 已归位测试树（本目录 test/moonep，经
-    # _here 插入的 sys.path 命中）；MoonepBuffer 含
+    # _here 插入的 sys.path 命中）；Buffer 含
     # ElasticBuffer 依赖——缺 whl 时收集不报错（skip 而非 error）
     import mem_stat
-    from moonep_buffer import MoonepBuffer  # noqa: F401
+    from moonep_buffer import Buffer  # noqa: F401
 
     _HAS_TRAIN_DEPS = True
 except Exception:  # CI 无 NPU/无实现时收集不报错
@@ -252,18 +254,18 @@ def run(args):
     )
 
     t0 = time.perf_counter()
-    # ---- MoonepBuffer 构造（ctx 子组 + workspace 预留 + 通信建连一体化）----
+    # ---- Buffer 构造（ctx 子组 + workspace 预留 + 通信建连一体化）----
     # 旧 run 的手工段（heap_need 计算 → hccl_buffer_size 注入 → new_group →
     # ctx 创建 → window_slots 定型）全部内化于构造
-    with mem_stat.delta("train", note="MoonepBuffer 构造（workspace 精算 + 通信建连）"):
-        buf = MoonepBuffer(
+    with mem_stat.delta("train", note="Buffer 构造（workspace 精算 + 通信建连）"):
+        buf = Buffer(
             S,
             H,
             Hp,
             K,
             E,
-            moonep_group=dist.group.WORLD,
-            ep_group=dist.group.WORLD,
+            num_ep_ranks=dist.get_world_size(),
+            group=dist.group.WORLD,
             slots=args.slots,
             grad_dtype=args.grad_dtype,
         )
@@ -312,7 +314,7 @@ def run(args):
 
         # ---- 前向：plan → 行桩注入 → 分组 FFN ----
         # plan：五件套（vtopk-only 快路径；NamedTuple 解包兼容）
-        plan = buf.plan(tpe, topk)
+        plan = buf._plan(tpe, topk)
         _dst_n, cu_seqlens, etc, _src_n, _vtopk = plan
         n = S * K  # plan 保证每 rank 恰收 S×K 行（负载均衡副本）
         # 数据面行桩：recv [n,H] 按 cu 分组序确定性
@@ -329,9 +331,9 @@ def run(args):
         # 传 home 行切片（data_ptr 同址 ⇒ sync 跳过）
         if views is None:
             reals = init_param_tensors(epn, H, Hp, 3000, rank, dev)
-            views = buf.prefetch_weight(plan, local_weights=reals)
+            views = _prefetch_api(buf, plan, local_weights=reals)
         else:
-            buf.prefetch_weight(plan, local_weights=[w[:epn] for w in views[0]])
+            _prefetch_api(buf, plan, local_weights=[w[:epn] for w in views[0]])
 
         # cu D2H：唯一 host 同步点（分组边界）
         cu_list = cu_seqlens.cpu().tolist()
@@ -474,7 +476,7 @@ def run(args):
             torch.npu.synchronize()
             dist.barrier()
             ev_s.record()
-            buf.reduce_grad(plan, local_grads=[g1, g3, g2])
+            _reduce_api(buf, plan, local_grads=[g1, g3, g2])
             ev_e.record()
             torch.npu.synchronize()
             dist.barrier()
@@ -493,7 +495,7 @@ def run(args):
                 flush=True,
             )
         else:
-            buf.reduce_grad(plan, local_grads=[g1, g3, g2])
+            _reduce_api(buf, plan, local_grads=[g1, g3, g2])
         if ref_home is not None:
             all_ok = True
             for name, got, ref in zip(
@@ -510,8 +512,7 @@ def run(args):
                     flush=True,
                 )
             print(
-                f"[VERIFY] pull vs all_reduce 参考："
-                f"{'✅ PASS' if all_ok else '❌ FAIL'}",
+                f"[VERIFY] pull vs all_reduce 参考：{'PASS' if all_ok else 'FAIL'}",
                 flush=True,
             )
             del ref_home
@@ -542,7 +543,7 @@ def run(args):
             "note",
             f"step{step}_snapshot",
             note=f"loss={loss.item():.4f} fwd={tf - ts:.2f}s bwd={tb - tf:.2f}s | "
-            f"device_used={(total - free) / 2**30:.2f} GiB / {total / 2**30:.0f} GiB | "
+            f"device_used={(total - free) / 230:.2f} GiB / {total / 230:.0f} GiB | "
             f"torch_allocated={torch.npu.memory_allocated() / 2**30:.2f} GiB "
             f"reserved={torch.npu.memory_reserved() / 2**30:.2f} GiB",
         )
@@ -660,6 +661,8 @@ def main(argv=None):
 # pytest 收集入口（test/moonep 约定）：CI 单进程 pytest 形态自动跳过，
 # 真正执行需 torchrun + NPU（与 test_moonep_ep.py 的守卫同款思想）
 # ---------------------------------------------------------------------------
+
+
 _requires_train_env = pytest.mark.skipif(
     not _HAS_TRAIN_DEPS
     or "RANK" not in os.environ

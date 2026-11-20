@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 
-"""Communication contexts and symmetric-memory layout for MoonEP weight prefetch.
+"""MoonEP 通信上下文与对称 workspace 布局。
 
 新通信 API 适配（UbMem 映射内存）：
   - MoonepContext 持有本 rank 独立 workspace（uint8 NPU 张量，本 rank
@@ -18,10 +18,7 @@
     moonep_layout 为唯一真源）；旧 HCCL_BUFFSIZE 容量约束与 EB 通信域
     分离契约（check_no_shared_elastic_buffer）随之消解——workspace 为
     本 rank 私有注册内存。
-
-Resolves torch.distributed process groups into device-side MoonepCommCtx tensors.
-Provides capacity checks, stream ordering, workspace storage and rank
-synchronization barriers."""
+"""
 
 from __future__ import annotations
 
@@ -100,12 +97,12 @@ def _vector_core_num(ready: bool) -> int:
 def resident_blocks(cap: int = 64) -> int:
     """本机可同时常驻的 AIV block 数（含 grid 级同步屏障 kernel 的硬上限）。
 
-    `global_sync_all()` 要求**全部 block 同时常驻**：block_dim 超过本机有效
+    `global_sync_all()` 要求全部 block 同时常驻：block_dim 超过本机有效
     AIV 核数（例如 56 核机型上排 64 块）时，调度器只能分时复用，grid 级同步屏障永远
     收不齐 → 死循环挂死。核数取 `get_platform_info().vector_core_num`
     （设备已初始化时含流的控核配额）；查询报错直接抛出，只有核数为 0 时
     退保守值而不是猜硬件规格。设备未初始化时只读静态 SoC 规格，不触发
-    设备初始化；该结果**不缓存**，运行期设备就绪后再按流配额复核，保证
+    设备初始化；该结果不缓存，运行期设备就绪后再按流配额复核，保证
     实启块数不超过配额。
 
     cap 是"核数再多也不加块"的经验上限（块数收益递减）；返回值 ≤ cap。
@@ -132,6 +129,14 @@ def resident_blocks(cap: int = 64) -> int:
         # 设备未初始化：静态规格不缓存，运行期初始化后再按配额复核
         return min(cap, cores)
     return min(cap, _RESIDENT_BLOCKS)
+
+
+def capped_blocks(context, cap):
+    """常驻块数上限再套一层 num_sms（构造参数；None 保持现有口径）。"""
+    blocks = resident_blocks(cap)
+    if context is not None and context.num_sms is not None:
+        blocks = min(blocks, int(context.num_sms))
+    return blocks
 
 
 def finish_op(context, async_finish=False):
@@ -259,7 +264,7 @@ class MoonepContext:
         # 缺省 = 本 context 自知的唯一硬需求（plan 交换区下界）——不做
         # 环境变量级粗预留（2048MiB 缺省的额外预留）；reduce/prefetch
         # 的形状相关区域（权重/scale 发布区 + 梯度副本区）由调用方显式
-        # 传入（MoonepBuffer 按形状精算；裸 API 用 _workspace_need() 同式）。
+        # 传入（Buffer 按形状精算；裸 API 用 _workspace_need() 同式）。
         if workspace_bytes is None:
             workspace_bytes = HEAP_BASE + PLAN_REGION_END
         workspace_bytes = int(workspace_bytes)
@@ -303,6 +308,7 @@ class MoonepContext:
         self.weight_dtype = None
         self.grad_dtype = None
         self.window_slots = None
+        self.num_sms = None  # kernel 常驻块数上限（None = 只按 resident_blocks）
         self.pending_overflow = None
         self.weight_views = {}
         self.bar_epoch_t = None
@@ -341,7 +347,7 @@ def check_heap_capacity(context, need_bytes, what):
             f"{what}超出 workspace：需要 {need_bytes} B "
             f"({need_bytes / 2**20:.1f} MiB)，可用 {heap_bytes} B "
             f"({heap_bytes / 2**20:.1f} MiB)。请按形状精算显式传入 "
-            "workspace_bytes（MoonepBuffer._workspace_need() 同式）。"
+            "workspace_bytes（Buffer._workspace_need() 同式）。"
         )
 
 
@@ -490,9 +496,9 @@ def create_moonep_context(
     （ProcessGroup），rank/rank_size 与 HCCL comm name 均按组内取值。
     workspace_bytes 缺省 = plan 交换区下界（HEAP_BASE + PLAN_REGION_END，
     分配即所需——不做粗预留）；跑 reduce/prefetch 的裸 API 调用方须按形状
-    精算显式传入（``MoonepBuffer._workspace_need()``；MoonepBuffer 路径
+    精算显式传入（``Buffer._workspace_need()``；Buffer 路径
     构造期已自动注入）。
-    裸 API 的形状在首调算子时才确定，按上界预留；MoonepBuffer 构造路径
+    裸 API 的形状在首调算子时才确定，按上界预留；Buffer 构造路径
     按形状精算注入。
     """
     if group is not None:

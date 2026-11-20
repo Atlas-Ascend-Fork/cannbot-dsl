@@ -8,21 +8,21 @@
 
 """reduce_grad：副本专家权重梯度跨 rank 归并回 home rank（训练反向）。
 
-**owner 直累协议（UbMem 映射读）**，数据流：
+owner 直累协议（UbMem 映射读），数据流：
 
   FFN 反向产出 full-dW ``t[2*epn, Wg]``（前 epn 行 home 种子、后 epn 行
-  副本 dW）→ 发送侧 host 把副本行拷入**本 rank** workspace 副本区
+  副本 dW）→ 发送侧 host 把副本行拷入本 rank workspace 副本区
   ``[epn, Wg]``（一次 GM 拷贝，恒定不随 R 增长）→ 单 kernel
   （2/3 组一次 launch）：
   ① 头部屏障（per-peer flag 握手：对端 kernel 启动即其流序在前的
      host 副本区写入已完成——保护对端上轮远读与本轮覆写不重叠）
-  ② owner **映射远读**副本区（etc_inv 逆映射行命中）→ 确定性归并
+  ② owner 映射远读副本区（etc_inv 逆映射行命中）→ 确定性归并
      （行单写者分区 + 固定 peer 升序远读（滞后窗流水）+ UB fp32 累加 +
      单次写回）
   ③ 尾部 sym_barrier（下一轮 host 覆写安全）
 
   精度（确定性归并）：逐元素加法序列恒定（seed → peer 升序 →
-  终轮一次舍入），**跨 run 逐位可重复**；bf16/fp16 舍入从 R-1 次降为
+  终轮一次舍入），跨 run 逐位可重复；bf16/fp16 舍入从 R-1 次降为
   1 次（精度提升 ~(R-1)×）。代价：块内 peer 串行读（链路级并发读数
   不变——吞吐对块内调度形态不敏感），UB 额外 acc/seed/out 缓冲（16 位
   chunk 16K 时环深 ≤3）。
@@ -73,7 +73,7 @@ from moonep_context import (
     next_barrier_epoch,
     normalize_group_list,
     pick_weight_chunk,
-    resident_blocks,
+    capped_blocks,
     sync_transport_stream,
 )
 from moonep_context import sym_barrier
@@ -812,13 +812,13 @@ def reduce_grad(
     # 块数封顶常驻核数（950PR 64 块）——R>64 时不随 R 增长：屏障写者与读块
     # 都按 peer 轮转（peer_block_split），避免写者被分波调度推到第二波互等
     # 。归并 tile 条带同样取此块数。
-    blocks = resident_blocks(_HEADER_BARRIER_CAP)
+    blocks = capped_blocks(context, _HEADER_BARRIER_CAP)
     chunk_limit = (
         _CHUNK_UB_LIMIT_BF16 if (grad_bf16 or grad_fp16) else _CHUNK_UB_LIMIT_FP32
     )
     chunks = tuple(pick_weight_chunk(w, chunk_limit) for w in widths)
     # 行宽须为 _VL=64 倍数（归并 tile 步进=_VL——非倍数时尾 tile 越界 UB；
-    # MoonepBuffer 构造期已查，裸 API 路径在此 fail-fast）
+    # Buffer 构造期已查，裸 API 路径在此 fail-fast）
     for w in widths:
         if w % _VL:
             raise ValueError(f"Wg={w} 须为 {_VL} 的倍数（归并 _VL 尾块越界防护）")

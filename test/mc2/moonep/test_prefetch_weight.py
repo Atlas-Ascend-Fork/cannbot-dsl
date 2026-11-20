@@ -67,7 +67,7 @@ def test_moonep_prefetch_weight_dsl_api(moonep_groups, monkeypatch):
     from moonep_buffer import _workspace_need
 
     ctx = create_moonep_context(
-        group=moonep_groups[0],
+        group=moonep_groups,
         workspace_bytes=_workspace_need(
             world_size, epn, w_elems, 1, torch.bfloat16, torch.bfloat16
         ),
@@ -121,7 +121,7 @@ def test_moonep_prefetch_weight_fp16_ring(moonep_groups):
     """2 组 fp16 + 环形清单：视图 dtype 跟随输入，命中槽与 home 行逐元素相等。"""
     rank, world_size = _init_ep_group()
     epn, w_elems = 1, 17
-    ctx = create_moonep_context(group=moonep_groups[0], workspace_bytes=64 << 20)
+    ctx = create_moonep_context(group=moonep_groups, workspace_bytes=64 << 20)
     ctx.last_plan_shape = (32, 8)
 
     etc_cpu = torch.full((world_size, epn), -1, dtype=torch.int32)

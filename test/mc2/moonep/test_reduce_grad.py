@@ -26,6 +26,8 @@ import os
 import sys
 
 import pytest
+
+from conftest import _reduce_api  # noqa: E402
 import torch
 import torch.distributed as dist
 
@@ -38,11 +40,12 @@ sys.path.insert(
 
 try:
     import torch_npu  # noqa: F401
-    from moonep_buffer import MoonepBuffer  # noqa: F401
+    from moonep_buffer import Buffer  # noqa: F401
 
     _HAS_DSL_IMPL = True
 except Exception:  # CI 无 NPU / 无 DSL 时收集不报错（skip 而非 error）
     _HAS_DSL_IMPL = False
+
 
 _requires_train_env = pytest.mark.skipif(
     not _HAS_DSL_IMPL
@@ -95,14 +98,14 @@ def _get_buffer(moonep_groups, grad_dtype="bf16"):
     world = dist.get_world_size()
     key = (world, str(grad_dtype))
     if key not in _R_POOL:
-        _R_POOL[key] = MoonepBuffer(
+        _R_POOL[key] = Buffer(
             _S,
             _H,
             _Hp,
             _K,
             _EPN * world,
-            moonep_group=moonep_groups[0],
-            ep_group=moonep_groups[1],
+            num_ep_ranks=dist.get_world_size(),
+            group=moonep_groups,
             grad_dtype=grad_dtype,
         )
     return _R_POOL[key]
@@ -146,12 +149,12 @@ def test_r1_reduce_3group_bf16(moonep_groups):
     rank, world = _init_group()
     buf = _get_buffer(moonep_groups, "bf16")
     topk, tpe = _routing(11)
-    plan = buf.plan(tpe, topk)
+    plan = buf._plan(tpe, topk)
     etc_cpu = plan.experts_to_copy.cpu()
     assert int((etc_cpu >= 0).sum()) > 0
     base = 0.0
     grads = [_full_dw(buf.epn, _W, g, base, torch.bfloat16) for g in range(_NUM_GROUPS)]
-    home_views = buf.reduce_grad(plan, local_grads=grads)  # sync：单值
+    home_views = _reduce_api(buf, plan, local_grads=grads)  # sync：单值
     assert len(home_views) == _NUM_GROUPS
     torch.npu.synchronize()
     for g, t in enumerate(grads):
@@ -168,23 +171,23 @@ def test_r2_reduce_2group_intertwined_bf16(moonep_groups):
     首调定型）。
     """
     rank, world = _init_group()
-    buf = MoonepBuffer(
+    buf = Buffer(
         _S,
         _H,
         _Hp,
         _K,
         _EPN * world,
-        moonep_group=moonep_groups[0],
-        ep_group=moonep_groups[1],
+        num_ep_ranks=dist.get_world_size(),
+        group=moonep_groups,
         grad_dtype="bf16",
     )
     topk, tpe = _routing(12)
-    plan = buf.plan(tpe, topk)
+    plan = buf._plan(tpe, topk)
     etc_cpu = plan.experts_to_copy.cpu()
     base = 1.0
     g13 = _full_dw(buf.epn, 2 * _W, 0, base, torch.bfloat16)
     g2 = _full_dw(buf.epn, _W, 1, base, torch.bfloat16)
-    home_views = buf.reduce_grad(plan, local_grads=[g13, g2])
+    home_views = _reduce_api(buf, plan, local_grads=[g13, g2])
     assert len(home_views) == 2
     torch.npu.synchronize()
     _verify_merged(g13, rank, world, buf.epn, etc_cpu, 0, base, 2 * _W, "R2 w13 ")
@@ -203,15 +206,15 @@ def test_r9_reduce_rotated_peer_blocks(moonep_groups, monkeypatch):
     rank, world = _init_group()
     import reduce_grad as rg_mod
 
-    monkeypatch.setattr(rg_mod, "resident_blocks", lambda cap=64: 2)
+    monkeypatch.setattr(rg_mod, "capped_blocks", lambda ctx, cap: 2)
     buf = _get_buffer(moonep_groups, "bf16")
     topk, tpe = _routing(19)
-    plan = buf.plan(tpe, topk)
+    plan = buf._plan(tpe, topk)
     etc_cpu = plan.experts_to_copy.cpu()
     assert int((etc_cpu >= 0).sum()) > 0
     base = 2.0
     grads = [_full_dw(buf.epn, _W, g, base, torch.bfloat16) for g in range(_NUM_GROUPS)]
-    home_views = buf.reduce_grad(plan, local_grads=grads)
+    home_views = _reduce_api(buf, plan, local_grads=grads)
     assert len(home_views) == _NUM_GROUPS
     # 确实按 clamp 后的块数编译（否则本用例退化为 block-per-peer，白跑）
     specs = list(rg_mod._UBMEM_PROGRAMS)  # 直累程序缓存
@@ -233,10 +236,10 @@ def test_r3_e5_grad_dtype_mismatch(moonep_groups):
     _init_group()
     buf = _get_buffer(moonep_groups, "bf16")
     topk, tpe = _routing(13)
-    plan = buf.plan(tpe, topk)
+    plan = buf._plan(tpe, topk)
     grads = [_full_dw(buf.epn, _W, g, 0.0, torch.float32) for g in range(_NUM_GROUPS)]
     with pytest.raises(TypeError, match="grad_dtype"):
-        buf.reduce_grad(plan, local_grads=grads)
+        _reduce_api(buf, plan, local_grads=grads)
 
 
 @pytest.mark.npu
@@ -244,7 +247,7 @@ def test_r3_e5_grad_dtype_mismatch(moonep_groups):
 def test_r4_capacity_failfast():
     """R4（容量 fail-fast）：小 workspace 裸 ctx → 接收区越界 RuntimeError。
 
-    MoonepBuffer 构造按形状精算 workspace，不使用 EB/对称堆（
+    Buffer 构造按形状精算 workspace，不使用 EB/对称堆（
     heap_required_bytes == heap_bytes 恒成立），旧"注入小 hccl_buffer_size
     组"的注入面不复存在。等价 fail-fast：显式 workspace_bytes 仅过 plan
     区（构造检查）的裸 ctx 上调 reduce_grad——check_heap_capacity 在程序
@@ -285,22 +288,22 @@ def test_r5_reduce_fp32(moonep_groups):
     fp32 元素级探针（randn+常值双实验）无可复现缺陷，硬门禁直接校验。
     """
     rank, world = _init_group()
-    buf = MoonepBuffer(
+    buf = Buffer(
         _S,
         _H,
         _Hp,
         _K,
         _EPN * world,
-        moonep_group=moonep_groups[0],
-        ep_group=moonep_groups[1],
+        num_ep_ranks=dist.get_world_size(),
+        group=moonep_groups,
         grad_dtype="fp32",
     )
     topk, tpe = _routing(15)
-    plan = buf.plan(tpe, topk)
+    plan = buf._plan(tpe, topk)
     etc_cpu = plan.experts_to_copy.cpu()
     base = 0.0
     grads = [_full_dw(buf.epn, _W, g, base, torch.float32) for g in range(_NUM_GROUPS)]
-    buf.reduce_grad(plan, local_grads=grads)
+    _reduce_api(buf, plan, local_grads=grads)
     torch.npu.synchronize()
     for g, t in enumerate(grads):
         _verify_merged(t, rank, world, buf.epn, etc_cpu, g, base, _W, f"R5 组{g} ")
@@ -324,14 +327,14 @@ def _randn_full_dw(rank, epn, w, g, dtype):
 
 
 def _expect_randn_merged(world, epn, w, g, dtype, etc_cpu, rank):
-    """CPU 重建期望：**本 rank 种子** + Σ 他人副本行（序无关和的精确基准）。
+    """CPU 重建期望：本 rank 种子 + Σ 他人副本行（序无关和的精确基准）。
 
     贡献映射须与 kernel/pack 语义一致（与常值档 ``_expect_merged_row`` 同
-    模型）：``etc[r][j] = e`` 表示 peer r 的**副本槽 j** 承载专家 e——归并
+    模型）：``etc[r][j] = e`` 表示 peer r 的副本槽 j 承载专家 e——归并
     即 ``exp[e % epn] += dw_r[epn + j]``（对端槽 j 的梯度 = 其 full-dW 行
     epn+j；owner home 行 = e % epn）。两版历史误构造：首版误加全组种子
     （999ab6d 修）；第二版假设"槽 j 恒承载本地索引 j 的专家"（``e % epn
-    == j`` 门 + ``exp[j] += dw[epn + j]``）——plan 的槽位是**紧凑排布**
+    == j`` 门 + ``exp[j] += dw[epn + j]``）——plan 的槽位是紧凑排布
     （_fill_rep_copy 按专家号升序从 0 压缩填槽，非 e%epn 对位；一专家可
     多 rank 副本），v24 8P routing-21 下 etc[1][0]=15 / etc[3,6,7][0]=17 /
     etc[2][0]=31 全部落 j=0，rank 3/4/7 的行 3/1/3 期望漏加（got 实为
@@ -365,7 +368,7 @@ def test_r6_reduce_randn_fp32_bf16(moonep_groups):
     行内元素级错位必然显形；bf16 档容差 rel 5%（原子串行化舍入）。
     副本段只读契约同步校验。
 
-    rank 分歧告警（v24 实证）：本用例双 dtype 循环中途 assert 失败会让
+    rank 分歧告警：本用例双 dtype 循环中途 assert 失败会让
     失败 rank 提前进入 R7、存活 rank 留在 bf16 档——两组 plan/barrier 的
     进程内 epoch 计数在同值上碰撞（plan _EPOCH 与 _BAR_EPOCH 均为进程级
     全局计数），同一堆内交换互穿：需求矩阵混行 → 混合 etc、槽区数据互
@@ -386,12 +389,12 @@ def test_r6_reduce_randn_fp32_bf16(moonep_groups):
         gdtype = "fp32" if dtype == torch.float32 else "bf16"
         buf = _get_buffer(moonep_groups, gdtype)
         topk, tpe = _routing(21)
-        plan = buf.plan(tpe, topk)
+        plan = buf._plan(tpe, topk)
         etc_cpu = plan.experts_to_copy.cpu()
         grads = [
             _randn_full_dw(rank, buf.epn, _W, g, dtype) for g in range(_NUM_GROUPS)
         ]
-        buf.reduce_grad(plan, local_grads=grads)
+        _reduce_api(buf, plan, local_grads=grads)
         torch.npu.synchronize()
         for g, t in enumerate(grads):
             exp = _expect_randn_merged(world, buf.epn, _W, g, dtype, etc_cpu, rank)
@@ -438,20 +441,20 @@ def test_r7_reduce_empty_and_asymmetric(moonep_groups):
     buf = _get_buffer(moonep_groups, "bf16")
     # 轮 1：active（正常路由）
     topk, tpe = _routing(31)
-    plan = buf.plan(tpe, topk)
+    plan = buf._plan(tpe, topk)
     etc_active = plan.experts_to_copy.cpu()
     g1 = [_full_dw(buf.epn, _W, g, 0.0, torch.bfloat16) for g in range(3)]
-    buf.reduce_grad(plan, local_grads=g1)
+    _reduce_api(buf, plan, local_grads=g1)
     torch.npu.synchronize()
     _verify_merged(g1[0], rank, world, buf.epn, etc_active, 0, 0.0, _W, "R7 轮1 ")
 
     # 轮 2：空 plan（全 rank 只选本地专家 → etc 恒 -1）
     topk_e, tpe_e = _local_only_routing()
-    plan_e = buf.plan(tpe_e, topk_e)
+    plan_e = buf._plan(tpe_e, topk_e)
     etc_empty = plan_e.experts_to_copy.cpu()
     assert not bool((etc_empty >= 0).any()), "本地路由不应产生副本清单"
     g2 = [_full_dw(buf.epn, _W, g, 5.0, torch.bfloat16) for g in range(3)]
-    buf.reduce_grad(plan_e, local_grads=g2)
+    _reduce_api(buf, plan_e, local_grads=g2)
     torch.npu.synchronize()
     # 零触碰：home = 纯本地种子（_full_dw 行变编码 (i+1)·(g+1)+base）
     for g, t in enumerate(g2):
@@ -471,10 +474,10 @@ def test_r7_reduce_empty_and_asymmetric(moonep_groups):
 
     # 轮 3：active 复位（独立归并，base=7 区分）
     topk3, tpe3 = _routing(31)
-    plan3 = buf.plan(tpe3, topk3)
+    plan3 = buf._plan(tpe3, topk3)
     assert bool((plan3.experts_to_copy.cpu() >= 0).any()) or world == 1
     g3 = [_full_dw(buf.epn, _W, g, 7.0, torch.bfloat16) for g in range(3)]
-    buf.reduce_grad(plan3, local_grads=g3)
+    _reduce_api(buf, plan3, local_grads=g3)
     torch.npu.synchronize()
     _verify_merged(g3[0], rank, world, buf.epn, etc_active, 0, 7.0, _W, "R7 轮3 ")
 
@@ -493,19 +496,19 @@ def test_r8_reduce_multichunk_column_position(moonep_groups):
     w = 32768  # bf16 chunk=16384 → n_c=2
     half = w // 2
 
-    buf = MoonepBuffer(
+    buf = Buffer(
         _S,
         _H,
         w // _H,  # Hp=1024 → W=32768（专用 buffer——形状键独立）
         _K,
         _EPN * world,
-        moonep_group=moonep_groups[0],
-        ep_group=moonep_groups[1],
+        num_ep_ranks=dist.get_world_size(),
+        group=moonep_groups,
         grad_dtype="bf16",
     )
     try:
         topk, tpe = _routing(23)
-        plan = buf.plan(tpe, topk)
+        plan = buf._plan(tpe, topk)
         etc_cpu = plan.experts_to_copy.cpu()
         assert int((etc_cpu >= 0).sum()) > 0
 
@@ -522,7 +525,7 @@ def test_r8_reduce_multichunk_column_position(moonep_groups):
                 t[i, half:] = _row_val(i, g) + 8.0
             grads.append(t)
 
-        buf.reduce_grad(plan, local_grads=grads)  # sync：单值——归并原位
+        _reduce_api(buf, plan, local_grads=grads)  # sync：单值——归并原位
         torch.npu.synchronize()
 
         for g, t in enumerate(grads):

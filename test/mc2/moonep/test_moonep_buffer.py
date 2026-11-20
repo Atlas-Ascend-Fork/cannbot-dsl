@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 
-"""MoonepBuffer 用例矩阵：plan/prefetch/reduce 三算子基础功能（设计 §6.3）。
+"""Buffer 用例矩阵：plan/prefetch/reduce 三算子基础功能（设计 §6.3）。
 
 运行（4 卡）：
     torchrun --nproc_per_node=4 -m pytest test/moonep/test_moonep_buffer.py -q
@@ -32,6 +32,8 @@ import sys
 from typing import NamedTuple
 
 import pytest
+
+from conftest import _prefetch_api, _reduce_api  # noqa: E402
 import torch
 import torch.distributed as dist
 
@@ -52,7 +54,7 @@ from conftest import fill_empty_slots  # noqa: E402
 
 try:
     import torch_npu  # noqa: F401
-    from moonep_buffer import MoonepBuffer  # noqa: F401
+    from moonep_buffer import Buffer  # noqa: F401
     from moonep_context import (  # noqa: F401
         HEAP_BASE,
         LAYOUT_TAIL_BYTES,
@@ -98,7 +100,7 @@ def _init_group():
         dist.init_process_group(backend="hccl")
     world = dist.get_world_size()
     if world < 2:
-        pytest.skip("MoonepBuffer 用例需 >= 2 卡")
+        pytest.skip("Buffer 用例需 >= 2 卡")
     rank = dist.get_rank()
     torch.npu.set_device(rank)
     return rank, world
@@ -122,7 +124,8 @@ def _fill_and_repush(buf, plan, views):
     fill_empty_slots(buf.epn, views)
     buf.barrier()
     weights, scales = views
-    buf.prefetch_weight(
+    _prefetch_api(
+        buf,
         plan,
         local_weights=[v[: buf.epn] for v in weights],
         local_scales=[s[: buf.epn] for s in scales] if scales else None,
@@ -131,7 +134,7 @@ def _fill_and_repush(buf, plan, views):
 
 
 def _get_buffer(moonep_groups, slots=1, grad_dtype="bf16"):
-    """构造（或复用）池化 MoonepBuffer——全 rank 同序命中同键。"""
+    """构造（或复用）池化 Buffer——全 rank 同序命中同键。"""
     world = dist.get_world_size()
     E = _EPN * world
     key = (_S, _K, E, _W, _NUM_GROUPS, slots, str(grad_dtype), _H)
@@ -142,15 +145,15 @@ def _get_buffer(moonep_groups, slots=1, grad_dtype="bf16"):
         _old_buf = _BUFFER_POOL.pop(_old_key)
         _old_buf.destroy()
     if key not in _BUFFER_POOL:
-        moonep_group, ep_group = moonep_groups
-        _BUFFER_POOL[key] = MoonepBuffer(
+        moonep_group = moonep_groups
+        _BUFFER_POOL[key] = Buffer(
             _S,
             _H,
             _Hp,
             _K,
             E,
-            moonep_group=moonep_group,
-            ep_group=ep_group,
+            num_ep_ranks=world,
+            group=moonep_group,
             slots=slots,
             grad_dtype=grad_dtype,
         )
@@ -163,20 +166,20 @@ def _dedicated_buffer(moonep_groups, **kwargs):
     形状缺省主门禁档；E/expert 两维等均可经 kwargs 覆盖（后写胜出）。
     """
     world = dist.get_world_size()
-    moonep_group, ep_group = moonep_groups
+    moonep_group = moonep_groups
     args = dict(
         E=_EPN * world,
         Hp=_Hp,
     )
     args.update(kwargs)
-    buf = MoonepBuffer(
+    buf = Buffer(
         _S,
         _H,
         args.pop("Hp"),
         _K,
         args.pop("E"),
-        moonep_group=moonep_group,
-        ep_group=ep_group,
+        num_ep_ranks=world,
+        group=moonep_group,
         **args,
     )
     _DEDICATED.append(buf)
@@ -354,7 +357,7 @@ def test_a2_plan_tuple_compat_and_guards(moonep_groups):
     _init_group()
     buf = _get_buffer(moonep_groups)
     topk, tpe = _routing(42)
-    plan = buf.plan(tpe, topk)
+    plan = buf._plan(tpe, topk)
     # 元组解包兼容（NamedTuple 即 tuple）+ 属性访问双形态
     dst_n, cu, etc, src_n, vtopk = plan
     assert plan.dst_n is dst_n and plan.src_n is src_n
@@ -374,9 +377,9 @@ def test_a2_plan_tuple_compat_and_guards(moonep_groups):
     assert int((etc_cpu >= 0).sum()) > 0, "balanced 路由未产生副本槽：副本路径未被覆盖"
     # 构造期一致性守卫：异形入参拒绝（先于 kernel 发射，无集合调用）
     with pytest.raises(ValueError):
-        buf.plan(tpe[: E - 1].clone(), topk)
+        buf._plan(tpe[: E - 1].clone(), topk)
     with pytest.raises(ValueError):
-        buf.plan(tpe, topk[: _S - 1])
+        buf._plan(tpe, topk[: _S - 1])
 
 
 # ---------------------------------------------------------------------------
@@ -392,14 +395,14 @@ def test_a3_prefetch_zero_copy_e2e(moonep_groups):
     rank, _world = _init_group()
     buf = _get_buffer(moonep_groups)
     topk, tpe = _routing(42)
-    plan = buf.plan(tpe, topk)
+    plan = buf._plan(tpe, topk)
     etc_cpu = plan.experts_to_copy.cpu()
     assert int((etc_cpu >= 0).sum()) > 0, "balanced 路由未产生副本槽：副本路径未被覆盖"
     # 首调显式传 real：视图按各组行宽创建并缓存（A4 路径），返回供零拷贝复用
     reals = [
         _fill_weight_real(rank, buf.epn, buf.H * buf.Hp, g) for g in range(_NUM_GROUPS)
     ]
-    views_w, views_s = buf.prefetch_weight(plan, local_weights=reals)
+    views_w, views_s = _prefetch_api(buf, plan, local_weights=reals)
     # 空槽哨兵（库内 fill 已移除）：fill → barrier → 复推后空槽保持 -1
     _fill_and_repush(buf, plan, (views_w, views_s))
     # 零拷贝轮：参数更新直接写视图 home 行（data_ptr 与 real 切片同址），
@@ -409,7 +412,7 @@ def test_a3_prefetch_zero_copy_e2e(moonep_groups):
     # C7+C8 契约：local_weights 必选——零拷贝语义 = 传视图 home 行切片本体
     # （data_ptr 与 home 段同址 ⇒ sync_transport 同址跳过，自动零拷贝）
     home_rows = [v[: buf.epn] for v in views_w]
-    buf.prefetch_weight(plan, local_weights=home_rows)
+    _prefetch_api(buf, plan, local_weights=home_rows)
     torch.npu.synchronize()
     case = _PrefetchCase(rank, buf.epn, buf.H * buf.Hp)
     for g, v in enumerate(views_w):
@@ -426,13 +429,13 @@ def test_a4_prefetch_explicit_real(moonep_groups):
     rank, _world = _init_group()
     buf = _get_buffer(moonep_groups)
     topk, tpe = _routing(42)
-    plan = buf.plan(tpe, topk)
+    plan = buf._plan(tpe, topk)
     etc_cpu = plan.experts_to_copy.cpu()
     reals = [
         _fill_weight_real(rank, buf.epn, buf.H * buf.Hp, g) for g in range(_NUM_GROUPS)
     ]
-    views_w, views_s = buf.prefetch_weight(
-        plan, local_weights=reals
+    views_w, views_s = _prefetch_api(
+        buf, plan, local_weights=reals
     )  # home 行被写入 real
     # 空槽哨兵（库内 fill 已移除）：fill → barrier → 复推后空槽保持 -1
     _fill_and_repush(buf, plan, (views_w, views_s))
@@ -459,7 +462,7 @@ def test_a5_reduce_encoded_multigroup(moonep_groups):
     rank, world = _init_group()
     buf = _get_buffer(moonep_groups)
     topk, tpe = _routing(42)
-    plan = buf.plan(tpe, topk)
+    plan = buf._plan(tpe, topk)
     etc_cpu = plan.experts_to_copy.cpu()
     assert int((etc_cpu >= 0).sum()) > 0, "未产生副本槽：reduce 副本路径未被覆盖"
     base = 0.0
@@ -468,8 +471,8 @@ def test_a5_reduce_encoded_multigroup(moonep_groups):
     g1 = _full_dw_grads(buf.epn, _Hp, _H, 0, base, buf.grad_dtype)
     g3 = _full_dw_grads(buf.epn, _Hp, _H, 1, base, buf.grad_dtype)
     g2 = _full_dw_grads(buf.epn, _H, _Hp, 2, base, buf.grad_dtype)
-    buf.reduce_grad(
-        plan, local_grads=[g1, g3, g2]
+    _reduce_api(
+        buf, plan, local_grads=[g1, g3, g2]
     )  # 门/上/下组序（组数从张量解析；dtype 经 E5 校验）
     torch.npu.synchronize()
     for gi, t in enumerate((g1, g3, g2)):
@@ -495,18 +498,19 @@ def test_a5_reduce_encoded_multigroup(moonep_groups):
 @pytest.mark.npu
 @_requires_train_env
 def test_a6_view_zero_copy_and_layout(moonep_groups):
-    """A6：weight_view 缓存访问器幂等（同 data_ptr）；
+    """A6：重复 prefetch 返回同址视图；
     组间按整视图步长推进；slots=2 槽间不重叠；group/slot 越界守卫。"""
     rank, _world = _init_group()
     buf = _get_buffer(moonep_groups)
     topk, tpe = _routing(42)
-    plan = buf.plan(tpe, topk)
+    plan = buf._plan(tpe, topk)
     reals = [
         _fill_weight_real(rank, buf.epn, buf.H * buf.Hp, g) for g in range(_NUM_GROUPS)
     ]
-    views_w, views_s = buf.prefetch_weight(plan, local_weights=reals)
-    # 缓存访问器幂等（同 data_ptr）+ 视图数 = 组数（运行期定型）
-    assert buf.weight_view(0).data_ptr() == buf.weight_view(0).data_ptr()
+    views_w, views_s = _prefetch_api(buf, plan, local_weights=reals)
+    # 重复调用返回同址视图 + 视图数 = 组数（运行期定型）
+    again_w, _ = _prefetch_api(buf, plan, local_weights=reals)
+    assert again_w[0].data_ptr() == views_w[0].data_ptr()
     assert len(views_w) == _NUM_GROUPS and not views_s
     # 组间步长：同槽相邻组视图按整视图步长推进（组间不重叠）
     va, vb = views_w[0], views_w[1]
@@ -515,47 +519,53 @@ def test_a6_view_zero_copy_and_layout(moonep_groups):
     # slots=2 构造档：槽 s 视图基址 = 发布区 + s*组数*整视图步长
     buf2 = _get_buffer(moonep_groups, slots=2)
     topk2, tpe2 = _routing(42)
-    plan2 = buf2.plan(tpe2, topk2)
+    plan2 = buf2._plan(tpe2, topk2)
     reals2 = [
         _fill_weight_real(rank, buf2.epn, buf2.H * buf2.Hp, g)
         for g in range(_NUM_GROUPS)
     ]
     # sync 返回 (weights, scales) 二元组——取 slot0 的组 0 权重视图
-    v_slot0 = buf2.prefetch_weight(plan2, local_weights=reals2, slot=0)
-    v_slot1 = buf2.prefetch_weight(plan2, local_weights=reals2, slot=1)
+    v_slot0 = _prefetch_api(buf2, plan2, local_weights=reals2, slot=0)
+    v_slot1 = _prefetch_api(buf2, plan2, local_weights=reals2, slot=1)
     s0, s1 = v_slot0[0][0], v_slot1[0][0]
     assert buf2.slots == 2
     assert (
         s1.data_ptr() - s0.data_ptr() == _NUM_GROUPS * view_bytes
         and (s1.data_ptr() - s0.data_ptr()) % view_bytes == 0
     ), "双槽视图槽间重叠或步长不符"
-    # 越界守卫（组/槽）
+    # 越界守卫（槽）与形态互斥守卫
     with pytest.raises(ValueError):
-        buf.weight_view(_NUM_GROUPS)
+        _prefetch_api(buf, plan, local_weights=reals, slot=buf.slots)
     with pytest.raises(ValueError):
-        buf.weight_view(0, slot=buf.slots)
+        buf.prefetch_weight(
+            plan=plan,
+            local_gate_weight=reals[0],
+            local_up_weight=reals[1],
+            local_down_weight=reals[2],
+            local_gate_up_weight=reals[0],
+        )
     # 未 prefetch 的槽位访问 → 引导性报错（视图随首调创建）：buf2 双槽
     # 两槽均已预取，改用专用 buffer 只预取 slot 0
-    buf3 = MoonepBuffer(
+    buf3 = Buffer(
         _S,
         _H,
         _Hp,
         _K,
         _EPN * _world,
-        moonep_group=moonep_groups[0],
-        ep_group=moonep_groups[1],
+        num_ep_ranks=dist.get_world_size(),
+        group=moonep_groups,
         slots=2,
     )
     _DEDICATED.append(buf3)
     topk3, tpe3 = _routing(42)
-    plan3 = buf3.plan(tpe3, topk3)
+    plan3 = buf3._plan(tpe3, topk3)
     reals3 = [
         _fill_weight_real(rank, buf3.epn, buf3.H * buf3.Hp, g)
         for g in range(_NUM_GROUPS)
     ]
-    buf3.prefetch_weight(plan3, local_weights=reals3, slot=0)
+    _prefetch_api(buf3, plan3, local_weights=reals3, slot=0)
     with pytest.raises(RuntimeError):
-        buf3.weight_view(0, slot=1)
+        buf3.scale_views(slot=1)
 
 
 # ---------------------------------------------------------------------------
@@ -575,7 +585,7 @@ def test_a8_two_round_reentry(moonep_groups):
     buf = _get_buffer(moonep_groups)
     for rnd, (seed, base, scale) in enumerate(((101, 0.0, 1), (202, 8.0, 2))):
         topk, tpe = _routing(seed)
-        plan = buf.plan(tpe, topk)
+        plan = buf._plan(tpe, topk)
         etc_cpu = plan.experts_to_copy.cpu()
         # —— prefetch 轮（编码按轮倍率区分——上一轮残留数据必被检出；
         #     首轮显式 real，次轮 real=None 零拷贝——两种入参形态都覆盖）——
@@ -590,7 +600,7 @@ def test_a8_two_round_reentry(moonep_groups):
                 )
                 for g in range(_NUM_GROUPS)
             ]
-            views_w, views_s = buf.prefetch_weight(plan, local_weights=reals)
+            views_w, views_s = _prefetch_api(buf, plan, local_weights=reals)
             # 空槽哨兵（库内 fill 已移除）：fill → barrier → 复推
             _fill_and_repush(buf, plan, (views_w, views_s))
         else:
@@ -615,12 +625,12 @@ def test_a8_two_round_reentry(moonep_groups):
             # C7+C8 契约：零拷贝轮传视图 home 行切片本体（data_ptr 同址
             # ⇒ sync 跳过——若传陈旧 reals 会把旧值覆写进已更新的 home 行）
             home_rows = [v[: buf.epn] for v in views_w]
-            views_w, views_s = buf.prefetch_weight(plan, local_weights=home_rows)
+            views_w, views_s = _prefetch_api(buf, plan, local_weights=home_rows)
         # —— reduce 轮（编码基数随轮变化；full-dW 直入）——
         g1 = _full_dw_grads(buf.epn, _Hp, _H, 0, base, buf.grad_dtype)
         g3 = _full_dw_grads(buf.epn, _Hp, _H, 1, base, buf.grad_dtype)
         g2 = _full_dw_grads(buf.epn, _H, _Hp, 2, base, buf.grad_dtype)
-        buf.reduce_grad(plan, local_grads=[g1, g3, g2])
+        _reduce_api(buf, plan, local_grads=[g1, g3, g2])
         torch.npu.synchronize()
         # —— 双算子校验 ——
         case = _PrefetchCase(rank, buf.epn, buf.H * buf.Hp)
@@ -656,14 +666,14 @@ def test_a9_async_finish_events(moonep_groups):
     rank, world = _init_group()
     buf = _get_buffer(moonep_groups)
     topk, tpe = _routing(42)
-    plan = buf.plan(tpe, topk)
+    plan = buf._plan(tpe, topk)
     etc_cpu = plan.experts_to_copy.cpu()
     # —— prefetch async（首调显式 real；返回 (views, event)）——
     reals = [
         _fill_weight_real(rank, buf.epn, buf.H * buf.Hp, g) for g in range(_NUM_GROUPS)
     ]
-    (views_w, views_s), ev = buf.prefetch_weight(
-        plan, async_finish=True, local_weights=reals
+    (views_w, views_s), ev = _prefetch_api(
+        buf, plan, async_finish=True, local_weights=reals
     )
     assert ev is not None and isinstance(ev, torch.npu.Event)
     torch.npu.current_stream().wait_event(ev)
@@ -680,7 +690,7 @@ def test_a9_async_finish_events(moonep_groups):
     g1 = _full_dw_grads(buf.epn, _Hp, _H, 0, base, buf.grad_dtype)
     g3 = _full_dw_grads(buf.epn, _Hp, _H, 1, base, buf.grad_dtype)
     g2 = _full_dw_grads(buf.epn, _H, _Hp, 2, base, buf.grad_dtype)
-    _hv, ev2 = buf.reduce_grad(plan, async_finish=True, local_grads=[g1, g3, g2])
+    _hv, ev2 = _reduce_api(buf, plan, async_finish=True, local_grads=[g1, g3, g2])
     assert ev2 is not None and isinstance(ev2, torch.npu.Event)
     torch.npu.current_stream().wait_event(ev2)
     buf.barrier()
@@ -727,19 +737,19 @@ def test_a12_intertwined_2group(moonep_groups):
     rank, world = _init_group()
     # 专用 buffer：2 组结构定型 ctx.layout_groups（与池化 3 组互斥），
     # 入 _DEDICATED 保活防 GC 中途触发 EB 析构
-    buf = MoonepBuffer(
+    buf = Buffer(
         _S,
         _H,
         _Hp,
         _K,
         _EPN * world,
-        moonep_group=moonep_groups[0],
-        ep_group=moonep_groups[1],
+        num_ep_ranks=dist.get_world_size(),
+        group=moonep_groups,
         slots=1,
     )
     _DEDICATED.append(buf)
     topk, tpe = _routing(42)
-    plan = buf.plan(tpe, topk)
+    plan = buf._plan(tpe, topk)
     etc_cpu = plan.experts_to_copy.cpu()
     assert int((etc_cpu >= 0).sum()) > 0, "balanced 路由未产生副本槽"
     W = buf.H * buf.Hp
@@ -747,7 +757,7 @@ def test_a12_intertwined_2group(moonep_groups):
     # —— prefetch 2 组交织：组数/行宽从张量解析（(2W, W)）——
     w13 = _fill_weight_real(rank, buf.epn, 2 * W, 0)  # [epn, 2W] 交织行
     w2 = _fill_weight_real(rank, buf.epn, W, 1)  # [epn, W]
-    views_w, views_s = buf.prefetch_weight(plan, local_weights=(w13, w2))
+    views_w, views_s = _prefetch_api(buf, plan, local_weights=(w13, w2))
     torch.npu.synchronize()
     assert len(views_w) == 2 and not views_s, (
         f"交织 2 组 bf16 应返回 2 权重视图、无 scale，got {len(views_w)}/{len(views_s)}"
@@ -784,7 +794,7 @@ def test_a12_intertwined_2group(moonep_groups):
     base = 0.0
     g13 = _full_dw_2d(buf.epn, 2 * W, 0, base, buf.grad_dtype)
     g2 = _full_dw_2d(buf.epn, W, 1, base, buf.grad_dtype)
-    buf.reduce_grad(plan, local_grads=[g13, g2])
+    _reduce_api(buf, plan, local_grads=[g13, g2])
     torch.npu.synchronize()
     _verify_merged(g13, rank, world, buf.epn, etc_cpu, 0, base, 2 * W, tag="w13 ")
     _verify_merged(g2, rank, world, buf.epn, etc_cpu, 1, base, W, tag="down ")
@@ -850,19 +860,19 @@ def test_a12b_intertwined_half_gate_up(moonep_groups):
     tile 边界错位，差分必被检出。同时校验 home 行半区一致。
     """
     rank, world = _init_group()
-    buf = MoonepBuffer(
+    buf = Buffer(
         _S,
         _H,
         _Hp,
         _K,
         _EPN * world,
-        moonep_group=moonep_groups[0],
-        ep_group=moonep_groups[1],
+        num_ep_ranks=dist.get_world_size(),
+        group=moonep_groups,
         slots=1,
     )
     _DEDICATED.append(buf)
     topk, tpe = _routing(43)
-    plan = buf.plan(tpe, topk)
+    plan = buf._plan(tpe, topk)
     etc_cpu = plan.experts_to_copy.cpu()
     assert int((etc_cpu >= 0).sum()) > 0, "balanced 路由未产生副本槽"
     W = buf.H * buf.Hp
@@ -871,7 +881,7 @@ def test_a12b_intertwined_half_gate_up(moonep_groups):
     # prefetch 交织差分编码
     w13 = _fill_intertwined_real(rank, epn, W, 0)
     w2 = _fill_weight_real(rank, epn, W, 1)
-    views_w, views_s = buf.prefetch_weight(plan, local_weights=(w13, w2))
+    views_w, views_s = _prefetch_api(buf, plan, local_weights=(w13, w2))
     torch.npu.synchronize()
     assert views_w[0].shape == (2 * epn, 2 * W)
 
@@ -920,13 +930,13 @@ def test_a11_knob_mapping(moonep_groups):
     buf32 = _get_buffer(moonep_groups, grad_dtype="fp32")
     assert buf32.grad_dtype == torch.float32
     topk, tpe = _routing(42)
-    plan = buf32.plan(tpe, topk)
+    plan = buf32._plan(tpe, topk)
     etc_cpu = plan.experts_to_copy.cpu()
     base = 0.0
     g1 = _full_dw_grads(buf32.epn, _Hp, _H, 0, base, torch.float32)
     g3 = _full_dw_grads(buf32.epn, _Hp, _H, 1, base, torch.float32)
     g2 = _full_dw_grads(buf32.epn, _H, _Hp, 2, base, torch.float32)
-    buf32.reduce_grad(plan, local_grads=[g1, g3, g2])
+    _reduce_api(buf32, plan, local_grads=[g1, g3, g2])
     torch.npu.synchronize()
     for gi, t in enumerate((g1, g3, g2)):
         _verify_merged(
@@ -956,14 +966,14 @@ def _get_quant_buffer(moonep_groups):
     world = dist.get_world_size()
     key = (world,)
     if key not in _QUANT_POOL:
-        _QUANT_POOL[key] = MoonepBuffer(
+        _QUANT_POOL[key] = Buffer(
             _S,
             _H,
             _QUANT_HP,
             _K,
             _EPN * world,
-            moonep_group=moonep_groups[0],
-            ep_group=moonep_groups[1],
+            num_ep_ranks=dist.get_world_size(),
+            group=moonep_groups,
             weight_dtype="e4m3fn",
         )
     return _QUANT_POOL[key]
@@ -1057,7 +1067,7 @@ def test_a13_mxfp8_intertwined_scale(moonep_groups):
     rank, world = _init_group()
     buf = _get_quant_buffer(moonep_groups)
     topk, tpe = _routing(57)
-    plan = buf.plan(tpe, topk)
+    plan = buf._plan(tpe, topk)
     etc_cpu = plan.experts_to_copy.cpu()
     assert int((etc_cpu >= 0).sum()) > 0, "balanced 路由未产生副本槽"
     epn, W = buf.epn, _QUANT_W
@@ -1068,8 +1078,8 @@ def test_a13_mxfp8_intertwined_scale(moonep_groups):
     w2 = _fill_fp8_real(rank, epn, W, 1)
     s13 = _fill_scale_real(rank, epn, sg13, 0)
     s2 = _fill_scale_real(rank, epn, sg2, 1)
-    views_w, views_s = buf.prefetch_weight(
-        plan, local_weights=(w13, w2), local_scales=(s13, s2)
+    views_w, views_s = _prefetch_api(
+        buf, plan, local_weights=(w13, w2), local_scales=(s13, s2)
     )
     torch.npu.synchronize()
 
@@ -1122,7 +1132,7 @@ def test_a13_mxfp8_intertwined_scale(moonep_groups):
     base = 0.0
     g13 = _full_dw_2d(epn, 2 * W, 0, base, torch.bfloat16)
     g2 = _full_dw_2d(epn, W, 1, base, torch.bfloat16)
-    buf.reduce_grad(plan, local_grads=[g13, g2])
+    _reduce_api(buf, plan, local_grads=[g13, g2])
     torch.npu.synchronize()
     _verify_merged(g13, rank, world, epn, etc_cpu, 0, base, 2 * W, "mxfp8 w13 ")
     _verify_merged(g2, rank, world, epn, etc_cpu, 1, base, W, "mxfp8 w2 ")
@@ -1130,8 +1140,8 @@ def test_a13_mxfp8_intertwined_scale(moonep_groups):
     # —— 零拷贝复推：home 行切片直推（含 scale home 行——C8 同址跳过）——
     home_w = [v[:epn] for v in views_w]
     home_s = [v[:epn] for v in views_s]
-    views2_w, views2_s = buf.prefetch_weight(
-        plan, local_weights=home_w, local_scales=home_s
+    views2_w, views2_s = _prefetch_api(
+        buf, plan, local_weights=home_w, local_scales=home_s
     )
     torch.npu.synchronize()
     _verify_fp8_view(
@@ -1156,13 +1166,13 @@ def test_e2_fp8_requires_scales(moonep_groups):
     _init_group()
     buf = _get_quant_buffer(moonep_groups)
     topk, tpe = _routing(57)
-    plan = buf.plan(tpe, topk)
+    plan = buf._plan(tpe, topk)
     rank = dist.get_rank()
     epn, W = buf.epn, _QUANT_W
     w13 = _fill_fp8_real(rank, epn, 2 * W, 0)
     w2 = _fill_fp8_real(rank, epn, W, 1)
     with pytest.raises(ValueError, match="local_scales"):
-        buf.prefetch_weight(plan, local_weights=(w13, w2))
+        _prefetch_api(buf, plan, local_weights=(w13, w2))
 
 
 @pytest.mark.npu
@@ -1172,7 +1182,7 @@ def test_e2_bf16_rejects_scales(moonep_groups):
     _init_group()
     buf = _get_buffer(moonep_groups)
     topk, tpe = _routing(42)
-    plan = buf.plan(tpe, topk)
+    plan = buf._plan(tpe, topk)
     rank = dist.get_rank()
     W = _H * _Hp
     reals = [_fill_weight_real(rank, buf.epn, W, g) for g in range(_NUM_GROUPS)]
@@ -1182,7 +1192,7 @@ def test_e2_bf16_rejects_scales(moonep_groups):
         for _ in range(_NUM_GROUPS)
     ]
     with pytest.raises(ValueError, match="fp8"):
-        buf.prefetch_weight(plan, local_weights=reals, local_scales=scales)
+        _prefetch_api(buf, plan, local_weights=reals, local_scales=scales)
 
 
 @pytest.mark.npu
@@ -1192,7 +1202,7 @@ def test_e2_scale_dtype_gate(moonep_groups):
     _init_group()
     buf = _get_quant_buffer(moonep_groups)
     topk, tpe = _routing(57)
-    plan = buf.plan(tpe, topk)
+    plan = buf._plan(tpe, topk)
     rank = dist.get_rank()
     epn, W = buf.epn, _QUANT_W
     w13 = _fill_fp8_real(rank, epn, 2 * W, 0)
@@ -1202,7 +1212,7 @@ def test_e2_scale_dtype_gate(moonep_groups):
     # uint8 scale：dtype 终态后不再合法（MX 标准要求 e8m0fnu 原生编码）
     s2_u8 = _fill_scale_real(rank, epn, sg13, 1).view(torch.uint8)
     with pytest.raises(TypeError, match="e8m0fnu"):
-        buf.prefetch_weight(plan, local_weights=(w13, w2), local_scales=(s13, s2_u8))
+        _prefetch_api(buf, plan, local_weights=(w13, w2), local_scales=(s13, s2_u8))
 
 
 @pytest.mark.npu
@@ -1212,7 +1222,7 @@ def test_e3_scale_align(moonep_groups):
     _init_group()
     buf = _get_quant_buffer(moonep_groups)
     topk, tpe = _routing(57)
-    plan = buf.plan(tpe, topk)
+    plan = buf._plan(tpe, topk)
     rank = dist.get_rank()
     epn, W = buf.epn, _QUANT_W
     w13 = _fill_fp8_real(rank, epn, 2 * W, 0)
@@ -1220,7 +1230,7 @@ def test_e3_scale_align(moonep_groups):
     s13 = _fill_scale_real(rank, epn, 2 * W // 32, 0)
     s_bad = _fill_scale_real(rank, epn, 16, 1)  # 16B：非 32B 倍数
     with pytest.raises(ValueError, match="32"):
-        buf.prefetch_weight(plan, local_weights=(w13, w2), local_scales=(s13, s_bad))
+        _prefetch_api(buf, plan, local_weights=(w13, w2), local_scales=(s13, s_bad))
 
 
 @pytest.mark.npu
@@ -1230,12 +1240,12 @@ def test_e1_weight_dtype_mismatch(moonep_groups):
     _init_group()
     buf = _get_quant_buffer(moonep_groups)
     topk, tpe = _routing(57)
-    plan = buf.plan(tpe, topk)
+    plan = buf._plan(tpe, topk)
     epn, W = buf.epn, _QUANT_W
     w13 = _fill_weight_real(dist.get_rank(), epn, 2 * W, 0)  # bf16 → 违约
     w2 = _fill_fp8_real(dist.get_rank(), epn, W, 1)
     with pytest.raises(TypeError, match="dtype"):
-        buf.prefetch_weight(plan, local_weights=(w13, w2))
+        _prefetch_api(buf, plan, local_weights=(w13, w2))
 
 
 @pytest.mark.npu
@@ -1245,14 +1255,14 @@ def test_e1_uint8_unsupported(moonep_groups):
     _init_group()
     world = dist.get_world_size()
     with pytest.raises(TypeError, match="uint8"):
-        MoonepBuffer(
+        Buffer(
             _S,
             _H,
             _QUANT_HP,
             _K,
             _EPN * world,
-            moonep_group=moonep_groups[0],
-            ep_group=moonep_groups[1],
+            num_ep_ranks=dist.get_world_size(),
+            group=moonep_groups,
             weight_dtype="uint8",
         )
 
@@ -1266,20 +1276,20 @@ def test_e5m2_whitelist_and_e2(moonep_groups):
     E2 ValueError；补一次 e5m2 + e8m0fnu scales 的最小 e2e 推送对拍
     （kernel 侧 1B 字节语义与 e4m3fn 同路径，此处覆盖 host 侧映射）。"""
     rank, world = _init_group()
-    buf = MoonepBuffer(
+    buf = Buffer(
         _S,
         _H,
         _QUANT_HP,
         _K,
         _EPN * world,
-        moonep_group=moonep_groups[0],
-        ep_group=moonep_groups[1],
+        num_ep_ranks=dist.get_world_size(),
+        group=moonep_groups,
         weight_dtype="e5m2",
     )
     _DEDICATED.append(buf)
     assert buf.weight_dtype == torch.float8_e5m2
     topk, tpe = _routing(57)
-    plan = buf.plan(tpe, topk)
+    plan = buf._plan(tpe, topk)
     etc_cpu = plan.experts_to_copy.cpu()
     epn, W = buf.epn, _QUANT_W
     sg13, sg2 = 2 * W // 32, W // 32
@@ -1297,11 +1307,11 @@ def test_e5m2_whitelist_and_e2(moonep_groups):
 
     # E2：e5m2 不传 scales → ValueError
     with pytest.raises(ValueError, match="local_scales"):
-        buf.prefetch_weight(plan, local_weights=(w13, w2))
+        _prefetch_api(buf, plan, local_weights=(w13, w2))
 
     # 最小 e2e：e5m2 + e8m0fnu scales 推送对拍（字节 LUT 同式）
-    views_w, views_s = buf.prefetch_weight(
-        plan, local_weights=(w13, w2), local_scales=(s13, s2)
+    views_w, views_s = _prefetch_api(
+        buf, plan, local_weights=(w13, w2), local_scales=(s13, s2)
     )
     # 空槽哨兵（库内 fill 已移除）：fill → barrier → 复推（含 scale 组）
     _fill_and_repush(buf, plan, (views_w, views_s))
@@ -1342,12 +1352,12 @@ def test_a14_prefetch_randn_elementwise(moonep_groups):
     rank, world = _init_group()
     buf = _get_buffer(moonep_groups)
     topk, tpe = _routing(67)
-    plan = buf.plan(tpe, topk)
+    plan = buf._plan(tpe, topk)
     etc_cpu = plan.experts_to_copy.cpu()
     epn = buf.epn
 
     reals = [_randn_weight(rank, epn, _W) for _ in range(_NUM_GROUPS)]
-    views_w, views_s = buf.prefetch_weight(plan, local_weights=reals)
+    views_w, views_s = _prefetch_api(buf, plan, local_weights=reals)
     # 空槽哨兵（库内 fill 已移除）：fill → barrier → 复推
     _fill_and_repush(buf, plan, (views_w, views_s))
 
@@ -1375,3 +1385,65 @@ def test_a14_prefetch_randn_elementwise(moonep_groups):
             assert torch.equal(v_cpu[epn + j], owner_w[e - home * epn]), (
                 f"A14 组 {g} 槽 {j}（专家 {e}，home {home}）元素级失配"
             )
+
+
+@pytest.mark.npu
+@_requires_train_env
+def test_a15_dispatch_combine_new_api(moonep_groups):
+    """
+    A15：新 dispatch/combine 接口——前向建 plan、反向复用 plan，
+    combine 由 Buffer 自动匹配最近一次同方向 dispatch 的状态。
+    """
+    rank, world = _init_group()
+    buf = _get_buffer(moonep_groups)
+    topk, tpe = _routing(42)
+    torch.manual_seed(1234 + rank)
+    hidden = torch.randn(_S, _H, dtype=torch.bfloat16, device="npu")
+    route_w = torch.rand(_S, _K, dtype=torch.float32, device="npu")
+
+    recv, recv_w, cu, plan = buf.dispatch(hidden, route_w, topk, tpe)
+    assert cu.data_ptr() == plan.cu_seqlens.data_ptr()
+    cap = recv.shape[0]
+    assert recv.shape == (cap, _H) and recv_w.shape == (cap,)
+
+    out, out_w, _h = buf.combine(
+        plan=plan, hidden_nvsh=recv * 2, route_weights_nvs=recv_w
+    )
+    assert out.shape == (_S, _H) and out_w.shape == (_S, _K)
+
+    # 推理形态：前向 dispatch 不带 weights，combine 不传 weights
+    recv_nw, recv_w_nw, cu_nw, plan_nw = buf.dispatch(hidden, None, topk, tpe)
+    assert recv_w_nw is None and cu_nw.data_ptr() == plan_nw.cu_seqlens.data_ptr()
+    out_nw, out_w_nw, _ = buf.combine(plan=plan_nw, hidden_nvsh=recv_nw * 2)
+    assert out_nw.shape == (_S, _H) and out_w_nw is None
+
+    grad = torch.randn(_S, _H, dtype=torch.bfloat16, device="npu")
+    g_recv, g_w, _, plan_b = buf.dispatch(grad, plan=plan)
+    assert plan_b is plan and g_w is None and g_recv.shape[1] == _H
+    g_out, g_out_w, third = buf.combine(plan=plan, hidden_nvsh=g_recv)
+    assert g_out.shape == (_S, _H) and g_out_w is None and third is None
+
+    # 负例：handle 用后置空——再次 combine 立即报错
+    with pytest.raises(RuntimeError):
+        buf.combine(plan=plan, hidden_nvsh=g_recv)
+
+    # 负例：同方向 dispatch 后换 plan 调 combine → 身份校验报错
+    recv_p, _, _, plan_p = buf.dispatch(hidden, route_w, topk, tpe)
+    other_plan = buf._plan(tpe, topk)
+    with pytest.raises(RuntimeError):
+        buf.combine(plan=other_plan, hidden_nvsh=recv_p * 2)
+
+    # 负例：前向/反向 handle 同时存在且未传 weights → 方向歧义
+    recv_f, _, _, _ = buf.dispatch(hidden, route_w, topk, tpe)
+    buf.dispatch(hidden, plan=plan_p)
+    with pytest.raises(RuntimeError):
+        buf.combine(plan=plan_p, hidden_nvsh=recv_f * 2)
+
+    # 负例：route_weights 行数与接收行数不一致
+    recv_w_bad, _, _, plan_w = buf.dispatch(hidden, route_w, topk, tpe)
+    with pytest.raises(ValueError):
+        buf.combine(
+            plan=plan_w,
+            hidden_nvsh=recv_w_bad * 2,
+            route_weights_nvs=torch.zeros(1, dtype=torch.float32, device="npu"),
+        )

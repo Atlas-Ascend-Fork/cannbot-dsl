@@ -9,7 +9,7 @@
 """moonep_plan 基线（UbMem 通路）。
 
 口径同 bench_reduce_grad（§11 教训）：
-- **kernel 时长**：profiler kernel_details.csv Duration 中位数（每拍恰
+- kernel 时长：profiler kernel_details.csv Duration 中位数（每拍恰
   1 次 plan 发射——单 launch 设计，口径成立）；
 - 逐拍 span：对齐 barrier[i]→barrier[i+1]（含 host/队列间隙）；
 - sustained：async 背靠背 + npu Event 总时（profiler 外——host 发射

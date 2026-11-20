@@ -76,7 +76,7 @@ def _pulled_bytes(etc_cpu, rank, epn, w_elems, groups=3):
 
 
 def _iter_kernels(out_dir):
-    """逐 rank 只取**最新** trace 的 kernel_details.csv。
+    """逐 rank 只取最新 trace 的 kernel_details.csv。
 
     out_dir 跨 run 累积（同 --out 复用）时全量递归会把旧 run 的 kernel
     时长掺入中位数（旧 run 会稀释当前指标）。按 rank
@@ -102,9 +102,9 @@ def _summarize(out_dir):
     """返回 (pull 时长列表, [(barrier 起始时间, 时长)], kernel 名集合, 迭代 span 列表)。
 
     迭代 span：对齐 barrier[i] 起始 → barrier[i+1] 起始（末拍到本拍最后
-    一个 pull/merge/barrier kernel 的结束）。**逐拍口径**——多批次两段式
+    一个 pull/merge/barrier kernel 的结束）。逐拍口径——多批次两段式
     下 per-launch 中位数口径会把单次发射时长当整拍（×批数虚高 → 带宽虚高），带宽一律以 iter 口径为准。
-    launch-med 口径仅在**每拍恰 1 次 pull 发射**时与 iter 等价（单
+    launch-med 口径仅在每拍恰 1 次 pull 发射时与 iter 等价（单
     kernel 设计：prefetch/K=epn 直累/UbMem）；多发射/拍一律看 iter。
     """
     pull, barrier, names = [], [], set()
@@ -253,7 +253,7 @@ def main():
 
         if rank == 0:
             print(
-                f"\n== reduce_grad kernel 基线 ==\n"
+                f"\n== reduce_grad 基线 ==\n"
                 f"规格: R={world} epn={args.epn} W={args.w_elems} groups=3 "
                 f"pattern={pattern} iters={args.iters}\n"
             )
@@ -271,11 +271,11 @@ def main():
                 print(
                     f"rank{item['rank']}: pulled {item['pulled_bytes'] / 2**20:.3f} MiB | "
                     f"pull {_fmt(pull, 'us')} | "
-                    f"iter med {iter_med} | **{iter_gbs}** | "
+                    f"iter med {iter_med} | {iter_gbs} | "
                     f"barrier {_fmt(barrier, 'us')} | "
                     f"align {_fmt(item['align_barrier'], 'us')} | launch-med {gbs}"
                 )
-            print(f"rank0 kernels: {gathered[0]['names']}")
+            print(f"[kernels] rank0: {gathered[0]['names']}")
 
 
 if __name__ == "__main__":

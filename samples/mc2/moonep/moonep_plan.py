@@ -71,6 +71,7 @@ from moonep_context import (
     MAX_E,
     MAX_R,
     next_barrier_epoch,
+    capped_blocks,
     check_pending_overflow,
     record_transport_event,
     resident_blocks,
@@ -91,6 +92,8 @@ from moonep_comm import (
 # 常量
 # ---------------------------------------------------------------------------
 _MAX_PLAN_BLOCKS = 64  # 单次启动 block 上限，实际取 min(AIV 核数, cap)
+# 编译期烘焙的块数上限（_get_plan_program 锁内按 num_sms 覆写）
+_PLAN_BLOCK_LIMIT = _MAX_PLAN_BLOCKS
 _CHUNK_MIN = 128  # chunk 下限（token/块），再小则每块 O(E) 重建占比过高
 _VF_SAFE_CHUNK = 1024  # chunk 上限（vf 栈安全——见 _plan_chunking docstring）
 
@@ -906,13 +909,13 @@ class _PlanKernel:
 # ---------------------------------------------------------------------------
 
 
-def _plan_chunking(num_rows):
+def _plan_chunking(num_rows, block_limit=None):
     """chunk 取整除 N 的 2 的幂，范围 [_CHUNK_MIN, _VF_SAFE_CHUNK]。
 
     上限来自 vf 栈：constexpr 展开次数随 chunk 增长，chunk=2048 时栈
     6720B 超 6144B 上限、编译失败（A5 S=8192）。
     """
-    cap = resident_blocks(_MAX_PLAN_BLOCKS)
+    cap = resident_blocks(_MAX_PLAN_BLOCKS) if block_limit is None else int(block_limit)
     target_chunk = max(_CHUNK_MIN, ceil_div(num_rows, cap))
     chunk = ceil_pow2(target_chunk)
     if chunk > _VF_SAFE_CHUNK:
@@ -926,9 +929,10 @@ def _plan_chunking(num_rows):
     return chunk, num_chunks, token_blocks
 
 
-def _pfx_block_count(num_experts):
+def _pfx_block_count(num_experts, block_limit=None):
     """Pfx 的 block 数：E 的可整除因子，且不超过本机可常驻核数。"""
-    block_count = min(num_experts, resident_blocks(_MAX_PLAN_BLOCKS))
+    cap = resident_blocks(_MAX_PLAN_BLOCKS) if block_limit is None else int(block_limit)
+    block_count = min(num_experts, cap)
     while block_count > 1 and num_experts % block_count != 0:
         block_count -= 1
     return block_count
@@ -942,10 +946,12 @@ class _PlanBlocks(NamedTuple):
     pfx_blocks: int
 
 
-def _plan_blocks(num_rows, num_experts):
+def _plan_blocks(num_rows, num_experts, block_limit=None):
     """分块与专家块一次算全；不做 lru_cache（块数依赖运行期核数）。"""
-    _, num_chunks, token_blocks = _plan_chunking(num_rows)
-    return _PlanBlocks(num_chunks, token_blocks, _pfx_block_count(num_experts))
+    _, num_chunks, token_blocks = _plan_chunking(num_rows, block_limit)
+    return _PlanBlocks(
+        num_chunks, token_blocks, _pfx_block_count(num_experts, block_limit)
+    )
 
 
 @host
@@ -961,7 +967,7 @@ def _moonep_plan_host(
     num_experts = gm_tpe.shape[0]
     world_size = _RANK_SIZE  # trace 期烘焙；rank 运行时由 ctx.rankId 取
     num_rows = gm_topk.shape[0]  # 本 rank topk 扁平视图，直接作 Cnt/Asg 输入
-    blocks = _plan_blocks(num_rows, num_experts)
+    blocks = _plan_blocks(num_rows, num_experts, _PLAN_BLOCK_LIMIT)
     _PlanKernel(
         world_size,
         num_experts,
@@ -972,7 +978,7 @@ def _moonep_plan_host(
     )[
         min(
             max(blocks.token_blocks, blocks.pfx_blocks),
-            resident_blocks(_MAX_PLAN_BLOCKS),
+            _PLAN_BLOCK_LIMIT,
         )
     ](
         gm_tpe,
@@ -1090,22 +1096,21 @@ def _zero_placeholder(num_rows):
     return t
 
 
-def _get_plan_program(num_tokens, top_k, num_experts, world_size):
+def _get_plan_program(num_tokens, top_k, num_experts, world_size, block_limit=None):
     """按 (S,K,E,R,块数) 键控的编译产物缓存。"""
-    # 块数也是编译期常量（角色分派），核数不同的机器不能复用同一 program
-    key = (
-        num_tokens,
-        top_k,
-        num_experts,
-        world_size,
-        resident_blocks(_MAX_PLAN_BLOCKS),
+    limit = (
+        resident_blocks(_MAX_PLAN_BLOCKS) if block_limit is None else int(block_limit)
     )
+    # 块数也是编译期常量（角色分派），核数不同的机器不能复用同一 program
+    key = (num_tokens, top_k, num_experts, world_size, limit)
     with _PLAN_LOCK:
         program = _PLAN_PROGRAMS.get(key)
         if program is not None:
             return program
+        global _PLAN_BLOCK_LIMIT
+        _PLAN_BLOCK_LIMIT = limit
         num_rows = num_tokens * top_k
-        blocks = _plan_blocks(num_rows, num_experts)
+        blocks = _plan_blocks(num_rows, num_experts, limit)
         ws_total = _ws_layout(world_size, num_experts, blocks.num_chunks)["total"]
         global _RANK_SIZE
         _RANK_SIZE = world_size
@@ -1190,6 +1195,7 @@ def moonep_plan(context, tokens_per_expert, topk_experts_sk):
     epn = num_experts // world_size
     num_rows = num_tokens * top_k  # 任意 N 原生整除（分块降档，无尾补机制）
     dims = _PlanDims(num_tokens, top_k, num_experts, world_size)
+    block_limit = capped_blocks(context, _MAX_PLAN_BLOCKS)
 
     dst_n = _zero_placeholder(num_rows)
     # 三份输出共享一次分配；kernel 全量覆写，empty 即可
@@ -1208,7 +1214,7 @@ def moonep_plan(context, tokens_per_expert, topk_experts_sk):
     # workspace 单槽缓存：同 shape 复用，shape 变化时按新布局重分配。
     ws_entry = context.plan_workspace
     if ws_entry is None or ws_entry[0] != dims:
-        blocks = _plan_blocks(num_rows, dims.num_experts)
+        blocks = _plan_blocks(num_rows, dims.num_experts, block_limit)
         ws_total = _ws_layout(dims.world_size, dims.num_experts, blocks.num_chunks)[
             "total"
         ]
@@ -1217,7 +1223,13 @@ def moonep_plan(context, tokens_per_expert, topk_experts_sk):
         context.plan_workspace = ws_entry
     gm_ws = ws_entry[1]
     # Cnt/Asg 只消费本 rank 的行，直接传 [S,K] 展平视图
-    _get_plan_program(dims.num_tokens, dims.top_k, dims.num_experts, dims.world_size)(
+    _get_plan_program(
+        dims.num_tokens,
+        dims.top_k,
+        dims.num_experts,
+        dims.world_size,
+        block_limit,
+    )(
         tokens_per_expert,
         gm_flag,
         gm_ws,

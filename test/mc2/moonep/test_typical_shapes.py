@@ -82,7 +82,7 @@ def test_typical_shape_plan_prefetch_reduce(
     torch.manual_seed(42 + rank)
     topk = torch.randint(0, experts, (tokens, top_k), dtype=torch.int32)
     tpe = torch.bincount(topk.flatten(), minlength=experts).to(torch.int32)
-    plan = buf.plan(tpe.npu(), topk.npu())
+    plan = buf._plan(tpe.npu(), topk.npu())
     torch.npu.synchronize()
 
     # 均衡不变量
@@ -155,7 +155,7 @@ def test_typical_shape_dispatch_combine(tokens, top_k, experts, moonep_groups):
     torch.manual_seed(42 + rank)
     topk = torch.randint(0, experts, (tokens, top_k), dtype=torch.int32)
     tpe = torch.bincount(topk.flatten(), minlength=experts).to(torch.int32)
-    plan = buf.plan(tpe.npu(), topk.npu())
+    plan = buf._plan(tpe.npu(), topk.npu())
 
     x = torch.randn(tokens, hidden, dtype=torch.bfloat16).npu()
     weights = torch.rand(tokens, top_k, dtype=torch.float32).npu()
