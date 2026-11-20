@@ -466,10 +466,6 @@ const simtSidebar = {
               "link": "/zh/api/simt/math/comparison/vbeq"
             },
             {
-              "text": "vbeq_mask",
-              "link": "/zh/api/simt/math/comparison/vbeq-mask"
-            },
-            {
               "text": "ne",
               "link": "/zh/api/simt/math/comparison/ne"
             },
@@ -492,10 +488,6 @@ const simtSidebar = {
             {
               "text": "vbne",
               "link": "/zh/api/simt/math/comparison/vbne"
-            },
-            {
-              "text": "vbne_mask",
-              "link": "/zh/api/simt/math/comparison/vbne-mask"
             },
             {
               "text": "le",
@@ -522,10 +514,6 @@ const simtSidebar = {
               "link": "/zh/api/simt/math/comparison/vble"
             },
             {
-              "text": "vble_mask",
-              "link": "/zh/api/simt/math/comparison/vble-mask"
-            },
-            {
               "text": "ge",
               "link": "/zh/api/simt/math/comparison/ge"
             },
@@ -548,10 +536,6 @@ const simtSidebar = {
             {
               "text": "vbge",
               "link": "/zh/api/simt/math/comparison/vbge"
-            },
-            {
-              "text": "vbge_mask",
-              "link": "/zh/api/simt/math/comparison/vbge-mask"
             },
             {
               "text": "lt",
@@ -578,10 +562,6 @@ const simtSidebar = {
               "link": "/zh/api/simt/math/comparison/vblt"
             },
             {
-              "text": "vblt_mask",
-              "link": "/zh/api/simt/math/comparison/vblt-mask"
-            },
-            {
               "text": "gt",
               "link": "/zh/api/simt/math/comparison/gt"
             },
@@ -604,10 +584,6 @@ const simtSidebar = {
             {
               "text": "vbgt",
               "link": "/zh/api/simt/math/comparison/vbgt"
-            },
-            {
-              "text": "vbgt_mask",
-              "link": "/zh/api/simt/math/comparison/vbgt-mask"
             },
             {
               "text": "isfinite",
