@@ -10,7 +10,7 @@ Reg 计算数据搬运接口，用于结束一组[`vsqueeze_and_storeunalign`](.
 ## 函数原型
 
 ```python
-vsqueeze_and_storeunalign_finalize(tensor, offset, ureg: StoreUnalignReg) -> None
+vsqueeze_and_storeunalign_finalize(tensor, offset, ureg: SqueezeStoreReg) -> None
 ```
 
 ## 参数说明
@@ -60,7 +60,6 @@ from cannbotdsl.ops.reg import (
     vsqueeze_and_storeunalign,
     vsqueeze_and_storeunalign_finalize,
     vsqueeze_and_storeunalign_init,
-    vstore_unalign_begin,
 )
 from cannbotdsl.tensor import MemLoc
 
@@ -75,9 +74,8 @@ def _vsqueeze_and_storeunalign_finalize_kernel(src0, dst):
     res = out
     with vf(mode="simd"):
         mask = create_mask(pattern="m3", elem_bits=32)
-        sq = vsqueeze_and_storeunalign_init(vload(in0, 0), mask=mask)
-        ureg = vstore_unalign_begin(res)
-        vsqueeze_and_storeunalign(res, 0, sq, ureg)
+        ureg = vsqueeze_and_storeunalign_init(res)
+        vsqueeze_and_storeunalign(res, 0, vload(in0, 0), ureg, mask=mask)
         vsqueeze_and_storeunalign_finalize(res, 0, ureg)
 
     mem_copy(dst, out)

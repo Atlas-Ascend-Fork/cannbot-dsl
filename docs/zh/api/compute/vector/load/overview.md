@@ -167,8 +167,7 @@ from cannbotdsl.ops.reg import (
     vload_unalign_init,
     vsqueeze_and_storeunalign_finalize,
     vsqueeze_and_storeunalign_init,
-    vstore_unalign,
-    vstore_unalign_begin,
+    vsqueeze_and_storeunalign,
 )
 from cannbotdsl.tensor import MemLoc
 
@@ -187,9 +186,9 @@ def _load_unalign_kernel(src0, dst):
         vload_unalign_init(in0, 1)
         v = vload_unalign(in0, 1)
         # 非对齐搬出：连续搬出主块，循环结束后写回暂存的尾块
-        sq = vsqueeze_and_storeunalign_init(v, mask=mask)
-        ureg = vstore_unalign_begin(res)
-        vstore_unalign(res, 0, sq, ureg)
+
+        ureg = vsqueeze_and_storeunalign_init(res)
+        vsqueeze_and_storeunalign(res, 0, v, ureg, mask=mask)
         vsqueeze_and_storeunalign_finalize(res, 0, ureg)
 
     mem_copy(dst, out)

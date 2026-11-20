@@ -5,33 +5,31 @@
 
 ## 功能说明
 
-标记一组连续搬出操作的压缩点。将`src`中`mask`比特位为1的元素压缩后作为返回值返回，返回值需与`vsqueeze_and_storeunalign`一一对应使用，由`vsqueeze_and_storeunalign`搬出到UB。本接口自身不读写AR特殊寄存器。
-
-AR寄存器用于配合`vsqueeze_and_storeunalign`及`vsqueeze_and_storeunalign_finalize`使用：调用`vsqueeze_and_storeunalign`后，有效元素的总字节数会被存入AR寄存器用于接口内自动地址偏移。在一组连续搬出操作开始前，需调用`vstore_unalign_begin`将AR寄存器清零。
+开启一组连续搬出操作，对AR特殊寄存器进行清零操作，并返回非对齐寄存器`ureg`。AR寄存器用于配合[`vsqueeze_and_storeunalign`](./vsqueeze-and-storeunalign.md)及[`vsqueeze_and_storeunalign_finalize`](./vsqueeze-and-storeunalign-finalize.md)使用：当调用`vsqueeze_and_storeunalign`后，有效元素的总字节数会被存入AR寄存器用于接口内自动地址偏移。在首次调用`vsqueeze_and_storeunalign`之前，需调用本接口将AR寄存器清零。
 
 ## 函数原型
 
 ```python
-vsqueeze_and_storeunalign_init(src: RawVReg, *, mask: Mask) -> RawVReg
+vsqueeze_and_storeunalign_init(tensor, *, no_clear_ar: bool = False) -> SqueezeStoreReg
 ```
 
 ## 参数说明
 
 | 参数 | 输入/输出 | 说明 |
 | --- | --- | --- |
-| `src` | 输入 | 源操作数（矢量数据寄存器）。 |
-| `mask` | 输入 | 源操作数掩码（掩码寄存器），用于指示在计算过程中哪些元素参与计算。mask中与元素对应的比特位为1时，该元素参与计算；为0时，该元素不参与计算。 |
+| `tensor` | 输出 | 位于Unified Buffer（UB）中的目的张量，后续搬出操作将结果写入该张量。 |
+| `no_clear_ar` | 输入 | 是否跳过AR寄存器清零：取值为`False`时本接口将AR寄存器清零；取值为`True`时不执行清零，本次搬出操作在上一组操作剩余的AR偏移基础上继续累加，默认为`False`。 |
 
 ## 返回值说明
 
-返回与`src`及`mask`关联、供配套压缩搬出接口使用的输入值，类型为`RawVReg`，其中元素的数据类型与`src`一致。该值须按约束说明用于后续压缩搬出，不能作为独立压缩结果任意使用。
+- 返回非对齐搬出状态句柄`ureg`，类型为`SqueezeStoreReg`，用于后续`vsqueeze_and_storeunalign`和`vsqueeze_and_storeunalign_finalize`调用。
 
 ## 约束说明
 
-- 本接口需在VF作用域内调用。
-- 每组连续搬出操作开始前，需调用一次本接口，再调用`vsqueeze_and_storeunalign`。本接口的返回值只能被`vsqueeze_and_storeunalign`使用一次，否则会报错。
+- 每组连续搬出操作开始前，需调用一次本接口，再调用`vsqueeze_and_storeunalign`。如果在一组连续搬出过程中再次调用本接口，AR寄存器记录的字节偏移会被重置，后续数据可能覆盖已经写入的结果。
 - 开始新一组操作前，需先调用`vsqueeze_and_storeunalign_finalize`完成上一组操作，避免上一组暂存在非对齐寄存器中的尾块数据丢失。
 - 本接口执行后，首次调用`vsqueeze_and_storeunalign`时使用的非对齐寄存器无需预先初始化。
+- 本接口需在VF作用域内调用。
 
 ## 调用示例
 
@@ -47,10 +45,9 @@ from cannbotdsl.lang.vf import vf
 from cannbotdsl.ops.reg import (
     create_mask,
     vload,
-    vsqueeze_and_storeunalign,
     vsqueeze_and_storeunalign_finalize,
     vsqueeze_and_storeunalign_init,
-    vstore_unalign_begin,
+    vsqueeze_and_storeunalign,
 )
 from cannbotdsl.tensor import MemLoc
 
@@ -65,9 +62,8 @@ def _vsqueeze_and_storeunalign_init_kernel(src0, dst):
     res = out
     with vf(mode="simd"):
         mask = create_mask(pattern="m3", elem_bits=32)
-        sq = vsqueeze_and_storeunalign_init(vload(in0, 0), mask=mask)
-        ureg = vstore_unalign_begin(res)
-        vsqueeze_and_storeunalign(res, 0, sq, ureg)
+        ureg = vsqueeze_and_storeunalign_init(res)
+        vsqueeze_and_storeunalign(res, 0, vload(in0, 0), ureg, mask=mask)
         vsqueeze_and_storeunalign_finalize(res, 0, ureg)
 
     mem_copy(dst, out)

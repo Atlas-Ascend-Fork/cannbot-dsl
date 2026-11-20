@@ -23,7 +23,7 @@ get_squeeze_status() -> Int64
 
 ## 约束说明
 
-- 调用本接口前，需先调用 [`vstore_unalign_begin`](../../compute/vector/reg_permute_sel/vstore-unalign-begin.md) 清空AR特殊寄存器，再调用 [`vsqueeze_and_storeunalign_init`](../../compute/vector/reg_permute_sel/vsqueeze-and-storeunalign-init.md) 标记压缩点并调用 [`vsqueeze_and_storeunalign`](../../compute/vector/reg_permute_sel/vsqueeze-and-storeunalign.md) 完成数据筛选；否则返回值没有确定含义。
+- 调用本接口前，需先调用 [`vsqueeze_and_storeunalign_init`](../../compute/vector/reg_permute_sel/vsqueeze-and-storeunalign-init.md) 清空AR特殊寄存器，再调用 [`vsqueeze_and_storeunalign`](../../compute/vector/reg_permute_sel/vsqueeze-and-storeunalign.md) 完成数据筛选；否则返回值没有确定含义。
 
 ## 调用示例
 
@@ -33,7 +33,8 @@ get_squeeze_status() -> Int64
 import torch
 import torch_npu
 
-from cannbotdsl import UB, dtypes, host, make_buffer
+from cannbotdsl import Buffer, dtypes, host, make_layout
+from cannbotdsl.tensor import MemLoc
 from cannbotdsl.lang.jit import jit
 from cannbotdsl.lang.kernel import kernel
 from cannbotdsl.lang.vf import vf
@@ -44,7 +45,6 @@ from cannbotdsl.ops.reg import (
     vsqueeze_and_storeunalign,
     vsqueeze_and_storeunalign_finalize,
     vsqueeze_and_storeunalign_init,
-    vstore_unalign_begin,
 )
 
 @jit
@@ -52,17 +52,14 @@ def compact_store(ub_output):
     with vf(mode="simd"):
         mask = create_mask(pattern="vl4", elem_bits=32)
         source = vdups(7, dtypes.uint32, mask=mask)
-        cursor = vstore_unalign_begin(ub_output)
-        squeezed = vsqueeze_and_storeunalign_init(source, mask=mask)
-        vsqueeze_and_storeunalign(ub_output, 0, squeezed, cursor)
+        cursor = vsqueeze_and_storeunalign_init(ub_output)
+
+        vsqueeze_and_storeunalign(ub_output, 0, source, cursor, mask=mask)
         vsqueeze_and_storeunalign_finalize(ub_output, 0, cursor)
 
 @kernel
 def _kernel(status):
-    ub_space = UB.view(262144)
-    ub_output = make_buffer(
-        ub_space[slice(0, 256),], dtype=dtypes.uint32
-    )
+    ub_output = Buffer(MemLoc.UB, dtypes.uint32, make_layout((64,)))
     compact_store(ub_output)
     status[0] = get_squeeze_status()
 
@@ -75,6 +72,7 @@ def main():
     run(status)
     torch.npu.synchronize()
     valid_bytes = int(status.cpu()[0])
+    assert valid_bytes == 16, valid_bytes
     print(f"squeeze_valid_bytes: {valid_bytes}")
 
 if __name__ == "__main__":

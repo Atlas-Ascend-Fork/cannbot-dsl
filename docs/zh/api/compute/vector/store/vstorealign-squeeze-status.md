@@ -51,7 +51,7 @@ from cannbotdsl.ops.reg import (
     vload,
     vsqueeze_and_storeunalign,
     vsqueeze_and_storeunalign_init,
-    vstore_unalign_begin,
+    vsqueeze_and_storeunalign_finalize,
     vstorealign_squeeze_status,
 )
 from cannbotdsl.tensor import MemLoc
@@ -69,10 +69,10 @@ def _vstorealign_squeeze_status_kernel(src0, dst, status):
     res2 = st
     with vf(mode="simd"):
         mask = create_mask(pattern="vl32", elem_bits=32)
-        ureg = vstore_unalign_begin(res)
-        sq = vsqueeze_and_storeunalign_init(vload(in0, 0), mask=mask)
-        vsqueeze_and_storeunalign(res, 0, sq, ureg)
+        ureg = vsqueeze_and_storeunalign_init(res)
+        vsqueeze_and_storeunalign(res, 0, vload(in0, 0), ureg, mask=mask)
         vstorealign_squeeze_status(res2, 0)
+        vsqueeze_and_storeunalign_finalize(res, 0, ureg)
 
     mem_copy(dst, out)
     mem_copy(status, st)

@@ -236,7 +236,7 @@ API 页面按语言、数据结构、数据搬运、计算、设备执行、调�
       - [vsqueeze_and_storeunalign_init](compute/vector/reg_permute_sel/vsqueeze-and-storeunalign-init.md)
       - [vsqueeze_and_storeunalign](compute/vector/reg_permute_sel/vsqueeze-and-storeunalign.md)
       - [vunsqueeze](compute/vector/reg_permute_sel/vunsqueeze.md)
-      - [vstore_unalign_begin](compute/vector/reg_permute_sel/vstore-unalign-begin.md)
+      - [create_ustore_reg](compute/vector/reg_permute_sel/create-ustore-reg.md)
       - [vstore_unalign](compute/vector/reg_permute_sel/vstore-unalign.md)
       - [vunpack](compute/vector/reg_permute_sel/vunpack.md)
     - 索引操作

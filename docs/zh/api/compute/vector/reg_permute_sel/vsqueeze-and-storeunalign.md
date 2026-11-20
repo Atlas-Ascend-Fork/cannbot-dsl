@@ -5,16 +5,12 @@
 
 ## 功能说明
 
-Reg 计算数据搬运接口。将压缩后的源操作数`value`中的元素连续搬出到Unified Buffer（UB）的`tensor`中。压缩后的元素按其在源操作数中的顺序从低位开始连续排列，`value`中的剩余元素置0。
-
-本接口使用AR特殊寄存器记录当前连续搬出的有效数据总字节数。首次调用本接口前，需调用[`vsqueeze_and_storeunalign_init`](./vsqueeze-and-storeunalign-init.md)标记压缩点，由[`vstore_unalign_begin`](./vstore-unalign-begin.md)清零AR寄存器。接口执行前，AR寄存器中的值表示相对于`tensor`的写入偏移，单位为字节；接口执行后，本次选中元素的总字节数会累加到AR寄存器中。连续调用本接口并保持`tensor`和`ureg`不变，可将多组筛选结果连续写入UB，无需手动更新地址。AR寄存器中的值可通过[`get_squeeze_status`](../../../execution/device/get-squeeze-status.md)接口获取。
-
-接口将可完整组成32B的主块写入UB，未满32B的尾块暂存在非对齐寄存器`ureg`中。完成一次或多次连续搬出后，需调用[`vsqueeze_and_storeunalign_finalize`](./vsqueeze-and-storeunalign-finalize.md)将尾块写入UB。
+按 `mask` 筛选源向量 `src` 的元素，保持原顺序压紧并追加写入 UB。首先调用 `vsqueeze_and_storeunalign_init(tensor)` 初始化状态，默认清零 AR。每次写入将选中元素的字节数累加到 AR，同一序列须复用目标、基址偏移和状态句柄。最后调用 `vsqueeze_and_storeunalign_finalize` 刷新尾块。
 
 ## 函数原型
 
 ```python
-vsqueeze_and_storeunalign(tensor, offset, value: RawVReg, ureg: StoreUnalignReg) -> None
+vsqueeze_and_storeunalign(tensor, offset, src: RawVReg, ureg: SqueezeStoreReg, *, mask: Mask) -> None
 ```
 
 ## 参数说明
@@ -23,8 +19,9 @@ vsqueeze_and_storeunalign(tensor, offset, value: RawVReg, ureg: StoreUnalignReg)
 | --- | --- | --- |
 | `tensor` | 输出 | 位于Unified Buffer（UB）中的目的张量，用于接收连续搬出的有效元素。<br>`tensor`的地址无需32B对齐，但需按`sizeof(dtype)`字节对齐。 |
 | `offset` | 输入 | 相对于`tensor`的元素偏移。 |
-| `value` | 输入 | 源操作数（矢量数据寄存器），取`vsqueeze_and_storeunalign_init`返回的压缩结果。 |
-| `ureg` | 输入 | 非对齐寄存器，由`vstore_unalign_begin`返回。 |
+| `src` | 输入 | 原始源向量，元素类型与目标一致。 |
+| `mask` | 输入 | 选择参与压紧的元素，位宽须与源向量匹配。 |
+| `ureg` | 输入 | 非对齐寄存器，由`vsqueeze_and_storeunalign_init`返回。 |
 
 **支持的元素数据类型：**
 
@@ -65,7 +62,6 @@ from cannbotdsl.ops.reg import (
     vsqueeze_and_storeunalign,
     vsqueeze_and_storeunalign_finalize,
     vsqueeze_and_storeunalign_init,
-    vstore_unalign_begin,
 )
 from cannbotdsl.tensor import MemLoc
 
@@ -80,9 +76,8 @@ def _vsqueeze_and_storeunalign_kernel(src0, dst):
     res = out
     with vf(mode="simd"):
         mask = create_mask(pattern="m3", elem_bits=32)
-        sq = vsqueeze_and_storeunalign_init(vload(in0, 0), mask=mask)
-        ureg = vstore_unalign_begin(res)
-        vsqueeze_and_storeunalign(res, 0, sq, ureg)
+        ureg = vsqueeze_and_storeunalign_init(res)
+        vsqueeze_and_storeunalign(res, 0, vload(in0, 0), ureg, mask=mask)
         vsqueeze_and_storeunalign_finalize(res, 0, ureg)
 
     mem_copy(dst, out)

@@ -1,112 +1,75 @@
 # vstore_unalign
+
 ## 产品支持情况
 
 - Ascend 950PR&950DT系列产品：支持
 
 ## 功能说明
 
-Reg 计算数据搬运接口。将压缩后的源操作数`value`中的元素连续搬出到Unified Buffer（UB）的`tensor`中。压缩后的元素按其在源操作数中的顺序从低位开始连续排列，`value`中的剩余元素置0。
-
-本接口使用AR特殊寄存器记录当前连续搬出的有效数据总字节数。首次调用本接口前，需调用[`vsqueeze_and_storeunalign_init`](./vsqueeze-and-storeunalign-init.md)标记压缩点，由[`vstore_unalign_begin`](./vstore-unalign-begin.md)清零AR寄存器。接口执行前，AR寄存器中的值表示相对于`tensor`的写入偏移，单位为字节；接口执行后，本次选中元素的总字节数会累加到AR寄存器中。连续调用本接口并保持`tensor`和`ureg`不变，可将多组筛选结果连续写入UB，无需手动更新地址。AR寄存器中的值可通过[`get_squeeze_status`](../../../execution/device/get-squeeze-status.md)接口获取。
-
-接口将可完整组成32B的主块写入UB，未满32B的尾块暂存在非对齐寄存器`ureg`中。完成一次或多次连续搬出后，需调用[`vsqueeze_and_storeunalign_finalize`](./vsqueeze-and-storeunalign-finalize.md)将尾块写入UB。
+将源向量的前 count 个元素从目标视图起点写入 UB，尾部暂存在 ureg 中。默认由调用方通过目标视图推进地址。post_update=True 时首次以视图起点初始化指针，此后每次自动推进 count 个元素，同一序列使用同一视图和模式。对应 asc_storeunalign / asc_storeunalign_postupdate。
 
 ## 函数原型
 
 ```python
-vstore_unalign(tensor, offset, value: RawVReg, ureg: StoreUnalignReg) -> None
+vstore_unalign(tensor, src: RawVReg, ureg: UStoreReg, *, count, post_update: bool = False) -> None
 ```
 
 ## 参数说明
 
 | 参数 | 输入/输出 | 说明 |
 | --- | --- | --- |
-| `tensor` | 输出 | 位于Unified Buffer（UB）中的目的张量，用于接收连续搬出的有效元素。<br>`tensor`的地址无需32B对齐，但需按`sizeof(dtype)`字节对齐。 |
-| `offset` | 输入 | 相对于`tensor`的元素偏移。 |
-| `value` | 输入 | 源操作数（矢量数据寄存器），取`vsqueeze_and_storeunalign_init`返回的压缩结果。 |
-| `ureg` | 输入 | 非对齐寄存器，由`vstore_unalign_begin`返回。 |
-
-**支持的元素数据类型：**
-
-`dtypes.int4x2`、`dtypes.int8`、`dtypes.uint8`、`dtypes.fp4x2_e2m1`、`dtypes.fp4x2_e1m2`、`dtypes.float8_e8m0`、`dtypes.float8_e5m2`、`dtypes.float8_e4m3fn`、`dtypes.int16`、`dtypes.uint16`、`dtypes.float16`、`dtypes.bfloat16`、`dtypes.int32`、`dtypes.uint32`、`dtypes.float32`。
+| tensor | 输出 | UB 目标视图，按元素自然对齐，类型与 src 一致。 |
+| src | 输入 | 原始源向量。 |
+| ureg | 输入/输出 | create_ustore_reg 返回的尾部状态。 |
+| count | 输入 | 本次元素数，范围 0 到向量容量，动态范围由调用方保证。 |
+| post_update | 输入 | 是否在写入后自动推进目的指针，默认 False。 |
 
 ## 返回值说明
 
-无返回值。结果写入`tensor`。
+无返回值。
 
 ## 约束说明
 
-### 通用约束
-
-- UB容量上限为256KB，用户可用容量随编译选项与编程场景变化。`tensor`加AR寄存器记录的累计字节数不可超过实际可用容量，否则会触发写越界异常。
-- 如果本接口与其他指令存在UB地址重叠，需要插入同步指令[`vmem_bar`](../reg_sync/vmem-bar.md)，保证多个指令串行化。
-
-### 指令约束
-
-- 本接口需在VF作用域内调用。
-- 每组连续搬出操作开始前，需调用一次`vsqueeze_and_storeunalign_init`和一次`vstore_unalign_begin`。连续调用本接口时，需保持`tensor`和`ureg`不变；最后一次调用后，需调用一次`vsqueeze_and_storeunalign_finalize`完成收尾。
+- 在 SIMD VF 作用域内使用。
+- 连续写入和刷新复用同一尾部状态。访问范围须在可用 UB 内。
 
 ## 调用示例
 
-以下示例演示`vstore_unalign`的调用，并在Host侧校验结果。
+以下示例可直接执行，检查有效输出与未写入区域。
 
 ```python
 import torch
 import torch_npu
-
 from cannbotdsl import Buffer, host, make_layout, mem_copy
 from cannbotdsl.lang.kernel import kernel
 from cannbotdsl.lang.vf import vf
-from cannbotdsl.ops.reg import (
-    create_mask,
-    vload,
-    vsqueeze_and_storeunalign_finalize,
-    vsqueeze_and_storeunalign_init,
-    vstore_unalign,
-    vstore_unalign_begin,
-)
+from cannbotdsl.ops import reg
 from cannbotdsl.tensor import MemLoc
 
 @kernel
-def _vstore_unalign_kernel(src0, dst):
-    buf = Buffer(MemLoc.UB, src0.dtype, make_layout((64,)))
-    out = Buffer(MemLoc.UB, dst.dtype, make_layout((64,)))
-
-    mem_copy(buf, src0)
-
-    in0 = buf
-    res = out
+def copy_kernel(src, dst):
+    ub_src = Buffer(MemLoc.UB, src.dtype, make_layout((64,)))
+    ub_dst = Buffer(MemLoc.UB, dst.dtype, make_layout((64,)))
+    mem_copy(ub_src, src)
+    mem_copy(ub_dst, dst)
     with vf(mode="simd"):
-        mask = create_mask(pattern="m3", elem_bits=32)
-        sq = vsqueeze_and_storeunalign_init(vload(in0, 0), mask=mask)
-        ureg = vstore_unalign_begin(res)
-        vstore_unalign(res, 0, sq, ureg)
-        vsqueeze_and_storeunalign_finalize(res, 0, ureg)
-
-    mem_copy(dst, out)
+        tail = reg.create_ustore_reg()
+        value = reg.vload(ub_src, 0)
+        reg.vstore_unalign(ub_dst, value, tail, count=13)
+        reg.vstore_unalign_post(ub_dst, 13, tail)
+    mem_copy(dst, ub_dst)
 
 @host
-def run(src0, dst):
-    _vstore_unalign_kernel[1](src0, dst)
+def run(src, dst):
+    copy_kernel[1](src, dst)
 
-def main():
-    src0 = torch.arange(64, dtype=torch.float32, device="npu:0")
-    dst = torch.empty_like(src0)
-
-    run(src0, dst)
-    torch.npu.synchronize()
-
-    torch.testing.assert_close(dst.cpu()[:22], src0.cpu()[0::3])
-    print("vstore_unalign example passed")
-    print(f"first={float(dst.cpu()[0]):.1f}, last={float(dst.cpu()[21]):.1f}")
-
-if __name__ == "__main__":
-    main()
+src = torch.arange(64, dtype=torch.float32, device="npu:0")
+dst = torch.full_like(src, -1)
+run(src, dst)
+torch.npu.synchronize()
+torch.testing.assert_close(dst.cpu()[:13], src.cpu()[:13], rtol=0, atol=0)
+torch.testing.assert_close(dst.cpu()[13:], torch.full((51,), -1.0), rtol=0, atol=0)
+print("ordinary unaligned store example passed")
 ```
 
-预期结果：
-
-```text
-vstore_unalign example passed
-first=0.0, last=63.0
-```
+预期输出 `ordinary unaligned store example passed`。
