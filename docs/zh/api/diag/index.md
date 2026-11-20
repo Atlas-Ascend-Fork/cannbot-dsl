@@ -6,6 +6,7 @@
 
 | 接口 | 用途 |
 | --- | --- |
+| [debug](./debug.md) | 为 kernel 和设备端 jit 配置硬件流水消融。 |
 | [dump_tensor](./dump_tensor.md) | 将GM或支持的片上存储区间写入CANN调试流。 |
 | [dump_reg](./dump_reg.md) | 打印SIMD VF中的一个矢量寄存器。 |
 | [异常 Tensor 落盘](./exception_dump.md) | 在AIC/AIV异常时导出CANN标准Tensor文件，供故障解析。 |

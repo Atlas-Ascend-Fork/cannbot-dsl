@@ -53,4 +53,4 @@ operator-dump/
 ## 与运行时调试输出的区别
 
 本功能在编译阶段归档源码，不读取输入Tensor的数据，也不记录设备运行时周期。
-[print_time_stamp](../api/debug/print_time_stamp.md)在设备执行时记录周期和PC，其原生二进制保存路径由CANN Dump配置及相关环境变量控制，不使用`CANNBOTDSL_DUMP_DIR`。
+[print_time_stamp](../api/diag/print_time_stamp.md)在设备执行时记录周期和PC，其原生二进制保存路径由CANN Dump配置及相关环境变量控制，不使用`CANNBOTDSL_DUMP_DIR`。

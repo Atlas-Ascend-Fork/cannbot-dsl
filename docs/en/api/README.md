@@ -7,9 +7,10 @@ The Chinese API tree is available from the [API reference entry](../../zh/api/in
 
 The following debugging pages are maintained in Chinese; English translations are pending.
 
-- [Debug interface overview](../../zh/api/debug/index.md)
-- [dump_tensor](../../zh/api/debug/dump_tensor.md)
-- [dump_reg](../../zh/api/debug/dump_reg.md)
-- [Exception tensor dump](../../zh/api/debug/exception_dump.md)
-- [print](../../zh/api/debug/print.md)
-- [Device timestamp markers](../../zh/api/debug/print_time_stamp.md)
+- [debug: hardware pipeline ablation](../../zh/api/diag/debug.md)
+- [Debug interface overview](../../zh/api/diag/index.md)
+- [dump_tensor](../../zh/api/diag/dump_tensor.md)
+- [dump_reg](../../zh/api/diag/dump_reg.md)
+- [Exception tensor dump](../../zh/api/diag/exception_dump.md)
+- [print](../../zh/api/diag/print.md)
+- [Device timestamp markers](../../zh/api/diag/print_time_stamp.md)

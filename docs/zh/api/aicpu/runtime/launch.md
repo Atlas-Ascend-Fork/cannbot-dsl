@@ -23,7 +23,21 @@ CompiledAicpuKernel.launch(
 | 参数 | 输入/输出 | 说明 |
 | --- | --- | --- |
 | `stream_handle` | 输入 | 当前NPU stream的整数句柄，可通过[current_raw_stream](./current-raw-stream.md)获取。 |
-| `kwargs` | 输入 | 按参数类字段名称传入参数。标量字段传入Python整数，GM字段传入设备缓冲区地址。字段名称、数量和类型必须与参数类声明一致。 |
+| `kwargs` | 输入 | 按参数类字段名称传入参数。标量字段传入Python整数，`interface` 模式的 GM 字段可传入 NPU `torch.Tensor` 或整数设备地址；`legacy` 模式仅传入已打包参数结构的设备地址 `param_addr`。字段名称及值须与所选模式和参数声明对应。 |
+
+### Tensor 参数与 profiling
+
+以下增量能力已在 Ascend 950PR 验证，其他产品需按安装版本确认。
+
+在 `interface` 模式下，传入 Tensor 对象可保留 shape、dtype 和 format，例如 `source=source`。只传 `source.data_ptr()` 时仅保留地址，不能推导 Tensor 描述。
+
+- Tensor 必须在同一 NPU 上、连续且 dtype 与 GM 元素类型匹配：`I32`/`U32`/`I64`/`U64` 分别对应 `torch.int32`/`torch.uint32`/`torch.int64`/`torch.uint64`。
+- 当前 NPU 必须与 Tensor 设备一致。`stream_handle` 必须等于该设备当前 TorchNPU stream 的句柄；非默认 stream 的获取和提交需在同一个 `torch.npu.stream(stream)` 上下文内完成。
+- Tensor 最多 8 维，各维大小须能用 uint32 表示。非 NPU、非连续、超维或 stream/device 不匹配等情况在下发前报错；dtype 不匹配抛出 `TypeError`。
+- 默认按 `gm_in` / `gm_out` 上报 Tensor 角色；若声明了 `ProfileSpec`，只上报其选择的字段。显式选择的字段传入裸地址会抛出 `TypeError`。
+- 元数据上报不复制 Tensor 数据，也不为上报额外同步设备。调用方仍需保证缓冲区在任务执行期间有效。
+
+需要重新编译 `interface` 动态库才能获得 Tensor profiling 上报能力；旧动态库可以沿用原启动入口，但不能因此获得缺失的上报信息。`legacy` 模式不解析参数块中的 Tensor。完整采集示例见 [AICPU Tensor 参数与 Profiling](../../../guide/aicpu-profiling.md)。
 
 ## 返回值说明
 

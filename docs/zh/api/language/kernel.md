@@ -75,7 +75,7 @@ run(out)
 assert out.cpu().tolist() == [0]
 ```
 
-完整配置项及展示规则见[Profiling名称与类型](../debug/profiling.md)。
+完整配置项及展示规则见[Profiling名称与类型](../diag/profiling.md)。
 
 ## 配置调度模式
 

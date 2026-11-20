@@ -7,6 +7,38 @@
 `@aicpu_kernel`用于声明一个AI CPU 函数。函数读取参数类中的标量和GM字段，完成轻量控制计算，并通过GM输出字段写回结果。
 
 
+## 函数原型
+
+```python
+from cannbotdsl.aicpu import aicpu_kernel
+
+
+def aicpu_kernel(fn=None, *, profile=None): ...
+```
+
+支持 `@aicpu_kernel` 和 `@aicpu_kernel(profile=...)` 两种形式。
+
+## 参数说明
+
+| 参数 | 输入/输出 | 说明 |
+| --- | --- | --- |
+| `fn` | 输入 | 被装饰的 Python 函数。使用带参数装饰器时由装饰器接收，通常不直接填写。 |
+| `profile` | 输入 | `cannbotdsl.ProfileSpec` 或 `None`，默认 `None`。在 `interface` 模式下配置 profiling 名称、逻辑类型及 GM 字段角色。 |
+
+未提供 `profile` 时，名称和逻辑类型使用入口名；以 Tensor 传入的 `gm_in` 字段默认作为输入，`gm_out` 默认作为输出。提供 `ProfileSpec` 后，角色列表完整替代默认推导；仅填写名称或使用空 `ProfileSpec()` 时，Tensor 上报列表为空。
+
+`inputs`、`outputs`、`inouts` 使用参数类中的 **GM 字段名**，例如 `source`，不使用函数形参名 `args`。字段不存在或不是 GM 字段时，装饰阶段抛出 `ValueError`；`profile` 类型不正确时抛出 `TypeError`。显式选择的 GM 字段在 `launch` 时必须传入 NPU Tensor，不能只传地址。
+
+`ProfileSpec` 的字段与重名约束见 [Profiling 名称与类型](../../diag/profiling.md#aicpu-接口配置)，Tensor 类型和 stream 约束见 [CompiledAicpuKernel.launch](../runtime/launch.md)。
+
+## 返回值说明
+
+直接装饰函数时返回 AI CPU Kernel 句柄，可用于 `run_host` 和 `compile_aicpu_kernel`；仅指定 `profile` 时返回接收函数的装饰器。声明本身不启动设备计算或性能采集。
+
+## 约束说明
+
+Tensor profiling 需要包含该能力的运行时以及重新编译的 `interface` 动态库。`legacy` 参数块模式不自动解析 Tensor，也不启用这一上报路径。该增量能力已在 Ascend 950PR 验证，其他产品需按对应版本确认。
+
 ## 声明AI CPU函数
 
 在函数定义前添加`@aicpu_kernel`。函数接收一个使用参数类进行类型注解的参数，参数类中的字段用于声明标量和GM输入、输出。

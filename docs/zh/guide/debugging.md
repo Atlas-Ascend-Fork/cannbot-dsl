@@ -135,7 +135,7 @@ with vf(mode="simd"):
 
 在启动 Python、初始化 ACL/NPU 之前设置 `ASCEND_DUMP_SCENE=aic_err_brief_dump` 和 CANN 工作目录 `ASCEND_WORK_PATH`。`CANNBOTDSL_AIC_ERROR_DEBUG=1` 用于编译行号，不能替代 CANN 异常 Dump 开关；`CANNBOTDSL_AIC_ERROR_DEBUG_DIR` 指定的 DSL 报告目录与 CANN 目录独立。
 
-详细配置、可导出的 Tensor 范围、文件关联和解析步骤见[异常 Tensor 落盘](../api/debug/exception_dump.md)。DSL 的 JSON/LOG、原有输入 `.bin/.pt` 与 CANN 标准文件用途不同；异常时观察到的数据也不保证等于执行前输入或完整输出，不能直接作为复现依据。
+详细配置、可导出的 Tensor 范围、文件关联和解析步骤见[异常 Tensor 落盘](../api/diag/exception_dump.md)。DSL 的 JSON/LOG、原有输入 `.bin/.pt` 与 CANN 标准文件用途不同；异常时观察到的数据也不保证等于执行前输入或完整输出，不能直接作为复现依据。
 
 ## 精度验证
 
@@ -247,7 +247,7 @@ Host 侧的构图、编译和运行错误由 `CANNBotError` 及 `DiagnosticCode`
 
 ## 设备周期打点与源码归档
 
-[print_time_stamp](../api/debug/print_time_stamp.md)在Kernel标量代码中记录周期、PC和核信息。`marker_id`只标识代码位置；多核归属及原生二进制落盘、解析方法见接口文档。打点不会自动等待全部流水完成，不能把标量推进时间直接当作异步计算完成时间。
+[print_time_stamp](../api/diag/print_time_stamp.md)在Kernel标量代码中记录周期、PC和核信息。`marker_id`只标识代码位置；多核归属及原生二进制落盘、解析方法见接口文档。打点不会自动等待全部流水完成，不能把标量推进时间直接当作异步计算完成时间。
 
 [AscendC源码归档](./ascendc-dump.md)在编译阶段按算子、shape和dtype保存源码及元数据。它不采集运行时Tensor内容；其`CANNBOTDSL_DUMP_DIR`也不是timestamp原生二进制的保存配置。
 
@@ -282,7 +282,7 @@ dt = (time.perf_counter() - t0) / 100
 
 通过 `@kernel(profile=cannbotdsl.ProfileSpec(...))` 配置上报名称、逻辑类型及 Tensor 参数角色；
 未提供配置时，框架自动补齐名称并推导默认 Tensor 角色。具体规则见
-[Profiling 名称与类型](../api/debug/profiling.md)。
+[Profiling 名称与类型](../api/diag/profiling.md)。
 
 设备侧可以用 [`get_system_cycle()`](../api/execution/device/get-system-cycle.md) 读周期数，给关键代码段做粗粒度计时。注意这会引入标量指令，别放在最内层循环里。
 

@@ -102,7 +102,7 @@ def demo_kernel(x: cbd.Tensor, out: cbd.Tensor):
 ```
 
 - **`print()`** 在构图期执行，看到的是 Python 对象：tile 大小、shape、分支选择、你算出来的循环次数。用它调试「我生成了什么样的 kernel」。
-- **[`cbd.print()`](../api/debug/print.md)** 会被编译进 Kernel，在设备上执行，输出真实数据。用它调试「算出来对不对」。
+- **[`cbd.print()`](../api/diag/print.md)** 会被编译进 Kernel，在设备上执行，输出真实数据。用它调试「算出来对不对」。
 
 ::: danger `cannbotdsl` 把设备打印也命名为 `print`
 包顶层导出的 `print` 就是设备侧打印（`cannbotdsl.core.diag.debug.print`）。

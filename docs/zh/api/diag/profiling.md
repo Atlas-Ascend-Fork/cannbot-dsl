@@ -298,3 +298,17 @@ msprof --application="python profiling_names.py" \
 | `NamedCopyKernel.__call__` | `copy` | `Copy` |
 
 相关接口：[@kernel](../language/kernel.md)、[Kernel 启动配置](../language/launch.md)。
+
+## AICPU 接口配置
+
+同一 `ProfileSpec` 也可传入 `@aicpu_kernel(profile=...)`，用于独立 AICPU `interface` kernel。它复用上述名称和角色字段，不需要另一种配置类型。
+
+| 项目 | AICPU 规则 |
+| --- | --- |
+| 名称与类型 | 未指定的 `name` / `op_type` 使用入口名；硬件任务类型为 `AI_CPU`，与逻辑 `op_type` 区分。 |
+| 默认角色 | `profile=None` 时，直接传入 Tensor 的 `gm_in` 字段作为输入、`gm_out` 字段作为输出。 |
+| 显式角色 | `inputs`、`outputs`、`inouts` 使用参数类的 GM 字段名，不能填写结构体形参名或标量字段名；在启动时要求对应值为 NPU Tensor。 |
+| 只配置名称 | `ProfileSpec(name="copy")` 和 `ProfileSpec()` 的 Tensor 列表均为空，不自动追加默认角色。 |
+| 适用模式 | `interface` 模式；`legacy` 参数块不自动解析 Tensor。旧动态库需要重新编译以获得上报能力。 |
+
+装饰器原型、参数与完整示例见 [@aicpu_kernel](../aicpu/programming/aicpu-kernel.md)，传参和 stream 要求见 [CompiledAicpuKernel.launch](../aicpu/runtime/launch.md)，采集及结果阅读见 [AICPU profiling 指南](../../guide/aicpu-profiling.md)。

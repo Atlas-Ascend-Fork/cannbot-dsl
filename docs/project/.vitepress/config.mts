@@ -65,6 +65,7 @@ const programmingModelSidebar = [
     items: [
       { text: '写出第一个算子', link: '/zh/guide/first-operator' },
       { text: 'AI CPU 与调度计划', link: '/zh/guide/aicpu' },
+      { text: 'AICPU Tensor 参数与 Profiling', link: '/zh/guide/aicpu-profiling' },
       { text: '融合算子的设计方法论', link: '/zh/guide/fusion-design' }
     ]
   },
@@ -79,6 +80,10 @@ const programmingModelSidebar = [
       { text: '高性能算子编写指南', link: '/zh/guide/performance' },
       { text: '调试与精度验证', link: '/zh/guide/debugging' },
       { text: 'AscendC源码归档', link: '/zh/guide/ascendc-dump' },
+      { text: 'AIC / AIV 异常诊断与 Python 源码定位', link: '/zh/guide/aic-error-debug' },
+      { text: '输入 Tensor 快照', link: '/zh/guide/input-tensor-dump' },
+      { text: 'Tiling 结果采集', link: '/zh/guide/tiling-dump' },
+      { text: '硬件流水消融', link: '/zh/api/diag/debug' },
       { text: 'AOT 与 Native 算子包', link: '/zh/guide/aot-packaging' },
       { text: '当前限制、迁移与常见问题', link: '/zh/guide/limitations' },
       { text: '概念对照、命名速查与术语表', link: '/zh/guide/appendix' }
@@ -2338,26 +2343,26 @@ const apiSidebar = [
         "items": [
           {
             "text": "调试",
-            "link": "/zh/api/debug",
+            "link": "/zh/api/diag",
             "items": [
               {
                 "text": "dump_tensor",
-                "link": "/zh/api/debug/dump_tensor"
+                "link": "/zh/api/diag/dump_tensor"
               },
               {
                 "text": "dump_reg",
-                "link": "/zh/api/debug/dump_reg"
+                "link": "/zh/api/diag/dump_reg"
               },
-              { "text": "异常 Tensor 落盘", "link": "/zh/api/debug/exception_dump" },
-              { "text": "log", "link": "/zh/api/debug/log" },
-              { "text": "统一错误模板", "link": "/zh/api/debug/error_message" },
+              { "text": "异常 Tensor 落盘", "link": "/zh/api/diag/exception_dump" },
+              { "text": "log", "link": "/zh/api/diag/log" },
+              { "text": "统一错误模板", "link": "/zh/api/diag/error_message" },
               {
                 "text": "print",
-                "link": "/zh/api/debug/print"
+                "link": "/zh/api/diag/print"
               },
               {
                 "text": "print_time_stamp",
-                "link": "/zh/api/debug/print_time_stamp"
+                "link": "/zh/api/diag/print_time_stamp"
               }
             ],
             "collapsed": true
@@ -2901,7 +2906,7 @@ const normalizeApiSidebar = (sidebar: any[]) => {
   const execution = find(items, '/execution')
   let debug: any
   if (execution) {
-    debug = find(execution.items ?? [], '/debug')
+    debug = find(execution.items ?? [], '/diag')
     if (debug) execution.items = remove(execution.items, debug)
     execution.items = [
       find(execution.items ?? [], '/execution/device'),
@@ -2912,7 +2917,7 @@ const normalizeApiSidebar = (sidebar: any[]) => {
 
   if (debug) {
     debug.text = '调试与性能分析'
-    debug.items = [...(debug.items ?? []), { text: 'Profiling 名称与类型', link: '/zh/api/debug/profiling' }]
+    debug.items = [...(debug.items ?? []), { text: 'debug（流水消融）', link: '/zh/api/diag/debug' }, { text: 'Profiling 名称与类型', link: '/zh/api/diag/profiling' }]
   }
 
   const compilation = find(items, '/compilation')

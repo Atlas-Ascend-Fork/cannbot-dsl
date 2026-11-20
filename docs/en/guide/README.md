@@ -5,6 +5,11 @@ The Chinese development-guide tree is available from the [programming model over
 
 ## Debugging documentation
 
-The following page is maintained in Chinese; its English translation is pending.
+The following pages are maintained in Chinese; their English translations are pending.
 
 - [AscendC source archiving](../../zh/guide/ascendc-dump.md)
+- [AIC / AIV diagnostics and Python source mapping](../../zh/guide/aic-error-debug.md)
+- [Input Tensor snapshots](../../zh/guide/input-tensor-dump.md)
+- [Tiling result collection](../../zh/guide/tiling-dump.md)
+- [AICPU Tensor arguments and profiling](../../zh/guide/aicpu-profiling.md)
+- [Hardware pipeline ablation](../../zh/api/diag/debug.md)
