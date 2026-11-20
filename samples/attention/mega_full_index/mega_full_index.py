@@ -9,7 +9,9 @@
 
 """第 20 层 Indexer 的公开接口、准备对象与单 kernel 融合启动。
 
-输入准备仅做校验、分配与零拷贝视图。公开入口默认combined PA cache，并保留分离K/scale模式，B1/S8、16 使用设备有效长度进行 KV128 调度，Metadata 仅占位。设备参数先排列 Tensor，再排列标量，公开接口顺序保持不变。"""
+输入准备仅做校验、分配与零拷贝视图。公开入口默认combined PA cache，并保留分离K/scale模式，
+B=1/2/3/4、每序列 S=6/8/16 使用设备有效长度进行 KV128 调度，Metadata 仅占位。
+设备参数先排列 Tensor，再排列标量，公开接口顺序保持不变。"""
 
 from __future__ import annotations
 
@@ -212,8 +214,8 @@ def _prepare_k(
     return (args, (total, h, d, dr), projected, partials)
 
 
-def _k_specs(storage_mode=1):
-    tk = Dim("TK", min=1)
+def _k_specs(storage_mode=1, total_rows=None):
+    tk = Dim("TK", min=1) if total_rows is None else total_rows
     blocks = Dim("CACHE_BLOCKS", min=1)
     s0 = Dim("CACHE_S0")
     cache_spec = (
@@ -264,9 +266,7 @@ def check_page_bounds(k_cache, block_table=None, cache_index=None):
     ``block_table`` 的页号必须位于 ``[0, P)``；``cache_index`` 的每个 slot
     必须为 ``-1``（跳过）或位于 ``[0, P*128)``，``P`` 为物理 cache 页数。
     """
-    pages = (
-        int(block_table.shape[1]) if block_table is not None else int(k_cache.shape[0])
-    )
+    pages = int(k_cache.shape[0])
     if block_table is not None and block_table.numel():
         page_ids = block_table.cpu()
         if int(page_ids.min()) < 0 or int(page_ids.max()) >= pages:
@@ -337,25 +337,26 @@ def prepare_mega_full_index(
     if storage_mode not in (0, 1):
         raise ValueError("storage_mode must be 0 or 1")
     prologue._validate_cache_layout(k_cache, k_scale_cache, storage_mode)
+    batch_count = 0 if cu_seqlens_q is None else cu_seqlens_q.numel() - 1
+    sequence_rows = qr.shape[0] // max(1, batch_count)
     fast_decode = (
-        qr.shape[0]
-        in (
-            6,
-            8,
-            16,
-        )
+        batch_count in (1, 2, 3, 4)
+        and qr.shape[0] == batch_count * sequence_rows
+        and sequence_rows in (6, 8, 16)
         and block_table is not None
         and ((k_cache.shape[1] * 8 if storage_mode == 1 else k_cache.shape[1]) == 128)
         and (cu_seqlens_q is not None)
-        and (cu_seqlens_q.numel() == 2)
+        and (cu_seqlens_q.numel() == batch_count + 1)
         and (seqused_q is not None)
-        and (seqused_q.numel() == 1)
+        and (seqused_q.numel() == batch_count)
         and (seqused_k is not None)
-        and (seqused_k.numel() == 1)
+        and (seqused_k.numel() == batch_count)
         and (cmp_residual_k is None)
     )
     if not fast_decode:
-        raise ValueError("Indexer currently requires B=1, S=6/8/16 and page_size=128")
+        raise ValueError(
+            "Indexer requires B=1/2/3/4, equal physical S=6/8/16 per sequence and page_size=128"
+        )
     qw_outputs, qw_args, plan, geo = _prepare_qw(
         x,
         qr,
@@ -448,7 +449,7 @@ def prepare_mega_full_index(
         return_value=return_value,
         candidate_topk_blocks=candidate_topk_blocks,
         candidate_block_size=candidate_block_size,
-        _decode_seq=qr.shape[0] if fast_decode else 0,
+        _decode_seq=sequence_rows if fast_decode else 0,
     )
     return PreparedFusion(
         qw_args,
@@ -537,6 +538,8 @@ class PreparedFusion:
     ):
         self.storage_mode = storage_mode
         self.fast_decode = fast_decode
+        self.batch_count = int(qli_stage.args[21])
+        self.sequence_rows = kgeo[0] // self.batch_count
         self.qw_args = qw_args
         self.k_args = k_args
         self.qli_stage = qli_stage
@@ -586,9 +589,10 @@ class PreparedFusion:
             self.storage_mode,
             self.plan.p.shape_key(),
             self.kgeo[1:],
-            self.kgeo[0] if self.fast_decode else 0,
+            self.sequence_rows if self.fast_decode else 0,
             self.qli_stage.config,
             self.qli_stage.args[22] > 16384,
+            self.batch_count,
         )
         compiled = _COMPILED.get(key)
         if compiled is None:
@@ -596,7 +600,7 @@ class PreparedFusion:
                 self.qli_stage.config,
                 self.plan,
                 self.geo,
-                self.kgeo,
+                (self.sequence_rows, *self.kgeo[1:]),
                 self.storage_mode,
             )
             compiled = _compile_stages(
@@ -608,9 +612,10 @@ class PreparedFusion:
                 self.geo,
                 self.kgeo[0] == 1,
                 self.qli_stage.config,
-                self.kgeo[0] if self.fast_decode else 0,
+                self.sequence_rows if self.fast_decode else 0,
                 self.qli_stage.args[22] > 16384,
                 self.storage_mode,
+                batch_count=self.batch_count,
             )
             _COMPILED[key] = compiled
         compiled(*args)
@@ -629,12 +634,17 @@ def _compile_stages(
     fast_seq=0,
     long_k=False,
     storage_mode=1,
+    batch_count=1,
 ):
     if fast_seq:
         qw_device = ParallelQw()
         k_projection = DecodeKProjection()
         qli_device, qli_specs = qli.build_runner(
-            qli_config, fast_seq, long_k, logical_cache=storage_mode == 1
+            qli_config,
+            fast_seq,
+            long_k,
+            logical_cache=storage_mode == 1,
+            batch_count=batch_count,
         )
 
     @prologue.jit
@@ -677,8 +687,8 @@ def _compile_stages(
                 onchip_rewind()
                 k_projection.kernel(klatent, kwk, kprojected, 16, task - 16)
 
-    @kernel
-    def mega_full_index(
+    @prologue.jit
+    def sequence_kernel(
         qwx: Tensor,
         qwqr: Tensor,
         qwwqb: Tensor,
@@ -876,6 +886,218 @@ def _compile_stages(
             lmergeaddr,
         )
 
+    @kernel
+    def mega_full_index(
+        qwx: Tensor,
+        qwqr: Tensor,
+        qwwqb: Tensor,
+        qwww: Tensor,
+        qwdqr: Tensor,
+        qwdwqb: Tensor,
+        qwrs: Tensor,
+        qwrc: Tensor,
+        qwq: Tensor,
+        qwdq: Tensor,
+        qww: Tensor,
+        qwws: Tensor,
+        klatent: Tensor,
+        kwk: Tensor,
+        knorm: Tensor,
+        krs: Tensor,
+        krc: Tensor,
+        kindex: Tensor,
+        kcache: Tensor,
+        ktokens: Tensor,
+        kprojected: Tensor,
+        lw: Tensor,
+        lqscale: Tensor,
+        lcu: Tensor,
+        lseqq: Tensor,
+        lseqk: Tensor,
+        lresidual: Tensor,
+        ltable: Tensor,
+        lkeyout: Tensor,
+        lcandidatekeyout: Tensor,
+        lcandlength: Tensor,
+        lmetadata: Tensor,
+        kpartials: Tensor,
+        qwt,
+        qwscale,
+        keps,
+        lquery,
+        lkey,
+        lkscale,
+        lkeystride,
+        lscalestride,
+        lpartialidx,
+        lpartialbits,
+        lpartialcandidx,
+        lpartialcandbits,
+        lworkers,
+        ltotalq,
+        lbatch,
+        ltokens,
+        lmaxqtask,
+        lkeyrows,
+        lscalerows,
+        ltaskcount,
+        lfinalidx,
+        lfinalbits,
+        lfinalcandidx,
+        lfinalcandbits,
+        lreturn,
+        lmerge,
+        loffset,
+        lmergeaddr,
+    ):
+        if const_expr(batch_count == 1):
+            sequence_kernel(
+                qwx,
+                qwqr,
+                qwwqb,
+                qwww,
+                qwdqr,
+                qwdwqb,
+                qwrs,
+                qwrc,
+                qwq,
+                qwdq,
+                qww,
+                qwws,
+                klatent,
+                kwk,
+                knorm,
+                krs,
+                krc,
+                kindex,
+                kcache,
+                ktokens,
+                kprojected,
+                lw,
+                lqscale,
+                lcu,
+                lseqq,
+                lseqk,
+                lresidual,
+                ltable,
+                lkeyout,
+                lcandidatekeyout,
+                lcandlength,
+                lmetadata,
+                kpartials,
+                qwt,
+                qwscale,
+                keps,
+                lquery,
+                lkey,
+                lkscale,
+                lkeystride,
+                lscalestride,
+                lpartialidx,
+                lpartialbits,
+                lpartialcandidx,
+                lpartialcandbits,
+                lworkers,
+                ltotalq,
+                lbatch,
+                ltokens,
+                lmaxqtask,
+                lkeyrows,
+                lscalerows,
+                ltaskcount,
+                lfinalidx,
+                lfinalbits,
+                lfinalcandidx,
+                lfinalcandbits,
+                lreturn,
+                lmerge,
+                loffset,
+                lmergeaddr,
+            )
+        else:
+            # Every Mix block visits sequences in the same order. Shared GM
+            # scratch is reused only after the preceding sequence completes.
+            # Tensor tiles and byte offsets select one independent TND sequence;
+            # all projection, quantization, score and TopK code stays in the
+            # original single-sequence JIT body above.
+            for batch in prologue.range_constexpr(batch_count):
+                batch_end = batch + 1
+                row = batch * fast_seq
+                sequence_offset = loffset
+                if loffset != 0:
+                    sequence_offset = loffset + row * 4
+                if const_expr(storage_mode == 1):
+                    sequence_tokens = prologue.tile_slice(
+                        ktokens, (fast_seq, 96), (batch, 0)
+                    )
+                else:
+                    sequence_tokens = ktokens
+                sequence_kernel(
+                    prologue.tile_slice(qwx, (fast_seq, 5120), (batch, 0)),
+                    prologue.tile_slice(qwqr, (fast_seq, 1280), (batch, 0)),
+                    qwwqb,
+                    qwww,
+                    prologue.tile_slice(qwdqr, (fast_seq, 20, 2), (batch, 0, 0)),
+                    qwdwqb,
+                    prologue.tile_slice(qwrs, (fast_seq, 64), (batch, 0)),
+                    prologue.tile_slice(qwrc, (fast_seq, 64), (batch, 0)),
+                    prologue.tile_slice(qwq, (fast_seq, 2048), (batch, 0)),
+                    prologue.tile_slice(qwdq, (fast_seq, 128), (batch, 0)),
+                    prologue.tile_slice(qww, (fast_seq, 32), (batch, 0)),
+                    qwws,
+                    prologue.tile_slice(klatent, (fast_seq, 512), (batch, 0)),
+                    kwk,
+                    knorm,
+                    prologue.tile_slice(krs, (fast_seq, 64), (batch, 0)),
+                    prologue.tile_slice(krc, (fast_seq, 64), (batch, 0)),
+                    prologue.tile_slice(kindex, (fast_seq,), (batch,)),
+                    kcache,
+                    sequence_tokens,
+                    prologue.tile_slice(kprojected, (fast_seq, 128), (batch, 0)),
+                    prologue.tile_slice(lw, (fast_seq, 32), (batch, 0)),
+                    prologue.tile_slice(lqscale, (fast_seq * 32, 2, 2), (batch, 0, 0)),
+                    lcu,
+                    prologue.tile_slice(lseqq, (1,), (batch,)),
+                    prologue.tile_slice(lseqk, (1,), (batch,)),
+                    lresidual,
+                    ltable[batch:batch_end, None],
+                    lkeyout,
+                    lcandidatekeyout,
+                    prologue.tile_slice(lcandlength, (fast_seq,), (batch,)),
+                    lmetadata,
+                    kpartials,
+                    fast_seq,
+                    qwscale,
+                    keps,
+                    lquery + row * 2048,
+                    lkey,
+                    lkscale,
+                    lkeystride,
+                    lscalestride,
+                    lpartialidx,
+                    lpartialbits,
+                    lpartialcandidx,
+                    lpartialcandbits,
+                    lworkers,
+                    fast_seq,
+                    1,
+                    ltokens,
+                    lmaxqtask,
+                    lkeyrows,
+                    lscalerows,
+                    ltaskcount,
+                    lfinalidx + row * 512 * 4,
+                    lfinalbits + row * 512 * 2,
+                    lfinalcandidx + row * 2048 * 4,
+                    lfinalcandbits + row * 2048 * 2,
+                    lreturn,
+                    lmerge,
+                    sequence_offset,
+                    lmergeaddr,
+                )
+                global_sync_all()
+                onchip_rewind()
+
     @host
     def launch(
         qwx: Tensor,
@@ -1005,8 +1227,12 @@ def _compile_stages(
         )
 
     specs = (
-        *prologue._arg_specs(geo, Dim("T1", min=1), Dim("QW_WS", min=1)),
-        *_k_specs(storage_mode),
+        *prologue._arg_specs(
+            geo,
+            batch_count * fast_seq if fast_seq else Dim("T1", min=1),
+            Dim("QW_WS", min=1),
+        ),
+        *_k_specs(storage_mode, batch_count * fast_seq if fast_seq else None),
         *qli_specs,
         TensorSpec((256, 32), dtypes.float32),
     )
@@ -1104,7 +1330,7 @@ def mega_full_index(
 
 @export("mega_full_index")
 def export_mega_full_index():
-    """Export S6/S8/S16 providers without creating tensors or running NPU work.
+    """Export B1/B2/B3/B4, S6/S8/S16 short-K providers without NPU work.
 
     Page count, page strides and effective KV length remain runtime axes.
     All providers use the same compile factory as PreparedFusion.run().
@@ -1123,17 +1349,19 @@ def export_mega_full_index():
                 plan = ParallelQw()
                 key_geometry = (seq, 512, 128, 64)
                 stages = _build(config, plan, geometry, key_geometry, storage_mode)
-                handles.append(
-                    _compile_stages(
-                        *stages,
-                        geometry,
-                        False,
-                        config,
-                        seq,
-                        False,
-                        storage_mode,
+                for batch_count in (1, 2, 3, 4):
+                    handles.append(
+                        _compile_stages(
+                            *stages,
+                            geometry,
+                            False,
+                            config,
+                            seq,
+                            False,
+                            storage_mode,
+                            batch_count=batch_count,
+                        )
                     )
-                )
     finally:
         for handle in handles:
             handle.close()

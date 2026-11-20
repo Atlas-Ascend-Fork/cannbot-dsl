@@ -20,7 +20,7 @@
 
 | 项目 | 约定 |
 | :--- | :--- |
-| Batch / 序列长度 | `B=1`，物理 query 行数 `T=S=6`、`8` 或 `16` |
+| Batch / 序列长度 | `B=1/2/3/4`，每序列物理行数 `S=6/8/16`，总行数 `T=B×S` |
 | 模型维度 | hidden size 为 5120，Q LoRA rank 为 1280，K latent 为 512 |
 | Indexer heads | 32 个 Q head，共享一个 K head，每个 head 为 128 维 |
 | RoPE | Q/K 最后 64 维，相邻偶奇维配对 |
@@ -30,9 +30,9 @@
 | 核数调度 | 运行时查询当前 stream 的 AIC/AIV 资源；已验证 28/32 AIC |
 | Metadata | 仅保留输入槽位，不读取内容，无需调用 QLI Metadata 算子 |
 
-`T` 表示输入的物理行数，`Qv=seqused_q[0]` 表示有效 query 数，
-`L=seqused_k[0]` 表示包含本块新 token 的有效 KV 长度。
-有效 query 位于前 `Qv` 行，其余行输出无效索引。`block_table` 的宽度决定逻辑容量，
+`T` 表示输入的物理行数，第 `b` 个序列的 `Qv=seqused_q[b]` 表示有效 query 数，
+`L=seqused_k[b]` 表示包含本块新 token 的有效 KV 长度。
+各序列按 batch 顺序连续拼接；第 `b` 个序列占 `[b*S,(b+1)*S)`，其中前 `Qv` 行有效，其余行输出无效索引。`block_table` 的宽度决定逻辑容量，
 有效长度不得超过该容量；物理 cache 页数可以与逻辑页数不同。
 
 ### 计算流程
@@ -75,7 +75,7 @@ product   = BF16(ReLU(dot[h, j]) * BF16(W[h]))
 score[j]  = BF16(score[j] + product)       # 按 head 0…31 顺序累加
 ```
 
-第 `i` 个有效 query 的可见 token 数为：
+每个序列内第 `i` 个有效 query（`i` 从 0 开始）的可见 token 数为：
 
 ```text
 visible(i) = clamp(L - Qv + i + 1, 0, L)
@@ -153,12 +153,12 @@ E8M0 以 UINT8 或等价 E8M0 字节载体传入。
 | 14 | `k_cache` | mode 1：`[P,16,544]`；mode 0：`[P,128,1,64]` | UINT8 / ND | 含历史 K，原地更新；`P` 为物理页数 |
 | 15 | `k_scale_cache` | mode 0：`[P,128,1,4]` | UINT8 / ND 或 `None` | mode 0 必须提供；mode 1 必须为 `None` |
 | 16 | `cache_index` | `[T]` | INT64 / ND | 物理 token slot；`-1` 跳过写入 |
-| 17 | `cu_seqlens_q` | `[2]` | INT32 / ND | 必须提供，B=1 时为 `[0,T]` |
+| 17 | `cu_seqlens_q` | `[B+1]` | INT32 / ND | 必须提供，内容为 `[0,S,2*S,...,B*S]` |
 | 18 | `cu_seqlens_k` | — | `None` | 当前 PA 场景传 `None` |
-| 19 | `seqused_q` | `[1]` | INT32 / ND | 必须提供，有效 query 数 `Qv` |
-| 20 | `seqused_k` | `[1]` | INT32 / ND | 必须提供，有效 KV 长度 `L` |
+| 19 | `seqused_q` | `[B]` | INT32 / ND | 必须提供，有效 query 数 `Qv` |
+| 20 | `seqused_k` | `[B]` | INT32 / ND | 必须提供，有效 KV 长度 `L` |
 | 21 | `cmp_residual_k` | — | `None` | 当前仅支持 ratio 1 |
-| 22 | `block_table` | `[1,max_pages]` | INT32 / ND | 必须提供，逻辑页到物理页的映射 |
+| 22 | `block_table` | `[B,max_pages]` | INT32 / ND | 必须提供，逻辑页到物理页的映射 |
 | 23 | `output_idx_offset` | `[T,1]` | INT32 / ND 或 `None` | 给有效 TopK token 索引加偏移；不改变 candidate 块号 |
 | 24 | `metadata` | `[1024]` | INT32 / ND 或 `None` | 连续占位 Tensor，不读取其内容 |
 
@@ -236,7 +236,7 @@ k_scale_cache[P,128,1,4]   # E8M0 scale
 
 ### 寻址与更新语义
 
-`block_table[0,logical_page]` 给出物理页号，活动页号须位于 `[0,P)`。
+`block_table[b,logical_page]` 给出物理页号，活动页号须位于 `[0,P)`。
 `cache_index` 使用物理 token slot，而不是逻辑 token 索引：
 
 ```text
@@ -260,7 +260,7 @@ data 偏移为 `r*64`，scale 偏移为 `512+r*4`。
 
 ## 快速开始
 
-依赖 CANNBotDSL 0.8、配套 PyTorch/torch_npu 和 CANN，环境配置见
+依赖 CANNBotDSL 0.8.3、配套 PyTorch/torch_npu 和 CANN，环境配置见
 [仓库 README](../../../README.md)。加载 CANN 环境后，从仓库根目录执行：
 
 ```bash
@@ -318,15 +318,16 @@ mode 0 调用时，先准备分离的 data/scale cache，再传 `storage_mode=0`
 [test_mega_full_index.py](../../../test/attention/mega_full_index/test_mega_full_index.py)，
 包含输入构造、独立 CPU golden、阶段调试、完整回归和 profiling 入口。
 
-CI 固定跑 9 条设备用例；判据自检（`pack_cache`/`unpack_cache` 字节契约、
+原有 9 条 B=1 设备用例继续保留；新增 24 条 batch 用例覆盖 B=2/3/4、S=6/8/16、两种 cache 模式和长 KV，另有 3 条非法 batch/metadata 拒绝检查与 1 条 Native 导出域检查。判据自检（`pack_cache`/`unpack_cache` 字节契约、
 E2M1 中点与负零、候选块选择参考、分块打分参考、公开签名、任务切分覆盖）
 由 session 级 fixture `reference_selfcheck` 跑一次，不占设备、不单独计入用例数。
 
 ### 执行命令
 
 ```bash
-# 9 条设备用例；核数自动获取。
-python -m pytest -q test/attention/mega_full_index/test_mega_full_index.py
+# B=1 与 B=2/3/4 回归；核数自动获取。
+python -m pytest -q test/attention/mega_full_index/test_mega_full_index.py \
+  test/attention/mega_full_index/test_mega_full_index_batch.py
 
 # 样例导入检查。
 python -c "from samples.attention.mega_full_index.mega_full_index import mega_full_index, prepare_mega_full_index"

@@ -4076,9 +4076,16 @@ class Kv128:
                 )
 
 
-def build_runner(config, seq, long_k=False, logical_cache=True):
+def build_runner(config, seq, long_k=False, logical_cache=True, batch_count=1):
     specs = _qli_specs(*config)
     specs = list(specs)
+    total_rows = batch_count * seq
+    specs[2] = TensorSpec((total_rows, 32), dtypes.float32)
+    specs[3] = TensorSpec((total_rows * 32, 2, 2), dtypes.float8_e8m0)
+    specs[7] = TensorSpec((batch_count + 1,), dtypes.int32)
+    specs[8] = TensorSpec((batch_count,), dtypes.int32)
+    specs[9] = TensorSpec((batch_count,), dtypes.int32)
+    specs[11] = TensorSpec((batch_count, Dim("MAX_BLOCKS")), dtypes.int32)
     specs[12] = TensorSpec((Dim("DECODE_WS_ROWS"), Dim("S2_PAD")), dtypes.uint16)
     specs[13] = TensorSpec((Dim("DECODE_WS_ROWS"), Dim("CANDIDATE_PAD")), dtypes.uint16)
     specs = tuple(specs)
