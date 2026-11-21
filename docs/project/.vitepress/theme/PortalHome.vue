@@ -10,6 +10,8 @@
 
 <script setup lang="ts">
 import { computed, ref } from 'vue'
+import { withBase } from 'vitepress'
+import { data as updates } from '../data/updates.data'
 
 const props = withDefaults(defineProps<{ lang?: 'zh' | 'en' }>(), { lang: 'zh' })
 
@@ -59,16 +61,9 @@ const zh = {
   releaseTitle: '框架 Release Notes',
   viewAll: '查看全部 →',
   releaseTag: '框架',
-  releases: [
-    { time: '0.8.3', date: '2026-11-12', title: '排序、归并与矩阵转置', desc: '扩展数据搬运能力，增强运行时诊断。', href: '/zh/release-notes/0.8.3' },
-    { time: '0.8.2', date: '2026-11-06', title: 'Tensor 视图与调试能力', desc: '完善搬运、设备函数导出和诊断路径。', href: '/zh/release-notes/0.8.2' },
-  ],
   operatorTitle: '算子与网络 Changelog',
   operatorTag: '算子',
-  operators: [
-    { time: '10.28', date: '2026-10-28', title: '矩阵乘 staging 接口迁移', desc: '统一 RingBuffer、copy_options 与尾块处理。' },
-    { time: '09.29', date: '2026-09-29', title: 'attn_prologue', desc: '迁入 MXFP8 attention prologue 与精度用例。' },
-  ],
+  noUpdates: '暂无更新',
 }
 
 const en = {
@@ -113,16 +108,9 @@ const en = {
   releaseTitle: 'Framework release notes',
   viewAll: 'View all →',
   releaseTag: 'Framework',
-  releases: [
-    { time: '0.8.3', date: '2026-11-12', title: 'Sorting, merge and matrix transpose', desc: 'Expands data movement and runtime diagnostics.', href: '/zh/release-notes/0.8.3' },
-    { time: '0.8.2', date: '2026-11-06', title: 'Tensor views and debugging', desc: 'Refines data movement, device-function export and diagnostics.', href: '/zh/release-notes/0.8.2' },
-  ],
   operatorTitle: 'Operator & network changelog',
   operatorTag: 'Operator',
-  operators: [
-    { time: '10.28', date: '2026-10-28', title: 'Matmul staging API migration', desc: 'Unifies RingBuffer, copy_options and tail-block handling.' },
-    { time: '09.29', date: '2026-09-29', title: 'attn_prologue', desc: 'Ports the MXFP8 attention prologue with precision cases.' },
-  ],
+  noUpdates: 'No updates yet',
 }
 
 const c = computed(() => (props.lang === 'en' ? en : zh))
@@ -289,24 +277,26 @@ async function copyCommand(id: string, command: string) {
           <article class="portal-update-list">
             <div class="portal-update-head">
               <h3>{{ c.releaseTitle }}</h3>
-              <a href="/zh/release-notes">{{ c.viewAll }}</a>
+              <a :href="withBase('/zh/release-notes.html')">{{ c.viewAll }}</a>
             </div>
-            <a v-for="r in c.releases" :key="r.time" class="portal-update-row" :href="r.href">
-              <time :datetime="r.date">{{ r.time }}</time>
+            <a v-for="r in updates.releases.slice(0, 2)" :key="r.version" class="portal-update-row" :href="withBase(r.href)">
+              <time :datetime="r.date">{{ r.version }}</time>
               <span><strong>{{ r.title }}</strong><small>{{ r.desc }}</small></span>
               <em>{{ c.releaseTag }}</em>
             </a>
+            <p v-if="!updates.releases.length" class="portal-update-empty">{{ c.noUpdates }}</p>
           </article>
           <article class="portal-update-list portal-update-operator">
             <div class="portal-update-head">
               <h3>{{ c.operatorTitle }}</h3>
               <a :href="changelogHref" target="_blank" rel="noopener">{{ c.viewAll }}</a>
             </div>
-            <a v-for="o in c.operators" :key="o.time" class="portal-update-row" :href="changelogHref" target="_blank" rel="noopener">
+            <a v-for="o in updates.operators.slice(0, 2)" :key="o.date" class="portal-update-row" :href="changelogHref" target="_blank" rel="noopener">
               <time :datetime="o.date">{{ o.time }}</time>
               <span><strong>{{ o.title }}</strong><small>{{ o.desc }}</small></span>
               <em>{{ c.operatorTag }}</em>
             </a>
+            <p v-if="!updates.operators.length" class="portal-update-empty">{{ c.noUpdates }}</p>
           </article>
         </div>
       </section>

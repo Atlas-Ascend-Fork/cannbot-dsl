@@ -1001,6 +1001,13 @@
   white-space: nowrap;
 }
 
+.portal-update-empty {
+  margin: 0;
+  padding: 18px 0;
+  color: var(--portal-muted-2);
+  font-size: 12px;
+}
+
 @media (max-width: 960px) {
   .portal-features {
     grid-template-columns: repeat(2, minmax(0, 1fr));
