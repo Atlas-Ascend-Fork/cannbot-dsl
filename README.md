@@ -39,7 +39,7 @@ CANNBot 是 [CANN](https://hiascend.com/software/cann) 社区的 Infra 智能体
 | 操作系统 | CANN 支持的 Linux 发行版，见[硬件兼容性查询](https://www.hiascend.com/hardware/compatibility) |
 | Python | 3.10、3.11、3.12、3.13 |
 | CANN | 9.2.1，见 [CANN 安装部署](https://www.hiascend.com/zh/cann/download?versionId=813&ids=d806%2Ch0501%2Ch0601%2Ch0703&currentTab=0) |
-| CANNBot-DSL | 0.8.2 |
+| CANNBot-DSL | 0.8.4 |
 | torch | 2.7.1 / 2.9.0 / 2.10.0 / 2.11.0 / 2.12.0 |
 
 > CANN 软件包请以 [CANN 安装部署](https://www.hiascend.com/zh/cann/download?versionId=813&ids=d806%2Ch0501%2Ch0601%2Ch0703&currentTab=0)页面提供的产品和架构匹配版本为准。
@@ -62,10 +62,10 @@ source ${install_path}/ascend-toolkit/set_env.sh
 
 ### 2. 安装 CANNBot-DSL
 
-CANNBot-DSL 0.8.2 已发布到 pip 源。发行包名为 `cannbot-dsl`，导入名为 `cannbotdsl`：
+CANNBot-DSL 0.8.4 已发布到 pip 源。发行包名为 `cannbot-dsl`，导入名为 `cannbotdsl`：
 
 ```bash
-python -m pip install cannbot-dsl==0.8.2
+python -m pip install cannbot-dsl==0.8.4
 ```
 
 

@@ -10,7 +10,7 @@
 | --- | --- |
 | 操作系统 | Linux，CPU架构为`x86_64`或`aarch64`。 |
 | Python | 3.10、3.11、3.12或3.13。 |
-| CANNBot-DSL | 0.8.2。 |
+| CANNBot-DSL | 0.8.4。 |
 | CANN | 9.2.1，安装与目标NPU匹配的Toolkit和算子包。 |
 | PyTorch、`torch_npu` | 选择与Python、CANN及目标NPU配套的版本。 |
 
@@ -35,7 +35,7 @@ npu-smi info
 安装配套的PyTorch和`torch_npu`后，使用同一个Python环境安装DSL和样例测试依赖：
 
 ```bash
-python -m pip install cannbot-dsl==0.8.2
+python -m pip install cannbot-dsl==0.8.4
 python -m pip install numpy ml_dtypes pytest pytest-xdist==3.8.0 PyYAML
 ```
 
@@ -46,7 +46,7 @@ python -c 'import cannbotdsl; print(cannbotdsl.__version__)'
 python -c 'import torch, torch_npu; print(torch.npu.is_available())'
 ```
 
-预期分别输出`0.8.2`和`True`。
+预期分别输出`0.8.4`和`True`。
 
 ## 获取源码
 

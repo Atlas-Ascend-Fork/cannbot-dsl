@@ -68,7 +68,7 @@ python3 scripts/ci/sync_catalog.py --check
 ```bash
 export PYTHON=/path/to/python3.12
 export CANN_ENV=/path/to/Ascend/ascend-toolkit/set_env.sh
-export CANNBOTDSL_WHEEL=/path/to/cannbot_dsl-0.8.2-cp312-cp312-manylinux_2_17_x86_64.whl
+export CANNBOTDSL_WHEEL=/path/to/cannbot_dsl-0.8.4-cp312-cp312-manylinux_2_17_x86_64.whl
 
 bash packaging/native/run-build.sh --list
 bash packaging/native/run-build.sh --group ds41
