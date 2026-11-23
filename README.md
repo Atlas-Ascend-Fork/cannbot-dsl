@@ -102,6 +102,7 @@ python -c 'import cannbotdsl; print(cannbotdsl.__version__)'
 | [matmul/transpose_batch_matmul](samples/matmul/transpose_batch_matmul) | `transpose_batch_mat_mul()` | 批矩阵乘 + 输出转置（permY=[1,0,2]，零拷贝落地），支持 ND/WeightNZ 权重、perm 交换、bsf>1 输出合并与 FP16/BF16/FP32/HF32 模式 |
 | [flash_attn](samples/attention/flash_attn) | `flash_attn()`、`flash_attn_metadata()` | Flash Attention，支持 GQA、变长序列和分页 KV cache |
 | [flash_attn_fp8_fullquant](samples/attention/flash_attn_fp8_fullquant) | `flash_attn_fp8_fullquant()` | FP8 全量化 Attention，支持 GQA、变长序列和分页 KV cache |
+| [flash_attn_hif8_fullquant](samples/attention/flash_attn_hif8_fullquant) | `npu_flash_atten_hif8_fullquant()` | HIF8 原生全量化 Attention，支持 GQA、变长序列、BNSD/BSND/TND、causal、Flash Decode 与可选 FP32 LSE |
 | [flash_mla_with_kvcache](samples/attention/flash_mla_with_kvcache) | `flash_mla_with_kvcache()`、`flash_mla_with_kvcache_metadata()` | Flash MLA 推理，Query 为 TND、KV 为分页 cache |
 | [qwen_sparse_attn](samples/attention/qwen_sparse_attn) | `qwen_sparse_attn()` | 固定 `block_size=128` 的分块稀疏注意力，含 AICPU metadata 规划 |
 | [quant_block_sparse_attn](samples/attention/quant_block_sparse_attn) | `quant_block_sparse_attn()`、`quant_block_sparse_attn_metadata()` | FP8 量化块稀疏注意力，面向分页 prefill |
