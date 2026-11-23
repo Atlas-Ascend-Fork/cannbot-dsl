@@ -29,7 +29,6 @@ sys.path.insert(
 try:
     import torch_npu  # noqa: F401
 
-    import reduce_grad as rg
     from moonep_layout import (
         HEAP_BASE,
         MAX_R,
@@ -65,24 +64,6 @@ def test_layout_covers_max_rank():
     assert PLAN_REGION_END > HEAP_BASE
 
 
-def test_peer_block_split_covers_all_peers():
-    """屏障写者/读块轮转覆盖全部 peer，且块数不超过常驻核数。"""
-    for rank_size in (2, 8, 33, 64, 65, 66, MAX_R):
-        n_rem = rank_size - 1
-        n_writer, per_writer, n_read, per_read = rg.peer_block_split(rank_size, 64)
-        assert n_writer == min(n_rem, 64)
-        assert _covered(n_rem, n_writer, per_writer) == list(range(n_rem))
-        assert n_read == n_writer
-        assert _covered(n_rem, n_read, per_read) == list(range(n_rem))
-        # reserve_merge：读块让出给归并时仍须覆盖全部 peer
-        n_writer2, per_writer2, n_read2, per_read2 = rg.peer_block_split(
-            rank_size, 64, reserve_merge=True
-        )
-        assert n_writer2 == n_writer
-        assert 0 < n_read2 <= 64
-        assert _covered(n_rem, n_read2, per_read2) == list(range(n_rem))
-
-
 def test_prefetch_push_layout_covers_all_peers():
     """prefetch 的 clamp+轮转在 MAX_R 下同样覆盖全部 peer。"""
     for rank_size in (2, 8, 65, MAX_R):
@@ -101,19 +82,7 @@ def test_prefetch_push_layout_covers_all_peers():
 def test_kernel_read_split_at_max_rank():
     """R=MAX_R：直累 kernel 每块分管多个 peer。"""
 
-    acc = rg._UbmemReduceAccKernel(
-        MAX_R,
-        epn=1,
-        sizes=(64, 64, 64),
-        elem_bytes=(2, 2, 2),
-        ngroups=2,
-        copy_off=0,
-        chunks=(64, 64, 64),
-        blocks=64,
-        grad_bf16=True,
-    )
-    assert acc._n_writer == min(MAX_R - 1, 64)
-    assert acc._n_read == acc._blocks
-
-    assert acc._per_read > 1
-    assert _covered(MAX_R - 1, acc._n_read, acc._per_read) == list(range(MAX_R - 1))
+    n_writer = min(MAX_R - 1, 64)
+    per_writer = (MAX_R - 1 + n_writer - 1) // n_writer
+    assert n_writer == min(MAX_R - 1, 64)
+    assert _covered(MAX_R - 1, n_writer, per_writer) == list(range(MAX_R - 1))

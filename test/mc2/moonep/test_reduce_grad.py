@@ -206,7 +206,7 @@ def test_r9_reduce_rotated_peer_blocks(moonep_groups, monkeypatch):
     rank, world = _init_group()
     import reduce_grad as rg_mod
 
-    monkeypatch.setattr(rg_mod, "capped_blocks", lambda ctx, cap: 2)
+    monkeypatch.setattr(rg_mod, "resident_blocks", lambda cap: 2)
     buf = _get_buffer(moonep_groups, "bf16")
     topk, tpe = _routing(19)
     plan = buf._plan(tpe, topk)

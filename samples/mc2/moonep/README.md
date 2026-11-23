@@ -29,8 +29,8 @@ MoonEP 是面向 EP（Expert Parallelism）的通信库：用动态冗余专家�
 
 ```python
 Buffer(
-    S, H, Hp, K, E, num_ep_ranks,
-    num_sms=None, token_padding=128, group=None,
+    S, H, Hp, K, E, num_ep_ranks, group,
+    num_sms=None, token_padding=128,
     *, weight_dtype="bf16", grad_dtype="bf16", slots=1,
 )
 ```
@@ -42,22 +42,23 @@ Buffer(
 | `Hp` | 输入 | 专家 FFN 中间维，权重行宽 `W = H × Hp` | int | ND |
 | `K` | 输入 | 每 token top-k | int | ND |
 | `E` | 输入 | EP 组专家总数 | int | ND |
-| `num_ep_ranks` | 输入 | EP 组 rank 数；None 取 `group` world size | int | ND |
-| `num_sms` | 可选输入 | MoonEP kernel 常驻块数上限；None 按硬件常驻核数 | int | ND |
+| `num_ep_ranks` | 输入 | 必选；EP 组 rank 数，取值 2–128，须等于 `group` 的 world size | int | ND |
+| `group` | 输入 | 必选；MoonEP 上下文与 ElasticBuffer 共用的通信组 | ProcessGroup | - |
+| `num_sms` | 可选输入 | 预留参数：MoonEP kernel 使用的 AIV 核数，取值 1–设备 AIV 核数；当前仅支持 `None` | int | ND |
 | `token_padding` | 可选输入 | 预留参数，当前不生效 | int | ND |
-| `group` | 可选输入 | MoonEP 上下文与 ElasticBuffer 共用的通信组 | ProcessGroup | - |
 | `weight_dtype` | 可选输入 | 权重数据类型定型值 | str 或 torch.dtype | ND |
 | `grad_dtype` | 可选输入 | 梯度数据类型定型值，缺省 `bf16` | str 或 torch.dtype | ND |
 | `slots` | 可选输入 | 权重窗口槽数，层间流水取 2 | int | ND |
 
-构造是集体调用：内含 workspace 注册、UbMem 建连与 ElasticBuffer 创建；全 EP rank 须以相同参数、相同顺序执行。
+构造是集体调用：内含 workspace 注册与 UbMem 建连；ElasticBuffer 在首次 `dispatch` / `combine` 时懒构造。全 EP rank 须以相同参数、相同顺序执行。
 
 接口约束：
 
 - `S >= 1`、`H >= 1`、`Hp >= 1` 且 `W` 为 64 的倍数；`K >= 1`。
-- `E <= 1024`、`E % R == 0`（R 为通信组 rank 数）；`num_ep_ranks` 显式给出时须等于组 world size。
-- `group` 仅接受 `ProcessGroup`，None 取 `dist.group.WORLD`。
-- `num_sms` 为正整数或 None，仅作用于 dispatch 内部的规划、prefetch_weight、reduce_grad。
+- `num_ep_ranks` 取值 2–128，且须等于 `group` 的 world size；`E <= 1024`、`E % R == 0`（R 即 `num_ep_ranks`）。
+- `group` 为必选参数，仅接受 `ProcessGroup`。
+- `num_sms` 为预留参数，当前仅支持 `None`（按设备全部 AIV 核运行）；传其他值会被拒绝。
+- `token_padding` 为预留参数，当前不生效。
 - `weight_dtype` 取 `bf16` / `fp16` / `e4m3fn` / `e5m2`；`grad_dtype` 取 `bf16` / `fp16` / `fp32`。
 - `slots >= 1`，全链一致。
 
@@ -94,6 +95,24 @@ grad_expert_output_nvsh, _, _, _ = dispatch(grad_output_sh, plan=plan)
 - `hidden_sh` 严格为 `(S, H)`；`route_weights_sk` / `topk_experts_sk` 严格为 `(S, K)`；张量须在 NPU 上。
 - 内部用 `plan.vtopk.view(S, K)` 作为 `topk_idx`、`num_experts = 2E`、每 rank 容量 `nmtr = S`。
 
+### MoonepPlan 结构
+
+`MoonepPlan` 是 `dispatch` 前向返回的规划句柄，实现为 `NamedTuple`：字段顺序固定，可按 5 元组解包，也可按属性访问。
+
+| 字段 | 形状 | 数据类型 | 说明 |
+| :--- | :--- | :--- | :--- |
+| `dst_n` | `(N,)` | INT32 | 零占位；vtopk-only 快路径不计算，恒为 0 |
+| `cu_seqlens` | `(2*epn,)` | INT32 | 各 rank 的分段偏移，GMM 按此切分专家段 |
+| `experts_to_copy` | `(R, epn)` | INT32 | 副本清单：第 `r` 行第 `s` 列是 rank `r` 第 `s` 个专家槽位的源 rank；`-1` 表示该槽位没有远程副本 |
+| `src_n` | `(N,)` | INT32 | 零占位，同 `dst_n` |
+| `vtopk` | `(N,)` | INT32 | 虚拟专家 id（扩展空间 `2E`），dispatch / combine 的路由依据 |
+
+其中 `N = S × K`、`epn = E / R`、`R = num_ep_ranks`。
+
+- `experts_to_copy` 同时是 `prefetch_weight` 与 `reduce_grad` 的输入；`vtopk.view(S, K)` 作为 `dispatch` 的 `topk_idx`。
+- 返回路径不做 host 同步：溢出与布局不变量延迟到下一个 MoonEP 算子尾部校验。
+- `plan` 可跨调用、跨前向/反向复用；同方向 `dispatch → combine` 之间不能再插一次同方向 `dispatch`。
+
 ### prefetch_weight
 
 ```python
@@ -104,38 +123,45 @@ prefetch_weight(
     local_gate_up_scales=None, async_finish=False, slot=0,
 )
 
-# 3 组
-gate_pb, up_pb, down_pb = prefetch_weight(
+# 3 组：返回值依次是权重视图元组与 scale 视图元组
+(gate_pb, up_pb, down_pb), (gate_sb, up_sb, down_sb) = prefetch_weight(
     plan=plan,
     local_gate_weight=w1, local_up_weight=w3, local_down_weight=w2,
+    local_gate_scales=s1, local_up_scales=s3, local_down_scales=s2,
 )
 # W13 交织
-gate_up_pb, down_pb = prefetch_weight(
+(gate_up_pb, down_pb), (gate_up_sb, down_sb) = prefetch_weight(
     plan=plan, local_gate_up_weight=w13, local_down_weight=w2,
+    local_gate_up_scales=s13, local_down_scales=s2,
 )
 ```
 
 | 参数名 | 输入/输出 | 描述 | 数据类型 | 数据格式 |
 | :--- | :--- | :--- | :--- | :--- |
 | `plan` | 输入 | dispatch 返回的 `MoonepPlan` | MoonepPlan | - |
-| `local_gate_weight` | 输入 | gate home 权重，shape `(epn, ...)` | 构造 `weight_dtype` | ND |
-| `local_up_weight` | 输入 | up home 权重，shape `(epn, ...)` | 构造 `weight_dtype` | ND |
-| `local_down_weight` | 输入 | down home 权重，shape `(epn, ...)`；W13 形态也必传 | 构造 `weight_dtype` | ND |
-| `local_gate_up_weight` | 可选输入 | W13 交融权重，每专家一行 2W | 构造 `weight_dtype` | ND |
-| `local_gate_scales` / `local_up_scales` / `local_down_scales` | 可选输入 | 3 组 mxfp8 scale，shape `(epn, Sg)` | FLOAT8_E8M0FNU | ND |
-| `local_gate_up_scales` / `local_down_scales` | 可选输入 | W13 2 组 scale | FLOAT8_E8M0FNU | ND |
+| `local_gate_weight` | 可选输入 | gate home 权重，shape `(epn, ...)`；3 组形态必传 | 构造 `weight_dtype` | ND |
+| `local_up_weight` | 可选输入 | up home 权重，shape `(epn, ...)`；3 组形态必传 | 构造 `weight_dtype` | ND |
+| `local_down_weight` | 输入 | down home 权重，shape `(epn, ...)`；3 组与 W13 形态都必传 | 构造 `weight_dtype` | ND |
+| `local_gate_up_weight` | 可选输入 | W13 交织权重，每专家一行 2W；与 gate/up 二选一 | 构造 `weight_dtype` | ND |
+| `local_gate_scales` | 可选输入 | gate 的 mxfp8 scale，shape `(epn, Sg)`；3 组形态使用 | FLOAT8_E8M0FNU | ND |
+| `local_up_scales` | 可选输入 | up 的 mxfp8 scale，shape `(epn, Sg)`；3 组形态使用 | FLOAT8_E8M0FNU | ND |
+| `local_down_scales` | 可选输入 | down 的 mxfp8 scale，shape `(epn, Sg)`；3 组与 W13 形态都使用 | FLOAT8_E8M0FNU | ND |
+| `local_gate_up_scales` | 可选输入 | W13 交织 scale，行宽覆盖 2W；仅 W13 形态使用 | FLOAT8_E8M0FNU | ND |
 | `async_finish` | 可选输入 | True 返回发起流事件 | BOOL | - |
 | `slot` | 可选输入 | 窗口槽位，`0 <= slot < slots` | int | - |
-| `gate_pb` / `up_pb` / `down_pb` | 输出 | 3 组权重视图，各组 `[2*epn, Wg]` | 同权重 | ND |
-| `gate_up_pb` / `down_pb` | 输出 | W13 形态二元组 | 同权重 | ND |
+| `gate_pb` | 输出 | gate 权重视图 `[2*epn, Wg]`；3 组形态返回 | 同权重 | ND |
+| `up_pb` | 输出 | up 权重视图 `[2*epn, Wg]`；3 组形态返回 | 同权重 | ND |
+| `down_pb` | 输出 | down 权重视图 `[2*epn, Wg]`；3 组与 W13 形态都返回 | 同权重 | ND |
+| `gate_up_pb` | 输出 | W13 交织权重视图，行宽为 2W；仅 W13 形态返回 | 同权重 | ND |
+| `scales` | 输出 | scale 视图元组，与权重逐组对应，行宽 `Sg`；未量化时为空元组 | FLOAT8_E8M0FNU | ND |
 
 接口约束：
 
 - 3 组（gate + up + down）与 W13（gate_up + down）二选一；W13 不接受 gate/up 独立参数。
 - 组数与各组行宽在首次调用后定型，后续必须一致；组间 dtype 一致且等于构造 `weight_dtype`。
 - mxfp8 双向契约：fp8 权重必须传 scales；传了 scales 权重就必须是 fp8；scale 类型固定 `float8_e8m0fnu`，行宽须为 32B 倍数。
-- `0 <= slot < slots`；总宽不超过构造期按 `3W` 预留的容量；空槽填 `-1`（bf16/fp16/fp32），fp8 视图保留 0。
-- scale 视图经 `scale_views(slot=0)` 读取；`async_finish=True` 时返回 `(buffers, event)`。
+- `0 <= slot < slots`；总宽不超过构造期按 `3W` 预留的容量；**空槽内容未定义**（等价 `torch.empty`，可能为零或上一轮残留值）——空槽在 `cu_seqlens` 中段长恒为 0，不参与计算。
+- 返回 `(views, scales)` 二元组：`views` 为权重视图元组（3 组或 2 组），`scales` 为逐组对应的 scale 视图元组，未量化时为空元组；`async_finish=True` 时返回 `((views, scales), event)`。
 
 ### combine
 
@@ -186,35 +212,44 @@ gate_up_rb, down_rb = reduce_grad(
 | 参数名 | 输入/输出 | 描述 | 数据类型 | 数据格式 |
 | :--- | :--- | :--- | :--- | :--- |
 | `plan` | 输入 | dispatch 返回的 `MoonepPlan` | MoonepPlan | - |
-| `local_gate_grad` / `local_up_grad` / `local_down_grad` | 输入 | 3 组 full-dW，每组 `(2*epn, Wg)` 或 `(2*epn, Hp, H)` | 构造 `grad_dtype` | ND |
-| `local_gate_up_grad` / `local_down_grad` | 输入 | W13 形态 2 组 full-dW | 构造 `grad_dtype` | ND |
+| `local_gate_grad` | 可选输入 | gate 的 full-dW，`(2*epn, Wg)` 或 `(2*epn, Hp, H)`；3 组形态必传 | 构造 `grad_dtype` | ND |
+| `local_up_grad` | 可选输入 | up 的 full-dW，`(2*epn, Wg)` 或 `(2*epn, Hp, H)`；3 组形态必传 | 构造 `grad_dtype` | ND |
+| `local_down_grad` | 输入 | down 的 full-dW，`(2*epn, Wg)` 或 `(2*epn, Hp, H)`；3 组与 W13 形态都必传 | 构造 `grad_dtype` | ND |
+| `local_gate_up_grad` | 可选输入 | W13 交织 full-dW，行宽为 2W；仅 W13 形态必传 | 构造 `grad_dtype` | ND |
 | `async_finish` | 可选输入 | True 返回发起流事件 | BOOL | - |
-| `gate_rb` / `up_rb` / `down_rb` | 输出 | 3 组归并结果，各组 `(epn, Wg)` | 同梯度 | ND |
-| `gate_up_rb` / `down_rb` | 输出 | W13 形态二元组 | 同梯度 | ND |
+| `gate_rb` | 输出 | gate 归并结果 `(epn, Wg)`；3 组形态返回 | 同梯度 | ND |
+| `up_rb` | 输出 | up 归并结果 `(epn, Wg)`；3 组形态返回 | 同梯度 | ND |
+| `down_rb` | 输出 | down 归并结果 `(epn, Wg)`；3 组与 W13 形态都返回 | 同梯度 | ND |
+| `gate_up_rb` | 输出 | W13 交织归并结果，行宽为 2W；仅 W13 形态返回 | 同梯度 | ND |
 
 接口约束：
 
-- `local_grads` 为 2 或 3 组 full-dW：前 `epn` 行 home 种子、后 `epn` 行副本 dW，行序与 `prefetch_weight` 视图一致。
+- 梯度为 2 或 3 组 full-dW：前 `epn` 行 home 种子、后 `epn` 行副本 dW，行序与 `prefetch_weight` 视图一致。
 - 组间 dtype 一致且等于构造期 `grad_dtype`；`Wg` 须为 64 的倍数。
 - 时序：晚于本层权重最后一次读、早于下一层 `prefetch_weight`；`async_finish=True` 时返回 `(buffers, event)`。
 
 ### 辅助接口
 
-| 接口 | 说明 |
-| :--- | :--- |
-| `scale_views(slot=0)` | 最近一次 prefetch 的 scale 视图元组；未量化时为空元组 |
-| `barrier()` | 组内屏障；返回即全组此前流上的工作都已完成 |
-| `destroy(*, release_group=False, release_eb=False)` | 幂等释放；缺省不销毁组/EB，WORLD 组始终不销毁，传 `True` 才显式回收非 WORLD 组/EB |
+- `barrier()`：组内屏障。返回时全组在此前流上发起的工作都已完成，用于阶段切换或调试。
+- `destroy(*, release_group=False, release_eb=False)`：幂等释放。缺省不销毁通信组与 ElasticBuffer，WORLD 组始终不销毁；传 `True` 才显式回收非 WORLD 组 / EB。
+- 查询属性：`rank`、`rank_size`、`epn`、`H`、`Hp`、`slots`、`weight_dtype`、`grad_dtype`、`layout_groups`、`heap_required_bytes`、`heap_bytes`、`destroyed`，以及预留参数当前值 `num_sms`、`token_padding`。
 
 ## 约束说明
 
 - **环境**：构造前完成 `dist.init_process_group(backend="hccl")`；一进程一卡并绑定 `torch.npu.set_device(local_rank)`；单机 ≥ 2 卡，8 卡为验收形态。
-- **通信域**：`group` 为单个 `ProcessGroup`，同时用于 MoonEP 上下文与 ElasticBuffer；None 取 WORLD。数据面不占通信域 HCCL 外部 buffer，`hccl_buffer_size` 由创建方自理。
-- **规模与形状**：`E <= 1024`、`R <= 128`、`E % R == 0`、`S >= 1`、`K >= 1`；各 rank 的 S 一致。
+- **通信域**：`group` 为必选参数，单个 `ProcessGroup`，同时用于 MoonEP 上下文与 ElasticBuffer。数据面不占通信域 HCCL 外部 buffer，`hccl_buffer_size` 由创建方自理。
+- **规模与形状**：`2 <= num_ep_ranks <= 128` 且等于通信组 world size；`E <= 1024`、`E % R == 0`、`S >= 1`、`K >= 1`；各 rank 的 S 一致。
 - **数据类型**：`tokens_per_expert` / `topk_experts_sk` / `experts_to_copy` 为 int32；权重支持 bf16 / fp16 / e4m3 / e5m2，组间一致；梯度支持 bf16 / fp16 / fp32 且等于构造定型值。
 - **分组与行宽**：权重/梯度支持 3 组（常见等宽 `(W, W, W)`）或 W13 2 组（`(2W, W)`），总宽上限 `3W`（`W = H × Hp`）；`W` 须为 64 的倍数。
-- **槽位**：`slots >= 1`，全链一致；`token_padding` 当前仅保留参数，不生效。
+- **槽位**：`slots >= 1`，全链一致；`num_sms`、`token_padding` 为预留参数，当前分别只接受 `None` 与缺省值。
 - **生命周期**：视图和 `plan` 返回的张量须在 `destroy()` 前用完；`destroy` 可重复调用。
+
+### 环境变量
+
+| 变量 | 取值 | 默认值 | 说明 |
+| :--- | :--- | :--- | :--- |
+| `MOONEP_PUSH_BLOCKS` | 正整数，且不超过设备可同时常驻 AIV block 数 | `64` | 限制 `prefetch_weight` push kernel 的并发 block 上限；进入编译键，全 EP rank 须使用相同值。 |
+| `MOONEP_ACC_DEPTH` | `2`–`16` | R≤8 为 `4`，R>8 为 `3` | 指定 `reduce_grad` 读流水环深；同时决定 UB chunk 上限并进入编译键，全 EP rank 须使用相同值。 |
 
 ## 调用说明
 
@@ -246,7 +281,8 @@ buf = Buffer(
 hidden_nvsh, route_weights_nvs, cu_seqlens, plan = buf.dispatch(
     hidden_sh, route_weights_sk, topk_experts_sk, tokens_per_expert,
 )
-gate_pb, up_pb, down_pb = buf.prefetch_weight(
+# 未量化时第二个返回值是空元组
+(gate_pb, up_pb, down_pb), _ = buf.prefetch_weight(
     plan=plan,
     local_gate_weight=w1, local_up_weight=w3, local_down_weight=w2,
 )
@@ -277,8 +313,7 @@ from reduce_grad import reduce_grad
 ctx = create_moonep_context(
     group=dist.group.WORLD,
     workspace_bytes=_workspace_need(
-        dist.get_world_size(), E // dist.get_world_size(), W, 1,
-        torch.bfloat16, torch.bfloat16,
+        E // dist.get_world_size(), W, 1, torch.bfloat16, torch.bfloat16
     ),
 )
 topk = topk_idx.to(torch.int32).npu()

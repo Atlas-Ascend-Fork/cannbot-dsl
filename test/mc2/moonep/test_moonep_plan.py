@@ -248,7 +248,7 @@ def test_moonep_plan_blocks_lt_ranks(monkeypatch):
         pytest.skip("需 >=4 卡构造 B<R")
     import moonep_plan as plan_mod
 
-    monkeypatch.setattr(plan_mod, "capped_blocks", lambda ctx, cap: 2)
+    monkeypatch.setattr(plan_mod, "resident_blocks", lambda cap: 2)
     num_tokens, top_k, epn = 64, 4, 4
     shape = RouteShape(world_size, num_tokens, top_k, epn * world_size)
     topk_all, _, _ = _make_case(shape, "balanced", 7)

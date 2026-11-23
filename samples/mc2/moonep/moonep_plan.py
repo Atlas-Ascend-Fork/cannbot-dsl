@@ -17,19 +17,21 @@
 
 约束：E <= 1024、R <= MAX_R（128）、E % R == 0；N = S*K 任意规模。
 
-实现为单 kernel 三阶段，阶段间 global_sync_all 栅栏，块角色由 block_idx 决定：
+按 rank 规模选择 launch 形态，块角色由 block_idx 决定：
 
-    阶段 0  交换计数 → 计数 → cap 均衡贪心 + 冷/热专家 vid
-    阶段 1  副本清单（Tables）与段查找表（Pfx）
-    阶段 2  token 落位（冷专家 vgather；热专家按段二分定位）
+    小 EP 组：preparation 与 token 落位分两个 launch
+    大 EP 组：以下四个阶段分 launch，隔离 R16 运行期资源生命周期
+    阶段 0  交换计数
+    阶段 1  token 落位（冷专家 vgather；热专家按段二分定位）
+    阶段 2  副本清单（Tables）与段查找表（Pfx）
+    阶段 3  cap 均衡贪心 + 冷/热专家 vid
 """
 
 import threading
 from typing import NamedTuple
 
-import torch
-
 import cannbotdsl
+import torch
 from cannbotdsl import TensorSpec, dtypes
 from cannbotdsl.buffer import Buffer
 from cannbotdsl.lang.constexpr import const_expr, range_constexpr
@@ -49,36 +51,33 @@ from cannbotdsl.ops.reg import (
     veqs,
     vgather,
     vhistogram_frequency,
-    vlts,
     vload,
     vload_deinterleave,
-    vunpack,
+    vlts,
     vreinterpret,
     vsqueeze_and_storeunalign,
     vsqueeze_and_storeunalign_finalize,
     vsqueeze_and_storeunalign_init,
     vstore,
-    vstore_unalign_begin,
     vstorealign_squeeze_status,
+    vunpack,
 )
 from cannbotdsl.ops.sync import global_sync_all, vec_sync_all
 from cannbotdsl.tensor import MemLoc, make_layout, make_pointer, make_tensor, tile_slice
 from cannbotdsl.types.datastruct import StructRef
-
 from moonep_context import (
     DEM_ALL_OFF,
     HEAP_BASE,
     MAX_E,
     MAX_R,
-    next_barrier_epoch,
-    capped_blocks,
     check_pending_overflow,
+    next_barrier_epoch,
     record_transport_event,
     resident_blocks,
     sync_transport_stream,
 )
+from moonep_layout import NOTIFY_STRIDE
 from moonep_comm import (
-    NOTIFY_STRIDE,
     MoonepCommCtx,
     make_xfer_rb,
     spin_u32_ge,
@@ -88,11 +87,19 @@ from moonep_comm import (
     xfer_open,
 )
 
+try:
+    from cannbotdsl.ops.reg import vstore_unalign_begin
+except ImportError:
+    vstore_unalign_begin = None
+
+
+_HAS_LEGACY_SQUEEZE_STORE = vstore_unalign_begin is not None
+
 # ---------------------------------------------------------------------------
 # 常量
 # ---------------------------------------------------------------------------
 _MAX_PLAN_BLOCKS = 64  # 单次启动 block 上限，实际取 min(AIV 核数, cap)
-# 编译期烘焙的块数上限（_get_plan_program 锁内按 num_sms 覆写）
+# 编译期烘焙的块数上限（_get_plan_program 锁内按实际机型核数覆写）
 _PLAN_BLOCK_LIMIT = _MAX_PLAN_BLOCKS
 _CHUNK_MIN = 128  # chunk 下限（token/块），再小则每块 O(E) 重建占比过高
 _VF_SAFE_CHUNK = 1024  # chunk 上限（vf 栈安全——见 _plan_chunking docstring）
@@ -150,10 +157,9 @@ _RANK_SIZE = 1  # 组内 R（编译锁内写入，参与编译缓存键）
 # ---------------------------------------------------------------------------
 @kernel
 class _PlanKernel:
-    """plan 单 kernel：跨卡交换 → 贪心均衡 → 表生成 → token 落位。
+    """plan kernel：跨卡交换 → 贪心均衡 → 表生成 → token 落位.
 
-    单 launch 多阶段融合；阶段间 global_sync_all() 做 grid 级屏障，块角色由
-    block_idx 决定。阶段划分见模块 docstring。
+    每 launch 处理一个阶段；需要全阶段会合时使用 global_sync_all()。
     """
 
     def __init__(
@@ -164,8 +170,10 @@ class _PlanKernel:
         num_chunks,
         token_blocks,
         pfx_blocks,
+        phase,
     ):
         """绑定编译期形状参数。"""
+        self._phase = int(phase)
         self._rank_size = int(rank_size)
         self._num_experts = int(num_experts)
         self._epn = self._num_experts // self._rank_size
@@ -183,7 +191,7 @@ class _PlanKernel:
         gm_io,
         ctx: StructRef[MoonepCommCtx],
     ):
-        """按 block 角色分派三个阶段。"""
+        """按 launch phase 分派交换、规划、表生成与落位。"""
         rank_size, num_experts = self._rank_size, self._num_experts
         epn = self._epn
         views = _bind_plan_views(gm_ws, rank_size, num_experts, self._num_chunks)
@@ -199,27 +207,43 @@ class _PlanKernel:
             MemLoc.UB, dtypes.int32, make_layout((rank_size, num_experts))
         )
 
-        if block_id < dtypes.int64(rank_size):
+        if const_expr(self._phase == 0 or self._phase == 3) and block_id < dtypes.int64(
+            rank_size
+        ):
             self._exchange_put_peer(ctx, gm_tpe, gm_flag, block_id)
-        if block_id == dtypes.int64(0):
+        if const_expr(self._phase == 0 or self._phase == 3) and block_id == (
+            dtypes.int64(0)
+        ):
             self._exchange(ctx, gm_tpe, gm_flag, views.dem, ub_demand)
-        if block_id < dtypes.int64(self._token_blocks):
+        if const_expr(self._phase == 0 or self._phase == 3) and block_id < dtypes.int64(
+            self._token_blocks
+        ):
             self._count(block_id, gm_topk, views.counts)
-        if block_id == dtypes.int64(0):
+
+        if const_expr(self._phase == 4) and block_id == dtypes.int64(0):
+            self._exchange(ctx, gm_tpe, gm_flag, views.dem, ub_demand)
+        if const_expr(self._phase == 0 or self._phase == 4) and block_id == (
+            dtypes.int64(0)
+        ):
             self._greedy_all(ctx, ub_demand, views, gm_cu)
 
-        global_sync_all()
+        if const_expr(self._phase == 0):
+            global_sync_all()
 
         # ---- 阶段 1：Tables / Pfx（只依赖阶段 0 的 order/counts） ----
         num_blocks = get_block_num()
-        self._tables_loop(block_id, num_blocks, views, gm_copy_list)
-        if block_id < dtypes.int64(self._pfx_blocks):
+        if const_expr(self._phase == 0 or self._phase == 2):
+            self._tables_loop(block_id, num_blocks, views, gm_copy_list)
+        if const_expr(self._phase == 0 or self._phase == 2) and block_id < dtypes.int64(
+            self._pfx_blocks
+        ):
             self._pfx(ctx, block_id, views)
 
-        global_sync_all()
+        if const_expr(self._phase == 0 or self._phase == 2):
+            global_sync_all()
 
         # ---- 阶段 2：token 落位 ----
-        if block_id < dtypes.int64(self._token_blocks):
+        if const_expr(self._phase == 1) and block_id < dtypes.int64(self._token_blocks):
             self._assign(block_id, gm_topk, gm_vtopk, views)
 
     # ---- 阶段 0：Exchange（单 block 通信） ----
@@ -261,7 +285,6 @@ class _PlanKernel:
         """块并行发射 tpe 行 + 哨兵：按实际块数跨步覆盖全部 peer（B<R 安全）。"""
         world_size, num_experts = self._rank_size, self._num_experts
         my_rank_u64 = dtypes.uint64(ctx.rankId)
-        epoch = dtypes.uint32(gm_flag[dtypes.int64(0)])
         xfer_rb = make_xfer_rb()
         tpe_addr = tensor_address(gm_tpe)
         num_blocks = get_block_num()
@@ -287,7 +310,6 @@ class _PlanKernel:
                 ub_flag_write(
                     peerh,
                     my_rank_u64 * dtypes.uint64(NOTIFY_STRIDE),
-                    epoch,
                     tensor_address(gm_flag),
                 )
 
@@ -484,8 +506,8 @@ class _PlanKernel:
                         ub_loads, world_size, lane, True
                     )
                     if max_load > cap:
-                        dst_r, min_load = self._warp_extreme_idx(
-                            ub_loads, world_size, lane, False
+                        dst_r, min_load = self._warp_min_source_idx(
+                            ub_loads, ub_rhome, src_r, world_size, lane
                         )
                         moved = self._greedy_round_warp(
                             ub_rem,
@@ -549,6 +571,31 @@ class _PlanKernel:
             if better:
                 best = round_best
                 idx = round_idx
+        return idx, best
+
+    @jit
+    def _warp_min_source_idx(self, ub_loads, ub_rhome, src_r, world_size, lane):
+        """Find the least-loaded destination compatible with its source rank."""
+        best = dtypes.int32(_GREEDY_POS_INF)
+        idx = dtypes.int32(-1)
+        for j in range_constexpr((world_size + _WARP_SIZE - 1) // _WARP_SIZE):
+            k = lane + j * _WARP_SIZE
+            value = dtypes.int32(_GREEDY_POS_INF)
+            if k < world_size:
+                source = ub_rhome[dtypes.int64(k)]
+                if source < dtypes.int32(0) or source == src_r:
+                    value = ub_loads[dtypes.int64(k)]
+            round_best = simt.reduce_min(value)
+            candidate = dtypes.int32(world_size)
+            if k < world_size and value == round_best:
+                candidate = k
+            round_idx = simt.reduce_min(candidate)
+            if round_best < best:
+                best = round_best
+                idx = round_idx
+        if best == dtypes.int32(_GREEDY_POS_INF):
+            idx = src_r
+            best = ub_loads[dtypes.int64(src_r)]
         return idx, best
 
     @jit
@@ -831,15 +878,27 @@ class _PlanKernel:
         if const_expr(vec_end > 0):
             with vf(mode="simd"):
                 mask = full_mask(32)  # int32 全 lane
-                cursor = vstore_unalign_begin(ub_hot_idx)
-                for off in range_constexpr(0, vec_end, _I32_LANES):
-                    indices = vreinterpret(vload(ub_topk, off), dtypes.uint32)
-                    values = vgather(ub_vid_chunk, indices, mask=mask)
-                    vstore(ub_vtopk, off, values, mask)
-                    hot = vlts(values, 0, mask=mask)
-                    positions = varange(off, dtypes.int32)
-                    squeezed = vsqueeze_and_storeunalign_init(positions, mask=hot)
-                    vsqueeze_and_storeunalign(ub_hot_idx, 0, squeezed, cursor)
+                if const_expr(_HAS_LEGACY_SQUEEZE_STORE):
+                    cursor = vstore_unalign_begin(ub_hot_idx)
+                    for off in range_constexpr(0, vec_end, _I32_LANES):
+                        indices = vreinterpret(vload(ub_topk, off), dtypes.uint32)
+                        values = vgather(ub_vid_chunk, indices, mask=mask)
+                        vstore(ub_vtopk, off, values, mask)
+                        hot = vlts(values, 0, mask=mask)
+                        positions = varange(off, dtypes.int32)
+                        squeezed = vsqueeze_and_storeunalign_init(positions, mask=hot)
+                        vsqueeze_and_storeunalign(ub_hot_idx, 0, squeezed, cursor)
+                else:
+                    cursor = vsqueeze_and_storeunalign_init(ub_hot_idx)
+                    for off in range_constexpr(0, vec_end, _I32_LANES):
+                        indices = vreinterpret(vload(ub_topk, off), dtypes.uint32)
+                        values = vgather(ub_vid_chunk, indices, mask=mask)
+                        vstore(ub_vtopk, off, values, mask)
+                        hot = vlts(values, 0, mask=mask)
+                        positions = varange(off, dtypes.int32)
+                        vsqueeze_and_storeunalign(
+                            ub_hot_idx, 0, positions, cursor, mask=hot
+                        )
                 vsqueeze_and_storeunalign_finalize(ub_hot_idx, 0, cursor)
                 vstorealign_squeeze_status(ub_num_hot, 0)
             vec_sync_all()
@@ -963,11 +1022,95 @@ def _moonep_plan_host(
     gm_io,
     ctx: StructRef[MoonepCommCtx],
 ):
-    """单 launch 发射：三个阶段一次提交。"""
+    """Launch plan phases according to the expert-parallel group size."""
     num_experts = gm_tpe.shape[0]
     world_size = _RANK_SIZE  # trace 期烘焙；rank 运行时由 ctx.rankId 取
     num_rows = gm_topk.shape[0]  # 本 rank topk 扁平视图，直接作 Cnt/Asg 输入
     blocks = _plan_blocks(num_rows, num_experts, _PLAN_BLOCK_LIMIT)
+    split_preparation = world_size >= 16
+    if not split_preparation:
+        _PlanKernel(
+            world_size,
+            num_experts,
+            num_rows,
+            blocks.num_chunks,
+            blocks.token_blocks,
+            blocks.pfx_blocks,
+            0,
+        )[
+            min(
+                max(blocks.token_blocks, blocks.pfx_blocks),
+                _PLAN_BLOCK_LIMIT,
+            )
+        ](
+            gm_tpe,
+            gm_flag,
+            gm_ws,
+            gm_topk,
+            gm_io,
+            ctx,
+        )
+    if split_preparation:
+        _PlanKernel(
+            world_size,
+            num_experts,
+            num_rows,
+            blocks.num_chunks,
+            blocks.token_blocks,
+            blocks.pfx_blocks,
+            3,
+        )[
+            min(
+                max(blocks.token_blocks, blocks.pfx_blocks),
+                _PLAN_BLOCK_LIMIT,
+            )
+        ](
+            gm_tpe,
+            gm_flag,
+            gm_ws,
+            gm_topk,
+            gm_io,
+            ctx,
+        )
+    if split_preparation:
+        _PlanKernel(
+            world_size,
+            num_experts,
+            num_rows,
+            blocks.num_chunks,
+            blocks.token_blocks,
+            blocks.pfx_blocks,
+            4,
+        )[1](
+            gm_tpe,
+            gm_flag,
+            gm_ws,
+            gm_topk,
+            gm_io,
+            ctx,
+        )
+    if split_preparation:
+        _PlanKernel(
+            world_size,
+            num_experts,
+            num_rows,
+            blocks.num_chunks,
+            blocks.token_blocks,
+            blocks.pfx_blocks,
+            2,
+        )[
+            min(
+                max(blocks.token_blocks, blocks.pfx_blocks),
+                _PLAN_BLOCK_LIMIT,
+            )
+        ](
+            gm_tpe,
+            gm_flag,
+            gm_ws,
+            gm_topk,
+            gm_io,
+            ctx,
+        )
     _PlanKernel(
         world_size,
         num_experts,
@@ -975,19 +1118,8 @@ def _moonep_plan_host(
         blocks.num_chunks,
         blocks.token_blocks,
         blocks.pfx_blocks,
-    )[
-        min(
-            max(blocks.token_blocks, blocks.pfx_blocks),
-            _PLAN_BLOCK_LIMIT,
-        )
-    ](
-        gm_tpe,
-        gm_flag,
-        gm_ws,
-        gm_topk,
-        gm_io,
-        ctx,
-    )
+        1,
+    )[blocks.token_blocks](gm_tpe, gm_flag, gm_ws, gm_topk, gm_io, ctx)
 
 
 _PLAN_PROGRAMS = {}
@@ -1096,7 +1228,13 @@ def _zero_placeholder(num_rows):
     return t
 
 
-def _get_plan_program(num_tokens, top_k, num_experts, world_size, block_limit=None):
+def _get_plan_program(
+    num_tokens,
+    top_k,
+    num_experts,
+    world_size,
+    block_limit=None,
+):
     """按 (S,K,E,R,块数) 键控的编译产物缓存。"""
     limit = (
         resident_blocks(_MAX_PLAN_BLOCKS) if block_limit is None else int(block_limit)
@@ -1195,7 +1333,7 @@ def moonep_plan(context, tokens_per_expert, topk_experts_sk):
     epn = num_experts // world_size
     num_rows = num_tokens * top_k  # 任意 N 原生整除（分块降档，无尾补机制）
     dims = _PlanDims(num_tokens, top_k, num_experts, world_size)
-    block_limit = capped_blocks(context, _MAX_PLAN_BLOCKS)
+    block_limit = resident_blocks(_MAX_PLAN_BLOCKS)
 
     dst_n = _zero_placeholder(num_rows)
     # 三份输出共享一次分配；kernel 全量覆写，empty 即可
@@ -1244,6 +1382,7 @@ def moonep_plan(context, tokens_per_expert, topk_experts_sk):
     check_pending_overflow(context)
     context.pending_overflow = (cu_seqlens, num_rows)
     context.last_plan_shape = (num_tokens, top_k)  # 供 prefetch/reduce 的调用顺序守卫
+    context.reduce_copy_plan_token += 1
     return MoonepPlan(dst_n, cu_seqlens, experts_to_copy, src_n, vtopk)
 
 

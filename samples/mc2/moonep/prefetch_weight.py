@@ -17,6 +17,7 @@
 """
 
 import threading
+import os
 from typing import NamedTuple
 
 import cannbotdsl
@@ -54,22 +55,20 @@ from moonep_context import (
     group_slot_rows,
     next_barrier_epoch,
     prefetch_weight_off,
-    capped_blocks,
     reduce_stg_off,
     resident_blocks,
     slot_stride_bytes,
     sync_transport_stream,
     workspace_base,
 )
-from moonep_layout import PREFETCH_SLICE_FLAGS_OFF
+from moonep_layout import NOTIFY_STRIDE, PREFETCH_SLICE_FLAGS_OFF
 from moonep_comm import (
-    NOTIFY_STRIDE,
     MoonepCommCtx,
     _gm_view,
     make_xfer_rb,
     spin_u32_ge,
     tensor_address,
-    ub_flag_write,
+    ub_flag_write_snapshot,
     ub_write,
     xfer_open,
 )
@@ -86,11 +85,22 @@ _MAX_PUSH_BLOCKS = 64
 # 行分片上限：与 reduce 的 MOONEP_ACC_SPLIT 同构——每 peer 最多 8 个 block
 # 并发驱动其链路（跨 supernode 链路单核仅 ~26 GB/s，需多核聚合）。
 _PUSH_SPLIT = 8
+
+
+def _push_block_limit():
+    """Resolve the opt-in push block ceiling for concurrent workloads."""
+    configured = int(os.environ.get("MOONEP_PUSH_BLOCKS", _MAX_PUSH_BLOCKS))
+    if configured < 1:
+        raise ValueError("MOONEP_PUSH_BLOCKS must be >= 1")
+    return min(resident_blocks(_MAX_PUSH_BLOCKS), configured)
+
+
 # UbMem 深环承载在飞量，prefetch 侧 UB 占用小。
 _PREFETCH_XFER_DEPTH = 6
 _MAX_PUSH_PROGRAMS = 64
 _PUSH_EVENT_ID = 4
 _SCAN_EVENT_ID = 5
+_SNAP_EVENT_ID = 6  # epoch 快照 MTE2→S（旗语会合单读）
 _MAX_WEIGHT_GROUPS = 3  # 权重组槽上限（2 组时第 3 槽不参与推送）
 _MAX_SCALE_GROUPS = 3  # scale 组槽上限（fp8 形态每组权重配一个 scale 组）
 _MAX_GROUPS = _MAX_WEIGHT_GROUPS + _MAX_SCALE_GROUPS  # kernel 入口固定 6 张量槽
@@ -123,21 +133,13 @@ def _push_layout(rank_size, block_limit=None):
     n_rem = max(rank_size - 1, 0)
     if n_rem <= 0:
         return 1, 1, 1
-    resident = (
-        resident_blocks(_MAX_PUSH_BLOCKS) if block_limit is None else int(block_limit)
-    )
+    resident = _push_block_limit() if block_limit is None else int(block_limit)
     want = min(n_rem * _PUSH_SPLIT, resident)
     if want >= n_rem:
         nblk = (want // n_rem) * n_rem
         return nblk, 1, nblk // n_rem
     nblk = max(want, 1)
     return nblk, (n_rem + nblk - 1) // nblk, 1
-
-
-def _slice_flag_off(p_comp, k, n_slices):
-    """本 rank 本地 (peer 紧凑号, slice) 完成标志的 workspace 偏移。"""
-    idx = dtypes.uint64(p_comp) * dtypes.uint64(int(n_slices)) + dtypes.uint64(k)
-    return dtypes.uint64(PREFETCH_SLICE_FLAGS_OFF) + idx * dtypes.uint64(4)
 
 
 # ---------------------------------------------------------------------------
@@ -180,7 +182,8 @@ class _MoonepPrefetchPushKernel:
         self._ngroups = int(ngroups)
         # 逐组一行字节数
         self._row_bytes = tuple(s * b for s, b in zip(self._sizes, self._elem_bytes))
-        actual = self._row_bytes[: self._ngroups]
+        ngroups = self._ngroups
+        actual = self._row_bytes[:ngroups]
         self._group_rows, self._slot_rows = group_slot_rows(self._epn, actual)
         self._nblk = int(nblk)
         self._per_block = int(per_block)
@@ -206,7 +209,6 @@ class _MoonepPrefetchPushKernel:
         my_rank = dtypes.int64(ctx.rankId)
         my_rank_i32 = dtypes.int32(ctx.rankId)
         my_rank_u64 = dtypes.uint64(ctx.rankId)
-        epoch = dtypes.uint32(gm_epoch[dtypes.int64(0)])
         xfer_rb = make_xfer_rb(_PREFETCH_XFER_DEPTH)
         epoch_addr = tensor_address(gm_epoch)
         push_base = dtypes.uint64(HEAP_BASE + prefetch_weight_off())
@@ -226,7 +228,6 @@ class _MoonepPrefetchPushKernel:
                 my_rank,
                 my_rank_i32,
                 my_rank_u64,
-                epoch,
                 epoch_addr,
                 push_base,
                 reals,
@@ -247,7 +248,6 @@ class _MoonepPrefetchPushKernel:
                         my_rank,
                         my_rank_i32,
                         my_rank_u64,
-                        epoch,
                         epoch_addr,
                         push_base,
                         reals,
@@ -267,7 +267,6 @@ class _MoonepPrefetchPushKernel:
         my_rank,
         my_rank_i32,
         my_rank_u64,
-        epoch,
         epoch_addr,
         push_base,
         reals,
@@ -287,6 +286,14 @@ class _MoonepPrefetchPushKernel:
         peer = peer_id if peer_id < my_rank else peer_id + dtypes.int64(1)
         # peer 索引按排序非自身 rank 紧凑编号（peer_id 本身即紧凑序号）
         peerh = xfer_open(ctx, dtypes.uint32(dtypes.uint64(peer_id)))
+        # epoch 单读快照：自旋阈值、本地分片完成标志与远端 flag 写值
+        # 必须来自同一代。epoch 输入可能跨流异步更新；同一 kernel 内
+        # 分开读 GM 会在读写时点漂移时得到不同代。
+        ub_epoch = Buffer(MemLoc.UB, dtypes.uint32, make_layout((1,)))
+        mem_copy(ub_epoch, _gm_view(epoch_addr, 1, dtypes.uint32))
+        vec_sync_notify(PIPE.MTE2, PIPE.S, _SNAP_EVENT_ID)
+        vec_sync_wait(PIPE.MTE2, PIPE.S, _SNAP_EVENT_ID)
+        epoch = dtypes.uint32(ub_epoch[dtypes.int64(0)])
         self._scan_peer(gm_etc, peer, ub_etc, ub_row, my_rank_i32)
 
         # 逐行直推，每行 ngroups 笔（分片模式以 slice_id 起步、n_slices 步进）
@@ -318,19 +325,27 @@ class _MoonepPrefetchPushKernel:
         if const_expr(self._n_slices > 1):
             # 每个分片完成后写本地 (peer, slice) 标志（MTE3 同 pipe，数据
             # 先于标志）；slice-0 汇总本 peer 全部分片后再发远端 flag。
-            self._put_slice_flag(ctx, peer_id, slice_id, epoch_addr)
+            slice_idx = dtypes.uint64(peer_id) * dtypes.uint64(
+                int(self._n_slices)
+            ) + dtypes.uint64(slice_id)
+            slice_flag_addr = dtypes.uint64(ctx.localWsAddr) + (
+                dtypes.uint64(PREFETCH_SLICE_FLAGS_OFF) + slice_idx * dtypes.uint64(4)
+            )
+            mem_copy(_gm_view(slice_flag_addr, 1, dtypes.uint32), ub_epoch)
             if slice_id == dtypes.int64(0):
                 for k in range_constexpr(self._n_slices):
+                    k_idx = dtypes.uint64(peer_id) * dtypes.uint64(
+                        int(self._n_slices)
+                    ) + dtypes.uint64(k)
                     spin_u32_ge(
                         ctx,
-                        _slice_flag_off(peer_id, k, self._n_slices),
+                        PREFETCH_SLICE_FLAGS_OFF + k_idx * dtypes.uint64(4),
                         epoch,
                     )
-                ub_flag_write(
+                ub_flag_write_snapshot(
                     peerh,
                     my_rank_u64 * dtypes.uint64(NOTIFY_STRIDE),
-                    epoch,
-                    epoch_addr,
+                    ub_epoch,
                 )
                 spin_u32_ge(
                     ctx,
@@ -338,13 +353,12 @@ class _MoonepPrefetchPushKernel:
                     epoch,
                 )
         else:
-            # 尾部 flag 与数据同通道保序（ub_flag_write 首尾 fence——
+            # 尾部 flag 与数据同通道保序（快照写首尾 fence——
             # MTE3 同 pipe：flag 落地即此前全部行已到对端）
-            ub_flag_write(
+            ub_flag_write_snapshot(
                 peerh,
                 my_rank_u64 * dtypes.uint64(NOTIFY_STRIDE),
-                epoch,
-                epoch_addr,
+                ub_epoch,
             )
             # 等对端收到本轮 flag
             spin_u32_ge(
@@ -352,16 +366,6 @@ class _MoonepPrefetchPushKernel:
                 dtypes.uint64(peer) * dtypes.uint64(NOTIFY_STRIDE),
                 epoch,
             )
-
-    @jit
-    def _put_slice_flag(self, ctx, p_comp, slice_id, epoch_addr):
-        """本 rank 本地写 (peer, slice) 完成标志（值=本轮 epoch）。"""
-        ub_epoch = Buffer(MemLoc.UB, dtypes.uint32, make_layout((1,)))
-        mem_copy(ub_epoch, _gm_view(epoch_addr, 1, dtypes.uint32))
-        addr = dtypes.uint64(ctx.localWsAddr) + _slice_flag_off(
-            p_comp, slice_id, self._n_slices
-        )
-        mem_copy(_gm_view(addr, 1, dtypes.uint32), ub_epoch)
 
     @jit
     def _scan_peer(self, gm_etc, peer, ub_etc, ub_row, my_rank_i32):
@@ -622,10 +626,9 @@ def _create_weight_views(context, epn, sizes, scale_sizes, *, slot=0, slots=1, d
         )
         addr += ROWS_PER_EXPERT * epn * w * weight_bytes
     views = tuple(views)
-    # 空槽保持 -1；fp8 视图不填（保留 0 初始化语义）。
-    if dtype in (torch.bfloat16, torch.float16, torch.float32):
-        for v in views:
-            v[epn:].fill_(-1)
+    # 副本段不做本地初始化（等价 torch.empty）：空槽内容未定义，且空槽在
+    # cu_seqlens 中段长为 0、不参与计算。此处不得整段 fill——本地填充会与
+    # 对端推送到本槽的副本行竞态（晚到会把已推来的行抹掉）。
     context.weight_views[key] = views
     return views
 
@@ -669,7 +672,7 @@ def _create_scale_views(
     return views
 
 
-def _sync_transport(context, local_weights, views, epn):
+def _sync_transport(local_weights, views, epn):
     """把每组前 epn 行写入视图 home 段；同址时跳过。"""
     for real_w, view_w in zip(local_weights, views):
         if real_w.data_ptr() == view_w[:epn].data_ptr():
@@ -868,9 +871,9 @@ def prefetch_weight(
         else ()
     )
     sync_transport_stream(context)
-    _sync_transport(context, flats, views, epn)
+    _sync_transport(flats, views, epn)
     if scale_flats:
-        _sync_transport(context, scale_flats, scale_views, epn)
+        _sync_transport(scale_flats, scale_views, epn)
     # 真实组在前、pad 槽在后；kernel 只按字节搬运。
     n_w = len(flats)
     n_s = len(scale_flats)
@@ -897,7 +900,7 @@ def prefetch_weight(
         weight_bytes,
         _window_bytes(context, epn, sizes, scale_sizes, weight_bytes),
         context.rank_size,
-        capped_blocks(context, _MAX_PUSH_BLOCKS),
+        _push_block_limit(),
     )(
         *reals6,
         experts_to_copy,

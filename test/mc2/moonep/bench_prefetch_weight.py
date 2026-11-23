@@ -137,7 +137,7 @@ def main():
 
     ctx = create_moonep_context(
         workspace_bytes=_workspace_need(
-            world, args.epn, args.w_elems, 1, torch.bfloat16, torch.bfloat16
+            args.epn, args.w_elems, 1, torch.bfloat16, torch.bfloat16
         )
     )
     ctx.last_plan_shape = (32, 8)  # 绕开 plan 的调用顺序守卫

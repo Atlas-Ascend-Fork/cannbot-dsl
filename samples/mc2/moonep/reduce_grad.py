@@ -62,7 +62,6 @@ from cannbotdsl.ops.reg import (
 )
 from cannbotdsl.tensor import MemLoc, make_layout, make_pointer, make_tensor, tile_slice
 from cannbotdsl.types.datastruct import StructRef
-
 from moonep_context import (
     BAR_FLAGS_OFF,
     HEAP_BASE,
@@ -73,7 +72,7 @@ from moonep_context import (
     next_barrier_epoch,
     normalize_group_list,
     pick_weight_chunk,
-    capped_blocks,
+    resident_blocks,
     sync_transport_stream,
 )
 from moonep_context import sym_barrier
@@ -88,43 +87,35 @@ from moonep_comm import (
 
 # _VL：fp32 归并步进（vf 寄存器 256B//4 = 64）。
 _VL = 64
-_MERGE_FENCE_ID = 6  # etc 扫描 MTE2→S 栅栏事件（kernel 内独立无冲突）
-
 _MAX_GRAD_GROUPS = 3  # 梯度组槽上限（kernel 入口固定 3 张量槽，ngroups 裁剪）
-
-_R = 1  # 组内 rank_size（编译锁内写入，进 program 键）
-_BLOCKS = 28  # 实际启动块数（编译锁内写入，进 program 键）
-_REDUCE_LOCK = threading.Lock()
 
 # merge UB 预算：ub_row（grad dtype chunk）+ ub_acc（fp32 chunk）≤ ~96KB
 _CHUNK_UB_LIMIT_BF16 = 16384
 _CHUNK_UB_LIMIT_FP32 = 8192
 _HEADER_BARRIER_CAP = 64  # 头部屏障/读块上限（950PR vector_core_num 满额）
+_UB_BYTES = 253952
+_MAX_ACC_DEPTH = 16
 
 
-def peer_block_split(rank_size, blocks, reserve_merge=False):
-    """头部屏障写者块与读块的划分（R 与 AIV 核数解耦）。
+def _acc_depth(rank_size):
+    """Pipeline depth for a rank group, with an optional environment override."""
+    default_depth = 4 if int(rank_size) <= 8 else 3
+    depth = int(os.environ.get("MOONEP_ACC_DEPTH", str(default_depth)))
+    if not 2 <= depth <= _MAX_ACC_DEPTH:
+        raise ValueError(f"MOONEP_ACC_DEPTH={depth} must be in [2, {_MAX_ACC_DEPTH}]")
+    return depth
 
-    ``blocks`` 由 host clamp 到常驻核数（resident_blocks）——所有块都在首波，
-    屏障写者不会再被分波调度推到第二波。写者块按 ``rank_size-1`` 轮转分摊
-    peer（``reserve_merge=True`` 供归并同拍形态让出读块——当前直累路径
-    不用，保留给组合形态）。
-    返回 ``(n_writer, per_writer, n_read, per_read)``。
-    """
-    n_rem = max(int(rank_size) - 1, 0)
-    n_writer = min(n_rem, int(blocks))
-    per_writer = (n_rem + n_writer - 1) // n_writer if n_writer else 0
-    n_read = n_writer
-    if reserve_merge and n_writer >= int(blocks):
-        n_read = max(1, int(blocks) // 2)
-    per_read = (n_rem + n_read - 1) // n_read if n_read else 0
-    return n_writer, per_writer, n_read, per_read
+
+def _acc_chunk_limit(depth, grad_16bit):
+    """Largest power-of-two chunk fitting the depth-aware UB budget."""
+    bytes_per_element = 2 * depth + 8 if grad_16bit else 4 * (depth + 1)
+    power = 1 << ((_UB_BYTES // bytes_per_element).bit_length() - 1)
+    base_limit = _CHUNK_UB_LIMIT_BF16 if grad_16bit else _CHUNK_UB_LIMIT_FP32
+    return min(base_limit, power)
 
 
 @jit
-def _barrier_flags_put(
-    ctx, blk, my_rank_u64, n_peer, n_writer, per_writer, gm_epoch, epoch
-):
+def _barrier_flags_put(ctx, blk, my_rank_u64, n_peer, n_writer, per_writer, gm_epoch):
     """头部屏障写者块：把 my flag 写到本块分管的全部 peer（轮转分配）。
 
     先写完分管 peer 再进自旋（调用方在循环外等全部 peer）——写者块全在
@@ -140,7 +131,6 @@ def _barrier_flags_put(
                 peerh,
                 dtypes.uint64(HEAP_BASE + BAR_FLAGS_OFF)
                 + my_rank_u64 * dtypes.uint64(4),
-                epoch,
                 tensor_address(gm_epoch),
             )
 
@@ -248,9 +238,6 @@ class _UbmemReduceAccKernel:
         self._copy_off = int(copy_off)
         self._row_bytes = tuple(s * b for s, b in zip(self._sizes, self._elem_bytes))
         self._chunks = tuple(int(c) for c in chunks)
-        self._n_tiles = tuple(
-            self._epn * (self._sizes[g] // self._chunks[g]) for g in range(3)
-        )
         self._blocks = int(blocks)
         self._depth = int(depth)
         # 读块布局（确定性归并——行单写者分区）：块 b 归并行
@@ -307,6 +294,10 @@ class _UbmemReduceAccKernel:
             # fp32：seed 入/结果出都直通 acc（MTE2/MTE3），无 16 位转换
             ub_seed = ub_acc
             ub_out = ub_acc
+        ub_peer_compact = Buffer(
+            MemLoc.UB, dtypes.int32, make_layout((self._rank_size,))
+        )
+        ub_peer_j = Buffer(MemLoc.UB, dtypes.int32, make_layout((self._rank_size,)))
         blk = dtypes.int64(get_block_idx())
         if blk < dtypes.int64(self._n_read):
             # —— ① 头部屏障写者：my flag 写到本块分管的全部 peer
@@ -320,24 +311,39 @@ class _UbmemReduceAccKernel:
                     self._n_writer,
                     self._per_writer,
                     gm_epoch,
-                    epoch,
                 )
             connection = connection_from_address(dtypes.uint64(ctx.connection))
             inv_base = tensor_address(gm_etc_inv)
             # —— 确定性归并：行单写者 + 固定 peer 升序 + UB fp32 累加 +
             #     单次写（逐位可重复）——
-            self._det_merge(
-                connection,
-                reals,
-                ctx,
-                my_rank,
-                epoch,
-                inv_base,
-                ub_pipe,
-                ub_acc,
-                ub_seed,
-                ub_out,
-            )
+            if const_expr(self._rank_size <= 8):
+                self._det_merge_compact(
+                    connection,
+                    reals,
+                    ctx,
+                    my_rank,
+                    epoch,
+                    inv_base,
+                    ub_pipe,
+                    ub_acc,
+                    ub_seed,
+                    ub_out,
+                    ub_peer_compact,
+                    ub_peer_j,
+                )
+            else:
+                self._det_merge_dense(
+                    connection,
+                    reals,
+                    ctx,
+                    my_rank,
+                    epoch,
+                    inv_base,
+                    ub_pipe,
+                    ub_acc,
+                    ub_seed,
+                    ub_out,
+                )
 
     @jit
     def _det_read_j(self, inv_base, i, p_actual, rank_size):
@@ -355,6 +361,34 @@ class _UbmemReduceAccKernel:
             make_layout((1,)),
         )
         return dtypes.int64(cbd.scalar.load_bypass(j_t.ptr(0)))
+
+    @jit
+    def _det_build_peer_row(
+        self,
+        inv_base,
+        i,
+        my_rank,
+        rank_size,
+        ub_peer_compact,
+        ub_peer_j,
+    ):
+        """Compact this row's contributing peers while preserving rank order."""
+        count = dtypes.int32(0)
+        for p_actual in cannbotdsl.range(
+            dtypes.int64(0), dtypes.int64(rank_size), dtypes.int64(1)
+        ):
+            if p_actual != my_rank:
+                j = self._det_read_j(inv_base, i, p_actual, rank_size)
+                if j >= dtypes.int64(0):
+                    if p_actual < my_rank:
+                        ub_peer_compact[dtypes.int64(count)] = dtypes.int32(p_actual)
+                    else:
+                        ub_peer_compact[dtypes.int64(count)] = dtypes.int32(
+                            p_actual - dtypes.int64(1)
+                        )
+                    ub_peer_j[dtypes.int64(count)] = dtypes.int32(j)
+                    count = count + dtypes.int32(1)
+        return count
 
     @jit
     def _det_wait_peer_flags(self, ctx, my_rank, epoch):
@@ -402,17 +436,14 @@ class _UbmemReduceAccKernel:
                     )
 
     @jit
-    def _det_consume(self, t, i, g, my_rank, rank_size, inv_base, ub_pipe, ub_acc):
+    def _det_consume(self, t, g, ub_peer_j, ub_pipe, ub_acc):
         """滞后窗消费侧：peer tc = t-depth 的贡献入 fp32 累加器
         （先消费后发射——环在飞数恒 ≤ depth）。"""
         depth = int(self._depth)
         chunk = int(self._chunks[g])
         tc = t - dtypes.int64(depth)
         if tc >= dtypes.int64(0):
-            pa_c = tc
-            if pa_c >= my_rank:
-                pa_c = pa_c + dtypes.int64(1)
-            j_c = self._det_read_j(inv_base, i, pa_c, rank_size)
+            j_c = dtypes.int64(ub_peer_j[tc])
             if j_c >= dtypes.int64(0):
                 slot = ub_pipe.next_read()
                 # vf: acc += slot（fp32 直加；16 位 unpack+cast 后加）
@@ -441,18 +472,26 @@ class _UbmemReduceAccKernel:
                             )
 
     @jit
-    def _det_issue(self, connection, inv_base, i, t, c, g, my_rank, rank_size, ub_pipe):
+    def _det_issue(
+        self,
+        connection,
+        i,
+        t,
+        c,
+        g,
+        n_valid,
+        ub_peer_compact,
+        ub_peer_j,
+        ub_pipe,
+    ):
         """滞后窗发射侧：peer t 的副本 chunk 映射远读入环下一槽。
 
         get_peer 取 compact 序号（连接表 0..R-2）；etc_inv 列取 actual
         rank（pa_i）——两者域不同，混用则 get_peer 越界 → mapped 野值 →
         远读地址无效（MTE 507035）。
         """
-        if t < dtypes.int64(rank_size - 1):
-            pa_i = t
-            if pa_i >= my_rank:
-                pa_i = pa_i + dtypes.int64(1)
-            j_i = self._det_read_j(inv_base, i, pa_i, rank_size)
+        if t < n_valid:
+            j_i = dtypes.int64(ub_peer_j[t])
             if j_i >= dtypes.int64(0):
                 chunk = int(self._chunks[g])
                 elem = 2 if (self._grad_bf16 or self._grad_fp16) else 4
@@ -462,7 +501,8 @@ class _UbmemReduceAccKernel:
                     else (dtypes.bfloat16 if self._grad_bf16 else dtypes.float32)
                 )
                 slot_w = ub_pipe.next_write()
-                peer = connection.get_peer(dtypes.uint32(dtypes.uint64(t)))
+                peer_compact = dtypes.int64(ub_peer_compact[t])
+                peer = connection.get_peer(dtypes.uint32(dtypes.uint64(peer_compact)))
                 mapped = dtypes.uint64(peer.get_mapped_addr(0))
                 j64 = dtypes.int64(j_i)
                 row_base = dtypes.uint64(
@@ -512,7 +552,182 @@ class _UbmemReduceAccKernel:
             mem_copy(home_tile, tile_slice(ub_out, (chunk,), (0,)))
 
     @jit
-    def _det_merge(
+    def _det_merge_compact(
+        self,
+        connection,
+        reals,
+        ctx,
+        my_rank,
+        epoch,
+        inv_base,
+        ub_pipe,
+        ub_acc,
+        ub_seed,
+        ub_out,
+        ub_peer_compact,
+        ub_peer_j,
+    ):
+        """确定性归并主循环：行单写者 + 固定 peer 升序 + 单次写。
+
+        块 b 归并行 {b, b+blocks, ...}（同行恰一块——单写者，无原子）。
+        每 (行, 组, chunk) tile：seed（home chunk，本地快读）入 fp32
+        累加器 → peer 升序流水累加（读块内环深滞后窗，MTE2 读 ∥ vf 加）→
+        单次写回 home chunk（一次 dtype 舍入）。
+
+        逐元素加法序列恒为 seed、peer 升序贡献、终轮一次舍入——与 host
+        参照（fp32 串行累加后一次 cast）逐位一致，跨 run 逐位可重复。
+
+        每行先压缩有效 peer 升序列表；tile 内 t 遍历
+        [0, n_valid+depth)。该列表保持实际 rank 升序，因此逐元素加法顺序
+        与全 peer 扫描完全一致。
+        """
+        rank_size = int(self._rank_size)
+        epn_rt = dtypes.int64(self._epn)
+        blocks_rt = dtypes.int64(self._blocks)
+        # ① 等全部 peer 的入槽 flag
+        self._det_wait_peer_flags(ctx, my_rank, epoch)
+        # ② 行单写者分区：i = blk, blk+blocks, ...
+        blk = dtypes.int64(get_block_idx())
+        for i in cannbotdsl.range(blk, epn_rt, blocks_rt):
+            n_valid = self._det_build_peer_row(
+                inv_base,
+                i,
+                my_rank,
+                rank_size,
+                ub_peer_compact,
+                ub_peer_j,
+            )
+            if n_valid > dtypes.int32(0):
+                for g in range_constexpr(_MAX_GRAD_GROUPS):
+                    if g < int(self._ngroups):
+                        chunk = int(self._chunks[g])
+                        n_c = int(self._sizes[g]) // chunk
+                        for c in cannbotdsl.range(
+                            dtypes.int64(0), dtypes.int64(n_c), dtypes.int64(1)
+                        ):
+                            # —— tile (i, g, c)：seed → peer 升序流水 → 单次写 ——
+                            tile_idx = i * dtypes.int64(n_c) + c
+                            self._det_seed_acc(reals, g, tile_idx, ub_acc, ub_seed)
+                            # —— peer 升序 issue/consume（滞后窗 depth；先消费
+                            #    后发射——环在飞数恒 ≤ depth）——
+                            n_iter = dtypes.int64(n_valid) + dtypes.int64(
+                                int(self._depth)
+                            )
+                            for t in cannbotdsl.range(
+                                dtypes.int64(0), n_iter, dtypes.int64(1)
+                            ):
+                                self._det_consume(
+                                    t,
+                                    g,
+                                    ub_peer_j,
+                                    ub_pipe,
+                                    ub_acc,
+                                )
+                                self._det_issue(
+                                    connection,
+                                    i,
+                                    t,
+                                    c,
+                                    g,
+                                    n_valid,
+                                    ub_peer_compact,
+                                    ub_peer_j,
+                                    ub_pipe,
+                                )
+                            # —— 单次写回（终轮一次舍入）——
+                            self._det_writeback(reals, g, tile_idx, ub_acc, ub_out)
+
+    @jit
+    def _det_row_has_remote(self, inv_base, i, my_rank, rank_size):
+        """Return 1 when any peer contributes to local home row ``i``."""
+        found = dtypes.int32(0)
+        for p_actual in cannbotdsl.range(
+            dtypes.int64(0), dtypes.int64(rank_size), dtypes.int64(1)
+        ):
+            if p_actual != my_rank:
+                j = self._det_read_j(inv_base, i, p_actual, rank_size)
+                if j >= dtypes.int64(0):
+                    found = dtypes.int32(1)
+        return found
+
+    @jit
+    def _det_consume_dense(
+        self, t, i, g, my_rank, rank_size, inv_base, ub_pipe, ub_acc
+    ):
+        """Consume one dense peer slot after the pipeline depth."""
+        depth = int(self._depth)
+        chunk = int(self._chunks[g])
+        tc = t - dtypes.int64(depth)
+        if tc >= dtypes.int64(0):
+            pa_c = tc
+            if pa_c >= my_rank:
+                pa_c = pa_c + dtypes.int64(1)
+            j_c = self._det_read_j(inv_base, i, pa_c, rank_size)
+            if j_c >= dtypes.int64(0):
+                slot = ub_pipe.next_read()
+                with vf(mode="simd"):
+                    full = full_mask()
+                    if const_expr(not (self._grad_bf16 or self._grad_fp16)):
+                        for off in range_constexpr(0, chunk, _VL):
+                            acc_v = vadd(
+                                vload(ub_acc, off), vload(slot, off), mask=full
+                            )
+                            vstore(ub_acc, off, acc_v, full)
+                    else:
+                        for off in range_constexpr(0, chunk, _VL):
+                            contrib = vcast(
+                                vload_unpack(
+                                    slot, off, unpack_mode=UnpackMode.B16_TO_B32
+                                ),
+                                dtypes.float32,
+                                mask=full,
+                            )
+                            vstore(
+                                ub_acc,
+                                off,
+                                vadd(vload(ub_acc, off), contrib, mask=full),
+                                full,
+                            )
+
+    @jit
+    def _det_issue_dense(
+        self, connection, inv_base, i, t, c, g, my_rank, rank_size, ub_pipe
+    ):
+        """Issue one dense peer slot into the read pipeline."""
+        if t < dtypes.int64(rank_size - 1):
+            pa_i = t
+            if pa_i >= my_rank:
+                pa_i = pa_i + dtypes.int64(1)
+            j_i = self._det_read_j(inv_base, i, pa_i, rank_size)
+            if j_i >= dtypes.int64(0):
+                chunk = int(self._chunks[g])
+                elem = 2 if (self._grad_bf16 or self._grad_fp16) else 4
+                grad_dt = (
+                    dtypes.float16
+                    if self._grad_fp16
+                    else (dtypes.bfloat16 if self._grad_bf16 else dtypes.float32)
+                )
+                slot_w = ub_pipe.next_write()
+                peer = connection.get_peer(dtypes.uint32(dtypes.uint64(t)))
+                mapped = dtypes.uint64(peer.get_mapped_addr(0))
+                j64 = dtypes.int64(j_i)
+                row_base = dtypes.uint64(
+                    HEAP_BASE + int(self._group_off[g]) + j64 * int(self._row_bytes[g])
+                )
+                remote_src = make_tensor(
+                    make_pointer(
+                        grad_dt,
+                        dtypes.int64(
+                            mapped + row_base + dtypes.uint64(c * chunk * elem)
+                        ),
+                        MemLoc.GM,
+                    ),
+                    make_layout((chunk,)),
+                )
+                mem_copy(tile_slice(slot_w, (chunk,), (0,)), remote_src)
+
+    @jit
+    def _det_merge_dense(
         self,
         connection,
         reals,
@@ -525,67 +740,52 @@ class _UbmemReduceAccKernel:
         ub_seed,
         ub_out,
     ):
-        """确定性归并主循环：行单写者 + 固定 peer 升序 + 单次写。
-
-        块 b 归并行 {b, b+blocks, ...}（同行恰一块——单写者，无原子）。
-        每 (行, 组, chunk) tile：seed（home chunk，本地快读）入 fp32
-        累加器 → peer 升序流水累加（读块内环深滞后窗，MTE2 读 ∥ vf 加）→
-        单次写回 home chunk（一次 dtype 舍入）。
-
-        逐元素加法序列恒为 seed、peer 升序贡献、终轮一次舍入——与 host
-        参照（fp32 串行累加后一次 cast）逐位一致，跨 run 逐位可重复。
-
-        peer 发射/消费用统一滞后窗（consume(t-depth) ∥ issue(t)）：t 遍历
-        [0, n_rem+depth)，消费侧 peer = t-depth、发射侧 peer = t，各自独立
-        查 etc_inv 有效性——无需"下一个有效 peer"前瞻扫描；窗内在飞读数
-        恒 ≤ depth（环槽不覆写未消费数据）。
-
-        j 值直接 GM 标量 load_bypass 读（UB 标量读路径 j 野值致
-        MTE 507035）。逐 tile 2×(n_rem+depth) 次 GM 读，测试形状可
-        忽略；bench 形状的行内缓存命中由 DCache 承担。
-        """
+        """Deterministic dense-peer merge used above eight ranks."""
         rank_size = int(self._rank_size)
         epn_rt = dtypes.int64(self._epn)
         blocks_rt = dtypes.int64(self._blocks)
-        # ① 等全部 peer 的入槽 flag
         self._det_wait_peer_flags(ctx, my_rank, epoch)
-        # ② 行单写者分区：i = blk, blk+blocks, ...
         blk = dtypes.int64(get_block_idx())
         for i in cannbotdsl.range(blk, epn_rt, blocks_rt):
-            for g in range_constexpr(_MAX_GRAD_GROUPS):
-                if g < int(self._ngroups):
-                    chunk = int(self._chunks[g])
-                    n_c = int(self._sizes[g]) // chunk
-                    for c in cannbotdsl.range(
-                        dtypes.int64(0), dtypes.int64(n_c), dtypes.int64(1)
-                    ):
-                        # —— tile (i, g, c)：seed → peer 升序流水 → 单次写 ——
-                        tile_idx = i * dtypes.int64(n_c) + c
-                        self._det_seed_acc(reals, g, tile_idx, ub_acc, ub_seed)
-                        # —— peer 升序 issue/consume（滞后窗 depth；先消费
-                        #    后发射——环在飞数恒 ≤ depth）——
-                        n_iter = dtypes.int64(rank_size - 1) + dtypes.int64(
-                            int(self._depth)
-                        )
-                        for t in cannbotdsl.range(
-                            dtypes.int64(0), n_iter, dtypes.int64(1)
+            has_remote = self._det_row_has_remote(inv_base, i, my_rank, rank_size)
+            if has_remote > dtypes.int32(0):
+                for g in range_constexpr(_MAX_GRAD_GROUPS):
+                    if g < int(self._ngroups):
+                        chunk = int(self._chunks[g])
+                        n_c = int(self._sizes[g]) // chunk
+                        for c in cannbotdsl.range(
+                            dtypes.int64(0), dtypes.int64(n_c), dtypes.int64(1)
                         ):
-                            self._det_consume(
-                                t, i, g, my_rank, rank_size, inv_base, ub_pipe, ub_acc
+                            tile_idx = i * dtypes.int64(n_c) + c
+                            self._det_seed_acc(reals, g, tile_idx, ub_acc, ub_seed)
+                            n_iter = dtypes.int64(rank_size - 1) + dtypes.int64(
+                                int(self._depth)
                             )
-                            self._det_issue(
-                                connection,
-                                inv_base,
-                                i,
-                                t,
-                                c,
-                                g,
-                                my_rank,
-                                rank_size,
-                                ub_pipe,
-                            )
-                        # —— 单次写回（终轮一次舍入）——
-                        self._det_writeback(reals, g, tile_idx, ub_acc, ub_out)
+                            for t in cannbotdsl.range(
+                                dtypes.int64(0), n_iter, dtypes.int64(1)
+                            ):
+                                self._det_consume_dense(
+                                    t,
+                                    i,
+                                    g,
+                                    my_rank,
+                                    rank_size,
+                                    inv_base,
+                                    ub_pipe,
+                                    ub_acc,
+                                )
+                                self._det_issue_dense(
+                                    connection,
+                                    inv_base,
+                                    i,
+                                    t,
+                                    c,
+                                    g,
+                                    my_rank,
+                                    rank_size,
+                                    ub_pipe,
+                                )
+                            self._det_writeback(reals, g, tile_idx, ub_acc, ub_out)
 
 
 # ---------------------------------------------------------------------------
@@ -671,7 +871,7 @@ def _get_acc_program(spec):
 
 
 def _copy_grads_to_ws(
-    context, local_grads, epn, widths, grad_bf16, grad_fp16, copy_off
+    context, experts_to_copy, local_grads, epn, widths, grad_bf16, grad_fp16, copy_off
 ):
     """发送侧：副本行 local_grads[g][epn:] 拷入 workspace 副本区。
 
@@ -705,8 +905,24 @@ def _copy_grads_to_ws(
             base += region
         cached = (key, views)
         context._pull_ws_copy_views = cached
+
+    index_cache = getattr(context, "_pull_ws_copy_indices", None)
+    index_key = (
+        int(context.reduce_copy_plan_token),
+        int(context.rank),
+        int(epn),
+    )
+    if index_cache is None or index_cache[0] != index_key:
+        active_rows = (
+            experts_to_copy[context.rank].ge(0).nonzero(as_tuple=False).flatten()
+        )
+        index_cache = (index_key, active_rows, experts_to_copy)
+        context._pull_ws_copy_indices = index_cache
     for g, w in enumerate(widths):
-        cached[1][g].copy_(local_grads[g][epn:])
+        source = local_grads[g][epn:]
+        cached[1][g].index_copy_(
+            0, index_cache[1], source.index_select(0, index_cache[1])
+        )
 
 
 def reduce_grad(
@@ -715,7 +931,6 @@ def reduce_grad(
     local_grads,
     epn,
     *,
-    slot=0,
     slots=None,
     async_finish=False,
 ):
@@ -736,8 +951,6 @@ def reduce_grad(
         async_finish: False（缺省）阻塞到全组归并完成（返回 event=None）；
                      True 返回发起流 torch.npu.Event（wait_event 汇合后读
                      归并结果）。
-        slot: 窗口池槽位（与 prefetch 同族约定——reduce 侧仅校验一致性，
-            归并落点与槽位无关）。
         slots: 窗口池层数（None = context.window_slots 定型值；显式给出时
             须与定型值一致，否则 ValueError）。
 
@@ -753,7 +966,6 @@ def reduce_grad(
         context, local_grads, epn
     )
 
-    local_grads[0].dtype
     elem_bytes = 2 if (grad_bf16 or grad_fp16) else 4
     # 跨流护栏：本算子与前序通信算子共用 epoch 握手机制，须按发起序
     # 执行（同流为快路径零开销）
@@ -792,7 +1004,6 @@ def reduce_grad(
         HEAP_BASE + copy_off + copy_bytes + LAYOUT_TAIL_BYTES,
         "pull 梯度副本区",
     )
-
     # —— 槽视图一致性守卫（pull_slots_used 契约沿用）——
     used = context.pull_slots_used
     if used is None:
@@ -806,16 +1017,23 @@ def reduce_grad(
     # —— owner 直累数据面（发送侧拷入 + owner 映射远读直累）——
     # 发送侧：host 把副本行拷入 workspace 副本区（一次 GM 拷贝 ~19MB < 1ms）
     # 归并 kernel 只读 etc 映射行（无未映射行入和——pull 天然无陈旧行问题）
-    _copy_grads_to_ws(context, local_grads, epn, widths, grad_bf16, grad_fp16, copy_off)
+    _copy_grads_to_ws(
+        context,
+        experts_to_copy,
+        local_grads,
+        epn,
+        widths,
+        grad_bf16,
+        grad_fp16,
+        copy_off,
+    )
     # 归并 kernel：owner 远读 peer 副本 + vf 流式归并
     gm_epoch = next_barrier_epoch(context)
-    # 块数封顶常驻核数（950PR 64 块）——R>64 时不随 R 增长：屏障写者与读块
-    # 都按 peer 轮转（peer_block_split），避免写者被分波调度推到第二波互等
-    # 。归并 tile 条带同样取此块数。
-    blocks = capped_blocks(context, _HEADER_BARRIER_CAP)
-    chunk_limit = (
-        _CHUNK_UB_LIMIT_BF16 if (grad_bf16 or grad_fp16) else _CHUNK_UB_LIMIT_FP32
-    )
+    # 块数封顶常驻核数（950PR 64 块）——R>64 时不随 R 增长：屏障写者按
+    # peer 轮转，读块按行条带划分，避免写者被分波调度推到第二波互等。
+    blocks = resident_blocks(_HEADER_BARRIER_CAP)
+    acc_depth = _acc_depth(rank_size)
+    chunk_limit = _acc_chunk_limit(acc_depth, grad_bf16 or grad_fp16)
     chunks = tuple(pick_weight_chunk(w, chunk_limit) for w in widths)
     # 行宽须为 _VL=64 倍数（归并 tile 步进=_VL——非倍数时尾 tile 越界 UB；
     # Buffer 构造期已查，裸 API 路径在此 fail-fast）
@@ -825,12 +1043,8 @@ def reduce_grad(
     ngroups = len(local_grads)
     # 3 槽：真实组前缀 + pad 尾置（缺省槽复用末组——kernel 不读取）
     sizes = tuple(widths) + (widths[-1],) * (_MAX_GRAD_GROUPS - ngroups)
-    # 环深旋钮（缺省生产值；MOONEP_ACC_DEPTH 供 bench 矩阵实验——spec
-    # 进编译键，环境变量不直接进 kernel）。确定性归并（唯一累加
-    # 路径）：固定 peer 升序 + UB fp32 累加 + 单次写回——逐位可重复，
-    # bf16/fp16 舍入从 R-1 次降为 1 次；UB 预算含 acc/seed/out（16 位
-    # chunk 16K 时 depth≤3）。
-    acc_depth = int(os.environ.get("MOONEP_ACC_DEPTH", "3"))
+    # 环深与 chunk 上限同源计算；depth 进入编译键。确定性归并保持
+    # peer 升序、UB fp32 累加与单次写回。
     spec = _ReduceSpec(
         epn=epn,
         sizes=sizes,

@@ -27,7 +27,7 @@
   握手的 put flag + 自旋收齐——头部屏障语义沿用。
 
 布局约定（workspace 相对偏移；公式唯一真源 moonep_layout）：
-    到达槽（per sender rank）：notify_slot_off(r) = r * NOTIFY_STRIDE
+    到达槽（per sender rank）：offset(r) = r * NOTIFY_STRIDE
     值 = 本轮 epoch（u32）；epoch 跨算子单调（moonep_context 维护）。
 """
 
@@ -40,26 +40,18 @@ import threading
 import cannbotdsl as cbd
 import torch
 from cannbotdsl import Constexpr, comm, datastruct, dtypes
+from cannbotdsl._mlir.dialects import cannbotir
 from cannbotdsl.buffer import Buffer
 from cannbotdsl.core.ir_transport import unwrap_operand
-from cannbotdsl.types.datastruct import _marshal_datastruct
 from cannbotdsl.lang.constexpr import const_expr, range_constexpr
 from cannbotdsl.lang.jit import jit
 from cannbotdsl.ring_buffer import RingBuffer
 from cannbotdsl.tensor import MemLoc, make_layout, make_pointer, make_tensor, tile_slice
 from cannbotdsl.types._numeric import UInt64
-from moonep_layout import NOTIFY_STRIDE
-
-from cannbotdsl._mlir.dialects import cannbotir
-
+from cannbotdsl.types.datastruct import _marshal_datastruct
 # ---------------------------------------------------------------------------
 # 到达槽布局（workspace 相对偏移；区域 [0, MAX_R*NOTIFY_STRIDE) ⊂ [0, HEAP_BASE)）
 # ---------------------------------------------------------------------------
-
-
-def notify_slot_off(rank: int) -> int:
-    """sender rank r 的到达槽偏移（接收侧 workspace 相对偏移，u32 值域）。"""
-    return int(rank) * NOTIFY_STRIDE
 
 
 # ---------------------------------------------------------------------------
@@ -256,7 +248,21 @@ def _ub_fence():
 
 
 @jit
-def ub_flag_write(peer, slot_off, value, src_addr):
+def ub_flag_write_snapshot(peer, slot_off, epoch_ub):
+    """4B epoch 快照写对端槽——值取 kernel 起始的一次性 UB 快照。
+
+    与 ``ub_flag_write`` 同通道保序（首尾 fence + MTE3 数据通道：flag
+    落地即此前全部行已到对端）。快照源保证同一 kernel 内的自旋阈值、
+    本地完成标志与远端写值始终同代。
+    """
+    mapped = dtypes.uint64(peer.get_mapped_addr(0))
+    _ub_fence()
+    cbd.mem_copy(_gm_view(mapped + dtypes.uint64(slot_off), 1, dtypes.uint32), epoch_ub)
+    _ub_fence()
+
+
+@jit
+def ub_flag_write(peer, slot_off, src_addr):
     """4B epoch 写对端槽——经 MTE3 数据通道（与数据写同 pipe 保序）。
 
     （combine 数值错位根因）：scalar bypass 写与 MTE3 批量写走
@@ -324,7 +330,6 @@ def comm_barrier_all(
             ub_flag_write(
                 peer,
                 dtypes.uint64(flags_off) + my_rank_u64 * dtypes.uint64(4),
-                epoch,
                 src_addr,
             )
     for p in range_constexpr(rank_size):
@@ -382,9 +387,7 @@ class _TopoNative:
 
     def reachable(self, layer, peer, proto):
         my_rank = self._domain.get_rank_id()
-        return bool(
-            self._handle.check_reachable(my_rank, peer, layer, comm.Protocol(proto))
-        )
+        return bool(self._handle.check_reachable(my_rank, peer, layer, proto))
 
 
 class _TopoPeerProto:
@@ -428,8 +431,10 @@ def _topo_surface(domain):
 
 
 def _proto_value(x):
-    """协议对象 → 数值（native 面可返回裸 int）。"""
-    return x.value if hasattr(x, "value") else x
+    """协议对象 → native 数值（x86 native 面可返回裸 int）。"""
+    if hasattr(x, "name"):
+        return int(getattr(comm._native(), x.name))
+    return x
 
 
 def _full_coverage_layer(domain, peers, proto_enum):

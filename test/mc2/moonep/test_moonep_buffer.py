@@ -544,28 +544,6 @@ def test_a6_view_zero_copy_and_layout(moonep_groups):
             local_down_weight=reals[2],
             local_gate_up_weight=reals[0],
         )
-    # 未 prefetch 的槽位访问 → 引导性报错（视图随首调创建）：buf2 双槽
-    # 两槽均已预取，改用专用 buffer 只预取 slot 0
-    buf3 = Buffer(
-        _S,
-        _H,
-        _Hp,
-        _K,
-        _EPN * _world,
-        num_ep_ranks=dist.get_world_size(),
-        group=moonep_groups,
-        slots=2,
-    )
-    _DEDICATED.append(buf3)
-    topk3, tpe3 = _routing(42)
-    plan3 = buf3._plan(tpe3, topk3)
-    reals3 = [
-        _fill_weight_real(rank, buf3.epn, buf3.H * buf3.Hp, g)
-        for g in range(_NUM_GROUPS)
-    ]
-    _prefetch_api(buf3, plan3, local_weights=reals3, slot=0)
-    with pytest.raises(RuntimeError):
-        buf3.scale_views(slot=1)
 
 
 # ---------------------------------------------------------------------------

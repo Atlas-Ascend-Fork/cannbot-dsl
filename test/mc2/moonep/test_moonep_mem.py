@@ -30,9 +30,8 @@
 - --slots/--grad-dtype CLI 旋钮直接映射构造参数；堆需求
   打印改经 heap_required_bytes 只读 property 回读；
 - MEMSTAT delta/log 打点全部保留（观测点，非接口调用）；
-- MOONEP_PUSH_BLOCKS 覆盖开关已移除：实现读 _MAX_PUSH_BLOCKS
-  经 resident_blocks() 按核数自适应，开关写入手已是无效死代码（8P aivec
-  271 规避由核数自适应承担）。
+- MOONEP_PUSH_BLOCKS 可限制并发 block 上限，缺省经 resident_blocks()
+  按核数自适应。
 
 显存统计（MEMSTAT 标签行，grep 汇总）：
   - Buffer 构造（HCCL 子组+workspace 预留+通信建连）delta 打点，

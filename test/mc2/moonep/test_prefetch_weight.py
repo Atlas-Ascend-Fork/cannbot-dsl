@@ -69,7 +69,7 @@ def test_moonep_prefetch_weight_dsl_api(moonep_groups, monkeypatch):
     ctx = create_moonep_context(
         group=moonep_groups,
         workspace_bytes=_workspace_need(
-            world_size, epn, w_elems, 1, torch.bfloat16, torch.bfloat16
+            epn, w_elems, 1, torch.bfloat16, torch.bfloat16
         ),
     )
     ctx.last_plan_shape = (num_tokens, top_k)  # 设置窗口布局元数据

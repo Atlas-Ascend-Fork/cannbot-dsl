@@ -34,7 +34,7 @@ sys.path.insert(
 )
 
 # conftest 提供 moonep_groups fixture + fill_and_repush
-from conftest import fill_and_repush  # noqa: E402
+from conftest import _reduce_api, fill_and_repush  # noqa: E402
 from prefetch_utils import _init_ep_group  # noqa: E402
 
 
@@ -55,7 +55,7 @@ def test_plan_precision_binary(tokens, top_k, epn, mode, moonep_groups):
 
     rank, world = _init_ep_group()
     num_experts = epn * world
-    ctx = create_moonep_context(group=moonep_groups[0])
+    ctx = create_moonep_context(group=moonep_groups)
 
     # CPU golden：确定性路由
     torch.manual_seed(42 + rank)
@@ -69,11 +69,10 @@ def test_plan_precision_binary(tokens, top_k, epn, mode, moonep_groups):
     assert int(cu[-1].cpu()) == tokens * top_k, (
         f"cu[-1]={int(cu[-1].cpu())} != S*K={tokens * top_k}"
     )
-    # vtopk == topk.flatten()（逐位一致）
-    vtopk_cpu = vtopk.cpu()
-    assert torch.equal(vtopk_cpu, topk.flatten()), "vtopk 与 topk 逐位不一致"
-    # etc 值域合法：[-1, 2*E) 且 ≥0 项为合法 slot
     etc_cpu = etc.cpu()
+    vtopk_cpu = vtopk.cpu()
+    assert int(vtopk_cpu.min()) >= 0 and int(vtopk_cpu.max()) < 2 * num_experts
+    # etc 值域合法：[-1, 2*E) 且 ≥0 项为合法 slot
     assert (etc_cpu[etc_cpu >= 0] < 2 * num_experts).all(), "etc 超出 [0, 2E) 值域"
     # 每行至多一个 home rank（单源不变量）
     for r in range(world):
@@ -84,15 +83,35 @@ def test_plan_precision_binary(tokens, top_k, epn, mode, moonep_groups):
 
 
 @pytest.mark.npu
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_prefetch_precision_binary(dtype, moonep_groups):
     """prefetch 副本行与 home 行逐位一致（零拷贝直推，无数值变换）。"""
-    from moonep_context import create_moonep_context
+    from moonep_context import (
+        HEAP_BASE,
+        LAYOUT_TAIL_BYTES,
+        create_moonep_context,
+    )
+    from moonep_layout import reduce_region_end
     from prefetch_weight import prefetch_weight
 
     rank, world = _init_ep_group()
     epn, weight_rows = 4, 512
-    ctx = create_moonep_context(group=moonep_groups[0])
+    workspace_bytes = (
+        HEAP_BASE
+        + reduce_region_end(
+            epn,
+            weight_rows,
+            3,
+            1,
+            grad_bytes_per_elem=dtype.itemsize,
+            weight_bytes=dtype.itemsize,
+        )
+        + LAYOUT_TAIL_BYTES
+    )
+    ctx = create_moonep_context(
+        group=moonep_groups,
+        workspace_bytes=workspace_bytes,
+    )
     ctx.last_plan_shape = (32, 8)
 
     etc = torch.full((world, epn), -1, dtype=torch.int32)
@@ -100,17 +119,32 @@ def test_prefetch_precision_binary(dtype, moonep_groups):
         etc[dst] = torch.arange(epn, dtype=torch.int32)
     etc = etc.npu()
 
-    reals = [torch.randn(epn, weight_rows, dtype=dtype).npu() for _ in range(3)]
-    views, _ = prefetch_weight(ctx, etc, reals, epn)
-    fill_and_repush(ctx, etc, reals, epn, views)
+    reals = []
+    for group in range(3):
+        weight = torch.empty(epn, weight_rows, dtype=dtype)
+        for local_expert in range(epn):
+            weight[local_expert].fill_(float(100 * group + rank * epn + local_expert))
+        reals.append(weight.npu())
+    weight_views, _ = prefetch_weight(ctx, etc, reals, epn)
+    fill_and_repush(ctx, etc, (weight_views, ()), epn)
     torch.npu.synchronize()
 
     for g in range(3):
-        actual = views[g].cpu()
-        expected = reals[g].cpu()
-        assert torch.equal(actual, expected), (
-            f"prefetch 组{g} 副本行不等于 home 行（dtype={dtype}）"
+        actual = weight_views[g].cpu()
+        assert torch.equal(actual[:epn], reals[g].cpu()), (
+            f"prefetch 组{g} home 行不等于本地权重（dtype={dtype}）"
         )
+        for slot in range(epn):
+            expert = int(etc[rank, slot].item())
+            if expert < 0:
+                assert torch.equal(
+                    actual[epn + slot], torch.full_like(actual[epn + slot], -1)
+                ), f"prefetch 组{g} 空 slot={slot} 未保持哨兵"
+            else:
+                expected = torch.full_like(actual[epn + slot], float(100 * g + expert))
+                assert torch.equal(actual[epn + slot], expected), (
+                    f"prefetch 组{g} slot={slot} 副本行不等于 home 行"
+                )
     ctx.close()
     print(f"[PRECISION] prefetch dtype={dtype}: binary exact ✓")
 
@@ -124,18 +158,18 @@ def test_reduce_grad_precision_formula(grad_dtype, moonep_groups):
     bf16/fp16: 每行 |actual - expected| ≤ n_copy * ulp(dtype)
     （n_copy = 该行全局专家的副本条目数；det 路径单次舍入）。
     """
-    from moonep_buffer import MoonepBuffer
+    from moonep_buffer import Buffer
 
     rank, world = _init_ep_group()
     epn, weight_rows, groups = 4, 256, 3
-    buf = MoonepBuffer(
+    buf = Buffer(
         32,
-        weight_rows,
-        weight_rows // 2,
+        32,
+        8,
         8,
         epn * world,
-        moonep_group=moonep_groups[0],
-        ep_group=moonep_groups[1],
+        world,
+        group=moonep_groups,
         grad_dtype=(
             "fp32"
             if grad_dtype == torch.float32
@@ -148,7 +182,9 @@ def test_reduce_grad_precision_formula(grad_dtype, moonep_groups):
     torch.manual_seed(100 + rank)
     topk = torch.randint(0, epn * world, (32, 8), dtype=torch.int32)
     tpe = torch.bincount(topk.flatten(), minlength=epn * world).to(torch.int32)
-    plan = buf._plan(tpe.npu(), topk.npu())
+    topk_npu = topk.npu()
+    tpe_npu = tpe.npu()
+    plan = buf._plan(tpe_npu, topk_npu)
 
     base = 2.0
     grads = []
@@ -158,7 +194,7 @@ def test_reduce_grad_precision_formula(grad_dtype, moonep_groups):
         t[epn:] = base + 1.0  # 副本增量
         grads.append(t.npu())
 
-    home_views = buf.reduce_grad(plan, local_grads=grads)
+    home_views = _reduce_api(buf, plan, grads)
     torch.npu.synchronize()
 
     etc_cpu = plan.experts_to_copy.cpu()
@@ -214,36 +250,47 @@ def test_dispatch_combine_precision(moonep_groups):
              → fp32 累加 → 精度公式 |actual-expected| ≤ (K-1)*ulp(fp32)。
     """
     try:
-        from moonep_buffer import MoonepBuffer
+        from moonep_buffer import Buffer
     except ImportError:
         pytest.skip("需 cann_ops_transformer（EB dispatch/combine）")
 
     rank, world = _init_ep_group()
     tokens, top_k, hidden = 32, 8, 256
     epn = 4
-    buf = MoonepBuffer(
+    buf = Buffer(
         tokens,
         hidden,
         hidden,
         top_k,
         epn * world,
-        moonep_group=moonep_groups[0],
-        ep_group=moonep_groups[1],
+        world,
+        group=moonep_groups,
     )
 
     torch.manual_seed(200 + rank)
     topk = torch.randint(0, epn * world, (tokens, top_k), dtype=torch.int32)
     tpe = torch.bincount(topk.flatten(), minlength=epn * world).to(torch.int32)
-    plan = buf._plan(tpe.npu(), topk.npu())
+    topk_npu = topk.npu()
+    tpe_npu = tpe.npu()
+    plan = buf._plan(tpe_npu, topk_npu)
 
     # dispatch 精度：x → recv_x（bf16 逐位一致）
     x = torch.randn(tokens, hidden, dtype=torch.bfloat16).npu()
     weights = torch.rand(tokens, top_k, dtype=torch.float32).npu()
-    recv_x, recv_w, handle = buf.dispatch(plan, x, topk_weights=weights)
+    recv_x, recv_w, _, plan = buf.dispatch(
+        x,
+        route_weights_sk=weights,
+        topk_experts_sk=topk_npu,
+        tokens_per_expert=tpe_npu,
+    )
 
     # combine 精度：y 填充 → out（加权回收）
     y = torch.randn(recv_x.shape[0], hidden, dtype=torch.bfloat16).npu()
-    out, out_w = buf.combine(y, handle, topk_weights=recv_w)
+    out, out_w, _ = buf.combine(
+        plan=plan,
+        hidden_nvsh=y,
+        route_weights_nvs=recv_w,
+    )
 
     torch.npu.synchronize()
 

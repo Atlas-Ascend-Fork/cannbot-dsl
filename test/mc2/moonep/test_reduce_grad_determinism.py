@@ -32,6 +32,8 @@ import pytest
 import torch
 import torch.distributed as dist
 
+from conftest import _reduce_api
+
 sys.path.insert(
     0,
     os.path.join(
@@ -41,7 +43,7 @@ sys.path.insert(
 
 try:
     import torch_npu  # noqa: F401
-    from moonep_buffer import MoonepBuffer  # noqa: F401
+    from moonep_buffer import Buffer  # noqa: F401
 
     _HAS_DSL_IMPL = True
 except Exception:  # CI 无 NPU / 无 DSL 时收集不报错（skip 而非 error）
@@ -183,7 +185,7 @@ def test_d1_bitwise_pinned(dtype_name, torch_dtype, moonep_groups):
     outs = []
     for launch in range(3):
         grads = _local_grads_of(all_grads, rank)
-        buf.reduce_grad(plan, local_grads=grads)
+        _reduce_api(buf, plan, grads)
         torch.npu.synchronize()
         outs.append([t[:epn].clone() for t in grads])
         if launch == 0:
@@ -219,14 +221,14 @@ def test_d1b_multichunk(moonep_groups):
     """
     rank, world = _init_group()
     weight_rows = 32768
-    buf = MoonepBuffer(
+    buf = Buffer(
         _S,
         64,
         weight_rows,
         _K,
         _EPN * world,
-        moonep_group=moonep_groups[0],
-        ep_group=moonep_groups[1],
+        world,
+        group=moonep_groups,
         grad_dtype="bf16",
     )
     epn = buf.epn
@@ -238,7 +240,7 @@ def test_d1b_multichunk(moonep_groups):
         for r in range(world)
     ]
     grads = _local_grads_of(all_grads, rank)
-    buf.reduce_grad(plan, local_grads=grads)
+    _reduce_api(buf, plan, grads)
     torch.npu.synchronize()
     for g in range(2):
         for i in range(buf.epn):
@@ -272,7 +274,7 @@ def test_d2_encoded_exact(dtype_name, moonep_groups):
         for r_i in range(2 * buf.epn):
             t[r_i] = float(2 + (r_i + 1))
         groups.append(t.npu())
-    buf.reduce_grad(plan, local_grads=groups)
+    _reduce_api(buf, plan, groups)
     torch.npu.synchronize()
     for g in range(3):
         for i in range(buf.epn):
@@ -298,8 +300,8 @@ def test_d2_encoded_exact(dtype_name, moonep_groups):
 @pytest.mark.npu
 @_requires_train_env
 def test_d3_workspace_readonly(moonep_groups):
-    """D3：副本区只读不变量——reduce 后本 rank workspace 副本区与
-    入槽内容逐位一致（kernel 只读对端；写侧归 host copy_）。
+    """D3：活跃副本槽只读不变量——reduce 后本 rank 已发布槽与入槽内容
+    逐位一致（kernel 只读对端；未参与计划的槽不进入数据面）。
     """
     rank, world = _init_group()
     buf = _get_buffer(moonep_groups, "bf16")
@@ -310,15 +312,21 @@ def test_d3_workspace_readonly(moonep_groups):
         for r in range(world)
     ]
     grads = _local_grads_of(all_grads, rank)
-    buf.reduce_grad(plan, local_grads=grads)
+    _reduce_api(buf, plan, grads)
     torch.npu.synchronize()
     epn = buf.epn
     ws_views = getattr(buf._ctx, "_pull_ws_copy_views", None)
     ok = ws_views is not None
     if ok:
-        for g in range(3):
-            ok = ok and torch.equal(ws_views[1][g].cpu(), grads[g][epn:].cpu())
-    _assert_all_ranks(ok, "D3 副本区被 reduce 改写（只读不变量破坏）")
+        active_rows = (
+            plan.experts_to_copy[rank].ge(0).nonzero(as_tuple=False).flatten().cpu()
+        )
+        if int(active_rows.numel()):
+            for g in range(3):
+                actual = ws_views[1][g].cpu()[active_rows]
+                expected = grads[g][epn:].cpu()[active_rows]
+                ok = ok and torch.equal(actual, expected)
+    _assert_all_ranks(ok, "D3 活跃副本槽被 reduce 改写（只读不变量破坏）")
     if rank == 0:
         print("[DET] D3 workspace readonly invariant PASS")
     buf.destroy()
@@ -338,7 +346,7 @@ def test_d5_lifecycle_rounds(moonep_groups):
     plan = buf._plan(tpe, topk)
     etc_1 = plan.experts_to_copy.cpu()
     grads1 = _local_grads_of(_randn_grads_set(51, world, buf.epn), rank)
-    buf.reduce_grad(plan, local_grads=grads1)
+    _reduce_api(buf, plan, grads1)
     torch.npu.synchronize()
     _verify_against_reference(
         grads1,
@@ -357,7 +365,7 @@ def test_d5_lifecycle_rounds(moonep_groups):
     assert not bool((etc_e >= 0).any()), "本地路由不应产生副本清单"
     grads2 = _local_grads_of(_randn_grads_set(52, world, buf.epn), rank)
     seed_snap = [t[:epn].clone() for t in grads2]
-    buf.reduce_grad(plan_e, local_grads=grads2)
+    _reduce_api(buf, plan_e, grads2)
     torch.npu.synchronize()
     for g in range(3):
         _assert_all_ranks(
@@ -369,7 +377,7 @@ def test_d5_lifecycle_rounds(moonep_groups):
     plan3 = buf._plan(tpe3, topk3)
     etc_3 = plan3.experts_to_copy.cpu()
     grads3 = _local_grads_of(_randn_grads_set(53, world, buf.epn), rank)
-    buf.reduce_grad(plan3, local_grads=grads3)
+    _reduce_api(buf, plan3, grads3)
     torch.npu.synchronize()
     _verify_against_reference(
         grads3,
@@ -415,15 +423,16 @@ def _get_buffer(moonep_groups, dtype_name):
     """池化 buffer（组型 3 等宽；dtype 键控共享——梯度槽区按定型 dtype 预留）。"""
     world = dist.get_world_size()
     key = (world, str(dtype_name))
-    if key not in _BUF_POOL:
-        _BUF_POOL[key] = MoonepBuffer(
+    buf = _BUF_POOL.get(key)
+    if buf is None or buf.destroyed:
+        _BUF_POOL[key] = Buffer(
             _S,
             64,
             _W,
             _K,
             _EPN * world,
-            moonep_group=moonep_groups[0],
-            ep_group=moonep_groups[1],
+            world,
+            group=moonep_groups,
             grad_dtype=dtype_name,
         )
     return _BUF_POOL[key]

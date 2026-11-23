@@ -101,11 +101,8 @@ def _prefetch_api(
         kw = dict(local_gate_up_weight=weights[0], local_down_weight=weights[1])
         if scales is not None:
             kw.update(local_gate_up_scales=scales[0], local_down_scales=scales[1])
-    out = buf.prefetch_weight(plan=plan, slot=slot, async_finish=async_finish, **kw)
-    if async_finish:
-        views, event = out
-        return (views, buf.scale_views(slot)), event
-    return out, buf.scale_views(slot)
+    # 新接口直接返回 (views, scales)；async 形态为 ((views, scales), event)。
+    return buf.prefetch_weight(plan=plan, slot=slot, async_finish=async_finish, **kw)
 
 
 def _reduce_api(buf, plan, local_grads, async_finish=False):

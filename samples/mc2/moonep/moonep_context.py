@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import threading
+from collections import deque
 import warnings
 
 import cannbotdsl
@@ -129,14 +130,6 @@ def resident_blocks(cap: int = 64) -> int:
         # 设备未初始化：静态规格不缓存，运行期初始化后再按配额复核
         return min(cap, cores)
     return min(cap, _RESIDENT_BLOCKS)
-
-
-def capped_blocks(context, cap):
-    """常驻块数上限再套一层 num_sms（构造参数；None 保持现有口径）。"""
-    blocks = resident_blocks(cap)
-    if context is not None and context.num_sms is not None:
-        blocks = min(blocks, int(context.num_sms))
-    return blocks
 
 
 def finish_op(context, async_finish=False):
@@ -301,6 +294,7 @@ class MoonepContext:
         self.transport_stream = None
         self.transport_event = None
         self.last_plan_shape = None
+        self.reduce_copy_plan_token = 0
         self.group = None
         self.layout_groups = None
         self.layout_widths = None
@@ -308,10 +302,10 @@ class MoonepContext:
         self.weight_dtype = None
         self.grad_dtype = None
         self.window_slots = None
-        self.num_sms = None  # kernel 常驻块数上限（None = 只按 resident_blocks）
         self.pending_overflow = None
         self.weight_views = {}
         self.bar_epoch_t = None
+        self.bar_epoch_tensors = deque(maxlen=128)
 
     def close(self):
         """断开连接（幂等；workspace/视图随张量引用回收）。"""
@@ -430,16 +424,14 @@ def _get_barrier_program(world_size):
 
 
 def next_barrier_epoch(context):
-    """推进本轮 epoch 并写回设备张量（1 元素 int32），返回该张量（复用）。"""
+    """推进本轮 epoch 并创建独立设备张量（1 元素 int32）。"""
     global _BAR_EPOCH
     if _BAR_EPOCH >= _BAR_EPOCH_MAX:
         raise RuntimeError("barrier epoch 已达 int32 上限，请重建 MoonEP 上下文")
     _BAR_EPOCH += 1
-    gm_epoch = context.bar_epoch_t
-    if gm_epoch is None:
-        gm_epoch = torch.empty(1, dtype=torch.int32, device="npu")
-        context.bar_epoch_t = gm_epoch
-    gm_epoch.fill_(_BAR_EPOCH)  # 复用张量：省掉每步一次分配
+    gm_epoch = torch.full((1,), _BAR_EPOCH, dtype=torch.int32, device="npu")
+    context.bar_epoch_t = gm_epoch
+    context.bar_epoch_tensors.append(gm_epoch)
     return gm_epoch
 
 
@@ -459,6 +451,7 @@ def sym_barrier(context, *, sync=True):
         return
     gm_epoch = next_barrier_epoch(context)
     _get_barrier_program(context.rank_size)(gm_epoch, context.ctx_tensor)
+    record_transport_event(context)
     if not sync:
         return
     # 等待范围为发起流而非整卡（避免封死跨层/跨流流水）

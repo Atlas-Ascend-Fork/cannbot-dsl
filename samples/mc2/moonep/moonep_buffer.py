@@ -44,8 +44,8 @@ reduce_grad）；plan 在 dispatch 内部完成，不单独对外。
     buf.destroy()
 
 W13 交织形态用 ``local_gate_up_weight`` + ``local_down_weight``（prefetch
-返回 ``(gate_up, down)`` 二元组）；``local_*_scales`` 同理成对传入，scale
-视图经 ``scale_views()`` 读取。
+返回 ``(views, scales)``，其中 views 为 ``(gate_up, down)``）；``local_*_scales``
+同理成对传入。
 """
 
 from __future__ import annotations
@@ -53,13 +53,11 @@ from __future__ import annotations
 import threading
 import warnings
 
-import torch
-import torch.distributed as dist
-
 import moonep_plan
 import prefetch_weight
 import reduce_grad
-from moonep_plan import MoonepPlan
+import torch
+import torch.distributed as dist
 from moonep_context import (
     HEAP_BASE,
     LAYOUT_TAIL_BYTES,
@@ -72,6 +70,7 @@ from moonep_context import (
     reduce_region_end,
     sym_barrier,
 )
+from moonep_plan import MoonepPlan
 
 # reduce VL=64 尾块约束（moonep_context VL 同源）：W 非 64 倍数时尾块越界 UB
 _W_ALIGN = 64
@@ -80,7 +79,7 @@ _UE8M0_BLOCK = 32  # mxfp8 block scale 粒度（每 32 权重元素 1 个 ue8m0 
 _CHUNK_TRIAL_UB = 16384
 
 
-def _workspace_need(rank_size, epn, w, slots, gdtype, wdtype):
+def _workspace_need(epn, w, slots, gdtype, wdtype):
     """moonep workspace（通信 buffer）实际容量唯一真源。
 
     ``HEAP_BASE + reduce_region_end(...) + LAYOUT_TAIL_BYTES``：权重+scale
@@ -171,8 +170,7 @@ class Buffer:
 
     构造内化：workspace 精算 → 单通信组解析（moonep ctx 与 ElasticBuffer
     复用同一 ``ProcessGroup``）→ MoonepContext → window_slots/dtype 定型。
-    ``num_sms`` 限制 MoonEP kernel 的常驻块数；``token_padding`` 当前仅
-    保留参数、不改变运行时行为。
+    ``num_sms`` / ``token_padding`` 为预留参数，当前分别只接受 None 与缺省值。
 
     单 group 说明：MoonEP 数据面使用本 rank 私有注册 workspace，EB 自建
     注册内存；两者共用同一 HCCL 通信器是刻意设计。``_ensure_eb`` 的锁只
@@ -188,14 +186,15 @@ class Buffer:
         Hp: int,
         K: int,
         E: int,
-        num_ep_ranks: int | None,
+        num_ep_ranks: int,
+        group: torch.distributed.ProcessGroup,
         num_sms: int | None = None,
         token_padding: int = 128,
-        group=None,
         *,
         weight_dtype: str | torch.dtype = "bf16",
         grad_dtype: str | torch.dtype = "bf16",
         slots: int = 1,
+        eb_netlayer: str = "auto",
     ) -> None:
         """构造（集体调用）。
 
@@ -205,18 +204,18 @@ class Buffer:
             Hp: 专家 FFN 中间维；权重行宽上界 ``W = H × Hp``。
             K: 每 token top-k。
             E: EP 组专家总数（``E % R == 0``）。
-            num_ep_ranks: EP rank 数；None 取 ``group`` 的 world size，
-                显式给出时须一致。
-            group: 通信组；None 取 ``dist.group.WORLD``。同一个组同时用于
-                MoonEP ctx 与 ElasticBuffer。
-            num_sms: MoonEP kernel 常驻块数上限；None 只按硬件常驻核数。
+            num_ep_ranks: EP rank 数，取值 2–128，须等于 ``group`` 的 world
+                size。
+            group: 通信组（必选）。同一个组同时用于 MoonEP ctx 与
+                ElasticBuffer。
+            num_sms: 预留参数：计划开放的语义是 MoonEP kernel 使用的 AIV
+                核数；当前仅支持 None。
             token_padding: 预留参数（当前不生效）。
             weight_dtype: 权重 dtype（bf16/fp16/e4m3fn/e5m2）。
             grad_dtype: 梯度 dtype（bf16/fp16/fp32）。
             slots: 权重窗口槽数（层间流水取 2）。
+            eb_netlayer: ElasticBuffer netlayer 透传，``auto`` 或非负数字符串。
         """
-        if group is None:
-            group = dist.group.WORLD
         if not isinstance(group, torch.distributed.ProcessGroup):
             raise TypeError(
                 f"group 须为 torch.distributed.ProcessGroup，got {type(group).__name__}"
@@ -226,15 +225,22 @@ class Buffer:
             raise ValueError(f"EP 组规模 {rank_size} 超过 MAX_R={MAX_R}")
         if E > MAX_E:
             raise ValueError(f"E={E} 超过 MAX_E={MAX_E}")
-        if num_ep_ranks is None:
-            num_ep_ranks = rank_size
-        elif int(num_ep_ranks) != rank_size:
+        if (
+            not isinstance(num_ep_ranks, int)
+            or isinstance(num_ep_ranks, bool)
+            or not 2 <= num_ep_ranks <= MAX_R
+        ):
+            raise ValueError(
+                f"num_ep_ranks 须为 2–{MAX_R} 的整数，got {num_ep_ranks!r}"
+            )
+        if num_ep_ranks != rank_size:
             raise ValueError(
                 f"num_ep_ranks={num_ep_ranks} 与 group world size={rank_size} 不符"
             )
         if num_sms is not None:
-            if not isinstance(num_sms, int) or isinstance(num_sms, bool) or num_sms < 1:
-                raise ValueError(f"num_sms 须为正整数或 None，got {num_sms!r}")
+            raise NotImplementedError(
+                f"num_sms 为预留参数，当前仅支持 None，got {num_sms!r}"
+            )
         if (
             not isinstance(token_padding, int)
             or isinstance(token_padding, bool)
@@ -257,6 +263,16 @@ class Buffer:
             raise ValueError(f"H 须 >= 1，got {H}")
         if Hp < 1:
             raise ValueError(f"Hp 须 >= 1，got {Hp}")
+        if not (
+            isinstance(eb_netlayer, str)
+            and (
+                eb_netlayer == "auto"
+                or (eb_netlayer.isascii() and eb_netlayer.isdigit())
+            )
+        ):
+            raise ValueError(
+                f"eb_netlayer 须为 'auto' 或非负数字符串，got {eb_netlayer!r}"
+            )
         w = int(H) * int(Hp)
         gdtype = _normalize_grad_dtype(grad_dtype)
         wdtype = _normalize_weight_dtype(weight_dtype)
@@ -266,19 +282,18 @@ class Buffer:
             )
         pick_weight_chunk(w, _CHUNK_TRIAL_UB)
         epn = E // rank_size
-        grad_elem = 2 if gdtype in (torch.bfloat16, torch.float16) else 4
-        heap_need = _workspace_need(rank_size, epn, w, slots, gdtype, wdtype)
+        heap_need = _workspace_need(epn, w, slots, gdtype, wdtype)
 
         self._group = group
         self._ctx = create_moonep_context(group=self._group, workspace_bytes=heap_need)
         self._ctx.window_slots = slots
         self._ctx.weight_dtype = wdtype
         self._ctx.grad_dtype = gdtype
-        self._ctx.num_sms = num_sms
         check_heap_capacity(self._ctx, heap_need, "Buffer 构造")
         self._eb = None  # 懒构造（首调 dispatch/combine）
         self._eb_lock = threading.Lock()  # 首调并发守卫（EB 构造不可重入）
         self._nmtr = int(S)
+        self._eb_netlayer = eb_netlayer
         self._S, self._K, self._E = int(S), int(K), int(E)
         self._H = int(H)
         self._epn = epn
@@ -287,7 +302,6 @@ class Buffer:
         self._slots = int(slots)
         self._weight_dtype = wdtype
         self._grad_dtype = gdtype
-        self._grad_elem_bytes = grad_elem
         self._heap_need = heap_need
         self._heap_bytes = self._ctx.workspace_bytes
         self._rank = self._ctx.rank
@@ -298,7 +312,6 @@ class Buffer:
         self._handle_bwd = None
         self._handle_fwd_plan = None
         self._handle_bwd_plan = None
-        self._view_cache = {}  # slot -> (weights, scales) 视图二元组
         self._destroyed = False
 
     # ------------------------------------------------------------------
@@ -323,11 +336,16 @@ class Buffer:
                     "dispatch/combine 需要 cann_ops_transformer（ElasticBuffer）。"
                     "安装：pip install <cann_ops_transformer whl>"
                 ) from exc
+            # 仅显式设置时透传——旧版 ElasticBuffer 不接受 netlayer 参数
+            eb_kwargs = {}
+            if self._eb_netlayer != "auto":
+                eb_kwargs["netlayer"] = self._eb_netlayer
             self._eb = ElasticBuffer(
                 self._group,
                 num_max_tokens_per_rank=self._nmtr,
                 hidden=self._H,
                 num_topk=self._K,
+                **eb_kwargs,
             )
 
     # ------------------------------------------------------------------
@@ -365,10 +383,10 @@ class Buffer:
 
         前向：传 ``topk_experts_sk`` + ``tokens_per_expert``（``plan`` 为空），
         内部生成 plan；返回 ``(hidden_nvsh, route_weights_nvs, cu_seqlens, plan)``。
-        反向：传 ``plan=``（其余为空），复用前向 plan 重分发输出梯度。
+        复用规划：传 ``plan=`` + ``route_weights_sk`` 为同路由前向重分发；
+        只传 ``plan=``（无权重）为反向梯度重分发。
         """
         self._require_alive()
-        self._ensure_eb()
         if hidden_sh.dtype not in (torch.bfloat16, torch.float16):
             raise TypeError(
                 f"hidden_sh dtype 须为 bfloat16/float16，got {hidden_sh.dtype}"
@@ -382,13 +400,17 @@ class Buffer:
             )
         if plan is not None:
             if topk_experts_sk is not None or tokens_per_expert is not None:
-                raise ValueError("传 plan（反向）时不能再传 topk/tpe")
-            if route_weights_sk is not None:
-                raise ValueError("反向 dispatch 不接受 route_weights")
+                raise ValueError("传 plan（复用规划）时不能再传 topk/tpe")
             if not isinstance(plan, MoonepPlan):
                 raise TypeError(f"plan 须为 MoonepPlan，got {type(plan).__name__}")
+            # route_weights_sk 随车 = 前向复用 plan（同路由重分发，权重随车）；
+            # 不带权重 = 反向梯度重分发（recv_w 为 None）。
             return self._dispatch_and_return(
-                hidden_sh, plan, do_cpu_sync, None, forward=False
+                hidden_sh,
+                plan,
+                do_cpu_sync,
+                route_weights_sk,
+                forward=route_weights_sk is not None,
             )
         if topk_experts_sk is None or tokens_per_expert is None:
             raise ValueError("前向 dispatch 须传 topk_experts_sk 与 tokens_per_expert")
@@ -416,20 +438,70 @@ class Buffer:
         )
 
     def _dispatch_and_return(self, x, plan, do_cpu_sync, topk_weights, forward):
-        recv_x, _meta, recv_w, handle = self._eb.dispatch(
-            x,
-            topk_idx=plan.vtopk.view(self._S, self._K),
-            topk_weights=(topk_weights.float() if topk_weights is not None else None),
-            num_experts=2 * self._E,
-            num_max_tokens_per_rank=self._nmtr,
-            do_cpu_sync=do_cpu_sync,
+        self._ensure_eb()
+        dispatch_kwargs = {
+            "topk_weights": (
+                topk_weights.float() if topk_weights is not None else None
+            ),
+            "do_cpu_sync": do_cpu_sync,
+        }
+        dispatch_kwargs.update(
+            {
+                "topk_idx": plan.vtopk.view(self._S, self._K),
+                "num_experts": 2 * self._E,
+                "num_max_tokens_per_rank": self._nmtr,
+            }
         )
+        recv_x, _meta, recv_w, handle = self._eb.dispatch(x, **dispatch_kwargs)
         if forward:
             self._handle_fwd = handle
             self._handle_fwd_plan = plan
         else:
             self._handle_bwd = handle
             self._handle_bwd_plan = plan
+        return recv_x, recv_w, plan.cu_seqlens, plan
+
+    def _dispatch_cached(
+        self,
+        hidden_sh: torch.Tensor,
+        *,
+        plan: MoonepPlan,
+        handle,
+        route_weights_sk: torch.Tensor | None = None,
+        do_cpu_sync: bool = True,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, MoonepPlan]:
+        """Replay a caller-managed ElasticBuffer dispatch handle."""
+        self._require_alive()
+        self._ensure_eb()
+        if hidden_sh.dtype not in (torch.bfloat16, torch.float16):
+            raise TypeError(
+                f"hidden_sh dtype 须为 bfloat16/float16，got {hidden_sh.dtype}"
+            )
+        if not hidden_sh.is_contiguous():
+            raise ValueError("hidden_sh 须为连续张量")
+        if tuple(hidden_sh.shape) != (self._S, self._H):
+            raise ValueError(
+                f"hidden_sh.shape={tuple(hidden_sh.shape)} 须为 (S, H)="
+                f"({self._S}, {self._H})"
+            )
+        if not isinstance(plan, MoonepPlan):
+            raise TypeError(f"plan 须为 MoonepPlan，got {type(plan).__name__}")
+        if route_weights_sk is not None and tuple(route_weights_sk.shape) != (
+            self._S,
+            self._K,
+        ):
+            raise ValueError(
+                f"route_weights_sk.shape={tuple(route_weights_sk.shape)} "
+                f"!= 构造期 (S, K)=({self._S}, {self._K})"
+            )
+        recv_x, _meta, recv_w, _handle = self._eb.dispatch(
+            hidden_sh,
+            handle=handle,
+            topk_weights=(
+                route_weights_sk.float() if route_weights_sk is not None else None
+            ),
+            do_cpu_sync=do_cpu_sync,
+        )
         return recv_x, recv_w, plan.cu_seqlens, plan
 
     def prefetch_weight(
@@ -449,8 +521,9 @@ class Buffer:
     ):
         """推送 home 权重到各 rank 预取槽。
 
-        3 组形态返回 ``(gate, up, down)``；W13 交织形态返回
-        ``(gate_up, down)``；``async_finish=True`` 时再追加发起流事件。
+        返回 ``(views, scales)``：3 组形态 views 为 ``(gate, up, down)``，
+        W13 交织形态为 ``(gate_up, down)``；scales 与权重逐组对应，未量化时
+        为空元组。``async_finish=True`` 时返回 ``((views, scales), event)``。
         """
         ctx = self._require_alive()
         if not isinstance(plan, MoonepPlan):
@@ -501,21 +574,12 @@ class Buffer:
             (views, scale_views), event = result
         else:
             views, scale_views = result
-        self._view_cache[int(slot)] = (views, scale_views)
         out = (
             (views[0], views[1], views[2]) if len(views) == 3 else (views[0], views[1])
         )
-        return (out, event) if async_finish else out
-
-    def scale_views(self, slot: int = 0) -> tuple:
-        """最近一次 prefetch 的 scale 视图元组（mxfp8；未量化时为空元组）。"""
-        self._require_alive()
-        if not 0 <= slot < self._slots:
-            raise ValueError(f"slot={slot} 超出槽位数 {self._slots}")
-        cached = self._view_cache.get(int(slot))
-        if cached is None:
-            raise RuntimeError(f"slot={slot} 尚无视图——先调用一次 prefetch_weight")
-        return cached[1]
+        if async_finish:
+            return (out, scale_views), event
+        return out, scale_views
 
     def combine(
         self,
@@ -557,6 +621,13 @@ class Buffer:
                     f"route_weights_nvs.numel()={route_weights_nvs.numel()} "
                     f"!= hidden_nvsh.shape[0]={hidden_nvsh.shape[0]}"
                 )
+        combine_input = hidden_nvsh
+        if route_weights_nvs is not None and self._rank_size >= 16:
+            # Apply selection weights before large-group combine while retaining
+            # the original weights for the gathered view.
+            combine_input = (hidden_nvsh.float() * route_weights_nvs.unsqueeze(1)).to(
+                hidden_nvsh.dtype
+            )
         have_fwd = self._handle_fwd is not None
         have_bwd = self._handle_bwd is not None
         if route_weights_nvs is not None:
@@ -585,7 +656,7 @@ class Buffer:
                 "（同方向 dispatch→combine 之间不能插另一 plan）"
             )
         out, out_w = self._eb.combine(
-            hidden_nvsh, handle, topk_weights=route_weights_nvs
+            combine_input, handle, topk_weights=route_weights_nvs
         )
         # 用后置空：重复 combine / 旧 handle 复用立即报错
         if fwd:
@@ -594,6 +665,53 @@ class Buffer:
         else:
             self._handle_bwd = None
             self._handle_bwd_plan = None
+        return out, out_w, None
+
+    def _combine_cached(
+        self,
+        *,
+        plan: MoonepPlan,
+        hidden_nvsh: torch.Tensor,
+        route_weights_nvs: torch.Tensor | None,
+        handle,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, object]:
+        """Combine with a caller-managed cached dispatch handle."""
+        self._require_alive()
+        self._ensure_eb()
+        if not isinstance(plan, MoonepPlan):
+            raise TypeError(f"combine 需要 MoonepPlan，got {type(plan).__name__}")
+        if hidden_nvsh.dim() != 2 or hidden_nvsh.shape[1] != self._H:
+            raise ValueError(
+                f"hidden_nvsh.shape={tuple(hidden_nvsh.shape)} 须为 [cap, H={self._H}]"
+            )
+        if hidden_nvsh.dtype not in (torch.bfloat16, torch.float16):
+            raise TypeError(
+                f"hidden_nvsh dtype 须为 bfloat16/float16，got {hidden_nvsh.dtype}"
+            )
+        if not hidden_nvsh.is_contiguous():
+            raise ValueError("hidden_nvsh 须为连续张量")
+        if route_weights_nvs is not None:
+            if (
+                route_weights_nvs.dim() != 1
+                or route_weights_nvs.dtype != torch.float32
+                or not route_weights_nvs.is_contiguous()
+            ):
+                raise ValueError(
+                    "route_weights_nvs 须为连续 1D float32，且行数等于对应 dispatch 的 recv 行数"
+                )
+            if route_weights_nvs.numel() != hidden_nvsh.shape[0]:
+                raise ValueError(
+                    f"route_weights_nvs.numel()={route_weights_nvs.numel()} "
+                    f"!= hidden_nvsh.shape[0]={hidden_nvsh.shape[0]}"
+                )
+        combine_input = hidden_nvsh
+        if route_weights_nvs is not None and self._rank_size >= 16:
+            combine_input = (hidden_nvsh.float() * route_weights_nvs.unsqueeze(1)).to(
+                hidden_nvsh.dtype
+            )
+        out, out_w = self._eb.combine(
+            combine_input, handle, topk_weights=route_weights_nvs
+        )
         return out, out_w, None
 
     def reduce_grad(
@@ -635,7 +753,6 @@ class Buffer:
             plan.experts_to_copy,
             grads,
             self._epn,
-            slot=0,
             slots=self._slots,
             async_finish=async_finish,
         )
@@ -706,7 +823,7 @@ class Buffer:
 
     @property
     def num_sms(self) -> int | None:
-        """MoonEP kernel 常驻块数上限（None = 按硬件）。"""
+        """预留参数：计划开放为 MoonEP kernel 使用的 AIV 核数；当前恒为 None。"""
         return self._num_sms
 
     @property

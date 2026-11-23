@@ -20,6 +20,7 @@ import sys
 
 import pytest
 import torch
+import torch_npu  # noqa: F401
 
 sys.path.insert(
     0,
@@ -57,26 +58,23 @@ def test_typical_shape_plan_prefetch_reduce(
     tokens, hidden, hp, top_k, experts, grad_dtype, moonep_groups
 ):
     """典型 shape 下 plan → prefetch → reduce_grad 全链功能验证。"""
-    from moonep_buffer import MoonepBuffer
+    from moonep_buffer import Buffer
 
     rank, world = _init_ep_group()
     epn = experts // world
     weight_rows = hidden * hp  # 展平行宽
 
-    try:
-        buf = MoonepBuffer(
-            tokens,
-            hidden,
-            hp,
-            top_k,
-            experts,
-            moonep_group=moonep_groups[0],
-            ep_group=moonep_groups[1],
-            weight_dtype="bf16",
-            grad_dtype=grad_dtype,
-        )
-    except Exception as e:
-        pytest.skip(f"shape 超容量: {e}")
+    buf = Buffer(
+        tokens,
+        hidden,
+        hp,
+        top_k,
+        experts,
+        world,
+        group=moonep_groups,
+        weight_dtype="bf16",
+        grad_dtype=grad_dtype,
+    )
 
     # plan
     torch.manual_seed(42 + rank)
@@ -95,7 +93,12 @@ def test_typical_shape_plan_prefetch_reduce(
         return torch.randn(epn, weight_rows, dtype=torch.bfloat16).npu()
 
     reals = [_randn_group_weights() for _ in range(3)]
-    views, scales = buf.prefetch_weight(plan, local_weights=reals)
+    views, _scales = buf.prefetch_weight(
+        plan=plan,
+        local_gate_weight=reals[0],
+        local_up_weight=reals[1],
+        local_down_weight=reals[2],
+    )
     torch.npu.synchronize()
 
     # 视图 shape 校验
@@ -110,7 +113,12 @@ def test_typical_shape_plan_prefetch_reduce(
     for g in range(3):
         grads[g][:epn] = 1.0
         grads[g][epn:] = 1.5
-    home = buf.reduce_grad(plan, local_grads=[t.npu() for t in grads])
+    home = buf.reduce_grad(
+        plan=plan,
+        local_gate_grad=grads[0].npu(),
+        local_up_grad=grads[1].npu(),
+        local_down_grad=grads[2].npu(),
+    )
     torch.npu.synchronize()
 
     # 归并结果有限
@@ -136,20 +144,20 @@ def test_typical_shape_plan_prefetch_reduce(
 def test_typical_shape_dispatch_combine(tokens, top_k, experts, moonep_groups):
     """典型 shape 下 dispatch/combine（EB 委托）功能验证。"""
     try:
-        from moonep_buffer import MoonepBuffer
+        from moonep_buffer import Buffer
     except ImportError:
         pytest.skip("需 cann_ops_transformer（EB dispatch/combine）")
 
     rank, world = _init_ep_group()
     hidden = 3584
-    buf = MoonepBuffer(
+    buf = Buffer(
         tokens,
         hidden,
         hidden,
         top_k,
         experts,
-        moonep_group=moonep_groups[0],
-        ep_group=moonep_groups[1],
+        world,
+        group=moonep_groups,
     )
 
     torch.manual_seed(42 + rank)
@@ -159,9 +167,17 @@ def test_typical_shape_dispatch_combine(tokens, top_k, experts, moonep_groups):
 
     x = torch.randn(tokens, hidden, dtype=torch.bfloat16).npu()
     weights = torch.rand(tokens, top_k, dtype=torch.float32).npu()
-    recv_x, recv_w, handle = buf.dispatch(plan, x, topk_weights=weights)
+    recv_x, recv_w, _, plan = buf.dispatch(
+        x,
+        route_weights_sk=weights,
+        plan=plan,
+    )
     y = torch.randn(recv_x.shape[0], hidden, dtype=torch.bfloat16).npu()
-    out, out_w = buf.combine(y, handle, topk_weights=recv_w)
+    out, out_w, _ = buf.combine(
+        plan=plan,
+        hidden_nvsh=y,
+        route_weights_nvs=recv_w,
+    )
     torch.npu.synchronize()
 
     assert recv_x.shape[0] > 0, "dispatch 接收行数为零"
