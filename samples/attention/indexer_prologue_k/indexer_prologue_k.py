@@ -379,7 +379,7 @@ class _FusedPostScatterKernel:
                 rr.vload_unalign_init(rotated, rotated_offset)
                 shifted = rr.vload_unalign(rotated, rotated_offset)
                 old = rr.vload(work, segment_start)
-                merged = rr.vmerge(range_mask, shifted, old)
+                merged = rr.vselect(shifted, old, cond_mask=range_mask)
                 rr.vstore(work, segment_start, merged, end_mask)
 
             rr.vmem_bar("vst_vld")
@@ -484,7 +484,7 @@ class _FusedPostScatterKernel:
                     code_scratch,
                     (first_group + 1) * VL - FP4_GROUP_SIZE // E2M1_VALUES_PER_BYTE,
                 )
-                joined = rr.vmerge(tail, second_shifted, first)
+                joined = rr.vselect(second_shifted, first, cond_mask=tail)
                 rr.vstore_pack(
                     packed_output,
                     group_pair * FP4_GROUP_SIZE,

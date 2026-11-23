@@ -226,10 +226,9 @@ API 页面按语言、数据结构、数据搬运、计算、设备执行、调�
       - [vne](compute/vector/reg_compare/vne.md)
       - [vnes](compute/vector/reg_compare/vnes.md)
     - 排布变换
-      - [vcompress](compute/vector/reg_permute_sel/vcompress.md)
+      - [vsqueeze](compute/vector/reg_permute_sel/vsqueeze.md)
       - [vdeinterleave](compute/vector/reg_permute_sel/vdeinterleave.md)
       - [vinterleave](compute/vector/reg_permute_sel/vinterleave.md)
-      - [vmerge](compute/vector/reg_permute_sel/vmerge.md)
       - [vpack](compute/vector/reg_permute_sel/vpack.md)
       - [vselect](compute/vector/reg_permute_sel/vselect.md)
       - [vsqueeze_and_storeunalign_finalize](compute/vector/reg_permute_sel/vsqueeze-and-storeunalign-finalize.md)

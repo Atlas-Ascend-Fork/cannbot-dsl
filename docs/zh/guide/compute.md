@@ -214,7 +214,7 @@ mask, _ = update_mask(64, 32)                       # 位置参数形式
 | 选择 | `vselect(a, b, cond_mask=...)` |
 | 广播 | `vdup`、`vdups` |
 | 类型转换 | `vcast`、`vreinterpret`、`vceil`、`vfloor`、`vtrunc` |
-| 排布变换 | `vpack`、`vunpack`、`vinterleave`、`vdeinterleave`、`vmerge`、`vcompress`、`vunsqueeze` |
+| 排布变换 | `vpack`、`vunpack`、`vinterleave`、`vdeinterleave`、`vsqueeze`、`vunsqueeze` |
 | 掩码操作 | `full_mask`、`create_mask`、`update_mask`、`mask_counter`、`mask_and/or/xor/not` |
 | 索引 | `varange` |
 | 直方图 | `vhistogram_accumulate`、`vhistogram_frequency` |

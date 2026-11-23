@@ -2134,8 +2134,8 @@ const apiSidebar = [
                 "section": "/compute/vector/reg_permute_sel",
                 "items": [
                   {
-                    "text": "vcompress",
-                    "link": "/zh/api/compute/vector/reg_permute_sel/vcompress"
+                    "text": "vsqueeze",
+                    "link": "/zh/api/compute/vector/reg_permute_sel/vsqueeze"
                   },
                   {
                     "text": "vdeinterleave",
@@ -2144,10 +2144,6 @@ const apiSidebar = [
                   {
                     "text": "vinterleave",
                     "link": "/zh/api/compute/vector/reg_permute_sel/vinterleave"
-                  },
-                  {
-                    "text": "vmerge",
-                    "link": "/zh/api/compute/vector/reg_permute_sel/vmerge"
                   },
                   {
                     "text": "vpack",

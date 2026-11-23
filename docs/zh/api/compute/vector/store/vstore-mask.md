@@ -17,7 +17,7 @@
 ## 函数原型
 
 ```python
-vstore_mask(tensor, offset, value: RawVReg, mask: Mask, *, merge_mode: 'str | MergeMode' = MergeMode.ZEROING) -> None
+vstore_mask(tensor, offset, value: RawVReg, mask: Mask) -> None
 ```
 
 ## 参数说明
@@ -28,7 +28,6 @@ vstore_mask(tensor, offset, value: RawVReg, mask: Mask, *, merge_mode: 'str | Me
 | `offset` | 输入 | 相对`tensor`起始地址的偏移量，类型为`dtypes.int32`，单位为元素。<br>通过`offset`参数偏移后的实际访问地址落在UB地址范围内，且实际访问地址仍需32字节对齐，否则会报错。 |
 | `value` | 输入 | 源操作数（矢量数据寄存器）。dtype须与`tensor`一致。 |
 | `mask` | 输入 | 源操作数掩码（掩码寄存器），用于指示参与搬出的元素。对应位置为1时参与搬出，为0时不参与搬出。 |
-| `merge_mode` | 输入 | 掩码合并模式，类型为`MergeMode`或对应的字符串，默认值为`MergeMode.ZEROING`。本搬出接口对未选中的目的地址均保留原值，此参数不改变这一行为。 |
 
 **支持的元素数据类型：**
 

@@ -1,4 +1,4 @@
-# vcompress
+# vsqueeze
 ## 产品支持情况
 
 - Ascend 950PR&950DT系列产品：支持
@@ -12,7 +12,7 @@
 ## 函数原型
 
 ```python
-vcompress(src: RawVReg, *, mask: Mask) -> RawVReg
+vsqueeze(src: RawVReg, *, mask: Mask) -> RawVReg
 ```
 
 ## 参数说明
@@ -37,7 +37,7 @@ vcompress(src: RawVReg, *, mask: Mask) -> RawVReg
 
 ## 调用示例
 
-以下示例演示`vcompress`的调用，并在Host侧校验结果。
+以下示例演示`vsqueeze`的调用，并在Host侧校验结果。
 
 ```python
 import torch
@@ -46,11 +46,11 @@ import torch_npu
 from cannbotdsl import Buffer, host, make_layout, mem_copy
 from cannbotdsl.lang.kernel import kernel
 from cannbotdsl.lang.vf import vf
-from cannbotdsl.ops.reg import create_mask, full_mask, vcompress, vload, vstore
+from cannbotdsl.ops.reg import create_mask, full_mask, vsqueeze, vload, vstore
 from cannbotdsl.tensor import MemLoc
 
 @kernel
-def _vcompress_kernel(src0, dst):
+def _vsqueeze_kernel(src0, dst):
     buf = Buffer(MemLoc.UB, src0.dtype, make_layout((64,)))
     out = Buffer(MemLoc.UB, dst.dtype, make_layout((64,)))
 
@@ -60,13 +60,13 @@ def _vcompress_kernel(src0, dst):
     res = out
     with vf(mode="simd"):
         mask = create_mask(pattern="vl32", elem_bits=32)
-        vstore(res, 0, vcompress(vload(in0, 0), mask=mask), full_mask())
+        vstore(res, 0, vsqueeze(vload(in0, 0), mask=mask), full_mask())
 
     mem_copy(dst, out)
 
 @host
 def run(src0, dst):
-    _vcompress_kernel[1](src0, dst)
+    _vsqueeze_kernel[1](src0, dst)
 
 def main():
     src0 = torch.arange(64, dtype=torch.float32, device="npu:0")
@@ -78,7 +78,7 @@ def main():
     expected = torch.zeros(64)
     expected[:32] = src0.cpu()[:32]
     torch.testing.assert_close(dst.cpu(), expected)
-    print("vcompress example passed")
+    print("vsqueeze example passed")
     print(f"first={float(dst.cpu()[0]):.4f}, last={float(dst.cpu()[31]):.4f}")
 
 if __name__ == "__main__":
@@ -88,6 +88,6 @@ if __name__ == "__main__":
 预期结果：
 
 ```text
-vcompress example passed
+vsqueeze example passed
 first=0.0000, last=31.0000
 ```
