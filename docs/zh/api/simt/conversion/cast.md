@@ -39,7 +39,7 @@ simt.cast(value, *, dtype, rounding=RoundingMode.RN, saturate=False) -> 目标�
 | `float16` | `bfloat16` | `RN`、`RNA`、`RD`、`RU`、`RZ`。 | 仅`False`。 |
 | `bfloat16` | `float16` | `RN`、`RNA`、`RD`、`RU`、`RZ`。 | `False`或`True`；启用时须满足下文`CTRL[60]`设置要求。 |
 | `int16`、`uint16` | `float16`、`bfloat16` | `RN`、`RD`、`RU`、`RZ`。 | 仅`False`。 |
-| `int32`、`uint32` | `float16` | `RN`、`RNA`、`RD`、`RU`、`RZ`。 | `False`或`True`；启用时须满足下文`CTRL[60]`设置要求。 |
+| `int32`、`uint32` | `float16` | `RN`、`RNA`、`RD`、`RU`、`RZ`。 | `False`或`True`。 |
 | `int32`、`uint32` | `bfloat16` | `RN`、`RNA`、`RD`、`RU`、`RZ`。 | 仅`False`。 |
 | `int64`、`uint64` | `float16`、`bfloat16` | `RN`、`RNA`、`RD`、`RU`、`RZ`。 | 仅`False`。 |
 | `float16`、`bfloat16` | `int8`、`uint8` | 固定向零舍入，`rounding`参数不生效。 | 不生效。 |
@@ -48,7 +48,7 @@ simt.cast(value, *, dtype, rounding=RoundingMode.RN, saturate=False) -> 目标�
 | `int8`、`uint8`、`int16`、`uint16`、`int32`、`uint32`、`int64`、`uint64`、`float32`、`bool` | 同左，且与源类型不同 | 不生效，按普通标量数值转换处理；浮点转整数时，输入须为有限值且结果在目标范围内。 | 不生效。 |
 
 - 不支持表外类型组合。`int8`、`uint8`转换为`float16`或`bfloat16`时，须先转换为`int32`。
-- 表中标明支持`saturate=True`的转换受`CTRL[60]`控制：SIMD与SIMT混合执行时，须在进入SIMT函数前，在SIMD侧将`CTRL[60]`置为`0`；纯SIMT Kernel中不能通过该参数启用这些转换的饱和模式。寄存器设置接口见[set_ctrl](../../execution/device/spr/set-ctrl.md)。
+- `float32`转换为`float16`或`bfloat16`、`bfloat16`转换为`float16`时，饱和行为受`CTRL[60]`控制：SIMD与SIMT混合执行时，须在进入SIMT函数前，在SIMD侧将`CTRL[60]`置为`0`；纯SIMT Kernel中不能通过该参数启用这些转换的饱和模式。寄存器设置接口见[set_ctrl](../../execution/device/spr/set-ctrl.md)。
 - 此处的饱和转换将超范围结果限制为目标类型的有限值，不是将结果限制到`[0, 1]`。
 
 ## 调用示例
