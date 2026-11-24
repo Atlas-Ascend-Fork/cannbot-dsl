@@ -31,13 +31,15 @@ veqs(src: RawVReg, scalar, *, mask: Mask) -> Mask
 
 **支持的元素数据类型：**
 
-`dtypes.int8`、`dtypes.uint8`、`dtypes.int16`、`dtypes.uint16`、`dtypes.float16`、`dtypes.bfloat16`、`dtypes.int32`、`dtypes.uint32`、`dtypes.float32`。
+`dtypes.int8`、`dtypes.uint8`、`dtypes.int16`、`dtypes.uint16`、`dtypes.float16`、`dtypes.bfloat16`、`dtypes.int32`、`dtypes.uint32`、`dtypes.float32`、`dtypes.int64`、`dtypes.uint64`。
 
 ## 返回值说明
 
 返回保存逐元素比较结果的掩码寄存器值，类型为`Mask`。
 
 ## 约束说明
+
+- `int64`、`uint64`输入的`scalar`须为对应类型可表示的整数。
 
 - 本接口需在VF作用域内调用，`src`为矢量数据寄存器。
 - `mask`比特位为0时，计算结果对应比特位写0。

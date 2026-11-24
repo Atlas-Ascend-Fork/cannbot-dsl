@@ -30,7 +30,7 @@ vmula(acc: RawVReg, lhs: RawVReg, rhs: RawVReg, *, mask: Mask) -> RawVReg
 
 **支持的元素数据类型：**
 
-支持的数据类型为`dtypes.int16`、`dtypes.uint16`、`dtypes.float16`、`dtypes.bfloat16`、`dtypes.int32`、`dtypes.uint32`、`dtypes.float32`。
+支持的数据类型为`dtypes.int16`、`dtypes.uint16`、`dtypes.float16`、`dtypes.bfloat16`、`dtypes.int32`、`dtypes.uint32`、`dtypes.float32`、`dtypes.int64`、`dtypes.uint64`。
 
 ## 返回值说明
 

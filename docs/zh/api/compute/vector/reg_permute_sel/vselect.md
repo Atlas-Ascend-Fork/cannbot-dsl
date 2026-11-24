@@ -31,7 +31,7 @@ vselect(src_true: RawVReg, src_false: RawVReg, *, cond_mask: Mask) -> RawVReg
 
 **支持的元素数据类型：**
 
-`dtypes.bool`、`dtypes.int8`、`dtypes.uint8`、`dtypes.hifloat8`、`dtypes.float8_e5m2`、`dtypes.float8_e4m3fn`、`dtypes.int16`、`dtypes.uint16`、`dtypes.float16`、`dtypes.bfloat16`、`dtypes.int32`、`dtypes.uint32`、`dtypes.float32`。
+`dtypes.bool`、`dtypes.int8`、`dtypes.uint8`、`dtypes.hifloat8`、`dtypes.float8_e5m2`、`dtypes.float8_e4m3fn`、`dtypes.int16`、`dtypes.uint16`、`dtypes.float16`、`dtypes.bfloat16`、`dtypes.int32`、`dtypes.uint32`、`dtypes.float32`、`dtypes.int64`、`dtypes.uint64`。
 
 ## 返回值说明
 

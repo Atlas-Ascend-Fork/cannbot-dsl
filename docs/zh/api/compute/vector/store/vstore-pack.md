@@ -11,7 +11,7 @@
 
 - **连续对齐搬出模式**：将压缩后的数据搬出到UB起始地址，由用户自行更新目的地址。
 - **立即数偏移搬出模式**：通过`dtypes.int32`类型的`offset`指定相对目的起始地址的偏移，偏移单位为**元素**，用户可选择更新偏移或更新目的地址。
-- **Post Update搬出模式**：压缩搬出完成后自动更新目的地址，`offset`指定每次更新的元素个数。
+- **Post Update搬出模式**：`B64_TO_B32`模式压缩搬出完成后自动更新目的地址，`offset`指定每次更新的32位目的元素个数。
 
 以**b32位宽压缩至b16位宽搬出**过程为例，示意图如下：
 
@@ -19,7 +19,7 @@
 
 ![reg store pack示意图](../../../figures/reg_store_pack.svg)
 
-从矢量数据寄存器压缩搬出到UB的接口，根据`mask`将`value`中有效元素的低位bit数据连续存储于`tensor`中。
+从矢量数据寄存器压缩搬出到UB的接口，根据`mask`将`value`中有效元素的低位bit数据写入`tensor`的对应目的位置。
 
 ## 函数原型
 
@@ -32,15 +32,15 @@ vstore_pack(tensor, offset, value: RawVReg, mask: Mask, *, pack_mode, post_updat
 | 参数 | 输入/输出 | 说明 |
 | --- | --- | --- |
 | `tensor` | 输出 | 目的操作数的起始地址。起始地址需32字节对齐。 |
-| `offset` | 输入 | 相对`tensor`起始地址的偏移量，类型为`dtypes.int32`，单位为元素。<br>`offset`的单位为元素，通过`offset`参数偏移后的实际访问地址需落在UB地址范围内，且仍需32字节对齐，否则会报错。 |
-| `value` | 输入 | 源操作数（矢量数据寄存器）。`dtype`须与`tensor`一致。 |
+| `offset` | 输入 | 目的地址偏移量，类型为`dtypes.int32`，单位为目的元素。`B64_TO_B32`且`post_update=True`时作为游标步长，而非本次写入的起始偏移。实际访问地址须在UB有效范围内，并满足32字节对齐要求。 |
+| `value` | 输入 | 源操作数（矢量数据寄存器）。与`tensor`的元素类型组合须满足[约束说明](#约束说明)；`B64_TO_B32`模式将64位整数的低32位写入32位整数目的元素。 |
 | `mask` | 输入 | 源操作数掩码（掩码寄存器），用于指示参与搬出的元素。对应位置为1时参与搬出，为0时不参与搬出。<br>`mask`比特位为1的源操作数元素参与搬出，并将低半部分bit数据写入压缩后对应的目的位置；为0的元素不参与搬出，压缩后对应的目的位置保持原值。 |
 | `pack_mode` | 输入 | 压缩搬出模式，类型为`PackMode`或对应的字符串，必选。可用的压缩模式及其与寄存器、目的元素类型和掩码粒度的组合要求见[约束说明](#约束说明)，不能使用共享枚举的全部成员。 |
-| `post_update` | 输入 | 是否采用Post Update模式。取值为`True`或`False`，默认值为`False`。取值为`True`时，`offset`仍作为目的地址偏移使用，本接口不更新目的地址指针。 |
+| `post_update` | 输入 | 是否采用Post Update模式，默认值为`False`。`B64_TO_B32`模式取`True`时，从当前目的游标写入，随后按`offset`个32位目的元素推进游标；其他现有模式仍将`offset`作为普通地址偏移，不更新目的地址指针。 |
 
 **支持的元素数据类型：**
 
-常用目的元素类型为`dtypes.int8`、`dtypes.uint8`、`dtypes.int16`、`dtypes.uint16`、`dtypes.float16`、`dtypes.bfloat16`。低精度浮点数转换结果也可按其位宽压缩存储；模式与元素类型、掩码粒度的组合见约束说明。
+常用目的元素类型为`dtypes.int8`、`dtypes.uint8`、`dtypes.int16`、`dtypes.uint16`、`dtypes.float16`、`dtypes.bfloat16`。`B64_TO_B32`模式支持`dtypes.int64`、`dtypes.uint64`源寄存器，目的元素为`dtypes.int32`或`dtypes.uint32`。低精度浮点数转换结果也可按其位宽压缩存储；模式与元素类型、掩码粒度的组合见约束说明。
 
 ## 返回值说明
 
@@ -48,13 +48,14 @@ vstore_pack(tensor, offset, value: RawVReg, mask: Mask, *, pack_mode, post_updat
 
 ## 约束说明
 
-压缩搬出需满足以下组合，不支持64位数据槽压缩为32位的搬出。
+压缩搬出需满足以下组合：
 
 | 压缩模式 | `value`的元素位宽 | `tensor`的元素位宽 | `mask.elem_bits` |
 | --- | --- | --- | --- |
 | `PACK_HALF`或`B32_TO_B16` | 16位，转换结果位于32位数据槽的低16位 | 16位 | 32 |
 | `B16_TO_B8` | 16位，或由转换得到的`dtypes.float8_e8m0` | 8位 | 16 |
 | `PACK_QUARTER`或`B32_TO_B8` | 32位，或由转换得到的`dtypes.float8_e4m3fn`、`dtypes.float8_e5m2` | 8位 | 32 |
+| `B64_TO_B32` | `int64`或`uint64`，提取每个元素的低32位 | `int32`或`uint32` | 64 |
 
 ### 通用约束
 

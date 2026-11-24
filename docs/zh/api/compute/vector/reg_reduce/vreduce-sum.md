@@ -55,6 +55,8 @@ vreduce_sum(src: RawVReg, *, mask: Mask) -> RawVReg
 | `dtypes.int32` | `dtypes.int32` |
 | `dtypes.uint32` | `dtypes.uint32` |
 | `dtypes.float32` | `dtypes.float32` |
+| `dtypes.int64` | `dtypes.int64` |
+| `dtypes.uint64` | `dtypes.uint64` |
 
 ## 返回值说明
 

@@ -27,13 +27,15 @@ vabs_sub(lhs: RawVReg, rhs: RawVReg, *, mask: Mask) -> RawVReg
 
 **支持的元素数据类型：**
 
-`dtypes.float16`、`dtypes.float32`。
+`dtypes.float16`、`dtypes.float32`、`dtypes.int64`。
 
 ## 返回值说明
 
 返回保存差值绝对值计算结果的矢量数据寄存器值，类型为`RawVReg`，其中元素的数据类型与`lhs`、`rhs`一致。
 
 ## 约束说明
+
+- `int64`输入先按64位回绕规则求差，再对该差值取绝对值；差值为`INT64_MIN`时，结果仍为`INT64_MIN`。
 
 - 本接口需在`vf(mode="simd")`作用域内调用。
 

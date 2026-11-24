@@ -30,7 +30,7 @@ vdiv(lhs: RawVReg, rhs: RawVReg, *, mask: Mask, precision_mode: bool = False) ->
 
 **支持的元素数据类型：**
 
-`dtypes.int16`、`dtypes.uint16`、`dtypes.float16`、`dtypes.int32`、`dtypes.uint32`、`dtypes.float32`。
+`dtypes.int16`、`dtypes.uint16`、`dtypes.float16`、`dtypes.int32`、`dtypes.uint32`、`dtypes.float32`、`dtypes.int64`、`dtypes.uint64`。
 
 ## 返回值说明
 

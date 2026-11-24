@@ -43,6 +43,10 @@ vscatter(tensor, src: RawVReg, index: RawVReg, *, mask: Mask) -> None
 | `dtypes.int32` | `dtypes.uint32` |
 | `dtypes.uint32` | `dtypes.uint32` |
 | `dtypes.float32` | `dtypes.uint32` |
+| `dtypes.int64` | `dtypes.uint32` |
+| `dtypes.int64` | `dtypes.uint64` |
+| `dtypes.uint64` | `dtypes.uint32` |
+| `dtypes.uint64` | `dtypes.uint64` |
 
 ## 返回值说明
 

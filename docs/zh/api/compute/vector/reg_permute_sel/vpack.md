@@ -5,7 +5,7 @@
 
 ## 功能说明
 
-将源操作数中的元素选取低8位（b16）、低16位（b32）后压缩写入返回值中：`part`取值为`'lower'`（默认值）时写入返回值的低半部分，取值为`'highest'`时写入返回值的高半部分。
+将源操作数中的元素选取低8位（b16）、低16位（b32）或低32位（b64）后压缩写入返回值中：`part`取值为`'lower'`（默认值）时写入返回值的低半部分，取值为`'highest'`时写入返回值的高半部分。
 
 ![pack high draft示意图](../../../figures/pack_high_draft.svg)
 
@@ -35,6 +35,8 @@ dtype_src与dtype_dst支持的数据类型对如下：
 | `dtypes.int16` | `dtypes.uint8` |
 | `dtypes.uint32` | `dtypes.uint16` |
 | `dtypes.int32` | `dtypes.uint16` |
+| `dtypes.int64` | `dtypes.uint32` |
+| `dtypes.uint64` | `dtypes.uint32` |
 
 ## 返回值说明
 

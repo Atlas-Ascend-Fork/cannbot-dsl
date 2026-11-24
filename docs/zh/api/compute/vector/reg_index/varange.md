@@ -35,7 +35,7 @@ varange(start, dtype, *, order_mode: 'str | OrderMode' = OrderMode.INCREASED) ->
 
 **支持的元素数据类型：**
 
-参数`dtype`指定生成索引的元素数据类型，支持`dtypes.int8`、`dtypes.int16`、`dtypes.float16`、`dtypes.int32`、`dtypes.float32`。
+参数`dtype`指定生成索引的元素数据类型，支持`dtypes.int8`、`dtypes.int16`、`dtypes.float16`、`dtypes.int32`、`dtypes.float32`、`dtypes.int64`。
 
 ## 返回值说明
 
@@ -45,7 +45,7 @@ varange(start, dtype, *, order_mode: 'str | OrderMode' = OrderMode.INCREASED) ->
 
 - 本接口需在`vf(mode="simd")`作用域内调用。
 
-- 整型dtype（`dtypes.int8`、`dtypes.int16`、`dtypes.int32`）结果在超出该dtype可表示范围时回绕（wrap-around），不触发异常。例如`dtypes.int8`取`start=127`时，序列前128个元素依次为127、−128、−127、…、-2；`start=−128`时，序列前128个元素依次为−128、−127、…、−1。
+- 整型dtype（`dtypes.int8`、`dtypes.int16`、`dtypes.int32`、`dtypes.int64`）结果在超出该dtype可表示范围时回绕（wrap-around），不触发异常。例如`dtypes.int8`取`start=127`时，序列前128个元素依次为127、−128、−127、…、-2；`start=−128`时，序列前128个元素依次为−128、−127、…、−1。
 
 ## 调用示例
 

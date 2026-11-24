@@ -26,7 +26,7 @@ vabs(src: RawVReg, *, mask: Mask) -> RawVReg
 
 **支持的元素数据类型：**
 
-`dtypes.int8`、`dtypes.int16`、`dtypes.float16`、`dtypes.int32`、`dtypes.float32`。
+`dtypes.int8`、`dtypes.int16`、`dtypes.float16`、`dtypes.int32`、`dtypes.float32`、`dtypes.int64`。
 
 ## 返回值说明
 

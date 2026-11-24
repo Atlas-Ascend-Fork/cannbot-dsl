@@ -51,6 +51,10 @@ vgather(tensor, index: RawVReg, *, mask: Mask) -> RawVReg
 | `dtypes.int32` | `dtypes.int32` | `dtypes.uint32` |
 | `dtypes.uint32` | `dtypes.uint32` | `dtypes.uint32` |
 | `dtypes.float32` | `dtypes.float32` | `dtypes.uint32` |
+| `dtypes.int64` | `dtypes.int64` | `dtypes.uint32` |
+| `dtypes.int64` | `dtypes.int64` | `dtypes.uint64` |
+| `dtypes.uint64` | `dtypes.uint64` | `dtypes.uint32` |
+| `dtypes.uint64` | `dtypes.uint64` | `dtypes.uint64` |
 
 其中，`src_dtype`表示`tensor`的元素数据类型，`dst_dtype`表示返回寄存器值的元素数据类型，`index_dtype`表示索引寄存器的元素数据类型。返回元素类型与`tensor`一致；8位源元素使用16位硬件数据槽和`elem_bits=16`的掩码，不表示DSL返回元素类型提升为16位。
 
@@ -69,7 +73,7 @@ vgather(tensor, index: RawVReg, *, mask: Mask) -> RawVReg
 - 对于`mask`筛选需要搬运的元素，对应的地址需要在UB有效范围内；对于`mask`未筛选的元素，对应的地址不会触发任何地址越界异常，同时返回值中对应的元素将被置零。
 - 当`tensor`为8位元素类型时，每个16位硬件数据槽的低8位保存收集到的源元素比特，高8位补0。返回寄存器仍按源元素类型解释，不能将硬件槽补零理解为返回`dtypes.int16`或`dtypes.uint16`。
 
-- 当`tensor`与返回值数据类型一致，但是与`index`数据类型不一致时，数据写入返回值索引为偶数的位置，奇数索引位置置零。例如`tensor`为`dtypes.int8`数据类型，`index`为`dtypes.uint16`数据类型时，适用场景如下图：
+- 对于8位或16位源元素，当`index`的元素位宽是源元素位宽的两倍时，数据写入返回值索引为偶数的位置，奇数索引位置置零。64位源数据与32位索引组合时，返回连续的完整64位元素。例如`tensor`为`dtypes.int8`数据类型，`index`为`dtypes.uint16`数据类型时，适用场景如下图：
 
 ![vgather different type示意图](../../../figures/vgather_different_type.svg)
 

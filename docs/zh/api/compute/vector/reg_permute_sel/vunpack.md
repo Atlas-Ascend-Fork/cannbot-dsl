@@ -45,6 +45,8 @@ dtype_src与dtype_dst支持的数据类型对如下：
 | `dtypes.int8` | `dtypes.int16` |
 | `dtypes.uint16` | `dtypes.uint32` |
 | `dtypes.int16` | `dtypes.int32` |
+| `dtypes.uint32` | `dtypes.uint64` |
+| `dtypes.int32` | `dtypes.int64` |
 
 ## 返回值说明
 
