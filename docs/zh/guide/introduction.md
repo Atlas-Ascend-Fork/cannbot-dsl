@@ -151,8 +151,9 @@ program(x, y, out)
 
 ```python
 add_kernel[8](x, y, out)   # 启动 8 个 block
-add_kernel(x, y, out)      # 省略时默认为 1
 ```
+
+每次启动都必须显式指定 block 数量；省略方括号或传入 `None` 会报错。
 
 纯 SIMT Kernel 则由 Host 传 `dim3(block)` 和 `dim3(thread)`；两种启动形式见[SIMT · Host 启动规则](./compute.md#host-启动规则)。SIMT 需要 CANN 9.2.0 及以上版本。
 
