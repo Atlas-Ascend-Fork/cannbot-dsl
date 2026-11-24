@@ -397,6 +397,10 @@
       "source": "samples/attention/flash_attn_hif8_fullquant",
       "test": "test/attention/flash_attn_hif8_fullquant"
     },
+    "flash_attn_mxfp8_fullquant": {
+      "source": "samples/attention/flash_attn_mxfp8_fullquant",
+      "test": "test/attention/flash_attn_mxfp8_fullquant"
+    },
     "mega_compressor": {
       "source": "samples/attention/mega_compressor",
       "test": "test/attention/mega_compressor",
@@ -497,6 +501,7 @@
       "flash_attn",
       "flash_attn_fp8_fullquant",
       "flash_attn_hif8_fullquant",
+      "flash_attn_mxfp8_fullquant",
       "flash_mla_with_kvcache",
       "mega_compressor"
     ],
@@ -1123,6 +1128,17 @@
         ],
         "tests": [
           "@flash_attn_hif8_fullquant/test"
+        ]
+      },
+      {
+        "name": "flash_attn_mxfp8_fullquant",
+        "enabled": true,
+        "watch": [
+          "@flash_attn_mxfp8_fullquant/source",
+          "@flash_attn_mxfp8_fullquant/test"
+        ],
+        "tests": [
+          "@flash_attn_mxfp8_fullquant/test"
         ]
       },
       {
