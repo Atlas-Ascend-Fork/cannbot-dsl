@@ -111,7 +111,7 @@ def _init_ep_group():
 
 
 def _assert_cu_matches_vtopk(cu, vtopk, num_experts):
-    hist = torch.bincount(vtopk.to(torch.int64), minlength=2 * num_experts)
+    hist = torch.bincount(vtopk.reshape(-1).to(torch.int64), minlength=2 * num_experts)
     dist.all_reduce(hist)
     rows = cu.numel()
     rank = dist.get_rank()
@@ -740,7 +740,9 @@ def test_moonep_precision_pipeline_fp32_then_bf16():
         f"vtopk 越界：[{int(v_cpu.min())},{int(v_cpu.max())}) 应为 [0,{2 * shape.num_experts})"
     )
     _assert_cu_matches_vtopk(cu, vtopk, shape.num_experts)
-    for i, (v, e) in enumerate(zip(v_cpu.tolist(), topk_all[rank].flatten().tolist())):
+    for i, (v, e) in enumerate(
+        zip(v_cpu.reshape(-1).tolist(), topk_all[rank].flatten().tolist())
+    ):
         d, slot = v // (2 * epn), v % (2 * epn)
         if slot < epn:
             assert d == e // epn and slot == e % epn, (
@@ -1010,7 +1012,9 @@ def test_moonep_general_spec_8192_h7168_k16_epn28():
         f"（合法范围 [0, 2E)={2 * shape.num_experts}）"
     )
     _assert_cu_matches_vtopk(cu, vtopk, shape.num_experts)
-    for i, (v, e) in enumerate(zip(v_cpu.tolist(), topk_all[rank].flatten().tolist())):
+    for i, (v, e) in enumerate(
+        zip(v_cpu.reshape(-1).tolist(), topk_all[rank].flatten().tolist())
+    ):
         d, slot = v // (2 * epn), v % (2 * epn)
         if slot < epn:
             assert d == e // epn and slot == e % epn, (

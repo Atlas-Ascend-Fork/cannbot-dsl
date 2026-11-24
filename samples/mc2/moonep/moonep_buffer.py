@@ -420,6 +420,23 @@ class Buffer:
         )
 
     def _dispatch_and_return(self, x, plan, do_cpu_sync, topk_weights, forward):
+        expected_epn = self._E // self._rank_size
+        etc_shape = tuple(plan.experts_to_copy.shape)
+        if etc_shape != (self._rank_size, expected_epn):
+            raise ValueError(
+                f"plan 的专家空间与当前 Buffer 不一致："
+                f"etc.shape={etc_shape}, 期望=({self._rank_size}, {expected_epn})"
+            )
+        if plan.cu_seqlens.numel() != 2 * expected_epn:
+            raise ValueError(
+                f"plan.cu_seqlens.numel()={plan.cu_seqlens.numel()} "
+                f"!= 2*epn={2 * expected_epn}"
+            )
+        if tuple(plan.vtopk.shape) != (self._S, self._K):
+            raise ValueError(
+                f"plan.vtopk.shape={tuple(plan.vtopk.shape)} "
+                f"!= 构造期 (S, K)=({self._S}, {self._K})"
+            )
         self._ensure_eb()
         dispatch_kwargs = {
             "topk_weights": (
@@ -429,7 +446,7 @@ class Buffer:
         }
         dispatch_kwargs.update(
             {
-                "topk_idx": plan.vtopk.view(self._S, self._K),
+                "topk_idx": plan.vtopk,
                 "num_experts": 2 * self._E,
                 "num_max_tokens_per_rank": self._nmtr,
             }

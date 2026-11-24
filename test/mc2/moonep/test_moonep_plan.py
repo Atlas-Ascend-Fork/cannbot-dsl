@@ -154,12 +154,12 @@ def _make_case(shape, mode, seed):
 
 
 def _ep_dispatch(buf, x, vtopk, shape, rw=None):
-    """dispatch：topk_idx=vtopk（[N] 虚拟专家 id 投影 reshape 为 [S,K]），
+    """dispatch：topk_idx=vtopk（[S,K] 虚拟专家 id），
     num_experts=2E 扩展空间。返回 (recv_x, recv_w, handle)。
     """
     recv_x, _, recv_w, handle = buf.dispatch(
         x,
-        topk_idx=vtopk.view(shape.num_tokens, shape.top_k),
+        topk_idx=vtopk,
         topk_weights=rw,
         num_experts=2 * shape.num_experts,
         num_max_tokens_per_rank=_ep_nmtr(shape.num_tokens, shape.top_k),
@@ -350,7 +350,7 @@ def test_moonep_plan_single_source_nondivisible():
 
     slots = 2 * epn
     etc_rows = etc.cpu().tolist()
-    vid = vtopk.cpu().tolist()
+    vid = vtopk.cpu().reshape(-1).tolist()
     for e, v in zip(mine, vid):
         r, s = v // slots, v % slots
         if s < epn:

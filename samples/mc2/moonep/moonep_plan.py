@@ -13,7 +13,7 @@
     dst_n[N] / src_n[N]         零占位（vtopk-only 快路径不计算）
     cu_seqlens[2*epn]           本 rank 接收区各槽位累计行数
     experts_to_copy[R, epn]     各 rank 的副本清单（-1 填充，单源）
-    vtopk[N]                    虚拟专家 id（扩展空间 2E）
+    vtopk[S,K]                  虚拟专家 id（扩展空间 2E）
 
 约束：E <= 1024、R <= MAX_R（128）、E % R == 0；N = S*K 任意规模。
 
@@ -103,6 +103,7 @@ _MAX_PLAN_BLOCKS = 64  # 单次启动 block 上限，实际取 min(AIV 核数, c
 _PLAN_BLOCK_LIMIT = _MAX_PLAN_BLOCKS
 _CHUNK_MIN = 128  # chunk 下限（token/块），再小则每块 O(E) 重建占比过高
 _VF_SAFE_CHUNK = 1024  # chunk 上限（vf 栈安全——见 _plan_chunking docstring）
+_PLAN_UB_BUDGET = 192 * 1024  # Greedy 的 dem+order 两个 R*E 表的 UB 预算
 
 # 向量粒度（2048-bit 向量）
 _I32_LANES = 64  # int32 lanes（Assign 冷专家路径步长）
@@ -575,7 +576,7 @@ class _PlanKernel:
 
     @jit
     def _warp_min_source_idx(self, ub_loads, ub_rhome, src_r, world_size, lane):
-        """Find the least-loaded destination compatible with its source rank."""
+        """选择与源 rank 兼容的最轻目标 rank。"""
         best = dtypes.int32(_GREEDY_POS_INF)
         idx = dtypes.int32(-1)
         for j in range_constexpr((world_size + _WARP_SIZE - 1) // _WARP_SIZE):
@@ -725,23 +726,20 @@ class _PlanKernel:
     def _pfx(self, ctx, block_id, views):
         """热专家的 chunk 前缀位置表与段查找表。"""
         world_size, num_experts = self._rank_size, self._num_experts
-        num_chunks = self._num_chunks
         experts_per_block = num_experts // self._pfx_blocks
         expert_start = block_id * experts_per_block
 
-        pcnt_row = Buffer(MemLoc.UB, dtypes.int32, make_layout((1, num_chunks)))
         ord_rank_row = Buffer(MemLoc.UB, dtypes.int32, make_layout((1, world_size)))
         ord_end_row = Buffer(MemLoc.UB, dtypes.int32, make_layout((1, world_size)))
 
         for k in cannbotdsl.range(experts_per_block):
             e = expert_start + k
-            self._build_pfx_row(ctx, e, views, pcnt_row, ord_rank_row, ord_end_row)
-            mem_copy(tile_slice(views.pcnt, (1, num_chunks), (e, 0)), pcnt_row)
+            self._build_pfx_row(ctx, e, views, ord_rank_row, ord_end_row)
             mem_copy(tile_slice(views.ord_rank, (1, world_size), (e, 0)), ord_rank_row)
             mem_copy(tile_slice(views.ord_end, (1, world_size), (e, 0)), ord_end_row)
 
     @jit
-    def _build_pfx_row(self, ctx, e, views, pcnt_row, ord_rank_row, ord_end_row):
+    def _build_pfx_row(self, ctx, e, views, ord_rank_row, ord_end_row):
         """单个专家的 pcnt/ord_rank/ord_end 行。"""
         world_size = self._rank_size
         my_rank = dtypes.int32(ctx.rankId)  # 运行时取（self-serve 偏好序）
@@ -790,9 +788,10 @@ class _PlanKernel:
                                     gm_dem.ptr((dtypes.int64(r), dtypes.int64(e)))
                                 )
                 chunk_prefix = dtypes.int32(0)
-                for c in range_constexpr(num_chunks):
-                    pcnt_row[dtypes.int64(0), dtypes.int64(c)] = (
-                        prefix_base + chunk_prefix
+                for c in cannbotdsl.range(num_chunks):
+                    simt.l2cache_store(
+                        views.pcnt.ptr((dtypes.int64(e), dtypes.int64(c))),
+                        prefix_base + chunk_prefix,
                     )
                     chunk_prefix = chunk_prefix + simt.l2cache_load(
                         gm_counts.ptr((dtypes.int64(c), dtypes.int64(e)))
@@ -1022,7 +1021,7 @@ def _moonep_plan_host(
     gm_io,
     ctx: StructRef[MoonepCommCtx],
 ):
-    """Launch plan phases according to the expert-parallel group size."""
+    """按 EP 组规模选择 launch 形态：小 EP 融合，大 EP 分阶段。"""
     num_experts = gm_tpe.shape[0]
     world_size = _RANK_SIZE  # trace 期烘焙；rank 运行时由 ctx.rankId 取
     num_rows = gm_topk.shape[0]  # 本 rank topk 扁平视图，直接作 Cnt/Asg 输入
@@ -1283,7 +1282,7 @@ class MoonepPlan(NamedTuple):
         experts_to_copy: [R, epn] int32 副本清单（-1 填充；每行至多一个
             远程 home rank），prefetch/reduce 共用。
         src_n: [N] int32 零占位（vtopk-only 快路径不计算）。
-        vtopk: [N] int32 虚拟专家 id（扩展空间 2E，供 moe_ep dispatch 路由）。
+        vtopk: [S, K] int32 虚拟专家 id（扩展空间 2E，供 moe_ep dispatch 路由）。
     """
 
     dst_n: torch.Tensor
@@ -1304,11 +1303,12 @@ def moonep_plan(context, tokens_per_expert, topk_experts_sk):
     Returns:
         MoonepPlan（NamedTuple，可按 5-tuple 解包）：
         dst_n[N] / src_n[N] 为零占位；cu_seqlens[2*epn]、experts_to_copy[R,epn]
-        与 vtopk[N] 由 kernel 全量产出。
+        与 vtopk[S,K] 由 kernel 全量产出。
 
     Notes:
         - 返回路径零同步：溢出与布局不变量延迟到下一个 moonep 算子尾部校验。
         - 形状约束：E <= 1024、R <= MAX_R（128）、E % R == 0；S*K 任意 N 原生整除。
+        - UB 约束：2*R*E*4 <= 192KiB；超出时在入口报错，避免 kernel 资源失败。
         - 规划结果可跨调用、跨前反向复用。
     """
 
@@ -1330,8 +1330,18 @@ def moonep_plan(context, tokens_per_expert, topk_experts_sk):
         raise ValueError(f"E={num_experts} 不能被 R={world_size} 整除")
     if num_experts > MAX_E:
         raise ValueError(f"E={num_experts} 超过 v1 上限 MAX_E={MAX_E}")
+    ub_need = 2 * world_size * num_experts * _INT32_BYTES
+    if ub_need > _PLAN_UB_BUDGET:
+        raise ValueError(
+            f"plan 的 dem/order UB 需求 {ub_need}B 超过预算 {_PLAN_UB_BUDGET}B："
+            f"R={world_size}, E={num_experts}；"
+            f"当前支持 2*R*E*4 <= {_PLAN_UB_BUDGET}"
+        )
     epn = num_experts // world_size
     num_rows = num_tokens * top_k  # 任意 N 原生整除（分块降档，无尾补机制）
+    topk_flat = topk_experts_sk.reshape(-1)
+    bad_topk = ((topk_flat < 0) | (topk_flat >= num_experts)).any()
+    topk_safe = topk_flat.clamp(0, num_experts - 1)
     dims = _PlanDims(num_tokens, top_k, num_experts, world_size)
     block_limit = resident_blocks(_MAX_PLAN_BLOCKS)
 
@@ -1346,7 +1356,7 @@ def moonep_plan(context, tokens_per_expert, topk_experts_sk):
     etc_end = cu_elems + etc_elems
     experts_to_copy = gm_io[cu_elems:etc_end].view(world_size, epn)
     src_n = _zero_placeholder(num_rows)
-    vtopk = gm_io[etc_end:]
+    vtopk = gm_io[etc_end:].view(num_tokens, top_k)
     # epoch 全算子共用一个单调计数器（跨算子单调，哨兵不串轮）
     gm_flag = next_barrier_epoch(context)
     # workspace 单槽缓存：同 shape 复用，shape 变化时按新布局重分配。
@@ -1371,7 +1381,7 @@ def moonep_plan(context, tokens_per_expert, topk_experts_sk):
         tokens_per_expert,
         gm_flag,
         gm_ws,
-        topk_experts_sk.reshape(-1),
+        topk_safe,
         gm_io,
         context.ctx_tensor,
     )
@@ -1380,7 +1390,7 @@ def moonep_plan(context, tokens_per_expert, topk_experts_sk):
     # 先冲洗上一轮延迟检查（异步链曾在此静默丢弃溢出信号）；
     # 本轮结果延迟到下一个算子校验，返回路径零同步。
     check_pending_overflow(context)
-    context.pending_overflow = (cu_seqlens, num_rows)
+    context.pending_overflow = (cu_seqlens, num_rows, bad_topk)
     context.last_plan_shape = (num_tokens, top_k)  # 供 prefetch/reduce 的调用顺序守卫
     context.reduce_copy_plan_token += 1
     return MoonepPlan(dst_n, cu_seqlens, experts_to_copy, src_n, vtopk)

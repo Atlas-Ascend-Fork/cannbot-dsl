@@ -351,13 +351,18 @@ def check_pending_overflow(context):
     if pending is None:
         return
     context.pending_overflow = None
-    cu_seqlens, num_rows = pending
+    cu_seqlens, num_rows, *extra = pending
     cu_tail = int(cu_seqlens[-1].item())
     if cu_tail != num_rows:
         raise RuntimeError(
             f"副本槽溢出：极端路由下单 rank 副本数超过 epn={cu_seqlens.shape[0] // 2}"
             f" 个预留槽（cu_seqlens 尾值={cu_tail} != N={num_rows}）。"
             "请检查专家清单与布局元数据。"
+        )
+    if extra and bool(extra[0].item()):
+        raise RuntimeError(
+            "topk 专家 id 越界：要求 0 <= topk_experts_sk < E；"
+            "越界项已被 clamp 到合法范围，结果不可用。"
         )
 
 
