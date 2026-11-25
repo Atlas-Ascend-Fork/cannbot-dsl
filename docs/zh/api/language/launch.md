@@ -15,7 +15,9 @@ def run(x, y, out):
     add_kernel[8](x, y, out)
 ```
 
-上例启动8个block，`x`、`y`、`out`为核函数的实参。每次启动都必须显式指定block数量。省略方括号或传入`None`会报错，不会使用默认核数。
+上例中，`x`、`y`、`out` 为核函数的实参。方括号内的 `block` 指定核函数本次启动的逻辑核数量，`[8]` 表示启动 8 个逻辑核。纯 Vector 或纯 Cube 场景下，该值分别表示启动的 Vector Core 或 Cube Core 实例数。在 Mix 1:2 模式下，该值表示启动的核组合数，每个组合包含 1 个 Cube Core 和 2 个 Vector Core。
+
+`block` 支持 Python `int` 或非布尔 DSL 整型标量，取值须大于 0。省略方括号或传入 `None` 时，默认启动 1 个逻辑核。
 
 ## 使用位置
 
