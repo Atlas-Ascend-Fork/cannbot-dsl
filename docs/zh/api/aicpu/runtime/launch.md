@@ -22,7 +22,7 @@ CompiledAicpuKernel.launch(
 
 | 参数 | 输入/输出 | 说明 |
 | --- | --- | --- |
-| `stream_handle` | 输入 | 当前NPU stream的整数句柄，可通过[current_raw_stream](./current-raw-stream.md)获取。 |
+| `stream_handle` | 输入 | 有效的 NPU stream 整数句柄，可通过 [current_raw_stream](./current-raw-stream.md) 获取。 |
 | `kwargs` | 输入 | 按参数类字段名称传入参数。标量字段传入Python整数，`interface` 模式的 GM 字段可传入 NPU `torch.Tensor` 或整数设备地址；`legacy` 模式仅传入已打包参数结构的设备地址 `param_addr`。字段名称及值须与所选模式和参数声明对应。 |
 
 ### Tensor 参数与 profiling
@@ -41,12 +41,14 @@ CompiledAicpuKernel.launch(
 
 ## 返回值说明
 
-返回`0`，表示启动请求已经提交。设备侧后续算子可以在同一NPU stream上直接使用输出缓冲区；如果Host需要立即读取结果，应通过数据拷贝或同步接口等待相关任务完成。
+返回 `0` 表示 Host 侧启动调用已返回。如需排查任务下发异常，可参考 CANN 运行时日志。
+
+AI CPU 算子异步执行。已下发的任务可以在同一 NPU stream 上按顺序衔接。Host 读取结果前应通过数据拷贝或同步接口等待相关任务完成。
 
 ## 约束说明
 
 - 只能在Host 侧调用，不能在`@aicpu_kernel`函数体或其他设备函数体中调用。
-- `stream_handle`、输入地址和输出地址必须来自同一设备。
+- `stream_handle` 须由 CANN 或 TorchNPU 运行时获取。传裸句柄时，调用方须确保句柄有效，并与输入、输出地址属于同一设备。
 - 输入和输出缓冲区必须保持有效，直到对应stream完成。
 
 ## 调用示例
@@ -87,13 +89,12 @@ def main():
             workdir=workdir,
             launch_mode="interface",
         )
-        status = compiled.launch(
+        compiled.launch(
             current_raw_stream(0),
             source=source.data_ptr(),
             output=output.data_ptr(),
             count=source.numel(),
         )
-        assert status == 0
         torch.testing.assert_close(output.cpu(), source.cpu())
 
     print("launch example passed")

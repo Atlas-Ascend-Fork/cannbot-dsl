@@ -13,7 +13,7 @@
 compile_aicpu_kernel(
     kernel: Kernel,
     *,
-    workdir: str,
+    workdir: str | None = None,
     launch_mode: str,
     npu_arch: str = "dav-3510",
     build_x86: bool = False,
@@ -27,7 +27,7 @@ compile_aicpu_kernel(
 | 参数 | 输入/输出 | 说明 |
 | --- | --- | --- |
 | `kernel` | 输入 | `@aicpu_kernel`返回的函数句柄。 |
-| `workdir` | 输入 | 保存编译结果的目录。目录不存在时自动创建，调用方需要具有写权限。 |
+| `workdir` | 输入 | 保存编译结果的目录，可省略，默认值为 `None`。省略或传入 `None` 时，框架会创建临时目录。指定目录不存在时会自动创建，调用方需要具有写权限。 |
 | `launch_mode` | 输入 | 参数传递方式。必填，无默认值。常规使用传入`"interface"`，启动时按参数类字段名称传入参数。`"legacy"`为保留模式，启动时通过`param_addr`传入已打包参数结构的设备地址。 |
 | `npu_arch` | 输入 | 目标NPU架构，默认值为`"dav-3510"`。应与实际运行设备和编译环境匹配。 |
 | `build_x86` | 输入 | 是否额外准备Host 侧验证产物，默认值为`False`。普通设备运行不需要设置为`True`。 |
@@ -38,7 +38,8 @@ compile_aicpu_kernel(
 
 ## 约束说明
 
-无
+编译前需安装对应版本的 CANN Toolkit，并加载该安装目录的 `set_env.sh`。
+`ASCEND_HOME_PATH` 必须指向该 CANN 安装目录，`compile_aicpu_kernel()` 通过它查找 Bisheng 和 AI CPU 交叉编译工具链。
 
 ## 调用示例
 
