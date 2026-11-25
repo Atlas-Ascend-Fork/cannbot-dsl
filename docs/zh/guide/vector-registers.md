@@ -129,12 +129,12 @@ def _compute(self, x, out):
 
 ## RegLayout
 
-部分搬入 / 搬出接口接受 `reg_layout` 参数，用于指定数据在寄存器内的排布变体，样例里出现在成对的解交织加载上：
+类型转换接口 `vcast` 接受 `reg_layout` 参数，用于指定数据在寄存器内的排布变体，样例里出现在成对的解交织加载后的类型转换上：
 
 ```python
 even_exp, odd_exp = rr.vload_deinterleave(qk_ch, base, width="b32")
-rr.vstore_strided(..., reg_layout=rr.RegLayout.ZERO)
-rr.vstore_strided(..., reg_layout=rr.RegLayout.ONE)
+even_fp16 = rr.vcast(even_exp, self.dtype_16, mask=even_mask, reg_layout=rr.RegLayout.ZERO)
+odd_fp16 = rr.vcast(odd_exp, self.dtype_16, mask=odd_mask, reg_layout=rr.RegLayout.ONE)
 ```
 
 ::: info 包内可用 · 文档站未收录
