@@ -6,11 +6,13 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 
-"""Bounded CI coverage: six precision cases and two metadata-only cases.
+"""Bounded CI coverage for precision, FP4 weight layout and output metadata.
 
 The broader token sweep, intermediate-byte checks, graph stress and profiler
 utilities are maintained outside the repository under local validation/.
 """
+
+# fmt: off
 
 from functools import lru_cache
 
@@ -90,7 +92,7 @@ def _native(x, sin, cos, weights):
 
 
 def _as_nz(weights):
-    """Prepack FP8 bytes into private NZ and transpose their ND scale axes."""
+    """Prepack FP8 bytes into standard NZ and transpose their ND scale axes."""
     wa, wb, sa, sb = weights
     e8 = torch.float8_e8m0fnu
     packed = []
@@ -161,6 +163,39 @@ def test_attn_epilogue(t, ng, nz):
             raise
 
 
+@pytest.mark.npu
+@pytest.mark.parametrize("t,ng", [(17, 2), (257, 1)])
+def test_fp4_woa_nz(t, ng):
+    """Check the official FP4 NZ conversion and reject mismatched weight layouts."""
+    torch.npu.set_device(0)
+    x, sin, cos = _inputs(t, ng)
+    _, wb, sa, sb = _weights(ng)
+    rng = torch.Generator().manual_seed(2028)
+    raw = torch.randint(256, (ng, 1024, 2048), dtype=torch.uint8, generator=rng)
+    codebook = torch.tensor([
+        0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+    ], dtype=torch.float32).to(torch.float8_e4m3fn).view(torch.uint8)
+    decoded = torch.stack((codebook[(raw & 15).long()], codebook[(raw >> 4).long()]), dim=-1)
+    woa_fp8 = decoded.reshape(ng, 1024, 4096).npu().view(torch.float8_e4m3fn)
+    expected = _native(x, sin, cos, (woa_fp8, wb, sa, sb)).view(torch.int16).cpu()
+
+    raw_npu = raw.npu()
+    woa_nz = torch_npu.npu_format_cast(
+        raw_npu, torch_npu.Format.FRACTAL_NZ,
+        customize_dtype=torch.float8_e4m3fn, input_dtype=torch.float4_e2m1fn_x2,
+    )
+    assert woa_nz.shape == (ng, 1024, 2048) and woa_nz.dtype == torch.uint8
+    assert torch_npu.get_npu_format(woa_nz) in (50, "FRACTAL_NZ_C0_16")
+    _, wb_nz, _, sb_nz = _as_nz(_weights(ng))
+    x, sin, cos = x.npu(), sin.npu(), cos.npu()
+    actual = torch.ops.cannbotdsl.attn_epilogue(x, woa_nz, wb_nz, sa, sb_nz, sin, cos)
+    torch.testing.assert_close(actual.view(torch.int16).cpu(), expected, rtol=0, atol=0)
+    with pytest.raises(ValueError, match="WOA and WOB must both use ND or both use NZ"):
+        op.attn_epilogue(x, woa_nz, wb, sa, sb, sin, cos)
+    with pytest.raises(ValueError, match="FP4 WOA requires uint8 FRACTAL_NZ_C0_16"):
+        op.attn_epilogue(x, raw_npu, wb_nz, sa, sb_nz, sin, cos)
+
+
 @pytest.mark.parametrize("ng,nz", [(8, False), (2, True)])
 def test_meta(ng, nz):
     """Check output metadata using logical ND/NZ shapes without NPU access."""
@@ -176,5 +211,5 @@ def test_meta(ng, nz):
         ((t, 64), torch.float32),
     ]
     args = [torch.empty(shape, dtype=dt, device="meta") for shape, dt in shapes]
-    result = op.attn_epilogue_op(*args)
+    result = torch.ops.cannbotdsl.attn_epilogue(*args)
     assert result.shape == (t, 5120) and result.dtype == torch.bfloat16

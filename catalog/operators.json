@@ -15,7 +15,9 @@
       "native": {
         "export": "attn_epilogue",
         "sources": [
-          "@attn_epilogue/source/attn_epilogue.py"
+          "@attn_epilogue/source/attn_epilogue.py",
+          "@attn_epilogue/source/attn_epilogue_tiling.py",
+          "@attn_epilogue/source/attn_epilogue_kernel.py"
         ]
       }
     },

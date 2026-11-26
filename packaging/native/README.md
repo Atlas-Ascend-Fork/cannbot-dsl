@@ -97,16 +97,18 @@ python3 scripts/ci/sync_catalog.py --check
 
 ## attn_epilogue 静态配置
 
-`attn_epilogue` 的实现与导出集中在 `attn_epilogue.py`，无需 common 模块。
-默认导出 28/32 核、ND/NZ 两种权重布局：NG=8 的
-`T=1,72,128,256,512,1024,2048,4096,8192`，以及 NG=2/1 的 `T=1,16`，共 52 个配置。
-两级混合布局可通过 `first_nz`、`second_nz` 独立指定。
+`attn_epilogue` 的源码清单包含 `attn_epilogue.py`、`attn_epilogue_tiling.py` 和 `attn_epilogue_kernel.py`。
+默认导出 48 个配置，覆盖 28/32 核、双 FP8 的 ND/ND 和 NZ/NZ，以及 FP4 WOA 搭配 FP8 WOB 的 NZ/NZ。
+NG=8 的默认 T 为 `72,80,96,120`，NG=1/2 的默认 T 为 `1,16`。
+
+`weight_format` 同时指定两级权重的布局。`first_fp4: true` 选择 WOA FP4，同时要求 `weight_format` 为 `nz`。
+FP4 WOA 由官方 `npu_format_cast` 转为 `FRACTAL_NZ_C0_16` 的 `uint8 [NG,1024,2048]`，scale 使用 ND。
 
 例如，profiles.json 中的配置可写为：
 
 ```json
-{"attn_epilogue":[{"block_num":32,"ng":2,"weight_format":"nz","tokens":[1,7,16]}]}
+{"attn_epilogue":[{"block_num":32,"ng":2,"first_fp4":true,"weight_format":"nz","tokens":[1,7,16]}]}
 ```
 
-当前安装包依赖 DSL 0.8.0 系列。实现使用 RingBuffer、显式 layout 和 copy_options，
-已有 Native 资源应使用当前源码及相同版本的 DSL 重新构建。
+安装后通过 `from ops.attn_epilogue import attn_epilogue` 加载该算子并注册 `torch.ops.cannbotdsl.attn_epilogue`。
+已有 Native 资源需用当前源码和匹配运行环境的 DSL 重新构建。
