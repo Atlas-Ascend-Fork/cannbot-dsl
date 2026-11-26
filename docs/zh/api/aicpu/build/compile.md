@@ -16,7 +16,7 @@ compile_aicpu_kernel(
     workdir: str | None = None,
     launch_mode: str,
     npu_arch: str = "dav-3510",
-    build_x86: bool = False,
+    enable_host_lib_build: bool = False,
 ) -> CompiledAicpuKernel
 ```
 
@@ -30,7 +30,7 @@ compile_aicpu_kernel(
 | `workdir` | 输入 | 保存编译结果的目录，可省略，默认值为 `None`。省略或传入 `None` 时，框架会创建临时目录。指定目录不存在时会自动创建，调用方需要具有写权限。 |
 | `launch_mode` | 输入 | 参数传递方式。必填，无默认值。常规使用传入`"interface"`，启动时按参数类字段名称传入参数。`"legacy"`为保留模式，启动时通过`param_addr`传入已打包参数结构的设备地址。 |
 | `npu_arch` | 输入 | 目标NPU架构，默认值为`"dav-3510"`。应与实际运行设备和编译环境匹配。 |
-| `build_x86` | 输入 | 是否额外准备Host 侧验证产物，默认值为`False`。普通设备运行不需要设置为`True`。 |
+| `enable_host_lib_build` | 输入 | 默认值为 `False`，只编译设备库。设为 `True` 时，还会用主机 C++ 编译器生成 `<kernel名>_host.so`，可通过返回对象的 `run_host_lib(...)` 调用该库。 |
 
 ## 返回值说明
 

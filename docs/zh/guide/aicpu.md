@@ -68,19 +68,21 @@ from cannbotdsl.aicpu import I32, I64, U32, aicpu_kernel, gm_in, gm_out
 | `current_raw_stream(device_id)` | 取当前设备的原生 stream，下发时需要 |
 | [`compile_aicpu_kernel(...)`](../api/aicpu/build/compile.md) | 编译 AI CPU kernel，得到带 `launch(...)` 方法的对象 |
 | `pack_struct_bytes` | 把结构化参数打包成字节 |
-| `X86Buffer` | 本机 C++ 编译验证所用缓冲，不是 `run_host` 的必需参数 |
+| `HostBuffer` | 调用已编译的主机库时，为 `run_host_lib(...)` 的 GM 输入和输出提供主机缓冲区 |
 | `AicpuTraceError` | AI CPU 侧的异常类型 |
 
 ::: warning `compile_aicpu_kernel` 不在 `cannbotdsl.aicpu` 的 `__all__` 里
-`cannbotdsl.aicpu` 导出的是：`aicpu_kernel`、`AicpuTraceError`、`gm_in`、`gm_out`、`I32`、`I64`、`U32`、`U64`、`X86Buffer`、`current_raw_stream`、`pack_struct_bytes`。
+本节用到的 `aicpu_kernel`、`AicpuTraceError`、`gm_in`、`gm_out`、`I32`、`I64`、`U32`、`U64`、`HostBuffer`、`current_raw_stream` 和 `pack_struct_bytes` 均可从 `cannbotdsl.aicpu` 导入。
 
 `compile_aicpu_kernel` 要从子模块导入：
 
 ```python
 from cannbotdsl.aicpu.toolchain import compile_aicpu_kernel
 
-compile_aicpu_kernel(kernel, *, workdir, launch_mode,
-                     npu_arch="dav-3510", build_x86=False)
+compiled = compile_aicpu_kernel(
+    kernel, workdir=workdir, launch_mode="interface",
+    npu_arch="dav-3510", enable_host_lib_build=False,
+)
 ```
 :::
 
@@ -166,7 +168,9 @@ class MyKernel:
 status = params_kernel.run_host(**kwargs)   # 按参数名传，结果写入 kwargs 中的输出数组
 ```
 
-`run_host(self, **kwargs)` 只接受关键字参数。它返回函数的状态值（常见约定为 `0`），计算结果写入调用方准备的输出数组；无需为此构造 `X86Buffer`。可以将这些输出与独立的 Python 参考算法比较，再与设备结果比较。
+`run_host(self, **kwargs)` 只接受关键字参数。它返回函数的状态值（常见约定为 `0`），计算结果写入调用方准备的输出数组。可以将这些输出与独立的 Python 参考算法比较，再与设备结果比较。
+
+若要验证生成的 C++ 代码，编译时传入 `enable_host_lib_build=True`，再调用 `compiled.run_host_lib(**kwargs)`。GM 参数可用 `HostBuffer` 包装。上面的 `params_kernel.run_host(**kwargs)` 直接用 Python 解释执行，无需编译主机库。
 
 Host 解释执行通过，只能说明该路径的参考逻辑符合预期，不能证明 C++ 生成、设备编译和 AI CPU 实际执行正确。设备验证还需下发、同步并比较输出，具体步骤见 [AI CPU 编程概述](../api/aicpu/index.md)。
 
