@@ -78,7 +78,37 @@ python -c 'import cannbotdsl; print(cannbotdsl.__version__)'
 ### 3. 获取源码并运行算子
 
 获取源码、运行Add样例和精度测试的方法见[源码构建](docs/zh/install/source-build.md)。
-需要提前编译并分发算子时，参见[AOT与Native算子包](docs/zh/guide/aot-packaging.md)。
+
+### 4. 编译、打包并安装 Native 算子包
+
+需要提前编译并分发算子时，可将 `samples/` 中已登记的算子打包为 Native wheel。
+支持按 `k3`、`ds41` 网络分组、单个算子或全部已登记算子构建。
+
+完成源码获取后，在仓库根目录执行以下命令。打包脚本需要本地 DSL wheel 文件；
+仅通过 pip 安装 DSL 包不会提供该文件。请使用构建时的 Python 下载匹配其版本和 CPU 架构的 wheel：
+
+```bash
+export PYTHON=/path/to/python3.12
+export CANN_ENV=/path/to/Ascend/ascend-toolkit/set_env.sh
+"$PYTHON" -m pip download --no-deps --only-binary=:all: cannbot-dsl==0.8.4 -d /path/to/dsl-wheels
+export CANNBOTDSL_WHEEL=/path/to/dsl-wheels/cannbot_dsl-0.8.4-cp312-cp312-manylinux_2_17_x86_64.whl
+
+# 列出算子和网络分组，编译并打包 K3 分组。
+bash packaging/native/run-build.sh --list
+bash packaging/native/run-build.sh --group k3
+
+# 安装生成的算子包，验证包导入与 Native 资源注册。
+"$PYTHON" -m pip install --force-reinstall --no-deps packaging/native/output/groups/k3/wheels/*.whl
+"$PYTHON" -c 'import ops; print(ops.__file__)'
+```
+
+上述 wheel 文件名以 Python 3.12、x86_64 为例，`PYTHON`、`CANN_ENV` 和 `CANNBOTDSL_WHEEL`
+需替换为本机实际的绝对路径。构建和运行环境应使用相同版本的 DSL。
+
+构建 DS41 分组时，将 `--group k3` 改为 `--group ds41`，安装路径相应改为
+`packaging/native/output/groups/ds41/wheels/*.whl`。单算子和全量构建参数、产物目录见
+[Native 打包说明](packaging/native/README.md)；预编译配置覆盖与运行时验证见
+[AOT 与 Native 算子包](docs/zh/guide/aot-packaging.md)。
 
 
 ## 📦 算子列表
