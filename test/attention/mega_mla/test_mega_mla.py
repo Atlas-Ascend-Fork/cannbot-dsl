@@ -5552,7 +5552,7 @@ def _mega_mla_native_namespace(monkeypatch):
 
     builder = _mega_native_builder()
     operators, _ = builder.load_catalog()
-    source = builder.source_index()[operators["mega_mla"][0]]
+    source = builder.OPS_ROOT / operators["mega_mla"][0]
     sample = source.parent
     monkeypatch.syspath_prepend(str(sample))
     import attention_geometry as geometry
@@ -5579,8 +5579,7 @@ def _mega_mla_native_namespace(monkeypatch):
 def test_mega_dependencies_are_complete():
     builder = _mega_native_builder()
     operators, groups = builder.load_catalog()
-    files = builder.source_index()
-    sample = files["mega_mla_native.py"].parent
+    sample = (builder.OPS_ROOT / operators["mega_mla"][0]).parent
     assert {Path(n).name for n in operators["mega_mla"]} == {
         p.name for p in sample.glob("*.py")
     }
@@ -5802,15 +5801,10 @@ def test_native_wheel_contains_mega_sources_and_resources(tmp_path, monkeypatch)
     operators, _ = builder.load_catalog()
     selected = ["mega_mla", "mega_full_index"]
     source_files = {
-        Path(name).name: builder.source_index()[name]
-        for name in builder.selected_filenames(selected, operators)
+        Path(name).name: builder.OPS_ROOT / name
+        for operator in selected
+        for name in operators[operator]
     }
-    # Avoid leaking main()'s process-wide environment into other tests.
-    monkeypatch.setattr(
-        builder,
-        "configure_intermediate_environment",
-        lambda work: work.mkdir(parents=True),
-    )
     monkeypatch.setattr(sys, "path", list(sys.path))
 
     def compile_native(**kwargs):
@@ -5827,22 +5821,24 @@ def test_native_wheel_contains_mega_sources_and_resources(tmp_path, monkeypatch)
         return output
 
     monkeypatch.setattr(aot, "build", compile_native)
+    # Keep the mocked compiler in this process.
     assert (
         builder.main(
             [
                 "--operators",
                 *selected,
-                "--output-root",
+                "--jobs=1",
+                "--no-partial",
+                "--output-dir",
                 str(tmp_path / "out"),
-                "--work-root",
+                "--work-dir",
                 str(tmp_path / "work"),
             ]
         )
         == 0
     )
-    (wheel,) = (tmp_path / "out" / "operators" / "__".join(selected) / "wheels").glob(
-        "*.whl"
-    )
+    (wheel,) = (tmp_path / "out").iterdir()
+    assert wheel.suffix == ".whl"
     with zipfile.ZipFile(wheel) as archive:
         for name, source in source_files.items():
             assert archive.read("ops/" + name) == source.read_bytes()
@@ -5858,8 +5854,11 @@ def test_native_wheel_contains_mega_sources_and_resources(tmp_path, monkeypatch)
         (metadata,) = (
             name for name in archive.namelist() if name.endswith(".dist-info/METADATA")
         )
-        assert "Requires-Dist: opkit" not in archive.read(metadata).decode()
-        assert "Requires-Dist: cannbot-dsl>=0.8.0" in archive.read(metadata).decode()
+        metadata_text = archive.read(metadata).decode()
+        assert "Requires-Dist: opkit" not in metadata_text
+        assert "Requires-Dist: pytest" not in metadata_text
+        assert "Requires-Dist: cannbot-dsl>=0.8.0" in metadata_text
+        assert "Requires-Python: <3.14,>=3.10" in metadata_text
 
 
 def main(argv=None):

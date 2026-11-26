@@ -11,11 +11,11 @@ requires = ["setuptools>=70.1", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "cannbot-arena-net"
+name = "cannbot-dsl-ops"
 version = "0.3.0"
 description = "Selected CANNBotDSL operators and compiled Native resources"
-requires-python = ">=3.10"
-dependencies = ["cannbot-dsl>=0.8.0", "torch", "pytest"]
+requires-python = ">=3.10,<3.14"
+dependencies = ["cannbot-dsl>=0.8.0", "torch"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

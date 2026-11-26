@@ -314,6 +314,6 @@ Native 发布配置的容量上限为 16384，百万级 PA 使用源码 JIT。
 `page_size=0` 表示 TND；非零表示 PA 分页 KV 布局。其余可选字段为 `topk`、
 `norm_eps`、`softmax_scale`。序列长度必须为正偶数；运行时形状、页池布局、
 参数及 stream 核配额必须命中发布配置，其他配置需要另行发布。
-构建方法见 [Native 打包说明](../../../packaging/native/README.md)。
+构建方法见 [Native 打包说明](../../../packaging/README.md)。
 
 外部 migration setup 按普通 Python 脚本完整执行，应仅准备输入、program/args 与工作区。内置 setup 可直接指定 `test/attention/mega_reindex/test_mega_reindex.py`，由共享的 `_make_case()` 函数准备。

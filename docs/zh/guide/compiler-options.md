@@ -167,10 +167,10 @@ export CANNBOTDSL_JIT_TIME_PROFILING=1
 
 ### 目标架构
 
-AOT 构建的默认目标是 `dav-3510`，可用 `--target` 切换；运行时也可以用 `CANNBOTDSL_NPU_ARCH` 覆盖探测结果（优先级：env > 运行时 SoC 查询 > 默认 `dav-3510`），跨编译场景用它保证确定性。
+Native 打包默认面向 `ascend950`，可用 `--soc=ascend950` 显式指定。运行时的 `CANNBOTDSL_NPU_ARCH` 使用架构名，优先级依次为环境变量、运行时 SoC 查询和默认值 `dav-3510`。
 
 ```bash
-./run-build.sh --group ds41 --target dav-3510
+python3 packaging/native/build.py --group ds41 --soc=ascend950
 ```
 
 设备侧要按架构分支时，用 `const_expr()` 把调用方算好的布尔值标记成编译期条件：
@@ -220,16 +220,13 @@ Host 侧的 API：
 
 ## AOT 与 Native 包相关的变量
 
-容易混淆的一点：下面大部分是**打包工程 `packaging/native` 的构建脚本**读的，不是 DSL 运行时读的。两类分开列：
+AOT 导出函数和 Native 运行时读取以下变量：
 
 | 变量 | 谁读 | 作用 |
 | --- | --- | --- |
 | `CANNBOTDSL_NATIVE_BINARY_MODE=require` | **DSL 运行时** | 未命中预编译二进制时立即报错，不回退 JIT。上线前自检用 |
 | `CANNBOTDSL_NATIVE_BINARY_REPORT` | **DSL 运行时** | 把预编译二进制的命中记录写成 JSON |
-| `CANNBOTDSL_WHEEL` | 构建脚本 | 指定打包用的 DSL wheel |
-| `CANNBOTDSL_ROOT` | 构建脚本 | 指定仓库根 |
-| `CANNBOTDSL_DS41_PROFILES` | 构建脚本 | 用外置 JSON 覆盖默认导出配置集合 |
-| `CANN_ENV` | 构建脚本 | 指定 `set_env.sh` |
+| `CANNBOTDSL_DS41_PROFILES` | DS41 算子导出函数 | 用外置 JSON 覆盖默认导出配置集合 |
 
 用法与产物布局见 [AOT 与 Native 算子包](./aot-packaging.md)。
 

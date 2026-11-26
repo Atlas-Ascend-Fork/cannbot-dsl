@@ -31,62 +31,56 @@ def export_add():
 ## Native 打包工程
 
 `packaging/native/` 通过 `cannbotdsl.aot.build` 编译登记的算子，并生成 wheel。
-源码位于 `samples/`，路径与辅助模块在 `catalog/operators.json` 中维护。
-例如，`operators` 映射中的一个算子定义为：
+源码位于 `samples/`，Native 导出及其辅助模块在 `packaging/native/operators.json` 中维护。
+例如，清单的 `operators` 映射中的一个定义为：
 
 ```json
 {
   "mixed_quant_sparse_flash_mla": {
-    "source": "samples/attention/mixed_quant_sparse_flash_mla",
-    "native": {
-      "export": "mqsmla",
-      "sources": [
-        "@mixed_quant_sparse_flash_mla/source/mixed_quant_sparse_flash_mla.py",
-        "@mixed_quant_sparse_flash_mla/source/mixed_quant_sparse_flash_mla_metadata.py"
-      ]
-    }
+    "export": "mqsmla",
+    "sources": [
+      "attention/mixed_quant_sparse_flash_mla/mixed_quant_sparse_flash_mla.py",
+      "attention/mixed_quant_sparse_flash_mla/mixed_quant_sparse_flash_mla_metadata.py"
+    ]
   }
 }
 ```
 
-`native.export` 与源码中的 `@export(...)` 名称一致；`native.sources` 列出主模块
-及其辅助模块。`net/<网络>/network.json` 通过算子 ID 选择分组成员。
-在仓库根目录生成构建配置：
-
-```bash
-python3 scripts/ci/sync_catalog.py --write
-python3 scripts/ci/sync_catalog.py --check
-```
-
-生成的 `packaging/native/operator_groups.toml` 使用相对 `samples/` 的源码路径。
+`export` 与源码中的 `@export(...)` 名称一致；`sources` 列出相对于 `samples/` 的主模块
+及辅助模块路径。`packaging/net/network.json` 通过算子 ID 选择分组成员。
+`build.py` 自行读取和校验这两份 JSON，不需要运行 CI 配置生成器。
 同一次构建中的模块使用文件名作为包内模块名，不同来源的同名模块会在编译前报错。
 
 ### 构建与安装
 
-在仓库根目录执行：
+按[源码构建](../install/source-build.md)准备环境后，在仓库根目录执行：
 
 ```bash
-export PYTHON=/path/to/python3.12
-export CANN_ENV=/path/to/Ascend/ascend-toolkit/set_env.sh
-export CANNBOTDSL_WHEEL=/path/to/cannbot_dsl-0.8.4-cp312-cp312-manylinux_2_17_x86_64.whl
-
-bash packaging/native/run-build.sh --list
-bash packaging/native/run-build.sh --group ds41
-bash packaging/native/run-build.sh --operator mqsmla
-python3 -m pip install packaging/native/output/groups/ds41/wheels/*.whl
+# 先激活已安装 DSL、PyTorch、torch_npu 的 Python 环境。
+# CANN 非默认安装时，将下列路径改为实际 set_env.sh。
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+python3 -m pip install 'setuptools>=70.1' wheel
+python3 packaging/native/build.py --list
+python3 packaging/native/build.py --group ds41 --no-partial
+python3 packaging/native/build.py --operator mqsmla
+python3 -m pip install --force-reinstall --no-deps packaging/native/output/cannbot_dsl_ops_ds41-0.3.0-*.whl
 ```
 
-默认目标是 `dav-3510`，可通过 `--target dav-2201` 指定其他受支持目标。
-`--list`和`--help`可直接运行。完整构建参数和产物目录见
-[Native打包说明](https://gitcode.com/cann/cannbot-dsl/blob/master/packaging/native/README.md)。
+构建脚本不会自动探测或 `source` CANN，也不会安装 DSL；每个新终端都需先加载上述环境。
+`python3` 和 `python3 -m pip` 应使用同一已激活的 Python 环境。
 
-wheel 分发名为 `cannbot-arena-net`，Python 包名为 `ops`，依赖 `cannbot-dsl>=0.8.0`。
+Native 打包默认使用 `ascend950`，也可显式传入 `--soc=ascend950`。
+`--list` 和 `--help` 可直接运行。完整构建参数和产物目录见仓库中的 `packaging/README.md`。
+
+单算子或全量 wheel 分发名为 `cannbot-dsl-ops`；DS41、K3 分组包分别为
+`cannbot-dsl-ops-ds41`、`cannbot-dsl-ops-k3`，版本均为 `0.3.0`，依赖 `cannbot-dsl>=0.8.0`。
+它们都提供 Python 包 `ops`，切换分发前需先卸载另一种已安装的分发。
 导入 `ops` 时通过 `cannbotdsl.aot.register_directory` 注册 Native 资源。
 AICore 使用 AOT 导出；配套 AICPU metadata 资源安装在 `ops/_aicpu/`。
 
 ### 验证二进制覆盖
 
-安装后可以用环境变量检查是否命中了预编译二进制。**这两个是 DSL 运行时读的**（`cannbotdsl/aot/runtime.py`），和上面那几个构建脚本变量不是一回事：
+安装后可以用环境变量检查是否命中了预编译二进制。**这两个是 DSL 运行时读的**（`cannbotdsl/aot/runtime.py`），与算子导出阶段使用的配置变量作用不同：
 
 ```bash
 # 未命中时立即报错，不回退 JIT
@@ -104,9 +98,10 @@ export CANNBOTDSL_NATIVE_BINARY_REPORT=/path/to/native-report.json
 | 变量 | 谁读 |
 | --- | --- |
 | `CANNBOTDSL_NATIVE_BINARY_MODE` / `NATIVE_BINARY_REPORT` | **DSL 运行时** |
-| `CANNBOTDSL_WHEEL` / `CANNBOTDSL_ROOT` / `CANNBOTDSL_DS41_PROFILES` / `CANN_ENV` / `PYTHON` | **`run-build.sh` 打包脚本**，`python/cannbotdsl` 里没有读取点 |
+| `CANNBOTDSL_DS41_PROFILES` | 支持该变量的 DS41 算子导出函数 |
 
-所以在运行环境里设第二组是没用的。完整的 DSL 运行时变量清单见[编译选项与产物观察](./compiler-options.md)。
+`CANNBOTDSL_DS41_PROFILES` 在 AOT 导出阶段读取，不改变已安装 Native 二进制的配置集合；
+运行时未命中是否回退 JIT，由 `CANNBOTDSL_NATIVE_BINARY_MODE` 决定。完整的 DSL 运行时变量清单见[编译选项与产物观察](./compiler-options.md)。
 :::
 
 ::: warning
@@ -125,13 +120,27 @@ AOT 的核心工作量不在构建流程，而在**决定导出哪些配置**。
 
 DS41 的静态配置由各算子的 `export_*` 函数定义。QLI、QSLI 等算子枚举布局、掩码、压缩比和分页大小，动态维度通过 TensorSpec 表达；`attn_epilogue` 的 token 数和核配额按静态配置枚举。具体组合以对应导出函数为准。
 
-配置集合也可以外置成 JSON，通过环境变量指定：
+`CANNBOTDSL_DS41_PROFILES` 是可选的构建配置文件路径。支持它的算子在执行
+`export_*` 时读取 JSON，用指定的 token 数、布局、核配额等配置替换默认导出集合。
+它不选择 DS41 网络成员，也不加载 CANN 环境；未设置该变量时使用源码中的默认规格。
+
+例如，只为 `engram_gate` 构建 `tokens=72`、56 核、不带 mask 的配置。
+在仓库根目录且已完成上面的环境准备后执行：
 
 ```bash
-export CANNBOTDSL_DS41_PROFILES=/path/to/profiles.json
+mkdir -p packaging/native/.build
+cat > packaging/native/.build/engram-profiles.json <<'JSON'
+{"engram_gate": [{"max_blocks": 56, "tokens": [72], "has_mask": [false]}]}
+JSON
+CANNBOTDSL_DS41_PROFILES="$PWD/packaging/native/.build/engram-profiles.json" \
+  python3 packaging/native/build.py --operator engram_gate
 ```
 
-JSON 里只列出的配置会被替换，未列出的算子保留默认配置。
+上面的环境变量只对该次构建命令生效。各算子的 JSON 字段由其导出函数定义，
+不同算子不能直接套用同一组字段。部分导出函数要求指定的 JSON 包含自身的键，
+例如 `attn_epilogue` 缺键时会报错；按组构建时需为相关算子准备完整配置，
+不能统一假定“未列出的算子都会保留默认配置”。仅需默认配置时不设置此变量。
+未导出的规格在运行时按 Native 模式回退 JIT 或报错。
 
 ## JIT 还是 AOT
 

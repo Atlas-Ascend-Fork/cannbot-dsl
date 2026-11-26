@@ -86,4 +86,4 @@ python3 -m pytest test/attention/flash_kda/test_flash_kda.py -v
 ```
 
 源码与测试路径见 [算子清单](../catalog/README.md)，Native 编译与 wheel 打包见
-[Native 打包](../packaging/native/README.md)。
+[Native 打包](../packaging/README.md)。

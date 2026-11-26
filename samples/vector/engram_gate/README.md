@@ -47,17 +47,13 @@ pytest -q test/vector/engram_gate/test_engram_gate.py
 ## 安装包调用
 
 源码示例与测试直接加载本仓库 sample。需要部署安装包时，使用共享
-[Native 构建工程](../../../packaging/native/README.md)，注册名为 `engram_gate`，所属组为
+[Native 构建工程](../../../packaging/README.md)，注册名为 `engram_gate`，所属组为
 `ds41`：
 
 ```bash
-export PYTHON=/path/to/python3.12
-export CANN_ENV=/path/to/Ascend/cann/set_env.sh
-source "$CANN_ENV"
-export CANNBOTDSL_WHEEL=/path/to/cannbot_dsl-0.8.0-cp312-cp312-manylinux_2_28_x86_64.whl
-bash packaging/native/run-build.sh --operator engram_gate
-"$PYTHON" -m pip install --no-deps --force-reinstall \
-  packaging/native/output/operators/engram_gate/wheels/*.whl
+python3 packaging/native/build.py --operator engram_gate
+python3 -m pip install --no-deps --force-reinstall \
+  packaging/native/output/cannbot_dsl_ops-0.3.0-*.whl
 ```
 
 `T`、mask ABI 与核配额参与编译（张量形状、launch grid 和 host launcher 均随之变化），

@@ -125,9 +125,11 @@ NPUGraph-EX 使用 `fullgraph=True,dynamic=False,options={"force_eager":False,"c
 在已激活 CANN 和 DSL 0.8.2 的环境中，从仓库根目录编包：
 
 ```bash
-python packaging/native/build.py --operator mla_prolog_v4 --target dav-3510
+python packaging/native/build.py --operator=mla_prolog_v4 --soc=ascend950
 ```
 
 Native 包须覆盖实际调用的编译键；匹配包内索引时直接加载二进制，不重建 IR。
 其他编译条件相同，8191、8192、8193 等不同 T 复用 Native；改变 NZ `(dim,q_lora)` 仍可能需要不同二进制。
-联合编包、安装及 Native 模式设置见[Native 打包说明](../../../packaging/native/README.md)，其中 DSL 环境使用本算子要求的 0.8.2。
+构建生成的 wheel 位于 `packaging/native/output/`。K3 组包含本算子和 `quant_mla_prolog`，
+可用 `--group=k3` 构建整组，或用 `--operators mla_prolog_v4 quant_mla_prolog` 只打包这两个算子。
+安装及 Native 模式设置见 [Native 打包说明](../../../packaging/README.md)。

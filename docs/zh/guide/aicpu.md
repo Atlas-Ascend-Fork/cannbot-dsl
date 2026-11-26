@@ -201,7 +201,7 @@ Host 解释执行通过，只能说明该路径的参考逻辑符合预期，不
 
 - **AI CPU 不是性能热点，但它在关键路径上。** 它的执行时间会直接加到算子总耗时里，所以调度算法本身要足够轻。复杂的筛选（例如稀疏 TopK）应该放在 AI Core 上做，AI CPU 只做分核规划。
 - **AOT 打包时 AI CPU 是独立的一条编译路径。** 产物装到 `ops/_aicpu/`，运行时优先加载预编译文件；直接跑源码时走原有的即时编译路径。见 [AOT 与 Native 算子包](./aot-packaging.md)。
-- **登记 AOT 时别漏文件。** metadata 算子通常是独立的 `.py`，必须在 `operator_groups.toml` 里和主算子一起列出，漏了会导致 wheel 内缺模块。
+- **登记 AOT 时别漏文件。** metadata 算子通常是独立的 `.py`，必须在 `packaging/native/operators.json` 的 `sources` 里和主算子一起列出，漏了会导致 wheel 内缺模块。
 
 ## 速查
 

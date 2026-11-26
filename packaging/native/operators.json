@@ -1,0 +1,195 @@
+{
+  "schema_version": 1,
+  "operators": {
+    "mixed_quant_sparse_flash_mla": {
+      "export": "mqsmla",
+      "sources": [
+        "attention/mixed_quant_sparse_flash_mla/mixed_quant_sparse_flash_mla.py",
+        "attention/mixed_quant_sparse_flash_mla/mixed_quant_sparse_flash_mla_metadata.py"
+      ]
+    },
+    "quant_lightning_indexer": {
+      "export": "qli",
+      "sources": [
+        "attention/quant_lightning_indexer/quant_lightning_indexer.py",
+        "attention/quant_lightning_indexer_metadata/quant_lightning_indexer_metadata.py"
+      ]
+    },
+    "quant_sparse_lightning_indexer": {
+      "export": "qsli",
+      "sources": [
+        "attention/quant_sparse_lightning_indexer/quant_sparse_lightning_indexer.py",
+        "attention/quant_sparse_lightning_indexer_metadata/quant_sparse_lightning_indexer_metadata.py"
+      ]
+    },
+    "attn_epilogue": {
+      "export": "attn_epilogue",
+      "sources": [
+        "attention/attn_epilogue/attn_epilogue.py",
+        "attention/attn_epilogue/attn_epilogue_tiling.py",
+        "attention/attn_epilogue/attn_epilogue_kernel.py"
+      ]
+    },
+    "attn_prologue": {
+      "export": "attn_prologue",
+      "sources": [
+        "attention/attn_prologue/attn_prologue.py",
+        "attention/attn_prologue/attn_prologue_kernel.py",
+        "attention/attn_prologue/attn_prologue_tiling.py"
+      ]
+    },
+    "indexer_prologue_qw": {
+      "export": "indexer_prologue_qw",
+      "sources": [
+        "attention/indexer_prologue_qw/indexer_prologue_qw.py",
+        "attention/indexer_prologue_qw/indexer_prologue_qw_format.py"
+      ]
+    },
+    "indexer_prologue_k": {
+      "export": "indexer_prologue_k",
+      "sources": [
+        "attention/indexer_prologue_k/indexer_prologue_k.py"
+      ]
+    },
+    "engram_gate": {
+      "export": "engram_gate",
+      "sources": [
+        "vector/engram_gate/engram_gate.py"
+      ]
+    },
+    "block_attn_res_update_rms_norm": {
+      "export": "block_attn_res_update_rms_norm",
+      "sources": [
+        "vector/block_attn_res_update_rms_norm/block_attn_res_update_rms_norm.py"
+      ]
+    },
+    "flash_kda": {
+      "export": "flash_kda",
+      "sources": [
+        "attention/flash_kda/flash_kda.py",
+        "attention/flash_kda/flash_kda_metadata.py",
+        "attention/flash_kda/flash_kda_staged.py",
+        "attention/flash_kda/flash_kda_persistent.py",
+        "attention/flash_kda/flash_kda_validation.py"
+      ]
+    },
+    "flash_kda_fwd": {
+      "export": "flash_kda_fwd",
+      "sources": [
+        "attention/flash_kda_fwd/flash_kda_fwd.py",
+        "attention/flash_kda_fwd/flash_kda_fwd_metadata.py",
+        "attention/flash_kda_fwd/flash_kda_fwd_staged.py",
+        "attention/flash_kda_fwd/flash_kda_fwd_persistent.py",
+        "attention/flash_kda_fwd/flash_kda_fwd_validation.py"
+      ]
+    },
+    "flash_kda_cp_preprocess": {
+      "export": "flash_kda_cp_preprocess",
+      "sources": [
+        "attention/flash_kda_cp_preprocess/flash_kda_cp_preprocess.py",
+        "attention/flash_kda_cp_preprocess/flash_kda_cp_preprocess_metadata.py"
+      ]
+    },
+    "flash_kda_cp_main": {
+      "export": "flash_kda_cp_main",
+      "sources": [
+        "attention/flash_kda_cp_main/flash_kda_cp_main.py",
+        "attention/flash_kda_cp_main/flash_kda_cp_main_metadata.py"
+      ]
+    },
+    "fused_recurrent_kda_snapshot": {
+      "export": "fused_recurrent_kda",
+      "sources": [
+        "attention/fused_recurrent_kda_snapshot/fused_recurrent_kda_snapshot.py"
+      ]
+    },
+    "fused_recurrent_kda_replayssm": {
+      "export": "fused_recurrent_kda_replayssm",
+      "sources": [
+        "attention/fused_recurrent_kda_replayssm/fused_recurrent_kda_replayssm.py"
+      ]
+    },
+    "mega_recurrent_kda": {
+      "export": "mega_recurrent_kda",
+      "sources": [
+        "attention/mega_recurrent_kda/mega_recurrent_kda.py",
+        "attention/mega_recurrent_kda/mega_recurrent_kda_common.py",
+        "attention/mega_recurrent_kda/mega_recurrent_kda_frontend.py",
+        "attention/mega_recurrent_kda/mega_recurrent_kda_backend.py"
+      ]
+    },
+    "commit_recurrent_kda": {
+      "export": "commit_recurrent_kda",
+      "sources": [
+        "attention/commit_recurrent_kda/commit_recurrent_kda.py"
+      ]
+    },
+    "quant_mla_prolog": {
+      "export": "quant_mla_prolog",
+      "sources": [
+        "attention/quant_mla_prolog/quant_mla_prolog.py"
+      ]
+    },
+    "mla_prolog_v4": {
+      "export": "mla_prolog_v4",
+      "sources": [
+        "attention/mla_prolog_v4/mla_prolog_v4.py"
+      ]
+    },
+    "moonep": {
+      "export": "moonep_plan",
+      "sources": [
+        "mc2/moonep/moonep_plan.py",
+        "mc2/moonep/moonep_context.py"
+      ]
+    },
+    "mega_mla": {
+      "export": "mega_mla",
+      "sources": [
+        "attention/mega_mla/mega_mla_native.py",
+        "attention/mega_mla/attention_geometry.py",
+        "attention/mega_mla/attention_inputs.py",
+        "attention/mega_mla/attention_matmul.py",
+        "attention/mega_mla/mega_mla.py",
+        "attention/mega_mla/mega_mla_kernel.py",
+        "attention/mega_mla/attention_pipeline.py",
+        "attention/mega_mla/attention_sequence_filter.py",
+        "attention/mega_mla/attention_sequence_inputs.py",
+        "attention/mega_mla/attention_workspace.py",
+        "attention/mega_mla/cache_decode.py",
+        "attention/mega_mla/compressed_cache_gather.py",
+        "attention/mega_mla/dual_cache_vector_attention.py",
+        "attention/mega_mla/mxfp8_matmul.py",
+        "attention/mega_mla/paged_cache.py",
+        "attention/mega_mla/qkv_projection.py",
+        "attention/mega_mla/rotary_position_embedding.py"
+      ]
+    },
+    "mega_full_index": {
+      "export": "mega_full_index",
+      "sources": [
+        "attention/mega_full_index/mega_full_index.py",
+        "attention/mega_full_index/prologue.py",
+        "attention/mega_full_index/qli.py"
+      ]
+    },
+    "mega_compressor": {
+      "export": "mega_compressor",
+      "sources": [
+        "attention/mega_compressor/mega_compressor.py"
+      ]
+    },
+    "mega_reindex": {
+      "export": "mega_reindex",
+      "sources": [
+        "attention/mega_reindex/mega_reindex.py",
+        "attention/mega_reindex/reindex_front.py",
+        "attention/mega_reindex/reindex_query.py",
+        "attention/mega_reindex/reindex_runtime.py",
+        "attention/mega_reindex/reindex_tail.py",
+        "attention/mega_reindex/reindex_matmul.py",
+        "attention/mega_reindex/reindex_mx.py"
+      ]
+    }
+  }
+}

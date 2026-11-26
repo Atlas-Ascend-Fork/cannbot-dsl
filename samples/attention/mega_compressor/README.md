@@ -113,8 +113,7 @@ BSH／TH 非连续输入，以及 stream 限制为 28 个 Cube／56 个 Vector �
 ## Native 打包
 
 `mega_compressor` 已登记到算子清单 `catalog/operators.json` 和网络清单
-`net/ds41/network.json`，由 `scripts/ci/sync_catalog.py` 生成
-`packaging/native/operator_groups.toml` 的 `ds41` 组。
+`packaging/net/network.json`，由 Native 构建器直接读取。
 打包器通过 `@export("mega_compressor")` 收集真实的权重打包、BSH Decode、TH Decode 和 Prefill 主计算，使用 CANNBotDSL 0.8，导出阶段不分配 NPU Tensor、不执行 Kernel，也不查询当前卡的核配额。
 
 ```bash

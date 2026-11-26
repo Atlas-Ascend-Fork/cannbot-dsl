@@ -233,11 +233,13 @@ torch_npu 2.12.0.post2。
 
 ## Native 安装包
 
-共享 [Native 构建工程](../../../packaging/native/README.md) 的源码清单包含接口、切分和 kernel 三个文件。
+共享 [Native 构建工程](../../../packaging/README.md) 的源码清单包含接口、切分和 kernel 三个文件。
+
+按打包说明准备环境后，在仓库根目录构建并安装。下例使用 Python 3.12、Linux x86_64，具体文件名以构建输出的 `Wheel:` 路径为准。
 
 ```bash
-bash packaging/native/run-build.sh --operator attn_epilogue
-python3 -m pip install packaging/native/output/operators/attn_epilogue/wheels/*.whl
+python3 packaging/native/build.py --operator=attn_epilogue
+python3 -m pip install --force-reinstall --no-deps packaging/native/output/cannbot_dsl_ops-0.3.0-cp312-cp312-linux_x86_64.whl
 ```
 
 安装后通过 `from ops.attn_epilogue import attn_epilogue` 导入。默认导出 48 个配置，覆盖 28/32 核、

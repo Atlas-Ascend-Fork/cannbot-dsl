@@ -11,7 +11,7 @@
 
 本算子已登记到统一 Native 编包工程的 `ds41` 组，源码、`prologue.py`、`qli.py` 和预编译
 资源随组安装。安装后从 `ops.mega_full_index` 导入 `mega_full_index`；编包命令见
-[Native 编包说明](../../../packaging/native/README.md)，默认导出范围见
+[Native 编包说明](../../../packaging/README.md)，默认导出范围见
 [Native 导出入口](mega_full_index.py)。
 
 ## 算子介绍

@@ -6125,8 +6125,9 @@ class _Assemble:
         encoded_outputs = _ring_buffer(
             MemLoc.UB, (self.batch_rows, LATENT + self.Dr), output_dtype, depth=2
         )
+        scale_stride = 8  # Eight FP32 elements give each DMA source 32-byte alignment.
         scale_outputs = _ring_buffer(
-            MemLoc.UB, (self.batch_rows, 1), dtypes.float32, depth=2
+            MemLoc.UB, (self.batch_rows, scale_stride), dtypes.float32, depth=2
         )
         scale_buffer = _buffer(MemLoc.UB, (self.batch_rows, 2 * VECTOR), dtypes.float32)
         q_tokens = q.view((T, heads * (LATENT + self.Dr)))
@@ -6428,15 +6429,24 @@ class _Assemble:
                                         precision_mode=True,
                                     )
                                     rr.vstore_first(scale_buffer, stats_base, scale)
-                                    rr.vstore_first(batch_scales, local_row, scale)
-                            _copy(
-                                tile_slice(
-                                    descale_tokens,
-                                    (self.batch_rows, 1),
-                                    (token_batch, head),
-                                ),
-                                scale_outputs.next_read()[0:valid_rows, None],
-                            )
+                                    rr.vstore_first(
+                                        batch_scales, local_row * scale_stride, scale
+                                    )
+                            scales = scale_outputs.next_read()
+                            # The GM head column has a dynamic row stride. Copy
+                            # one scale per token using an aligned UB row.
+                            for local_row in range(valid_rows):
+                                token = token_batch * self.batch_rows + local_row
+                                destination = tile_slice(
+                                    descale_tokens, (1, 1), (token, head)
+                                )
+                                source = tile_slice(
+                                    scales, (1, scale_stride), (local_row, 0)
+                                )
+                                _copy(
+                                    _view(destination, shape=(1,)),
+                                    _view(source, shape=(1,)),
+                                )
                             with vf(mode="simd"):
                                 quant_mask = rr.full_mask()
                                 rr.vmem_bar("vst_vld")

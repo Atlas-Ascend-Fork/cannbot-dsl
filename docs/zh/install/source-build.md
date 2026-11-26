@@ -24,11 +24,8 @@
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 ```
 
-检查设备是否正常：
-
-```bash
-npu-smi info
-```
+需要排查设备可见性或查看 NPU 状态时，可在装有驱动管理工具的主机上运行 `npu-smi info`。
+这一步是可选的。运行算子前，可用下文的 Python 命令检查当前环境能否访问 NPU。
 
 ### 安装Python依赖
 
@@ -101,3 +98,21 @@ python -m pytest test/vector/add/test_add.py -v
 ```
 
 其他算子的源码、参数和测试方法见[样例导航](https://gitcode.com/cann/cannbot-dsl/tree/master/samples)。
+
+## 编译与安装 Native 算子包
+
+需要提前编译并分发算子时，在同一个 Python 环境安装构建依赖：
+
+```bash
+# 每个新终端先激活 Python 环境，再手动加载 CANN（路径按实际安装修改）。
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+python -m pip install 'setuptools>=70.1' wheel
+python packaging/native/build.py --list
+python packaging/native/build.py --group ds41 --no-partial
+python -m pip install --force-reinstall --no-deps packaging/native/output/cannbot_dsl_ops_ds41-0.3.0-*.whl
+```
+
+构建脚本已移除环境探测与自动加载，不会代为执行 `source` 或安装 DSL。
+调用前需按上文激活同一个 Python 环境、加载 CANN，并安装 CANNBot-DSL、PyTorch 和 `torch_npu`。
+默认目标为 `ascend950`。其他分组、单算子选择、目标 SoC 及产物目录见仓库中的 `packaging/README.md`。
+构建选项和二进制命中验证见 [AOT 与 Native 算子包](../guide/aot-packaging.md)。

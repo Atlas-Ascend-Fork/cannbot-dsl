@@ -166,10 +166,10 @@ window 代入 `P=Pw,S=Sw,record_bytes=544`；压缩侧代入 `P=Pc,S=Sc,record_b
 
 ### Native wheel
 
-本算子已登记到统一编包工程的 `ds41` 组，组构建命令为 `./run-build.sh --group ds41`。
+本算子已登记到统一编包工程的 `ds41` 组，组构建命令为 `python3 packaging/native/build.py --group ds41`。
 安装后从 `ops.mega_mla` 导入 `mega_mla`。默认预编译配置和自定义 profiles 字段见
 [Native 导出入口](mega_mla_native.py)；通用构建流程和二进制命中模式见
-[Native 编包说明](../../../packaging/native/README.md)。
+[Native 编包说明](../../../packaging/README.md)。
 
 需要支持 Layout 资源接口的 CANNBotDSL、PyTorch 2.7 及以上、配套 torch_npu 和 CANN。
 PyTorch 必须同时提供 float8_e4m3fn 和 float8_e8m0fnu；E8M0 用于三路投影 scale。

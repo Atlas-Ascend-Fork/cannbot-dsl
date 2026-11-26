@@ -11,9 +11,10 @@ cannbot-dsl/
 │   └── project/         # 文档站构建工程
 ├── samples/             # 算子样例、样例导航和 README
 ├── test/                # 与样例对应的测试代码
-├── catalog/             # 算子源码、测试及 Native 依赖清单
-├── packaging/native/    # Native 算子包构建工程
-├── net/                 # 网络算子分组
+├── catalog/             # CI 算子源码、测试与路由清单
+├── packaging/           # 网络分组与 Native 打包
+│   ├── net/             # 网络算子分组清单
+│   └── native/          # Native 算子包构建入口
 ├── figures/             # 仓库根 README 使用的图片
 ├── build.sh             # CI 环境校验和测试调度入口
 └── requirements.txt     # Python 依赖

@@ -232,9 +232,10 @@ def test_mega_reindex_dependencies_and_ds41_registration():
     registered = {Path(path).name for path in operators["mega_reindex"]}
     assert registered == {path.name for path in SAMPLE.glob("*.py")}
     assert groups["ds41"].count("mega_reindex") == 1
-    assert builder.choose_operators(
-        builder.parse_args(["--operator", "mega_reindex"]), operators, groups
-    ) == (["mega_reindex"], Path("operators/mega_reindex"))
+    selected = builder.choose_operators(
+        builder.parse_args(["--operator=mega_reindex"]), operators, groups
+    )
+    assert selected == ["mega_reindex"]
 
 
 def _tree():

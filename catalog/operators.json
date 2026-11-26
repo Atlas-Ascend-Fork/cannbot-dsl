@@ -11,77 +11,27 @@
     },
     "attn_epilogue": {
       "source": "samples/attention/attn_epilogue",
-      "test": "test/attention/attn_epilogue",
-      "native": {
-        "export": "attn_epilogue",
-        "sources": [
-          "@attn_epilogue/source/attn_epilogue.py",
-          "@attn_epilogue/source/attn_epilogue_tiling.py",
-          "@attn_epilogue/source/attn_epilogue_kernel.py"
-        ]
-      }
+      "test": "test/attention/attn_epilogue"
     },
     "attn_prologue": {
       "source": "samples/attention/attn_prologue",
-      "test": "test/attention/attn_prologue",
-      "native": {
-        "export": "attn_prologue",
-        "sources": [
-          "@attn_prologue/source/attn_prologue.py",
-          "@attn_prologue/source/attn_prologue_kernel.py",
-          "@attn_prologue/source/attn_prologue_tiling.py"
-        ]
-      }
+      "test": "test/attention/attn_prologue"
     },
     "flash_kda": {
       "source": "samples/attention/flash_kda",
-      "test": "test/attention/flash_kda",
-      "native": {
-        "export": "flash_kda",
-        "sources": [
-          "@flash_kda/source/flash_kda.py",
-          "@flash_kda/source/flash_kda_metadata.py",
-          "@flash_kda/source/flash_kda_staged.py",
-          "@flash_kda/source/flash_kda_persistent.py",
-          "@flash_kda/source/flash_kda_validation.py"
-        ]
-      }
+      "test": "test/attention/flash_kda"
     },
     "flash_kda_fwd": {
       "source": "samples/attention/flash_kda_fwd",
-      "test": "test/attention/flash_kda_fwd",
-      "native": {
-        "export": "flash_kda_fwd",
-        "sources": [
-          "@flash_kda_fwd/source/flash_kda_fwd.py",
-          "@flash_kda_fwd/source/flash_kda_fwd_metadata.py",
-          "@flash_kda_fwd/source/flash_kda_fwd_staged.py",
-          "@flash_kda_fwd/source/flash_kda_fwd_persistent.py",
-          "@flash_kda_fwd/source/flash_kda_fwd_validation.py"
-        ]
-      }
+      "test": "test/attention/flash_kda_fwd"
     },
     "flash_kda_cp_preprocess": {
       "source": "samples/attention/flash_kda_cp_preprocess",
-      "test": "test/attention/flash_kda_cp_preprocess",
-      "native": {
-        "export": "flash_kda_cp_preprocess",
-        "sources": [
-          "@flash_kda_cp_preprocess/source/flash_kda_cp_preprocess.py",
-          "@flash_kda_cp_preprocess/source/flash_kda_cp_preprocess_metadata.py"
-        ]
-      }
+      "test": "test/attention/flash_kda_cp_preprocess"
     },
     "flash_kda_cp_main": {
       "source": "samples/attention/flash_kda_cp_main",
-      "test": "test/attention/flash_kda_cp_main",
-      "native": {
-        "export": "flash_kda_cp_main",
-        "sources": [
-          "@flash_kda_cp_main/source/flash_kda_cp_main.py",
-          "@flash_kda_cp_main/source/flash_kda_cp_main_metadata.py"
-        ]
-      }
+      "test": "test/attention/flash_kda_cp_main"
     },
     "matmul": {
       "inventory_path": "matmul",
@@ -131,23 +81,11 @@
     },
     "indexer_prologue_k": {
       "source": "samples/attention/indexer_prologue_k",
-      "test": "test/attention/indexer_prologue_k",
-      "native": {
-        "export": "indexer_prologue_k",
-        "sources": [
-          "@indexer_prologue_k/source/indexer_prologue_k.py"
-        ]
-      }
+      "test": "test/attention/indexer_prologue_k"
     },
     "engram_gate": {
       "source": "samples/vector/engram_gate",
-      "test": "test/vector/engram_gate",
-      "native": {
-        "export": "engram_gate",
-        "sources": [
-          "@engram_gate/source/engram_gate.py"
-        ]
-      }
+      "test": "test/vector/engram_gate"
     },
     "quant_block_sparse_attn": {
       "source": "samples/attention/quant_block_sparse_attn",
@@ -155,25 +93,11 @@
     },
     "indexer_prologue_qw": {
       "source": "samples/attention/indexer_prologue_qw",
-      "test": "test/attention/indexer_prologue_qw",
-      "native": {
-        "export": "indexer_prologue_qw",
-        "sources": [
-          "@indexer_prologue_qw/source/indexer_prologue_qw.py",
-          "@indexer_prologue_qw/source/indexer_prologue_qw_format.py"
-        ]
-      }
+      "test": "test/attention/indexer_prologue_qw"
     },
     "quant_lightning_indexer": {
       "source": "samples/attention/quant_lightning_indexer",
-      "test": "test/attention/quant_lightning_indexer",
-      "native": {
-        "export": "qli",
-        "sources": [
-          "@quant_lightning_indexer/source/quant_lightning_indexer.py",
-          "@quant_lightning_indexer_metadata/source/quant_lightning_indexer_metadata.py"
-        ]
-      }
+      "test": "test/attention/quant_lightning_indexer"
     },
     "quant_lightning_indexer_metadata": {
       "source": "samples/attention/quant_lightning_indexer_metadata",
@@ -181,14 +105,7 @@
     },
     "quant_sparse_lightning_indexer": {
       "source": "samples/attention/quant_sparse_lightning_indexer",
-      "test": "test/attention/quant_sparse_lightning_indexer",
-      "native": {
-        "export": "qsli",
-        "sources": [
-          "@quant_sparse_lightning_indexer/source/quant_sparse_lightning_indexer.py",
-          "@quant_sparse_lightning_indexer_metadata/source/quant_sparse_lightning_indexer_metadata.py"
-        ]
-      }
+      "test": "test/attention/quant_sparse_lightning_indexer"
     },
     "quant_sparse_lightning_indexer_metadata": {
       "source": "samples/attention/quant_sparse_lightning_indexer_metadata",
@@ -196,14 +113,7 @@
     },
     "mixed_quant_sparse_flash_mla": {
       "source": "samples/attention/mixed_quant_sparse_flash_mla",
-      "test": "test/attention/mixed_quant_sparse_flash_mla",
-      "native": {
-        "export": "mqsmla",
-        "sources": [
-          "@mixed_quant_sparse_flash_mla/source/mixed_quant_sparse_flash_mla.py",
-          "@mixed_quant_sparse_flash_mla/source/mixed_quant_sparse_flash_mla_metadata.py"
-        ]
-      }
+      "test": "test/attention/mixed_quant_sparse_flash_mla"
     },
     "mixed_quant_sparse_flash_mla_metadata": {
       "inventory_path": "attention/mixed_quant_sparse_flash_mla_metadata",
@@ -212,76 +122,31 @@
     },
     "block_attn_res_update_rms_norm": {
       "source": "samples/vector/block_attn_res_update_rms_norm",
-      "test": "test/vector/block_attn_res_update_rms_norm",
-      "native": {
-        "export": "block_attn_res_update_rms_norm",
-        "sources": [
-          "@block_attn_res_update_rms_norm/source/block_attn_res_update_rms_norm.py"
-        ]
-      }
+      "test": "test/vector/block_attn_res_update_rms_norm"
     },
     "fused_recurrent_kda_snapshot": {
       "source": "samples/attention/fused_recurrent_kda_snapshot",
-      "test": "test/attention/fused_recurrent_kda_snapshot",
-      "native": {
-        "export": "fused_recurrent_kda",
-        "sources": [
-          "@fused_recurrent_kda_snapshot/source/fused_recurrent_kda_snapshot.py"
-        ]
-      }
+      "test": "test/attention/fused_recurrent_kda_snapshot"
     },
     "fused_recurrent_kda_replayssm": {
       "source": "samples/attention/fused_recurrent_kda_replayssm",
-      "test": "test/attention/fused_recurrent_kda_replayssm",
-      "native": {
-        "export": "fused_recurrent_kda_replayssm",
-        "sources": [
-          "@fused_recurrent_kda_replayssm/source/fused_recurrent_kda_replayssm.py"
-        ]
-      }
+      "test": "test/attention/fused_recurrent_kda_replayssm"
     },
     "mega_recurrent_kda": {
       "source": "samples/attention/mega_recurrent_kda",
-      "test": "test/attention/mega_recurrent_kda",
-      "native": {
-        "export": "mega_recurrent_kda",
-        "sources": [
-          "@mega_recurrent_kda/source/mega_recurrent_kda.py",
-          "@mega_recurrent_kda/source/mega_recurrent_kda_common.py",
-          "@mega_recurrent_kda/source/mega_recurrent_kda_frontend.py",
-          "@mega_recurrent_kda/source/mega_recurrent_kda_backend.py"
-        ]
-      }
+      "test": "test/attention/mega_recurrent_kda"
     },
     "commit_recurrent_kda": {
       "source": "samples/attention/commit_recurrent_kda",
-      "test": "test/attention/commit_recurrent_kda",
-      "native": {
-        "export": "commit_recurrent_kda",
-        "sources": [
-          "@commit_recurrent_kda/source/commit_recurrent_kda.py"
-        ]
-      }
+      "test": "test/attention/commit_recurrent_kda"
     },
     "quant_mla_prolog": {
       "source": "samples/attention/quant_mla_prolog",
-      "test": "test/attention/quant_mla_prolog",
-      "native": {
-        "export": "quant_mla_prolog",
-        "sources": [
-          "@quant_mla_prolog/source/quant_mla_prolog.py"
-        ]
-      }
+      "test": "test/attention/quant_mla_prolog"
     },
     "mla_prolog_v4": {
       "source": "samples/attention/mla_prolog_v4",
-      "test": "test/attention/mla_prolog_v4",
-      "native": {
-        "export": "mla_prolog_v4",
-        "sources": [
-          "@mla_prolog_v4/source/mla_prolog_v4.py"
-        ]
-      }
+      "test": "test/attention/mla_prolog_v4"
     },
     "gather_v2": {
       "source": "samples/vector/gather_v2",
@@ -293,14 +158,7 @@
     },
     "moonep": {
       "source": "samples/mc2/moonep",
-      "test": "test/mc2/moonep",
-      "native": {
-        "export": "moonep_plan",
-        "sources": [
-          "@moonep/source/moonep_plan.py",
-          "@moonep/source/moonep_context.py"
-        ]
-      }
+      "test": "test/mc2/moonep"
     },
     "sparse_flash_mla": {
       "source": "samples/attention/sparse_flash_mla",
@@ -315,31 +173,11 @@
     },
     "mega_full_index": {
       "source": "samples/attention/mega_full_index",
-      "test": "test/attention/mega_full_index",
-      "native": {
-        "export": "mega_full_index",
-        "sources": [
-          "@mega_full_index/source/mega_full_index.py",
-          "@mega_full_index/source/prologue.py",
-          "@mega_full_index/source/qli.py"
-        ]
-      }
+      "test": "test/attention/mega_full_index"
     },
     "mega_reindex": {
       "source": "samples/attention/mega_reindex",
-      "test": "test/attention/mega_reindex",
-      "native": {
-        "export": "mega_reindex",
-        "sources": [
-          "@mega_reindex/source/mega_reindex.py",
-          "@mega_reindex/source/reindex_front.py",
-          "@mega_reindex/source/reindex_query.py",
-          "@mega_reindex/source/reindex_runtime.py",
-          "@mega_reindex/source/reindex_tail.py",
-          "@mega_reindex/source/reindex_matmul.py",
-          "@mega_reindex/source/reindex_mx.py"
-        ]
-      }
+      "test": "test/attention/mega_reindex"
     },
     "matmul_streamk": {
       "source": "samples/matmul/matmul/matmul_streamk.py",
@@ -351,29 +189,7 @@
     },
     "mega_mla": {
       "source": "samples/attention/mega_mla",
-      "test": "test/attention/mega_mla",
-      "native": {
-        "export": "mega_mla",
-        "sources": [
-          "@mega_mla/source/mega_mla_native.py",
-          "@mega_mla/source/attention_geometry.py",
-          "@mega_mla/source/attention_inputs.py",
-          "@mega_mla/source/attention_matmul.py",
-          "@mega_mla/source/mega_mla.py",
-          "@mega_mla/source/mega_mla_kernel.py",
-          "@mega_mla/source/attention_pipeline.py",
-          "@mega_mla/source/attention_sequence_filter.py",
-          "@mega_mla/source/attention_sequence_inputs.py",
-          "@mega_mla/source/attention_workspace.py",
-          "@mega_mla/source/cache_decode.py",
-          "@mega_mla/source/compressed_cache_gather.py",
-          "@mega_mla/source/dual_cache_vector_attention.py",
-          "@mega_mla/source/mxfp8_matmul.py",
-          "@mega_mla/source/paged_cache.py",
-          "@mega_mla/source/qkv_projection.py",
-          "@mega_mla/source/rotary_position_embedding.py"
-        ]
-      }
+      "test": "test/attention/mega_mla"
     },
     "quant_batch_matmul_inplace_add": {
       "source": "samples/matmul/quant_matmul/quant_batch_matmul_inplace_add.py",
@@ -409,41 +225,9 @@
     },
     "mega_compressor": {
       "source": "samples/attention/mega_compressor",
-      "test": "test/attention/mega_compressor",
-      "native": {
-        "export": "mega_compressor",
-        "sources": [
-          "@mega_compressor/source/mega_compressor.py"
-        ]
-      }
+      "test": "test/attention/mega_compressor"
     }
   },
-  "native_exports": [
-    "mixed_quant_sparse_flash_mla",
-    "quant_lightning_indexer",
-    "quant_sparse_lightning_indexer",
-    "attn_epilogue",
-    "attn_prologue",
-    "indexer_prologue_qw",
-    "indexer_prologue_k",
-    "engram_gate",
-    "block_attn_res_update_rms_norm",
-    "flash_kda",
-    "flash_kda_fwd",
-    "flash_kda_cp_preprocess",
-    "flash_kda_cp_main",
-    "fused_recurrent_kda_snapshot",
-    "fused_recurrent_kda_replayssm",
-    "mega_recurrent_kda",
-    "commit_recurrent_kda",
-    "quant_mla_prolog",
-    "mla_prolog_v4",
-    "moonep",
-    "mega_mla",
-    "mega_full_index",
-    "mega_compressor",
-    "mega_reindex"
-  ],
   "ci": {
     "skip_all_tests": false,
     "ignore": [
@@ -452,10 +236,11 @@
       "scripts/ci/operator_list.yaml",
       "scripts/ci/parse_changed_ops.py",
       "scripts/ci/perf_cases.py",
+      "scripts/ci/sync_catalog.py",
       "scripts/format_cpp.sh",
       "scripts/run_codespell.sh",
       "test/test_config.yaml",
-      "net/"
+      "packaging/net/"
     ],
     "inventory": [
       "fused_norm_rope_attn_rope_cast_fwd",
@@ -659,7 +444,7 @@
       },
       {
         "name": "quant_mla_prolog",
-        "enabled": true,
+        "enabled": false,
         "watch": [
           "@quant_mla_prolog/source",
           "@quant_mla_prolog/test"
@@ -1043,7 +828,7 @@
       },
       {
         "name": "mega_reindex",
-        "enabled": true,
+        "enabled": false,
         "watch": [
           "@mega_reindex/source",
           "@mega_reindex/test"
@@ -1053,10 +838,10 @@
         ]
       },
       {
-        "name": "ds41_network",
+        "name": "network_groups",
         "enabled": false,
         "watch": [
-          "net/ds41/network.json"
+          "packaging/net/network.json"
         ],
         "tests": [
           "@mixed_quant_sparse_flash_mla/test",
@@ -1071,16 +856,8 @@
           "@mega_mla/test",
           "@mega_full_index/test",
           "@mega_compressor/test",
-          "@mega_reindex/test"
-        ]
-      },
-      {
-        "name": "k3_network",
-        "enabled": false,
-        "watch": [
-          "net/k3/network.json"
-        ],
-        "tests": [
+          "@mega_reindex/test",
+          "@attn_prologue/test",
           "@block_attn_res_update_rms_norm/test",
           "@flash_kda/test",
           "@flash_kda_fwd/test",
@@ -1090,12 +867,13 @@
           "@fused_recurrent_kda_replayssm/test",
           "@mega_recurrent_kda/test",
           "@commit_recurrent_kda/test",
+          "@mla_prolog_v4/test",
           "@quant_mla_prolog/test"
         ]
       },
       {
         "name": "mega_mla",
-        "enabled": true,
+        "enabled": false,
         "watch": [
           "@mega_mla/source",
           "@mega_mla/test"

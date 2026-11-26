@@ -130,23 +130,19 @@ assert torch.count_nonzero(out).item() == 0
 ### 安装包调用
 
 源码示例与测试直接加载本仓库 sample。需要部署安装包时，使用共享
-[Native 构建工程](../../../packaging/native/README.md)，注册名为 `mqsmla`，所属组为
+[Native 构建工程](../../../packaging/README.md)，注册名为 `mqsmla`，所属组为
 `ds41`，同时打包主算子和 metadata 模块：
 
 ```bash
-export PYTHON=/path/to/python3.12
-export CANN_ENV=/path/to/Ascend/cann/set_env.sh
-source "$CANN_ENV"
-export CANNBOTDSL_WHEEL=/path/to/cannbot_dsl-0.8.0-cp312-cp312-manylinux_2_28_x86_64.whl
-bash packaging/native/run-build.sh --operator mqsmla
-"$PYTHON" -m pip install --no-deps --force-reinstall \
-  packaging/native/output/operators/mqsmla/wheels/cannbot_arena_net-0.3.0-cp312-cp312-linux_x86_64.whl
+python3 packaging/native/build.py --operator mqsmla
+python3 -m pip install --no-deps --force-reinstall \
+  packaging/native/output/cannbot_dsl_ops-0.3.0-cp312-cp312-linux_x86_64.whl
 export CANNBOTDSL_NATIVE_BINARY_MODE=require
 mkdir -p .build/mqsmla-readme
 export CANNBOTDSL_NATIVE_BINARY_REPORT="$PWD/.build/mqsmla-readme/native.json"
 ```
 
-生成的 wheel 分发名为 `cannbot-arena-net`，Python 包名为 `ops`。安装包调用方式：
+生成的 wheel 分发名为 `cannbot-dsl-ops`，Python 包名为 `ops`。安装包调用方式：
 
 ```python
 from ops.mixed_quant_sparse_flash_mla import mixed_quant_sparse_flash_mla
