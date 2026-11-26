@@ -2478,14 +2478,17 @@ MX_GROUP_SIZE = 32
 # torch_npu.Format.FRACTAL_NZ; spelled out so importing this module stays free
 # of torch_npu until the NPU path actually runs.
 FRACTAL_NZ = 29
-# T values the packaged export compiles a binary for.  The host entry point
-# below plans any T; this list only bounds the AOT build.
+# T values in the default verification matrix: T is batch * seq, so decode
+# contributes batch x {1 accepted token, 1 + 5 MTP draft tokens} and prefill
+# contributes batch x chunk length with no MTP.  Kept as a literal rather than
+# derived from the verification shape module so that ``net/ops`` stays
+# importable on its own; ``net/verification/test/indexer_prologue_qw_shapes.py``
+# generates it.
 #
-# The default is the deployment set: T is batch * seq, so decode contributes
-# batch x {1 accepted token, 1 + 5 MTP draft tokens} and prefill contributes
-# batch x chunk length with no MTP.  Kept as a literal rather than derived from
-# the verification shape module so that ``net/ops`` stays importable on its own;
-# ``net/verification/test/indexer_prologue_qw_shapes.py`` generates it.
+# This list is not the export set: the AOT build packages every template that
+# ``plan_buckets`` enumerates, because T is dynamic but the head split is a
+# compile-time shape key.  Bounding the export by this matrix leaves the T
+# ranges served by the other keys with no installed binary.
 DEPLOYMENT_T = (
     1,
     4,
@@ -2511,10 +2514,11 @@ DEPLOYMENT_T = (
 )
 
 
-def _export_t_values() -> tuple[int, ...]:
+def _export_t_values() -> tuple[int, ...] | None:
+    """The ``IPQW_EXPORT_T`` subset, or None to package every template."""
     raw = os.environ.get("IPQW_EXPORT_T", "")
     if not raw:
-        return DEPLOYMENT_T
+        return None
     values = []
     for part in raw.split(","):
         if part:
@@ -2523,6 +2527,18 @@ def _export_t_values() -> tuple[int, ...]:
 
 
 EXPORT_T = _export_t_values()
+
+
+def _export_shape_keys(buckets, geo) -> set[tuple]:
+    """Shape keys the AOT build must include for this geometry.
+
+    An unset ``IPQW_EXPORT_T`` means every template in ``plan_buckets``.  A set
+    value is an opt-in subset for targeted builds; it never turns dynamic T
+    into a static T.
+    """
+    if EXPORT_T is None:
+        return {tile_plan.shape_key() for tile_plan, _, _ in buckets}
+    return {_plan_for(t_value, geo).p.shape_key() for t_value in EXPORT_T}
 
 
 def split_t_min(cube_cores: int | None = None) -> int:
@@ -3025,11 +3041,13 @@ def indexer_prologue_qw(*tensors, **options):
 def export_indexer_prologue_qw():
     """Package one artifact per template, not one artifact per T.
 
-    plan_buckets() lists two templates by default, and each uses Dim for its
-    T range. IPQW_EXPORT_T selects templates; it does not turn dynamic T into
-    a static T. shape_key does not include the core count. The launch grid
-    arrives through the workspace shape. resolve_cube_cores() only builds the
-    host plan; it does not mean each core count needs its own template.
+    plan_buckets() enumerates every compile-time shape over the dynamic-T
+    range, and each uses Dim for the T values it serves.  By default all of
+    them are packaged, so any T can hit a shipped binary; IPQW_EXPORT_T
+    restricts the build to the templates that serve the listed T values.
+    shape_key does not include the core count. The launch grid arrives through
+    the workspace shape. resolve_cube_cores() only builds the host plan; it
+    does not mean each core count needs its own template.
     """
     # Frozen geometry: hidden dim, q_lora, head count, head dim, RoPE length.
     geo = Geometry(
@@ -3041,9 +3059,7 @@ def export_indexer_prologue_qw():
         resolve_cube_cores(),
     )
     buckets = plan_buckets(geo)
-    wanted = set()
-    for t_value in EXPORT_T:
-        wanted.add(_plan_for(t_value, geo).p.shape_key())
+    wanted = _export_shape_keys(buckets, geo)
     for index, (tile_plan, t_lo, t_hi) in enumerate(buckets):
         if tile_plan.shape_key() not in wanted:
             continue
