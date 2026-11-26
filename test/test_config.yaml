@@ -429,6 +429,13 @@ flash_attn_mxfp8_fullquant:
     - test/attention/flash_attn_mxfp8_fullquant
   options:
     - attention/flash_attn_mxfp8_fullquant
+flash_mla_fullquant:
+  module: true
+  src:
+    - samples/attention/flash_mla_fullquant
+    - test/attention/flash_mla_fullquant
+  options:
+    - attention/flash_mla_fullquant
 flash_mla_with_kvcache:
   module: true
   src:

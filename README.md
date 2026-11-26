@@ -134,6 +134,7 @@ bash packaging/native/run-build.sh --group k3
 | [flash_attn_fp8_fullquant](samples/attention/flash_attn_fp8_fullquant) | `flash_attn_fp8_fullquant()` | FP8 全量化 Attention，支持 GQA、变长序列和分页 KV cache |
 | [flash_attn_hif8_fullquant](samples/attention/flash_attn_hif8_fullquant) | `npu_flash_atten_hif8_fullquant()` | HIF8 原生全量化 Attention，支持 GQA、变长序列、BNSD/BSND/TND、causal、Flash Decode 与可选 FP32 LSE |
 | [flash_attn_mxfp8_fullquant](samples/attention/flash_attn_mxfp8_fullquant) | `npu_flash_atten_mxfp8_fullquant()` | MXFP8 全量化 GQA Flash Attention，支持 Prefill、Decode 和分页 KV cache |
+| [flash_mla_fullquant](samples/attention/flash_mla_fullquant) | `flash_mla_fullquant_fp8()` / `flash_mla_fullquant_hif8()` | FP8 E4M3 / HIF8 全量化 MLA decode，支持分页 KV cache、causal、Flash Decode 与可选 LSE |
 | [flash_mla_with_kvcache](samples/attention/flash_mla_with_kvcache) | `flash_mla_with_kvcache()`、`flash_mla_with_kvcache_metadata()` | Flash MLA 推理，Query 为 TND、KV 为分页 cache |
 | [qwen_sparse_attn](samples/attention/qwen_sparse_attn) | `qwen_sparse_attn()` | 固定 `block_size=128` 的分块稀疏注意力，含 AICPU metadata 规划 |
 | [quant_block_sparse_attn](samples/attention/quant_block_sparse_attn) | `quant_block_sparse_attn()`、`quant_block_sparse_attn_metadata()` | FP8 量化块稀疏注意力，面向分页 prefill |

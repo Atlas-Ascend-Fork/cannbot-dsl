@@ -57,5 +57,6 @@ operators:
   - attention/flash_attn_fp8_fullquant
   - attention/flash_attn_hif8_fullquant
   - attention/flash_attn_mxfp8_fullquant
+  - attention/flash_mla_fullquant
   - attention/flash_mla_with_kvcache
   - attention/mega_compressor
