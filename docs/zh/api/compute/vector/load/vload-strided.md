@@ -23,7 +23,7 @@ vload_strided(tensor, offset, mask: Mask, *, block_stride, repeat_stride = 0) ->
 | `offset` | 输入 | 相对`tensor`起始地址的偏移，单位为元素个数。 |
 | `mask` | 输入 | 掩码寄存器，用于指示在计算过程中哪些元素参与计算。该接口以`DataBlock`为数据搬运单元。<br>&bull; 当`DataBlock`中的任意一个元素被`mask`筛选成有效元素时，该`DataBlock`中所有数据都会搬入至矢量数据寄存器。<br>&bull; 当`DataBlock`中所有元素都被`mask`筛选成无效元素时，该`DataBlock`中的数据不会搬入到矢量数据寄存器，对应位置的元素设置为0，即使UB越界也不会报错。 |
 | `block_stride` | 输入 | 源操作数相邻`DataBlock`之间起始地址的步长，单位为32字节。 |
-| `repeat_stride` | 输入 | 本次搬入的起始读取地址相对`tensor`的偏移，单位为32字节。实际起始读取地址为`tensor`偏移`repeat_stride × 32`字节。默认值为`0`。 |
+| `repeat_stride` | 输入 | 本次搬入的起始读取地址相对`tensor`的偏移，单位为32字节。实际起始读取地址为`tensor`起始地址加上`offset × sizeof(dtype) + repeat_stride × 32`字节。默认值为`0`。 |
 
 **支持的元素数据类型：**
 
@@ -63,7 +63,7 @@ from cannbotdsl.tensor import MemLoc
 
 @kernel
 def _vload_strided_kernel(src0, dst):
-    buf = Buffer(MemLoc.UB, src0.dtype, make_layout((128,)))
+    buf = Buffer(MemLoc.UB, src0.dtype, make_layout((144,)))
     out = Buffer(MemLoc.UB, dst.dtype, make_layout((64,)))
 
     mem_copy(buf, src0)
@@ -72,7 +72,7 @@ def _vload_strided_kernel(src0, dst):
     res = out
     with vf(mode="simd"):
         mask = full_mask()
-        r = vload_strided(in0, 0, mask, block_stride=2, repeat_stride=1)
+        r = vload_strided(in0, 8, mask, block_stride=2, repeat_stride=1)
         vstore(res, 0, r, mask)
 
     mem_copy(dst, out)
@@ -82,14 +82,14 @@ def run(src0, dst):
     _vload_strided_kernel[1](src0, dst)
 
 def main():
-    src0 = torch.arange(128, dtype=torch.float32, device="npu:0")
+    src0 = torch.arange(144, dtype=torch.float32, device="npu:0")
     dst = torch.empty((64,), dtype=torch.float32, device="npu:0")
 
     run(src0, dst)
     torch.npu.synchronize()
 
-    # 每个DataBlock为8个元素，搬入步长为2、起始偏移为1个DataBlock，即取第1、3、…、15个DataBlock
-    torch.testing.assert_close(dst.cpu(), src0.cpu().view(16, 8)[1::2].reshape(-1))
+    # 每个DataBlock为8个元素，offset=8与repeat_stride=1合计偏移2个DataBlock，即取第2、4、…、16个DataBlock
+    torch.testing.assert_close(dst.cpu(), src0.cpu().view(18, 8)[2:18:2].reshape(-1))
     print("vload_strided example passed")
     print(f"first={float(dst.cpu()[0]):.4f}, last={float(dst.cpu()[-1]):.4f}")
 
@@ -101,5 +101,5 @@ if __name__ == "__main__":
 
 ```text
 vload_strided example passed
-first=8.0000, last=127.0000
+first=16.0000, last=135.0000
 ```

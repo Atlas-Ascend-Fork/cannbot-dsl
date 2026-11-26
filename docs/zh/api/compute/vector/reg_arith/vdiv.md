@@ -13,6 +13,8 @@ $$
 dst_i = lhs_i \div rhs_i
 $$
 
+对于整数类型，除法结果的商向零截断。
+
 ## 函数原型
 
 ```python
@@ -40,6 +42,7 @@ vdiv(lhs: RawVReg, rhs: RawVReg, *, mask: Mask, precision_mode: bool = False) ->
 
 - 本接口需在`vf(mode="simd")`作用域内调用。
 
+- 对被`mask`选中的整数元素，调用者须保证除数不为0，且商在结果类型的可表示范围内。
 - 除零错误需由调用者避免；浮点dtype除零时结果为`IEEE 754`特殊值（`±inf`或`nan`）。
 - `dtypes.float16`、`dtypes.float32`数据类型的计算结果与标准`IEEE 754`二进制浮点除法相比可能存在1 ULP精度差异。
 

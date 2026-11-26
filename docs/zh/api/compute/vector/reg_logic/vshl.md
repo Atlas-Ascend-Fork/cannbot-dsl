@@ -47,7 +47,9 @@ vshl(src: RawVReg, shift_bits: int, *, mask: Mask) -> RawVReg
 
 ### 位移约束
 
-- 当`shift_bits`大于`src`的数据类型位宽时，输出结果中的有效元素置零。
+- 对于8、16、32位元素，当`shift_bits`大于或等于`src`的数据类型位宽时，输出结果中的有效元素置零。
+
+- 64位元素仅支持`0 <= shift_bits < 64`，不适用上述规则。
 
 ## 调用示例
 
