@@ -57,9 +57,9 @@ from cannbotdsl.tensor import MemLoc
 
 @kernel
 def _vstore_interleave_kernel(src0, src1, dst):
-    buf0 = Buffer(MemLoc.UB, src0.dtype, make_layout((64,)))
-    buf1 = Buffer(MemLoc.UB, src1.dtype, make_layout((64,)))
-    out = Buffer(MemLoc.UB, dst.dtype, make_layout((128,)))
+    buf0 = Buffer(MemLoc.UB, src0.dtype, make_layout((128,)))
+    buf1 = Buffer(MemLoc.UB, src1.dtype, make_layout((128,)))
+    out = Buffer(MemLoc.UB, dst.dtype, make_layout((256,)))
 
     mem_copy(buf0, src0)
     mem_copy(buf1, src1)
@@ -77,10 +77,10 @@ def run(src0, src1, dst):
     _vstore_interleave_kernel[1](src0, src1, dst)
 
 def main():
-    src0 = torch.arange(64, dtype=torch.int32).to(torch.float16).to("npu:0")
+    src0 = torch.arange(128, dtype=torch.int32).to(torch.float16).to("npu:0")
     src1 = src0 + 100.0
-    dst = torch.empty((128,), dtype=torch.float16, device="npu:0")
-    expected = torch.zeros(128, dtype=torch.float16)
+    dst = torch.empty((256,), dtype=torch.float16, device="npu:0")
+    expected = torch.zeros(256, dtype=torch.float16)
     expected[0::2] = src0.cpu()
     expected[1::2] = src1.cpu()
 
@@ -99,5 +99,5 @@ if __name__ == "__main__":
 
 ```text
 vstore_interleave example passed
-first=0.0000, last=163.0000
+first=0.0000, last=227.0000
 ```

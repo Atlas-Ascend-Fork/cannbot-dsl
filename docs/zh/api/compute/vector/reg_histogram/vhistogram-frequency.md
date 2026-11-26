@@ -43,7 +43,7 @@ vhistogram_frequency(src: RawVReg, *, mask: Mask, bin: int = 0) -> RawVReg
 ### 计算约束
 
 - `mask`用于筛选源操作数：掩码位为0时，源操作数`src`对应位置的数值将被忽略，返回值对应位置数值为忽略该位置`src`后统计得到的值。
-- 本接口每次调用都从零开始计数，不累加前一次调用的结果；需要在上一次统计结果的基础上累加时，请使用[`vhistogram_accumulate`](./vhistogram-accumulate.md)。
+- 本接口每次调用都从零开始计数，不累加前一次调用的结果。
 
 ## 调用示例
 

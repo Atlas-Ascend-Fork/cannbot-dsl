@@ -65,8 +65,8 @@ from cannbotdsl.tensor import MemLoc
 
 @kernel
 def _vload_downsample_kernel(src0, dst):
-    buf = Buffer(MemLoc.UB, src0.dtype, make_layout((128,)))
-    out = Buffer(MemLoc.UB, dst.dtype, make_layout((64,)))
+    buf = Buffer(MemLoc.UB, src0.dtype, make_layout((256,)))
+    out = Buffer(MemLoc.UB, dst.dtype, make_layout((128,)))
 
     mem_copy(buf, src0)
 
@@ -83,8 +83,8 @@ def run(src0, dst):
     _vload_downsample_kernel[1](src0, dst)
 
 def main():
-    src0 = torch.arange(128, dtype=torch.int32).to(torch.float16).to("npu:0")
-    dst = torch.empty((64,), dtype=torch.float16, device="npu:0")
+    src0 = torch.arange(256, dtype=torch.int32).to(torch.float16).to("npu:0")
+    dst = torch.empty((128,), dtype=torch.float16, device="npu:0")
 
     run(src0, dst)
     torch.npu.synchronize()
@@ -101,5 +101,5 @@ if __name__ == "__main__":
 
 ```text
 vload_downsample example passed
-first=0.0000, last=126.0000
+first=0.0000, last=254.0000
 ```
