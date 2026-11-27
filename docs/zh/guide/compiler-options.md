@@ -48,6 +48,10 @@ python my_op.py
 
 归档会在`CANNBOTDSL_DUMP_DIR/asc/`下按算子身份、参数shape和dtype保存各个编译变体，避免同名入口互相覆盖。根目录的`<function>.asc`仍只保留最近一次源码。目录规则、元数据及算子包构建注意事项见[AscendC源码归档](./ascendc-dump.md)。
 
+`CANNBOTDSL_DUMP_ASCENDC`是默认关闭的统一dump开关，还会在运行时启用[输入Tensor快照](./input-tensor-dump.md)和[Tiling结果导出](./tiling-dump.md)。`CANNBOTDSL_DUMP_DIR`控制这些普通dump的根目录，不控制AIC异常报告；后者使用`CANNBOTDSL_AIC_ERROR_DEBUG_DIR`。
+
+包含“诊断仅异常时落盘”更新的框架包，在正常编译、加载、调用和退出时不预写AIC诊断材料；未开启其他dump且没有异常时，不因这些功能创建`.dump`。异常报告及回调维测只写文件。适用前提、编译行号开关和报告读取方法见[AIC / AIV异常诊断](./aic-error-debug.md)。
+
 想直接打到终端而不落盘：
 
 | 变量 | 作用 |

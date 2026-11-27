@@ -10,11 +10,15 @@ See LICENSE in the root of the software repository for the full text of the Lice
 
 # AIC / AIV 异常诊断与 Python 源码定位
 
-DSL 在 NPU 执行时默认启用 AIC / AIV 异常监测。发生异常后保存 kernel、host 参数、PC 和寄存器，并生成终端日志及 JSON / LOG 报告。异常回调还会尝试保存当次输入 Tensor，供排查和准备单算子复现数据。当前不采集运行时 Python 调用栈。
+DSL在NPU执行时默认启用AIC / AIV异常监测。发生异常后保存kernel、host参数、PC和寄存器，并生成JSON / LOG文件报告。异常回调还会尝试保存当次输入Tensor，供排查和准备单算子复现数据。当前不采集运行时Python调用栈。
+
+DSL诊断不向标准输出或标准错误（stdout/stderr）打印报告、回调维测或应急现场；CANN、驱动及上层框架自身的日志和异常输出不受影响。
 
 ## 使用前准备
 
 安装包需包含 AIC / AIV 诊断、异常输入保存及 Python 来源映射能力。Python 定位需要带行号和来源映射的编译产物；旧产物需重新编译。异常输入保存还要求产物包含 Tensor 参数布局。
+
+本文的目录和输出说明适用于包含“诊断仅异常时落盘、报告仅写文件”更新的框架包。旧包可能在正常路径归档材料或打印诊断日志；仅设置环境变量不能补充这些更新，使用前需确认安装包包含对应实现。
 
 ## 配置方法
 
@@ -28,7 +32,7 @@ python your_compile_or_jit_script.py
 
 `CANNBOTDSL_AIC_ERROR_DEBUG` 默认关闭，设为 `1` 才添加 `-lineinfo`；它控制编译行号信息和 Python 来源映射，不控制异常监测。运行时打开该开关不能为已编译的旧包补充行号，需要重新编译。
 
-`CANNBOTDSL_AIC_ERROR_DEBUG_DIR` 控制诊断产物和异常报告目录，默认是当前目录下的 `.dump/aic_error`。建议使用可写、运行期间不会被清理的绝对路径；配置后再启动进程。
+`CANNBOTDSL_AIC_ERROR_DEBUG_DIR`控制诊断产物和异常报告目录，默认是当前目录下的`.dump/aic_error`，不随`CANNBOTDSL_DUMP_DIR`改变。建议使用可写、运行期间不会被清理的绝对路径；配置后再启动进程。该目录只在收到异常后创建。正常编译、加载、调用和退出不创建AIC诊断目录，也不预先写出诊断源码或二进制。若其他dump开关也未开启，正常运行不会因为这些诊断功能创建`.dump`。
 
 在异常回调时自动尝试读取输入 Tensor，见[异常输入 Tensor 保存](#异常输入-tensor-保存)；若需要执行前的原始输入，见[输入 Tensor 快照](input-tensor-dump.md)。
 
@@ -36,24 +40,29 @@ python your_compile_or_jit_script.py
 
 ```text
 aic-reports/
-  build-*/                    # 诊断所需源码、manifest 和二进制归档
-  artifact-index/              # 编译产物索引
-  process-<PID>-*/
+  process-<PID>-<唯一后缀>/
+    artifact-<编译产物ID>/     # 异常涉及的编译产物
+      kernel.asc              # 生成的AscendC源码
+      artifact.so             # 与本次kernel匹配的二进制
+      manifest.json           # 源码、参数布局、校验值等描述
     events.jsonl               # 原始异常事件
     events.jsonl.registers.jsonl
     snapshot-<sequence>.json    # 回调现场及恢复报告所需信息
-    error-*.native.log         # 回调阶段生成的基础日志
+    error-*.native.log         # 基础现场、回调维测及同一事件的后续更新
     error-*.json               # 结构化诊断报告
     error-*.log                # 可读诊断报告
+    diagnostic.log            # Python诊断状态信息，有记录时生成
     inputs-<sequence>.json     # 异常时的逐参数复制结果
     inputs-<sequence>-arg-<index>.bin
     inputs-<sequence>-arg-<index>.pt
     inputs-<sequence>.metadata.json
 ```
 
-上图列出可能存在的诊断材料，不表示正常执行一定会创建所有目录。材料的持久化时机取决于安装版本；采用异常时落盘的版本在捕获异常后才创建相应材料。
+上图列出异常后可能生成的材料；关联或保存失败时，部分文件可能缺失，应结合报告中的状态判断。`process-<PID>-<唯一后缀>`区分异常进程及进程实例；`artifact-<编译产物ID>`区分该进程涉及的编译产物，不是算子名称。同一事件通过`sequence`对应。不再创建正常路径的`build-*`、`loaded-*`或`artifact-index`诊断归档；旧目录不会自动删除。
 
-不同进程分别保存到 `process-<PID>-*`，同一事件通过 `sequence` 对应。二进制也可能在加载阶段归档到 `loaded-*` 目录；分析或搬迁时应保留整个诊断根目录。
+编译或首次加载时，源码和匹配二进制先保留在内存中。异常快照包含恢复所需的二进制副本，报告进程校验SHA256摘要后才写出`artifact-*`内容。因此，原算子文件被删除、移动，或者提交进程已退出，仍可从完整快照恢复。为此会增加与已登记编译产物大小有关的进程内存占用，重复调用不会重复读取或编码二进制。搬迁时保留整个`process-*`目录；旧版快照仍需保留它引用的二进制。
+
+手动开启的源码归档和执行前输入快照分别保存到`CANNBOTDSL_DUMP_DIR`下的`asc/`和`inputs/`，默认不写到`aic_error/`。两类目录及名称含义见[源码归档的目录说明](ascendc-dump.md#普通dump与异常诊断目录)。
 
 ## 阅读报告
 
@@ -78,12 +87,14 @@ aic-reports/
 
 ## 只有基础日志或报告缺失时
 
-异常回调会向 stderr 打印 `[CANNBotDSL][exceptionCallback]` 日志，无需打开 lineinfo 开关。按同一 PID 和 `sequence` 检查：
+在对应事件的`error-*.native.log`中查看`[CANNBotDSL][exceptionCallback]`维测记录，无需打开lineinfo开关。提交映射先保留在有界内存中，异常后随回调记录写出；超过容量时记录丢弃计数。按同一PID和`sequence`检查：
 
 1. `stage=captured`：确认回调已收到异常，并查看 `binding`、参数数量和寄存器数量。
 2. `stage=checkpoint`：检查 `snapshot`、`native_log` 和 `notify`。`notify=no_snapshot` 表示快照保存失败，不是没有捕获异常。
-3. `checkpoint_write` / `checkpoint_directory`：检查失败操作、路径和 errno。目录被删除时会尝试重建并重试，仍失败时尽力向 stderr 输出原始现场。
+3. `checkpoint_write` / `checkpoint_directory`：检查失败操作、路径和errno。目录首次使用或被删除时会创建或重建；指定目录不可用时尝试进程专属的系统临时目录。实际路径记录在落盘日志中，两处均失败时无法保证报告完整，不回退终端输出。
 4. `binding_lookup` / `binding_registration`：关联失败时检查接口状态及提交身份。`binding_candidate` 只供排查，不能作为已匹配的 kernel 或参数。
+
+回调维测位于`Exception callback diagnostics`段。正常提交阶段保留的映射信息位于`Recent submission diagnostics`段，仅作为上下文。同一事件由`pending`更新为`matched`时追加`Updated native checkpoint for the same event`段，保留前面的现场与维测；标准`error-*.json/log`仍表示最新解码结果。不再生成独立`callback.log`。
 
 输入流与实际任务流不同时，`launch_identity` / `binding_identity` 会记录两者及查询状态。匹配仍要求 device、实际 stream、task 和提交线程一致，不通过忽略 stream 来猜测。
 
@@ -93,7 +104,7 @@ aic-reports/
 python -m cannbotdsl.core.diag.aic_error_recovery /path/to/process-PID-directory
 ```
 
-恢复失败时查看 `snapshot-*.recovery-error`。只有 `events.jsonl` 不能说明标准报告已经生成；只有 `.native.log` 时应检查快照和恢复状态。
+离线恢复同样只写文件，不打印报告正文。恢复失败时查看`snapshot-*.recovery-error`。只有`events.jsonl`不能说明标准报告已经生成；只有`.native.log`时应检查快照和恢复状态。
 
 ## 诊断范围与限制
 
@@ -130,6 +141,8 @@ python run_operator.py
 | `inputs-<sequence>-arg-<index>.bin` | 回调中已读出的设备存储字节；即使原进程立即退出仍可保留 |
 | `inputs-<sequence>-arg-<index>.pt` | 报告进程生成的 CPU Tensor |
 | `inputs-<sequence>.metadata.json` | 参数顺序、标量原始字节/可解码值、shape、strides、dtype、format、保存状态和文件名 |
+
+复制和转换状态保存在报告及上述元数据中，回调阶段的诊断写入同一事件的`error-*.native.log`，不向终端打印。
 
 例如读取第一个输入：
 

@@ -34,6 +34,8 @@ python your_program.py
 
 `CANNBOTDSL_AIC_ERROR_DEBUG` 另行控制编译行号和 Python 来源映射，不控制本功能或默认启用的异常监测。
 
+本功能使用`CANNBOTDSL_DUMP_DIR/inputs/`，属于普通调试输出，默认不写到`.dump/aic_error/`。异常输入另用`CANNBOTDSL_AIC_ERROR_DEBUG_DIR`，两者的创建时机和路径配置见[普通dump与异常诊断目录](ascendc-dump.md#普通dump与异常诊断目录)。
+
 ## 保存范围与文件组织
 
 ```text
@@ -46,6 +48,11 @@ operator-dump/inputs/<入口名>-<算子身份哈希>/
 ```
 
 不同算子身份、进程及调用分别保存，避免覆盖。`.pt` 与 metadata 使用临时文件加原子替换发布。
+
+- `<入口名>-<算子身份哈希>`标识可调用对象；入口同名时用身份哈希区分。
+- `process-<PID>`标识本次运行进程。
+- `call-<时间戳>-<唯一后缀>`标识一次调用；时间戳为Unix时间的纳秒值，唯一后缀避免并发覆盖。
+- `000-x-32x64-float16.pt`依次包含参数序号、参数名、shape和dtype。完整描述及原始format以同目录的`metadata.json`为准。
 
 默认保存所有传入的 Tensor 参数，包括 TensorList 展开后的元素、输出缓冲区和原地更新缓冲区。保存的是调用前数据；输出缓冲区若尚未初始化，其快照不代表有效计算结果。
 

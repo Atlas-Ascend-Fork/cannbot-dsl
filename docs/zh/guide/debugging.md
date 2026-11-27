@@ -249,7 +249,7 @@ Host 侧的构图、编译和运行错误由 `CANNBotError` 及 `DiagnosticCode`
 
 [print_time_stamp](../api/diag/print_time_stamp.md)在Kernel标量代码中记录周期、PC和核信息。`marker_id`只标识代码位置；多核归属及原生二进制落盘、解析方法见接口文档。打点不会自动等待全部流水完成，不能把标量推进时间直接当作异步计算完成时间。
 
-[AscendC源码归档](./ascendc-dump.md)在编译阶段按算子、shape和dtype保存源码及元数据。它不采集运行时Tensor内容；其`CANNBOTDSL_DUMP_DIR`也不是timestamp原生二进制的保存配置。
+[AscendC源码归档](./ascendc-dump.md)在编译阶段按算子、shape和dtype保存源码及元数据。统一开关`CANNBOTDSL_DUMP_ASCENDC`还会启用[执行前输入Tensor快照](./input-tensor-dump.md)和[Tiling结果导出](./tiling-dump.md)，增加数据复制和文件写入开销。`CANNBOTDSL_DUMP_DIR`控制这些普通dump的目录，不控制timestamp原生二进制或AIC异常报告的保存路径。
 
 ## 性能分析
 
