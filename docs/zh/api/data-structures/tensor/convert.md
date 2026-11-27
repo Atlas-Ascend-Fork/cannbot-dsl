@@ -41,11 +41,11 @@ convert(
 | --- | --- | --- |
 | self | 输入 | L0C累加结果Tensor，常用float32或int32。源数据及参数表在对应的`mem_copy`执行时读取。 |
 | dtype | 输入 | 目的元素类型，必须与 mem_copy 目标一致。offset支持int4x2、int8和uint8；relu_limit支持float16、bfloat16、int4x2、int8、uint8、float8_e4m3fn、hifloat8，不支持 float32。具体类型组合还须满足累加类型和搬运目标的转换能力。 |
-| scale | 输入 | 标量缩放系数，或逐输出通道的编码量化表；表格式见[量化参数表格式](#量化参数表格式)。不启用量化控制时省略表示普通类型转换；使用激活或偏移控制而省略 scale 时默认系数为 1.0。 |
-| offset | 输入 | 标量量化输出偏移，默认0。int4x2输出取值范围为[-16, 15]，int8/uint8输出取值范围为[-256, 255]。与量化表一起使用时不得另传非零或动态偏移，表内已含偏移。 |
-| negative_scale | 输入 | 对原始值小于 0 的 L0C 结果使用的独立缩放系数；可传入标量，对所有负值使用同一系数，也可传入逐输出通道参数表，分别缩放各通道的负值。该能力不限定卷积场景。<br>默认 `None`，不单独处理负值。支持数值或位于 L1/FBUF_ACT 的 `Tensor`；参数表须为连续 `float32[N]`，每项对应一个输出通道，N 须覆盖输出列数且为 1～512。L1 表自动暂存时长度须为 64B 的整数倍、源起点按 32B 对齐；FBUF_ACT 表起点须按 64B 对齐。表可从 GM 经 L1 准备，或用 `mem_copy` 显式搬入 FBUF_ACT 后复用；其分配及手动访问方式见 [FBUF_ACT.view](../storage/fbuf-act-view.md)。 |
-| relu_limit | 输入 | 输出上限，必须在目的类型中为正且有限；整数输出阈值必须为整数且不超过类型最大值。FP8/HIF8 必须用 [storage_bits](storage-bits.md) 提供有效单元素编码；FP16/BF16/INT4/INT8/UINT8也可使用编码。 |
-| rounding_mode | 输入 | 默认`None`，使用转换的默认舍入方式。支持`"half_away"`和`"hybrid"`，用于L0C的float32转换为hifloat8。 |
+| scale | 输入 | 可选，标量缩放系数，或逐输出通道的编码量化表；表格式见[量化参数表格式](#量化参数表格式)。不启用量化控制时省略表示普通类型转换；使用激活或偏移控制而省略 scale 时默认系数为 1.0。默认值为`None`。 |
+| offset | 输入 | 可选，标量量化输出偏移，默认值为`0`。int4x2输出取值范围为[-16, 15]，int8/uint8输出取值范围为[-256, 255]。与量化表一起使用时不得另传非零或动态偏移，表内已含偏移。 |
+| negative_scale | 输入 | 可选，对原始值小于 0 的 L0C 结果使用的独立缩放系数；可传入标量，对所有负值使用同一系数，也可传入逐输出通道参数表，分别缩放各通道的负值。该能力不限定卷积场景。<br>默认值为 `None`，不单独处理负值。支持数值或位于 L1/FBUF_ACT 的 `Tensor`；参数表须为连续 `float32[N]`，每项对应一个输出通道，N 须覆盖输出列数且为 1～512。L1 表自动暂存时长度须为 64B 的整数倍、源起点按 32B 对齐；FBUF_ACT 表起点须按 64B 对齐。表可从 GM 经 L1 准备，或用 `mem_copy` 显式搬入 FBUF_ACT 后复用；其分配及手动访问方式见 [FBUF_ACT.view](../storage/fbuf-act-view.md)。 |
+| relu_limit | 输入 | 可选，输出上限，必须在目的类型中为正且有限；整数输出阈值必须为整数且不超过类型最大值。FP8/HIF8 必须用 [storage_bits](storage-bits.md) 提供有效单元素编码；FP16/BF16/INT4/INT8/UINT8也可使用编码。默认值为`None`。 |
+| rounding_mode | 输入 | 可选，默认值为`None`，使用转换的默认舍入方式。支持`"half_away"`和`"hybrid"`，用于L0C的float32转换为hifloat8。 |
 
 ### 量化参数表格式
 

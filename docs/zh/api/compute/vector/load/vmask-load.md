@@ -24,9 +24,9 @@ vmask_load(tensor, offset = 0, *, elem_bits: int = 32, dist = 'norm') -> Mask
 | 参数 | 输入/输出 | 说明 |
 | --- | --- | --- |
 | `tensor` | 输入 | 源UB地址，实际读取地址必须按32字节对齐，搬入VL/8长度数据。 |
-| `offset` | 输入 | 相对`tensor`起始地址的偏移，单位为元素个数，默认值为`0`。 |
-| `elem_bits` | 输入 | 掩码元素位宽，支持`8`、`16`、`32`，对应b8、b16、b32模式，默认值为`32`。 |
-| `dist` | 输入 | 搬入模式，取值为`'norm'`、`'upsample'`或`'downsample'`，默认值为`'norm'`。取值为`'norm'`时搬入VL/8长度数据；取值为`'upsample'`时读取VL/16长度数据；取值为`'downsample'`时读取VL/4长度数据。 |
+| `offset` | 输入 | 可选，相对`tensor`起始地址的偏移，单位为元素个数，默认值为`0`。 |
+| `elem_bits` | 输入 | 可选，掩码元素位宽，支持`8`、`16`、`32`，对应b8、b16、b32模式，默认值为`32`。 |
+| `dist` | 输入 | 可选，搬入模式，取值为`'norm'`、`'upsample'`或`'downsample'`，默认值为`'norm'`。取值为`'norm'`时搬入VL/8长度数据；取值为`'upsample'`时读取VL/16长度数据；取值为`'downsample'`时读取VL/4长度数据。 |
 
 ## 返回值说明
 

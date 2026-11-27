@@ -18,7 +18,7 @@ vsqueeze_and_storeunalign_init(tensor, *, no_clear_ar: bool = False) -> SqueezeS
 | 参数 | 输入/输出 | 说明 |
 | --- | --- | --- |
 | `tensor` | 输出 | 位于Unified Buffer（UB）中的目的张量，后续搬出操作将结果写入该张量。 |
-| `no_clear_ar` | 输入 | 是否跳过AR寄存器清零：取值为`False`时本接口将AR寄存器清零；取值为`True`时不执行清零，本次搬出操作在上一组操作剩余的AR偏移基础上继续累加，默认为`False`。 |
+| `no_clear_ar` | 输入 | 可选，是否跳过AR寄存器清零：取值为`False`时本接口将AR寄存器清零；取值为`True`时不执行清零，本次搬出操作在上一组操作剩余的AR偏移基础上继续累加，默认值为`False`。 |
 
 ## 返回值说明
 

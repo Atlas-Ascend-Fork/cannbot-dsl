@@ -26,7 +26,7 @@ vload_unalign_init(tensor, offset = 0) -> None
 | 参数 | 输入/输出 | 说明 |
 | --- | --- | --- |
 | `tensor` | 输入 | 源UB地址。`tensor`与`offset`共同确定的实际访问地址必须按dtype对齐。 |
-| `offset` | 输入 | 相对`tensor`起始地址的偏移，单位为元素个数。默认值为`0`。 |
+| `offset` | 输入 | 可选，相对`tensor`起始地址的偏移，单位为元素个数。默认值为`0`。 |
 
 **支持的元素数据类型：**
 

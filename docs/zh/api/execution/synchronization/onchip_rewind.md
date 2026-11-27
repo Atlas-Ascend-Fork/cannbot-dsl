@@ -22,7 +22,7 @@ onchip_rewind(reset_sync_id: bool=True) -> None
 
 | 参数名 | <span style="white-space: nowrap">输入/输出</span> | 说明 |
 | --- | --- | --- |
-| `reset_sync_id` | 输入 | <p>是否复用已完成同步流程的同步资源，类型为 Python <code>bool</code>，默认值为 <code>True</code>。可选值：</p><ul><li><code>True</code>：允许复用已完成同步流程的同步资源。</li><li><code>False</code>：不启用上述同步资源复用。</li></ul> |
+| `reset_sync_id` | 输入 | <p>可选，是否复用已完成同步流程的同步资源，类型为 Python <code>bool</code>，默认值为 <code>True</code>。可选值：</p><ul><li><code>True</code>：允许复用已完成同步流程的同步资源。</li><li><code>False</code>：不启用上述同步资源复用。</li></ul> |
 
 ## 返回值说明
 

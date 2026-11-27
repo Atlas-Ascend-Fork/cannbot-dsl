@@ -25,9 +25,9 @@ vload_unpack(tensor, offset = 0, *, unpack_mode, post_update: bool = False) -> R
 | 参数 | 输入/输出 | 说明 |
 | --- | --- | --- |
 | `tensor` | 输入 | 源UB地址，实际读取地址必须按32字节对齐。 |
-| `offset` | 输入 | 相对`tensor`起始地址的偏移，单位为元素个数。默认值为`0`。 |
+| `offset` | 输入 | 可选，相对`tensor`起始地址的偏移，单位为元素个数。默认值为`0`。 |
 | `unpack_mode` | 输入 | 解包搬入模式，类型为`UnpackMode`或对应的字符串，必选。源位宽必须与模式匹配，按指定扩展倍数在源数据槽后补零。 |
-| `post_update` | 输入 | 是否采用Post Update模式。取值为`True`或`False`，默认值为`False`。取值为`True`时，`offset`仍作为源地址偏移使用，本接口不更新源地址指针。 |
+| `post_update` | 输入 | 可选，是否采用Post Update模式。取值为`True`或`False`，默认值为`False`。取值为`True`时，`offset`仍作为源地址偏移使用，本接口不更新源地址指针。 |
 
 **支持的元素数据类型：**
 

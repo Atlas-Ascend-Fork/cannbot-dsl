@@ -21,7 +21,7 @@ FBUF_ACT.view(*shape: int, dtype: DType | None = None) -> Tensor
 | 参数 | 输入/输出 | 说明 |
 | --- | --- | --- |
 | shape | 输入 | 覆盖完整空间的静态形状，元素数乘积必须为 2048；常用 `view(2048)`。也可传入一个形状元组或列表。单位为字节，不是 FP32 元素数。 |
-| dtype | 输入 | 仅允许 None 或 dtypes.uint8；绑定实际 FP32 表应在切出字节区间后调用 Tensor.view(dtype=...)。 |
+| dtype | 输入 | 可选，仅允许 None 或 dtypes.uint8；绑定实际 FP32 表应在切出字节区间后调用 Tensor.view(dtype=...)。默认值为`None`。 |
 
 ## 返回值说明
 

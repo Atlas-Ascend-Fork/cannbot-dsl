@@ -20,7 +20,7 @@ vmask_store(tensor, offset, mask: Mask, *, dist = 'norm') -> None
 | `tensor` | 输出 | 目的操作数在UB中的基地址，起始地址需32字节对齐。 |
 | `offset` | 输入 | 相对`tensor`起始地址的偏移量，类型为`dtypes.int32`，单位为元素个数。<br>`offset`的单位为元素个数。通过`offset`参数偏移后的实际访问地址需落在UB地址范围内，且仍需32字节对齐，否则会报错。 |
 | `mask` | 输入 | 源操作数（掩码寄存器）。 |
-| `dist` | 输入 | 掩码搬出模式。取值为`'norm'`（连续对齐搬出）或`'pack'`（每间隔1 bit丢弃1 bit，将保留的bit连续压缩存储）。默认值为`'norm'`。 |
+| `dist` | 输入 | 可选，掩码搬出模式。取值为`'norm'`（连续对齐搬出）或`'pack'`（每间隔1 bit丢弃1 bit，将保留的bit连续压缩存储）。默认值为`'norm'`。 |
 
 ## 返回值说明
 

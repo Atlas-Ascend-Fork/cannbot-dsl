@@ -28,8 +28,8 @@ vload(tensor, offset = 0, *, post_update: bool = False) -> RawVReg
 | 参数 | 输入/输出 | 说明 |
 | --- | --- | --- |
 | `tensor` | 输入 | 源UB地址，实际读取地址必须按32字节对齐。 |
-| `offset` | 输入 | 相对`tensor`起始地址的偏移，单位为元素个数。默认值为`0`。 |
-| `post_update` | 输入 | 是否采用Post Update模式。取值为`True`或`False`，默认值为`False`。取值为`True`时，接口采用Post Update模式，搬入完成后自动更新源地址指针，`offset`为Post Update步长，单位为元素个数，源地址增加`offset × sizeof(dtype)`字节。 |
+| `offset` | 输入 | 可选，相对`tensor`起始地址的偏移，单位为元素个数。默认值为`0`。 |
+| `post_update` | 输入 | 可选，是否采用Post Update模式。取值为`True`或`False`，默认值为`False`。取值为`True`时，接口采用Post Update模式，搬入完成后自动更新源地址指针，`offset`为Post Update步长，单位为元素个数，源地址增加`offset × sizeof(dtype)`字节。 |
 
 **支持的元素数据类型：**
 

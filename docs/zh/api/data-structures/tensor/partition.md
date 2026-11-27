@@ -25,8 +25,8 @@ partition(self, *, dim, part_id=None, alignment=1) -> Tensor
 | 参数名 | <span style="white-space: nowrap">输入/输出</span> | 说明 |
 | --- | --- | --- |
 | `dim` | 输入 | <p>必填。两路搬运分区采用的逻辑轴，类型为 Python 整数。可选值：</p> <ul> <li><code>0</code>：沿 M 轴分区。先将长度的一半向上取整，再向上补齐到 <code>alignment</code> 的整数倍，作为切分位置。第一块取前面部分，第二块取剩余部分。</li> <li><code>1</code>：沿 N 轴分区。先将总长度向上补齐到 32 的整数倍，再除以 2，作为切分位置。此时 <code>alignment</code> 必须为 <code>1</code>。</li> </ul>  |
-| `part_id` | 输入 | <p>选取的两路分区编号，可以是以下类型：</p> <ul> <li><code>None</code>：默认值，不单独选择某一路；L0C → UB 必须采用此值。</li> <li><code>int</code>：静态编号，只能为 0（第一路）或 1（第二路）。</li> <li><code>受支持的运行时整数</code>：动态选择 0 或 1。</li> </ul>   |
-| `alignment` | 输入 | <p>M 轴分区的切分对齐粒度，类型为 <code>int</code>。Python 正整数，默认 1。</p> <ul> <li><code>dim=0</code>：按指定粒度切分 M。</li> <li><code>dim=1</code>：只能为 1，N 分区使用硬件 32 列边界。</li> </ul>  |
+| `part_id` | 输入 | <p>可选，选取的两路分区编号。默认值为<code>None</code>。可以是以下类型：</p> <ul> <li><code>None</code>：默认值，不单独选择某一路；L0C → UB 必须采用此值。</li> <li><code>int</code>：静态编号，只能为 0（第一路）或 1（第二路）。</li> <li><code>受支持的运行时整数</code>：动态选择 0 或 1。</li> </ul>   |
+| `alignment` | 输入 | <p>可选，M 轴分区的切分对齐粒度，类型为 <code>int</code>。Python 正整数，默认值为<code>1</code>。</p> <ul> <li><code>dim=0</code>：按指定粒度切分 M。</li> <li><code>dim=1</code>：只能为 1，N 分区使用硬件 32 列边界。</li> </ul>  |
 
 ## 返回值说明
 

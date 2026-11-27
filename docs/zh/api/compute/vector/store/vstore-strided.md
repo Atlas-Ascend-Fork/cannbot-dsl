@@ -22,7 +22,7 @@ vstore_strided(tensor, offset, value: RawVReg, mask: Mask, *, block_stride, repe
 | `value` | 输入 | 源操作数（矢量数据寄存器）。dtype须与`tensor`一致。 |
 | `mask` | 输入 | 源操作数掩码（掩码寄存器），用于指示参与搬出的元素。对应位置为1时参与搬出，为0时不参与搬出。 |
 | `block_stride` | 输入 | 目的操作数相邻DataBlock之间起始地址的步长，类型为`dtypes.uint16`，单位为32字节。 |
-| `repeat_stride` | 输入 | 目的操作数起始地址偏移，类型为`dtypes.uint16`，单位为32字节。默认值为`0`。 |
+| `repeat_stride` | 输入 | 可选，目的操作数起始地址偏移，类型为`dtypes.uint16`，单位为32字节。默认值为`0`。 |
 
 **支持的元素数据类型：**
 

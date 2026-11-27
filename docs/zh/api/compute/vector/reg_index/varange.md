@@ -31,7 +31,7 @@ varange(start, dtype, *, order_mode: 'str | OrderMode' = OrderMode.INCREASED) ->
 | --- | --- | --- |
 | `start` | 输入 | 源操作数（标量），数据类型须与`dtype`一致。作为递增序列的起点时，序列第0个元素等于`start`，后续元素按1递增；作为递减序列的起点时，序列第0个元素等于`start + VL_T - 1`，后续元素按1递减。取值范围为该dtype的可表示范围。 |
 | `dtype` | 输入 | 生成索引的元素类型。 |
-| `order_mode` | 输入 | 索引排列方向，可传入`OrderMode`枚举成员，或字符串`"increased"`（递增）、`"decreased"`（递减），默认值为`OrderMode.INCREASED`。 |
+| `order_mode` | 输入 | 可选，索引排列方向，可传入`OrderMode`枚举成员，或字符串`"increased"`（递增）、`"decreased"`（递减），默认值为`OrderMode.INCREASED`。 |
 
 **支持的元素数据类型：**
 

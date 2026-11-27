@@ -34,9 +34,9 @@ vcast(
 | `src` | 输入 | 保存待转换元素的矢量数据寄存器，不会被本接口原地修改。支持的源元素类型见[类型组合表](#约束说明)。 |
 | `dtype` | 输入 | 目标元素数据类型，例如`dtypes.float32`。支持的源、目标类型组合见[约束说明](#约束说明)。 |
 | `mask` | 输入 | 指定参与转换的元素，掩码位为1时参与转换，为0时对应结果位置清零。 |
-| `rounding` | 输入 | 舍入模式，使用公共[RoundingMode](../../roundingmode.md#舍入模式说明)或对应的字符串写法。可通过`from cannbotdsl import RoundingMode`或`from cannbotdsl.types import RoundingMode`导入。默认值为`RoundingMode.NA`；各转换可用的模式子集见[约束说明](#约束说明)。 |
-| `saturate` | 输入 | 是否启用饱和模式：`True`表示将超出范围的结果限制在目标类型的可表示范围内，`False`表示采用非饱和模式。各类转换的溢出处理见[饱和模式与非饱和模式说明](../../roundingmode.md#饱和模式与非饱和模式说明)，允许启用饱和模式的类型组合见[约束说明](#约束说明)。默认值为`False`。 |
-| `reg_layout` | 输入 | 位置选择标签，类型为`RegLayout`，必须为编译期常量，不接受原始整数或字符串。默认值为`RegLayout.UNKNOWN`；枚举成员、位置含义及使用场景见[RegLayout枚举与位置选择](#reglayout枚举与位置选择)，可用成员还受[约束说明](#约束说明)限制。 |
+| `rounding` | 输入 | 可选，舍入模式，使用公共[RoundingMode](../../roundingmode.md#舍入模式说明)或对应的字符串写法。可通过`from cannbotdsl import RoundingMode`或`from cannbotdsl.types import RoundingMode`导入。默认值为`RoundingMode.NA`；各转换可用的模式子集见[约束说明](#约束说明)。 |
+| `saturate` | 输入 | 可选，是否启用饱和模式：`True`表示将超出范围的结果限制在目标类型的可表示范围内，`False`表示采用非饱和模式。各类转换的溢出处理见[饱和模式与非饱和模式说明](../../roundingmode.md#饱和模式与非饱和模式说明)，允许启用饱和模式的类型组合见[约束说明](#约束说明)。默认值为`False`。 |
+| `reg_layout` | 输入 | 可选，位置选择标签，类型为`RegLayout`，必须为编译期常量，不接受原始整数或字符串。默认值为`RegLayout.UNKNOWN`；枚举成员、位置含义及使用场景见[RegLayout枚举与位置选择](#reglayout枚举与位置选择)，可用成员还受[约束说明](#约束说明)限制。 |
 
 `rounding=RoundingMode.NA`表示不显式指定舍入模式：位宽收窄、等位宽转换以及浮点转整数时默认选择`RN`，可精确表示的位宽扩展转换不进行舍入。整数之间的转换不进行数值舍入。
 

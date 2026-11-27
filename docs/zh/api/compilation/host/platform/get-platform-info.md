@@ -20,8 +20,8 @@ get_platform_info(
 
 | 参数 | 输入/输出 | 说明 |
 | --- | --- | --- |
-| `force_refresh` | 输入 | 是否重新查询硬件信息。`True` 表示重新查询，`False` 表示优先使用缓存，默认值为 `False`。 |
-| `stream` | 输入 | 指定查询核数时使用的NPU执行流，支持 `torch.npu.Stream` 对象或整数形式的流句柄。默认值为 `None`，使用当前PyTorch NPU执行流。 |
+| `force_refresh` | 输入 | 可选，是否重新查询硬件信息。`True` 表示重新查询，`False` 表示优先使用缓存，默认值为 `False`。 |
+| `stream` | 输入 | 可选，指定查询核数时使用的NPU执行流，支持 `torch.npu.Stream` 对象或整数形式的流句柄。默认值为 `None`，使用当前PyTorch NPU执行流。 |
 
 ## 返回值说明
 

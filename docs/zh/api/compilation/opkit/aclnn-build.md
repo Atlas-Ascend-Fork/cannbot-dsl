@@ -21,10 +21,10 @@ opkit.build(*, collectors, target, output, operators=None, pattern="*.py", l0=Fa
 | `collectors` | 输入 | 包含 `@opkit.aclnn` 入口的模块或目录。 |
 | `target` | 输入 | 目标设备型号。 |
 | `output` | 输入 | 生成 ACLNN 构建输入的目录。 |
-| `operators` | 输入 | 可选的算子名称筛选列表。 |
-| `pattern` | 输入 | 扫描 Python 文件的匹配模式。 |
-| `l0` | 输入 | 是否生成 L0 相关 ACLNN 实现，默认关闭。 |
-| `l2` | 输入 | 是否生成 L2 相关 ACLNN 实现，默认关闭。 |
+| `operators` | 输入 | 可选，算子名称筛选列表。默认值为`None`。 |
+| `pattern` | 输入 | 可选，扫描 Python 文件的匹配模式。默认值为`'*.py'`。 |
+| `l0` | 输入 | 可选，是否生成 L0 相关 ACLNN 实现，默认值为`False`（关闭）。 |
+| `l2` | 输入 | 可选，是否生成 L2 相关 ACLNN 实现，默认值为`False`（关闭）。 |
 
 ## 返回值说明
 

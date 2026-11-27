@@ -47,8 +47,8 @@ cannbotdsl.range(start, stop, step, unroll_full=True)
 | 参数 | 输入/输出 | 说明 |
 | --- | --- | --- |
 | `*args` | 输入 | 一至三个位置参数，依次对应`stop`、`start, stop`或`start, stop, step`，单位为循环计数。`start`默认为0，`stop`为循环终点（不包含），无默认值，`step`默认为1。接受Python整数或运行时整数，步长必须为正。 |
-| `unroll` | 输入 | 可选，默认`None`。通过关键字`unroll=N`指定每组迭代的展开因子，`N`为编译期已知的正Python `int`。使用`unroll_full=True`时，不得显式传入此参数。 |
-| `unroll_full` | 输入 | 可选，默认`False`，类型为Python `bool`；设为`True`请求完全展开，不保证最终完全消除循环。使用`unroll=N`时保持为`False`。 |
+| `unroll` | 输入 | 可选，默认值为`None`。通过关键字`unroll=N`指定每组迭代的展开因子，`N`为编译期已知的正Python `int`。使用`unroll_full=True`时，不得显式传入此参数。 |
+| `unroll_full` | 输入 | 可选，默认值为`False`，类型为Python `bool`；设为`True`请求完全展开，不保证最终完全消除循环。使用`unroll=N`时保持为`False`。 |
 
 ## 返回值说明
 

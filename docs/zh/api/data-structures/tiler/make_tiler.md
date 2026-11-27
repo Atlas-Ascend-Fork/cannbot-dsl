@@ -19,7 +19,7 @@ make_tiler(tiler: Tiler, *, alignment=None)
 | 参数名 | <span style="white-space: nowrap">输入/输出</span> | 说明 |
 | --- | --- | --- |
 | <span id="tiler-参数可选值"></span>`tiler` | 输入 | <p>必填。可嵌套的切块大小，可以是以下类型：</p> <ul> <li><code>int</code>：一维静态正整数块长。</li> <li><code>核函数中计算得到的整数值</code>：例如输入Tensor的某一维长度；作为块长时须为64位正整数。</li> <li><code>tuple 或 list</code>：组合各维块长，可嵌套；保留各维的嵌套分组，维度顺序见下例。</li>  </ul>   |
-| <span id="alignment-参数可选值"></span>`alignment` | 输入 | <p>指定块长的对齐要求，可以是以下类型：</p> <ul> <li><code>None</code>：默认值，不额外声明对齐条件。</li> <li><code>int</code>：编译期正整数，对所有最内层维度采用同一对齐要求。</li> <li><code>tuple[int, ...]</code>：各项为编译期正整数；单元素时对所有最内层维度采用同一要求，多元素时须按从左到右的顺序，与各最内层维度一一对应。</li> <li><code>list[int]</code>：与tuple的逐维对应规则相同。</li> </ul>  |
+| <span id="alignment-参数可选值"></span>`alignment` | 输入 | <p>可选，指定块长的对齐要求。默认值为<code>None</code>。可以是以下类型：</p> <ul> <li><code>None</code>：默认值，不额外声明对齐条件。</li> <li><code>int</code>：编译期正整数，对所有最内层维度采用同一对齐要求。</li> <li><code>tuple[int, ...]</code>：各项为编译期正整数；单元素时对所有最内层维度采用同一要求，多元素时须按从左到右的顺序，与各最内层维度一一对应。</li> <li><code>list[int]</code>：与tuple的逐维对应规则相同。</li> </ul>  |
 
 例如，`tiler=((16, 32), 8)`包含三个最内层维度，按顺序为16、32、8；`alignment=(8, 16, 4)`分别指定这三个维度的对齐要求。
 

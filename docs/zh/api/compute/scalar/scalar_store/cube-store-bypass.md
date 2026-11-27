@@ -25,7 +25,7 @@ cube_store_bypass(ptr, value, *, atomic_add: bool = False) -> None
 | --- | --- | --- |
 | `ptr` | 输入 | 指向GM中待写入元素的指针，类型为`Pointer`，由`tensor.ptr(...)`形成。本接口更新其所指元素，指针值保持不变。`atomic_add=False`时覆盖所指元素，不读取其原值；`atomic_add=True`时读取原值参与原子累加。 |
 | `value` | 输入 | 待写入的整型标量或原子累加的加数，数值类型须与`ptr`所指元素一致。支持的元素数值类型见下文。 |
-| `atomic_add` | 输入 | 编译期Python布尔值，默认值为`False`。为`False`时直接写入`value`；为`True`时原子执行目标元素加`value`并写回。不能传入运行时布尔标量。 |
+| `atomic_add` | 输入 | 可选，编译期Python布尔值，默认值为`False`。为`False`时直接写入`value`；为`True`时原子执行目标元素加`value`并写回。不能传入运行时布尔标量。 |
 
 **支持的元素数据类型：**
 

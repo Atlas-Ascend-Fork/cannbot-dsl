@@ -43,7 +43,7 @@ FBUF_ACT.view(*shape: int, dtype: DType | None = None) -> Tensor
 | 参数 | 输入/输出 | 说明 |
 | --- | --- | --- |
 | `shape` | 输入 | 完整空间视图的形状。传入一个或多个编译期已知的正整数，或一个正整数元组、列表。元素数乘积必须等于上表中对应空间的完整字节容量。例如，UB可使用`view(262144)`或`view(512, 512)`。选取局部区域时，在返回视图上进行字节切片。 |
-| `dtype` | 输入 | 默认`None`，返回`uint8`视图；显式指定时也只能为`dtypes.uint8`。需要其他元素类型时，先选取字节区间，再使用[Tensor.view](../../tensor/view.md)指定类型和形状。 |
+| `dtype` | 输入 | 可选，默认值为`None`，返回`uint8`视图；显式指定时也只能为`dtypes.uint8`。需要其他元素类型时，先选取字节区间，再使用[Tensor.view](../../tensor/view.md)指定类型和形状。 |
 
 ## 返回值说明
 

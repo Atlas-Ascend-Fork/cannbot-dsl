@@ -30,8 +30,8 @@ RingBuffer(
 | `dtype` | 输入 | 元素类型，必填。可指定的类型见[数据类型](../../data-types.md)；元素类型须为具有完整字节存储宽度的标量类型，或为支持的低位打包类型。 |
 | `layout` | 输入 | 逻辑形状和坐标跨度。必填，传入 [make_layout()](../../tensor/make_layout.md) 返回的 `Layout`。 |
 | `depth` | 输入 | 槽位数量。必填，为 Python 正整数。 |
-| `physical_layout` | 输入 | 物理存储的形状和跨度。默认 `None`，根据逻辑布局、元素类型和格式推导；也可传入 `make_layout()` 返回的 `Layout`，指定预留空间或物理跨度。 |
-| `data_format` | 输入 | 存储格式。可选值为 `None`、`"nd"`、`"nz"`。默认 `None`：L1、L0A、L0B、L0C 使用 NZ，UB、BIAS使用 ND。 |
+| `physical_layout` | 输入 | 可选，物理存储的形状和跨度。默认值为 `None`，根据逻辑布局、元素类型和格式推导；也可传入 `make_layout()` 返回的 `Layout`，指定预留空间或物理跨度。 |
+| `data_format` | 输入 | 可选，存储格式。可选值为 `None`、`"nd"`、`"nz"`。默认值为 `None`：L1、L0A、L0B、L0C 使用 NZ，UB、BIAS使用 ND。 |
 
 ## 返回值说明
 

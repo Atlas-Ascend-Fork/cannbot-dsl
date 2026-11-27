@@ -58,14 +58,14 @@ load3d(
 | src | 输入 | 源 L1 `Tensor`，NC1HWC0 排布。<br>必填，无默认值。类型为 `Tensor`，起点须按 32B 对齐；元素类型须与 `dst` 相同，支持 `int8`、`uint8`、`int16`、`uint16`、`int32`、`uint32`、`float16`、`bfloat16`、`float32`、`float8_e4m3fn`、`float8_e5m2`、`hifloat8`。 |
 | feature | 输入 | 描述源特征图的高、宽、通道数及四周填充范围，见 [Load3DFeatureMap](../../data-structures/convolution/load3d-feature-map.md)。 |
 | window | 输入 | 指定转置前展开矩阵的起点及搬运范围，见 [Load3DWindow](../../data-structures/convolution/load3d-window.md)。 |
-| filter | 输入 | 指定卷积核的高、宽，顺序为 `(filter_h, filter_w)`。<br>默认 `(1, 1)`。支持包含 2 个整数的 tuple/list，每项为 0～511；0 表示空搬运。 |
-| stride | 输入 | 指定窗口在高、宽方向每次移动的距离，顺序为 `(stride_h, stride_w)`。<br>默认 `(1, 1)`。支持包含 2 个整数的 tuple/list，每项为 1～63。 |
-| dilation | 输入 | 指定窗口内部相邻采样点在高、宽方向的距离，顺序为 `(dilation_h, dilation_w)`；1 表示连续取点。<br>默认 `(1, 1)`。支持包含 2 个整数的 tuple/list，每项为 1～255。 |
-| transpose | 输入 | 指定写入 L0A 前是否转置展开矩阵；写入 L0B 时始终转置，不受此参数控制。<br>默认 `False`。支持布尔值。 |
-| config_bank | 输入 | 选择本次使用的配置槽，与目标位于 L0A 还是 L0B 无关。<br>默认 `"a"`。支持字符串 `"a"`、`"b"` 或整数选择值 `0`、`1`，分别对应配置槽 A、B。 |
-| repeat | 输入 | 控制重复搬运次数及源数据推进方式，见 [Load3DRepeat](../../data-structures/convolution/load3d-repeat.md)。 |
-| destination | 输入 | 控制目标分形块的间距及写入起点，见 [Load3DDestination](../../data-structures/convolution/load3d-destination.md)。 |
-| padding | 输入 | 指定特征图边界填充位置使用的单元素值，见 [Load3DPadding](../../data-structures/convolution/load3d-padding.md)。 |
+| filter | 输入 | 可选，指定卷积核的高、宽，顺序为 `(filter_h, filter_w)`。<br>默认值为 `(1, 1)`。支持包含 2 个整数的 tuple/list，每项为 0～511；0 表示空搬运。 |
+| stride | 输入 | 可选，指定窗口在高、宽方向每次移动的距离，顺序为 `(stride_h, stride_w)`。<br>默认值为 `(1, 1)`。支持包含 2 个整数的 tuple/list，每项为 1～63。 |
+| dilation | 输入 | 可选，指定窗口内部相邻采样点在高、宽方向的距离，顺序为 `(dilation_h, dilation_w)`；1 表示连续取点。<br>默认值为 `(1, 1)`。支持包含 2 个整数的 tuple/list，每项为 1～255。 |
+| transpose | 输入 | 可选，指定写入 L0A 前是否转置展开矩阵；写入 L0B 时始终转置，不受此参数控制。<br>默认值为 `False`。支持布尔值。 |
+| config_bank | 输入 | 可选，选择本次使用的配置槽，与目标位于 L0A 还是 L0B 无关。<br>默认值为 `"a"`。支持字符串 `"a"`、`"b"` 或整数选择值 `0`、`1`，分别对应配置槽 A、B。 |
+| repeat | 输入 | 可选，控制重复搬运次数及源数据推进方式，见 [Load3DRepeat](../../data-structures/convolution/load3d-repeat.md)。默认值为`Load3DRepeat()`。 |
+| destination | 输入 | 可选，控制目标分形块的间距及写入起点，见 [Load3DDestination](../../data-structures/convolution/load3d-destination.md)。默认值为`None`。 |
+| padding | 输入 | 可选，指定特征图边界填充位置使用的单元素值，见 [Load3DPadding](../../data-structures/convolution/load3d-padding.md)。默认值为`Load3DPadding.value(0)`。 |
 
 ## 返回值说明
 

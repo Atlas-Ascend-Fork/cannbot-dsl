@@ -38,7 +38,7 @@ mem_copy(
 | --- | --- | --- |
 | `dst` | 输入/输出 | 目标 [Tensor](../data-structures/tensor/overview.md)，或非空 `Tensor` tuple/list。<br>调用前须声明目标`Tensor`的布局及访问范围，保证内存足够；本接口不分配或扩容目标。启用原子累加时，会读取目标原值作为累加基数。 |
 | `src` | 输入 | 源 `Tensor`，或非空 `Tensor` tuple/list。 <br>调用前须声明源`Tensor`的布局及访问范围，保证内存足够；本接口不分配或扩容目标。|
-| `options` | 输入 | 已创建的 `CopyOptions` 对象，默认值为`None`。`CopyOptions`各选项的含义、取值及适用方向见[copy_options](copy-options.md)。 |
+| `options` | 输入 | 可选，已创建的 `CopyOptions` 对象，默认值为`None`。`CopyOptions`各选项的含义、取值及适用方向见[copy_options](copy-options.md)。 |
 
 ## 搬运方向
 

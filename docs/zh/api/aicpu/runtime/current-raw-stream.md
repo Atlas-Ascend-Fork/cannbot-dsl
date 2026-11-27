@@ -17,7 +17,7 @@ current_raw_stream(device_id: int = 0) -> int
 
 | 参数 | 输入/输出 | 说明 |
 | --- | --- | --- |
-| `device_id` | 输入 | NPU设备编号，默认值为`0`。 |
+| `device_id` | 输入 | 可选，NPU设备编号，默认值为`0`。 |
 
 ## 返回值说明
 

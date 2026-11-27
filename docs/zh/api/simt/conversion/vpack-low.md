@@ -19,7 +19,7 @@ simt.vpack_low(x, y=None) -> 短向量
 | 参数 | 输入/输出 | 说明 |
 | --- | --- | --- |
 | x | 输入 | float16x2或bfloat16x2短向量。 |
-| y | 输入 | 可选同dtype短向量，默认None。 |
+| y | 输入 | 可选，同dtype短向量，默认值为`None`。 |
 
 ## 返回值说明
 

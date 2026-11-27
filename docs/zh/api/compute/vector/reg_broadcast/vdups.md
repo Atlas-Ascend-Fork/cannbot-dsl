@@ -19,9 +19,9 @@ vdups(value, dtype, *, mask: 'Mask | None' = None, mode: str = 'zeroing', merge:
 | --- | --- | --- |
 | `value` | 输入 | 源操作数（标量），作为待广播的数据。返回值的数据类型由`dtype`指定。 |
 | `dtype` | 输入 | 返回值的数据类型，取值范围见本节支持的数据类型。 |
-| `mask` | 输入 | 目的操作数元素操作的有效指示（掩码寄存器）。`mask`筛选的元素在返回值中填充为`value`，未筛选的元素按`mode`的取值处理。默认值为`None`。 |
-| `mode` | 输入 | 掩码模式，取值为`'zeroing'`或`'merging'`，默认值为`'zeroing'`。取值为`'zeroing'`时，返回值中未被`mask`筛选的位置置0；取值为`'merging'`时采用合并模式，返回值中未被`mask`筛选的元素保留`merge`的值，此时必须同时传入`mask`和`merge`。 |
-| `merge` | 输入 | 合并模式下保留原值的矢量数据寄存器，仅在`mode`取值为`'merging'`时使用，数据类型须与`dtype`一致，默认值为`None`。返回值中未被`mask`筛选的元素保留该寄存器的值。 |
+| `mask` | 输入 | 可选，目的操作数元素操作的有效指示（掩码寄存器）。`mask`筛选的元素在返回值中填充为`value`，未筛选的元素按`mode`的取值处理。默认值为`None`。 |
+| `mode` | 输入 | 可选，掩码模式，取值为`'zeroing'`或`'merging'`，默认值为`'zeroing'`。取值为`'zeroing'`时，返回值中未被`mask`筛选的位置置0；取值为`'merging'`时采用合并模式，返回值中未被`mask`筛选的元素保留`merge`的值，此时必须同时传入`mask`和`merge`。 |
+| `merge` | 输入 | 可选，合并模式下保留原值的矢量数据寄存器，仅在`mode`取值为`'merging'`时使用，数据类型须与`dtype`一致，默认值为`None`。返回值中未被`mask`筛选的元素保留该寄存器的值。 |
 
 **支持的元素数据类型：**
 

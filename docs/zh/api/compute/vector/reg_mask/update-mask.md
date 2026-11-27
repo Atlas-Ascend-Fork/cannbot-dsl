@@ -27,7 +27,7 @@ update_mask(remaining, elem_bits: int = 32) -> tuple[Mask, ScalarValue | MaskCou
 | 参数 | 输入/输出 | 说明 |
 | --- | --- | --- |
 | `remaining` | 输入 | 剩余逻辑元素个数，可以传入整数常量、`ScalarValue`或`MaskCounter`，应为非负值。更新后的计数通过第二个返回值返回，需显式接收。 |
-| `elem_bits` | 输入 | 掩码元素位宽，支持`8`、`16`、`32`、`64`，默认值为`32`。 |
+| `elem_bits` | 输入 | 可选，掩码元素位宽，支持`8`、`16`、`32`、`64`，默认值为`32`。 |
 
 ## 返回值说明
 

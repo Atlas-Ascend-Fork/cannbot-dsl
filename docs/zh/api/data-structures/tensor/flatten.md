@@ -18,8 +18,8 @@ flatten(self, start_dim=0, end_dim=-1) -> Tensor
 
 | 参数名 | <span style="white-space: nowrap">输入/输出</span> | 说明 |
 | --- | --- | --- |
-| `start_dim` | 输入 | 合并的起始轴编号，须为编译时确定的整数。默认值为`0`。取值范围为`-self.rank ≤ start_dim < self.rank`；负数从末轴向前计数，`-1`表示最后一轴。 |
-| `end_dim` | 输入 | 合并的结束轴编号，包含该轴。须为编译时确定的整数，取值规则与`start_dim`相同。默认值为`-1`。 |
+| `start_dim` | 输入 | 可选，合并的起始轴编号，须为编译时确定的整数。默认值为`0`。取值范围为`-self.rank ≤ start_dim < self.rank`；负数从末轴向前计数，`-1`表示最后一轴。 |
+| `end_dim` | 输入 | 可选，合并的结束轴编号，包含该轴。须为编译时确定的整数，取值规则与`start_dim`相同。默认值为`-1`。 |
 
 ## 返回值说明
 

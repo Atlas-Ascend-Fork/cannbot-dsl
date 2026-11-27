@@ -34,16 +34,16 @@ copy_options(
 
 | 参数 | <span style="white-space: nowrap;">输入/输出</span> | 说明 |
 | --- | --- | --- |
-| `base` | 输入 | 已有的 `CopyOptions` 配置。默认值为 `None`，表示从默认配置创建；传入配置时，在其基础上覆盖创建新配置，原配置不变。 |
-| `engine` | 输入 | 选择搬运方式，支持 `"auto"`、`"nddma"` 或 `None`，默认值是 `None`。<br>`None` 与 `"auto"` 一样，表示 GM→UB 使用普通 DMA；其他方向的搬运行为由源、目标位置及 Tensor 布局和视图变换决定，见 [mem_copy 搬运方向](mem-copy.md#搬运方向)。<br>`"nddma"` 显式选择将多维数据从Global Memory（GM）搬运到Unified Buffer（UB），用法和支持范围见 [NDDMA](#nddma)。|
-| `dst_subblock` | 输入 | 启用单目标模式时，用于指示目标 UB `Tensor` 所在的 `sub_block_id` 。<br>默认值 `None`，表示不显式指定，默认选择 AIV0；取值为 0 或 1，取值为0时写入 AIV0，为1时写入 AIV1。与双目标分区搬运的关系见[单目标与双目标搬运](#单目标与双目标搬运)。 |
-| `unit_flag` | 输入 | 控制 `Mmad` 和 `Fixpipe` 指令细粒度并行，接受整型标量 ，取值说明如下：<br> `0`：默认值，不使能unitFlag；<br>`1`：无效值；<br>`2` 使能unitFlag，硬件执行完指令后，不改变L0C内存块的单元标志位；<br>`3`使能unitFlag，硬件执行完指令后，改变L0C内存块的单元标志位。<br> 启用时，对应的 `matmul` 也须启用 UnitFlag；计算与搬出如何配合见 [UnitFlag 特性说明](../compute/matrix/key-features-unit-flag.md)。|
-| `mx_scale` | 输入 | MX矩阵计算过程中所需的左/右矩阵对应的量化系数`Tensor`。<br>默认值为 `None`，表示只搬运左/右矩阵，不传入对应的量化`Tensor`；传入时，将量化`Tensor`搬入对应的 L0A_MX/L0B_MX。被传入 `mem_copy(dst, src, options=copy_options(mx_scale=scale))`使用时，`src` 是左/右矩阵，数据类型须为 `float8_e4m3fn`、`float8_e5m2` 或 `fp4x2_e2m1`；`mx_scale` 是对应的量化矩阵，数据类型须为 `float8_e8m0`。类型、布局和形状要求见 [MX 量化矩阵](#mx-量化矩阵)。 |
-| `l2_cache_ctl` | 输入 | 读写 GM 时的 L2 Cache 管理策略。<br>默认值为 `0`，各方向的可用策略`id`及含义见 [L2 Cache 策略](#l2-cache-策略)。 |
-| `atomic` | 输入 | 原子写入模式，支持 `"none"`、`"add"`、`"min"`、`"max"`，默认为 `"none"`。用于 UB 或 L0C 向 GM 搬运时的写入操作；不能与 `atomic_add` 同时指定。 |
-| `atomic_add` | 输入 | 是否将源`Tensor`的数据，原子累加到目标`Tensor`的原值上。<br>默认值为 `False`，表示覆盖写入；可传入布尔值，仅 UB→GM、L0C→GM 支持启用：<br> 1. UB→GM 要求源、目标元素类型相同，可为 `int8`、`int16`、`int32`、`bfloat16`、`float16` 或 `float32`；<br> 2. L0C→GM 要求源为 `float32` 或 `int32`，目标与源同类型，或为 `float16`、`bfloat16`、`int8`。L0C→GM 支持 ND 和 NZ 布局的原子累加。 |
-| `pad_val` | 输入 | 普通GM→UB/L1搬运时，对齐补齐使用的值。默认 `"first"` 表示使用首元素，也可指定常量或运行时标量。与 `Tensor.pad` 同时使用时，两者的常量填充值和编码必须一致。 |
-| `channel_split` | 输入 | 控制 L0C→GM/UB/L1 搬出时，是否把 16×16 的 FP32 源分形拆成两个 16×8 的目标分形。默认值为 `None`；显式设置时源、目标元素类型须为 `float32`，L0C→GM/UB 要求目标采用NZ布局。各取值见 [FP32 通道拆分](#fp32-通道拆分)。 |
+| `base` | 输入 | 可选，已有的 `CopyOptions` 配置。默认值为 `None`，表示从默认配置创建；传入配置时，在其基础上覆盖创建新配置，原配置不变。 |
+| `engine` | 输入 | 可选，选择搬运方式，支持 `"auto"`、`"nddma"` 或 `None`，未指定且无`base`时，默认值为 `None`。<br>`None` 与 `"auto"` 一样，表示 GM→UB 使用普通 DMA；其他方向的搬运行为由源、目标位置及 Tensor 布局和视图变换决定，见 [mem_copy 搬运方向](mem-copy.md#搬运方向)。<br>`"nddma"` 显式选择将多维数据从Global Memory（GM）搬运到Unified Buffer（UB），用法和支持范围见 [NDDMA](#nddma)。|
+| `dst_subblock` | 输入 | 可选，启用单目标模式时，用于指示目标 UB `Tensor` 所在的 `sub_block_id` 。<br>未指定且无`base`时，默认值为 `None`，表示不显式指定，默认选择 AIV0；取值为 0 或 1，取值为0时写入 AIV0，为1时写入 AIV1。与双目标分区搬运的关系见[单目标与双目标搬运](#单目标与双目标搬运)。 |
+| `unit_flag` | 输入 | 可选，控制 `Mmad` 和 `Fixpipe` 指令细粒度并行，接受整型标量。未指定且无`base`时，默认值为`0`。取值说明如下：<br> `0`：默认值，不使能unitFlag；<br>`1`：无效值；<br>`2` 使能unitFlag，硬件执行完指令后，不改变L0C内存块的单元标志位；<br>`3`使能unitFlag，硬件执行完指令后，改变L0C内存块的单元标志位。<br> 启用时，对应的 `matmul` 也须启用 UnitFlag；计算与搬出如何配合见 [UnitFlag 特性说明](../compute/matrix/key-features-unit-flag.md)。|
+| `mx_scale` | 输入 | 可选，MX矩阵计算过程中所需的左/右矩阵对应的量化系数`Tensor`。<br>未指定且无`base`时，默认值为 `None`，表示只搬运左/右矩阵，不传入对应的量化`Tensor`；传入时，将量化`Tensor`搬入对应的 L0A_MX/L0B_MX。被传入 `mem_copy(dst, src, options=copy_options(mx_scale=scale))`使用时，`src` 是左/右矩阵，数据类型须为 `float8_e4m3fn`、`float8_e5m2` 或 `fp4x2_e2m1`；`mx_scale` 是对应的量化矩阵，数据类型须为 `float8_e8m0`。类型、布局和形状要求见 [MX 量化矩阵](#mx-量化矩阵)。 |
+| `l2_cache_ctl` | 输入 | 可选，读写 GM 时的 L2 Cache 管理策略。<br>未指定且无`base`时，默认值为 `0`，各方向的可用策略`id`及含义见 [L2 Cache 策略](#l2-cache-策略)。 |
+| `atomic` | 输入 | 可选，原子写入模式，支持 `"none"`、`"add"`、`"min"`、`"max"`，未指定且无`base`时，默认值为 `"none"`。用于 UB 或 L0C 向 GM 搬运时的写入操作；不能与 `atomic_add` 同时指定。 |
+| `atomic_add` | 输入 | 可选，是否将源`Tensor`的数据，原子累加到目标`Tensor`的原值上。<br>未指定且无`base`时，默认值为 `False`，表示覆盖写入；可传入布尔值，仅 UB→GM、L0C→GM 支持启用：<br> 1. UB→GM 要求源、目标元素类型相同，可为 `int8`、`int16`、`int32`、`bfloat16`、`float16` 或 `float32`；<br> 2. L0C→GM 要求源为 `float32` 或 `int32`，目标与源同类型，或为 `float16`、`bfloat16`、`int8`。L0C→GM 支持 ND 和 NZ 布局的原子累加。 |
+| `pad_val` | 输入 | 可选，普通GM→UB/L1搬运时，对齐补齐使用的值。未指定且无`base`时，默认值为 `"first"`，表示使用首元素，也可指定常量或运行时标量。与 `Tensor.pad` 同时使用时，两者的常量填充值和编码必须一致。 |
+| `channel_split` | 输入 | 可选，控制 L0C→GM/UB/L1 搬出时，是否把 16×16 的 FP32 源分形拆成两个 16×8 的目标分形。未指定且无`base`时，默认值为 `None`；显式设置时源、目标元素类型须为 `float32`，L0C→GM/UB 要求目标采用NZ布局。各取值见 [FP32 通道拆分](#fp32-通道拆分)。 |
 
 ### NDDMA
 

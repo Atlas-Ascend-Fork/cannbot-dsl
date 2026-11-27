@@ -25,10 +25,10 @@ vload_broadcast(tensor, offset = 0, *, mode = None, width = None, post_update: b
 | 参数 | 输入/输出 | 说明 |
 | --- | --- | --- |
 | `tensor` | 输入 | 源UB地址，实际读取地址必须按dtype对齐。 |
-| `offset` | 输入 | 相对`tensor`起始地址的偏移，单位为元素个数。默认值为`0`。 |
-| `mode` | 输入 | 广播模式，取值为`'brc'`、`'datablock'`或`'elem2datablock'`，默认值为`None`。取值为`None`或`'brc'`时，将`tensor`首个元素广播到返回值的整个矢量数据寄存器；取值为`'datablock'`或`'elem2datablock'`时，将每个元素广播到返回值中对应的一个`DataBlock`（32字节）中，`'datablock'`为`'elem2datablock'`的别名。 |
-| `width` | 输入 | 广播的数据位宽，取值为`'b8'`或`'b16'`，默认值为`None`。取值为`'b8'`时将`tensor`的首个8bit元素广播到返回值中每个8bit位置，取值为`'b16'`时将`tensor`的首个16bit元素广播到返回值中每个16bit位置；取值为`None`时按`tensor`的元素数据类型广播。 |
-| `post_update` | 输入 | 是否采用Post Update模式。取值为`True`或`False`，默认值为`False`。取值为`True`时，接口采用Post Update模式，搬入完成后自动更新源地址指针，`offset`为Post Update步长，单位为`width`对应的元素宽度；仅`mode`为全lane广播（取值为`None`或`'brc'`）时支持。 |
+| `offset` | 输入 | 可选，相对`tensor`起始地址的偏移，单位为元素个数。默认值为`0`。 |
+| `mode` | 输入 | 可选，广播模式，取值为`'brc'`、`'datablock'`或`'elem2datablock'`，默认值为`None`。取值为`None`或`'brc'`时，将`tensor`首个元素广播到返回值的整个矢量数据寄存器；取值为`'datablock'`或`'elem2datablock'`时，将每个元素广播到返回值中对应的一个`DataBlock`（32字节）中，`'datablock'`为`'elem2datablock'`的别名。 |
+| `width` | 输入 | 可选，广播的数据位宽，取值为`'b8'`或`'b16'`，默认值为`None`。取值为`'b8'`时将`tensor`的首个8bit元素广播到返回值中每个8bit位置，取值为`'b16'`时将`tensor`的首个16bit元素广播到返回值中每个16bit位置；取值为`None`时按`tensor`的元素数据类型广播。 |
+| `post_update` | 输入 | 可选，是否采用Post Update模式。取值为`True`或`False`，默认值为`False`。取值为`True`时，接口采用Post Update模式，搬入完成后自动更新源地址指针，`offset`为Post Update步长，单位为`width`对应的元素宽度；仅`mode`为全lane广播（取值为`None`或`'brc'`）时支持。 |
 
 **支持的元素数据类型：**
 

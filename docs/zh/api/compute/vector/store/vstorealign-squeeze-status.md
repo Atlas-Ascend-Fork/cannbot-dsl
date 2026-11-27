@@ -21,8 +21,8 @@ vstorealign_squeeze_status(tensor, offset = 0, *, post_update: bool = False) -> 
 | 参数 | 输入/输出 | 说明 |
 | --- | --- | --- |
 | `tensor` | 输出 | UB中的目的张量，元素位宽必须为32位，用于接收AR中的状态值。普通模式从指定偏移写入，Post Update模式的游标从该张量起点开始。 |
-| `offset` | 输入 | 普通模式下为相对`tensor`起点的访问偏移，Post Update模式下为每次写入后的游标推进量。可传入整数常量或整型DSL标量，单位均为32位元素，默认值为`0`。一个元素对应4字节，不是字节偏移。 |
-| `post_update` | 输入 | 是否在写入后自动推进内部目的地址游标，取值为`True`或`False`，默认值为`False`。取值为`True`时每次写入后推进`offset × 4`字节；`offset=0`时不推进。 |
+| `offset` | 输入 | 可选，普通模式下为相对`tensor`起点的访问偏移，Post Update模式下为每次写入后的游标推进量。可传入整数常量或整型DSL标量，单位均为32位元素，默认值为`0`。一个元素对应4字节，不是字节偏移。 |
+| `post_update` | 输入 | 可选，是否在写入后自动推进内部目的地址游标，取值为`True`或`False`，默认值为`False`。取值为`True`时每次写入后推进`offset × 4`字节；`offset=0`时不推进。 |
 
 ## 返回值说明
 

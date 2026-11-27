@@ -25,7 +25,7 @@ conv2d_load_filter(dst: Tensor, src: Tensor, tile: Conv2dTile, *, l2_cache_ctl: 
 | dst | 输出 |  L1 目标`Tensor`。<br>必填，无默认值。类型为 `Tensor`，须为 ZN 视图，可对 NZ 缓冲区使用 `permute(1, 0)` 得到；元素类型须与 `tile.spec.dtype` 相同，容量须覆盖 `BN×Kh×Kw×BC` 个元素。 |
 | src | 输入 | 源`Tensor`，存放完整卷积权重。<br>必填，无默认值。类型为位于 GM 的 `Tensor`，按 OIHW 排布，形状须与 `tile.spec.filter_shape` 一致；元素类型须与 `tile.spec.dtype` 相同，支持 `float16`、`bfloat16`。 |
 | tile | 输入 | 指定当前批次、分组及通道切块，确定权重加载的起点和有效范围。<br>必填，无默认值。类型为 [Conv2dTile](../../data-structures/convolution/conv2d-tile.md)，由 [spec.tile](../../data-structures/convolution/make-conv2d-spec/tile.md) 创建，须与源权重及目标缓冲区对应。 |
-| l2_cache_ctl | 输入 | L2 读取缓存策略。<br>默认 `0`。支持编译期整数 `0`、`1`、`2`、`4`。 |
+| l2_cache_ctl | 输入 | 可选，L2 读取缓存策略。<br>默认值为 `0`。支持编译期整数 `0`、`1`、`2`、`4`。 |
 
 ## 返回值说明
 

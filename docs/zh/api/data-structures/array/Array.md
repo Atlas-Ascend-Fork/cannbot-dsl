@@ -20,7 +20,7 @@ Array(dtype, length, *, init=None)
 | --- | --- | --- |
 | `dtype` | 输入 | 元素类型。必填，可选值：`dtypes.bool`、`dtypes.int8`、`dtypes.uint8`、`dtypes.int16`、`dtypes.uint16`、`dtypes.int32`、`dtypes.uint32`、`dtypes.int64`、`dtypes.uint64`、`dtypes.float16`、`dtypes.bfloat16`、`dtypes.float32`、`dtypes.float64`。具体说明见[数据类型](../data-types.md)。 |
 | `length` | 输入 | 元素数量。必填，为 `1`～`2^63-1` 的 Python 整数。 |
-| `init` | 输入 | 初始值。默认 `None`，不初始化元素；也可传入长度等于 `length` 的 list 或 tuple，每项为符合 dtype 的 Python 常量。 |
+| `init` | 输入 | 可选，初始值。默认值为 `None`，不初始化元素；也可传入长度等于 `length` 的 list 或 tuple，每项为符合 dtype 的 Python 常量。 |
 
 ## 返回值说明
 

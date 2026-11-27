@@ -21,7 +21,7 @@ vstore_unalign_post(tensor, offset, ureg: UStoreReg, *, post_update: bool = Fals
 | tensor | 输出 | 配套写入的 UB 目标。自动推进模式使用相同视图。 |
 | offset | 输入 | 刷新地址的元素偏移。自动推进模式下须在 int32 范围内。 |
 | ureg | 输入 | 配套写入使用的 UStoreReg。 |
-| post_update | 输入 | 与配套写入模式一致，默认 False。 |
+| post_update | 输入 | 可选，与配套写入模式一致，默认值为`False`。 |
 
 ## 返回值说明
 

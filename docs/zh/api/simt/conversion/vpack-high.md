@@ -19,8 +19,8 @@ simt.vpack_high(x, y=None, *, dtype=None) -> 短向量或 float32 标量
 | 参数 | 输入/输出 | 说明 |
 | --- | --- | --- |
 | x | 输入 | float16x2或bfloat16x2短向量。 |
-| y | 输入 | 可选同dtype短向量，默认None。 |
-| dtype | 输入 | 默认None返回短向量；仅单输入形式可指定dtypes.float32返回标量。 |
+| y | 输入 | 可选，同dtype短向量，默认值为`None`。 |
+| dtype | 输入 | 可选，目标数据类型。默认值为`None`，返回短向量；仅单输入形式可指定dtypes.float32返回标量。 |
 
 ## 返回值说明
 

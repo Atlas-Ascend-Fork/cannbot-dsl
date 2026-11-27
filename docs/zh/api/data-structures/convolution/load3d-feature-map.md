@@ -27,10 +27,10 @@ Load3DFeatureMap(
 | height | 输入 | 行输入特征图高度，1～32767，不含 padding。 |
 | width | 输入 | 列输入特征图宽度，1～32767，不含 padding。 |
 | channels | 输入 | 源操作数的通道数，取值范围：channelSize∈[0, 65535]。<br> 对于half，channelSize除16的余数应当为0，4或8。<br>对于int8_t和uint8_t，channelSize除32的余数应当为0，4，8或16。<br>对于int4b_t，channelSize为8，16，32，N*64，N*64+8，N*64+16，N*64+32，N为正整数。 |
-| pad_top | 输入 | 上边界补值行数，0～255。 |
-| pad_bottom | 输入 | 下边界补值行数，0～255。 |
-| pad_left | 输入 | 左边界补值列数，0～255。 |
-| pad_right | 输入 | 右边界补值列数，0～255。 |
+| pad_top | 输入 | 可选，上边界补值行数，0～255。默认值为`0`。 |
+| pad_bottom | 输入 | 可选，下边界补值行数，0～255。默认值为`0`。 |
+| pad_left | 输入 | 可选，左边界补值列数，0～255。默认值为`0`。 |
+| pad_right | 输入 | 可选，右边界补值列数，0～255。默认值为`0`。 |
 
 ## 返回值说明
 

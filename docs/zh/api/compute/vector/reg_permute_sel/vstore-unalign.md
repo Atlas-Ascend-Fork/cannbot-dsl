@@ -22,7 +22,7 @@ vstore_unalign(tensor, src: RawVReg, ureg: UStoreReg, *, count, post_update: boo
 | src | 输入 | 原始源向量。 |
 | ureg | 输入/输出 | create_ustore_reg 返回的尾部状态。 |
 | count | 输入 | 本次元素数，范围 0 到向量容量，动态范围由调用方保证。 |
-| post_update | 输入 | 是否在写入后自动推进目的指针，默认 False。 |
+| post_update | 输入 | 可选，是否在写入后自动推进目的指针，默认值为`False`。 |
 
 ## 返回值说明
 

@@ -37,11 +37,11 @@ matmul(dst: Tensor, lhs: Tensor, rhs: Tensor, *, bias: Tensor | None = None, ini
 | `dst` | 输入/输出 | 目的操作数，结果矩阵C位于L0C Buffer，起始地址需按照1024字节对齐。初始累加值由`init`和`bias`共同决定，见[初始化与累加](#初始化与累加)。数据类型取值请参见下文支持的数据类型组合。 |
 | `lhs` | 输入 | 源操作数，左矩阵A位于L0A Buffer，起始地址需按照512字节对齐。数据类型取值请参见[支持的数据类型](#支持的数据类型)。 |
 | `rhs` | 输入 | 源操作数，右矩阵B位于L0B Buffer，起始地址需按照512字节对齐。数据类型取值请参见[支持的数据类型](#支持的数据类型)。 |
-| `bias` | 输入 | Bias矩阵在BiasTable Buffer中的起始地址。初始化时，将Bias沿M方向广播，作为初始累加值；不提供时，由`init`决定清零或使用`dst`原值，见[初始化与累加](#初始化与累加)。<br>Bias的数据类型需与C矩阵的数据类型保持一致。起始地址需按照64字节对齐，可以为非零地址。调用前，需通过`mem_copy`将Bias数据从L1 Buffer搬入。Bias占用长度为`N × dst的数据类型字节宽度`向上补齐到64字节。默认值为`None`。 |
-| `init` | 输入 | 配置初始累加值，接受Python布尔值或运行时布尔标量，默认值为`True`。<br>&nbsp;&nbsp;&bull; `True`：重新初始化；未提供`bias`时初始值为0，提供时初始值为广播后的Bias。<br>&nbsp;&nbsp;&bull; `False`：不执行清零操作，矩阵C的初始值由`dst`中原有矩阵配置。<br>传入Python布尔值`False`时不能同时提供`bias`；运行时布尔标量的取值及与`bias`的组合见[初始化与累加](#初始化与累加)。 |
-| `unit_flag` | 输入 | 用于控制矩阵乘加指令与矩阵搬出指令的细粒度并行，开启UnitFlag后，硬件每计算完一个分形，计算结果就会被搬出。取值说明如下：<br>&nbsp;&nbsp;&bull; `0`（DISABLE）：不开启UnitFlag。<br>&nbsp;&nbsp;&bull; `2`（ENABLE_KEEP）：开启UnitFlag，硬件执行完指令后不改变单元标志位。<br>&nbsp;&nbsp;&bull; `3`（ENABLE_UPDATE）：开启UnitFlag，硬件执行完指令后改变单元标志位。<br>矩阵乘加指令与对应的矩阵搬出指令必须都开启或都不开启UnitFlag，开启后指令之间无需再插入同步指令。<br>同步机制和迭代场景见[UnitFlag](./key-features-unit-flag.md)。默认值为`0`。 |
-| `disable_gemv` | 输入 | M为1时，配置是否关闭GEMV模式。<br>&nbsp;&nbsp;&bull; false：开启GEMV模式。<br>&nbsp;&nbsp;&bull; true：关闭GEMV模式。<br>M不为1时，该参数不生效。<br>向量布局与使用场景见[GEMV](./key-features-gemv.md)。默认值为`True`。 |
-| `mx_mode` | 输入 | 编译期Python布尔值，默认值为`False`。本页普通模式使用`False`；设置为`True`时执行带有量化系数的矩阵乘加，其功能、数据类型和量化系数矩阵的准备要求见[matmul（MX模式）](./matmul-mx.md)。 |
+| `bias` | 输入 | 可选，Bias矩阵在BiasTable Buffer中的起始地址。初始化时，将Bias沿M方向广播，作为初始累加值；不提供时，由`init`决定清零或使用`dst`原值，见[初始化与累加](#初始化与累加)。<br>Bias的数据类型需与C矩阵的数据类型保持一致。起始地址需按照64字节对齐，可以为非零地址。调用前，需通过`mem_copy`将Bias数据从L1 Buffer搬入。Bias占用长度为`N × dst的数据类型字节宽度`向上补齐到64字节。默认值为`None`。 |
+| `init` | 输入 | 可选，配置初始累加值，接受Python布尔值或运行时布尔标量，默认值为`True`。<br>&nbsp;&nbsp;&bull; `True`：重新初始化；未提供`bias`时初始值为0，提供时初始值为广播后的Bias。<br>&nbsp;&nbsp;&bull; `False`：不执行清零操作，矩阵C的初始值由`dst`中原有矩阵配置。<br>传入Python布尔值`False`时不能同时提供`bias`；运行时布尔标量的取值及与`bias`的组合见[初始化与累加](#初始化与累加)。 |
+| `unit_flag` | 输入 | 可选，用于控制矩阵乘加指令与矩阵搬出指令的细粒度并行，开启UnitFlag后，硬件每计算完一个分形，计算结果就会被搬出。取值说明如下：<br>&nbsp;&nbsp;&bull; `0`（DISABLE）：不开启UnitFlag。<br>&nbsp;&nbsp;&bull; `2`（ENABLE_KEEP）：开启UnitFlag，硬件执行完指令后不改变单元标志位。<br>&nbsp;&nbsp;&bull; `3`（ENABLE_UPDATE）：开启UnitFlag，硬件执行完指令后改变单元标志位。<br>矩阵乘加指令与对应的矩阵搬出指令必须都开启或都不开启UnitFlag，开启后指令之间无需再插入同步指令。<br>同步机制和迭代场景见[UnitFlag](./key-features-unit-flag.md)。默认值为`0`。 |
+| `disable_gemv` | 输入 | 可选，M为1时，配置是否关闭GEMV模式。<br>&nbsp;&nbsp;&bull; false：开启GEMV模式。<br>&nbsp;&nbsp;&bull; true：关闭GEMV模式。<br>M不为1时，该参数不生效。<br>向量布局与使用场景见[GEMV](./key-features-gemv.md)。默认值为`True`。 |
+| `mx_mode` | 输入 | 可选，编译期Python布尔值，默认值为`False`。本页普通模式使用`False`；设置为`True`时执行带有量化系数的矩阵乘加，其功能、数据类型和量化系数矩阵的准备要求见[matmul（MX模式）](./matmul-mx.md)。 |
 
 ### 初始化与累加
 

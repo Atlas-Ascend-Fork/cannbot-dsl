@@ -27,7 +27,7 @@ conv2d_load_fmap(dst: Tensor, src: Tensor, tile: Conv2dTile, *, l2_cache_ctl: in
 | dst | 输出 | 接收当前卷积分块所需的输入特征图，按 NC1HWC0 排布存入 L1，供后续 `conv2d_load_im2col` 使用。<br>必填，无默认值。<br>支持元素类型为 `float16` 或 `bfloat16` 的 `Tensor`，须与 `src` 和 `tile.spec.dtype` 相同；使用 ND 格式声明的 L1 缓冲区，容量至少满足 `tile.spec.fmap_l1_shape(tile=(BM, BC))` 的要求。 |
 | src | 输入 | GM 上的 NCHW 输入特征图。<br>必填，无默认值。<br>支持元素类型为 `float16` 或 `bfloat16` 的 `Tensor`，须与 `tile.spec.dtype` 相同，形状及排布须与卷积规格中的输入一致。 |
 | tile | 输入 | 指定当前卷积分块，决定源地址偏移、有效输入高度和实际输入通道数。<br>必填，无默认值。<br>类型为 [Conv2dTile](../../data-structures/convolution/conv2d-tile.md)，由 `spec.tile(...)` 创建，须与输入特征图及目标缓冲区使用的卷积规格和分块大小对应。 |
-| l2_cache_ctl | 输入 | 搬入 L1 的缓存策略。<br>默认值为 `0`。<br>支持编译期 `int`，取值为 `0`、`1`、`2` 或 `4`。 |
+| l2_cache_ctl | 输入 | 可选，搬入 L1 的缓存策略。<br>默认值为 `0`。<br>支持编译期 `int`，取值为 `0`、`1`、`2` 或 `4`。 |
 
 ## 返回值说明
 

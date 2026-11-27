@@ -22,8 +22,8 @@ def aicpu_kernel(fn=None, *, profile=None): ...
 
 | 参数 | 输入/输出 | 说明 |
 | --- | --- | --- |
-| `fn` | 输入 | 被装饰的 Python 函数。使用带参数装饰器时由装饰器接收，通常不直接填写。 |
-| `profile` | 输入 | `cannbotdsl.ProfileSpec` 或 `None`，默认 `None`。在 `interface` 模式下配置 profiling 名称、逻辑类型及 GM 字段角色。 |
+| `fn` | 输入 | 可选，被装饰的 Python 函数。使用带参数装饰器时由装饰器接收，通常不直接填写。默认值为`None`。 |
+| `profile` | 输入 | 可选，`cannbotdsl.ProfileSpec` 或 `None`，默认值为 `None`。在 `interface` 模式下配置 profiling 名称、逻辑类型及 GM 字段角色。 |
 
 未提供 `profile` 时，名称和逻辑类型使用入口名；以 Tensor 传入的 `gm_in` 字段默认作为输入，`gm_out` 默认作为输出。提供 `ProfileSpec` 后，角色列表完整替代默认推导；仅填写名称或使用空 `ProfileSpec()` 时，Tensor 上报列表为空。
 

@@ -19,7 +19,7 @@ cast(value, *, dtype, rounding: RoundingMode | str = RoundingMode.RN) -> ScalarV
 | --- | --- | --- |
 | `value` | 输入 | 待转换的标量，数值类型为`dtypes.float32`。 |
 | `dtype` | 输入 | 目标数值类型，当前仅支持`dtypes.int32`。 |
-| `rounding` | 输入 | 舍入模式，使用公共[RoundingMode](../../roundingmode.md)或对应的名称字符串（不区分大小写）。默认值为`RoundingMode.RN`；支持`RN`、`RNA`、`RD`、`RU`，或`"rn"`、`"rna"`、`"rd"`、`"ru"`。 |
+| `rounding` | 输入 | 可选，舍入模式，使用公共[RoundingMode](../../roundingmode.md)或对应的名称字符串（不区分大小写）。默认值为`RoundingMode.RN`；支持`RN`、`RNA`、`RD`、`RU`，或`"rn"`、`"rna"`、`"rd"`、`"ru"`。 |
 
 ## 返回值说明
 

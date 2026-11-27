@@ -27,7 +27,7 @@ vdiv(lhs: RawVReg, rhs: RawVReg, *, mask: Mask, precision_mode: bool = False) ->
 | --- | --- | --- |
 | `lhs` | 输入 | 源操作数（矢量数据寄存器）。 |
 | `rhs` | 输入 | 源操作数（矢量数据寄存器）。 |
-| `precision_mode` | 输入 | 精度模式开关。为`True`时使用计算结果与标准`IEEE 754`二进制浮点除法完全一致（0 ULP）的实现，仅支持`dtypes.float32`；默认为`False`，使用硬件除法实现，结果可能存在1 ULP精度差异。 |
+| `precision_mode` | 输入 | 可选，精度模式开关。为`True`时使用计算结果与标准`IEEE 754`二进制浮点除法完全一致（0 ULP）的实现，仅支持`dtypes.float32`；默认值为`False`，使用硬件除法实现，结果可能存在1 ULP精度差异。 |
 | `mask` | 输入 | 源操作数掩码（掩码寄存器），用于指示在计算过程中哪些元素参与计算。对应位置为1时参与计算，为0时不参与计算。mask未筛选的元素在输出中置零。 |
 
 **支持的元素数据类型：**

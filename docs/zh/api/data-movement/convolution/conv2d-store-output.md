@@ -27,7 +27,7 @@ conv2d_store_output(dst: Tensor, src: Tensor, tile: Conv2dTile, *, l2_cache_ctl:
 | dst | 输出 | 目标 GM 输出 `Tensor`。<br>必填，无默认值。类型为位于 GM 的 `Tensor`，按 NCHW 排布，形状为 `tile.spec.output_shape`；元素类型支持 `float16`、`bfloat16`。 |
 | src | 输入 | 待写回的 L0C 结果块。<br>必填，无默认值。类型为位于 L0C 的 `Tensor`，元素类型为 `float32`；使用 `tile.l0c_view(...)` 获取当前块的有效视图。 |
 | tile | 输入 | 根据 `batch`、`group`、输出位置块编号 `coord[0]` 和输出通道块编号 `coord[1]`，确定结果在完整输出中的位置及有效范围。<br>必填，无默认值。类型为 [Conv2dTile](../../data-structures/convolution/conv2d-tile.md)，由 [spec.tile](../../data-structures/convolution/make-conv2d-spec/tile.md) 创建，须与源结果块和目标输出对应。 |
-| l2_cache_ctl | 输入 | L2 搬出缓存策略。<br>默认 `0`。支持编译期整数 `0`、`1`、`2`、`4`。 |
+| l2_cache_ctl | 输入 | 可选，L2 搬出缓存策略。<br>默认值为 `0`。支持编译期整数 `0`、`1`、`2`、`4`。 |
 
 ## 返回值说明
 

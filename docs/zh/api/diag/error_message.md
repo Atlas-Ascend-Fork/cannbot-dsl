@@ -415,7 +415,7 @@ cbd.log.error_for_invalid_listsize_with_reason(
 | `entity_name` | 输入 | 被诊断的算子或实体名称；写入模板中的`op_name`字段。 |
 | `reason` | 输入 | 错误原因，写入模板正文。 |
 | `param_name` | 输入 | 被诊断的参数名称。 |
-| `tag` | 输入 | 仅限关键字传入的`str`，默认空串，不能含NUL；DSL中须为编译期常量，用于附加诊断标签。 |
+| `tag` | 输入 | 可选，仅限关键字传入的`str`，默认值为`""`，不能含NUL；DSL中须为编译期常量，用于附加诊断标签。 |
 
 <a id="error_with_invalid_input_shape"></a>
 
@@ -427,7 +427,7 @@ cbd.log.error_for_invalid_listsize_with_reason(
 | `index` | 输入 | 输入序号；框架原样记录，不进行起始下标转换 |
 | `incorrect_shape` | 输入 | 实际形状 |
 | `correct_shape` | 输入 | 期望或允许的形状 |
-| `tag` | 输入 | 见[通用参数](#通用参数)。 |
+| `tag` | 输入 | 可选，见[通用参数](#通用参数)。默认值为`''`。 |
 
 <a id="error_with_invalid_attr"></a>
 
@@ -439,7 +439,7 @@ cbd.log.error_for_invalid_listsize_with_reason(
 | `attr_name` | 输入 | 属性名称 |
 | `incorrect_val` | 输入 | 实际的错误属性值 |
 | `correct_val` | 输入 | 期望或允许的属性值 |
-| `tag` | 输入 | 见[通用参数](#通用参数)。 |
+| `tag` | 输入 | 可选，见[通用参数](#通用参数)。默认值为`''`。 |
 
 <a id="error_with_invalid_attr_size"></a>
 
@@ -451,7 +451,7 @@ cbd.log.error_for_invalid_listsize_with_reason(
 | `attr_name` | 输入 | 属性名称 |
 | `incorrect_size` | 输入 | 实际大小；具体表示属性元素数、shape size、列表元素数等，由接口场景决定 |
 | `correct_size` | 输入 | 期望或允许的大小，与incorrect_size使用相同度量 |
-| `tag` | 输入 | 见[通用参数](#通用参数)。 |
+| `tag` | 输入 | 可选，见[通用参数](#通用参数)。默认值为`''`。 |
 
 <a id="error_with_invalid_input"></a>
 
@@ -461,7 +461,7 @@ cbd.log.error_for_invalid_listsize_with_reason(
 | --- | --- | --- |
 | `entity_name` | 输入 | 见[通用参数](#通用参数)。 |
 | `param_name` | 输入 | 见[通用参数](#通用参数)。 |
-| `tag` | 输入 | 见[通用参数](#通用参数)。 |
+| `tag` | 输入 | 可选，见[通用参数](#通用参数)。默认值为`''`。 |
 
 <a id="error_with_invalid_input_shapesize"></a>
 
@@ -473,7 +473,7 @@ cbd.log.error_for_invalid_listsize_with_reason(
 | `index` | 输入 | 输入序号；框架原样记录，不进行起始下标转换 |
 | `incorrect_size` | 输入 | 实际大小；具体表示属性元素数、shape size、列表元素数等，由接口场景决定 |
 | `correct_size` | 输入 | 期望或允许的大小，与incorrect_size使用相同度量 |
-| `tag` | 输入 | 见[通用参数](#通用参数)。 |
+| `tag` | 输入 | 可选，见[通用参数](#通用参数)。默认值为`''`。 |
 
 <a id="error_with_invalid_input_format"></a>
 
@@ -485,7 +485,7 @@ cbd.log.error_for_invalid_listsize_with_reason(
 | `param_name` | 输入 | 见[通用参数](#通用参数)。 |
 | `data_format` | 输入 | 实际输入数据格式 |
 | `expected_format_list` | 输入 | 允许的数据格式集合或说明 |
-| `tag` | 输入 | 见[通用参数](#通用参数)。 |
+| `tag` | 输入 | 可选，见[通用参数](#通用参数)。默认值为`''`。 |
 
 <a id="error_with_invalid_input_dtype"></a>
 
@@ -497,7 +497,7 @@ cbd.log.error_for_invalid_listsize_with_reason(
 | `param_name` | 输入 | 见[通用参数](#通用参数)。 |
 | `data_dtype` | 输入 | 实际输入数据类型 |
 | `expected_dtype_list` | 输入 | 允许的数据类型集合或说明 |
-| `tag` | 输入 | 见[通用参数](#通用参数)。 |
+| `tag` | 输入 | 可选，见[通用参数](#通用参数)。默认值为`''`。 |
 
 <a id="error_for_invalid_shape"></a>
 
@@ -509,7 +509,7 @@ cbd.log.error_for_invalid_listsize_with_reason(
 | `param_name` | 输入 | 见[通用参数](#通用参数)。 |
 | `incorrect_shape` | 输入 | 实际形状 |
 | `correct_shape` | 输入 | 期望或允许的形状 |
-| `tag` | 输入 | 见[通用参数](#通用参数)。 |
+| `tag` | 输入 | 可选，见[通用参数](#通用参数)。默认值为`''`。 |
 
 <a id="error_for_invalid_shape_with_reason"></a>
 
@@ -521,7 +521,7 @@ cbd.log.error_for_invalid_listsize_with_reason(
 | `param_name` | 输入 | 见[通用参数](#通用参数)。 |
 | `incorrect_shape` | 输入 | 实际形状 |
 | `reason` | 输入 | 见[通用参数](#通用参数)。 |
-| `tag` | 输入 | 见[通用参数](#通用参数)。 |
+| `tag` | 输入 | 可选，见[通用参数](#通用参数)。默认值为`''`。 |
 
 <a id="error_for_invalid_shapes_with_reason"></a>
 
@@ -533,7 +533,7 @@ cbd.log.error_for_invalid_listsize_with_reason(
 | `param_names` | 输入 | 多个输入、输出或参数名称 |
 | `incorrect_shapes` | 输入 | 多个实际形状 |
 | `reason` | 输入 | 见[通用参数](#通用参数)。 |
-| `tag` | 输入 | 见[通用参数](#通用参数)。 |
+| `tag` | 输入 | 可选，见[通用参数](#通用参数)。默认值为`''`。 |
 
 <a id="error_for_invalid_shapedim"></a>
 
@@ -545,7 +545,7 @@ cbd.log.error_for_invalid_listsize_with_reason(
 | `param_name` | 输入 | 见[通用参数](#通用参数)。 |
 | `incorrect_dim` | 输入 | 实际形状维度值 |
 | `correct_dim` | 输入 | 期望或允许的形状维度值 |
-| `tag` | 输入 | 见[通用参数](#通用参数)。 |
+| `tag` | 输入 | 可选，见[通用参数](#通用参数)。默认值为`''`。 |
 
 <a id="error_for_invalid_shapedim_with_reason"></a>
 
@@ -557,7 +557,7 @@ cbd.log.error_for_invalid_listsize_with_reason(
 | `param_name` | 输入 | 见[通用参数](#通用参数)。 |
 | `incorrect_dim` | 输入 | 实际形状维度值 |
 | `reason` | 输入 | 见[通用参数](#通用参数)。 |
-| `tag` | 输入 | 见[通用参数](#通用参数)。 |
+| `tag` | 输入 | 可选，见[通用参数](#通用参数)。默认值为`''`。 |
 
 <a id="error_for_invalid_shapedims_with_reason"></a>
 
@@ -569,7 +569,7 @@ cbd.log.error_for_invalid_listsize_with_reason(
 | `param_names` | 输入 | 多个输入、输出或参数名称 |
 | `incorrect_dims` | 输入 | 多个实际形状维度值 |
 | `reason` | 输入 | 见[通用参数](#通用参数)。 |
-| `tag` | 输入 | 见[通用参数](#通用参数)。 |
+| `tag` | 输入 | 可选，见[通用参数](#通用参数)。默认值为`''`。 |
 
 <a id="error_for_invalid_shapesize"></a>
 
@@ -581,7 +581,7 @@ cbd.log.error_for_invalid_listsize_with_reason(
 | `param_name` | 输入 | 见[通用参数](#通用参数)。 |
 | `incorrect_size` | 输入 | 实际大小；具体表示属性元素数、shape size、列表元素数等，由接口场景决定 |
 | `correct_size` | 输入 | 期望或允许的大小，与incorrect_size使用相同度量 |
-| `tag` | 输入 | 见[通用参数](#通用参数)。 |
+| `tag` | 输入 | 可选，见[通用参数](#通用参数)。默认值为`''`。 |
 
 <a id="error_for_invalid_shapesize_with_reason"></a>
 
@@ -593,7 +593,7 @@ cbd.log.error_for_invalid_listsize_with_reason(
 | `param_name` | 输入 | 见[通用参数](#通用参数)。 |
 | `incorrect_size` | 输入 | 实际大小；具体表示属性元素数、shape size、列表元素数等，由接口场景决定 |
 | `reason` | 输入 | 见[通用参数](#通用参数)。 |
-| `tag` | 输入 | 见[通用参数](#通用参数)。 |
+| `tag` | 输入 | 可选，见[通用参数](#通用参数)。默认值为`''`。 |
 
 <a id="error_for_invalid_shapesizes_with_reason"></a>
 
@@ -605,7 +605,7 @@ cbd.log.error_for_invalid_listsize_with_reason(
 | `param_names` | 输入 | 多个输入、输出或参数名称 |
 | `incorrect_sizes` | 输入 | 多个实际大小 |
 | `reason` | 输入 | 见[通用参数](#通用参数)。 |
-| `tag` | 输入 | 见[通用参数](#通用参数)。 |
+| `tag` | 输入 | 可选，见[通用参数](#通用参数)。默认值为`''`。 |
 
 <a id="error_for_invalid_format"></a>
 
@@ -617,7 +617,7 @@ cbd.log.error_for_invalid_listsize_with_reason(
 | `param_name` | 输入 | 见[通用参数](#通用参数)。 |
 | `incorrect_format` | 输入 | 实际数据格式 |
 | `correct_format` | 输入 | 期望或允许的数据格式 |
-| `tag` | 输入 | 见[通用参数](#通用参数)。 |
+| `tag` | 输入 | 可选，见[通用参数](#通用参数)。默认值为`''`。 |
 
 <a id="error_for_invalid_format_with_reason"></a>
 
@@ -629,7 +629,7 @@ cbd.log.error_for_invalid_listsize_with_reason(
 | `param_name` | 输入 | 见[通用参数](#通用参数)。 |
 | `incorrect_format` | 输入 | 实际数据格式 |
 | `reason` | 输入 | 见[通用参数](#通用参数)。 |
-| `tag` | 输入 | 见[通用参数](#通用参数)。 |
+| `tag` | 输入 | 可选，见[通用参数](#通用参数)。默认值为`''`。 |
 
 <a id="error_for_invalid_formats_with_reason"></a>
 
@@ -641,7 +641,7 @@ cbd.log.error_for_invalid_listsize_with_reason(
 | `param_names` | 输入 | 多个输入、输出或参数名称 |
 | `incorrect_formats` | 输入 | 多个实际数据格式 |
 | `reason` | 输入 | 见[通用参数](#通用参数)。 |
-| `tag` | 输入 | 见[通用参数](#通用参数)。 |
+| `tag` | 输入 | 可选，见[通用参数](#通用参数)。默认值为`''`。 |
 
 <a id="error_for_invalid_dtype"></a>
 
@@ -653,7 +653,7 @@ cbd.log.error_for_invalid_listsize_with_reason(
 | `param_name` | 输入 | 见[通用参数](#通用参数)。 |
 | `incorrect_dtype` | 输入 | 实际数据类型 |
 | `correct_dtype` | 输入 | 期望或允许的数据类型 |
-| `tag` | 输入 | 见[通用参数](#通用参数)。 |
+| `tag` | 输入 | 可选，见[通用参数](#通用参数)。默认值为`''`。 |
 
 <a id="error_for_invalid_dtype_with_reason"></a>
 
@@ -665,7 +665,7 @@ cbd.log.error_for_invalid_listsize_with_reason(
 | `param_name` | 输入 | 见[通用参数](#通用参数)。 |
 | `incorrect_dtype` | 输入 | 实际数据类型 |
 | `reason` | 输入 | 见[通用参数](#通用参数)。 |
-| `tag` | 输入 | 见[通用参数](#通用参数)。 |
+| `tag` | 输入 | 可选，见[通用参数](#通用参数)。默认值为`''`。 |
 
 <a id="error_for_invalid_dtypes_with_reason"></a>
 
@@ -677,7 +677,7 @@ cbd.log.error_for_invalid_listsize_with_reason(
 | `param_names` | 输入 | 多个输入、输出或参数名称 |
 | `incorrect_dtypes` | 输入 | 多个实际数据类型 |
 | `reason` | 输入 | 见[通用参数](#通用参数)。 |
-| `tag` | 输入 | 见[通用参数](#通用参数)。 |
+| `tag` | 输入 | 可选，见[通用参数](#通用参数)。默认值为`''`。 |
 
 <a id="error_for_invalid_tensornum"></a>
 
@@ -689,7 +689,7 @@ cbd.log.error_for_invalid_listsize_with_reason(
 | `param_name` | 输入 | 见[通用参数](#通用参数)。 |
 | `incorrect_num` | 输入 | 实际tensor数量 |
 | `correct_num` | 输入 | 期望或允许的tensor数量 |
-| `tag` | 输入 | 见[通用参数](#通用参数)。 |
+| `tag` | 输入 | 可选，见[通用参数](#通用参数)。默认值为`''`。 |
 
 <a id="error_for_invalid_tensornums_with_reason"></a>
 
@@ -701,7 +701,7 @@ cbd.log.error_for_invalid_listsize_with_reason(
 | `param_names` | 输入 | 多个输入、输出或参数名称 |
 | `incorrect_nums` | 输入 | 多个实际tensor数量 |
 | `reason` | 输入 | 见[通用参数](#通用参数)。 |
-| `tag` | 输入 | 见[通用参数](#通用参数)。 |
+| `tag` | 输入 | 可选，见[通用参数](#通用参数)。默认值为`''`。 |
 
 <a id="error_for_invalid_value"></a>
 
@@ -713,7 +713,7 @@ cbd.log.error_for_invalid_listsize_with_reason(
 | `param_name` | 输入 | 见[通用参数](#通用参数)。 |
 | `incorrect_value` | 输入 | 实际参数值 |
 | `correct_value` | 输入 | 期望值或允许范围 |
-| `tag` | 输入 | 见[通用参数](#通用参数)。 |
+| `tag` | 输入 | 可选，见[通用参数](#通用参数)。默认值为`''`。 |
 
 <a id="error_for_invalid_listsize"></a>
 
@@ -725,7 +725,7 @@ cbd.log.error_for_invalid_listsize_with_reason(
 | `param_name` | 输入 | 见[通用参数](#通用参数)。 |
 | `incorrect_size` | 输入 | 实际大小；具体表示属性元素数、shape size、列表元素数等，由接口场景决定 |
 | `correct_size` | 输入 | 期望或允许的大小，与incorrect_size使用相同度量 |
-| `tag` | 输入 | 见[通用参数](#通用参数)。 |
+| `tag` | 输入 | 可选，见[通用参数](#通用参数)。默认值为`''`。 |
 
 <a id="error_for_invalid_value_with_reason"></a>
 
@@ -737,7 +737,7 @@ cbd.log.error_for_invalid_listsize_with_reason(
 | `param_name` | 输入 | 见[通用参数](#通用参数)。 |
 | `incorrect_value` | 输入 | 实际参数值 |
 | `reason` | 输入 | 见[通用参数](#通用参数)。 |
-| `tag` | 输入 | 见[通用参数](#通用参数)。 |
+| `tag` | 输入 | 可选，见[通用参数](#通用参数)。默认值为`''`。 |
 
 <a id="error_for_invalid_values_with_reason"></a>
 
@@ -749,7 +749,7 @@ cbd.log.error_for_invalid_listsize_with_reason(
 | `param_names` | 输入 | 多个输入、输出或参数名称 |
 | `incorrect_values` | 输入 | 多个实际参数值 |
 | `reason` | 输入 | 见[通用参数](#通用参数)。 |
-| `tag` | 输入 | 见[通用参数](#通用参数)。 |
+| `tag` | 输入 | 可选，见[通用参数](#通用参数)。默认值为`''`。 |
 
 <a id="error_for_invalid_stride"></a>
 
@@ -761,7 +761,7 @@ cbd.log.error_for_invalid_listsize_with_reason(
 | `param_name` | 输入 | 见[通用参数](#通用参数)。 |
 | `incorrect_stride` | 输入 | 实际步长 |
 | `correct_stride` | 输入 | 期望或允许的步长 |
-| `tag` | 输入 | 见[通用参数](#通用参数)。 |
+| `tag` | 输入 | 可选，见[通用参数](#通用参数)。默认值为`''`。 |
 
 <a id="error_for_file_path"></a>
 
@@ -772,7 +772,7 @@ cbd.log.error_for_invalid_listsize_with_reason(
 | `op_name` | 输入 | 算子名称；为对齐原宏保留该参数，文件和配置类模板正文不使用它，也不会覆盖自动推导的日志OpName |
 | `file_path` | 输入 | 出错文件路径 |
 | `reason` | 输入 | 见[通用参数](#通用参数)。 |
-| `tag` | 输入 | 见[通用参数](#通用参数)。 |
+| `tag` | 输入 | 可选，见[通用参数](#通用参数)。默认值为`''`。 |
 
 <a id="error_for_file_open"></a>
 
@@ -783,7 +783,7 @@ cbd.log.error_for_invalid_listsize_with_reason(
 | `op_name` | 输入 | 算子名称；为对齐原宏保留该参数，文件和配置类模板正文不使用它，也不会覆盖自动推导的日志OpName |
 | `file_path` | 输入 | 出错文件路径 |
 | `reason` | 输入 | 见[通用参数](#通用参数)。 |
-| `tag` | 输入 | 见[通用参数](#通用参数)。 |
+| `tag` | 输入 | 可选，见[通用参数](#通用参数)。默认值为`''`。 |
 
 <a id="error_for_file_parse"></a>
 
@@ -794,7 +794,7 @@ cbd.log.error_for_invalid_listsize_with_reason(
 | `op_name` | 输入 | 算子名称；为对齐原宏保留该参数，文件和配置类模板正文不使用它，也不会覆盖自动推导的日志OpName |
 | `file_name` | 输入 | 解析失败的文件名 |
 | `reason` | 输入 | 见[通用参数](#通用参数)。 |
-| `tag` | 输入 | 见[通用参数](#通用参数)。 |
+| `tag` | 输入 | 可选，见[通用参数](#通用参数)。默认值为`''`。 |
 
 <a id="error_for_invalid_config"></a>
 
@@ -807,7 +807,7 @@ cbd.log.error_for_invalid_listsize_with_reason(
 | `item` | 输入 | 配置项名称 |
 | `value` | 输入 | 实际配置项值 |
 | `expect` | 输入 | 期望的配置值或约束 |
-| `tag` | 输入 | 见[通用参数](#通用参数)。 |
+| `tag` | 输入 | 可选，见[通用参数](#通用参数)。默认值为`''`。 |
 
 <a id="error_for_invalid_config_with_reason"></a>
 
@@ -820,7 +820,7 @@ cbd.log.error_for_invalid_listsize_with_reason(
 | `item` | 输入 | 配置项名称 |
 | `value` | 输入 | 实际配置项值 |
 | `reason` | 输入 | 见[通用参数](#通用参数)。 |
-| `tag` | 输入 | 见[通用参数](#通用参数)。 |
+| `tag` | 输入 | 可选，见[通用参数](#通用参数)。默认值为`''`。 |
 
 <a id="error_for_invalid_configs_with_reason"></a>
 
@@ -833,7 +833,7 @@ cbd.log.error_for_invalid_listsize_with_reason(
 | `items` | 输入 | 多个配置项名称 |
 | `values` | 输入 | 多个实际配置项值 |
 | `reason` | 输入 | 见[通用参数](#通用参数)。 |
-| `tag` | 输入 | 见[通用参数](#通用参数)。 |
+| `tag` | 输入 | 可选，见[通用参数](#通用参数)。默认值为`''`。 |
 
 <a id="error_for_invalid_graph_node"></a>
 
@@ -843,7 +843,7 @@ cbd.log.error_for_invalid_listsize_with_reason(
 | --- | --- | --- |
 | `node_name` | 输入 | 被诊断的图节点名称 |
 | `reason` | 输入 | 见[通用参数](#通用参数)。 |
-| `tag` | 输入 | 见[通用参数](#通用参数)。 |
+| `tag` | 输入 | 可选，见[通用参数](#通用参数)。默认值为`''`。 |
 
 <a id="error_for_invalid_argument_with_reason"></a>
 
@@ -854,7 +854,7 @@ cbd.log.error_for_invalid_listsize_with_reason(
 | `entity_name` | 输入 | 见[通用参数](#通用参数)。 |
 | `param_name` | 输入 | 见[通用参数](#通用参数)。 |
 | `reason` | 输入 | 见[通用参数](#通用参数)。 |
-| `tag` | 输入 | 见[通用参数](#通用参数)。 |
+| `tag` | 输入 | 可选，见[通用参数](#通用参数)。默认值为`''`。 |
 
 <a id="error_for_invalid_listsize_with_reason"></a>
 
@@ -866,7 +866,7 @@ cbd.log.error_for_invalid_listsize_with_reason(
 | `param_name` | 输入 | 见[通用参数](#通用参数)。 |
 | `incorrect_size` | 输入 | 实际大小；具体表示属性元素数、shape size、列表元素数等，由接口场景决定 |
 | `reason` | 输入 | 见[通用参数](#通用参数)。 |
-| `tag` | 输入 | 见[通用参数](#通用参数)。 |
+| `tag` | 输入 | 可选，见[通用参数](#通用参数)。默认值为`''`。 |
 
 ## 返回值说明
 

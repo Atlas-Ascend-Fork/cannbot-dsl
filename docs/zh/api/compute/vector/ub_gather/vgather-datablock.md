@@ -23,7 +23,7 @@ vgather_datablock(tensor, index: RawVReg, *, mask: Mask | None = None) -> RawVRe
 | --- | --- | --- |
 | `tensor` | 输入 | 源操作数（矢量）的起始地址。 |
 | `index` | 输入 | 源操作数（矢量数据寄存器），表示返回值中每个DataBlock在UB中相对于`tensor`的索引位置。索引位置要大于等于0且32B对齐，索引可以存在相同的值。**index仅前8个数有效，单位是字节。** |
-| `mask` | 输入 | 源操作数掩码（掩码寄存器）。**DataBlock搬运的有效指示，按b32格式解释。一个DataBlock对应4bit，仅每4bit中的最低位有效。由于index仅前8个元素有效，因此mask仅使用前8个b32元素对应的bit 0、4、8、12、16、20、24、28，分别控制返回值中DataBlock0至DataBlock7是否更新，其余bit无效。** 默认值为`None`。 |
+| `mask` | 输入 | 可选，源操作数掩码（掩码寄存器）。**DataBlock搬运的有效指示，按b32格式解释。一个DataBlock对应4bit，仅每4bit中的最低位有效。由于index仅前8个元素有效，因此mask仅使用前8个b32元素对应的bit 0、4、8、12、16、20、24、28，分别控制返回值中DataBlock0至DataBlock7是否更新，其余bit无效。** 默认值为`None`。 |
 
 **支持的元素数据类型：**
 

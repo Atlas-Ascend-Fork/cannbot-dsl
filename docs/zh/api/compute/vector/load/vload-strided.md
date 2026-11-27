@@ -23,7 +23,7 @@ vload_strided(tensor, offset, mask: Mask, *, block_stride, repeat_stride = 0) ->
 | `offset` | 输入 | 相对`tensor`起始地址的偏移，单位为元素个数。 |
 | `mask` | 输入 | 掩码寄存器，用于指示在计算过程中哪些元素参与计算。该接口以`DataBlock`为数据搬运单元。<br>&bull; 当`DataBlock`中的任意一个元素被`mask`筛选成有效元素时，该`DataBlock`中所有数据都会搬入至矢量数据寄存器。<br>&bull; 当`DataBlock`中所有元素都被`mask`筛选成无效元素时，该`DataBlock`中的数据不会搬入到矢量数据寄存器，对应位置的元素设置为0，即使UB越界也不会报错。 |
 | `block_stride` | 输入 | 源操作数相邻`DataBlock`之间起始地址的步长，单位为32字节。 |
-| `repeat_stride` | 输入 | 本次搬入的起始读取地址相对`tensor`的偏移，单位为32字节。实际起始读取地址为`tensor`起始地址加上`offset × sizeof(dtype) + repeat_stride × 32`字节。默认值为`0`。 |
+| `repeat_stride` | 输入 | 可选，本次搬入的起始读取地址相对`tensor`的偏移，单位为32字节。实际起始读取地址为`tensor`起始地址加上`offset × sizeof(dtype) + repeat_stride × 32`字节。默认值为`0`。 |
 
 **支持的元素数据类型：**
 

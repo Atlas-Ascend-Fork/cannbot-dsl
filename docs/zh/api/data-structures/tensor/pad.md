@@ -27,8 +27,8 @@ pad(self, pad, mode="constant", value=None)
 | 参数名 | 输入/输出 | 说明 |
 | --- | --- | --- |
 | `pad` | 输入 | 填充量的元组或列表，从末尾维度开始，每两个值依次表示该维前、后的填充量。 |
-| `mode` | 输入 | 填充模式，支持 `"constant"` 和 `"replicate"`，默认 `"constant"`。 |
-| `value` | 输入 | 常量填充的值，默认为 `0`；`"replicate"` 模式使用边界值。 |
+| `mode` | 输入 | 可选，填充模式，支持 `"constant"` 和 `"replicate"`，默认值为 `"constant"`。 |
+| `value` | 输入 | 可选，常量填充的值。默认值为`None`，常量填充时使用 `0`；`"replicate"` 模式使用边界值。 |
 
 ## 返回值说明
 

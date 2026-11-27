@@ -20,7 +20,7 @@ cv_valid_extent(tensor, *, axis, alignment=1, part_id)
 | --- | --- | --- |
 | `tensor` | 输入 | 需要查询分区有效长度的Tensor。 |
 | `axis` | 输入 | 分区轴，取值为`0`或`1`。 |
-| `alignment` | 输入 | 分区对齐粒度，默认为`1`。 |
+| `alignment` | 输入 | 可选，分区对齐粒度，默认值为`1`。 |
 | `part_id` | 输入 | 分区编号，取值为`0`或`1`，可为整数或运行时整数。 |
 
 ## 返回值说明
