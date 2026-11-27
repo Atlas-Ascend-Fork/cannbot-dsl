@@ -89,9 +89,11 @@ export ASCEND_SLOG_PRINT_TO_STDOUT=1
 
 | 环境变量 | 普通Python | DSL + CANN | DSL + printf回退 |
 | --- | --- | --- | --- |
-| `ASCEND_GLOBAL_LOG_LEVEL` | `0/1/2/3/4`分别为DEBUG/INFO/WARNING/ERROR/关闭普通日志；有效值优先于Logger级别。未设置、空值或非法值时使用Logger级别，默认INFO。 | 由CANN日志系统控制。当前验证的SDK在未设置、空值或非法值时默认ERROR。 | 使用同样的五档阈值；未设置、空值或非法值时默认ERROR。 |
+| `ASCEND_GLOBAL_LOG_LEVEL` | `0/1/2/3/4`分别为DEBUG/INFO/WARNING/ERROR/关闭普通日志；有效值优先于Logger级别。未设置、空值或非法值时使用Logger级别；未显式配置Logger时默认ERROR，保留用户显式设置的级别。 | 由CANN日志系统控制。当前验证的SDK在未设置、空值或非法值时默认ERROR。 | 使用同样的五档阈值；未设置、空值或非法值时默认ERROR。 |
 | `ASCEND_GLOBAL_EVENT_ENABLE` | `0`关闭EVENT，`1`开启。无有效开关时不主动关闭；存在有效普通日志配置时EVENT独立于该阈值，否则遵循Python Logger级别。 | 由CANN独立控制EVENT。 | `0`关闭，其他值或未设置时开启；独立于普通日志阈值。 |
 | `ASCEND_SLOG_PRINT_TO_STDOUT` | `1`令默认Handler输出到stdout，`0`关闭默认Handler打屏，其他值或未设置时输出到stderr；不改变用户Handler。 | `1`打屏，`0`使用CANN文件日志路径，按SDK配置写入plog。 | `0`关闭输出，其他值或未设置时输出到stdout；不创建plog。 |
+
+普通Python专用Logger为`cannbotdsl.operator`，默认ERROR。因此在未显式配置Logger、全局等级未设置且EVENT开关未设置时，DEBUG、INFO、WARNING和EVENT均被过滤，只输出ERROR；显式设置`ASCEND_GLOBAL_EVENT_ENABLE=1`可独立开启EVENT。
 
 普通Python每次调用读取上述变量；不接管`ASCEND_MODULE_LOG_LEVEL`、`ASCEND_PROCESS_LOG_PATH`等SDK配置。Python Logger默认不向父Logger传播，不修改root Logger。可使用标准`logging`配置级别、过滤器、Handler或Formatter；`logging.disable`、Logger.disabled、用户Handler的级别与过滤器仍生效。需要Python文件日志时自行配置`logging.FileHandler`，这不属于CANN plog。
 
@@ -105,7 +107,7 @@ DSL正常路径自动查找`libcannbotdsl_helper.so`，也可在首次调用前�
 [LEVEL] OP(pid,process):YYYY-MM-DD-HH:mm:ss.mmm.uuu [backend_file:line][NNOP][backend_function][tid] errno[561000] OpName:[function] [source_file:line][CANNBOT DSL][tag][@role] message
 ```
 
-`errno[561000]`仅出现在ERROR。普通Python的角色为`python`，DSL为`host`、`kernel`或`jit`；设备域在角色之后增加`[block=<编号>,subblock=<编号>]`。同一有效参数值采用相同消息格式，但不同浮点精度的舍入、元信息及默认过滤级别可能不同。此接口的格式规则与[print](./print.md)不同，不能直接互换参数。
+`errno[561000]`仅出现在ERROR。普通Python的角色为`python`，DSL为`host`、`kernel`或`jit`；设备域在角色之后增加`[block=<编号>,subblock=<编号>]`。同一有效参数值采用相同消息格式，但不同浮点精度的舍入和元信息可能不同。三种路径的普通日志默认阈值均为ERROR；EVENT的默认过滤行为见上表。此接口的格式规则与[print](./print.md)不同，不能直接互换参数。
 
 ## 调用示例
 
