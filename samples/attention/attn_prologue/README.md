@@ -172,6 +172,9 @@ L1 复用路径还将 QB 权重预打包为输出特征宽 256、归约宽 320 �
 （shape、stride、dtype、device、ND/NZ 布局）可共享产物，LRU 缓存最多保留 32 项。
 `norm_eps` 作为运行时 FP32 参数，其数值变化不触发重新编译。使用 `@host` 启动入口和
 `cannbotdsl.compile()`；kernel 辅助函数使用 `@jit`，寄存器计算使用 `vf(mode="simd")`。
+设备实现由 `_Launcher` 在编译前根据 tiling 绑定入口类。L1 复用使用独立入口；NonL1Reuse 按 A 阶段的
+Branch/Generic 编排和 B 阶段的 Resident/Streaming 缓冲策略组合成四个单继承入口类。路径无关的量化、
+RoPE 等原语位于公共基类，device 方法不再包含 `l1_reuse` 或 `b_resident` 分支。
 
 prepared 对象复用自己的输入参数、工作区和输出；重复 `.run()` 会覆盖同一组输出与目标 cache slot。
 需要保存旧结果时应另行复制。准备阶段可能复制输入或预打包权重，因此输入或权重变化后应重新 prepare。
@@ -217,14 +220,15 @@ workspace_bytes = 4 * work_rows * split_k * (R + D)
 
 | 模块 | 主要实现 |
 |---|---|
-| 分块规划与路径选择 | [`AttnPrologueTiling.plan`](attn_prologue.py#L297)、[`AttnPrologueKernel.__call__`](attn_prologue.py#L808) |
-| QA/KV 投影 | 通用路径 [`_a1_tile`](attn_prologue.py#L2318) → [`_mm_a`](attn_prologue.py#L2408)；L1 复用路径 [`_resident_a_project`](attn_prologue.py#L1355) |
-| QR 部分和归约 | 通用路径 [`_acc_partial_qa`](attn_prologue.py#L2806)；L1 复用路径 [`_acc_all_partials`](attn_prologue.py#L1415) |
-| QR RMSNorm 与动态量化 | [`_quantize_qr`](attn_prologue.py#L2845)、[`_pack_scale`](attn_prologue.py#L2954) |
-| QB 投影与 Q 写回 | [`_stage_b`](attn_prologue.py#L3118)、[`_resident_b_cube`](attn_prologue.py#L1548)、[`_finish_q`](attn_prologue.py#L3858) |
-| KV 归约、后处理与写回 | [`_service_kv`](attn_prologue.py#L2079)、[`_reduce_normalize_a`](attn_prologue.py#L2542)、[`_finish_kv_row`](attn_prologue.py#L2976) |
-| 尾部 RoPE 与跨阶段发布 | [`_rope_pair`](attn_prologue.py#L3069)、[`_publish_a1`](attn_prologue.py#L1770)、[`_publish_qr`](attn_prologue.py#L1780) |
-| 公共入口与编译缓存 | [`prepare_attn_prologue`](attn_prologue.py#L4125)、[`_Launcher.compile_cached`](attn_prologue.py#L4042) |
+| 分块规划与路径选择 | [`AttnPrologueTiling.plan`](attn_prologue_tiling.py)、[`select_attn_prologue_kernel`](attn_prologue_kernel.py) |
+| 设备入口类 | [`L1ReuseAttnPrologueKernel`](attn_prologue_kernel_l1_reuse.py)；[NonL1Reuse](attn_prologue_kernel_non_l1_reuse.py) 的 `Branch/Generic × BResident/BStreaming` 四种组合 |
+| QA/KV 投影 | 非驻留路径 [`_a1_tile`](attn_prologue_kernel_non_l1_reuse.py) → `_mm_a`；L1 复用路径 [`_resident_a_project`](attn_prologue_kernel_l1_reuse.py) |
+| QR 部分和归约 | 非驻留路径 `_acc_partial_qa`；L1 复用路径 [`_acc_all_partials`](attn_prologue_kernel_common.py) |
+| QR RMSNorm 与动态量化 | [`_quantize_qr` 和 `_pack_scale`](attn_prologue_kernel_common.py) |
+| QB 投影与 Q 写回 | 非驻留路径 [`_stage_b`](attn_prologue_kernel_non_l1_reuse.py)；L1 复用路径 [`_resident_b_cube`](attn_prologue_kernel_l1_reuse.py) |
+| KV 归约、后处理与写回 | 非驻留路径 `_service_kv`；L1 复用路径 [`_reduce_normalize_a`](attn_prologue_kernel_l1_reuse.py)；公共 [`_finish_kv_row`](attn_prologue_kernel_common.py) |
+| 尾部 RoPE 与跨阶段发布 | 公共 [`_rope_pair` 和 `_publish_qr`](attn_prologue_kernel_common.py)；非驻留 [`_publish_a1`](attn_prologue_kernel_non_l1_reuse.py) |
+| 公共入口与编译缓存 | [`prepare_attn_prologue` 和 `_Launcher.compile_cached`](attn_prologue.py) |
 
 ## 网络侧封装（替换现有 prolog）
 

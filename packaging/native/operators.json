@@ -35,6 +35,9 @@
       "sources": [
         "attention/attn_prologue/attn_prologue.py",
         "attention/attn_prologue/attn_prologue_kernel.py",
+        "attention/attn_prologue/attn_prologue_kernel_common.py",
+        "attention/attn_prologue/attn_prologue_kernel_l1_reuse.py",
+        "attention/attn_prologue/attn_prologue_kernel_non_l1_reuse.py",
         "attention/attn_prologue/attn_prologue_tiling.py"
       ]
     },

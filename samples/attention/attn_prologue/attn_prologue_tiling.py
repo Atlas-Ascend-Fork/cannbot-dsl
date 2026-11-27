@@ -16,19 +16,17 @@ FixPipe 使用补齐的物理尾块，公开输出和 cache 更新仍使用逻�
 
 from __future__ import annotations
 
+# fmt: off
+
 import dataclasses
 import math
 
 
-from cannbotdsl import (
-    dtypes,
-    get_mem_size,
-    get_platform_info,
-)
+import cannbotdsl as cbd
 
 
-FLOAT8_E4M3FN = dtypes.float8_e4m3fn
-FLOAT8_E8M0 = dtypes.float8_e8m0
+FLOAT8_E4M3FN = cbd.dtypes.float8_e4m3fn
+FLOAT8_E8M0 = cbd.dtypes.float8_e8m0
 
 # MXFP8 编码常量，与独立 golden 保持一致。
 MX_GROUP = 32  # 每个 E8M0 scale 对应的元素数。
@@ -83,9 +81,7 @@ RESIDENT_GEOMETRIES = (RESIDENT_GEOMETRY, (5120, PANEL_RANK_WIDTH, 8192, 512, 64
 # ---- 硬件执行模型 ----
 AIV_PER_BLOCK = 2  # 每个 Cube block 绑定的 Vector subblock 数（AIV 全局编号 = block_idx*2 + subblock_id）。
 FIXPIPE_DUAL_DST = 2  # FixPipe 双目的地沿行/列的对半切分数。
-HEAD_SLICES = (
-    AIV_PER_BLOCK * FIXPIPE_DUAL_DST
-)  # head 特征轴被双目的地×双 subblock 切成的份数。
+HEAD_SLICES = AIV_PER_BLOCK * FIXPIPE_DUAL_DST  # head 特征轴被双目的地×双 subblock 切成的份数。
 ZN_FRACTAL_BYTES = NZ_M_FRAC * MX_PAIR  # E8M0 zn 分形（16 行 × 2 组）的字节数。
 
 # ---- 分块搜索边界 ----
@@ -105,8 +101,7 @@ LONG_TOKEN_LIMIT = 4096  # 启用 20 路 split-K 的 prefill token 阈值。
 RESIDENT_BN = 64  # 驻留路径的输出列分块（N64）。
 K_WINDOW_RESIDENT = 320  # 驻留路径预取的 K 窗口宽度。
 RESIDENT_K_WINDOWS = (  # 驻留权重预取的 K 窗口轮转槽数（1280 / 320 = 4）。
-    PANEL_RANK_WIDTH // K_WINDOW_RESIDENT
-)
+                      PANEL_RANK_WIDTH // K_WINDOW_RESIDENT)
 RESIDENT_HEAD_PANELS = 2  # 驻留 panel 打包下每 head 切成的半区数（512 / 256）。
 BN_B_FULL_HEAD = 512  # 覆盖完整 head 的 QB 输出列分块。
 
@@ -121,11 +116,11 @@ A2_BUF_DEPTH_DECODE = 2  # split_k 模板的 A2 Channel 深度。
 TOKEN_RANGE_UPPERS = (16, 32, 48, 64, 80, 96, 192, 256)
 
 
-def _ceil_div(value: int, divisor: int) -> int:
+def ceil_div(value: int, divisor: int) -> int:
     return -(-value // divisor)
 
 
-def _token_range_upper(token_count: int) -> int | None:
+def token_range_upper(token_count: int) -> int | None:
     """返回覆盖 token_count 的模板上界；超出最大范围时返回 None（逐 T 特化）。"""
     for upper in TOKEN_RANGE_UPPERS:
         if token_count <= upper:
@@ -135,10 +130,10 @@ def _token_range_upper(token_count: int) -> int | None:
 
 def _align(value: int, alignment: int) -> int:
     """将 value 向上对齐到 alignment 的整数倍。"""
-    return _ceil_div(value, alignment) * alignment
+    return ceil_div(value, alignment) * alignment
 
 
-def _kv_row_bytes(head_size: int) -> int:
+def kv_row_bytes(head_size: int) -> int:
     """KV cache 单行字节数：payload 后紧跟每组的 BF16 scale。"""
     return head_size + (head_size // MX_GROUP) * KV_SCALE_BYTES
 
@@ -152,22 +147,20 @@ def _largest_divisor(value: int, cap: int, step: int) -> int:
             best = candidate
         candidate += step
     if best == 0:
-        raise ValueError(
-            f"No divisor of {value} is at most {cap} and divisible by {step}"
-        )
+        raise ValueError(f"No divisor of {value} is at most {cap} and divisible by {step}")
     return best
 
 
 # host 侧分块与编译期常量
 def _resident_groups(owners, n_count, cores, weight_bytes, activation_bytes):
     """host 侧负载模型：最小化最繁忙核的搬运量。保留原有分组候选，兼容不能整除任务数的核数配置。该模型仅用于调度选择，不直接预测设备执行耗时。"""
-    old = min(n_count, _ceil_div(cores, owners))
+    old = min(n_count, ceil_div(cores, owners))
     candidates = {old} | {g for g in range(1, n_count + 1) if n_count % g == 0}
 
     def critical_path(groups):
         costs = [0] * cores
         for job in range(owners * groups):
-            tiles = _ceil_div(n_count - job % groups, groups)
+            tiles = ceil_div(n_count - job % groups, groups)
             costs[job % cores] += tiles * weight_bytes + activation_bytes
         return max(costs)
 
@@ -218,17 +211,17 @@ class AttnPrologueTiling:
     @property
     def exp_stride(self) -> int:
         """指数暂存的行跨度，以 int32 元素计，按 UB_ALIGN 字节对齐。"""
-        return _ceil_div(self.qr_groups, UB_ALIGN // 4) * (UB_ALIGN // 4)
+        return ceil_div(self.qr_groups, UB_ALIGN // 4) * (UB_ALIGN // 4)
 
     @property
     def scale_stride(self) -> int:
         """scale 的物理行跨度，以字节计；公开输出仅保留 qr_groups 列。"""
-        return _ceil_div(self.qr_groups, UB_ALIGN) * UB_ALIGN
+        return ceil_div(self.qr_groups, UB_ALIGN) * UB_ALIGN
 
     @property
     def m_tiles_a1(self) -> int:
         """投影阶段沿 token 轴的分块数量。"""
-        return _ceil_div(self.token_count, self.bm_a1)
+        return ceil_div(self.token_count, self.bm_a1)
 
     @property
     def n_tiles_qa(self) -> int:
@@ -249,7 +242,7 @@ class AttnPrologueTiling:
     @property
     def tiles_a2(self) -> int:
         """归约阶段的分块数量，每块分配给一个 Vector 核。"""
-        return _ceil_div(self.token_count, self.bm_a2)
+        return ceil_div(self.token_count, self.bm_a2)
 
     @property
     def b_cols(self) -> int:
@@ -265,10 +258,8 @@ class AttnPrologueTiling:
         拆分可使 KV Cube 与 QR Vector 重叠，但额外 Cube 波次不得超过 5%。
         该选择只依赖任务几何和核数，不依赖 token 长度白名单。
         """
-        shared = _ceil_div(self.tiles_a1_qa + self.tiles_a1_kv, self.block_dim)
-        separate = _ceil_div(self.tiles_a1_qa, self.block_dim) + _ceil_div(
-            self.tiles_a1_kv, self.block_dim
-        )
+        shared = ceil_div(self.tiles_a1_qa + self.tiles_a1_kv, self.block_dim)
+        separate = ceil_div(self.tiles_a1_qa, self.block_dim) + ceil_div(self.tiles_a1_kv, self.block_dim)
         return 100 * (separate - shared) <= 5 * shared
 
     @property
@@ -281,7 +272,7 @@ class AttnPrologueTiling:
 
     @property
     def owners_b(self) -> int:
-        return _ceil_div(self.token_count, self.bm_b)
+        return ceil_div(self.token_count, self.bm_b)
 
     @property
     def tiles_b(self) -> int:
@@ -298,9 +289,7 @@ class AttnPrologueTiling:
         qa_reduction_tiles = self.hidden_size // self.split_k // self.bk_a1
         qb_reduction_tiles = self.rank_size // self.bk_b
         # 4：scale 暂存最多合并的 K 分块数（可整除时启用）。
-        return (
-            4 if qa_reduction_tiles % 4 == 0 and qb_reduction_tiles % 4 == 0 else W_BUF
-        )
+        return (4 if qa_reduction_tiles % 4 == 0 and qb_reduction_tiles % 4 == 0 else W_BUF)
 
     @property
     def resident_scale_tiles(self):
@@ -309,87 +298,43 @@ class AttnPrologueTiling:
     @property
     def groups_a(self):
         k = self.hidden_size // self.split_k
-        return _resident_groups(
-            self.m_tiles_a1 * self.split_k,
-            self.n_tiles_qa + self.n_tiles_kv,
-            self.block_dim,
-            self.bn_a1 * k,
-            self.bm_a1 * k,
-        )
+        return _resident_groups(self.m_tiles_a1 * self.split_k, self.n_tiles_qa + self.n_tiles_kv, self.block_dim,
+                                self.bn_a1 * k, self.bm_a1 * k)
 
     @property
     def groups_b_pair(self):
         """twin 路径的 B 分组：job=(head group)，两个 token 分块内层，按单 owner 求解。"""
-        return _resident_groups(
-            1, self.head_count, self.block_dim, self.head_size * self.rank_size, 0
-        )
+        return _resident_groups(1, self.head_count, self.block_dim, self.head_size * self.rank_size, 0)
 
     @property
     def groups_b(self):
-        return _resident_groups(
-            self.owners_b,
-            self.head_count,
-            self.block_dim,
-            self.head_size * self.rank_size,
-            self.bm_b * self.rank_size,
-        )
+        return _resident_groups(self.owners_b, self.head_count, self.block_dim, self.head_size * self.rank_size,
+                                self.bm_b * self.rank_size)
 
     # 分块规划
     @classmethod
-    def plan(
-        cls,
-        token_count,
-        hidden_size,
-        rank_size,
-        head_count,
-        head_size,
-        rope_width,
-        l1_reuse_eligible=False,
-    ) -> AttnPrologueTiling:
+    def plan(cls, token_count, hidden_size, rank_size, head_count, head_size, rope_width,
+             l1_reuse_eligible=False) -> AttnPrologueTiling:
         """为已通过公共校验的输入选择静态分块。调用方负责公共几何约束和 L1 复用资格；本方法按容量及 NZ 网格检查候选。"""
-        cores = get_platform_info().cube_core_num
+        cores = cbd.get_platform_info().cube_core_num
         # ---- 阶段 1：驻留规划（L1 复用资格时优先） ----
         if l1_reuse_eligible:
             # 使用对齐的完整物理分块平衡 token 任务。候选由实际容量决定，
             # 不依赖具体机器的核数或型号。
             # 96：驻留 token 分块行数上限。
-            for limit in range(
-                min(96, _align(token_count, TOKEN_TILE_ALIGN)),
-                TOKEN_TILE_ALIGN - 1,
-                -TOKEN_TILE_ALIGN,
-            ):
-                owners = _ceil_div(token_count, limit)
-                token_tile_rows = _align(
-                    _ceil_div(token_count, owners), TOKEN_TILE_ALIGN
-                )
-                tiling = cls(
-                    token_count,
-                    hidden_size,
-                    rank_size,
-                    head_count,
-                    head_size,
-                    rope_width,
-                    cores,
-                    "split_k",
-                    4,  # 4：L1 复用流水线沿 K 的固定分块数，A1 按 W_BUF 槽成对流水。
-                    token_tile_rows,
-                    RESIDENT_BN,
-                    K_WINDOW_RESIDENT,
-                    K_WINDOW_RESIDENT,
-                    1,
-                    token_tile_rows,
-                    RESIDENT_BN,
-                    K_WINDOW_RESIDENT,
-                    K_WINDOW_RESIDENT,
-                    l1_reuse=True,
-                )
+            for limit in range(min(96,
+                                   _align(token_count, TOKEN_TILE_ALIGN)), TOKEN_TILE_ALIGN - 1, -TOKEN_TILE_ALIGN):
+                owners = ceil_div(token_count, limit)
+                token_tile_rows = _align(ceil_div(token_count, owners), TOKEN_TILE_ALIGN)
+                tiling = cls(token_count, hidden_size, rank_size, head_count, head_size, rope_width, cores, "split_k",
+                             4,  # 4：L1 复用流水线沿 K 的固定分块数，A1 按 W_BUF 槽成对流水。
+                             token_tile_rows, RESIDENT_BN, K_WINDOW_RESIDENT, K_WINDOW_RESIDENT, 1, token_tile_rows,
+                             RESIDENT_BN, K_WINDOW_RESIDENT, K_WINDOW_RESIDENT, l1_reuse=True)
                 try:
-                    tiling._check_capacity(
-                        get_mem_size("l1"),
-                        get_mem_size("ub"),
-                        get_mem_size("l0c") - L0C_RESERVED_BYTES,
-                        get_mem_size("l0b") // L0_DEPTH,
-                    )
+                    tiling._check_capacity(cbd.get_mem_size("l1"),
+                                           cbd.get_mem_size("ub"),
+                                           cbd.get_mem_size("l0c") - L0C_RESERVED_BYTES,
+                                           cbd.get_mem_size("l0b") // L0_DEPTH)
                     tiling._check_nz_grid()
                     return tiling
                 except ValueError:
@@ -397,19 +342,18 @@ class AttnPrologueTiling:
             # 驻留分块容量不足时，退回通用规划器。
 
         # ---- 阶段 2：通用容量预算 ----
-        l0b_cap = get_mem_size("l0b") // L0_DEPTH
-        l0c_cap = get_mem_size("l0c")
-        l1_cap = get_mem_size("l1")
-        ub_cap = get_mem_size("ub")
+        l0b_cap = cbd.get_mem_size("l0b") // L0_DEPTH
+        l0c_cap = cbd.get_mem_size("l0c")
+        l1_cap = cbd.get_mem_size("l1")
+        ub_cap = cbd.get_mem_size("ub")
         # 为 FixPipe 的 unit flag 窗口预留 16 KiB L0C 空间。
         l0c_budget = l0c_cap - L0C_RESERVED_BYTES
 
         def pick_k(reduction: int, output_tile_cols: int) -> tuple[int, int]:
             # A1 与 B 的静态缓冲共存，各使用一半 L0B 预算。
             k_l1 = _largest_divisor(reduction, min(K_L1_MAX, reduction), MX_PAIR_WIDTH)
-            reduction_tile_cols = _largest_divisor(
-                k_l1, min(BK_MAX, k_l1, l0b_cap // 2 // output_tile_cols), MX_PAIR_WIDTH
-            )
+            reduction_tile_cols = _largest_divisor(k_l1,
+                                                   min(BK_MAX, k_l1, l0b_cap // 2 // output_tile_cols), MX_PAIR_WIDTH)
             return k_l1, reduction_tile_cols
 
         # ---- 阶段 3：模板与 split-K 选择 ----
@@ -423,10 +367,8 @@ class AttnPrologueTiling:
             else:
                 # (2, 4, 8)：小 T decode 的候选 K 分块数。
                 for candidate in (2, 4, 8):
-                    if (
-                        hidden_size % (candidate * MX_PAIR_WIDTH) == 0
-                        and head_size // MX_PAIR_WIDTH * candidate >= cores
-                    ):
+                    if (hidden_size % (candidate * MX_PAIR_WIDTH) == 0
+                        and head_size // MX_PAIR_WIDTH * candidate >= cores):
                         split_k = candidate
                         # 在保证并行度的同时，限制 FP32 部分和的归约长度。
                         # 640：split-K 单分块归约长度上限。
@@ -436,11 +378,7 @@ class AttnPrologueTiling:
         # ---- 阶段 4：A1 输出列与 K 窗口 ----
         # A1 任务由 token 分块、输出列分块和 K 分块组成，NZ 列保持对齐。
         # 64/128：bn_a1 搜索上限（split_k / split_t）。
-        bn_a1 = _largest_divisor(
-            math.gcd(rank_size, head_size),
-            64 if template == "split_k" else 128,
-            FRACTAL_N,
-        )
+        bn_a1 = _largest_divisor(math.gcd(rank_size, head_size), 64 if template == "split_k" else 128, FRACTAL_N)
         k_l1_a1, bk_a1 = pick_k(hidden_size // split_k, bn_a1)
 
         # A2 使用有界的 2 的幂次分块，使偏移可整除补齐后的交换区行数。
@@ -453,9 +391,8 @@ class AttnPrologueTiling:
             # L0B 使用单槽，使 A1 与 B 的合计占用保持在 64 KiB 内。
             bn_b, k_l1_b, bk_b = BN_B_FULL_HEAD, K_WINDOW_RESIDENT, MX_PAIR_WIDTH
         elif template == "split_k" and (
-            # 8/96：驻留半头资格的 decode token 数区间（单 token 亦可）。
-            token_count == 1 or 8 <= token_count <= 96
-        ):
+                                        # 8/96：驻留半头资格的 decode token 数区间（单 token 亦可）。
+                                        token_count == 1 or 8 <= token_count <= 96):
             # 先选择完整 head 的保底分块，再由容量检查决定是否使用驻留半头。
             # 256：decode 半头的 K1 窗口宽度。
             bn_b, k_l1_b, bk_b = BN_B_FULL_HEAD, 256, MX_PAIR_WIDTH
@@ -479,27 +416,11 @@ class AttnPrologueTiling:
             bm_a1 = min(BM_A1_MAX, rounded_tokens)
             bm_b = min(BM_A1_MAX, rounded_tokens)
         while True:
-            tiling = cls(
-                token_count=token_count,
-                hidden_size=hidden_size,
-                rank_size=rank_size,
-                head_count=head_count,
-                head_size=head_size,
-                rope_width=rope_width,
-                template=template,
-                split_k=split_k,
-                # 启动网格使用平台提供的 Cube 核数。
-                block_dim=cores,
-                bm_a1=bm_a1,
-                bn_a1=bn_a1,
-                bk_a1=bk_a1,
-                k_l1_a1=k_l1_a1,
-                bm_a2=bm_a2,
-                bm_b=bm_b,
-                bn_b=bn_b,
-                bk_b=bk_b,
-                k_l1_b=k_l1_b,
-            )
+            tiling = cls(token_count=token_count, hidden_size=hidden_size, rank_size=rank_size, head_count=head_count,
+                         head_size=head_size, rope_width=rope_width, template=template, split_k=split_k,
+                         # 启动网格使用平台提供的 Cube 核数。
+                         block_dim=cores, bm_a1=bm_a1, bn_a1=bn_a1, bk_a1=bk_a1, k_l1_a1=k_l1_a1, bm_a2=bm_a2,
+                         bm_b=bm_b, bn_b=bn_b, bk_b=bk_b, k_l1_b=k_l1_b)
             try:
                 tiling._check_capacity(l1_cap, ub_cap, l0c_budget, l0b_cap)
             except ValueError:
@@ -517,21 +438,13 @@ class AttnPrologueTiling:
         # 共用的输出列分块。更大的输出块可减少对同一激活块的重复读取。
         # 该搜索位于基础行分块选择之后，避免增大输出块时隐式缩小行块。
         if template == "split_k":
-            for candidate_bn in range(
-                math.gcd(rank_size, head_size), FRACTAL_N - 1, -FRACTAL_N
-            ):
+            for candidate_bn in range(math.gcd(rank_size, head_size), FRACTAL_N - 1, -FRACTAL_N):
                 if rank_size % candidate_bn or head_size % candidate_bn:
                     continue
                 try:
-                    candidate_k_l1, candidate_bk = pick_k(
-                        hidden_size // split_k, candidate_bn
-                    )
-                    candidate = dataclasses.replace(
-                        tiling,
-                        bn_a1=candidate_bn,
-                        bk_a1=candidate_bk,
-                        k_l1_a1=candidate_k_l1,
-                    )
+                    candidate_k_l1, candidate_bk = pick_k(hidden_size // split_k, candidate_bn)
+                    candidate = dataclasses.replace(tiling, bn_a1=candidate_bn, bk_a1=candidate_bk,
+                                                    k_l1_a1=candidate_k_l1)
                     candidate._check_capacity(l1_cap, ub_cap, l0c_budget, l0b_cap)
                     candidate._check_nz_grid()
                 except (ValueError, NotImplementedError):
@@ -540,19 +453,10 @@ class AttnPrologueTiling:
                 break
 
         if template == "split_k" and token_count > DECODE_SPLIT_K_TOKENS:
-            candidate_k_l1 = _largest_divisor(
-                hidden_size // split_k,
-                min(K_L1_MAX, hidden_size // split_k),
-                MX_PAIR_WIDTH,
-            )
+            candidate_k_l1 = _largest_divisor(hidden_size // split_k,
+                                              min(K_L1_MAX, hidden_size // split_k), MX_PAIR_WIDTH)
             # 112/256：token>128 decode 的专属行/列分块。
-            candidate = dataclasses.replace(
-                tiling,
-                bm_a1=112,
-                bn_a1=256,
-                bk_a1=MX_PAIR_WIDTH,
-                k_l1_a1=candidate_k_l1,
-            )
+            candidate = dataclasses.replace(tiling, bm_a1=112, bn_a1=256, bk_a1=MX_PAIR_WIDTH, k_l1_a1=candidate_k_l1)
             candidate._check_capacity(l1_cap, ub_cap, l0c_budget, l0b_cap)
             candidate._check_nz_grid()
             tiling = candidate
@@ -576,76 +480,40 @@ class AttnPrologueTiling:
         base = self
         # decode 减少独立 K 部分和以降低 A2 搬运量，同时保留足够的
         # token、输出列和 K 分块任务并行度。
-        if (
-            self.template == "split_k"
-            and self.token_count <= DECODE_SPLIT_K_TOKENS
-            and self.hidden_size % (SPLIT_K_DECODE * MX_PAIR_WIDTH) == 0
-        ):
-            k_a = _largest_divisor(
-                self.hidden_size // SPLIT_K_DECODE,
-                min(K_L1_MAX, self.hidden_size // SPLIT_K_DECODE),
-                MX_PAIR_WIDTH,
-            )
-            base = dataclasses.replace(
-                base,
-                split_k=SPLIT_K_DECODE,
-                k_l1_a1=k_a,
-                bk_a1=MX_PAIR_WIDTH,
-                # token>32 时 A2 用 2 行分块。
-                bm_a2=2 if self.token_count > 32 else 1,
-            )
+        if (self.template == "split_k" and self.token_count <= DECODE_SPLIT_K_TOKENS
+            and self.hidden_size % (SPLIT_K_DECODE * MX_PAIR_WIDTH) == 0):
+            k_a = _largest_divisor(self.hidden_size // SPLIT_K_DECODE,
+                                   min(K_L1_MAX, self.hidden_size // SPLIT_K_DECODE), MX_PAIR_WIDTH)
+            base = dataclasses.replace(base, split_k=SPLIT_K_DECODE, k_l1_a1=k_a, bk_a1=MX_PAIR_WIDTH,
+                                       # token>32 时 A2 用 2 行分块。
+                                       bm_a2=2 if self.token_count > 32 else 1)
         # token 分块足够多时，无需再用二十个 K 分块提供并行度。
-        if (
-            self.template == "split_t"
-            and self.token_count >= LONG_TOKEN_LIMIT
-            and self.hidden_size % MX_PAIR_WIDTH == 0
-        ):
-            k_a = _largest_divisor(
-                self.hidden_size, min(K_L1_MAX, self.hidden_size), MX_PAIR_WIDTH
-            )
-            base = dataclasses.replace(
-                base,
-                split_k=1,
-                k_l1_a1=k_a,
-                bk_a1=_largest_divisor(
-                    k_a, min(BK_MAX, k_a, l0b_cap // 2 // base.bn_a1), MX_PAIR_WIDTH
-                ),
-                bm_a2=BM_A2_PREFILL,
-            )
+        if (self.template == "split_t" and self.token_count >= LONG_TOKEN_LIMIT
+            and self.hidden_size % MX_PAIR_WIDTH == 0):
+            k_a = _largest_divisor(self.hidden_size, min(K_L1_MAX, self.hidden_size), MX_PAIR_WIDTH)
+            base = dataclasses.replace(base, split_k=1, k_l1_a1=k_a,
+                                       bk_a1=_largest_divisor(k_a,
+                                                              min(BK_MAX, k_a, l0b_cap // 2 // base.bn_a1),
+                                                              MX_PAIR_WIDTH), bm_a2=BM_A2_PREFILL)
         # 每个 head 拆成两个列块，两个 Vector 半区都包含完整的 VL 分组。
-        if (
-            self.head_size % (HEAD_SLICES * VL) == 0
-            and self.head_size // HEAD_SLICES >= self.rope_width
-            and self.head_count * FIXPIPE_DUAL_DST >= self.block_dim
-        ):
-            k_window = _largest_divisor(
-                self.rank_size, min(K_WINDOW_RESIDENT, self.rank_size), MX_PAIR_WIDTH
-            )
+        if (self.head_size % (HEAD_SLICES * VL) == 0 and self.head_size // HEAD_SLICES >= self.rope_width
+            and self.head_count * FIXPIPE_DUAL_DST >= self.block_dim):
+            k_window = _largest_divisor(self.rank_size, min(K_WINDOW_RESIDENT, self.rank_size), MX_PAIR_WIDTH)
             tried = set()
             # 在任务归属数相同的情况下，选择最小的对齐 token 分块。
             # 128：驻留 bm 搜索上限。
-            for bm_limit in range(
-                min(128, _align(self.token_count, TOKEN_TILE_ALIGN)),
-                TOKEN_TILE_ALIGN - 1,
-                -TOKEN_TILE_ALIGN,
-            ):
-                owners = _ceil_div(self.token_count, bm_limit)
-                token_tile_rows = _align(
-                    _ceil_div(self.token_count, owners), TOKEN_TILE_ALIGN
-                )
+            for bm_limit in range(min(128,
+                                      _align(self.token_count, TOKEN_TILE_ALIGN)), TOKEN_TILE_ALIGN - 1,
+                                  -TOKEN_TILE_ALIGN):
+                owners = ceil_div(self.token_count, bm_limit)
+                token_tile_rows = _align(ceil_div(self.token_count, owners), TOKEN_TILE_ALIGN)
                 if token_tile_rows in tried:
                     continue
                 tried.add(token_tile_rows)
                 for a_window in (True, False):
-                    candidate = dataclasses.replace(
-                        base,
-                        b_resident=True,
-                        a1_window=a_window,
-                        bn_b=self.head_size // FIXPIPE_DUAL_DST,
-                        bk_b=MX_PAIR_WIDTH,
-                        k_l1_b=k_window,
-                        bm_b=token_tile_rows,
-                    )
+                    candidate = dataclasses.replace(base, b_resident=True, a1_window=a_window,
+                                                    bn_b=self.head_size // FIXPIPE_DUAL_DST, bk_b=MX_PAIR_WIDTH,
+                                                    k_l1_b=k_window, bm_b=token_tile_rows)
                     if fits(candidate):
                         return candidate
         candidate = dataclasses.replace(base, a1_window=True)
@@ -655,26 +523,18 @@ class AttnPrologueTiling:
 
     def _check_nz_grid(self) -> None:
         """要求完整的 NZ fractal：输出行和归约列均按网格对齐。"""
-        for name, reduction, window, block in (
-            ("A1", self.hidden_size // self.split_k, self.k_l1_a1, self.bk_a1),
-            ("B", self.rank_size, self.k_l1_b, self.bk_b),
-        ):
+        for name, reduction, window, block in (("A1", self.hidden_size // self.split_k, self.k_l1_a1, self.bk_a1),
+                                               ("B", self.rank_size, self.k_l1_b, self.bk_b)):
             if reduction % window or window % block:
-                raise ValueError(
-                    f"Invalid {name} tiling: K={reduction}, L1={window}, L0={block} must divide exactly"
-                )
-        for name, extent, align in (
-            ("bn_a1 (QA/KV NZ output rows)", self.bn_a1, NZ_M_FRAC),
-            ("k_l1_a1 (QA/KV NZ reduction columns)", self.k_l1_a1, NZ_C0_1B),
-            ("bn_b (QB NZ output rows)", self.bn_b, NZ_M_FRAC),
-            ("k_l1_b (QB NZ reduction columns)", self.k_l1_b, NZ_C0_1B),
-            ("rank_size (QA output width)", self.rank_size, NZ_M_FRAC),
-            ("head_size (KV output width)", self.head_size, NZ_M_FRAC),
-        ):
+                raise ValueError(f"Invalid {name} tiling: K={reduction}, L1={window}, L0={block} must divide exactly")
+        for name, extent, align in (("bn_a1 (QA/KV NZ output rows)", self.bn_a1, NZ_M_FRAC),
+                                    ("k_l1_a1 (QA/KV NZ reduction columns)", self.k_l1_a1, NZ_C0_1B),
+                                    ("bn_b (QB NZ output rows)", self.bn_b, NZ_M_FRAC),
+                                    ("k_l1_b (QB NZ reduction columns)", self.k_l1_b, NZ_C0_1B),
+                                    ("rank_size (QA output width)", self.rank_size, NZ_M_FRAC),
+                                    ("head_size (KV output width)", self.head_size, NZ_M_FRAC)):
             if extent % align:
-                raise NotImplementedError(
-                    f"NZ weights require {name} divisible by {align}, got {extent}"
-                )
+                raise NotImplementedError(f"NZ weights require {name} divisible by {align}, got {extent}")
 
     def _check_capacity(self, l1_cap, ub_cap, l0c_budget, l0b_cap) -> None:
         """检查所有同时存在的片上缓冲区是否超过设备容量。"""
@@ -683,192 +543,103 @@ class AttnPrologueTiling:
         if self.l1_reuse:
             # A1 与 B 复用同一组 L1/L0 Channel；容量还要计入预取的 B panel、
             # A2 同时加载的全部 split-K 部分和以及 Channel 标识数。
-            token_tile_rows, output_tile_cols, reduction_tile_cols = (
-                self.bm_a1,
-                self.bn_a1,
-                self.bk_a1,
-            )
+            token_tile_rows, output_tile_cols, reduction_tile_cols = (self.bm_a1, self.bn_a1, self.bk_a1)
             # 驻留 QB scale：每行字节按 16 对齐，行数按 32 对齐。
-            (
-                _ceil_div(rank_width // MX_GROUP, 16)
-                * 16
-                * _ceil_div(head_width, 32)
-                * 32
-            )
-            ub_a2 = (
-                (self.split_k + 1) * (rank_width + head_width) * FP32_BYTES
-                + (rank_width + head_width) * FP32_BYTES
-                + 2 * VL * FP32_BYTES
-                + 2 * rank_width
-                + 2 * max(self.exp_stride, VL) * FP32_BYTES
-                + 2 * self.scale_stride
-                + 2 * _kv_row_bytes(head_width)
-                + 2 * VL * FP32_BYTES
-                + A2_BUF_DEPTH_DECODE * rank_width * BF16_BYTES  # BF16 QR 输出行。
-                + VL * FP32_BYTES
-            )
+            (ceil_div(rank_width // MX_GROUP, 16) * 16 * ceil_div(head_width, 32) * 32)
+            ub_a2 = ((self.split_k + 1) * (rank_width + head_width) * FP32_BYTES
+                     + (rank_width + head_width) * FP32_BYTES + 2 * VL * FP32_BYTES + 2 * rank_width
+                     + 2 * max(self.exp_stride, VL) * FP32_BYTES + 2 * self.scale_stride + 2 * kv_row_bytes(head_width)
+                     + 2 * VL * FP32_BYTES
+                     + A2_BUF_DEPTH_DECODE * rank_width * BF16_BYTES  # BF16 QR 输出行。
+                     + VL * FP32_BYTES)
             # 6 = FP32 累加 + BF16 输出的每元素字节数。
-            ub_b = (
-                2
-                * (token_tile_rows // FIXPIPE_DUAL_DST)
-                * (head_width // FIXPIPE_DUAL_DST)
-                * 6
-                + 2 * (token_tile_rows // FIXPIPE_DUAL_DST) * VL * FP32_BYTES
-                + VL * FP32_BYTES
-            )
+            ub_b = (2 * (token_tile_rows // FIXPIPE_DUAL_DST) * (head_width // FIXPIPE_DUAL_DST) * 6
+                    + 2 * (token_tile_rows // FIXPIPE_DUAL_DST) * VL * FP32_BYTES + VL * FP32_BYTES)
             # round3：twin 路径把两个 token 分块的激活/QR 同时驻留，B 预取深度降为 2；
             # 容量改成与 kernel 实际分配逐一对应的精确求和（含 4 KiB 对齐余量）。
             twin_blocks = 2 if self.owners_b == 2 else 1
             resident_slots = self.resident_tiles * twin_blocks
             prefetch_windows = 2 if twin_blocks == 2 else RESIDENT_K_WINDOWS
-            scale_slot_bytes = (
-                _ceil_div(token_tile_rows, NZ_M_FRAC)
-                * _ceil_div(
-                    self.scale_k_tiles * reduction_tile_cols // MX_GROUP, MX_PAIR
-                )
-                * ZN_FRACTAL_BYTES
-            )
-            l1_used = (
-                resident_slots * token_tile_rows * reduction_tile_cols
-                + twin_blocks * self.resident_scale_tiles * scale_slot_bytes
-                + W_BUF * output_tile_cols * reduction_tile_cols
-                + (reduction_tile_cols // MX_GROUP) * output_tile_cols * W_BUF
-                + RESIDENT_K_WINDOWS * (reduction_tile_cols // MX_GROUP) * head_width
-                + prefetch_windows
-                * (PANEL_OUTPUT_TILES * output_tile_cols)
-                * reduction_tile_cols
-            ) + L1_ALIGN_RESERVE_BYTES
+            scale_slot_bytes = (ceil_div(token_tile_rows,
+                                         NZ_M_FRAC) * ceil_div(self.scale_k_tiles * reduction_tile_cols // MX_GROUP,
+                                                               MX_PAIR) * ZN_FRACTAL_BYTES)
+            l1_used = (resident_slots * token_tile_rows * reduction_tile_cols
+                       + twin_blocks * self.resident_scale_tiles * scale_slot_bytes
+                       + W_BUF * output_tile_cols * reduction_tile_cols
+                       + (reduction_tile_cols // MX_GROUP) * output_tile_cols * W_BUF
+                       + RESIDENT_K_WINDOWS * (reduction_tile_cols // MX_GROUP) * head_width + prefetch_windows
+                       * (PANEL_OUTPUT_TILES * output_tile_cols) * reduction_tile_cols) + L1_ALIGN_RESERVE_BYTES
             checks = [
                 # 每 MX_GROUP 个 payload 字节另需一个 scale 字节。
-                ("shared L1", l1_used, l1_cap),
-                (
-                    "shared L0A",
-                    L0_DEPTH * token_tile_rows * reduction_tile_cols,
-                    get_mem_size("l0a"),
-                ),
-                (
-                    "shared L0B",
-                    L0_DEPTH * output_tile_cols * reduction_tile_cols,
-                    l0b_cap * L0_DEPTH,
-                ),
-                (
-                    "L0C",
-                    (
-                        twin_blocks
-                        * token_tile_rows
-                        * (PANEL_OUTPUT_TILES * output_tile_cols)
-                        + twin_blocks * token_tile_rows * output_tile_cols
-                        if twin_blocks == 2
-                        else token_tile_rows * (output_tile_cols + head_width)
-                    )
-                    * FP32_BYTES,
-                    l0c_budget,
-                ),
-                ("UB", ub_a2 + ub_b + _twin_ub_extra(self), ub_cap),
-                (
-                    "Cube channel IDs",
-                    resident_slots
-                    + twin_blocks * self.resident_scale_tiles
-                    + 2 * W_BUF
-                    + 2 * L0_DEPTH
-                    # +4/+8：early panel、FixPipe 目的等保留 Channel 预算修正项。
-                    + 4
-                    + 8,
-                    # 32：单 kernel 可用的 Channel 标识上限。
-                    32,
-                ),
-            ]
+                      ("shared L1", l1_used, l1_cap),
+                      ("shared L0A", L0_DEPTH * token_tile_rows * reduction_tile_cols, cbd.get_mem_size("l0a")),
+                      ("shared L0B", L0_DEPTH * output_tile_cols * reduction_tile_cols, l0b_cap * L0_DEPTH),
+                      ("L0C", (twin_blocks * token_tile_rows * (PANEL_OUTPUT_TILES * output_tile_cols)
+                               + twin_blocks * token_tile_rows * output_tile_cols
+                               if twin_blocks == 2 else token_tile_rows * (output_tile_cols + head_width)) * FP32_BYTES,
+                       l0c_budget),
+                      ("UB", ub_a2 + ub_b + _twin_ub_extra(self), ub_cap),
+                      ("Cube channel IDs",
+                       resident_slots + twin_blocks * self.resident_scale_tiles + 2 * W_BUF + 2 * L0_DEPTH
+                       # +4/+8：early panel、FixPipe 目的等保留 Channel 预算修正项。
+                       + 4 + 8,
+                       # 32：单 kernel 可用的 Channel 标识上限。
+                       32)]
             for name, used, cap in checks:
                 if used > cap:
                     raise ValueError(f"Buffer {name}: {used} exceeds {cap}")
             return
 
         # ---- 阶段 2：L1 字节建模 ----
-        def l1_buffer_bytes(
-            token_tile_rows, output_tile_cols, k_a, k_l1, weight_buffers=W_BUF
-        ):
+        def l1_buffer_bytes(token_tile_rows, output_tile_cols, k_a, k_l1, weight_buffers=W_BUF):
             # 激活的 K 宽度可为一个 L0 分块或完整 L1 窗口。
             # 权重 payload 使用单槽，以保证 FP8 别名的起始地址在编译期可知。
-            return L0_DEPTH * (
-                token_tile_rows * k_a + token_tile_rows * (k_a // MX_GROUP)
-            ) + weight_buffers * (
-                output_tile_cols * k_l1 + (k_l1 // MX_GROUP) * output_tile_cols
-            )
+            return (L0_DEPTH * (token_tile_rows * k_a + token_tile_rows * (k_a // MX_GROUP))
+                    + weight_buffers * (output_tile_cols * k_l1 + (k_l1 // MX_GROUP) * output_tile_cols))
 
         # ---- 阶段 3：L1/L0B/L0A/L0C 检查表 ----
         checks = [
             # 各阶段缓冲在同一个 kernel 内静态共存，同步不会释放其空间。
-            (
-                "L1 (stage A1 + B)",
-                l1_buffer_bytes(self.bm_a1, self.bn_a1, self.k_l1_x_a1, self.k_l1_a1)
-                + (
-                    self.bm_b * (rank_width + rank_width // MX_GROUP)
-                    + 2
-                    * (self.bn_b * self.k_l1_b + (self.k_l1_b // MX_GROUP) * self.bn_b)
-                    if self.b_resident
-                    else l1_buffer_bytes(self.bm_b, self.bn_b, self.bk_b, self.k_l1_b)
-                ),
-                l1_cap,
-            ),
-            (
-                "L0B (stage A1 + B)",
-                self.bn_a1 * self.bk_a1 * L0_DEPTH
-                + self.bn_b
-                * self.bk_b
-                * (1 if self.bn_b == BN_B_FULL_HEAD else L0_DEPTH),
-                l0b_cap * L0_DEPTH,
-            ),
-            (
-                "L0A (stage A1 + B)",
-                (self.bm_a1 * self.bk_a1 + self.bm_b * self.bk_b) * L0_DEPTH,
-                l0b_cap * L0_DEPTH,
-            ),
+                  ("L1 (stage A1 + B)",
+                   l1_buffer_bytes(self.bm_a1, self.bn_a1, self.k_l1_x_a1, self.k_l1_a1)
+                   + (self.bm_b * (rank_width + rank_width // MX_GROUP) + 2
+                      * (self.bn_b * self.k_l1_b + (self.k_l1_b // MX_GROUP) * self.bn_b) if self.b_resident
+                      else l1_buffer_bytes(self.bm_b, self.bn_b, self.bk_b, self.k_l1_b)), l1_cap),
+                  ("L0B (stage A1 + B)", self.bn_a1 * self.bk_a1 * L0_DEPTH + self.bn_b * self.bk_b
+                   * (1 if self.bn_b == BN_B_FULL_HEAD else L0_DEPTH), l0b_cap * L0_DEPTH),
+                  ("L0A (stage A1 + B)", (self.bm_a1 * self.bk_a1 + self.bm_b * self.bk_b) * L0_DEPTH,
+                   l0b_cap * L0_DEPTH),
             # 为 FixPipe 的 unit flag 保留余量，不能占满全部 L0C。
-            (
-                "L0C (stage A1 + B)",
-                self.bm_a1 * self.bn_a1 * FP32_BYTES
-                + self.bm_b
-                * (self.bn_b if self.b_resident else head_width)
-                * FP32_BYTES,
-                l0c_budget,
-            ),
-        ]
+                  ("L0C (stage A1 + B)", self.bm_a1 * self.bn_a1 * FP32_BYTES + self.bm_b
+                   * (self.bn_b if self.b_resident else head_width) * FP32_BYTES, l0c_budget)]
         # ---- 阶段 4：A2/B UB 建模与总检查 ----
         m2 = self.bm_a2
-        a2_depth = (
-            A2_BUF_DEPTH_PREFILL if self.template == "split_t" else A2_BUF_DEPTH_DECODE
-        )
+        a2_depth = (A2_BUF_DEPTH_PREFILL if self.template == "split_t" else A2_BUF_DEPTH_DECODE)
         # 归约只由 Vector 执行，每个 DMA 分块包含 bm_a2 个 token 行。
         ub_a2 = (
-            a2_depth * m2 * rank_width * FP32_BYTES  # FP32 QA 交换区行。
-            + a2_depth * m2 * head_width * FP32_BYTES  # KV 行。
-            + rank_width * FP32_BYTES
-            + head_width * FP32_BYTES  # 归一化权重 gamma。
-            + 2 * (m2 * VL) * FP32_BYTES  # RoPE 正弦和余弦表。
-            + a2_depth * m2 * rank_width  # QR payload 字节。
-            + (m2 + 1) * max(self.exp_stride, VL) * FP32_BYTES
-            + a2_depth * m2 * self.scale_stride
-            + 2 * _kv_row_bytes(head_width)
-            + 2 * VL * FP32_BYTES
-            + a2_depth * m2 * rank_width * BF16_BYTES  # BF16 QR 输出行。
-            + VL * FP32_BYTES  # KV scale 位打包暂存区。
-        )  # 双缓冲 KV 字节及 RoPE 暂存区。
+                 a2_depth * m2 * rank_width * FP32_BYTES  # FP32 QA 交换区行。
+                 + a2_depth * m2 * head_width * FP32_BYTES  # KV 行。
+                 + rank_width * FP32_BYTES
+                 + head_width * FP32_BYTES  # 归一化权重 gamma。
+                 + 2 * (m2 * VL) * FP32_BYTES  # RoPE 正弦和余弦表。
+                 + a2_depth * m2 * rank_width  # QR payload 字节。
+                 + (m2 + 1) * max(self.exp_stride, VL) * FP32_BYTES + a2_depth * m2 * self.scale_stride
+                 + 2 * kv_row_bytes(head_width) + 2 * VL * FP32_BYTES
+                 + a2_depth * m2 * rank_width * BF16_BYTES  # BF16 QR 输出行。
+                 + VL * FP32_BYTES)  # KV scale 位打包暂存区；双缓冲 KV 字节及 RoPE 暂存区。
         if self.split_k > 1:
             # QA 部分和、Kahan 补偿及 KV 部分和同时占用 UB。
             ub_a2 += m2 * (2 * rank_width + head_width) * FP32_BYTES
         # 投影结果从 L0C 直接写入 GM；QB 沿特征轴分给两个 Vector 核。
         ub_b = (
-            self.bm_b * self.b_cols * FP32_BYTES  # FixPipe 目的缓冲区。
-            + self.bm_b * self.b_cols * 2  # BF16 输出缓冲区。
-            + 2 * self.bm_b * VL * FP32_BYTES  # RoPE 正弦和余弦表。
-            + VL * FP32_BYTES
-        )  # RoPE 暂存区。
+                self.bm_b * self.b_cols * FP32_BYTES  # FixPipe 目的缓冲区。
+                + self.bm_b * self.b_cols * 2  # BF16 输出缓冲区。
+                + 2 * self.bm_b * VL * FP32_BYTES  # RoPE 正弦和余弦表。
+                + VL * FP32_BYTES)  # RoPE 暂存区。
         checks += [("UB (stage A2 + B)", ub_a2 + ub_b, ub_cap)]
         for name, used, cap in checks:
             if used > cap:
-                raise ValueError(
-                    f"Buffer {name} requires {used} bytes, exceeding {cap}; reduce its token/output tile"
-                )
+                raise ValueError(f"Buffer {name} requires {used} bytes, exceeding {cap}; reduce its token/output tile")
 
 
 def _twin_ub_extra(tiling) -> int:
