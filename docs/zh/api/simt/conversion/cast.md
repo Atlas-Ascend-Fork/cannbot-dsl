@@ -51,6 +51,21 @@ simt.cast(value, *, dtype, rounding=RoundingMode.RN, saturate=False) -> 目标�
 - `float32`转换为`float16`或`bfloat16`、`bfloat16`转换为`float16`时，饱和行为受`CTRL[60]`控制：SIMD与SIMT混合执行时，须在进入SIMT函数前，在SIMD侧将`CTRL[60]`置为`0`；纯SIMT Kernel中不能通过该参数启用这些转换的饱和模式。寄存器设置接口见[set_ctrl](../../execution/device/spr/set-ctrl.md)。
 - 此处的饱和转换将超范围结果限制为目标类型的有限值，不是将结果限制到`[0, 1]`。
 
+### 特殊值处理
+
+| 源类型 → 目标类型 | `NaN` | `+Inf` | `-Inf` | `+0` | `-0` |
+| --- | --- | --- | --- | --- | --- |
+| `float32`、`bfloat16` → `float16`（非饱和） | `NaN` | `+Inf` | `-Inf` | `+0` | `-0` |
+| `float32`、`bfloat16` → `float16`（饱和） | `0` | `MAX` | `MIN` | `+0` | `-0` |
+| `float32` → `bfloat16`（非饱和） | `NaN` | `+Inf` | `-Inf` | `+0` | `-0` |
+| `float32` → `bfloat16`（饱和） | `0` | `MAX` | `MIN` | `+0` | `-0` |
+| `float16` → `bfloat16` | `NaN` | `+Inf` | `-Inf` | `+0` | `-0` |
+| `float16`、`bfloat16` → `float32` | `NaN` | `+Inf` | `-Inf` | `+0` | `-0` |
+| `float16`、`bfloat16` → 各整数类型 | `0` | `MAX` | `MIN` | `0` | `0` |
+| `float32` → 各整数类型 | 要求有限输入 | 要求有限输入 | 要求有限输入 | `0` | `0` |
+
+`MAX`、`MIN`分别表示目标数值类型的最大、最小有限值；无符号整数的`MIN`为`0`。
+
 ## 调用示例
 
 将输入转换为目标数据类型，并打印结果。
