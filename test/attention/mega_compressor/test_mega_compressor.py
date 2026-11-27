@@ -38,7 +38,7 @@ def _inputs(batch, seq):
     return [x, wk, wg, state, gamma, starts, used, cu, table]
 
 
-def _reference(tensors, ratio):
+def _reference(tensors, ratio, *, apply_norm=True):
     x, wk, wg, state, gamma, starts, used, cu, table = tensors
     projected = torch.cat((x.float() @ wk.float().T, x.float() @ wg.float().T), -1)
     cache = state.clone()
@@ -59,13 +59,13 @@ def _reference(tensors, ratio):
             .to(x.dtype)
             .float()
         )
-        outputs.append(
-            (
+        if apply_norm:
+            pooled = (
                 pooled
                 * torch.rsqrt(pooled.square().mean(-1, keepdim=True) + 1e-6)
                 * gamma.float()
-            ).to(x.dtype)
-        )
+            )
+        outputs.append(pooled.to(x.dtype))
         for token in range(max(0, length - 8), length):
             slot = (start + token) % 8
             cache[block, slot] = rows[token]
@@ -73,8 +73,8 @@ def _reference(tensors, ratio):
     return outputs, cache, written
 
 
-def _check(output, state, cpu, ratio):
-    expected, cache, written = _reference(cpu, ratio)
+def _check(output, state, cpu, ratio, *, apply_norm=True):
+    expected, cache, written = _reference(cpu, ratio, apply_norm=apply_norm)
     actual = output.cpu()
     offset = 0
     for b, ref in enumerate(expected):
@@ -145,6 +145,32 @@ def test_mega_compressor_bsh(batch, seq, ratio):
                 state.copy_(cpu[3])
                 graph.replay()
                 _check(captured, state, cpu, ratio)
+
+
+@pytest.mark.npu
+@pytest.mark.parametrize("backend", ["auto", "legacy", "pr221"])
+@pytest.mark.parametrize("apply_norm", [False, True])
+@pytest.mark.parametrize("ratio", [1, 2])
+def test_mega_compressor_backend_norm_weight(backend, apply_norm, ratio):
+    pytest.importorskip("torch_npu")
+    cpu = _inputs(1, 8)
+    x, wk, wg, state, gamma, starts, _, _, table = [t.npu() for t in cpu]
+    attrs = dict(
+        cmp_ratio=ratio,
+        state_block_table=table,
+        start_pos=starts,
+        norm_eps=1e-6,
+        backend=backend,
+    )
+    if apply_norm:
+        attrs["norm_weight"] = gamma
+    if backend == "pr221" and not apply_norm:
+        with pytest.raises(ValueError, match="norm_weight"):
+            op.mega_compressor(x.view(1, 8, 5120), wk, wg, state, **attrs)
+        assert torch.equal(state.cpu().view(torch.int32), cpu[3].view(torch.int32))
+        return
+    output = op.mega_compressor(x.view(1, 8, 5120), wk, wg, state, **attrs)
+    _check(output, state, cpu, ratio, apply_norm=apply_norm)
 
 
 @pytest.mark.npu

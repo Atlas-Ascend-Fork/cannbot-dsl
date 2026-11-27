@@ -3403,9 +3403,10 @@ def mega_compressor(
             norm_eps=norm_eps,
         ) as prepared:
             return prepared()
-    if norm_weight is not None and backend == "pr221":
+    if backend == "pr221":
         raise ValueError(
-            "shape/metadata is outside the specialization; use backend='legacy'"
+            "backend='pr221' requires norm_weight and supported BF16 BSH "
+            "inputs/metadata; use backend='auto' or 'legacy'"
         )
     used = _device_metadata(seqused, metadata.used, x.device)
     cu = (

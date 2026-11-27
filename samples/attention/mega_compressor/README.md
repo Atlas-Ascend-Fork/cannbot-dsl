@@ -72,7 +72,9 @@ Host 构造时查询当前 stream 的核资源，Kernel 从实际 launch 读取 
 | `start_pos` | INT32 `[B]`，随推理更新；prepared prefill 起点须按 ratio 对齐 |
 | `seqused` | 可选 INT32 `[B]`，每个请求的有效 token 数 |
 | `cu_seqlens` | TH 必传 INT32 `[B+1]`，带前导 0，末项为 T |
-| `backend` | `auto` 自动选择；`legacy` 通用调度；`pr221` 强制 BSH 专用路径 |
+| `backend` | `auto` 自动选择；`legacy` 通用调度；`pr221` 强制 BSH 专用路径，必须传入 `norm_weight`，不支持的参数组合会报错 |
+
+省略 `norm_weight` 只做 pooling 时，使用 `backend="auto"` 或 `backend="legacy"`。
 
 每个请求的有效输出数为 `(start_pos + seqused) // ratio - start_pos // ratio`。BSH 输出容量为 `[B,ceil(S/ratio),512]`；TH 有效行连续排列在开头。**S=1、ratio=2、偶数起点没有有效输出，只更新 cache。** Cache 保存未归一化的 KV/gate；ratio=2 的奇数起点会读取上一 token 的历史。
 
