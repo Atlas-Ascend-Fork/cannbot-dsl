@@ -444,7 +444,7 @@
       },
       {
         "name": "quant_mla_prolog",
-        "enabled": false,
+        "enabled": true,
         "watch": [
           "@quant_mla_prolog/source",
           "@quant_mla_prolog/test"
@@ -828,7 +828,7 @@
       },
       {
         "name": "mega_reindex",
-        "enabled": false,
+        "enabled": true,
         "watch": [
           "@mega_reindex/source",
           "@mega_reindex/test"
@@ -873,7 +873,7 @@
       },
       {
         "name": "mega_mla",
-        "enabled": false,
+        "enabled": true,
         "watch": [
           "@mega_mla/source",
           "@mega_mla/test"

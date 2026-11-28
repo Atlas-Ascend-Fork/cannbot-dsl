@@ -110,7 +110,7 @@ commit_recurrent_kda:
   options:
     - attention/commit_recurrent_kda
 quant_mla_prolog:
-  module: false
+  module: true
   src:
     - samples/attention/quant_mla_prolog
     - test/attention/quant_mla_prolog
@@ -356,7 +356,7 @@ mega_full_index:
   options:
     - attention/mega_full_index
 mega_reindex:
-  module: false
+  module: true
   src:
     - samples/attention/mega_reindex
     - test/attention/mega_reindex
@@ -393,7 +393,7 @@ network_groups:
     - attention/mla_prolog_v4
     - attention/quant_mla_prolog
 mega_mla:
-  module: false
+  module: true
   src:
     - samples/attention/mega_mla
     - test/attention/mega_mla
