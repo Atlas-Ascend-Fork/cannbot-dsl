@@ -5,7 +5,7 @@
 
 ## 功能说明
 
-从Unified Buffer（UB）中按dtype对齐的起始地址读取一个元素，并将该元素广播到整个矢量数据寄存器。结果通过函数返回值返回，搬运过程中数据格式和内容保持不变。本接口提供两种功能模式：
+从Unified Buffer（UB）读取单个元素、8个源元素或一个完整32B DataBlock，按`mode`指定方式广播到矢量寄存器。支持普通元素偏移及Post Update地址自更新。不同模式的读取量、数据排列和对齐要求见[mode枚举与模式选择](#mode枚举与模式选择)。
 
 - **对齐搬入模式**：将UB源地址的数据搬入到矢量数据寄存器，由用户自行更新源地址。
 - **立即数偏移搬入模式**：从相对源起始地址偏移指定距离的位置搬入数据。本接口不会自动更新源地址。
@@ -26,9 +26,22 @@ vload_broadcast(tensor, offset = 0, *, mode = None, width = None, post_update: b
 | --- | --- | --- |
 | `tensor` | 输入 | 源UB地址，实际读取地址必须按dtype对齐。 |
 | `offset` | 输入 | 可选，相对`tensor`起始地址的偏移，单位为元素个数。默认值为`0`。 |
-| `mode` | 输入 | 可选，广播模式，取值为`'brc'`、`'datablock'`或`'elem2datablock'`，默认值为`None`。取值为`None`或`'brc'`时，将`tensor`首个元素广播到返回值的整个矢量数据寄存器；取值为`'datablock'`或`'elem2datablock'`时，将每个元素广播到返回值中对应的一个`DataBlock`（32字节）中，`'datablock'`为`'elem2datablock'`的别名。 |
-| `width` | 输入 | 可选，广播的数据位宽，取值为`'b8'`或`'b16'`，默认值为`None`。取值为`'b8'`时将`tensor`的首个8bit元素广播到返回值中每个8bit位置，取值为`'b16'`时将`tensor`的首个16bit元素广播到返回值中每个16bit位置；取值为`None`时按`tensor`的元素数据类型广播。 |
-| `post_update` | 输入 | 可选，是否采用Post Update模式。取值为`True`或`False`，默认值为`False`。取值为`True`时，接口采用Post Update模式，搬入完成后自动更新源地址指针，`offset`为Post Update步长，单位为`width`对应的元素宽度；仅`mode`为全lane广播（取值为`None`或`'brc'`）时支持。 |
+| `mode` | 输入 | 可选，支持`None`、`brc`、`elem2datablock`、`datablock`和`block`，也接受对应的`BrcMode`枚举。`elem2datablock`仅接受16/32位源；`block`接受8/16/32位源并保留源dtype。 |
+| `width` | 输入 | 可选，仅全lane广播使用`b8`或`b16`，要求源为32位整数；返回`uint32`寄存器。`block`不接受`width`。 |
+| `post_update` | 输入 | 可选，默认`False`，`offset`是源元素偏移。`True`时每次读后推进内部指针；全lane显式`width`模式按所选位宽计步长，其他模式按源dtype计。全lane及整块广播步长保持32B对齐；元素到块广播的16/32位源分别保持16B/32B对齐。 |
+
+### mode枚举与模式选择
+
+`mode`接受下表中的取值或对应的`BrcMode`枚举。
+
+| mode取值 | BrcMode枚举 | 数据排列 | ASC对应能力 |
+| --- | --- | --- | --- |
+| `None` / `"brc"` | `BrcMode.FULL` | 单个源元素重复到整个矢量数据寄存器 | `asc_loadalign_brc` / `asc_loadalign_brc_elem` |
+| `"elem2datablock"` | `BrcMode.ELEM2DATABLOCK` | 读取8个源元素，每个元素分别重复填满一个32字节DataBlock | `asc_loadalign_brc_elem2datablock` |
+| `"datablock"` | `BrcMode.DATABLOCK` | 读取8个源元素，每个元素分别重复填满一个32字节DataBlock | `asc_loadalign_brc_elem2datablock` |
+| `"block"` | `BrcMode.BLOCK` | 读取一个完整32字节DataBlock，将整个块重复8次 | `asc_loadalign_brc_datablock` |
+
+全lane普通广播的实际地址按源元素对齐；整块广播按32字节对齐；元素到块广播的16/32位源分别按16字节/32字节对齐。上述模式均支持`post_update=True`。
 
 **支持的元素数据类型：**
 
@@ -36,7 +49,11 @@ dtype支持的数据类型为`dtypes.int4x2`、`dtypes.int8`、`dtypes.uint8`、
 
 ## 返回值说明
 
-返回保存广播搬入结果的矢量数据寄存器值，类型为`RawVReg`。在默认全元素广播模式下，`width=None`时元素类型与`tensor`一致，`width="b8"`或`"b16"`时为`dtypes.uint32`；在DataBlock广播模式下，16位源元素对应`dtypes.uint16`，32位源元素对应`dtypes.uint32`。
+返回保存广播搬入结果的矢量数据寄存器值，类型为`RawVReg`。返回元素类型按`mode`区分：
+
+- `None`、`"brc"`或`BrcMode.FULL`：`width=None`时元素类型与`tensor`一致，`width="b8"`或`"b16"`时为`dtypes.uint32`。
+- `"elem2datablock"`、`"datablock"`、`BrcMode.ELEM2DATABLOCK`或`BrcMode.DATABLOCK`：16位源元素对应`dtypes.uint16`，32位源元素对应`dtypes.uint32`。
+- `"block"`或`BrcMode.BLOCK`：元素类型与`tensor`一致。例如，`dtypes.float32`源返回`dtypes.float32`寄存器，不改为`dtypes.uint32`。
 
 ## 约束说明
 

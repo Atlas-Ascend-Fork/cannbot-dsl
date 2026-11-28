@@ -7,12 +7,12 @@
 
 从Unified Buffer（UB）中32字节对齐的起始地址非连续搬入8个`DataBlock`，并通过函数返回值返回保存搬入结果的矢量数据寄存器。每个`DataBlock`的数据量为32字节，支持配置相邻数据块之间的地址步长和本次搬入的起始读取位置。
 
-本接口与[`vload`](vload.md)的非连续对齐搬入模式功能相同，区别在于本接口通过函数返回值返回结果。
+本接口是独立的非连续DataBlock搬入入口；`vload`本身不提供该模式。
 
 ## 函数原型
 
 ```python
-vload_strided(tensor, offset, mask: Mask, *, block_stride, repeat_stride = 0) -> RawVReg
+vload_strided(tensor, offset, mask: Mask, *, block_stride, repeat_stride = 0, post_update: bool = False) -> RawVReg
 ```
 
 ## 参数说明
@@ -20,14 +20,17 @@ vload_strided(tensor, offset, mask: Mask, *, block_stride, repeat_stride = 0) ->
 | 参数 | 输入/输出 | 说明 |
 | --- | --- | --- |
 | `tensor` | 输入 | 源UB地址，实际读取地址必须按32字节对齐。 |
-| `offset` | 输入 | 相对`tensor`起始地址的偏移，单位为元素个数。 |
+| `offset` | 输入 | 相对`tensor`起始地址的偏移，单位为源元素个数。普通模式作为本次搬入的地址偏移；Post Update模式用于设置首次搬入的源地址，后续连续调用从更新后的源地址继续搬入。 |
 | `mask` | 输入 | 掩码寄存器，用于指示在计算过程中哪些元素参与计算。该接口以`DataBlock`为数据搬运单元。<br>&bull; 当`DataBlock`中的任意一个元素被`mask`筛选成有效元素时，该`DataBlock`中所有数据都会搬入至矢量数据寄存器。<br>&bull; 当`DataBlock`中所有元素都被`mask`筛选成无效元素时，该`DataBlock`中的数据不会搬入到矢量数据寄存器，对应位置的元素设置为0，即使UB越界也不会报错。 |
+| `post_update` | 输入 | 是否采用Post Update模式，默认值为`False`。`True`时从当前源地址非连续搬入8个`DataBlock`，搬入完成后，源地址指针增加`repeat_stride × 32`字节。 |
 | `block_stride` | 输入 | 源操作数相邻`DataBlock`之间起始地址的步长，单位为32字节。 |
-| `repeat_stride` | 输入 | 可选，本次搬入的起始读取地址相对`tensor`的偏移，单位为32字节。实际起始读取地址为`tensor`起始地址加上`offset × sizeof(dtype) + repeat_stride × 32`字节。默认值为`0`。 |
+| `repeat_stride` | 输入 | 可选，单位为32字节。普通模式下，实际起始读取地址为`tensor`起始地址加上`offset × sizeof(dtype) + repeat_stride × 32`字节；Post Update模式下，为每次搬入完成后源地址指针的更新步长，首次起始读取地址不叠加该步长。默认值为`0`。 |
 
 **支持的元素数据类型：**
 
 dtype支持的数据类型为`dtypes.int4x2`、`dtypes.int8`、`dtypes.uint8`、`dtypes.fp4x2_e2m1`、`dtypes.fp4x2_e1m2`、`dtypes.hifloat8`、`dtypes.float8_e8m0`、`dtypes.float8_e5m2`、`dtypes.float8_e4m3fn`、`dtypes.int16`、`dtypes.uint16`、`dtypes.float16`、`dtypes.bfloat16`、`dtypes.int32`、`dtypes.uint32`、`dtypes.float32`、`dtypes.int64`。
+
+`block_stride`和`repeat_stride`均为0至65535的DataBlock计数。普通模式首块地址为`tensor + offset × sizeof(dtype) + repeat_stride × 32B`；Post Update模式首次首块地址为`tensor + offset × sizeof(dtype)`，每次按照`block_stride`指定的块间隔搬入8个DataBlock，搬入完成后，源地址指针增加`repeat_stride × 32`字节。连续调用时，下一次从更新后的源地址继续搬入；`repeat_stride=0`时不更新源地址指针。
 
 ## 返回值说明
 

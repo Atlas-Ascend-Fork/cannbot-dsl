@@ -5,10 +5,10 @@
 
 ## 功能说明
 
-从Unified Buffer（UB）中32字节对齐的起始地址读取VL/2长度的连续数据，在每个源元素后补1个值为0的元素，并将得到的VL长度数据通过函数返回值返回。本接口提供两种功能模式：
+从Unified Buffer（UB）中32字节对齐的起始地址读取连续数据，按`unpack_mode`指定的方式解包后搬入矢量数据寄存器。`UNPACK2`读取VL/2长度的数据，在每个源元素后补1个值为0的元素；`UNPACK4`读取VL/4长度的数据，在每个源元素后补3个值为0的元素，均得到VL长度的数据。支持普通偏移和Post Update地址自更新。
 
 - **对齐搬入模式**：将UB源地址的数据解包后搬入到矢量数据寄存器，由用户自行更新源地址。
-- **立即数偏移搬入模式**：从相对源起始地址偏移指定距离的位置搬入数据。本接口不会自动更新源地址。
+- **立即数偏移搬入模式**：从相对源起始地址偏移指定距离的位置搬入数据。仅普通模式不自动更新源地址；Post Update模式的`offset`用作步长。
 
 **图1** 解包搬入矢量数据寄存器
 
@@ -26,12 +26,23 @@ vload_unpack(tensor, offset = 0, *, unpack_mode, post_update: bool = False) -> R
 | --- | --- | --- |
 | `tensor` | 输入 | 源UB地址，实际读取地址必须按32字节对齐。 |
 | `offset` | 输入 | 可选，相对`tensor`起始地址的偏移，单位为元素个数。默认值为`0`。 |
-| `unpack_mode` | 输入 | 解包搬入模式，类型为`UnpackMode`或对应的字符串，必选。源位宽必须与模式匹配，按指定扩展倍数在源数据槽后补零。 |
-| `post_update` | 输入 | 可选，是否采用Post Update模式。取值为`True`或`False`，默认值为`False`。取值为`True`时，`offset`仍作为源地址偏移使用，本接口不更新源地址指针。 |
+| `unpack_mode` | 输入 | 解包搬入模式，类型为`UnpackMode`或对应的字符串，必选。源位宽必须与模式匹配，具体取值和补零方式见[UnpackMode枚举与模式选择](#unpackmode枚举与模式选择)。 |
+| `post_update` | 输入 | 可选，默认值为`False`，`offset`是本次访问的源元素偏移。`True`时首次从源地址开始搬入，搬入完成后，源地址指针增加`offset`个源元素；静态步长须为正数、保持32字节对齐且能用int32表示。 |
+
+### UnpackMode枚举与模式选择
+
+| UnpackMode枚举 | 对应字符串 | 源元素位宽 | 解包方式 |
+| --- | --- | --- | --- |
+| `UnpackMode.UNPACK2` | `"unpack2"` | 8位、16位或32位 | 每个源元素后补1个值为0的元素 |
+| `UnpackMode.UNPACK4` | `"unpack4"` | 8位 | 每个源元素后补3个值为0的元素 |
+| `UnpackMode.B8_TO_B16` | `"b8_to_b16"` | 8位 | 每个源元素后补1个值为0的元素，与8位源的`UNPACK2`一致 |
+| `UnpackMode.B16_TO_B32` | `"b16_to_b32"` | 16位 | 每个源元素后补1个值为0的元素，与16位源的`UNPACK2`一致 |
+| `UnpackMode.B32_TO_B64` | `"b32_to_b64"` | 32位 | 每个源元素后补1个值为0的元素，与32位源的`UNPACK2`一致，不进行64位数值转换 |
+| `UnpackMode.B8_TO_B32` | `"b8_to_b32"` | 8位 | 每个源元素后补3个值为0的元素，与8位源的`UNPACK4`一致 |
 
 **支持的元素数据类型：**
 
-dtype支持的数据类型为`dtypes.int4x2`、`dtypes.int8`、`dtypes.uint8`、`dtypes.fp4x2_e2m1`、`dtypes.fp4x2_e1m2`、`dtypes.hifloat8`、`dtypes.float8_e8m0`、`dtypes.float8_e5m2`、`dtypes.float8_e4m3fn`、`dtypes.int16`、`dtypes.uint16`、`dtypes.float16`、`dtypes.bfloat16`、`dtypes.int32`、`dtypes.uint32`、`dtypes.float32`。
+dtype支持的数据类型为`dtypes.int4x2`、`dtypes.int8`、`dtypes.uint8`、`dtypes.fp4x2_e2m1`、`dtypes.fp4x2_e1m2`、`dtypes.hifloat8`、`dtypes.float8_e8m0`、`dtypes.float8_e5m2`、`dtypes.float8_e4m3fn`、`dtypes.int16`、`dtypes.uint16`、`dtypes.float16`、`dtypes.bfloat16`、`dtypes.int32`、`dtypes.uint32`、`dtypes.float32`。32位源的UNPACK2保持原dtype，在每个源元素后补1个值为0的元素。
 
 ## 返回值说明
 
@@ -40,8 +51,9 @@ dtype支持的数据类型为`dtypes.int4x2`、`dtypes.int8`、`dtypes.uint8`、
 - `UNPACK2`用于16位源元素时，整型源元素的返回类型为`dtypes.int32`，浮点源元素保持原元素类型。
 - `UNPACK2`用于8位源元素时，返回元素类型为`dtypes.uint16`。
 - `UNPACK4`用于8位源元素时，返回元素类型为`dtypes.uint32`。
+- `UNPACK2`用于32位源元素时，返回元素类型与源元素类型一致；`B32_TO_B64`不表示将源元素转换为64位数值。
 
-这些规则描述返回对象的元素类型；数据槽中的补零布局仍按功能说明解释，不等同于普通数值类型转换。
+这些规则描述返回对象的元素类型；寄存器中补零后的数据排列仍按功能说明解释，不等同于普通数值类型转换。
 
 ## 约束说明
 

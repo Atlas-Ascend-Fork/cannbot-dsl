@@ -5,22 +5,25 @@
 
 ## 功能说明
 
-从Unified Buffer（UB）中按dtype对齐的起始地址读取VL长度连续数据，并搬入矢量数据寄存器。本接口将`vload_unalign_init`中的非对齐寄存器（32字节）中缓存的前置数据与从UB读取的后续数据拼接，得到VL长度数据并搬入矢量数据寄存器。连续搬入时，需要在每次调用前手动更新源地址。
+从Unified Buffer（UB）中按dtype对齐的起始地址读取VL长度连续数据，并搬入矢量数据寄存器。本接口将`vload_unalign_init`中的非对齐寄存器（32字节）中缓存的前置数据与从UB读取的后续数据拼接，得到VL长度数据并搬入矢量数据寄存器。普通模式连续搬入时由调用方指定读取位置；Post Update模式由接口维护并推进内部源指针。
 
 设本次实际读取的起始字节地址为`src_start_addr`，结束字节地址为`src_end_addr`，其中`src_end_addr = src_start_addr + VL`；将`src_start_addr`向低地址方向对齐到32字节边界，得到`aligned_src_start_addr`。`vload_unalign_init`将字节地址范围`[aligned_src_start_addr, aligned_src_start_addr + 32)`的数据缓存到非对齐寄存器，本接口将该缓存与从UB读取的后续数据拼接，得到字节地址范围`[src_start_addr, src_end_addr)`的数据。
+
+`post_update=True`时，首次搬入的源地址由`vload_unalign_init(tensor, offset)`确定；后续`vload_unalign(tensor, offset, post_update=True)`中的`offset`为每次搬入完成后源地址指针更新的步长，单位为源元素个数。
 
 ## 函数原型
 
 ```python
-vload_unalign(tensor, offset = 0) -> RawVReg
+vload_unalign(tensor, offset = 0, *, post_update: bool = False) -> RawVReg
 ```
 
 ## 参数说明
 
 | 参数 | 输入/输出 | 说明 |
 | --- | --- | --- |
-| `tensor` | 输入 | 本次搬入的有效起始UB地址，必须按dtype对齐。本接口不会更新该地址。<br>`tensor`起始地址必须按dtype对齐，且实际访问范围必须在UB地址空间内，否则会报错。 |
-| `offset` | 输入 | 可选，相对`tensor`起始地址的偏移，单位为元素个数。默认值为`0`。 |
+| `tensor` | 输入 | 源UB地址，实际访问地址必须按dtype对齐。普通模式使用`tensor[offset]`；Post Update模式使用`vload_unalign_init`初始化得到的源地址指针。<br>`tensor`起始地址必须按dtype对齐，且实际访问范围必须在UB地址空间内，否则会报错。 |
+| `offset` | 输入 | 可选，单位为源元素个数。`post_update=False`时，为相对`tensor`起始地址的偏移，默认值为`0`；`post_update=True`时，为搬入完成后源地址指针更新的步长，须为正uint32元素个数，此时不能使用默认值`0`。 |
+| `post_update` | 输入 | 默认`False`；`True`从初始化指针读取后自动推进。 |
 
 **支持的元素数据类型：**
 
@@ -35,7 +38,7 @@ dtype支持的数据类型为`dtypes.int4x2`、`dtypes.int8`、`dtypes.uint8`、
 - 本接口需在VF作用域内调用。
 - UB容量上限为256KB，用户可用容量随编译选项与编程场景变化（默认预留6KB SIMD VF栈 + 2KB框架预留，可用248KB；SIMD+SIMT混编时再划分32KB～128KB作Data Cache，可用容量进一步减少）。UB地址偏移后不可超过实际可用容量，否则会报错。
 - 如果本指令与其他指令存在UB地址重叠，必须插入同步指令[`vmem_bar`](../reg_sync/vmem-bar.md)，保证多个指令串行化，防止出现异常数据。
-- 每次搬入前必须调用`vload_unalign_init`中的源地址预处理模式进行初始化，且初始化接口和本接口必须使用相同的`tensor`。
+- 普通模式的初始化和搬入按同一`tensor, offset`配对。Post Update模式在VF入口对同一`tensor`初始化一次，再在循环中使用该`tensor`进行搬入；不能将初始化放在条件分支或循环内。
 
 ## 调用示例
 
